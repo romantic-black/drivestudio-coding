@@ -27,7 +27,7 @@ A 3DGS framework for omni urban scene reconstruction and simulation!
 DriveStudio is a 3DGS codebase for urban scene reconstruction/simulation. It offers a system with multiple Gaussian representations to jointly reconstruct backgrounds, vehicles, and non-rigid categories (pedestrians, cyclists, etc.) from driving logs. DriveStudio also provides a unified data system supporting various popular driving datasets, including [Waymo](https://waymo.com/open/), [PandaSet](https://pandaset.org/), [Argoverse2](https://www.argoverse.org/av2.html), [KITTI](http://www.cvlibs.net/datasets/kitti/), [NuScenes](https://www.nuscenes.org/), and [NuPlan](https://www.nuscenes.org/nuplan).
 
 This codebase also contains the **official implementation** of:
-  > **OmniRe: Omni Urban Scene Reconstruction** <br> ICLR 2025 (Splotlight) <br> [Project Page](https://ziyc.github.io/omnire/) | [Paper](https://arxiv.org/abs/2408.16760) <br> [Ziyu Chen](https://ziyc.github.io/), [Jiawei Yang](https://jiawei-yang.github.io/), [Jiahui Huang](https://huangjh-pub.github.io/), [Riccardo de Lutio](https://riccardodelutio.github.io/), [Janick Martinez Esturo](https://www.jme.pub/), [Boris Ivanovic](https://www.borisivanovic.com/), [Or Litany](https://orlitany.github.io/), [Zan Gojcic](https://zgojcic.github.io/), [Sanja Fidler](https://www.cs.utoronto.ca/~fidler/), [Marco Pavone](https://stanford.edu/~pavone/), [Li Song](https://medialab.sjtu.edu.cn/author/li-song/), [Yue Wang](https://yuewang.xyz/)
+  > **OmniRe: Omni Urban Scene Reconstruction** <br> ICLR 2025 (Spotlight) <br> [Project Page](https://ziyc.github.io/omnire/) | [Paper](https://arxiv.org/abs/2408.16760) <br> [Ziyu Chen](https://ziyc.github.io/), [Jiawei Yang](https://jiawei-yang.github.io/), [Jiahui Huang](https://huangjh-pub.github.io/), [Riccardo de Lutio](https://riccardodelutio.github.io/), [Janick Martinez Esturo](https://www.jme.pub/), [Boris Ivanovic](https://www.borisivanovic.com/), [Or Litany](https://orlitany.github.io/), [Zan Gojcic](https://zgojcic.github.io/), [Sanja Fidler](https://www.cs.utoronto.ca/~fidler/), [Marco Pavone](https://stanford.edu/~pavone/), [Li Song](https://medialab.sjtu.edu.cn/author/li-song/), [Yue Wang](https://yuewang.xyz/)
 
 ## 🎉 Try your own projects/research on DriveStudio!
 ### 🔥 Highlighted implementations
@@ -156,6 +156,49 @@ python tools/train.py \
 ```shell
 python tools/eval.py --resume_from $ckpt_path
 ```
+
+<details>
+<summary>Compare with OmniRe</summary>
+To compare with OmniRe, run the following commands to reproduce the paper’s checkpoints.
+
+```
+# Scene Reconstruction
+for scene_idx in {0..7}; do
+    IFS=',' read scene_idx seg_name start_timestep end_timestep <<< $(awk -v idx="$(($scene_idx + 2))" \
+        'NR==idx {print $1, $2, $3, $4}' data/waymo_example_scenes.txt)
+    
+    python tools/train.py \
+        --config_file configs/paper_legacy/omnire.yaml \
+        --output_root logs/omnire_waymo/ \
+        --project recon \
+        --run_name ${scene_idx} \
+        data.scene_idx=$scene_idx \
+        data.start_timestep=$start_timestep \
+        data.end_timestep=$end_timestep \
+        data.pixel_source.test_image_stride=0
+done
+```
+
+```
+# Novel View Synthesis
+for scene_idx in {0..7}; do
+    IFS=',' read scene_idx seg_name start_timestep end_timestep <<< $(awk -v idx="$(($scene_idx + 2))" \
+        'NR==idx {print $1, $2, $3, $4}' data/waymo_example_scenes.txt)
+    
+    python tools/train.py \
+        --config_file configs/paper_legacy/omnire.yaml \
+        --output_root logs/omnire_waymo/ \
+        --project nvs \
+        --run_name ${scene_idx} \
+        data.scene_idx=$scene_idx \
+        data.start_timestep=$start_timestep \
+        data.end_timestep=$end_timestep \
+        data.pixel_source.test_image_stride=10
+done
+```
+
+and run `utils/gather_results.py` to get the results.
+</details>
 
 ## 👏 Contributions
 We're improving our project to develop a robust driving recom/sim system. Some areas we're focusing on:

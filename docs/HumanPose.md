@@ -156,3 +156,12 @@ Supported datasets for human body pose extraction:
 - Processing time varies with hardware, number of scenes, cameras, and frames.
 
 **4. Output:** Processed human poses will be saved in each processed scene's `humanpose/` directory.
+
+<details>
+<summary>Troubleshooting</summary>
+<br>
+
+> No such file or directory: 'basicModel_neutral_lbs_10_207_0_v1.0.0.pkl'
+
+Please refer to the solution [here](https://github.com/ziyc/drivestudio/issues/68#issuecomment-2556828459)
+</details>

@@ -118,6 +118,12 @@ Download the pretrained model `segformer.b5.1024x1024.city.160k.pth` from the go
 
 Remember the location where you download into, and pass it to the script in the next step with `--checkpoint` .
 
+<details>
+<summary>Troubleshooting: SegFormer Checkpoint Download</summary>
+
+If you encounter problems downloading the original SegFormer checkpoint from the official links, you can alternatively download a backup copy using command: `gdown 1e7DECAH0TRtPZM6hTqRGoboq1XPqSmuj`
+</details>
+
 
 #### Run Mask Extraction Script
 
