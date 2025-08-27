@@ -27,9 +27,9 @@ A 3DGS framework for omni urban scene reconstruction and simulation!
 DriveStudio is a 3DGS codebase for urban scene reconstruction/simulation. It offers a system with multiple Gaussian representations to jointly reconstruct backgrounds, vehicles, and non-rigid categories (pedestrians, cyclists, etc.) from driving logs. DriveStudio also provides a unified data system supporting various popular driving datasets, including [Waymo](https://waymo.com/open/), [PandaSet](https://pandaset.org/), [Argoverse2](https://www.argoverse.org/av2.html), [KITTI](http://www.cvlibs.net/datasets/kitti/), [NuScenes](https://www.nuscenes.org/), and [NuPlan](https://www.nuscenes.org/nuplan).
 
 This codebase also contains the **official implementation** of:
-  > **OmniRe: Omni Urban Scene Reconstruction** <br> [Project Page](https://ziyc.github.io/omnire/) | [Paper](https://arxiv.org/abs/2408.16760) <br> [Ziyu Chen](https://ziyc.github.io/), [Jiawei Yang](https://jiawei-yang.github.io/), [Jiahui Huang](https://huangjh-pub.github.io/), [Riccardo de Lutio](https://riccardodelutio.github.io/), [Janick Martinez Esturo](https://www.jme.pub/), [Boris Ivanovic](https://www.borisivanovic.com/), [Or Litany](https://orlitany.github.io/), [Zan Gojcic](https://zgojcic.github.io/), [Sanja Fidler](https://www.cs.utoronto.ca/~fidler/), [Marco Pavone](https://stanford.edu/~pavone/), [Li Song](https://medialab.sjtu.edu.cn/author/li-song/), [Yue Wang](https://yuewang.xyz/)
+  > **OmniRe: Omni Urban Scene Reconstruction** <br> ICLR 2025 (Splotlight) <br> [Project Page](https://ziyc.github.io/omnire/) | [Paper](https://arxiv.org/abs/2408.16760) <br> [Ziyu Chen](https://ziyc.github.io/), [Jiawei Yang](https://jiawei-yang.github.io/), [Jiahui Huang](https://huangjh-pub.github.io/), [Riccardo de Lutio](https://riccardodelutio.github.io/), [Janick Martinez Esturo](https://www.jme.pub/), [Boris Ivanovic](https://www.borisivanovic.com/), [Or Litany](https://orlitany.github.io/), [Zan Gojcic](https://zgojcic.github.io/), [Sanja Fidler](https://www.cs.utoronto.ca/~fidler/), [Marco Pavone](https://stanford.edu/~pavone/), [Li Song](https://medialab.sjtu.edu.cn/author/li-song/), [Yue Wang](https://yuewang.xyz/)
 
-# 🎉 Try your own projects/research on DriveStudio!
+## 🎉 Try your own projects/research on DriveStudio!
 ### 🔥 Highlighted implementations
 
 Our codebase supports two types of Gaussian trainers:
@@ -93,7 +93,9 @@ These functionalities are designed to enhance the overall performance and flexib
 
 ## 📢 Updates
 
-**[Aug 2024]**  Release code of DriveStudio.
+**[Jan 2025]**  OmniRe is accepted by ICLR 2025 as a spotlight paper!
+
+**[Aug 2024]**  Release code of DriveStudio!
 
 ## 🔨 Installation
 
@@ -170,11 +172,13 @@ We utilize the rasterization kernel from [gsplat](https://github.com/nerfstudio-
 We extend our deepest gratitude to the authors for their contributions to the community, which have greatly supported our research.
 
 ## Citation
+If you find this codebase helpful, please kindly cite:
 ```
-@article{chen2024omnire,
-    title={OmniRe: Omni Urban Scene Reconstruction},
-    author={Chen, Ziyu and Yang, Jiawei and Huang, Jiahui and Lutio, Riccardo de and Esturo, Janick Martinez and Ivanovic, Boris and Litany, Or and Gojcic, Zan and Fidler, Sanja and Pavone, Marco and Song, Li and Wang, Yue},
-    journal={arXiv preprint arXiv:2408.16760},
-    year={2024}
+@inproceedings{
+  chen2025omnire,
+  title={OmniRe: Omni Urban Scene Reconstruction},
+  author={Ziyu Chen and Jiawei Yang and Jiahui Huang and Riccardo de Lutio and Janick Martinez Esturo and Boris Ivanovic and Or Litany and Zan Gojcic and Sanja Fidler and Marco Pavone and Li Song and Yue Wang},
+  booktitle={The Thirteenth International Conference on Learning Representations},
+  year={2025}
 }
 ```
