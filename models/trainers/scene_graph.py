@@ -83,7 +83,7 @@ class MultiTrainer(BasicTrainer):
         else:
             return True
 
-    def init_gaussians_from_dataset(
+    def init_gaussians_from_dataset(    # 初始化点云
         self,
         dataset: DrivingDataset,
     ) -> None:
