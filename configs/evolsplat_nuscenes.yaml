@@ -1,0 +1,134 @@
+seed: 0
+dataset: nuscenes/6cams_direct  # Use direct loader
+
+# ------------- Trainer ------------ #
+trainer:
+  type: models.trainers.evol_splat_trainer.EVolSplatTrainer
+  optim:
+    num_iters: 30000
+    use_grad_scaler: false
+    cache_buffer_freq: -1  # if > 0, use error based image sampler for training
+  render:
+    near_plane: 0.1  # near plane for rendering
+    far_plane: 10000000000.0  # far plane for rendering
+    antialiased: false  # whether to use antialiasing for gaussian rendering
+    packed: false  # whether to use packed rendering
+    absgrad: true  # whether to use absolute gradient for rendering
+    sparse_grad: false  # whether to use sparse gradient for rendering
+    batch_size: 1  # batch size for rendering, currently only support 1
+  losses:
+    rgb:
+      w: 0.8
+    ssim:
+      w: 0.2
+    mask:
+      w: 0.05
+      opacity_loss_type: bce  # choose from [bce, safe_bce]
+    depth:
+      w: 0.01  # weight of depth loss
+      inverse_depth: False
+      normalize: False
+      loss_type: l1  # choose from ["l1", "l2"]
+    affine:
+      w: 0.00001  # weight of affine regularization
+  res_schedule:
+    double_steps: 250  # training starts at 1/d resolution, every n steps this is doubled
+    downscale_times: 2  # at the beginning, resolution is 1/2^d
+  gaussian_optim_general_cfg:
+    # Note: EVolSplat uses MLP decoders, so we optimize MLP parameters instead of direct gaussian params
+    # These settings may need adjustment based on actual training behavior
+    xyz:
+      lr: 1.6e-04
+      lr_final: 1.6e-06
+      scale_factor: scene_radius
+    sh_dc:
+      lr: 0.0025
+    sh_rest:
+      lr: 0.000125
+    opacity:
+      lr: 0.05
+    scaling:
+      lr: 0.005
+    rotation:
+      lr: 0.001
+  gaussian_ctrl_general_cfg:
+    warmup_steps: 500
+    reset_alpha_interval: 3000
+    refine_interval: 100
+    sh_degree_interval: 1000
+    n_split_samples: 2
+    reset_alpha_value: 0.01
+    densify_grad_thresh: 0.0005
+    densify_size_thresh: 0.003
+    cull_alpha_thresh: 0.005
+    cull_scale_thresh: 0.5
+    cull_screen_size: 0.15
+    split_screen_size: 0.05
+    stop_screen_size_at: 4000
+    stop_split_at: 15000
+    sh_degree: 3
+
+# ------------- EVolSplat Configuration ------------ #
+evol_splat:
+  # Sparse convolution parameters
+  sparse_conv_outdim: 8  # Output dimension of sparse convolution
+  voxel_size: 0.1  # Voxel size for volume construction
+  
+  # Projector parameters
+  local_radius: 1  # Local window radius for 2D feature sampling
+  num_neighbour_select: 4  # Number of neighboring views to use
+  
+  # MLP decoder parameters
+  sh_degree: 1  # Spherical harmonics degree
+  
+  # Offset parameters
+  offset_max: 0.1  # Maximum offset for point refinement
+  
+  # Volume freezing (optional)
+  freeze_volume: false  # If true, freeze volume features after initialization
+  
+  # Optimizer configuration for EVolSplat components
+  optim:
+    default_lr: 0.001  # Default learning rate for EVolSplat components
+    gaussion_decoder:
+      lr: 0.001
+    mlp_conv:
+      lr: 0.001
+    mlp_opacity:
+      lr: 0.001
+    mlp_offset:
+      lr: 0.001
+    sparse_conv:
+      lr: 0.001
+
+# ------------- Model Configuration ------------ #
+# Note: EVolSplatTrainer doesn't use the traditional node-based model structure
+# Instead, it dynamically generates gaussians from features
+# The model config here is kept for compatibility but may not be fully utilized
+model:
+  # EVolSplat doesn't use Background/RigidNodes in the traditional sense
+  # but we keep this structure for compatibility with drivestudio's rendering system
+  Background:
+    type: models.gaussians.VanillaGaussians
+    # This will be ignored by EVolSplatTrainer, but kept for compatibility
+    init:
+      from_lidar:
+        num_samples: 800_000
+        return_color: True
+      near_randoms: 100_000
+      far_randoms: 100_000
+
+# ------------- Logging ------------ #
+logging:
+  print_freq: 100
+  vis_freq: 1000
+  saveckpt_freq: 5000
+  save_seperate_video: false
+
+# ------------- Render Configuration ------------ #
+render:
+  fps: 10
+  vis_lidar: false
+  vis_sky: true
+  vis_error: false
+
