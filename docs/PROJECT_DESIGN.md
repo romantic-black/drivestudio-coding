@@ -3,6 +3,7 @@
 ## 概述
 
 本项目旨在整合 **drivestudio** 和 **EVolSplat** 两个框架，创建一个统一的3D高斯场景重建系统。项目需要：
+
 1. 复用 EVolSplat 的核心算法组件
 2. 使用 drivestudio 的渲染系统（rigid node + background node 混合渲染）
 3. 添加新的 nuScenes 数据加载器（直接读取，无需预处理）
@@ -59,12 +60,14 @@ drivestudio-coding/
 **目标**：创建新的 nuScenes 数据加载器，直接读取原始数据，无需预处理步骤。
 
 **设计思路**：
+
 - 参考 `nuscenes_preprocess.py` 的数据处理逻辑
 - 在 `nuscenes_loader.py` 中直接实现数据读取和转换
 - 输出格式与 `nuscenes_sourceloader.py` 兼容
 - 配置参数参考 `6cams.yaml`
 
 **实现要点**：
+
 ```python
 # datasets/nuscenes/nuscenes_loader.py
 class NuScenesDirectLoader:
@@ -75,21 +78,22 @@ class NuScenesDirectLoader:
     def __init__(self, data_root, split, scene_idx, ...):
         # 直接使用nuscenes SDK加载数据
         self.nusc = NuScenes(version=split, dataroot=data_root)
-        
+      
     def load_images(self):
         # 直接读取原始图像，不依赖processed文件夹
-        
+      
     def load_calibrations(self):
         # 直接从nuscenes API获取相机内外参
-        
+      
     def load_lidar(self):
         # 直接从nuscenes API获取LiDAR数据
-        
+      
     def load_objects(self):
         # 直接从nuscenes API获取对象标注
 ```
 
 **优势**：
+
 - 无需预处理步骤，减少存储空间
 - 更灵活的数据处理
 - 与现有sourceloader接口兼容
@@ -99,24 +103,28 @@ class NuScenesDirectLoader:
 **目标**：复用 EVolSplat 的核心算法组件，同时使用 drivestudio 的渲染系统。
 
 **设计思路**：
+
 - 将 EVolSplat 的核心组件提取到 `models/evol_splat/` 目录
 - 保持 EVolSplat 的编码器、transformer、volume 等组件
 - 替换渲染部分，使用 drivestudio 的渲染系统
 
 **需要复用的组件**：
+
 1. **编码器** (`third_party/EVolSplat/nerfstudio/Encoder/`)
+
    - 点云编码
    - 特征提取
-   
 2. **Transformer** (`third_party/EVolSplat/nerfstudio/transformer/`)
+
    - 时序建模
    - 特征融合
-   
 3. **Volume相关** (`third_party/EVolSplat/nerfstudio/field_components/`)
+
    - 体积表示
    - 稀疏卷积
 
 **集成方式**：
+
 ```python
 # models/evol_splat/__init__.py
 from .encoder import EVolSplatEncoder
@@ -142,31 +150,34 @@ class EVolSplatTrainer(MultiTrainer):
 **决策**：使用 drivestudio 的渲染系统（rigid node + background node 混合渲染）
 
 **理由**：
+
 1. **更灵活的场景表示**：
+
    - Background node：静态场景
    - Rigid node：刚体对象（车辆等）
    - 支持多节点混合渲染
-   
 2. **更好的动态场景处理**：
+
    - 支持实例级别的刚体变换
    - 支持SMPL节点（人体）
    - 支持可变形节点
-
 3. **与EVolSplat的兼容性**：
+
    - EVolSplat的输出（高斯参数）可以直接用于drivestudio的渲染
    - 只需要适配数据格式
 
 **渲染流程**：
+
 ```python
 # models/trainers/scene_graph.py (已存在)
 class MultiTrainer:
     def forward(self, image_infos, camera_infos):
         # 1. 收集各节点的Gaussians
         gs = self.collect_gaussians(...)
-        
+      
         # 2. 使用drivestudio的渲染系统
         outputs = self.render_gaussians(gs, ...)
-        
+      
         # 3. 混合渲染（Background + RigidNodes + ...）
         return outputs
 ```
@@ -176,21 +187,24 @@ class MultiTrainer:
 **决策**：使用 drivestudio 的训练和评估代码作为基础
 
 **理由**：
+
 1. **更完整的训练流程**：
+
    - 支持多节点训练
    - 支持场景图结构
    - 支持各种正则化损失
-   
 2. **更好的评估功能**：
+
    - 支持PSNR、SSIM、LPIPS等指标
    - 支持分节点渲染可视化
    - 支持视频生成
-
 3. **易于扩展**：
+
    - 可以轻松添加EVolSplat特定的损失函数
    - 可以集成EVolSplat的训练策略
 
 **集成方式**：
+
 ```python
 # tools/train.py (修改)
 # 保持drivestudio的训练框架
@@ -198,37 +212,41 @@ class MultiTrainer:
 
 def setup(args):
     cfg = OmegaConf.load(args.config_file)
-    
+  
     # 根据配置选择trainer
     if cfg.model.type == "evolsplat":
         trainer = EVolSplatTrainer(...)
     else:
         trainer = MultiTrainer(...)
-    
+  
     return trainer, dataset, cfg
 ```
 
 ## 3. 实现步骤
 
 ### Phase 1: 数据加载器
+
 1. ✅ 分析 `nuscenes_preprocess.py` 的数据处理逻辑
 2. ✅ 分析 `nuscenes_sourceloader.py` 的接口要求
 3. ⬜ 实现 `nuscenes_loader.py`，直接读取原始数据
 4. ⬜ 测试数据加载器，确保输出格式兼容
 
 ### Phase 2: EVolSplat组件提取
+
 1. ⬜ 分析 EVolSplat 的核心组件
 2. ⬜ 提取编码器、transformer、volume等组件到 `models/evol_splat/`
 3. ⬜ 适配接口，使其与drivestudio兼容
 4. ⬜ 编写单元测试
 
 ### Phase 3: 训练器集成
+
 1. ⬜ 创建 `EVolSplatTrainer`，继承 `MultiTrainer`
 2. ⬜ 集成EVolSplat的编码器和transformer
 3. ⬜ 保持drivestudio的渲染系统
 4. ⬜ 添加EVolSplat特定的损失函数（如需要）
 
 ### Phase 4: 配置和测试
+
 1. ⬜ 创建EVolSplat的训练配置
 2. ⬜ 测试端到端训练流程
 3. ⬜ 验证渲染质量
@@ -241,7 +259,7 @@ def setup(args):
 ```python
 class NuScenesDirectLoader:
     """直接读取nuScenes数据，无需预处理"""
-    
+  
     def __init__(
         self,
         data_root: str,           # nuScenes原始数据路径
@@ -253,15 +271,15 @@ class NuScenesDirectLoader:
         interpolate_N: int = 0,    # 插值帧数（0表示不插值）
     ):
         pass
-    
+  
     def load_cameras(self) -> Dict[str, CameraData]:
         """加载相机数据"""
         pass
-    
+  
     def load_lidar(self) -> SceneLidarSource:
         """加载LiDAR数据"""
         pass
-    
+  
     def load_objects(self) -> Dict:
         """加载对象标注"""
         pass
@@ -272,21 +290,21 @@ class NuScenesDirectLoader:
 ```python
 class EVolSplatEncoder(nn.Module):
     """EVolSplat编码器"""
-    
+  
     def forward(self, points: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
         """编码点云和特征"""
         pass
 
 class EVolSplatTransformer(nn.Module):
     """EVolSplat Transformer"""
-    
+  
     def forward(self, encoded_features: torch.Tensor, timestamps: torch.Tensor) -> torch.Tensor:
         """时序特征融合"""
         pass
 
 class EVolSplatVolume(nn.Module):
     """EVolSplat体积表示"""
-    
+  
     def forward(self, features: torch.Tensor) -> Dict[str, torch.Tensor]:
         """生成体积表示"""
         pass
@@ -297,7 +315,7 @@ class EVolSplatVolume(nn.Module):
 ```python
 class EVolSplatTrainer(MultiTrainer):
     """整合EVolSplat和drivestudio的训练器"""
-    
+  
     def __init__(
         self,
         evol_splat_config: OmegaConf,  # EVolSplat配置
@@ -308,7 +326,7 @@ class EVolSplatTrainer(MultiTrainer):
         self.encoder = EVolSplatEncoder(...)
         self.transformer = EVolSplatTransformer(...)
         # 渲染系统继承自MultiTrainer
-    
+  
     def forward(self, image_infos, camera_infos):
         # 1. 使用EVolSplat编码和transformer处理
         # 2. 生成Gaussians
@@ -364,21 +382,25 @@ model:
 ## 6. 注意事项
 
 ### 6.1 数据格式兼容性
+
 - 确保新的loader输出格式与现有sourceloader兼容
 - 注意坐标系转换（OpenCV vs nuScenes）
 - 注意时间戳对齐
 
 ### 6.2 依赖管理
+
 - EVolSplat可能依赖特定版本的nerfstudio
 - 需要处理依赖冲突
 - 考虑使用条件导入
 
 ### 6.3 性能考虑
+
 - 直接读取原始数据可能比预处理慢
 - 考虑添加缓存机制
 - 优化数据加载流程
 
 ### 6.4 代码维护
+
 - 保持EVolSplat原始代码在third_party中作为参考
 - 提取的组件要有清晰的文档
 - 保持与原始实现的兼容性
@@ -386,13 +408,14 @@ model:
 ## 7. 总结
 
 本项目采用**混合架构**：
+
 - **数据层**：新的直接读取loader（整合preprocess逻辑）
 - **模型层**：EVolSplat组件 + drivestudio渲染系统
 - **训练层**：drivestudio训练框架 + EVolSplat组件集成
 
 这种设计的优势：
+
 1. ✅ 充分利用两个框架的优势
 2. ✅ 保持代码模块化和可维护性
 3. ✅ 易于扩展和修改
 4. ✅ 避免重复实现
-
