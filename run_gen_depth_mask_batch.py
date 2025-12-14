@@ -26,11 +26,32 @@ def main():
         log(f"Error: Base directory not found: {base_dir}", "error")
         sys.exit(1)
     
-    # 获取所有场景目录
-    scene_dirs = sorted([d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d))])
+    # 读取过滤后的场景ID列表（与run_nuscenes_preprocess.py保持一致）
+    filtered_scenes_file = '/root/drivestudio-coding/data/nuscenes_filtered_scenes.txt'
+    filtered_scene_ids = set()
+    if os.path.exists(filtered_scenes_file):
+        with open(filtered_scenes_file, 'r') as f:
+            # 跳过第一行标题，读取场景ID并格式化为3位数字（与预处理脚本一致）
+            filtered_scene_ids = {str(int(line.strip())).zfill(3) for line in f.readlines()[1:] if line.strip()}
+        log(f"Loaded {len(filtered_scene_ids)} filtered scene IDs from {filtered_scenes_file}", "info")
+    else:
+        log(f"Warning: Filtered scenes file not found: {filtered_scenes_file}", "warning")
+        log("Will process all scenes in the directory", "warning")
+    
+    # 获取所有场景目录，并过滤（如果过滤列表存在）
+    all_scene_dirs = sorted([d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d))])
+    
+    if filtered_scene_ids:
+        # 只处理过滤列表中的场景
+        scene_dirs = [d for d in all_scene_dirs if d in filtered_scene_ids]
+        skipped = len(all_scene_dirs) - len(scene_dirs)
+        if skipped > 0:
+            log(f"Filtered out {skipped} scenes not in the filtered list", "info")
+    else:
+        scene_dirs = all_scene_dirs
     
     if len(scene_dirs) == 0:
-        log(f"Error: No scene directories found in {base_dir}", "error")
+        log(f"Error: No scene directories found in {base_dir} (after filtering)", "error")
         sys.exit(1)
     
     log(f"Found {len(scene_dirs)} scenes to process", "info")
@@ -98,10 +119,17 @@ def main():
                 successful_scenes.append(scene_dir_name)
                 log(f"Scene {scene_dir_name} completed", "success")
             else:
-                failed_scenes.append((scene_dir_name, result.stderr))
-                log(f"Scene {scene_dir_name} failed", "error")
-                if result.stderr:
-                    log(f"Error: {result.stderr[:200]}", "error")
+                error_msg = result.stderr if result.stderr else result.stdout
+                failed_scenes.append((scene_dir_name, error_msg))
+                log(f"Scene {scene_dir_name} failed with return code {result.returncode}", "error")
+                if error_msg:
+                    # 显示更多错误信息（最多500字符）
+                    error_display = error_msg[-500:] if len(error_msg) > 500 else error_msg
+                    log(f"Error output:\n{error_display}", "error")
+                if result.stdout:
+                    # 也显示标准输出（可能包含有用信息）
+                    stdout_display = result.stdout[-300:] if len(result.stdout) > 300 else result.stdout
+                    log(f"Stdout:\n{stdout_display}", "warning")
         except subprocess.TimeoutExpired:
             failed_scenes.append((scene_dir_name, "Timeout"))
             log(f"Scene {scene_dir_name} timed out", "error")

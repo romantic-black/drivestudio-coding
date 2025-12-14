@@ -33,12 +33,18 @@ def main():
     # Run the command with PYTHONPATH set
     env = os.environ.copy()
     env['PYTHONPATH'] = '/root/drivestudio-coding'
-    result = subprocess.run(cmd, cwd='/root/drivestudio-coding', env=env)
+    result = subprocess.run(cmd, cwd='/root/drivestudio-coding', env=env, capture_output=True, text=True)
     
     if result.returncode == 0:
         print("Preprocessing completed successfully!")
+        if result.stdout:
+            print("Output:", result.stdout[-500:])  # 显示最后500字符
     else:
         print(f"Preprocessing failed with exit code {result.returncode}")
+        if result.stderr:
+            print("Error output:", result.stderr[-1000:])  # 显示最后1000字符
+        if result.stdout:
+            print("Standard output:", result.stdout[-1000:])  # 显示最后1000字符
         sys.exit(1)
 
 if __name__ == "__main__":
