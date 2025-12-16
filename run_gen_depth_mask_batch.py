@@ -94,7 +94,7 @@ def main():
             continue
         
         # 构建命令
-        cmd = ['python', script_path, '--scene_dir', scene_path]
+        cmd = ['python', script_path, '--scene_dir', scene_path, '--cam_id', '0']
         
         if gen_depth:
             cmd.extend(['--gen_depth', '--depth_gpu_id', depth_gpu_id])
@@ -106,10 +106,16 @@ def main():
         # 运行命令
         log(f"Processing scene {scene_dir_name} ({idx}/{total})...", "info")
         
+        # 确保传递必要的环境变量
+        env = os.environ.copy()
+        if 'METRIC3D_PATH' not in env:
+            env['METRIC3D_PATH'] = '/root/drivestudio-coding/third_party/EVolSplat/preprocess/metric3d'
+        
         try:
             result = subprocess.run(
                 cmd,
                 cwd='/root/drivestudio-coding',
+                env=env,
                 capture_output=True,
                 text=True,
                 timeout=3600  # 1 hour timeout per scene
