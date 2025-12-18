@@ -111,8 +111,13 @@ def main(args):
     dataset = DrivingDataset(data_cfg=cfg.data)
 
     # setup trainer
+    trainer_kwargs = dict(cfg.trainer)
+    # Manually pass evol_splat_config if it exists in cfg
+    if "evol_splat" in cfg:
+        trainer_kwargs["evol_splat_config"] = cfg.evol_splat
+    
     trainer = import_str(cfg.trainer.type)(
-        **cfg.trainer,
+        **trainer_kwargs,
         num_timesteps=dataset.num_img_timesteps,
         model_config=cfg.model,
         num_train_images=len(dataset.train_image_set),

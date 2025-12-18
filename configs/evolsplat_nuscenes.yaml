@@ -87,6 +87,17 @@ evol_splat:
   # Volume freezing (optional)
   freeze_volume: false  # If true, freeze volume features after initialization
   
+  # Monocular depth map cameras
+  depth_map_cameras: [0]  # Default use camera 0 (front camera)
+  
+  # Monocular point cloud generation parameters
+  mono_pcd:
+    sparsity: "Drop50"  # Options: Drop90, Drop80, Drop50, Drop25, full
+    filter_sky: true  # Whether to filter sky regions
+    depth_consistency: true  # Whether to perform depth consistency check
+    use_bbx: true  # Whether to use bounding box cropping
+    initial_scale: 0.01  # Initial scale for point cloud (will be converted to log scale)
+  
   # Optimizer configuration for EVolSplat components
   optim:
     default_lr: 0.001  # Default learning rate for EVolSplat components
