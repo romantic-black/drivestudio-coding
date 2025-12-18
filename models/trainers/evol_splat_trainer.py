@@ -248,38 +248,21 @@ class EVolSplatTrainer(MultiTrainer):
         # Register normalized timestamps
         self.register_normalized_timestamps(self.num_timesteps)
 
-    def init_mono_points_from_dataset(self, dataset):
-        """
-        Initialize seed points from dataset using monocular depth maps.
-        
-        This method generates point cloud from monocular depth maps following
-        the notebook implementation in notebooks/nuscenes_pcd_generation.ipynb.
-        It reads depth maps directly from the file system without using dataset classes.
-        
-        Args:
-            dataset: DrivingDataset instance
-        """
-        logger.info("Initializing point cloud from monocular depth maps...")
-        
-        # 1. Get configuration parameters
+    def _get_mono_pcd_config(self):
+        """Get monocular point cloud generation configuration."""
         depth_map_cameras = self.evol_splat_cfg.get("depth_map_cameras", [0])
         mono_pcd_cfg = self.evol_splat_cfg.get("mono_pcd", {})
-        sparsity = mono_pcd_cfg.get("sparsity", "full")
-        filter_sky = mono_pcd_cfg.get("filter_sky", True)
-        depth_consistency = mono_pcd_cfg.get("depth_consistency", True)
-        use_bbx = mono_pcd_cfg.get("use_bbx", True)
-        initial_scale = mono_pcd_cfg.get("initial_scale", 0.01)
-        
-        logger.info(f"Monocular PCD config: cameras={depth_map_cameras}, sparsity={sparsity}, "
-                   f"filter_sky={filter_sky}, depth_consistency={depth_consistency}, use_bbx={use_bbx}")
-        
-        # 2. Get scene path and frame indices
-        scene_dir = dataset.data_path
-        if not os.path.exists(scene_dir):
-            raise ValueError(f"Scene directory not found: {scene_dir}")
-        
-        # Convert to absolute frame indices
-        # train_timesteps are relative to start_timestep, but depth files use absolute indices
+        return {
+            "depth_map_cameras": depth_map_cameras,
+            "sparsity": mono_pcd_cfg.get("sparsity", "full"),
+            "filter_sky": mono_pcd_cfg.get("filter_sky", True),
+            "depth_consistency": mono_pcd_cfg.get("depth_consistency", True),
+            "use_bbx": mono_pcd_cfg.get("use_bbx", True),
+            "initial_scale": mono_pcd_cfg.get("initial_scale", 0.01),
+        }
+    
+    def _get_absolute_frame_indices(self, dataset):
+        """Convert train_timesteps to absolute frame indices."""
         absolute_frame_indices = dataset.start_timestep + dataset.train_timesteps
         absolute_frame_indices = sorted(absolute_frame_indices.tolist())
         
@@ -288,41 +271,24 @@ class EVolSplatTrainer(MultiTrainer):
         
         logger.info(f"Processing {len(absolute_frame_indices)} training frames "
                    f"(absolute indices: {absolute_frame_indices[0]} to {absolute_frame_indices[-1]})")
-        
-        # 3. Get bounding box
+        return absolute_frame_indices
+    
+    def _get_bounding_box(self, use_bbx):
+        """Get bounding box from scene_aabb."""
         if use_bbx and self.aabb is not None:
             bbx_min = self.aabb[0].cpu().numpy()
             bbx_max = self.aabb[1].cpu().numpy()
             logger.info(f"Using bounding box: min={bbx_min}, max={bbx_max}")
+            return bbx_min, bbx_max
         else:
-            bbx_min = bbx_max = None
             logger.info("Bounding box filtering disabled")
-        
-        # 4. Initialize point cloud generator
-        pcd_generator = NuScenesMonoPCDGenerator(
-            sparsity=sparsity,
-            frame_start=absolute_frame_indices[0],
-            filter_sky=filter_sky,
-            depth_consistency=depth_consistency,
-            use_bbx=use_bbx,
-            bbx_min=bbx_min,
-            bbx_max=bbx_max
-        )
-        
-        # 5. Set directories and image dimensions
-        pcd_generator.dir_name = scene_dir
-        pcd_generator.depth_dir = os.path.join(scene_dir, 'depth')
-        H, W = get_image_dimensions(scene_dir)
-        pcd_generator.H, pcd_generator.W = H, W
-        
-        logger.info(f"Image dimensions: H={H}, W={W}")
-        
-        # 6. Load and filter depth files (by training frames and camera IDs)
-        depth_dir = pcd_generator.depth_dir
+            return None, None
+    
+    def _load_and_filter_depth_files(self, depth_dir, depth_map_cameras, absolute_frame_indices):
+        """Load and filter depth files by camera IDs and training frames."""
         if not os.path.exists(depth_dir):
             raise ValueError(f"Depth directory not found: {depth_dir}")
         
-        # Get all depth files
         all_depth_files = sorted([
             f for f in os.listdir(depth_dir) 
             if f.endswith('.npy') and not f.endswith('_meta.npz')
@@ -330,7 +296,6 @@ class EVolSplatTrainer(MultiTrainer):
         
         logger.info(f"Found {len(all_depth_files)} total depth files")
         
-        # Filter by camera IDs
         filtered_depth_files = []
         for file_name in all_depth_files:
             try:
@@ -345,8 +310,10 @@ class EVolSplatTrainer(MultiTrainer):
         
         logger.info(f"Filtered to {len(filtered_depth_files)} depth files "
                    f"(cameras={depth_map_cameras}, training frames)")
-        
-        # 7. Group depth files by frame index and apply sparsity filtering
+        return filtered_depth_files
+    
+    def _apply_sparsity_filtering(self, filtered_depth_files):
+        """Group depth files by frame and apply sparsity filtering."""
         frame_groups = {}
         for file_name in filtered_depth_files:
             try:
@@ -359,50 +326,43 @@ class EVolSplatTrainer(MultiTrainer):
         
         sorted_frame_indices = sorted(frame_groups.keys())
         
-        # Apply sparsity filtering based on position in sorted frame list
-        selected_frames = []
-        for frame_pos, frame_idx in enumerate(sorted_frame_indices):
-            selected_frames.append(frame_idx)
+        # For now, no sparsity filtering (user removed it)
+        selected_frames = sorted_frame_indices
         
-        # Collect depth files for selected frames
         depth_files = []
         for frame_idx in selected_frames:
             if frame_idx in frame_groups:
                 depth_files.extend(sorted(frame_groups[frame_idx]))
         
-        logger.info(f"After sparsity filtering: {len(selected_frames)} frames, {len(depth_files)} depth files")
-        
-        if len(depth_files) == 0:
-            raise ValueError("No depth files selected after sparsity filtering")
-        
-        # 8. Match depth files with poses and intrinsics
+        logger.info(f"After filtering: {len(selected_frames)} frames, {len(depth_files)} depth files")
+        return depth_files
+    
+    def _match_depth_files_with_poses(self, scene_dir, depth_files, depth_map_cameras, 
+                                     absolute_frame_indices, pcd_generator):
+        """Match depth files with poses and intrinsics."""
         extrinsics_dir = os.path.join(scene_dir, 'extrinsics')
         intrinsics_dir = os.path.join(scene_dir, 'intrinsics')
         
-        # Load reference pose for alignment (first frame, first camera)
+        # Load reference pose for alignment
         camera_front_start = None
-        first_frame_cam = None
         for frame_idx in absolute_frame_indices:
-            if 0 in depth_map_cameras:  # Use camera 0 as reference
+            if 0 in depth_map_cameras:
                 first_extrinsic_file = os.path.join(extrinsics_dir, f'{frame_idx:03d}_0.txt')
                 if os.path.exists(first_extrinsic_file):
                     camera_front_start = np.loadtxt(first_extrinsic_file)
-                    first_frame_cam = (frame_idx, 0)
                     break
         
-        if camera_front_start is None:
-            # Fallback: use first available extrinsic
-            if len(absolute_frame_indices) > 0 and len(depth_map_cameras) > 0:
-                first_frame_cam = (absolute_frame_indices[0], depth_map_cameras[0])
-                first_extrinsic_file = os.path.join(extrinsics_dir, 
-                    f'{first_frame_cam[0]:03d}_{first_frame_cam[1]}.txt')
-                if os.path.exists(first_extrinsic_file):
-                    camera_front_start = np.loadtxt(first_extrinsic_file)
-                    logger.warning(f"Using frame {first_frame_cam[0]} camera {first_frame_cam[1]} for alignment")
+        if camera_front_start is None and len(absolute_frame_indices) > 0 and len(depth_map_cameras) > 0:
+            first_frame_cam = (absolute_frame_indices[0], depth_map_cameras[0])
+            first_extrinsic_file = os.path.join(extrinsics_dir, 
+                f'{first_frame_cam[0]:03d}_{first_frame_cam[1]}.txt')
+            if os.path.exists(first_extrinsic_file):
+                camera_front_start = np.loadtxt(first_extrinsic_file)
+                logger.warning(f"Using frame {first_frame_cam[0]} camera {first_frame_cam[1]} for alignment")
         
         pcd_generator.camera_front_start = camera_front_start
         
-        # Pre-load intrinsics for all cameras
+        # Pre-load intrinsics
         cam_intrinsics_dict = {}
         for cam_id in depth_map_cameras:
             intrinsic_file = os.path.join(intrinsics_dir, f'{cam_id}.txt')
@@ -431,7 +391,6 @@ class EVolSplatTrainer(MultiTrainer):
                     if cam_id not in depth_map_cameras:
                         continue
                     
-                    # Load extrinsic
                     extrinsic_file = os.path.join(extrinsics_dir, f'{frame_idx:03d}_{cam_id}.txt')
                     if not os.path.exists(extrinsic_file):
                         logger.warning(f"Extrinsic file not found: {extrinsic_file}, skipping")
@@ -439,14 +398,11 @@ class EVolSplatTrainer(MultiTrainer):
                     
                     cam2world = np.loadtxt(extrinsic_file)
                     
-                    # Align to first frame first camera
                     if camera_front_start is not None:
                         cam2world = np.linalg.inv(camera_front_start) @ cam2world
                     
-                    # Convert to OpenCV coordinate system
                     cam2world = cam2world @ OPENCV2DATASET
                     
-                    # Get intrinsic
                     if cam_id in cam_intrinsics_dict:
                         cam_intrinsic = cam_intrinsics_dict[cam_id]
                     else:
@@ -461,39 +417,38 @@ class EVolSplatTrainer(MultiTrainer):
                 logger.warning(f"Error processing {file_name}: {e}")
                 continue
         
-        depth_files = valid_depth_files
-        
-        if len(depth_files) == 0:
+        if len(valid_depth_files) == 0:
             raise ValueError("No valid depth files after matching with poses")
         
-        if len(pcd_generator.c2w) != len(depth_files) or len(pcd_generator.intri) != len(depth_files):
+        if len(pcd_generator.c2w) != len(valid_depth_files) or len(pcd_generator.intri) != len(valid_depth_files):
             raise ValueError(f"Mismatch: {len(pcd_generator.c2w)} poses, {len(pcd_generator.intri)} intrinsics, "
-                           f"{len(depth_files)} depth files")
+                           f"{len(valid_depth_files)} depth files")
         
-        logger.info(f"Matched {len(depth_files)} depth files with poses and intrinsics")
-        
-        # 9. Depth consistency check (if enabled and frames are continuous enough)
+        logger.info(f"Matched {len(valid_depth_files)} depth files with poses and intrinsics")
+        return valid_depth_files
+    
+    def _perform_depth_consistency_check(self, depth_files, depth_consistency, pcd_generator, H, W):
+        """Perform depth consistency check if enabled."""
         if depth_consistency:
-            # Check if frames are mostly continuous
             frame_indices_in_files = sorted([int(f.split('_')[0]) for f in depth_files])
             frame_gaps = [frame_indices_in_files[i+1] - frame_indices_in_files[i] 
                          for i in range(len(frame_indices_in_files)-1)]
             max_gap = max(frame_gaps) if frame_gaps else 0
             
-            if max_gap > 5:  # If gaps are too large, disable depth consistency
+            if max_gap > 5:
                 logger.warning(f"Large frame gaps detected (max={max_gap}), disabling depth consistency")
                 depth_consistency = False
                 pcd_generator.depth_consistency = False
         
         if depth_consistency:
             logger.info("Performing depth consistency check...")
-            consistency_masks = pcd_generator.depth_consistency_check(depth_files=depth_files, H=H, W=W)
+            return pcd_generator.depth_consistency_check(depth_files=depth_files, H=H, W=W)
         else:
-            consistency_masks = [np.ones((H, W), dtype=np.bool_) for _ in range(len(depth_files))]
-        
-        # 10. Point cloud accumulation main loop
-        logger.info(f"Starting point cloud accumulation for {len(depth_files)} depth files...")
-        
+            return [np.ones((H, W), dtype=np.bool_) for _ in range(len(depth_files))]
+    
+    def _accumulate_point_cloud(self, scene_dir, depth_dir, depth_files, consistency_masks, 
+                                filter_sky, pcd_generator, H, W):
+        """Accumulate point cloud from depth maps."""
         # Add depth_utils path
         project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
         depth_utils_path = os.path.join(
@@ -506,10 +461,10 @@ class EVolSplatTrainer(MultiTrainer):
         
         from depth_utils import process_depth_for_use
         
-        color_pointclouds = []
-        downscale = 2  # Downsample factor for point cloud generation
+        logger.info(f"Starting point cloud accumulation for {len(depth_files)} depth files...")
         
-        # Create downscale mask
+        color_pointclouds = []
+        downscale = 2
         downscale_mask = np.zeros((H, W), dtype=np.bool_)
         downscale_mask[::downscale, ::downscale] = True
         
@@ -517,7 +472,7 @@ class EVolSplatTrainer(MultiTrainer):
             if (i + 1) % 10 == 0 or i == 0:
                 logger.info(f"Processing {i+1}/{len(depth_files)}: {file_name}")
             
-            # Load and preprocess depth map
+            # Load depth map
             depth_file = os.path.join(depth_dir, file_name)
             try:
                 depth, metadata = process_depth_for_use(depth_file, target_shape=(H, W))
@@ -540,23 +495,18 @@ class EVolSplatTrainer(MultiTrainer):
                 logger.warning(f"Failed to load RGB {file_name}: {e}")
                 continue
             
-            # Apply sky filtering if enabled
+            # Apply masks
+            final_mask = consistency_masks[i]
             if filter_sky:
                 sky_mask_file = os.path.join(scene_dir, 'sky_masks', file_name.replace('.npy', '.png'))
                 if os.path.exists(sky_mask_file):
                     sky_mask = cv2.imread(sky_mask_file, cv2.IMREAD_GRAYSCALE)
                     mask = (sky_mask > 0).astype(np.bool_)
-                    final_mask = np.logical_and(consistency_masks[i], mask)
+                    final_mask = np.logical_and(final_mask, mask)
                 else:
                     logger.warning(f"Sky mask not found: {sky_mask_file}, skipping sky filtering")
-                    final_mask = consistency_masks[i]
-            else:
-                final_mask = consistency_masks[i]
             
-            # Apply downscale mask
             final_mask = np.logical_and(downscale_mask, final_mask)
-            
-            # Extract valid pixels
             kept = np.argwhere(final_mask)
             
             if len(kept) == 0:
@@ -565,7 +515,6 @@ class EVolSplatTrainer(MultiTrainer):
             depth_values = depth[kept[:, 0], kept[:, 1]]
             rgb_values = rgb[kept[:, 0], kept[:, 1]]
             
-            # Filter invalid depth values
             valid_depth_mask = np.isfinite(depth_values) & (depth_values > 0)
             if not np.any(valid_depth_mask):
                 continue
@@ -587,7 +536,6 @@ class EVolSplatTrainer(MultiTrainer):
             xx, yy = np.meshgrid(x, y)
             pixels = np.vstack((xx.ravel(), yy.ravel())).T.reshape(H, W, 2)
             
-            # Ensure K is 3x3
             if K.shape == (4, 4):
                 K_3x3 = K[:3, :3]
             elif K.shape == (3, 3):
@@ -602,7 +550,6 @@ class EVolSplatTrainer(MultiTrainer):
             z_cam = depth_values
             coordinates = np.stack([x_cam, y_cam, z_cam], axis=1)
             
-            # Filter NaN/inf coordinates
             valid_coords_mask = np.isfinite(coordinates).all(axis=1)
             if not np.any(valid_coords_mask):
                 continue
@@ -612,10 +559,8 @@ class EVolSplatTrainer(MultiTrainer):
             coordinates = np.column_stack((coordinates, np.ones(len(coordinates))))
             
             # Transform to world coordinates
-            worlds = np.dot(c2w, coordinates.T).T
-            worlds = worlds[:, :3]
+            worlds = np.dot(c2w, coordinates.T).T[:, :3]
             
-            # Filter NaN/inf world coordinates
             valid_worlds_mask = np.isfinite(worlds).all(axis=1)
             if not np.any(valid_worlds_mask):
                 continue
@@ -623,26 +568,24 @@ class EVolSplatTrainer(MultiTrainer):
             worlds = worlds[valid_worlds_mask]
             rgb_values = rgb_values[valid_worlds_mask]
             
-            # Accumulate point cloud chunk
             point_cloud_chunk = np.concatenate([worlds, rgb_values.reshape(-1, 3)], axis=-1)
             color_pointclouds.append(point_cloud_chunk)
         
-        # Merge all point cloud chunks
         if len(color_pointclouds) == 0:
             raise ValueError("No valid point cloud generated")
         
         accumulated_pointcloud = np.concatenate(color_pointclouds, axis=0).reshape(-1, 6)
-        
-        # Final filtering: remove remaining NaN/inf values
         valid_mask = np.isfinite(accumulated_pointcloud[:, :3]).all(axis=1)
+        
         if not np.any(valid_mask):
             raise ValueError("No valid point cloud after NaN filtering")
         
         accumulated_pointcloud = accumulated_pointcloud[valid_mask]
-        
         logger.info(f"Accumulated point cloud: {len(accumulated_pointcloud)} points")
-        
-        # 11. Apply bounding box cropping if enabled
+        return accumulated_pointcloud
+    
+    def _postprocess_point_cloud(self, accumulated_pointcloud, use_bbx, bbx_min, bbx_max, pcd_generator):
+        """Apply bounding box cropping and point cloud filtering."""
         points = accumulated_pointcloud[:, :3]
         colors = accumulated_pointcloud[:, 3:]
         
@@ -651,31 +594,25 @@ class EVolSplatTrainer(MultiTrainer):
             points, colors = pcd_generator.crop_pointcloud(bbx_min, bbx_max, points, colors)
             logger.info(f"Points after bounding box: {len(points)}")
         
-        # 12. Point cloud filtering
         logger.info("Applying point cloud filtering...")
         point_cloud = o3d.geometry.PointCloud()
         point_cloud.points = o3d.utility.Vector3dVector(points[:, :3])
         point_cloud.colors = o3d.utility.Vector3dVector(colors)
         
-        # Statistical outlier removal
-        cl, ind = point_cloud.remove_statistical_outlier(
-            nb_neighbors=30, std_ratio=1.5
-        )
+        cl, ind = point_cloud.remove_statistical_outlier(nb_neighbors=30, std_ratio=1.5)
         point_cloud = point_cloud.select_by_index(ind)
-        
-        # Uniform downsampling
         point_cloud = point_cloud.uniform_down_sample(every_k_points=3)
         
         logger.info(f"Final point cloud: {len(point_cloud.points)} points")
-        
-        # 13. Convert to torch.Tensor and set
+        return point_cloud
+    
+    def _convert_to_tensor(self, point_cloud, initial_scale):
+        """Convert point cloud to torch.Tensor and set to trainer attributes."""
         final_points = np.asarray(point_cloud.points)
         final_colors = np.asarray(point_cloud.colors)
         
         self.means = torch.from_numpy(final_points).float().to(self.device)
         self.anchor_feats = torch.from_numpy(final_colors).float().to(self.device)
-        
-        # Set initial scales (log scale)
         self.scales = torch.log(torch.ones_like(self.means) * initial_scale)
         self.offset = torch.zeros_like(self.means)
         
@@ -683,13 +620,101 @@ class EVolSplatTrainer(MultiTrainer):
         logger.info(f"Point cloud range: X[{self.means[:, 0].min():.2f}, {self.means[:, 0].max():.2f}], "
                    f"Y[{self.means[:, 1].min():.2f}, {self.means[:, 1].max():.2f}], "
                    f"Z[{self.means[:, 2].min():.2f}, {self.means[:, 2].max():.2f}]")
+    
+    def init_mono_points_from_dataset(self, dataset):
+        """
+        Initialize seed points from dataset using monocular depth maps.
         
-        # 14. Clear depth map data to free memory
+        This method generates point cloud from monocular depth maps following
+        the notebook implementation in notebooks/nuscenes_pcd_generation.ipynb.
+        It reads depth maps directly from the file system without using dataset classes.
+        
+        Args:
+            dataset: DrivingDataset instance
+        """
+        logger.info("Initializing point cloud from monocular depth maps...")
+        
+        # Get configuration
+        config = self._get_mono_pcd_config()
+        depth_map_cameras = config["depth_map_cameras"]
+        sparsity = config["sparsity"]
+        filter_sky = config["filter_sky"]
+        depth_consistency = config["depth_consistency"]
+        use_bbx = config["use_bbx"]
+        initial_scale = config["initial_scale"]
+        
+        logger.info(f"Monocular PCD config: cameras={depth_map_cameras}, sparsity={sparsity}, "
+                   f"filter_sky={filter_sky}, depth_consistency={depth_consistency}, use_bbx={use_bbx}")
+        
+        # Get scene path and frame indices
+        scene_dir = dataset.data_path
+        if not os.path.exists(scene_dir):
+            raise ValueError(f"Scene directory not found: {scene_dir}")
+        
+        absolute_frame_indices = self._get_absolute_frame_indices(dataset)
+        bbx_min, bbx_max = self._get_bounding_box(use_bbx)
+        
+        # Initialize point cloud generator
+        pcd_generator = NuScenesMonoPCDGenerator(
+            sparsity=sparsity,
+            frame_start=absolute_frame_indices[0],
+            filter_sky=filter_sky,
+            depth_consistency=depth_consistency,
+            use_bbx=use_bbx,
+            bbx_min=bbx_min,
+            bbx_max=bbx_max
+        )
+        
+        pcd_generator.dir_name = scene_dir
+        pcd_generator.depth_dir = os.path.join(scene_dir, 'depth')
+        H, W = get_image_dimensions(scene_dir)
+        pcd_generator.H, pcd_generator.W = H, W
+        
+        logger.info(f"Image dimensions: H={H}, W={W}")
+        
+        # Load and filter depth files
+        filtered_depth_files = self._load_and_filter_depth_files(
+            pcd_generator.depth_dir, depth_map_cameras, absolute_frame_indices
+        )
+        
+        # Apply sparsity filtering
+        depth_files = self._apply_sparsity_filtering(filtered_depth_files)
+        
+        if len(depth_files) == 0:
+            raise ValueError("No depth files selected after filtering")
+        
+        # Match depth files with poses
+        depth_files = self._match_depth_files_with_poses(
+            scene_dir, depth_files, depth_map_cameras, absolute_frame_indices, pcd_generator
+        )
+        
+        # Depth consistency check
+        consistency_masks = self._perform_depth_consistency_check(
+            depth_files, depth_consistency, pcd_generator, H, W
+        )
+        
+        # Accumulate point cloud
+        accumulated_pointcloud = self._accumulate_point_cloud(
+            scene_dir, pcd_generator.depth_dir, depth_files, consistency_masks,
+            filter_sky, pcd_generator, H, W
+        )
+        
+        # Postprocess point cloud
+        point_cloud = self._postprocess_point_cloud(
+            accumulated_pointcloud, use_bbx, bbx_min, bbx_max, pcd_generator
+        )
+        
+        # Convert to tensor
+        self._convert_to_tensor(point_cloud, initial_scale)
+        
+        # Clear depth map data to free memory
         del pcd_generator.c2w, pcd_generator.intri
         if hasattr(pcd_generator, '_last_depth'):
             del pcd_generator._last_depth
-        del consistency_masks, color_pointclouds, accumulated_pointcloud
+        del consistency_masks, accumulated_pointcloud
         logger.info("Cleared depth map data from memory")
+
+        
 
     def init_gaussians_from_dataset(self, dataset):
         """
