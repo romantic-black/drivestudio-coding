@@ -396,12 +396,11 @@ class TestIntegration:
             min_keyframes_per_segment=3,
         )
         
-        # Load scene first
-        scene_data = dataset._load_scene(0)
+        # Initialize and load scene
+        dataset.initialize()
+        scene_data = dataset._ensure_scene_loaded(0)
         if scene_data is None:
             pytest.skip("Scene loading failed, cannot test batch format")
-        
-        dataset.train_scenes[0] = scene_data
         
         # Get batch
         batch = dataset.get_segment_batch(0, 0)
@@ -412,17 +411,23 @@ class TestIntegration:
         assert 'source' in batch
         assert 'target' in batch
         
-        # Check source format
-        assert batch['source']['image'].shape[0] == 3 * 6  # 3 frames × 6 cameras
-        assert batch['source']['extrinsics'].shape[0] == 3 * 6
-        assert batch['source']['intrinsics'].shape[0] == 3 * 6
-        assert batch['source']['depth'].shape[0] == 3 * 6
+        # Get actual number of cameras from scene data
+        scene_data = dataset._ensure_scene_loaded(0)
+        num_cams = scene_data['num_cams'] if scene_data else mock_driving_dataset.num_cams
         
-        # Check target format
-        assert batch['target']['image'].shape[0] == 6 * 6  # 6 frames × 6 cameras
-        assert batch['target']['extrinsics'].shape[0] == 6 * 6
-        assert batch['target']['intrinsics'].shape[0] == 6 * 6
-        assert batch['target']['depth'].shape[0] == 6 * 6
+        # Check source format (num_source_keyframes frames × num_cams cameras)
+        expected_source_count = dataset.num_source_keyframes * num_cams
+        assert batch['source']['image'].shape[0] == expected_source_count
+        assert batch['source']['extrinsics'].shape[0] == expected_source_count
+        assert batch['source']['intrinsics'].shape[0] == expected_source_count
+        assert batch['source']['depth'].shape[0] == expected_source_count
+        
+        # Check target format (num_target_keyframes frames × num_cams cameras)
+        expected_target_count = dataset.num_target_keyframes * num_cams
+        assert batch['target']['image'].shape[0] == expected_target_count
+        assert batch['target']['extrinsics'].shape[0] == expected_target_count
+        assert batch['target']['intrinsics'].shape[0] == expected_target_count
+        assert batch['target']['depth'].shape[0] == expected_target_count
         
         # Check intrinsics are 4x4
         assert batch['source']['intrinsics'].shape[1:] == (4, 4)
@@ -441,12 +446,8 @@ class TestIntegration:
             min_keyframes_per_segment=3,
         )
         
-        # Load scene first
-        scene_data = dataset._load_scene(0)
-        if scene_data is None:
-            pytest.skip("Scene loading failed, cannot test random sampling")
-        
-        dataset.train_scenes[0] = scene_data
+        # Initialize dataset
+        dataset.initialize()
         
         # Sample random batch
         batch = dataset.sample_random_batch()
@@ -455,4 +456,193 @@ class TestIntegration:
         assert 'scene_id' in batch
         assert 'source' in batch
         assert 'target' in batch
+
+
+class TestPreloadQueue:
+    """Test preload queue mechanism."""
+    
+    @pytest.fixture
+    def mock_driving_dataset(self):
+        """Create a mock DrivingDataset."""
+        dataset = Mock(spec=DrivingDataset)
+        
+        # Mock pixel_source
+        pixel_source = Mock()
+        pixel_source.num_cams = 6
+        pixel_source.camera_list = [0, 1, 2, 3, 4, 5]
+        
+        # Mock camera_data
+        camera_data = {}
+        for cam_id in range(6):
+            cam_mock = Mock()
+            cam_mock.lidar_depth_maps = None
+            cam_mock.depth_maps = {i: torch.ones(100, 200, dtype=torch.float32) * 10.0 for i in range(16)}
+            camera_data[cam_id] = cam_mock
+        
+        pixel_source.camera_data = camera_data
+        
+        # Mock get_image method
+        def mock_get_image(img_idx):
+            image_infos = {
+                'pixels': torch.rand(100, 200, 3),
+            }
+            cam_infos = {
+                'camera_to_world': torch.eye(4),
+                'intrinsics': torch.eye(3),
+            }
+            return image_infos, cam_infos
+        
+        pixel_source.get_image = mock_get_image
+        dataset.pixel_source = pixel_source
+        dataset.num_img_timesteps = 16
+        dataset.num_cams = 6
+        
+        # Mock get_aabb
+        dataset.get_aabb.return_value = torch.tensor([
+            [0.0, 0.0, 0.0],
+            [100.0, 100.0, 100.0]
+        ])
+        
+        # Mock get_novel_render_traj
+        def mock_get_traj(traj_types, target_frames):
+            trajectory = torch.eye(4).unsqueeze(0).repeat(target_frames, 1, 1)
+            trajectory[:, 0, 3] = torch.arange(target_frames).float() * 2.0
+            return {"front_center_interp": trajectory}
+        
+        dataset.get_novel_render_traj = mock_get_traj
+        return dataset
+    
+    @pytest.fixture
+    def mock_data_cfg(self):
+        """Create mock data configuration."""
+        return OmegaConf.create({
+            'dataset': 'nuscenes',
+            'data_root': '/mock/data',
+            'start_timestep': 0,
+            'end_timestep': -1,
+            'pixel_source': {
+                'type': 'datasets.nuscenes.nuscenes_sourceloader.NuScenesPixelSource',
+                'cameras': [0, 1, 2, 3, 4, 5],
+            },
+            'lidar_source': {
+                'type': 'datasets.nuscenes.nuscenes_sourceloader.NuScenesLiDARSource',
+                'load_lidar': False,
+            },
+        })
+    
+    @patch('datasets.multi_scene_dataset.DrivingDataset')
+    def test_initialize(self, mock_driving_dataset_class, mock_driving_dataset, mock_data_cfg):
+        """Test dataset initialization."""
+        mock_driving_dataset_class.return_value = mock_driving_dataset
+        
+        dataset = MultiSceneDataset(
+            data_cfg=mock_data_cfg,
+            train_scene_ids=[0, 1, 2],
+            eval_scene_ids=[],
+            min_keyframes_per_scene=5,
+            min_keyframes_per_segment=3,
+            preload_scene_count=2,
+        )
+        
+        # Should not be initialized yet
+        assert not dataset._initialized
+        assert len(dataset.scene_training_queue) == 0
+        
+        # Initialize
+        dataset.initialize()
+        
+        # Should be initialized
+        assert dataset._initialized
+        assert len(dataset.scene_training_queue) > 0
+    
+    @patch('datasets.multi_scene_dataset.DrivingDataset')
+    def test_preload_scenes(self, mock_driving_dataset_class, mock_driving_dataset, mock_data_cfg):
+        """Test scene preloading."""
+        mock_driving_dataset_class.return_value = mock_driving_dataset
+        
+        dataset = MultiSceneDataset(
+            data_cfg=mock_data_cfg,
+            train_scene_ids=[0, 1, 2],
+            eval_scene_ids=[],
+            min_keyframes_per_scene=5,
+            min_keyframes_per_segment=3,
+            preload_scene_count=2,
+        )
+        
+        dataset.initialize()
+        
+        # Check that scenes are preloaded
+        assert len(dataset.train_scenes_cache) <= 3  # current + 2 preloaded
+        assert dataset.get_current_scene_id() is not None
+    
+    @patch('datasets.multi_scene_dataset.DrivingDataset')
+    def test_switch_to_next_scene(self, mock_driving_dataset_class, mock_driving_dataset, mock_data_cfg):
+        """Test switching to next scene."""
+        mock_driving_dataset_class.return_value = mock_driving_dataset
+        
+        dataset = MultiSceneDataset(
+            data_cfg=mock_data_cfg,
+            train_scene_ids=[0, 1, 2],
+            eval_scene_ids=[],
+            min_keyframes_per_scene=5,
+            min_keyframes_per_segment=3,
+            preload_scene_count=2,
+        )
+        
+        dataset.initialize()
+        
+        # Get current scene
+        current_scene_id = dataset.get_current_scene_id()
+        assert current_scene_id is not None
+        
+        # Mark scene as completed
+        dataset.mark_scene_completed(current_scene_id)
+        
+        # Should have switched to next scene
+        new_scene_id = dataset.get_current_scene_id()
+        assert new_scene_id != current_scene_id or dataset.current_scene_index > 0
+    
+    @patch('datasets.multi_scene_dataset.DrivingDataset')
+    def test_get_current_scene_id(self, mock_driving_dataset_class, mock_driving_dataset, mock_data_cfg):
+        """Test getting current scene ID."""
+        mock_driving_dataset_class.return_value = mock_driving_dataset
+        
+        dataset = MultiSceneDataset(
+            data_cfg=mock_data_cfg,
+            train_scene_ids=[0],
+            eval_scene_ids=[],
+            min_keyframes_per_scene=5,
+            min_keyframes_per_segment=3,
+        )
+        
+        # Before initialization, should return None
+        assert dataset.get_current_scene_id() is None
+        
+        # After initialization
+        dataset.initialize()
+        current_scene_id = dataset.get_current_scene_id()
+        assert current_scene_id is not None
+        assert current_scene_id in dataset.scene_training_queue
+    
+    @patch('datasets.multi_scene_dataset.DrivingDataset')
+    def test_ensure_scene_loaded(self, mock_driving_dataset_class, mock_driving_dataset, mock_data_cfg):
+        """Test ensuring scene is loaded."""
+        mock_driving_dataset_class.return_value = mock_driving_dataset
+        
+        dataset = MultiSceneDataset(
+            data_cfg=mock_data_cfg,
+            train_scene_ids=[0],
+            eval_scene_ids=[],
+            min_keyframes_per_scene=5,
+            min_keyframes_per_segment=3,
+        )
+        
+        # Load scene
+        scene_data = dataset._ensure_scene_loaded(0)
+        assert scene_data is not None
+        assert 0 in dataset.train_scenes_cache
+        
+        # Loading again should return cached version
+        scene_data2 = dataset._ensure_scene_loaded(0)
+        assert scene_data is scene_data2
 

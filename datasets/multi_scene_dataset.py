@@ -46,6 +46,7 @@ class MultiSceneDataset:
         min_keyframes_per_scene: int = 10,
         min_keyframes_per_segment: int = 6,
         device: torch.device = torch.device("cpu"),
+        preload_scene_count: int = 3,
     ):
         """
         Initialize MultiSceneDataset.
@@ -64,6 +65,7 @@ class MultiSceneDataset:
             min_keyframes_per_scene: Minimum keyframes per scene, skip if not met (default 10)
             min_keyframes_per_segment: Minimum keyframes per segment, skip if not met (default 6)
             device: Device (default CPU)
+            preload_scene_count: Number of scenes to preload ahead (default 3)
         """
         # Store configuration
         self.data_cfg = data_cfg
@@ -83,32 +85,420 @@ class MultiSceneDataset:
         self.min_keyframes_per_scene = min_keyframes_per_scene
         self.min_keyframes_per_segment = min_keyframes_per_segment
         
-        # Load all training scenes (skip unsuitable ones)
-        self.train_scenes = {}
-        for scene_id in train_scene_ids:
-            scene_data = self._load_scene(scene_id)
-            if scene_data is not None:  # Scene is suitable
-                self.train_scenes[scene_id] = scene_data
-            else:
-                logger.warning(f"Skipping training scene {scene_id} (not suitable)")
+        # Initialize preload scene count
+        self.preload_scene_count = preload_scene_count
         
-        # Load all evaluation scenes (skip unsuitable ones)
+        # Initialize scene candidate pool (unvalidated scene IDs)
+        self.scene_candidate_pool = train_scene_ids.copy()
+        random.shuffle(self.scene_candidate_pool)  # Shuffle for randomness
+        
+        # Initialize training queue (validated scene IDs in training order)
+        self.scene_training_queue = []
+        
+        # Initialize scene cache (loaded scene data, max preload_scene_count + 1 scenes)
+        self.train_scenes_cache = {}
+        
+        # Initialize evaluation scenes (loaded on demand, can keep all)
         self.eval_scenes = {}
-        for scene_id in eval_scene_ids:
-            scene_data = self._load_scene(scene_id)
-            if scene_data is not None:  # Scene is suitable
-                self.eval_scenes[scene_id] = scene_data
-            else:
-                logger.warning(f"Skipping eval scene {scene_id} (not suitable)")
         
-        # Build scene to segment mapping
-        self._build_segment_mapping()
+        # Initialize current scene index in queue
+        self.current_scene_index = 0
+        
+        # Initialize invalid scene IDs set (validated but not suitable)
+        self.invalid_scene_ids = set()
+        
+        # Track if initialized
+        self._initialized = False
+    
+    def initialize(self):
+        """
+        Initialize training queue and preload initial scenes.
+        
+        This method:
+        1. Initializes training queue (validates and adds initial scenes)
+        2. Preloads initial scenes
+        
+        This is optional - the dataset will auto-initialize on first use,
+        but calling this explicitly allows early error detection.
+        """
+        if self._initialized:
+            logger.debug("Dataset already initialized")
+            return
+        
+        logger.info("Initializing MultiSceneDataset...")
+        
+        # Ensure training queue has enough scenes
+        self._ensure_training_queue_ready()
+        
+        if len(self.scene_training_queue) == 0:
+            logger.warning("No valid training scenes found after validation")
+            return
+        
+        logger.info(f"Training queue initialized with {len(self.scene_training_queue)} scenes")
+        
+        # Preload initial scenes
+        self._preload_scenes()
+        
+        self._initialized = True
+        logger.info("MultiSceneDataset initialization complete")
     
     def _build_segment_mapping(self):
         """Build mapping from scene_id to segment information."""
         self.scene_segment_counts = {}
-        for scene_id, scene_data in self.train_scenes.items():
+        for scene_id, scene_data in self.train_scenes_cache.items():
             self.scene_segment_counts[scene_id] = len(scene_data['segments'])
+    
+    def _ensure_training_queue_ready(self):
+        """
+        Ensure training queue has enough scenes (at least preload_scene_count + 1).
+        
+        This method validates scenes from candidate pool and adds them to queue.
+        If candidate pool is empty, reshuffle and refill from original scene IDs.
+        """
+        target_queue_size = self.preload_scene_count + 1
+        
+        # If queue already has enough scenes, return
+        if len(self.scene_training_queue) >= target_queue_size:
+            return
+        
+        # Try to fill queue from candidate pool
+        while len(self.scene_training_queue) < target_queue_size and len(self.scene_candidate_pool) > 0:
+            scene_id = self.scene_candidate_pool.pop(0)
+            if self._validate_and_add_to_queue(scene_id):
+                logger.debug(f"Scene {scene_id} validated and added to training queue")
+            else:
+                logger.debug(f"Scene {scene_id} is not suitable, skipping")
+        
+        # If candidate pool is empty and queue still not full, try to refill from original IDs
+        if len(self.scene_training_queue) < target_queue_size and len(self.scene_candidate_pool) == 0:
+            # Get remaining scene IDs that haven't been validated
+            remaining_ids = [
+                sid for sid in self.train_scene_ids 
+                if sid not in self.scene_training_queue and sid not in self.invalid_scene_ids
+            ]
+            if len(remaining_ids) > 0:
+                random.shuffle(remaining_ids)
+                self.scene_candidate_pool = remaining_ids
+                logger.info(f"Refilled candidate pool with {len(remaining_ids)} remaining scenes")
+                # Try to fill queue again
+                while len(self.scene_training_queue) < target_queue_size and len(self.scene_candidate_pool) > 0:
+                    scene_id = self.scene_candidate_pool.pop(0)
+                    if self._validate_and_add_to_queue(scene_id):
+                        logger.debug(f"Scene {scene_id} validated and added to training queue")
+                    else:
+                        logger.debug(f"Scene {scene_id} is not suitable, skipping")
+    
+    def _validate_and_add_to_queue(self, scene_id: int) -> bool:
+        """
+        Validate a scene and add it to training queue if suitable.
+        
+        This method performs a lightweight validation by loading the scene
+        and checking if it's suitable. If suitable, adds to queue.
+        
+        Args:
+            scene_id: Scene ID to validate
+            
+        Returns:
+            bool: True if scene is suitable and added to queue, False otherwise
+        """
+        # Skip if already in queue or invalid
+        if scene_id in self.scene_training_queue:
+            return True
+        if scene_id in self.invalid_scene_ids:
+            return False
+        
+        # Try to load and prepare scene (this does full validation)
+        scene_data = self._load_and_prepare_scene(scene_id)
+        
+        if scene_data is not None:
+            # Scene is suitable, add to queue
+            self.scene_training_queue.append(scene_id)
+            # Don't keep it in cache yet, will be loaded when needed
+            # Clean up the loaded data to save memory
+            if 'dataset' in scene_data:
+                dataset = scene_data['dataset']
+                if hasattr(dataset, 'cleanup'):
+                    dataset.cleanup()
+                if hasattr(dataset, 'pixel_source') and hasattr(dataset.pixel_source, 'cleanup'):
+                    dataset.pixel_source.cleanup()
+            del scene_data
+            return True
+        else:
+            # Scene is not suitable, mark as invalid
+            self.invalid_scene_ids.add(scene_id)
+            return False
+    
+    def _initialize_training_queue(self):
+        """
+        Initialize training queue by validating all training scene IDs.
+        
+        This method validates all training scenes and filters out invalid ones,
+        then creates a training queue. The queue can be shuffled or kept in order.
+        """
+        valid_scenes = []
+        
+        logger.info(f"Validating {len(self.train_scene_ids)} training scenes...")
+        for scene_id in self.train_scene_ids:
+            # Quick validation: try to load scene metadata (without full loading)
+            # We'll do a lightweight check here
+            scene_cfg = OmegaConf.create(OmegaConf.to_container(self.data_cfg))
+            scene_cfg.scene_idx = scene_id
+            
+            try:
+                # Create a temporary dataset to check if scene exists and is valid
+                temp_dataset = DrivingDataset(scene_cfg)
+                # Get trajectory to check keyframes
+                trajectory = self._get_scene_trajectory(temp_dataset)
+                keyframe_segments, _ = self._split_keyframes(trajectory)
+                
+                # Check if scene is suitable
+                if self._is_scene_suitable(keyframe_segments):
+                    valid_scenes.append(scene_id)
+                    self.valid_train_scene_ids.add(scene_id)
+                else:
+                    logger.warning(f"Scene {scene_id} is not suitable for training (insufficient keyframes), skipping...")
+                
+                # Clean up temporary dataset
+                del temp_dataset
+                del trajectory
+                del keyframe_segments
+            except Exception as e:
+                logger.warning(f"Failed to validate scene {scene_id}: {e}, skipping...")
+        
+        # Create training queue (can shuffle or keep order)
+        self.scene_training_queue = valid_scenes.copy()
+        random.shuffle(self.scene_training_queue)  # Shuffle for randomness
+        
+        logger.info(f"Training queue initialized with {len(self.scene_training_queue)} valid scenes")
+    
+    def _preload_scenes(self):
+        """
+        Preload scenes that will be needed next.
+        
+        This method ensures cache has:
+        - Current scene (if exists)
+        - Next preload_scene_count scenes
+        
+        If a scene fails to load, skip it and try the next one.
+        """
+        # Ensure queue has enough scenes
+        self._ensure_training_queue_ready()
+        
+        if len(self.scene_training_queue) == 0:
+            logger.warning("Training queue is empty, cannot preload scenes")
+            return
+        
+        # Load current scene if not already loaded
+        if self.current_scene_index < len(self.scene_training_queue):
+            current_scene_id = self.scene_training_queue[self.current_scene_index]
+            if current_scene_id not in self.train_scenes_cache:
+                logger.info(f"Loading current scene {current_scene_id}...")
+                scene_data = self._load_and_prepare_scene(current_scene_id)
+                if scene_data is not None:
+                    self.train_scenes_cache[current_scene_id] = scene_data
+                    logger.info(f"Scene {current_scene_id} loaded successfully")
+                else:
+                    logger.warning(f"Failed to load current scene {current_scene_id}")
+                    # Remove from queue if failed
+                    if current_scene_id in self.scene_training_queue:
+                        self.scene_training_queue.remove(current_scene_id)
+        
+        # Preload next scenes
+        max_cache_size = self.preload_scene_count + 1  # Current + preload
+        scenes_to_preload = []
+        
+        for i in range(1, self.preload_scene_count + 1):
+            scene_idx = self.current_scene_index + i
+            if scene_idx < len(self.scene_training_queue):
+                scene_id = self.scene_training_queue[scene_idx]
+                if scene_id not in self.train_scenes_cache:
+                    scenes_to_preload.append(scene_id)
+        
+        # Load scenes one by one, stop if cache is full
+        for scene_id in scenes_to_preload:
+            if len(self.train_scenes_cache) >= max_cache_size:
+                break
+            
+            logger.info(f"Preloading scene {scene_id}...")
+            scene_data = self._load_and_prepare_scene(scene_id)
+            if scene_data is not None:
+                self.train_scenes_cache[scene_id] = scene_data
+                logger.info(f"Scene {scene_id} preloaded successfully")
+            else:
+                logger.warning(f"Failed to preload scene {scene_id}, will skip")
+                # Remove from queue if failed
+                if scene_id in self.scene_training_queue:
+                    self.scene_training_queue.remove(scene_id)
+    
+    def _load_and_prepare_scene(self, scene_id: int) -> Optional[Dict]:
+        """
+        Load scene and complete all preprocessing.
+        
+        This method loads a scene and performs all necessary preprocessing:
+        - Scene loading (DrivingDataset)
+        - Trajectory extraction
+        - Keyframe splitting
+        - Scene suitability check
+        - Segment splitting
+        
+        Args:
+            scene_id: Scene ID to load
+            
+        Returns:
+            Scene data dictionary or None if scene is not suitable
+        """
+        return self._load_scene(scene_id)
+    
+    def _unload_scene(self, scene_id: int):
+        """
+        Unload scene from cache and free memory.
+        
+        Args:
+            scene_id: Scene ID to unload
+        """
+        if scene_id in self.train_scenes_cache:
+            scene_data = self.train_scenes_cache[scene_id]
+            
+            # Clean up dataset if it has cleanup methods
+            if 'dataset' in scene_data:
+                dataset = scene_data['dataset']
+                # Try to clean up dataset resources
+                if hasattr(dataset, 'cleanup'):
+                    dataset.cleanup()
+                if hasattr(dataset, 'pixel_source') and hasattr(dataset.pixel_source, 'cleanup'):
+                    dataset.pixel_source.cleanup()
+            
+            # Remove from cache
+            del self.train_scenes_cache[scene_id]
+            logger.info(f"Scene {scene_id} unloaded from cache")
+    
+    def _switch_to_next_scene(self):
+        """
+        Switch to next scene: unload current scene and load next from queue.
+        
+        This method:
+        1. Unloads the current scene
+        2. Updates current_scene_index
+        3. Ensures queue has enough scenes
+        4. Preloads the next scenes
+        """
+        # Get current scene ID
+        if self.current_scene_index >= len(self.scene_training_queue):
+            logger.warning("No more scenes in training queue")
+            return
+        
+        current_scene_id = self.scene_training_queue[self.current_scene_index]
+        
+        # Unload current scene
+        self._unload_scene(current_scene_id)
+        
+        # Update index
+        self.current_scene_index += 1
+        
+        # Check if there's a next scene
+        if self.current_scene_index >= len(self.scene_training_queue):
+            logger.info("All scenes in training queue have been processed")
+            # Try to refill queue
+            self._ensure_training_queue_ready()
+            if self.current_scene_index >= len(self.scene_training_queue):
+                return  # Still no scenes available
+        
+        # Ensure queue has enough scenes
+        self._ensure_training_queue_ready()
+        
+        # Preload next scenes
+        self._preload_scenes()
+    
+    def _ensure_scene_loaded(self, scene_id: int) -> Optional[Dict]:
+        """
+        Ensure specified scene is loaded in cache.
+        
+        If scene is already in cache, return it.
+        If not, load it using _load_and_prepare_scene.
+        If cache is full, unload a non-current scene.
+        
+        Args:
+            scene_id: Scene ID to ensure loaded
+            
+        Returns:
+            Scene data dictionary or None if scene cannot be loaded
+        """
+        # Check if already in cache
+        if scene_id in self.train_scenes_cache:
+            return self.train_scenes_cache[scene_id]
+        
+        # Check if it's an evaluation scene
+        if scene_id in self.eval_scene_ids:
+            if scene_id not in self.eval_scenes:
+                # Load evaluation scene
+                scene_data = self._load_and_prepare_scene(scene_id)
+                if scene_data is not None:
+                    self.eval_scenes[scene_id] = scene_data
+                else:
+                    return None
+            return self.eval_scenes[scene_id]
+        
+        # It's a training scene, check cache size
+        max_cache_size = self.preload_scene_count + 1
+        
+        # If cache is full, unload a scene that's not current
+        if len(self.train_scenes_cache) >= max_cache_size:
+            # Find a scene to unload (prefer non-current scenes)
+            current_scene_id = self.get_current_scene_id()
+            for cached_scene_id in list(self.train_scenes_cache.keys()):
+                if cached_scene_id != current_scene_id:
+                    self._unload_scene(cached_scene_id)
+                    break
+            # If still full, unload any scene
+            if len(self.train_scenes_cache) >= max_cache_size:
+                scene_to_unload = list(self.train_scenes_cache.keys())[0]
+                self._unload_scene(scene_to_unload)
+        
+        # Load the scene
+        scene_data = self._load_and_prepare_scene(scene_id)
+        if scene_data is not None:
+            self.train_scenes_cache[scene_id] = scene_data
+            return scene_data
+        else:
+            return None
+    
+    def get_current_scene_id(self) -> Optional[int]:
+        """
+        Get current training scene ID.
+        
+        Returns:
+            Current scene ID or None if no scene is available
+        """
+        if (self.current_scene_index < len(self.scene_training_queue) and 
+            len(self.scene_training_queue) > 0):
+            return self.scene_training_queue[self.current_scene_index]
+        return None
+    
+    def mark_scene_completed(self, scene_id: int):
+        """
+        Mark scene training as completed and switch to next scene.
+        
+        This method:
+        1. Verifies the scene_id matches the current scene
+        2. Switches to the next scene in the queue
+        3. Unloads the completed scene
+        4. Preloads the next scene (if available)
+        
+        Args:
+            scene_id: Scene ID that has been completed
+        """
+        current_scene_id = self.get_current_scene_id()
+        
+        if current_scene_id is None:
+            logger.warning("No current scene to mark as completed")
+            return
+        
+        if scene_id != current_scene_id:
+            logger.warning(f"Scene {scene_id} does not match current scene {current_scene_id}. Ignoring.")
+            return
+        
+        # Switch to next scene
+        self._switch_to_next_scene()
     
     def get_scene(self, scene_id: int) -> Optional[Dict]:
         """
@@ -126,12 +516,7 @@ class MultiSceneDataset:
                 - 'num_cams': int - Number of cameras in scene
             Returns None if scene not found
         """
-        if scene_id in self.train_scenes:
-            return self.train_scenes[scene_id]
-        elif scene_id in self.eval_scenes:
-            return self.eval_scenes[scene_id]
-        else:
-            return None
+        return self._ensure_scene_loaded(scene_id)
     
     def _load_scene(self, scene_id: int) -> Optional[Dict]:
         """
@@ -462,8 +847,12 @@ class MultiSceneDataset:
         """
         Get training batch for specified scene and segment.
         """
-        # 1. Get scene and segment information
-        scene_data = self.train_scenes[scene_id]
+        # 1. Ensure scene is loaded
+        scene_data = self._ensure_scene_loaded(scene_id)
+        if scene_data is None:
+            raise ValueError(f"Scene {scene_id} cannot be loaded or is not suitable")
+        
+        # 2. Get scene and segment information
         segment = scene_data['segments'][segment_id]
         scene_dataset = scene_data['dataset']
         
@@ -487,7 +876,9 @@ class MultiSceneDataset:
             frame_idx = self._select_frame_from_keyframe(keyframe_segment)
             target_frame_indices.append(frame_idx)
         
-        # 4. Load source images (3 frames × 6 cameras = 18 images)
+        # 4. Load source images (num_source_keyframes frames × num_cams cameras)
+        num_cams = scene_dataset.num_cams
+        num_source_images = len(source_frame_indices) * num_cams
         source_images = []
         source_extrinsics = []
         source_intrinsics = []
@@ -496,8 +887,8 @@ class MultiSceneDataset:
         source_cam_idxs = []
         
         for frame_idx in source_frame_indices:
-            for cam_idx in range(scene_dataset.num_cams):
-                img_idx = frame_idx * scene_dataset.num_cams + cam_idx
+            for cam_idx in range(num_cams):
+                img_idx = frame_idx * num_cams + cam_idx
                 image_infos, cam_infos = scene_dataset.pixel_source.get_image(img_idx)
                 
                 source_images.append(image_infos['pixels'])  # [H, W, 3]
@@ -519,7 +910,7 @@ class MultiSceneDataset:
                 source_frame_idxs.append(frame_idx)
                 source_cam_idxs.append(cam_idx)
         
-        # 5. Load target images (6 frames × 6 cameras = 36 images)
+        # 5. Load target images (num_target_keyframes frames × num_cams cameras)
         target_images = []
         target_extrinsics = []
         target_intrinsics = []
@@ -527,9 +918,10 @@ class MultiSceneDataset:
         target_frame_idxs = []
         target_cam_idxs = []
         
+        num_target_images = len(target_frame_indices) * num_cams
         for frame_idx in target_frame_indices:
-            for cam_idx in range(scene_dataset.num_cams):
-                img_idx = frame_idx * scene_dataset.num_cams + cam_idx
+            for cam_idx in range(num_cams):
+                img_idx = frame_idx * num_cams + cam_idx
                 image_infos, cam_infos = scene_dataset.pixel_source.get_image(img_idx)
                 
                 target_images.append(image_infos['pixels'])
@@ -555,21 +947,21 @@ class MultiSceneDataset:
             'segment_id': segment_id,
             
             'source': {
-                'image': torch.stack(source_images, dim=0),  # [18, H, W, 3]
-                'extrinsics': torch.stack(source_extrinsics, dim=0),  # [18, 4, 4]
-                'intrinsics': torch.stack(source_intrinsics, dim=0),  # [18, 4, 4]
-                'depth': torch.stack(source_depths, dim=0),  # [18, H, W]
-                'frame_indices': torch.tensor(source_frame_idxs, dtype=torch.long),  # [18]
-                'cam_indices': torch.tensor(source_cam_idxs, dtype=torch.long),  # [18]
+                'image': torch.stack(source_images, dim=0),  # [num_source_keyframes * num_cams, H, W, 3]
+                'extrinsics': torch.stack(source_extrinsics, dim=0),  # [num_source_keyframes * num_cams, 4, 4]
+                'intrinsics': torch.stack(source_intrinsics, dim=0),  # [num_source_keyframes * num_cams, 4, 4]
+                'depth': torch.stack(source_depths, dim=0),  # [num_source_keyframes * num_cams, H, W]
+                'frame_indices': torch.tensor(source_frame_idxs, dtype=torch.long),  # [num_source_keyframes * num_cams]
+                'cam_indices': torch.tensor(source_cam_idxs, dtype=torch.long),  # [num_source_keyframes * num_cams]
             },
             
             'target': {
-                'image': torch.stack(target_images, dim=0),  # [36, H, W, 3]
-                'extrinsics': torch.stack(target_extrinsics, dim=0),  # [36, 4, 4]
-                'intrinsics': torch.stack(target_intrinsics, dim=0),  # [36, 4, 4]
-                'depth': torch.stack(target_depths, dim=0),  # [36, H, W]
-                'frame_indices': torch.tensor(target_frame_idxs, dtype=torch.long),  # [36]
-                'cam_indices': torch.tensor(target_cam_idxs, dtype=torch.long),  # [36]
+                'image': torch.stack(target_images, dim=0),  # [num_target_keyframes * num_cams, H, W, 3]
+                'extrinsics': torch.stack(target_extrinsics, dim=0),  # [num_target_keyframes * num_cams, 4, 4]
+                'intrinsics': torch.stack(target_intrinsics, dim=0),  # [num_target_keyframes * num_cams, 4, 4]
+                'depth': torch.stack(target_depths, dim=0),  # [num_target_keyframes * num_cams, H, W]
+                'frame_indices': torch.tensor(target_frame_idxs, dtype=torch.long),  # [num_target_keyframes * num_cams]
+                'cam_indices': torch.tensor(target_cam_idxs, dtype=torch.long),  # [num_target_keyframes * num_cams]
             }
         }
         
@@ -577,25 +969,36 @@ class MultiSceneDataset:
     
     def sample_random_batch(self) -> Dict:
         """
-        Randomly sample a training batch.
+        Randomly sample a training batch from current scene.
         
         Returns:
             Same format as get_segment_batch()
         """
-        if len(self.train_scenes) == 0:
-            raise ValueError("No training scenes available")
+        # Ensure initialized
+        if not self._initialized:
+            self.initialize()
         
-        # Randomly select scene
-        scene_id = random.choice(list(self.train_scenes.keys()))
-        scene_data = self.train_scenes[scene_id]
+        # Get current scene ID
+        current_scene_id = self.get_current_scene_id()
+        if current_scene_id is None:
+            # Try to initialize queue
+            self._ensure_training_queue_ready()
+            current_scene_id = self.get_current_scene_id()
+            if current_scene_id is None:
+                raise ValueError("No training scenes available. Please check scene IDs and configuration.")
         
-        # Randomly select segment
+        # Ensure current scene is loaded
+        scene_data = self._ensure_scene_loaded(current_scene_id)
+        if scene_data is None:
+            raise ValueError(f"Current scene {current_scene_id} cannot be loaded")
+        
+        # Randomly select segment from current scene
         if len(scene_data['segments']) == 0:
-            raise ValueError(f"Scene {scene_id} has no valid segments")
+            raise ValueError(f"Scene {current_scene_id} has no valid segments")
         
         segment_id = random.choice(range(len(scene_data['segments'])))
         
-        return self.get_segment_batch(scene_id, segment_id)
+        return self.get_segment_batch(current_scene_id, segment_id)
     
     def _get_depth(
         self,

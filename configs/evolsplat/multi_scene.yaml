@@ -14,8 +14,8 @@ data:
   
   pixel_source:  # image source and object annotations
     type: datasets.nuscenes.nuscenes_sourceloader.NuScenesPixelSource
-    cameras: [0, 1, 2, 3, 4, 5]  # which cameras to use
-    downscale_when_loading: [3, 3, 3, 3, 3, 3]  # the size of the images to load
+    cameras: [0, 1, 2]  # which cameras to use
+    downscale_when_loading: [3, 3, 3]  # the size of the images to load
     downscale: 1  # downscale factor wrt to the downscale_when_loading
     undistort: False  # whether to undistort the images
     test_image_stride: 0  # use every Nth timestep for the test set. if 0, use all images for training and none for testing
@@ -23,7 +23,7 @@ data:
     load_dynamic_mask: True  # whether to load dynamic mask
     load_depth_maps: True  # whether to load depth maps from files (required for EVolSplat)
     load_objects: True  # whether to load object bounding boxes
-    load_smpl: True  # whether to load SMPL template for pedestrians
+    load_smpl: False  # whether to load SMPL template for pedestrians
     sampler:  # error based image sampler
       buffer_downscale: 8  # downscale factor for the buffer wrt load_size
       buffer_ratio: 0.5  # the percentage of images sampled according to the error buffer
@@ -31,7 +31,7 @@ data:
   
   lidar_source:  # everything related to "lidar" --- from lidar points
     type: datasets.nuscenes.nuscenes_sourceloader.NuScenesLiDARSource
-    load_lidar: False  # EVolSplat doesn't require LiDAR, but can be enabled for AABB computation
+    load_lidar: True  
     # ---- compute aabb from lidar ---- #
     # if load_lidar is True, we compute aabb from lidar, otherwise we compute aabb from cameras
     lidar_downsample_factor: 4  # downsample lidar by this factor to compute percentile
