@@ -1,0 +1,52 @@
+# MultiSceneDataset configuration for EVolSplat feed-forward 3DGS training
+# This configuration supports multi-scene training with keyframe-based segmentation
+
+data:
+  data_root: /mnt/f/DataSet/nuScenes/processed/trainval  # data root for the dataset
+  dataset: nuscenes  # dataset type (waymo, nuscenes, kitti, etc.)
+  start_timestep: 0  # which timestep to start from
+  end_timestep: -1  # which timestep to end at, -1 means the last timestep
+  preload_device: cpu  # choose from ["cpu", "cuda"], cache the data on this device
+  
+  # Training and evaluation scene IDs
+  train_scene_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]  # List of scene IDs for training
+  eval_scene_ids: [10, 11, 12, 13, 14]  # List of scene IDs for evaluation
+  
+  pixel_source:  # image source and object annotations
+    type: datasets.nuscenes.nuscenes_sourceloader.NuScenesPixelSource
+    cameras: [0, 1, 2, 3, 4, 5]  # which cameras to use
+    downscale_when_loading: [3, 3, 3, 3, 3, 3]  # the size of the images to load
+    downscale: 1  # downscale factor wrt to the downscale_when_loading
+    undistort: False  # whether to undistort the images
+    test_image_stride: 0  # use every Nth timestep for the test set. if 0, use all images for training and none for testing
+    load_sky_mask: True  # whether to load sky mask
+    load_dynamic_mask: True  # whether to load dynamic mask
+    load_depth_maps: True  # whether to load depth maps from files (required for EVolSplat)
+    load_objects: True  # whether to load object bounding boxes
+    load_smpl: True  # whether to load SMPL template for pedestrians
+    sampler:  # error based image sampler
+      buffer_downscale: 8  # downscale factor for the buffer wrt load_size
+      buffer_ratio: 0.5  # the percentage of images sampled according to the error buffer
+      start_enhance_weight: 3  # give more chance to sample starting frames, which usually have more errors
+  
+  lidar_source:  # everything related to "lidar" --- from lidar points
+    type: datasets.nuscenes.nuscenes_sourceloader.NuScenesLiDARSource
+    load_lidar: False  # EVolSplat doesn't require LiDAR, but can be enabled for AABB computation
+    # ---- compute aabb from lidar ---- #
+    # if load_lidar is True, we compute aabb from lidar, otherwise we compute aabb from cameras
+    lidar_downsample_factor: 4  # downsample lidar by this factor to compute percentile
+    lidar_percentile: 0.02  # percentile to compute aabb from lidar
+
+# MultiSceneDataset specific configuration
+multi_scene:
+  num_source_keyframes: 3  # Number of keyframes for source (3 frames × 6 cameras = 18 images)
+  num_target_keyframes: 6  # Number of keyframes for target (6 frames × 6 cameras = 36 images, includes source)
+  segment_overlap_ratio: 0.2  # Overlap ratio between segments (0.0 to 1.0)
+  min_keyframes_per_scene: 10  # Minimum keyframes per scene, skip if not met
+  min_keyframes_per_segment: 6  # Minimum keyframes per segment, skip if not met
+  
+  keyframe_split_config:
+    num_splits: 0  # Number of splits (0 means auto-determine)
+    min_count: 1  # Minimum number of frames in each keyframe segment
+    min_length: 0.0  # Minimum length of each keyframe segment
+

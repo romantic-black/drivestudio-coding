@@ -105,6 +105,8 @@ class CameraData(object):
         load_dynamic_mask: bool = False,
         # whether to load the sky masks
         load_sky_mask: bool = False,
+        # whether to load depth maps from files
+        load_depth_maps: bool = False,
         # the size to load the images
         downscale_when_loading: float = 1.0,
         # whether to undistort the images
@@ -140,6 +142,9 @@ class CameraData(object):
         if load_sky_mask:
             self.load_sky_masks()
         self.lidar_depth_maps = None # will be loaded by: self.load_depth()
+        self.depth_maps = None  # will be loaded by: self.load_depth_maps() if load_depth_maps=True
+        if load_depth_maps:
+            self.load_depth_maps()
         self.image_error_maps = None # will be built by: self.build_image_error_buffer()
         self.to(self.device)
         self.downscale_factor = 1.0
@@ -194,6 +199,7 @@ class CameraData(object):
         img_filepaths = []
         dynamic_mask_filepaths, sky_mask_filepaths = [], []
         human_mask_filepaths, vehicle_mask_filepaths = [], []
+        depth_filepaths = []
         
         fine_mask_path = os.path.join(self.data_path, "fine_dynamic_masks")
         if os.path.exists(fine_mask_path):
@@ -226,11 +232,15 @@ class CameraData(object):
             sky_mask_filepaths.append(
                 os.path.join(self.data_path, "sky_masks", f"{t:03d}_{self.cam_id}.png")
             )
+            depth_filepaths.append(
+                os.path.join(self.data_path, "depth", f"{t:03d}_{self.cam_id}.npy")
+            )
         self.img_filepaths = np.array(img_filepaths)
         self.dynamic_mask_filepaths = np.array(dynamic_mask_filepaths)
         self.human_mask_filepaths = np.array(human_mask_filepaths)
         self.vehicle_mask_filepaths = np.array(vehicle_mask_filepaths)
         self.sky_mask_filepaths = np.array(sky_mask_filepaths)
+        self.depth_filepaths = np.array(depth_filepaths)
         
     def load_images(self):
         images = []
@@ -379,7 +389,66 @@ class CameraData(object):
         lidar_depth_maps: Tensor,
     ):
         self.lidar_depth_maps = lidar_depth_maps.to(self.device)
+    
+    def load_depth_maps(self):
+        """
+        Load depth maps from files using depth_utils for preprocessing.
         
+        Depth maps are resized to match camera load_size (not original size).
+        Each depth map must correspond to its camera, otherwise raises error.
+        """
+        import sys
+        import os
+        # Add depth_utils path to sys.path if needed
+        depth_utils_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+            "third_party", "EVolSplat", "preprocess", "metric3d", "mono", "tools"
+        )
+        if depth_utils_path not in sys.path:
+            sys.path.insert(0, depth_utils_path)
+        
+        try:
+            from depth_utils import process_depth_for_use
+        except ImportError:
+            logger.error("Failed to import depth_utils. Please ensure depth_utils.py is available.")
+            raise
+        
+        depth_maps = []
+        target_shape = (self.load_size[0], self.load_size[1])  # (H, W) - camera load size
+        
+        for ix, depth_path in enumerate(tqdm(
+            self.depth_filepaths,
+            desc=f"Loading depth maps for camera {self.cam_id}",
+            dynamic_ncols=True,
+            total=len(self.depth_filepaths),
+        )):
+            if not os.path.exists(depth_path):
+                raise FileNotFoundError(
+                    f"Depth map not found for camera {self.cam_id}, frame {self.start_timestep + ix}: {depth_path}"
+                )
+            
+            # Load and process depth map using depth_utils
+            # target_shape is camera load_size, not original size
+            depth, metadata = process_depth_for_use(
+                depth_path,
+                target_shape=target_shape,
+                interpolation_mode='bilinear',
+            )
+            
+            # Verify depth map shape matches camera load size
+            if depth.shape != target_shape:
+                raise ValueError(
+                    f"Depth map shape mismatch for camera {self.cam_id}, frame {self.start_timestep + ix}. "
+                    f"Expected {target_shape}, got {depth.shape}. "
+                    f"Depth map must match camera load_size."
+                )
+            
+            depth_maps.append(depth)
+        
+        # Stack depth maps: [num_frames, H, W]
+        self.depth_maps = torch.from_numpy(np.stack(depth_maps, axis=0)).float().to(self.device)
+        logger.info(f"Loaded {len(depth_maps)} depth maps for camera {self.cam_id}, shape: {self.depth_maps.shape}")
+    
     def load_time(
         self,
         normalized_time: Tensor,
@@ -471,6 +540,8 @@ class CameraData(object):
             self.sky_masks = self.sky_masks.to(device)
         if self.lidar_depth_maps is not None:
             self.lidar_depth_maps = self.lidar_depth_maps.to(device)
+        if hasattr(self, 'depth_maps') and self.depth_maps is not None:
+            self.depth_maps = self.depth_maps.to(device)
         if self.image_error_maps is not None:
             self.image_error_maps = self.image_error_maps.to(device)
     
@@ -579,6 +650,24 @@ class CameraData(object):
                 )
             
         lidar_depth_map = None
+        depth_map = None
+        
+        # Priority 1: Use depth_maps (loaded from files via depth_utils)
+        if hasattr(self, 'depth_maps') and self.depth_maps is not None:
+            depth_map = self.depth_maps[frame_idx]
+            if self.downscale_factor != 1.0:
+                depth_map = (
+                    torch.nn.functional.interpolate(
+                        depth_map.unsqueeze(0).unsqueeze(0),
+                        scale_factor=self.downscale_factor,
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    .squeeze(0)
+                    .squeeze(0)
+                )
+        
+        # Priority 2: Use lidar_depth_maps (from LiDAR projection)
         if self.lidar_depth_maps is not None:
             lidar_depth_map = self.lidar_depth_maps[frame_idx]
             if self.downscale_factor != 1.0:
@@ -643,6 +732,7 @@ class CameraData(object):
             "vehicle_masks": vehicle_mask,
             "egocar_masks": egocar_mask,
             "lidar_depth_map": lidar_depth_map,
+            "depth_map": depth_map,  # Depth map loaded from files
         }
         image_infos = {k: v for k, v in _image_infos.items() if v is not None}
         

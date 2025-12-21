@@ -181,6 +181,7 @@ class NuScenesPixelSource(ScenePixelSource):
                 end_timestep=self.end_timestep,
                 load_dynamic_mask=self.data_cfg.load_dynamic_mask,
                 load_sky_mask=self.data_cfg.load_sky_mask,
+                load_depth_maps=self.data_cfg.get("load_depth_maps", False),
                 downscale_when_loading=self.data_cfg.downscale_when_loading[idx],
                 undistort=self.data_cfg.undistort,
                 buffer_downscale=self.buffer_downscale,
