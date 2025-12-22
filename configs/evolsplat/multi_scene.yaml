@@ -48,5 +48,5 @@ multi_scene:
   keyframe_split_config:
     num_splits: 0  # Number of splits (0 means auto-determine)
     min_count: 1  # Minimum number of frames in each keyframe segment
-    min_length: 0.0  # Minimum length of each keyframe segment
+    min_length: 2.0  # Minimum length of each keyframe segment
 

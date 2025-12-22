@@ -699,7 +699,7 @@ class MultiSceneDataset:
             num_segments_by_distance = max(2, int(distance_ratio * 3))  # More segments for longer distances
             num_segments = max(1, min(max_segments, num_segments_by_distance))
         
-        # 5. Group keyframes into segments based on distance
+        # 5. Group keyframes into segments based on distance with overlap
         segments = []
         segment_id = 0
         
@@ -716,48 +716,47 @@ class MultiSceneDataset:
                 'aabb': scene_aabb,
             })
         else:
-            # Multiple segments, group by cumulative distance
+            # Multiple segments with overlap
+            # Calculate segment distance and step distance
             segment_distance = total_keyframe_distance / num_segments
-            overlap_distance = segment_distance * overlap_ratio
+            # Clamp overlap_ratio to [0, 0.5] to avoid excessive overlap
+            overlap_ratio_clamped = min(overlap_ratio, 0.5)
+            step_distance = segment_distance * (1 - overlap_ratio_clamped)
             
-            current_segment_kf_indices = []
-            current_segment_frames = set()
-            segment_start_distance = 0.0
+            # Calculate how many overlapping segments we can generate
+            max_start_distance = total_keyframe_distance - segment_distance
+            if step_distance > 0:
+                num_overlap_segments = int(max_start_distance / step_distance) + 1
+            else:
+                # If step_distance is 0 (overlap_ratio = 1), only generate one segment
+                num_overlap_segments = 1
             
-            for kf_idx in range(len(keyframe_segments)):
-                kf_length = keyframe_lengths[kf_idx].item()
-                kf_center_distance = (keyframe_ranges[kf_idx, 0] + keyframe_ranges[kf_idx, 1]) / 2.0
+            # Generate overlapping segments by iterating multiple times
+            for seg_idx in range(num_overlap_segments):
+                segment_start_distance = seg_idx * step_distance
+                segment_end_distance = segment_start_distance + segment_distance
                 
-                # Check if should start new segment
-                if (len(current_segment_kf_indices) > 0 and 
-                    kf_center_distance - segment_start_distance > segment_distance + overlap_distance):
-                    # Check if current segment has enough keyframes
-                    if len(current_segment_kf_indices) >= self.min_keyframes_per_segment:
-                        segments.append({
-                            'segment_id': segment_id,
-                            'keyframe_indices': current_segment_kf_indices.copy(),
-                            'frame_indices': sorted(list(current_segment_frames)),
-                            'aabb': scene_aabb,  # Use scene AABB
-                        })
-                        segment_id += 1
+                # Collect keyframes within this segment's distance range
+                current_segment_kf_indices = []
+                current_segment_frames = set()
+                
+                for kf_idx in range(len(keyframe_segments)):
+                    kf_center_distance = (keyframe_ranges[kf_idx, 0] + keyframe_ranges[kf_idx, 1]) / 2.0
                     
-                    # Start new segment (consider overlap)
-                    segment_start_distance = kf_center_distance - overlap_distance
-                    current_segment_kf_indices = []
-                    current_segment_frames = set()
+                    # Check if keyframe is within this segment's range
+                    if segment_start_distance <= kf_center_distance < segment_end_distance:
+                        current_segment_kf_indices.append(kf_idx)
+                        current_segment_frames.update(keyframe_segments[kf_idx])
                 
-                # Add keyframe to current segment
-                current_segment_kf_indices.append(kf_idx)
-                current_segment_frames.update(keyframe_segments[kf_idx])
-            
-            # Handle last segment
-            if len(current_segment_kf_indices) >= self.min_keyframes_per_segment:
-                segments.append({
-                    'segment_id': segment_id,
-                    'keyframe_indices': current_segment_kf_indices,
-                    'frame_indices': sorted(list(current_segment_frames)),
-                    'aabb': scene_aabb,
-                })
+                # Only add segment if it has enough keyframes
+                if len(current_segment_kf_indices) >= self.min_keyframes_per_segment:
+                    segments.append({
+                        'segment_id': segment_id,
+                        'keyframe_indices': current_segment_kf_indices,
+                        'frame_indices': sorted(list(current_segment_frames)),
+                        'aabb': scene_aabb,
+                    })
+                    segment_id += 1
         
         # 6. Filter out segments with insufficient keyframes (double check)
         valid_segments = [
@@ -946,6 +945,13 @@ class MultiSceneDataset:
             'scene_id': torch.tensor([scene_id], dtype=torch.long),
             'segment_id': segment_id,
             
+            # Keyframe information for debugging/display
+            'keyframe_info': {
+                'segment_keyframes': segment['keyframe_indices'],  # All keyframes in this segment
+                'source_keyframes': source_keyframe_indices,  # Selected source keyframe indices
+                'target_keyframes': target_keyframe_indices,  # Selected target keyframe indices (includes source)
+            },
+            
             'source': {
                 'image': torch.stack(source_images, dim=0),  # [num_source_keyframes * num_cams, H, W, 3]
                 'extrinsics': torch.stack(source_extrinsics, dim=0),  # [num_source_keyframes * num_cams, 4, 4]
@@ -953,6 +959,7 @@ class MultiSceneDataset:
                 'depth': torch.stack(source_depths, dim=0),  # [num_source_keyframes * num_cams, H, W]
                 'frame_indices': torch.tensor(source_frame_idxs, dtype=torch.long),  # [num_source_keyframes * num_cams]
                 'cam_indices': torch.tensor(source_cam_idxs, dtype=torch.long),  # [num_source_keyframes * num_cams]
+                'keyframe_indices': torch.tensor(source_keyframe_indices, dtype=torch.long),  # [num_source_keyframes]
             },
             
             'target': {
@@ -962,6 +969,7 @@ class MultiSceneDataset:
                 'depth': torch.stack(target_depths, dim=0),  # [num_target_keyframes * num_cams, H, W]
                 'frame_indices': torch.tensor(target_frame_idxs, dtype=torch.long),  # [num_target_keyframes * num_cams]
                 'cam_indices': torch.tensor(target_cam_idxs, dtype=torch.long),  # [num_target_keyframes * num_cams]
+                'keyframe_indices': torch.tensor(target_keyframe_indices, dtype=torch.long),  # [num_target_keyframes]
             }
         }
         
@@ -1054,4 +1062,237 @@ class MultiSceneDataset:
         intrinsic_4x4[:3, :3] = intrinsic
         
         return intrinsic_4x4
+    
+    def create_scheduler(
+        self,
+        batches_per_segment: int = 20,
+        segment_order: str = "random",
+        scene_order: str = "random",
+        shuffle_segments: bool = True,
+        preload_next_scene: bool = True,
+    ) -> 'MultiSceneDatasetScheduler':
+        """
+        Create a scheduler instance for managing scene and segment traversal.
+        
+        Args:
+            batches_per_segment: Number of batches to iterate per segment (default 20)
+            segment_order: Segment traversal order ("random" or "sequential", default "random")
+            scene_order: Scene traversal order ("random" or "sequential", default "random")
+            shuffle_segments: Whether to shuffle segments within each scene (default True)
+            preload_next_scene: Whether to preload next scene when last segment starts (default True)
+            
+        Returns:
+            MultiSceneDatasetScheduler instance
+        """
+        return MultiSceneDatasetScheduler(
+            dataset=self,
+            batches_per_segment=batches_per_segment,
+            segment_order=segment_order,
+            scene_order=scene_order,
+            shuffle_segments=shuffle_segments,
+            preload_next_scene=preload_next_scene,
+        )
+
+
+class MultiSceneDatasetScheduler:
+    """
+    Scheduler for managing scene and segment traversal in MultiSceneDataset.
+    
+    This class manages the order of scene and segment traversal, automatically
+    switching between segments and scenes, and preloading next scenes.
+    """
+    
+    def __init__(
+        self,
+        dataset: MultiSceneDataset,
+        batches_per_segment: int = 20,
+        segment_order: str = "random",
+        scene_order: str = "random",
+        shuffle_segments: bool = True,
+        preload_next_scene: bool = True,
+    ):
+        """
+        Initialize scheduler.
+        
+        Args:
+            dataset: MultiSceneDataset instance
+            batches_per_segment: Number of batches to iterate per segment (default 20)
+            segment_order: Segment traversal order ("random" or "sequential", default "random")
+            scene_order: Scene traversal order ("random" or "sequential", default "random")
+            shuffle_segments: Whether to shuffle segments within each scene (default True)
+            preload_next_scene: Whether to preload next scene when last segment starts (default True)
+        """
+        self.dataset = dataset
+        self.batches_per_segment = batches_per_segment
+        self.segment_order = segment_order
+        self.scene_order = scene_order
+        self.shuffle_segments = shuffle_segments
+        self.preload_next_scene = preload_next_scene
+        
+        # State variables
+        self.current_scene_id: Optional[int] = None
+        self.current_segment_id: int = 0  # Index in scene_segment_order
+        self.current_batch_count: int = 0
+        self.scene_segment_order: List[int] = []  # Segment IDs in traversal order
+        
+        # Initialize scheduler state
+        self._initialize_scheduler_state()
+    
+    def _initialize_scheduler_state(self):
+        """Initialize scheduler state."""
+        # Ensure dataset is initialized
+        if not self.dataset._initialized:
+            self.dataset.initialize()
+        
+        # Get current scene
+        self.current_scene_id = self.dataset.get_current_scene_id()
+        if self.current_scene_id is None:
+            raise ValueError("No training scenes available. Please check scene IDs and configuration.")
+        
+        # Initialize segment order
+        self._initialize_segment_order()
+        
+        # Reset batch count
+        self.current_batch_count = 0
+    
+    def _initialize_segment_order(self):
+        """Initialize segment traversal order for current scene."""
+        scene_data = self.dataset.get_scene(self.current_scene_id)
+        if scene_data is None:
+            raise ValueError(f"Scene {self.current_scene_id} cannot be loaded")
+        
+        num_segments = len(scene_data['segments'])
+        if num_segments == 0:
+            raise ValueError(f"Scene {self.current_scene_id} has no valid segments")
+        
+        # Create segment order
+        if self.segment_order == "random":
+            self.scene_segment_order = list(range(num_segments))
+            if self.shuffle_segments:
+                random.shuffle(self.scene_segment_order)
+        elif self.segment_order == "sequential":
+            self.scene_segment_order = list(range(num_segments))
+        else:
+            raise ValueError(f"Invalid segment_order: {self.segment_order}. Must be 'random' or 'sequential'")
+    
+    def _switch_to_next_segment(self):
+        """Switch to next segment."""
+        self.current_batch_count = 0
+        self.current_segment_id += 1
+        
+        # Check if we've finished all segments in current scene
+        scene_data = self.dataset.get_scene(self.current_scene_id)
+        if scene_data is None:
+            raise ValueError(f"Scene {self.current_scene_id} cannot be loaded")
+        
+        if self.current_segment_id >= len(self.scene_segment_order):
+            # All segments in current scene are done, switch to next scene
+            self._switch_to_next_scene()
+            # Reinitialize segment order for new scene
+            self._initialize_segment_order()
+            self.current_segment_id = 0
+    
+    def _switch_to_next_scene(self):
+        """Switch to next scene."""
+        # Mark current scene as completed
+        if self.current_scene_id is not None:
+            self.dataset.mark_scene_completed(self.current_scene_id)
+        
+        # Get next scene
+        self.current_scene_id = self.dataset.get_current_scene_id()
+        if self.current_scene_id is None:
+            raise StopIteration("All scenes have been processed")
+        
+        # Ensure next scene is loaded
+        scene_data = self.dataset._ensure_scene_loaded(self.current_scene_id)
+        if scene_data is None:
+            raise ValueError(f"Next scene {self.current_scene_id} cannot be loaded")
+    
+    def _preload_next_scene_if_needed(self):
+        """Preload next scene if we're starting the last segment."""
+        scene_data = self.dataset.get_scene(self.current_scene_id)
+        if scene_data is None:
+            return
+        
+        # Check if current segment is the last one
+        is_last_segment = (self.current_segment_id == len(self.scene_segment_order) - 1)
+        
+        if is_last_segment and self.preload_next_scene:
+            # Get next scene ID from queue
+            current_scene_index = self.dataset.scene_training_queue.index(self.current_scene_id)
+            next_scene_index = current_scene_index + 1
+            
+            if next_scene_index < len(self.dataset.scene_training_queue):
+                next_scene_id = self.dataset.scene_training_queue[next_scene_index]
+                # Preload next scene
+                self.dataset._ensure_scene_loaded(next_scene_id)
+    
+    def next_batch(self) -> Dict:
+        """
+        Get next training batch.
+        
+        Automatically manages:
+        1. Batch count within current segment
+        2. Segment switching (when batches_per_segment is reached)
+        3. Scene switching (when all segments are done)
+        4. Scene preloading (when last segment starts)
+        
+        Returns:
+            Batch dictionary (same format as get_segment_batch())
+            
+        Raises:
+            StopIteration: When all scenes have been processed
+        """
+        # Check if we need to switch to next segment
+        if self.current_batch_count >= self.batches_per_segment:
+            self._switch_to_next_segment()
+        
+        # Preload next scene if needed (when starting last segment)
+        if self.current_batch_count == 0:
+            self._preload_next_scene_if_needed()
+        
+        # Get current segment ID from order
+        segment_id = self.scene_segment_order[self.current_segment_id]
+        
+        # Get batch
+        batch = self.dataset.get_segment_batch(self.current_scene_id, segment_id)
+        
+        # Increment batch count
+        self.current_batch_count += 1
+        
+        return batch
+    
+    def reset(self):
+        """Reset scheduler state."""
+        self.current_scene_id = None
+        self.current_segment_id = 0
+        self.current_batch_count = 0
+        self.scene_segment_order = []
+        self._initialize_scheduler_state()
+    
+    def get_current_info(self) -> Dict:
+        """
+        Get current scheduler state information.
+        
+        Returns:
+            Dict containing:
+                - 'scene_id': Current scene ID
+                - 'segment_id': Current segment ID (in scene_segment_order)
+                - 'segment_id_in_scene': Actual segment ID in scene
+                - 'batch_count': Current batch count within segment
+                - 'batches_per_segment': Number of batches per segment
+        """
+        segment_id_in_scene = (
+            self.scene_segment_order[self.current_segment_id]
+            if self.current_segment_id < len(self.scene_segment_order)
+            else None
+        )
+        
+        return {
+            'scene_id': self.current_scene_id,
+            'segment_id': self.current_segment_id,
+            'segment_id_in_scene': segment_id_in_scene,
+            'batch_count': self.current_batch_count,
+            'batches_per_segment': self.batches_per_segment,
+        }
 

@@ -43,13 +43,13 @@
 
 **Source**：
 - 用于特征提取的图像集合
-- 每次使用 3 个关键帧，每个关键帧选择 1 帧
-- 共 3 帧 × 6 相机 = 18 张图像
+- 每次使用 `num_source_keyframes` 个关键帧（默认 3），每个关键帧选择 1 帧
+- 共 `num_source_keyframes × num_cams` 张图像（相机数量是动态的，从场景数据中获取）
 
 **Target**：
 - 用于监督学习的图像集合
-- 包含 source 的 3 帧 + 另外 3 个关键帧（每个关键帧选择 1 帧）
-- 共 6 帧 × 6 相机 = 36 张图像
+- 包含 source 的所有关键帧 + 另外 `(num_target_keyframes - num_source_keyframes)` 个关键帧（每个关键帧选择 1 帧）
+- 共 `num_target_keyframes × num_cams` 张图像
 - **注意**：Target 包含 source，不要求独立
 
 ---
@@ -78,8 +78,11 @@ class MultiSceneDataset:
         num_source_keyframes: int = 3,
         num_target_keyframes: int = 6,  # 包含 source 的 3 帧 + 另外 3 帧
         segment_overlap_ratio: float = 0.2,  # 段与段之间的重叠比例
-        keyframe_split_config: Dict = None,  # 关键帧分割配置
+        keyframe_split_config: Optional[Dict] = None,  # 关键帧分割配置
+        min_keyframes_per_scene: int = 10,  # 场景的最小关键帧数量
+        min_keyframes_per_segment: int = 6,  # 段的最小关键帧数量
         device: torch.device = torch.device("cpu"),
+        preload_scene_count: int = 3,  # 预加载场景数量
     ):
         """
         Args:
@@ -96,6 +99,35 @@ class MultiSceneDataset:
             min_keyframes_per_scene: 场景的最小关键帧数量，不满足则跳过（默认10）
             min_keyframes_per_segment: 段的最小关键帧数量，不满足则跳过（默认6）
             device: 设备（默认CPU）
+            preload_scene_count: 预加载场景数量（默认3），用于控制内存占用
+        """
+        pass
+    
+    def initialize(self):
+        """
+        初始化训练队列和预加载初始场景。
+        
+        此方法：
+        1. 初始化训练队列（验证并添加初始场景）
+        2. 预加载初始场景
+        
+        这是可选的 - 数据集会在第一次使用时自动初始化，
+        但显式调用此方法可以提前检测错误。
+        """
+        pass
+    
+    def mark_scene_completed(self, scene_id: int):
+        """
+        标记场景训练完成并切换到下一个场景。
+        
+        此方法：
+        1. 验证 scene_id 是否匹配当前场景
+        2. 切换到队列中的下一个场景
+        3. 卸载已完成的场景
+        4. 预加载下一个场景（如果可用）
+        
+        Args:
+            scene_id: 已完成的场景ID
         """
         pass
     
@@ -132,22 +164,37 @@ class MultiSceneDataset:
             Dict包含：
                 - 'scene_id': Tensor[1] - 场景ID
                 - 'segment_id': int - 段ID
+                - 'keyframe_info': Dict - 关键帧信息（用于调试/显示）
+                    - 'segment_keyframes': List[int] - 段内所有关键帧索引
+                    - 'source_keyframes': List[int] - 选择的source关键帧索引
+                    - 'target_keyframes': List[int] - 选择的target关键帧索引（包含source）
                 - 'source': {
-                    'image': Tensor[18, H, W, 3],  # 3帧 × 6相机
-                    'extrinsics': Tensor[18, 4, 4],
-                    'intrinsics': Tensor[18, 4, 4],
-                    'depth': Tensor[18, H, W],
-                    'frame_indices': Tensor[18],  # 帧索引
-                    'cam_indices': Tensor[18],    # 相机索引
+                    'image': Tensor[num_source_keyframes * num_cams, H, W, 3],
+                    'extrinsics': Tensor[num_source_keyframes * num_cams, 4, 4],
+                    'intrinsics': Tensor[num_source_keyframes * num_cams, 4, 4],
+                    'depth': Tensor[num_source_keyframes * num_cams, H, W],
+                    'frame_indices': Tensor[num_source_keyframes * num_cams],  # 帧索引
+                    'cam_indices': Tensor[num_source_keyframes * num_cams],    # 相机索引
+                    'keyframe_indices': Tensor[num_source_keyframes],  # 关键帧索引
                 }
                 - 'target': {
-                    'image': Tensor[36, H, W, 3],  # 6帧 × 6相机
-                    'extrinsics': Tensor[36, 4, 4],
-                    'intrinsics': Tensor[36, 4, 4],
-                    'depth': Tensor[36, H, W],
-                    'frame_indices': Tensor[36],
-                    'cam_indices': Tensor[36],
+                    'image': Tensor[num_target_keyframes * num_cams, H, W, 3],
+                    'extrinsics': Tensor[num_target_keyframes * num_cams, 4, 4],
+                    'intrinsics': Tensor[num_target_keyframes * num_cams, 4, 4],
+                    'depth': Tensor[num_target_keyframes * num_cams, H, W],
+                    'frame_indices': Tensor[num_target_keyframes * num_cams],
+                    'cam_indices': Tensor[num_target_keyframes * num_cams],
+                    'keyframe_indices': Tensor[num_target_keyframes],  # 关键帧索引
                 }
+        """
+        pass
+    
+    def get_current_scene_id(self) -> Optional[int]:
+        """
+        获取当前训练场景ID。
+        
+        Returns:
+            当前场景ID或None（如果没有可用场景）
         """
         pass
     
@@ -159,6 +206,100 @@ class MultiSceneDataset:
             与 get_segment_batch() 相同的格式
         """
         pass
+    
+    def create_scheduler(
+        self,
+        batches_per_segment: int = 20,
+        segment_order: str = "random",
+        scene_order: str = "random",
+        shuffle_segments: bool = True,
+        preload_next_scene: bool = True,
+    ) -> 'MultiSceneDatasetScheduler':
+        """
+        创建调度器实例，用于管理场景和段的遍历顺序。
+        
+        Args:
+            batches_per_segment: 每个段遍历的batch数量（默认20）
+            segment_order: 段遍历顺序（"random"或"sequential"，默认"random"）
+            scene_order: 场景遍历顺序（"random"或"sequential"，默认"random"）
+            shuffle_segments: 是否在每个场景内打乱段顺序（默认True）
+            preload_next_scene: 是否在最后一个段开始训练时预加载下一个场景（默认True）
+            
+        Returns:
+            MultiSceneDatasetScheduler实例
+        """
+        pass
+```
+
+### MultiSceneDatasetScheduler
+
+```python
+class MultiSceneDatasetScheduler:
+    """
+    调度器类，用于管理场景和段的遍历顺序。
+    
+    核心功能：
+    1. 管理段内batch计数
+    2. 自动切换段（当达到batches_per_segment时）
+    3. 自动切换场景（当所有段遍历完成时）
+    4. 预加载下一个场景（在最后一个段开始训练时）
+    """
+    
+    def __init__(
+        self,
+        dataset: MultiSceneDataset,
+        batches_per_segment: int = 20,
+        segment_order: str = "random",
+        scene_order: str = "random",
+        shuffle_segments: bool = True,
+        preload_next_scene: bool = True,
+    ):
+        """
+        Args:
+            dataset: MultiSceneDataset实例
+            batches_per_segment: 每个段遍历的batch数量（默认20）
+            segment_order: 段遍历顺序（"random"或"sequential"，默认"random"）
+            scene_order: 场景遍历顺序（"random"或"sequential"，默认"random"）
+            shuffle_segments: 是否在每个场景内打乱段顺序（默认True）
+            preload_next_scene: 是否在最后一个段开始训练时预加载下一个场景（默认True）
+        """
+        pass
+    
+    def next_batch(self) -> Dict:
+        """
+        获取下一个训练batch。
+        
+        自动管理：
+        1. 段内batch计数
+        2. 段切换（当达到batches_per_segment时）
+        3. 场景切换（当所有段遍历完成时）
+        4. 场景预加载（当最后一个段开始训练时）
+        
+        Returns:
+            与 get_segment_batch() 相同的格式
+            
+        Raises:
+            StopIteration: 当所有场景都已处理完成时
+        """
+        pass
+    
+    def reset(self):
+        """重置调度器状态"""
+        pass
+    
+    def get_current_info(self) -> Dict:
+        """
+        获取当前调度器状态信息。
+        
+        Returns:
+            Dict包含：
+                - 'scene_id': 当前场景ID
+                - 'segment_id': 当前段ID（在scene_segment_order中的索引）
+                - 'segment_id_in_scene': 场景内的实际段ID
+                - 'batch_count': 当前段内的batch计数
+                - 'batches_per_segment': 每个段的batch数量
+        """
+        pass
 ```
 
 ---
@@ -166,6 +307,8 @@ class MultiSceneDataset:
 ## 实现细节
 
 ### 1. 初始化流程
+
+**延迟加载机制**：数据集采用延迟加载和预加载机制，不在初始化时加载所有场景，而是按需加载，以节省内存。
 
 ```python
 def __init__(self, ...):
@@ -186,33 +329,151 @@ def __init__(self, ...):
     }
     self.min_keyframes_per_scene = min_keyframes_per_scene
     self.min_keyframes_per_segment = min_keyframes_per_segment
+    self.preload_scene_count = preload_scene_count
     
-    # 3. 加载所有训练场景（跳过不适合的场景）
-    self.train_scenes = {}
-    for scene_id in train_scene_ids:
-        scene_data = self._load_scene(scene_id)
-        if scene_data is not None:  # 场景适合训练
-            self.train_scenes[scene_id] = scene_data
-        else:
-            logger.warning(f"Skipping training scene {scene_id} (not suitable)")
+    # 3. 初始化场景候选池（未验证的场景ID）
+    self.scene_candidate_pool = train_scene_ids.copy()
+    random.shuffle(self.scene_candidate_pool)  # 打乱以增加随机性
     
-    # 4. 加载所有评估场景（跳过不适合的场景）
+    # 4. 初始化训练队列（已验证的场景ID，按训练顺序）
+    self.scene_training_queue = []
+    
+    # 5. 初始化场景缓存（已加载的场景数据，最多 preload_scene_count + 1 个场景）
+    self.train_scenes_cache = {}
+    
+    # 6. 初始化评估场景（按需加载，可以保留所有）
     self.eval_scenes = {}
-    for scene_id in eval_scene_ids:
-        scene_data = self._load_scene(scene_id)
-        if scene_data is not None:  # 场景适合评估
-            self.eval_scenes[scene_id] = scene_data
-        else:
-            logger.warning(f"Skipping eval scene {scene_id} (not suitable)")
     
-    # 5. 构建场景到段的映射
-    self._build_segment_mapping()
+    # 7. 初始化当前场景索引
+    self.current_scene_index = 0
+    
+    # 8. 初始化无效场景ID集合（已验证但不适合的场景）
+    self.invalid_scene_ids = set()
+    
+    # 9. 跟踪是否已初始化
+    self._initialized = False
+
+def initialize(self):
+    """
+    初始化训练队列和预加载初始场景。
+    
+    此方法：
+    1. 初始化训练队列（验证并添加初始场景）
+    2. 预加载初始场景
+    
+    这是可选的 - 数据集会在第一次使用时自动初始化，
+    但显式调用此方法可以提前检测错误。
+    """
+    if self._initialized:
+        return
+    
+    # 确保训练队列有足够的场景
+    self._ensure_training_queue_ready()
+    
+    if len(self.scene_training_queue) == 0:
+        logger.warning("No valid training scenes found after validation")
+        return
+    
+    # 预加载初始场景
+    self._preload_scenes()
+    
+    self._initialized = True
 ```
 
-### 2. 场景加载
+**场景管理机制**：
+- **候选池 (scene_candidate_pool)**：未验证的场景ID列表，用于填充训练队列
+- **训练队列 (scene_training_queue)**：已验证且适合训练的场景ID列表，按训练顺序排列
+- **场景缓存 (train_scenes_cache)**：已加载的场景数据，最多保留 `preload_scene_count + 1` 个场景
+- **评估场景 (eval_scenes)**：评估场景数据，按需加载，可以保留所有
+- **无效场景集合 (invalid_scene_ids)**：已验证但不适合训练的场景ID集合
+
+**场景生命周期管理**：
+1. **场景验证**：`_validate_and_add_to_queue()` 方法验证场景是否适合训练
+   - 加载场景并检查关键帧数量
+   - 如果适合，添加到训练队列
+   - 如果不适合，标记为无效场景
+2. **队列维护**：`_ensure_training_queue_ready()` 方法确保训练队列有足够的场景
+   - 目标队列大小：`preload_scene_count + 1`
+   - 从候选池中验证并添加场景
+   - 如果候选池为空，从原始场景ID中重新填充
+3. **场景预加载**：`_preload_scenes()` 方法预加载即将使用的场景
+   - 加载当前场景（如果未加载）
+   - 预加载接下来的 `preload_scene_count` 个场景
+   - 如果场景加载失败，从队列中移除
+4. **场景切换**：`_switch_to_next_scene()` 和 `mark_scene_completed()` 方法管理场景切换
+   - 卸载当前场景
+   - 更新当前场景索引
+   - 确保队列有足够的场景
+   - 预加载下一个场景
+
+### 2. 场景加载和验证
+
+**场景验证流程**：
+```python
+def _validate_and_add_to_queue(self, scene_id: int) -> bool:
+    """
+    验证场景并添加到训练队列（如果适合）。
+    
+    此方法执行轻量级验证，通过加载场景并检查是否适合。
+    如果适合，添加到队列。
+    
+    Args:
+        scene_id: 要验证的场景ID
+        
+    Returns:
+        bool: True 如果场景适合并已添加到队列，False 否则
+    """
+    # 跳过如果已在队列中或无效
+    if scene_id in self.scene_training_queue:
+        return True
+    if scene_id in self.invalid_scene_ids:
+        return False
+    
+    # 尝试加载并准备场景（这会进行完整验证）
+    scene_data = self._load_and_prepare_scene(scene_id)
+    
+    if scene_data is not None:
+        # 场景适合，添加到队列
+        self.scene_training_queue.append(scene_id)
+        # 不保留在缓存中，将在需要时加载
+        # 清理加载的数据以节省内存
+        if 'dataset' in scene_data:
+            dataset = scene_data['dataset']
+            if hasattr(dataset, 'cleanup'):
+                dataset.cleanup()
+            if hasattr(dataset, 'pixel_source') and hasattr(dataset.pixel_source, 'cleanup'):
+                dataset.pixel_source.cleanup()
+        del scene_data
+        return True
+    else:
+        # 场景不适合，标记为无效
+        self.invalid_scene_ids.add(scene_id)
+        return False
+```
+
+**场景加载流程**：
 
 ```python
-def _load_scene(self, scene_id: int) -> Dict:
+def _load_and_prepare_scene(self, scene_id: int) -> Optional[Dict]:
+    """
+    加载场景并完成所有预处理。
+    
+    此方法加载场景并执行所有必要的预处理：
+    - 场景加载（DrivingDataset）
+    - 轨迹提取
+    - 关键帧分割
+    - 场景适合性检查
+    - 段分割
+    
+    Args:
+        scene_id: 要加载的场景ID
+        
+    Returns:
+        场景数据字典或None（如果场景不适合）
+    """
+    return self._load_scene(scene_id)
+
+def _load_scene(self, scene_id: int) -> Optional[Dict]:
     """
     加载单个场景的数据。
     
@@ -391,9 +652,13 @@ def _split_segments(
         # 根据关键帧数量和距离确定段数
         # 每个段至少需要 min_keyframes_per_segment 个关键帧
         max_segments = len(keyframe_segments) // self.min_keyframes_per_segment
-        num_segments = max(1, min(max_segments, int(total_keyframe_distance / aabb_length * 2)))
+        # 使用更激进的公式：如果距离接近AABB长度，创建更多段
+        # 按距离比例缩放，如果距离 >= 0.3 * aabb_length，至少创建2个段
+        distance_ratio = total_keyframe_distance / aabb_length
+        num_segments_by_distance = max(2, int(distance_ratio * 3))  # 更长距离创建更多段
+        num_segments = max(1, min(max_segments, num_segments_by_distance))
     
-    # 5. 将关键帧按照距离分组为段
+    # 5. 将关键帧按照距离分组为段（支持重叠）
     segments = []
     segment_id = 0
     
@@ -410,49 +675,47 @@ def _split_segments(
             'aabb': scene_aabb,
         })
     else:
-        # 多个段，按照累积距离分组
+        # 多个段，支持重叠
+        # 计算段长度和步长
         segment_distance = total_keyframe_distance / num_segments
-        overlap_distance = segment_distance * overlap_ratio
+        # 限制overlap_ratio最大为0.5，避免过度重叠
+        overlap_ratio_clamped = min(overlap_ratio, 0.5)
+        step_distance = segment_distance * (1 - overlap_ratio_clamped)
         
-        current_segment_kf_indices = []
-        current_segment_frames = set()
-        current_distance = 0.0
-        segment_start_distance = 0.0
+        # 计算可以生成多少个重叠段
+        max_start_distance = total_keyframe_distance - segment_distance
+        if step_distance > 0:
+            num_overlap_segments = int(max_start_distance / step_distance) + 1
+        else:
+            # 如果step_distance为0（overlap_ratio = 1），只生成一个段
+            num_overlap_segments = 1
         
-        for kf_idx in range(len(keyframe_segments)):
-            kf_length = keyframe_lengths[kf_idx].item()
-            kf_center_distance = (keyframe_ranges[kf_idx, 0] + keyframe_ranges[kf_idx, 1]) / 2.0
+        # 多次遍历，生成重叠段
+        for seg_idx in range(num_overlap_segments):
+            segment_start_distance = seg_idx * step_distance
+            segment_end_distance = segment_start_distance + segment_distance
             
-            # 检查是否应该开始新段
-            if (len(current_segment_kf_indices) > 0 and 
-                kf_center_distance - segment_start_distance > segment_distance + overlap_distance):
-                # 当前段的关键帧数量是否足够
-                if len(current_segment_kf_indices) >= self.min_keyframes_per_segment:
-                    segments.append({
-                        'segment_id': segment_id,
-                        'keyframe_indices': current_segment_kf_indices.copy(),
-                        'frame_indices': sorted(list(current_segment_frames)),
-                        'aabb': scene_aabb,  # 使用场景 AABB
-                    })
-                    segment_id += 1
+            # 收集该段内的keyframe
+            current_segment_kf_indices = []
+            current_segment_frames = set()
+            
+            for kf_idx in range(len(keyframe_segments)):
+                kf_center_distance = (keyframe_ranges[kf_idx, 0] + keyframe_ranges[kf_idx, 1]) / 2.0
                 
-                # 开始新段（考虑重叠）
-                segment_start_distance = kf_center_distance - overlap_distance
-                current_segment_kf_indices = []
-                current_segment_frames = set()
+                # 检查keyframe是否在该段的距离范围内
+                if segment_start_distance <= kf_center_distance < segment_end_distance:
+                    current_segment_kf_indices.append(kf_idx)
+                    current_segment_frames.update(keyframe_segments[kf_idx])
             
-            # 将关键帧添加到当前段
-            current_segment_kf_indices.append(kf_idx)
-            current_segment_frames.update(keyframe_segments[kf_idx])
-        
-        # 处理最后一个段
-        if len(current_segment_kf_indices) >= self.min_keyframes_per_segment:
-            segments.append({
-                'segment_id': segment_id,
-                'keyframe_indices': current_segment_kf_indices,
-                'frame_indices': sorted(list(current_segment_frames)),
-                'aabb': scene_aabb,
-            })
+            # 只添加关键帧数量足够的段
+            if len(current_segment_kf_indices) >= self.min_keyframes_per_segment:
+                segments.append({
+                    'segment_id': segment_id,
+                    'keyframe_indices': current_segment_kf_indices,
+                    'frame_indices': sorted(list(current_segment_frames)),
+                    'aabb': scene_aabb,
+                })
+                segment_id += 1
     
     # 6. 过滤掉关键帧数量不足的段（双重检查）
     valid_segments = [
@@ -500,7 +763,11 @@ def _select_source_and_target_keyframes(
     # 从剩余关键帧中选择额外的 target 关键帧
     remaining_keyframes = [kf for kf in available_keyframes if kf not in source_keyframe_indices]
     
-    if len(remaining_keyframes) < num_extra_target_keyframes:
+    if len(remaining_keyframes) == 0:
+        # 所有关键帧都被选为source，重复使用source关键帧作为target
+        extra_target_keyframes = source_keyframe_indices * (num_extra_target_keyframes // len(source_keyframe_indices) + 1)
+        extra_target_keyframes = extra_target_keyframes[:num_extra_target_keyframes]
+    elif len(remaining_keyframes) < num_extra_target_keyframes:
         # 如果剩余关键帧不足，重复使用
         extra_target_keyframes = remaining_keyframes * (num_extra_target_keyframes // len(remaining_keyframes) + 1)
         extra_target_keyframes = extra_target_keyframes[:num_extra_target_keyframes]
@@ -539,7 +806,87 @@ def _select_frame_from_keyframe(
     return frame_idx
 ```
 
-### 7. 批次打包
+### 7. 场景缓存管理
+
+**场景缓存策略**：
+```python
+def _ensure_scene_loaded(self, scene_id: int) -> Optional[Dict]:
+    """
+    确保指定场景已加载到缓存中。
+    
+    如果场景已在缓存中，返回它。
+    如果不在，使用 _load_and_prepare_scene 加载它。
+    如果缓存已满，卸载一个非当前场景。
+    
+    Args:
+        scene_id: 要确保加载的场景ID
+        
+    Returns:
+        场景数据字典或None（如果场景无法加载）
+    """
+    # 检查是否已在缓存中
+    if scene_id in self.train_scenes_cache:
+        return self.train_scenes_cache[scene_id]
+    
+    # 检查是否是评估场景
+    if scene_id in self.eval_scene_ids:
+        if scene_id not in self.eval_scenes:
+            # 加载评估场景
+            scene_data = self._load_and_prepare_scene(scene_id)
+            if scene_data is not None:
+                self.eval_scenes[scene_id] = scene_data
+            else:
+                return None
+        return self.eval_scenes[scene_id]
+    
+    # 是训练场景，检查缓存大小
+    max_cache_size = self.preload_scene_count + 1
+    
+    # 如果缓存已满，卸载一个非当前场景
+    if len(self.train_scenes_cache) >= max_cache_size:
+        # 找到一个要卸载的场景（优先非当前场景）
+        current_scene_id = self.get_current_scene_id()
+        for cached_scene_id in list(self.train_scenes_cache.keys()):
+            if cached_scene_id != current_scene_id:
+                self._unload_scene(cached_scene_id)
+                break
+        # 如果仍然满，卸载任何场景
+        if len(self.train_scenes_cache) >= max_cache_size:
+            scene_to_unload = list(self.train_scenes_cache.keys())[0]
+            self._unload_scene(scene_to_unload)
+    
+    # 加载场景
+    scene_data = self._load_and_prepare_scene(scene_id)
+    if scene_data is not None:
+        self.train_scenes_cache[scene_id] = scene_data
+        return scene_data
+    else:
+        return None
+
+def _unload_scene(self, scene_id: int):
+    """
+    从缓存中卸载场景并释放内存。
+    
+    Args:
+        scene_id: 要卸载的场景ID
+    """
+    if scene_id in self.train_scenes_cache:
+        scene_data = self.train_scenes_cache[scene_id]
+        
+        # 清理数据集资源（如果它有清理方法）
+        if 'dataset' in scene_data:
+            dataset = scene_data['dataset']
+            if hasattr(dataset, 'cleanup'):
+                dataset.cleanup()
+            if hasattr(dataset, 'pixel_source') and hasattr(dataset.pixel_source, 'cleanup'):
+                dataset.pixel_source.cleanup()
+        
+        # 从缓存中移除
+        del self.train_scenes_cache[scene_id]
+        logger.info(f"Scene {scene_id} unloaded from cache")
+```
+
+### 8. 批次打包
 
 ```python
 def get_segment_batch(
@@ -599,7 +946,7 @@ def get_segment_batch(
             # 获取深度图
             depth = self._get_depth(scene_dataset, frame_idx, cam_idx)
             if depth is None:
-                # 如果深度图不存在，创建占位符
+                # 如果深度图不存在，创建占位符（值为10.0）
                 H, W = image_infos['pixels'].shape[:2]
                 depth = torch.ones(H, W, dtype=torch.float32, device=self.device) * 10.0
             source_depths.append(depth)
@@ -629,7 +976,7 @@ def get_segment_batch(
             
             depth = self._get_depth(scene_dataset, frame_idx, cam_idx)
             if depth is None:
-                # 如果深度图不存在，创建占位符
+                # 如果深度图不存在，创建占位符（值为10.0）
                 H, W = image_infos['pixels'].shape[:2]
                 depth = torch.ones(H, W, dtype=torch.float32, device=self.device) * 10.0
             target_depths.append(depth)
@@ -642,22 +989,31 @@ def get_segment_batch(
         'scene_id': torch.tensor([scene_id], dtype=torch.long),
         'segment_id': segment_id,
         
+        # 关键帧信息（用于调试/显示）
+        'keyframe_info': {
+            'segment_keyframes': segment['keyframe_indices'],  # 段内所有关键帧
+            'source_keyframes': source_keyframe_indices,  # 选择的source关键帧索引
+            'target_keyframes': target_keyframe_indices,  # 选择的target关键帧索引（包含source）
+        },
+        
         'source': {
-            'image': torch.stack(source_images, dim=0),  # [18, H, W, 3]
-            'extrinsics': torch.stack(source_extrinsics, dim=0),  # [18, 4, 4]
-            'intrinsics': torch.stack(source_intrinsics, dim=0),  # [18, 4, 4]
-            'depth': torch.stack(source_depths, dim=0),  # [18, H, W]
-            'frame_indices': torch.tensor(source_frame_idxs, dtype=torch.long),  # [18]
-            'cam_indices': torch.tensor(source_cam_idxs, dtype=torch.long),  # [18]
+            'image': torch.stack(source_images, dim=0),  # [num_source_keyframes * num_cams, H, W, 3]
+            'extrinsics': torch.stack(source_extrinsics, dim=0),  # [num_source_keyframes * num_cams, 4, 4]
+            'intrinsics': torch.stack(source_intrinsics, dim=0),  # [num_source_keyframes * num_cams, 4, 4]
+            'depth': torch.stack(source_depths, dim=0),  # [num_source_keyframes * num_cams, H, W]
+            'frame_indices': torch.tensor(source_frame_idxs, dtype=torch.long),  # [num_source_keyframes * num_cams]
+            'cam_indices': torch.tensor(source_cam_idxs, dtype=torch.long),  # [num_source_keyframes * num_cams]
+            'keyframe_indices': torch.tensor(source_keyframe_indices, dtype=torch.long),  # [num_source_keyframes]
         },
         
         'target': {
-            'image': torch.stack(target_images, dim=0),  # [36, H, W, 3]
-            'extrinsics': torch.stack(target_extrinsics, dim=0),  # [36, 4, 4]
-            'intrinsics': torch.stack(target_intrinsics, dim=0),  # [36, 4, 4]
-            'depth': torch.stack(target_depths, dim=0),  # [36, H, W]
-            'frame_indices': torch.tensor(target_frame_idxs, dtype=torch.long),  # [36]
-            'cam_indices': torch.tensor(target_cam_idxs, dtype=torch.long),  # [36]
+            'image': torch.stack(target_images, dim=0),  # [num_target_keyframes * num_cams, H, W, 3]
+            'extrinsics': torch.stack(target_extrinsics, dim=0),  # [num_target_keyframes * num_cams, 4, 4]
+            'intrinsics': torch.stack(target_intrinsics, dim=0),  # [num_target_keyframes * num_cams, 4, 4]
+            'depth': torch.stack(target_depths, dim=0),  # [num_target_keyframes * num_cams, H, W]
+            'frame_indices': torch.tensor(target_frame_idxs, dtype=torch.long),  # [num_target_keyframes * num_cams]
+            'cam_indices': torch.tensor(target_cam_idxs, dtype=torch.long),  # [num_target_keyframes * num_cams]
+            'keyframe_indices': torch.tensor(target_keyframe_indices, dtype=torch.long),  # [num_target_keyframes]
         }
     }
     
@@ -672,50 +1028,30 @@ def _get_depth(
     """
     获取指定帧和相机的深度图。
     
-    优先从 DrivingDataset 的 lidar_depth_maps 获取，
-    如果不存在，尝试从文件直接加载。
+    优先级：
+    1. 从 camera_data.depth_maps 获取（从文件加载的深度图）
+    2. 从 camera_data.lidar_depth_maps 获取（从LiDAR投影得到的深度图）
+    3. 如果都不存在，返回None（调用者会创建占位符，值为10.0）
     
     Returns:
         depth: Tensor[H, W] 或 None
     """
-    # 方法1：从 DrivingDataset 的 lidar_depth_maps 获取
     try:
         pixel_source = scene_dataset.pixel_source
         cam_id = pixel_source.camera_list[cam_idx]
         camera_data = pixel_source.camera_data[cam_id]
         
+        # 方法1：从 depth_maps 获取（从文件加载）
+        if hasattr(camera_data, 'depth_maps') and camera_data.depth_maps is not None:
+            depth = camera_data.depth_maps[frame_idx]  # Tensor[H, W]
+            return depth.to(self.device)
+        
+        # 方法2：从 lidar_depth_maps 获取（从LiDAR投影）
         if camera_data.lidar_depth_maps is not None:
             depth = camera_data.lidar_depth_maps[frame_idx]  # Tensor[H, W]
-            return depth
-    except (IndexError, KeyError, AttributeError):
-        pass
-    
-    # 方法2：从文件直接加载（根据 Drivestudio 场景文件夹结构）
-    try:
-        scene_dir = scene_dataset.data_path
-        depth_file = os.path.join(
-            scene_dir,
-            'depth',
-            f'{frame_idx:03d}_{cam_idx}.npy'
-        )
-        
-        if os.path.exists(depth_file):
-            depth = np.load(depth_file)
-            
-            # 获取目标尺寸
-            img_idx = frame_idx * scene_dataset.num_cams + cam_idx
-            _, cam_infos = scene_dataset.pixel_source.get_image(img_idx)
-            H, W = cam_infos['height'].item(), cam_infos['width'].item()
-            
-            # 如果深度图尺寸不匹配，进行插值
-            if depth.shape != (H, W):
-                import cv2
-                depth = cv2.resize(depth, (W, H), interpolation=cv2.INTER_LINEAR)
-            
-            depth = torch.from_numpy(depth).float().to(self.device)
-            return depth
-    except (FileNotFoundError, OSError, ValueError):
-        pass
+            return depth.to(self.device)
+    except (IndexError, KeyError, AttributeError) as e:
+        logger.warning(f"Failed to get depth map for camera {cam_idx}, frame {frame_idx}: {e}")
     
     return None
 
@@ -820,10 +1156,11 @@ def split_trajectory(trajectory, num_splits=0, min_count=1, min_length=0):
 
 ### 2. Source 和 Target 数量检查
 
-- [ ] **Source 图像数量**：`num_source_keyframes * num_cams = 3 * 6 = 18`
-- [ ] **Target 图像数量**：`num_target_keyframes * num_cams = 6 * 6 = 36`
+- [ ] **Source 图像数量**：`num_source_keyframes * num_cams`（相机数量是动态的，从场景数据中获取）
+- [ ] **Target 图像数量**：`num_target_keyframes * num_cams`
 - [ ] **Target 包含 Source**：Target 的关键帧列表包含 Source 的所有关键帧
 - [ ] **关键帧选择不重复**：Source 和额外的 Target 关键帧不重复（但 Target 包含 Source）
+- [ ] **批次包含 keyframe_info**：批次中包含 `keyframe_info` 字段，用于调试和显示
 
 ### 3. 关键帧和段的关系检查
 
@@ -858,9 +1195,10 @@ def split_trajectory(trajectory, num_splits=0, min_count=1, min_length=0):
 ### 7. 批次格式检查
 
 - [ ] **批次格式符合 EVolSplat 要求**：包含 scene_id, source, target
-- [ ] **Source 维度正确**：`[18, H, W, 3]` 或 `[num_source_keyframes * num_cams, H, W, 3]`
-- [ ] **Target 维度正确**：`[36, H, W, 3]` 或 `[num_target_keyframes * num_cams, H, W, 3]`
-- [ ] **包含元数据**：frame_indices, cam_indices 等信息正确
+- [ ] **Source 维度正确**：`[num_source_keyframes * num_cams, H, W, 3]`
+- [ ] **Target 维度正确**：`[num_target_keyframes * num_cams, H, W, 3]`
+- [ ] **包含元数据**：frame_indices, cam_indices, keyframe_indices 等信息正确
+- [ ] **包含 keyframe_info**：批次中包含 keyframe_info 字段，包含段内所有关键帧、source关键帧、target关键帧信息
 
 ### 8. 轨迹获取检查
 
@@ -879,6 +1217,17 @@ def split_trajectory(trajectory, num_splits=0, min_count=1, min_length=0):
 - [ ] **场景 ID 传递正确**：batch 中的 scene_id 可以正确索引模型的 offset
 - [ ] **段 ID 处理**：段 ID 可能需要映射到场景级别的 offset（如果 offset 是场景级别的）
 - [ ] **Offset 共享**：同一场景的不同段可能共享 offset（需要根据实际需求决定）
+
+### 11. 调度器检查
+
+- [ ] **段内batch计数正确**：每个段固定遍历 `batches_per_segment` 次
+- [ ] **段切换正确**：当达到 `batches_per_segment` 时，自动切换到下一个段
+- [ ] **场景切换正确**：当所有段遍历完成时，自动切换到下一个场景
+- [ ] **段遍历顺序正确**：根据 `segment_order` 配置正确遍历（random或sequential）
+- [ ] **场景预加载正确**：在最后一个段开始训练时预加载下一个场景
+- [ ] **边界情况处理**：当所有场景遍历完成时，正确抛出 `StopIteration` 异常
+- [ ] **重叠段生成正确**：段之间有正确的overlap（基于距离，不是keyframe数量）
+- [ ] **重叠段数量合理**：重叠段数量不会过多（overlap_ratio限制在0.5以内）
 
 ---
 
@@ -911,18 +1260,71 @@ dataset = MultiSceneDataset(
         'min_count': 1,
         'min_length': 0.0,
     },
+    min_keyframes_per_scene=10,
+    min_keyframes_per_segment=6,
     device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+    preload_scene_count=3,  # 预加载3个场景
 )
 
-# 3. 获取随机批次
+# 3. 初始化数据集（可选，会在第一次使用时自动初始化）
+dataset.initialize()
+
+# 4. 获取当前场景ID
+current_scene_id = dataset.get_current_scene_id()
+print(f"当前训练场景: {current_scene_id}")
+
+# 5. 获取随机批次
 batch = dataset.sample_random_batch()
 
-# 4. 获取指定场景和段的批次
+# 6. 获取指定场景和段的批次
 batch = dataset.get_segment_batch(scene_id=0, segment_id=2)
 
-# 5. 获取场景信息
+# 7. 获取场景信息
 scene_info = dataset.get_scene(scene_id=0)
 print(f"场景 {scene_id} 有 {len(scene_info['segments'])} 个段")
+
+# 8. 在训练循环中使用（方式1：使用sample_random_batch）
+for iteration in range(100):
+    batch = dataset.sample_random_batch()
+    scene_id = batch['scene_id'].item()
+    segment_id = batch['segment_id']
+    
+    # 使用批次进行训练
+    # loss = model(batch)
+    # loss.backward()
+    # optimizer.step()
+    
+    # 如果场景训练完成，标记并切换到下一个场景
+    # dataset.mark_scene_completed(scene_id)
+
+# 9. 在训练循环中使用（方式2：使用调度器，推荐）
+scheduler = dataset.create_scheduler(
+    batches_per_segment=20,
+    segment_order="random",
+    scene_order="random",
+    shuffle_segments=True,
+    preload_next_scene=True,
+)
+
+for iteration in range(100):
+    try:
+        batch = scheduler.next_batch()
+        
+        # 使用批次进行训练
+        # loss = model(batch)
+        # loss.backward()
+        # optimizer.step()
+        
+        # 获取当前状态信息（可选）
+        if iteration % 100 == 0:
+            info = scheduler.get_current_info()
+            print(f"Iteration {iteration}: scene_id={info['scene_id']}, "
+                  f"segment_id={info['segment_id_in_scene']}, "
+                  f"batch_count={info['batch_count']}/{info['batches_per_segment']}")
+    except StopIteration:
+        # 所有场景遍历完成
+        print("All scenes have been processed")
+        break
 ```
 
 ---
@@ -1047,8 +1449,11 @@ def get_segment_batch_single_target(
 2. **关键帧机制**：按照距离分割关键帧，支持动态场景处理
 3. **段分割机制**：按照 AABB 限制分割段，支持大场景处理
 4. **灵活的 Source/Target 选择**：在段内随机选择关键帧和帧
-5. **EVolSplat 兼容**：输出格式符合 EVolSplat 的要求
-6. **Drivestudio 集成**：复用 `DrivingDataset` 和 `ScenePixelSource` 的接口
+5. **延迟加载和预加载机制**：按需加载场景，控制内存占用，最多同时缓存 `preload_scene_count + 1` 个训练场景
+6. **场景队列管理**：使用候选池、训练队列、场景缓存等机制管理场景生命周期
+7. **EVolSplat 兼容**：输出格式符合 EVolSplat 的要求，包含 keyframe_info 等元数据
+8. **Drivestudio 集成**：复用 `DrivingDataset` 和 `ScenePixelSource` 的接口
+9. **动态相机数量**：支持不同场景有不同数量的相机
 
-该设计允许在不修改 Drivestudio 核心代码的情况下，实现支持动态物体的 feed-forward 3DGS 训练。
+该设计允许在不修改 Drivestudio 核心代码的情况下，实现支持动态物体的 feed-forward 3DGS 训练，同时通过延迟加载和预加载机制有效控制内存占用。
 
