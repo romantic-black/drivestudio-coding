@@ -9,8 +9,11 @@ This module implements a multi-scene dataset class that supports:
 """
 import logging
 import os
+import queue
 import random
-from typing import Dict, List, Optional, Tuple
+import threading
+import time
+from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -19,6 +22,10 @@ from torch import Tensor
 
 from datasets.driving_dataset import DrivingDataset
 from datasets.tools.trajectory_utils import split_trajectory
+
+if TYPE_CHECKING:
+    import open3d as o3d
+    from datasets.pointcloud_generators.rgb_pointcloud_generator import RGBPointCloudGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +114,9 @@ class MultiSceneDataset:
         # Initialize invalid scene IDs set (validated but not suitable)
         self.invalid_scene_ids = set()
         
+        # Thread lock for protecting queue and cache operations
+        self._lock = threading.RLock()
+        
         # Track if initialized
         self._initialized = False
     
@@ -127,8 +137,9 @@ class MultiSceneDataset:
         
         logger.info("Initializing MultiSceneDataset...")
         
-        # Ensure training queue has enough scenes
-        self._ensure_training_queue_ready()
+        # Ensure training queue has enough scenes (with lock)
+        with self._lock:
+            self._ensure_training_queue_ready()
         
         if len(self.scene_training_queue) == 0:
             logger.warning("No valid training scenes found after validation")
@@ -154,23 +165,35 @@ class MultiSceneDataset:
         
         This method validates scenes from candidate pool and adds them to queue.
         If candidate pool is empty, reshuffle and refill from original scene IDs.
+        
+        Note: This method should be called with self._lock held.
+        
+        Important: Even if queue is full, we should continue adding scenes if
+        current_scene_index is approaching the end of the queue, to ensure all
+        scenes can be processed.
         """
         target_queue_size = self.preload_scene_count + 1
         
-        # If queue already has enough scenes, return
-        if len(self.scene_training_queue) >= target_queue_size:
+        # Calculate how many scenes ahead of current index we need
+        # We want at least target_queue_size scenes ahead of current index
+        scenes_ahead_needed = target_queue_size
+        scenes_ahead = len(self.scene_training_queue) - self.current_scene_index
+        
+        # If we have enough scenes ahead, return early
+        if scenes_ahead >= scenes_ahead_needed:
             return
         
         # Try to fill queue from candidate pool
-        while len(self.scene_training_queue) < target_queue_size and len(self.scene_candidate_pool) > 0:
+        while scenes_ahead < scenes_ahead_needed and len(self.scene_candidate_pool) > 0:
             scene_id = self.scene_candidate_pool.pop(0)
             if self._validate_and_add_to_queue(scene_id):
                 logger.debug(f"Scene {scene_id} validated and added to training queue")
+                scenes_ahead = len(self.scene_training_queue) - self.current_scene_index
             else:
                 logger.debug(f"Scene {scene_id} is not suitable, skipping")
         
-        # If candidate pool is empty and queue still not full, try to refill from original IDs
-        if len(self.scene_training_queue) < target_queue_size and len(self.scene_candidate_pool) == 0:
+        # If candidate pool is empty and we still need more scenes, try to refill from original IDs
+        if scenes_ahead < scenes_ahead_needed and len(self.scene_candidate_pool) == 0:
             # Get remaining scene IDs that haven't been validated
             remaining_ids = [
                 sid for sid in self.train_scene_ids 
@@ -181,10 +204,11 @@ class MultiSceneDataset:
                 self.scene_candidate_pool = remaining_ids
                 logger.info(f"Refilled candidate pool with {len(remaining_ids)} remaining scenes")
                 # Try to fill queue again
-                while len(self.scene_training_queue) < target_queue_size and len(self.scene_candidate_pool) > 0:
+                while scenes_ahead < scenes_ahead_needed and len(self.scene_candidate_pool) > 0:
                     scene_id = self.scene_candidate_pool.pop(0)
                     if self._validate_and_add_to_queue(scene_id):
                         logger.debug(f"Scene {scene_id} validated and added to training queue")
+                        scenes_ahead = len(self.scene_training_queue) - self.current_scene_index
                     else:
                         logger.debug(f"Scene {scene_id} is not suitable, skipping")
     
@@ -195,24 +219,45 @@ class MultiSceneDataset:
         This method performs a lightweight validation by loading the scene
         and checking if it's suitable. If suitable, adds to queue.
         
+        Note: This method should be called with self._lock held.
+        However, it releases the lock during I/O operations to avoid blocking.
+        
         Args:
             scene_id: Scene ID to validate
             
         Returns:
             bool: True if scene is suitable and added to queue, False otherwise
         """
-        # Skip if already in queue or invalid
+        # Skip if already in queue or invalid (check with lock held)
         if scene_id in self.scene_training_queue:
             return True
         if scene_id in self.invalid_scene_ids:
             return False
         
-        # Try to load and prepare scene (this does full validation)
-        scene_data = self._load_and_prepare_scene(scene_id)
+        # Release lock before I/O operation to avoid blocking other threads
+        # _load_and_prepare_scene is a long I/O operation
+        # For RLock, we need to safely release and re-acquire
+        # Use try/except to handle the case where lock might not be held
+        lock_released = False
+        try:
+            self._lock.release()
+            lock_released = True
+        except RuntimeError:
+            # Lock was not held, continue without releasing
+            pass
+        
+        try:
+            scene_data = self._load_and_prepare_scene(scene_id)
+        finally:
+            # Re-acquire lock if we released it
+            if lock_released:
+                self._lock.acquire()
         
         if scene_data is not None:
             # Scene is suitable, add to queue
-            self.scene_training_queue.append(scene_id)
+            # Double-check queue state (might have changed while lock was released)
+            if scene_id not in self.scene_training_queue:
+                self.scene_training_queue.append(scene_id)
             # Don't keep it in cache yet, will be loaded when needed
             # Clean up the loaded data to save memory
             if 'dataset' in scene_data:
@@ -353,6 +398,8 @@ class MultiSceneDataset:
         """
         Unload scene from cache and free memory.
         
+        Note: This method should be called with self._lock held.
+        
         Args:
             scene_id: Scene ID to unload
         """
@@ -417,50 +464,63 @@ class MultiSceneDataset:
         If not, load it using _load_and_prepare_scene.
         If cache is full, unload a non-current scene.
         
+        Note: This method should be called with self._lock held for cache operations.
+        However, _load_and_prepare_scene is a long I/O operation and may be called
+        without holding the lock (it will be called in background thread).
+        
         Args:
             scene_id: Scene ID to ensure loaded
             
         Returns:
             Scene data dictionary or None if scene cannot be loaded
         """
-        # Check if already in cache
-        if scene_id in self.train_scenes_cache:
-            return self.train_scenes_cache[scene_id]
-        
-        # Check if it's an evaluation scene
-        if scene_id in self.eval_scene_ids:
-            if scene_id not in self.eval_scenes:
-                # Load evaluation scene
-                scene_data = self._load_and_prepare_scene(scene_id)
-                if scene_data is not None:
-                    self.eval_scenes[scene_id] = scene_data
+        with self._lock:
+            # Check if already in cache
+            if scene_id in self.train_scenes_cache:
+                return self.train_scenes_cache[scene_id]
+            
+            # Check if it's an evaluation scene
+            if scene_id in self.eval_scene_ids:
+                if scene_id not in self.eval_scenes:
+                    # Load evaluation scene (release lock during I/O)
+                    pass  # Will load below
                 else:
-                    return None
-            return self.eval_scenes[scene_id]
-        
-        # It's a training scene, check cache size
-        max_cache_size = self.preload_scene_count + 1
-        
-        # If cache is full, unload a scene that's not current
-        if len(self.train_scenes_cache) >= max_cache_size:
-            # Find a scene to unload (prefer non-current scenes)
-            current_scene_id = self.get_current_scene_id()
-            for cached_scene_id in list(self.train_scenes_cache.keys()):
-                if cached_scene_id != current_scene_id:
-                    self._unload_scene(cached_scene_id)
-                    break
-            # If still full, unload any scene
+                    return self.eval_scenes[scene_id]
+            
+            # It's a training scene, check cache size
+            max_cache_size = self.preload_scene_count + 1
+            
+            # If cache is full, unload a scene that's not current
             if len(self.train_scenes_cache) >= max_cache_size:
-                scene_to_unload = list(self.train_scenes_cache.keys())[0]
-                self._unload_scene(scene_to_unload)
+                # Find a scene to unload (prefer non-current scenes)
+                current_scene_id = self.get_current_scene_id()
+                for cached_scene_id in list(self.train_scenes_cache.keys()):
+                    if cached_scene_id != current_scene_id:
+                        self._unload_scene(cached_scene_id)
+                        break
+                # If still full, unload any scene
+                if len(self.train_scenes_cache) >= max_cache_size:
+                    scene_to_unload = list(self.train_scenes_cache.keys())[0]
+                    self._unload_scene(scene_to_unload)
         
-        # Load the scene
-        scene_data = self._load_and_prepare_scene(scene_id)
-        if scene_data is not None:
-            self.train_scenes_cache[scene_id] = scene_data
-            return scene_data
+        # Load the scene (outside lock, as this is a long I/O operation)
+        if scene_id in self.eval_scene_ids and scene_id not in self.eval_scenes:
+            scene_data = self._load_and_prepare_scene(scene_id)
+            if scene_data is not None:
+                with self._lock:
+                    self.eval_scenes[scene_id] = scene_data
+                return scene_data
+            else:
+                return None
         else:
-            return None
+            # Training scene
+            scene_data = self._load_and_prepare_scene(scene_id)
+            if scene_data is not None:
+                with self._lock:
+                    self.train_scenes_cache[scene_id] = scene_data
+                return scene_data
+            else:
+                return None
     
     def get_current_scene_id(self) -> Optional[int]:
         """
@@ -469,10 +529,11 @@ class MultiSceneDataset:
         Returns:
             Current scene ID or None if no scene is available
         """
-        if (self.current_scene_index < len(self.scene_training_queue) and 
-            len(self.scene_training_queue) > 0):
-            return self.scene_training_queue[self.current_scene_index]
-        return None
+        with self._lock:
+            if (self.current_scene_index < len(self.scene_training_queue) and 
+                len(self.scene_training_queue) > 0):
+                return self.scene_training_queue[self.current_scene_index]
+            return None
     
     def mark_scene_completed(self, scene_id: int):
         """
@@ -487,18 +548,19 @@ class MultiSceneDataset:
         Args:
             scene_id: Scene ID that has been completed
         """
-        current_scene_id = self.get_current_scene_id()
-        
-        if current_scene_id is None:
-            logger.warning("No current scene to mark as completed")
-            return
-        
-        if scene_id != current_scene_id:
-            logger.warning(f"Scene {scene_id} does not match current scene {current_scene_id}. Ignoring.")
-            return
-        
-        # Switch to next scene
-        self._switch_to_next_scene()
+        with self._lock:
+            current_scene_id = self.get_current_scene_id()
+            
+            if current_scene_id is None:
+                logger.warning("No current scene to mark as completed")
+                return
+            
+            if scene_id != current_scene_id:
+                logger.warning(f"Scene {scene_id} does not match current scene {current_scene_id}. Ignoring.")
+                return
+            
+            # Switch to next scene
+            self._switch_to_next_scene()
     
     def get_scene(self, scene_id: int) -> Optional[Dict]:
         """
@@ -517,6 +579,95 @@ class MultiSceneDataset:
             Returns None if scene not found
         """
         return self._ensure_scene_loaded(scene_id)
+    
+    def get_segment_frames(
+        self,
+        scene_id: int,
+        segment_id: int,
+    ) -> List[int]:
+        """
+        获取段内所有帧索引。
+        
+        Args:
+            scene_id: 场景ID
+            segment_id: 段ID（场景内索引）
+            
+        Returns:
+            frame_indices: 段内所有帧索引列表（已排序、去重）
+        """
+        scene_data = self.get_scene(scene_id)
+        if scene_data is None:
+            raise ValueError(f"Scene {scene_id} not found")
+        
+        if segment_id >= len(scene_data['segments']):
+            raise ValueError(f"Segment {segment_id} not found in scene {scene_id}")
+        
+        segment = scene_data['segments'][segment_id]
+        frame_indices = segment['frame_indices']
+        
+        # 确保已排序、去重
+        frame_indices = sorted(list(set(frame_indices)))
+        
+        return frame_indices
+    
+    def get_frame_data(
+        self,
+        scene_id: int,
+        frame_idx: int,
+        cam_idx: int,
+    ) -> Dict:
+        """
+        获取指定帧和相机的数据。
+        
+        Args:
+            scene_id: 场景ID
+            frame_idx: 帧索引
+            cam_idx: 相机索引（在 camera_list 中的索引）
+            
+        Returns:
+            Dict包含：
+                - 'image': Tensor [H, W, 3] - RGB图像
+                - 'extrinsic': Tensor [4, 4] - 外参（cam_to_world）
+                - 'intrinsic': Tensor [4, 4] - 内参（4x4矩阵）
+                - 'depth': Tensor [H, W] - 深度图（如果可用）
+        """
+        scene_data = self.get_scene(scene_id)
+        if scene_data is None:
+            raise ValueError(f"Scene {scene_id} not found")
+        
+        scene_dataset = scene_data['dataset']
+        num_cams = scene_dataset.num_cams
+        
+        # 验证相机索引
+        if cam_idx >= num_cams:
+            raise ValueError(f"Camera index {cam_idx} out of range (num_cams={num_cams})")
+        
+        # 计算图像索引
+        img_idx = frame_idx * num_cams + cam_idx
+        
+        # 获取图像和相机信息
+        try:
+            image_infos, cam_infos = scene_dataset.pixel_source.get_image(img_idx)
+        except Exception as e:
+            raise ValueError(f"Failed to load image {img_idx}: {e}")
+        
+        # 获取深度图
+        depth = self._get_depth(scene_dataset, frame_idx, cam_idx)
+        if depth is None:
+            # 创建占位符深度图
+            H, W = image_infos['pixels'].shape[:2]
+            depth = torch.ones(H, W, dtype=torch.float32, device=self.device) * 10.0
+        
+        # 转换内参为4x4（如果原本是3x3）
+        intrinsic = cam_infos['intrinsics']  # [3, 3] or [4, 4]
+        intrinsic_4x4 = self._convert_intrinsic_to_4x4(intrinsic)
+        
+        return {
+            'image': image_infos['pixels'],  # [H, W, 3]
+            'extrinsic': cam_infos['camera_to_world'],  # [4, 4]
+            'intrinsic': intrinsic_4x4,  # [4, 4]
+            'depth': depth,  # [H, W]
+        }
     
     def _load_scene(self, scene_id: int) -> Optional[Dict]:
         """
@@ -1135,8 +1286,30 @@ class MultiSceneDatasetScheduler:
         self.current_batch_count: int = 0
         self.scene_segment_order: List[int] = []  # Segment IDs in traversal order
         
+        # Background thread for scene preloading
+        self._preload_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        
+        # Preload task queue (Scheduler → background thread)
+        self._preload_task_queue = queue.Queue()
+        
+        # Scene loading status (scene_id -> Event)
+        self._scene_loading_events: Dict[int, threading.Event] = {}
+        self._loading_lock = threading.RLock()  # Protect loading status dictionary
+        
+        # Next scene ID (maintained by Scheduler)
+        self._next_scene_id: Optional[int] = None
+        
         # Initialize scheduler state
         self._initialize_scheduler_state()
+        
+        # Start background thread
+        self._preload_thread = threading.Thread(
+            target=self._preload_worker,
+            daemon=True,  # Daemon thread, exits when main thread exits
+            name="ScenePreloadWorker"
+        )
+        self._preload_thread.start()
     
     def _initialize_scheduler_state(self):
         """Initialize scheduler state."""
@@ -1175,6 +1348,92 @@ class MultiSceneDatasetScheduler:
         else:
             raise ValueError(f"Invalid segment_order: {self.segment_order}. Must be 'random' or 'sequential'")
     
+    def _preload_worker(self):
+        """Background thread main loop: process preload tasks + ensure queue is full"""
+        while not self._stop_event.is_set():
+            try:
+                # 1. Process preload tasks (high priority)
+                try:
+                    scene_id = self._preload_task_queue.get(timeout=0.1)
+                    self._load_scene_in_background(scene_id)
+                except queue.Empty:
+                    pass
+                
+                # 2. Ensure queue is full (continuous monitoring)
+                with self.dataset._lock:
+                    self.dataset._ensure_training_queue_ready()
+                
+                # 3. Preload next scene in queue (if queue has new scenes)
+                self._preload_next_scene_in_queue()
+                
+                # Brief sleep to avoid excessive CPU usage
+                time.sleep(0.01)
+            except Exception as e:
+                logger.error(f"Error in preload worker: {e}", exc_info=True)
+    
+    def _load_scene_in_background(self, scene_id: int):
+        """Load scene in background thread"""
+        # Create loading event
+        with self._loading_lock:
+            if scene_id not in self._scene_loading_events:
+                self._scene_loading_events[scene_id] = threading.Event()
+            event = self._scene_loading_events[scene_id]
+        
+        # If already in cache, mark as complete
+        with self.dataset._lock:
+            if scene_id in self.dataset.train_scenes_cache:
+                event.set()
+                return
+        
+        # Load scene (without lock, as this is a long I/O operation)
+        try:
+            scene_data = self.dataset._load_and_prepare_scene(scene_id)
+            if scene_data is not None:
+                # Update cache with lock
+                with self.dataset._lock:
+                    # Check cache size, may need to unload other scenes
+                    max_cache_size = self.dataset.preload_scene_count + 1
+                    if len(self.dataset.train_scenes_cache) >= max_cache_size:
+                        # Unload non-current scenes
+                        current_scene_id = self.dataset.get_current_scene_id()
+                        for cached_id in list(self.dataset.train_scenes_cache.keys()):
+                            if cached_id != current_scene_id:
+                                self.dataset._unload_scene(cached_id)
+                                break
+                    
+                    self.dataset.train_scenes_cache[scene_id] = scene_data
+                event.set()  # Mark loading complete
+                logger.info(f"Scene {scene_id} preloaded in background")
+            else:
+                logger.warning(f"Failed to preload scene {scene_id}")
+                event.set()  # Set even on failure to avoid permanent blocking
+        except Exception as e:
+            logger.error(f"Error loading scene {scene_id}: {e}", exc_info=True)
+            event.set()  # Set even on failure to avoid permanent blocking
+    
+    def _preload_next_scene_in_queue(self):
+        """Preload next scene in queue (if exists and not loaded)"""
+        with self.dataset._lock:
+            current_scene_id = self.dataset.get_current_scene_id()
+            if current_scene_id is None:
+                return
+            
+            # Get next scene ID
+            try:
+                current_index = self.dataset.scene_training_queue.index(current_scene_id)
+                next_index = current_index + 1
+                if next_index < len(self.dataset.scene_training_queue):
+                    next_scene_id = self.dataset.scene_training_queue[next_index]
+                    
+                    # If not loaded, send preload task
+                    if next_scene_id not in self.dataset.train_scenes_cache:
+                        try:
+                            self._preload_task_queue.put_nowait(next_scene_id)
+                        except queue.Full:
+                            pass  # Queue full, skip
+            except (ValueError, IndexError):
+                pass  # Current scene not in queue, or no next scene
+    
     def _switch_to_next_segment(self):
         """Switch to next segment."""
         self.current_batch_count = 0
@@ -1193,23 +1452,53 @@ class MultiSceneDatasetScheduler:
             self.current_segment_id = 0
     
     def _switch_to_next_scene(self):
-        """Switch to next scene."""
+        """Switch to next scene, blocking if scene is not loaded yet."""
         # Mark current scene as completed
         if self.current_scene_id is not None:
-            self.dataset.mark_scene_completed(self.current_scene_id)
+            with self.dataset._lock:
+                self.dataset.mark_scene_completed(self.current_scene_id)
         
         # Get next scene
-        self.current_scene_id = self.dataset.get_current_scene_id()
-        if self.current_scene_id is None:
-            raise StopIteration("All scenes have been processed")
+        with self.dataset._lock:
+            self.current_scene_id = self.dataset.get_current_scene_id()
+            if self.current_scene_id is None:
+                raise StopIteration("All scenes have been processed")
         
-        # Ensure next scene is loaded
-        scene_data = self.dataset._ensure_scene_loaded(self.current_scene_id)
+        # Check if scene is loaded, block if not loaded
+        with self._loading_lock:
+            if self.current_scene_id not in self._scene_loading_events:
+                # Create loading event (may be loading)
+                self._scene_loading_events[self.current_scene_id] = threading.Event()
+            event = self._scene_loading_events[self.current_scene_id]
+        
+        # Check if already in cache
+        scene_data = None
+        with self.dataset._lock:
+            if self.current_scene_id in self.dataset.train_scenes_cache:
+                # Already loaded, use directly
+                scene_data = self.dataset.train_scenes_cache[self.current_scene_id]
+            else:
+                # Not loaded, trigger preload (if not already)
+                try:
+                    self._preload_task_queue.put_nowait(self.current_scene_id)
+                except queue.Full:
+                    pass
+        
+        # If not loaded, wait for loading to complete (outside lock to avoid deadlock)
         if scene_data is None:
-            raise ValueError(f"Next scene {self.current_scene_id} cannot be loaded")
+            logger.info(f"Waiting for scene {self.current_scene_id} to load...")
+            event.wait()  # Block and wait (without holding dataset._lock)
+            
+            # Check cache again after waiting
+            with self.dataset._lock:
+                scene_data = self.dataset.train_scenes_cache.get(self.current_scene_id)
+                if scene_data is None:
+                    raise ValueError(f"Scene {self.current_scene_id} failed to load")
+        
+        logger.info(f"Switched to scene {self.current_scene_id}")
     
     def _preload_next_scene_if_needed(self):
-        """Preload next scene if we're starting the last segment."""
+        """Trigger preload for next scene when starting the last segment."""
         scene_data = self.dataset.get_scene(self.current_scene_id)
         if scene_data is None:
             return
@@ -1218,14 +1507,27 @@ class MultiSceneDatasetScheduler:
         is_last_segment = (self.current_segment_id == len(self.scene_segment_order) - 1)
         
         if is_last_segment and self.preload_next_scene:
-            # Get next scene ID from queue
-            current_scene_index = self.dataset.scene_training_queue.index(self.current_scene_id)
-            next_scene_index = current_scene_index + 1
-            
-            if next_scene_index < len(self.dataset.scene_training_queue):
-                next_scene_id = self.dataset.scene_training_queue[next_scene_index]
-                # Preload next scene
-                self.dataset._ensure_scene_loaded(next_scene_id)
+            # Get next scene ID
+            with self.dataset._lock:
+                current_scene_id = self.dataset.get_current_scene_id()
+                if current_scene_id is None:
+                    return
+                
+                try:
+                    current_index = self.dataset.scene_training_queue.index(current_scene_id)
+                    next_index = current_index + 1
+                    if next_index < len(self.dataset.scene_training_queue):
+                        next_scene_id = self.dataset.scene_training_queue[next_index]
+                        self._next_scene_id = next_scene_id
+                        
+                        # Send preload task to background thread
+                        try:
+                            self._preload_task_queue.put_nowait(next_scene_id)
+                            logger.debug(f"Triggered preload for next scene {next_scene_id}")
+                        except queue.Full:
+                            logger.warning("Preload task queue is full")
+                except (ValueError, IndexError):
+                    pass
     
     def next_batch(self) -> Dict:
         """
@@ -1262,12 +1564,29 @@ class MultiSceneDatasetScheduler:
         
         return batch
     
+    def shutdown(self):
+        """Stop background thread and cleanup resources."""
+        if self._preload_thread is not None:
+            self._stop_event.set()
+            self._preload_thread.join(timeout=5.0)
+            if self._preload_thread.is_alive():
+                logger.warning("Preload thread did not stop in time")
+            self._preload_thread = None
+    
     def reset(self):
         """Reset scheduler state."""
+        # Clear loading events
+        with self._loading_lock:
+            self._scene_loading_events.clear()
+        
+        # Reset other state
         self.current_scene_id = None
         self.current_segment_id = 0
         self.current_batch_count = 0
         self.scene_segment_order = []
+        self._next_scene_id = None
+        
+        # Reinitialize
         self._initialize_scheduler_state()
     
     def get_current_info(self) -> Dict:
@@ -1295,4 +1614,90 @@ class MultiSceneDatasetScheduler:
             'batch_count': self.current_batch_count,
             'batches_per_segment': self.batches_per_segment,
         }
+    
+    def generate_segment_pointcloud(
+        self,
+        pointcloud_generator,
+        scene_id: Optional[int] = None,
+        segment_id: Optional[int] = None,
+    ):
+        """
+        为当前段（或指定段）生成点云。
+        
+        Args:
+            pointcloud_generator: 点云生成器实例
+            scene_id: 场景ID（如果为None，使用当前场景）
+            segment_id: 段ID（如果为None，使用当前段）
+            
+        Returns:
+            pointcloud: Open3D 点云对象
+        """
+        if scene_id is None:
+            scene_id = self.current_scene_id
+            if scene_id is None:
+                raise ValueError("No current scene available")
+        
+        if segment_id is None:
+            if self.current_segment_id >= len(self.scene_segment_order):
+                raise ValueError("No current segment available")
+            segment_id = self.scene_segment_order[self.current_segment_id]
+        
+        return pointcloud_generator.generate_pointcloud(
+            dataset=self.dataset,
+            scene_id=scene_id,
+            segment_id=segment_id,
+        )
+    
+    def generate_all_segment_pointclouds(
+        self,
+        pointcloud_generator,
+        scene_id: Optional[int] = None,
+        save_dir: Optional[str] = None,
+    ) -> Dict:
+        """
+        为场景的所有段生成点云。
+        
+        Args:
+            pointcloud_generator: 点云生成器实例
+            scene_id: 场景ID（如果为None，使用当前场景）
+            save_dir: 保存目录（如果为None，不保存）
+            
+        Returns:
+            Dict[segment_id, pointcloud]: 每个段的点云字典
+        """
+        import open3d as o3d
+        
+        if scene_id is None:
+            scene_id = self.current_scene_id
+            if scene_id is None:
+                raise ValueError("No current scene available")
+        
+        scene_data = self.dataset.get_scene(scene_id)
+        if scene_data is None:
+            raise ValueError(f"Scene {scene_id} not found")
+        
+        segments = scene_data['segments']
+        pointclouds = {}
+        
+        for segment_id in range(len(segments)):
+            try:
+                pointcloud = pointcloud_generator.generate_pointcloud(
+                    dataset=self.dataset,
+                    scene_id=scene_id,
+                    segment_id=segment_id,
+                )
+                pointclouds[segment_id] = pointcloud
+                
+                # 保存点云（如果指定了保存目录）
+                if save_dir is not None:
+                    os.makedirs(save_dir, exist_ok=True)
+                    save_path = os.path.join(save_dir, f"scene_{scene_id}_segment_{segment_id}.ply")
+                    o3d.io.write_point_cloud(save_path, pointcloud)
+                    logger.info(f"Saved pointcloud to {save_path}")
+                
+            except Exception as e:
+                logger.warning(f"Failed to generate pointcloud for scene {scene_id}, segment {segment_id}: {e}")
+                continue
+        
+        return pointclouds
 

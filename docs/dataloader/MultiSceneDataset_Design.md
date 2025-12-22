@@ -242,7 +242,9 @@ class MultiSceneDatasetScheduler:
     1. 管理段内batch计数
     2. 自动切换段（当达到batches_per_segment时）
     3. 自动切换场景（当所有段遍历完成时）
-    4. 预加载下一个场景（在最后一个段开始训练时）
+    4. 后台线程预加载场景（类似 torch DataLoader 的 worker 线程）
+    5. 确保训练队列始终保持满状态
+    6. 场景切换时阻塞等待（如果场景未加载完成）
     """
     
     def __init__(
@@ -285,6 +287,14 @@ class MultiSceneDatasetScheduler:
     
     def reset(self):
         """重置调度器状态"""
+        pass
+    
+    def shutdown(self):
+        """
+        停止后台线程并清理资源。
+        
+        应该在不再使用调度器时调用，以确保后台线程正确停止。
+        """
         pass
     
     def get_current_info(self) -> Dict:
@@ -396,6 +406,7 @@ def initialize(self):
    - 目标队列大小：`preload_scene_count + 1`
    - 从候选池中验证并添加场景
    - 如果候选池为空，从原始场景ID中重新填充
+   - **线程安全**：所有队列操作都使用锁保护
 3. **场景预加载**：`_preload_scenes()` 方法预加载即将使用的场景
    - 加载当前场景（如果未加载）
    - 预加载接下来的 `preload_scene_count` 个场景
@@ -405,6 +416,28 @@ def initialize(self):
    - 更新当前场景索引
    - 确保队列有足够的场景
    - 预加载下一个场景
+   - **线程安全**：所有缓存操作都使用锁保护
+
+**后台线程预加载机制**（MultiSceneDatasetScheduler）：
+1. **后台线程**：调度器启动一个守护线程，持续运行直到调度器被销毁
+   - 线程名称：`ScenePreloadWorker`
+   - 守护线程：主线程退出时自动退出
+2. **预加载任务队列**：使用 `queue.Queue` 在主线程和后台线程之间通信
+   - 主线程发送预加载任务（场景ID）
+   - 后台线程接收任务并执行场景加载
+3. **场景加载状态**：使用 `threading.Event` 跟踪每个场景的加载状态
+   - 场景加载完成后，设置对应的 Event
+   - 主线程在场景切换时，如果场景未加载，阻塞等待 Event
+4. **队列持续填充**：后台线程持续监控训练队列状态
+   - 当队列不满时，自动调用 `_ensure_training_queue_ready()` 填充队列
+   - 确保队列始终保持满状态（至少 `preload_scene_count + 1` 个场景）
+5. **预加载策略**：
+   - **主动预加载**：在最后一个 segment 开始时，主线程通过任务队列触发下一个场景的预加载
+   - **被动填充**：后台线程持续监控队列，自动预加载队列中的下一个场景
+6. **阻塞等待机制**：场景切换时，如果下一个场景未加载完成
+   - 主线程阻塞等待，直到场景加载完成
+   - 使用 `Event.wait()` 实现阻塞等待
+   - 避免在场景未准备好时继续训练
 
 ### 2. 场景加载和验证
 
@@ -806,7 +839,26 @@ def _select_frame_from_keyframe(
     return frame_idx
 ```
 
-### 7. 场景缓存管理
+### 7. 线程安全机制
+
+**MultiSceneDataset 的线程安全**：
+- 使用 `threading.RLock()` 保护队列和缓存操作
+- 需要加锁的方法：
+  - `_ensure_training_queue_ready()` - 队列操作
+  - `_validate_and_add_to_queue()` - 队列操作
+  - `_ensure_scene_loaded()` - 缓存操作
+  - `_unload_scene()` - 缓存操作
+  - `mark_scene_completed()` - 场景切换（涉及队列和缓存）
+  - `get_current_scene_id()` - 队列读取
+- 注意：`_load_and_prepare_scene()` 是耗时的 I/O 操作，在后台线程中执行，不需要加锁
+
+**MultiSceneDatasetScheduler 的线程同步**：
+- 使用 `queue.Queue` 在主线程和后台线程之间通信
+- 使用 `threading.Event` 跟踪场景加载状态
+- 使用 `threading.RLock()` 保护加载状态字典
+- 后台线程持续运行，确保队列满和场景预加载
+
+### 8. 场景缓存管理
 
 **场景缓存策略**：
 ```python
@@ -886,7 +938,7 @@ def _unload_scene(self, scene_id: int):
         logger.info(f"Scene {scene_id} unloaded from cache")
 ```
 
-### 8. 批次打包
+### 9. 批次打包
 
 ```python
 def get_segment_batch(
@@ -1229,6 +1281,16 @@ def split_trajectory(trajectory, num_splits=0, min_count=1, min_length=0):
 - [ ] **重叠段生成正确**：段之间有正确的overlap（基于距离，不是keyframe数量）
 - [ ] **重叠段数量合理**：重叠段数量不会过多（overlap_ratio限制在0.5以内）
 
+### 12. 后台线程检查
+
+- [ ] **后台线程启动**：调度器创建时自动启动后台线程
+- [ ] **后台线程停止**：调用 `shutdown()` 时正确停止后台线程
+- [ ] **队列持续填充**：后台线程确保训练队列始终保持满状态
+- [ ] **场景预加载**：后台线程自动预加载队列中的下一个场景
+- [ ] **阻塞等待**：场景切换时，如果场景未加载，主线程阻塞等待
+- [ ] **线程安全**：所有共享状态访问都使用锁保护
+- [ ] **资源清理**：调度器销毁时正确清理线程资源
+
 ---
 
 ## 使用示例
@@ -1306,25 +1368,29 @@ scheduler = dataset.create_scheduler(
     preload_next_scene=True,
 )
 
-for iteration in range(100):
-    try:
-        batch = scheduler.next_batch()
-        
-        # 使用批次进行训练
-        # loss = model(batch)
-        # loss.backward()
-        # optimizer.step()
-        
-        # 获取当前状态信息（可选）
-        if iteration % 100 == 0:
-            info = scheduler.get_current_info()
-            print(f"Iteration {iteration}: scene_id={info['scene_id']}, "
-                  f"segment_id={info['segment_id_in_scene']}, "
-                  f"batch_count={info['batch_count']}/{info['batches_per_segment']}")
-    except StopIteration:
-        # 所有场景遍历完成
-        print("All scenes have been processed")
-        break
+try:
+    for iteration in range(100):
+        try:
+            batch = scheduler.next_batch()
+            
+            # 使用批次进行训练
+            # loss = model(batch)
+            # loss.backward()
+            # optimizer.step()
+            
+            # 获取当前状态信息（可选）
+            if iteration % 100 == 0:
+                info = scheduler.get_current_info()
+                print(f"Iteration {iteration}: scene_id={info['scene_id']}, "
+                      f"segment_id={info['segment_id_in_scene']}, "
+                      f"batch_count={info['batch_count']}/{info['batches_per_segment']}")
+        except StopIteration:
+            # 所有场景遍历完成
+            print("All scenes have been processed")
+            break
+finally:
+    # 确保清理后台线程
+    scheduler.shutdown()
 ```
 
 ---
@@ -1451,9 +1517,12 @@ def get_segment_batch_single_target(
 4. **灵活的 Source/Target 选择**：在段内随机选择关键帧和帧
 5. **延迟加载和预加载机制**：按需加载场景，控制内存占用，最多同时缓存 `preload_scene_count + 1` 个训练场景
 6. **场景队列管理**：使用候选池、训练队列、场景缓存等机制管理场景生命周期
-7. **EVolSplat 兼容**：输出格式符合 EVolSplat 的要求，包含 keyframe_info 等元数据
-8. **Drivestudio 集成**：复用 `DrivingDataset` 和 `ScenePixelSource` 的接口
-9. **动态相机数量**：支持不同场景有不同数量的相机
+7. **后台线程预加载**：类似 torch DataLoader 的 worker 线程，持续预加载场景，确保训练队列满
+8. **线程安全**：所有队列和缓存操作都使用锁保护，支持多线程场景加载
+9. **阻塞等待机制**：场景切换时，如果场景未加载完成，主线程阻塞等待，确保数据就绪
+10. **EVolSplat 兼容**：输出格式符合 EVolSplat 的要求，包含 keyframe_info 等元数据
+11. **Drivestudio 集成**：复用 `DrivingDataset` 和 `ScenePixelSource` 的接口
+12. **动态相机数量**：支持不同场景有不同数量的相机
 
 该设计允许在不修改 Drivestudio 核心代码的情况下，实现支持动态物体的 feed-forward 3DGS 训练，同时通过延迟加载和预加载机制有效控制内存占用。
 

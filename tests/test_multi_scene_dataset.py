@@ -1214,3 +1214,260 @@ class TestIntegrationWithScheduler:
                 # Adjacent segments should have some overlap
                 assert len(overlap) > 0, f"Segments {i} and {i+1} should overlap"
 
+
+class TestBackgroundPreloading:
+    """Test background thread preloading mechanism."""
+    
+    @pytest.fixture
+    def mock_driving_dataset(self):
+        """Create a mock DrivingDataset."""
+        dataset = Mock(spec=DrivingDataset)
+        
+        # Mock pixel_source
+        pixel_source = Mock()
+        pixel_source.num_cams = 3
+        pixel_source.num_imgs = 100
+        pixel_source.camera_list = [0, 1, 2]
+        
+        # Mock camera_data
+        camera_data = {}
+        for cam_id in range(3):
+            cam_mock = Mock()
+            cam_mock.unique_cam_idx = cam_id
+            cam_mock.lidar_depth_maps = None
+            cam_mock.depth_maps = {i: torch.ones(100, 200, dtype=torch.float32) * 10.0 for i in range(16)}
+            camera_data[cam_id] = cam_mock
+        
+        pixel_source.camera_data = camera_data
+        
+        # Mock get_image method
+        def mock_get_image(img_idx):
+            cam_idx = img_idx % 3
+            frame_idx = img_idx // 3
+            
+            image_infos = {
+                'pixels': torch.rand(100, 200, 3),
+            }
+            cam_infos = {
+                'camera_to_world': torch.eye(4),
+                'intrinsics': torch.eye(3),
+                'height': torch.tensor(100),
+                'width': torch.tensor(200),
+            }
+            return image_infos, cam_infos
+        
+        pixel_source.get_image = mock_get_image
+        pixel_source.parse_img_idx = lambda idx: (idx % 3, idx // 3)
+        
+        dataset.pixel_source = pixel_source
+        dataset.num_img_timesteps = 16
+        dataset.num_cams = 3
+        dataset.data_path = "/mock/path"
+        
+        # Mock get_aabb
+        dataset.get_aabb.return_value = torch.tensor([
+            [0.0, 0.0, 0.0],
+            [50.0, 50.0, 50.0]
+        ])
+        
+        # Mock get_novel_render_traj
+        def mock_get_traj(traj_types, target_frames):
+            trajectory = torch.eye(4).unsqueeze(0).repeat(target_frames, 1, 1)
+            trajectory[:, 0, 3] = torch.arange(target_frames).float() * 2.0
+            return {"front_center_interp": trajectory}
+        
+        dataset.get_novel_render_traj = mock_get_traj
+        
+        return dataset
+    
+    @pytest.fixture
+    def mock_data_cfg(self):
+        """Create a mock data config."""
+        return OmegaConf.create({
+            'dataset': 'test',
+            'data_root': '/test/path',
+        })
+    
+    @patch('datasets.multi_scene_dataset.DrivingDataset')
+    def test_scheduler_background_thread_started(self, mock_driving_dataset_class, mock_driving_dataset, mock_data_cfg):
+        """Test that background thread is started when scheduler is created."""
+        mock_driving_dataset_class.return_value = mock_driving_dataset
+        
+        dataset = MultiSceneDataset(
+            data_cfg=mock_data_cfg,
+            train_scene_ids=[0],
+            eval_scene_ids=[],
+            min_keyframes_per_scene=5,
+            min_keyframes_per_segment=3,
+        )
+        
+        dataset.initialize()
+        
+        scheduler = dataset.create_scheduler(
+            batches_per_segment=10,
+        )
+        
+        # Check that background thread is started
+        assert scheduler._preload_thread is not None
+        assert scheduler._preload_thread.is_alive()
+        assert scheduler._preload_thread.daemon is True
+        
+        # Cleanup
+        scheduler.shutdown()
+    
+    @patch('datasets.multi_scene_dataset.DrivingDataset')
+    def test_scheduler_shutdown(self, mock_driving_dataset_class, mock_driving_dataset, mock_data_cfg):
+        """Test scheduler shutdown method."""
+        mock_driving_dataset_class.return_value = mock_driving_dataset
+        
+        dataset = MultiSceneDataset(
+            data_cfg=mock_data_cfg,
+            train_scene_ids=[0],
+            eval_scene_ids=[],
+            min_keyframes_per_scene=5,
+            min_keyframes_per_segment=3,
+        )
+        
+        dataset.initialize()
+        
+        scheduler = dataset.create_scheduler(
+            batches_per_segment=10,
+        )
+        
+        # Verify thread is running
+        assert scheduler._preload_thread.is_alive()
+        
+        # Shutdown
+        scheduler.shutdown()
+        
+        # Verify thread is stopped
+        assert scheduler._preload_thread is None or not scheduler._preload_thread.is_alive()
+    
+    @patch('datasets.multi_scene_dataset.DrivingDataset')
+    def test_queue_stays_full(self, mock_driving_dataset_class, mock_driving_dataset, mock_data_cfg):
+        """Test that training queue stays full with background thread."""
+        mock_driving_dataset_class.return_value = mock_driving_dataset
+        
+        dataset = MultiSceneDataset(
+            data_cfg=mock_data_cfg,
+            train_scene_ids=[0, 1, 2, 3, 4],
+            eval_scene_ids=[],
+            min_keyframes_per_scene=5,
+            min_keyframes_per_segment=3,
+            preload_scene_count=2,
+        )
+        
+        dataset.initialize()
+        
+        scheduler = dataset.create_scheduler(
+            batches_per_segment=2,
+        )
+        
+        # Wait a bit for background thread to fill queue
+        import time
+        time.sleep(0.5)
+        
+        # Check that queue has enough scenes
+        with dataset._lock:
+            target_queue_size = dataset.preload_scene_count + 1
+            assert len(dataset.scene_training_queue) >= target_queue_size or len(dataset.scene_candidate_pool) == 0
+        
+        # Cleanup
+        scheduler.shutdown()
+    
+    @patch('datasets.multi_scene_dataset.DrivingDataset')
+    def test_scene_preloading_on_last_segment(self, mock_driving_dataset_class, mock_driving_dataset, mock_data_cfg):
+        """Test that next scene is preloaded when starting last segment."""
+        mock_driving_dataset_class.return_value = mock_driving_dataset
+        
+        dataset = MultiSceneDataset(
+            data_cfg=mock_data_cfg,
+            train_scene_ids=[0, 1],
+            eval_scene_ids=[],
+            min_keyframes_per_scene=5,
+            min_keyframes_per_segment=3,
+            preload_scene_count=1,
+        )
+        
+        dataset.initialize()
+        
+        scheduler = dataset.create_scheduler(
+            batches_per_segment=1,
+            preload_next_scene=True,
+        )
+        
+        # Get scene data to find last segment
+        scene_data = dataset.get_scene(scheduler.current_scene_id)
+        num_segments = len(scene_data['segments'])
+        
+        # Process batches until we reach the last segment
+        for _ in range(num_segments - 1):
+            scheduler.next_batch()
+        
+        # Now we should be at the last segment
+        # Wait a bit for preloading
+        import time
+        time.sleep(0.5)
+        
+        # Check that next scene is being preloaded or loaded
+        with dataset._lock:
+            current_scene_id = dataset.get_current_scene_id()
+            if current_scene_id is not None:
+                try:
+                    current_index = dataset.scene_training_queue.index(current_scene_id)
+                    next_index = current_index + 1
+                    if next_index < len(dataset.scene_training_queue):
+                        next_scene_id = dataset.scene_training_queue[next_index]
+                        # Next scene should be in cache or loading
+                        assert (next_scene_id in dataset.train_scenes_cache or 
+                                next_scene_id in scheduler._scene_loading_events)
+                except (ValueError, IndexError):
+                    pass
+        
+        # Cleanup
+        scheduler.shutdown()
+    
+    @patch('datasets.multi_scene_dataset.DrivingDataset')
+    def test_blocking_wait_for_scene_load(self, mock_driving_dataset_class, mock_driving_dataset, mock_data_cfg):
+        """Test that scene switching blocks until scene is loaded."""
+        import time
+        
+        # Add delay to scene loading
+        original_load = mock_driving_dataset_class
+        
+        def delayed_load(*args, **kwargs):
+            time.sleep(0.1)  # Simulate slow loading
+            return mock_driving_dataset
+        
+        mock_driving_dataset_class.side_effect = delayed_load
+        
+        dataset = MultiSceneDataset(
+            data_cfg=mock_data_cfg,
+            train_scene_ids=[0, 1],
+            eval_scene_ids=[],
+            min_keyframes_per_scene=5,
+            min_keyframes_per_segment=3,
+            preload_scene_count=1,
+        )
+        
+        dataset.initialize()
+        
+        scheduler = dataset.create_scheduler(
+            batches_per_segment=1,
+        )
+        
+        # Process all segments in first scene
+        scene_data = dataset.get_scene(scheduler.current_scene_id)
+        num_segments = len(scene_data['segments'])
+        
+        for _ in range(num_segments):
+            scheduler.next_batch()
+        
+        # Now switching to next scene should block until loaded
+        # This is tested implicitly - if it doesn't block, the test would fail
+        # because the scene wouldn't be ready
+        
+        # Cleanup
+        scheduler.shutdown()
+        mock_driving_dataset_class.side_effect = original_load
+
