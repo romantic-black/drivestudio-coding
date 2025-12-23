@@ -49,6 +49,7 @@ class TestSegmentSplitting:
         """Test single segment case (short movement distance)."""
         # Mock scene dataset
         scene_dataset = Mock()
+        scene_dataset.lidar_source = None  # Explicitly set to None to test fallback
         scene_dataset.get_aabb.return_value = torch.tensor([
             [0.0, 0.0, 0.0],
             [100.0, 100.0, 100.0]
@@ -86,6 +87,7 @@ class TestSegmentSplitting:
         """Test multiple segments case (long movement distance)."""
         # Mock scene dataset
         scene_dataset = Mock()
+        scene_dataset.lidar_source = None  # Explicitly set to None to test fallback
         scene_dataset.get_aabb.return_value = torch.tensor([
             [0.0, 0.0, 0.0],
             [50.0, 50.0, 50.0]
@@ -121,6 +123,7 @@ class TestSegmentSplitting:
         """Test overlapping segments generation."""
         # Mock scene dataset
         scene_dataset = Mock()
+        scene_dataset.lidar_source = None  # Explicitly set to None to test fallback
         scene_dataset.get_aabb.return_value = torch.tensor([
             [0.0, 0.0, 0.0],
             [50.0, 50.0, 50.0]
@@ -166,6 +169,7 @@ class TestSegmentSplitting:
         """Test that overlap_ratio is clamped to 0.5."""
         # Mock scene dataset
         scene_dataset = Mock()
+        scene_dataset.lidar_source = None  # Explicitly set to None to test fallback
         scene_dataset.get_aabb.return_value = torch.tensor([
             [0.0, 0.0, 0.0],
             [50.0, 50.0, 50.0]

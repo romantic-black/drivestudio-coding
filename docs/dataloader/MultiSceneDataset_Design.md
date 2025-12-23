@@ -641,12 +641,14 @@ def _split_segments(
     1. 获取场景的 AABB 和轨迹
     2. 计算关键帧的合计距离
     3. 将关键帧按照距离和 AABB 长度分组为段
-    4. 过滤掉关键帧数量不足的段
+    4. 为每个段计算独立的 AABB（基于段内帧的lidar数据）
+    5. 过滤掉关键帧数量不足的段
     
     注意：
     - 段分割不需要那么精确，关键帧的合计距离对比AABB的长度即可
     - 段内设置一个最低关键帧数量限制，不满足则跳过
     - 段与段可以部分重合（overlap_ratio）
+    - **每个段使用独立的AABB**：基于段内帧的lidar数据计算，而不是使用场景AABB
     
     Args:
         scene_dataset: 场景数据集
@@ -659,7 +661,7 @@ def _split_segments(
             - 'segment_id': int - 段ID
             - 'keyframe_indices': List[int] - 该段包含的关键帧索引（全局关键帧索引）
             - 'frame_indices': List[int] - 该段包含的所有帧索引（去重后的帧索引列表）
-            - 'aabb': Tensor[2, 3] - 段的 AABB 边界（使用场景 AABB）
+            - 'aabb': Tensor[2, 3] - 段的 AABB 边界（基于段内帧的lidar数据计算）
     """
     # 1. 获取场景 AABB
     scene_aabb = scene_dataset.get_aabb()  # [2, 3]
@@ -701,11 +703,15 @@ def _split_segments(
         for kf_seg in keyframe_segments:
             all_frames.extend(kf_seg)
         
+        frame_indices = sorted(list(set(all_frames)))
+        # 计算段的AABB（基于段内帧的lidar数据）
+        segment_aabb = self._compute_segment_aabb(scene_dataset, frame_indices)
+        
         segments.append({
             'segment_id': segment_id,
             'keyframe_indices': list(range(len(keyframe_segments))),
-            'frame_indices': sorted(list(set(all_frames))),
-            'aabb': scene_aabb,
+            'frame_indices': frame_indices,
+            'aabb': segment_aabb,
         })
     else:
         # 多个段，支持重叠
@@ -742,11 +748,15 @@ def _split_segments(
             
             # 只添加关键帧数量足够的段
             if len(current_segment_kf_indices) >= self.min_keyframes_per_segment:
+                frame_indices = sorted(list(current_segment_frames))
+                # 计算段的AABB（基于段内帧的lidar数据）
+                segment_aabb = self._compute_segment_aabb(scene_dataset, frame_indices)
+                
                 segments.append({
                     'segment_id': segment_id,
                     'keyframe_indices': current_segment_kf_indices,
-                    'frame_indices': sorted(list(current_segment_frames)),
-                    'aabb': scene_aabb,
+                    'frame_indices': frame_indices,
+                    'aabb': segment_aabb,
                 })
                 segment_id += 1
     
@@ -758,6 +768,112 @@ def _split_segments(
     
     return valid_segments
 ```
+
+### 4.1 段AABB计算
+
+每个段的AABB是基于段内帧的lidar数据独立计算的，而不是使用场景级别的AABB。这确保了每个段都有反映其实际数据范围的边界框。
+
+```python
+def _compute_segment_aabb(
+    self,
+    scene_dataset: DrivingDataset,
+    frame_indices: List[int],
+) -> Tensor:
+    """
+    计算段的AABB边界。
+    
+    使用段内帧的lidar数据，参考 lidar_source.get_aabb 的方式计算。
+    
+    流程：
+    1. 从 scene_dataset.lidar_source 获取段内帧的lidar数据
+    2. 筛选段内帧的lidar点（使用 timesteps 匹配 frame_indices）
+    3. 计算lidar点的3D坐标：lidar_pts = origins + directions * ranges
+    4. 下采样lidar点（使用 lidar_downsample_factor）
+    5. 使用分位数计算AABB边界：
+       - aabb_min = torch.quantile(lidar_pts, percentile, dim=0)
+       - aabb_max = torch.quantile(lidar_pts, 1 - percentile, dim=0)
+    6. 调整高度：如果 aabb_max[-1] < 20，设置为 20.0
+    
+    注意：
+    - 如果lidar_source不存在或段内没有lidar数据，回退到场景AABB
+    - 配置参数从 lidar_source.data_cfg 获取：
+      - lidar_downsample_factor: 下采样因子（默认4）
+      - lidar_percentile: 分位数（默认0.02）
+    
+    Args:
+        scene_dataset: 场景数据集实例
+        frame_indices: 段内帧索引列表
+        
+    Returns:
+        aabb: Tensor[2, 3] - 段的AABB边界 [min, max]
+    """
+    # 检查lidar_source是否存在
+    if scene_dataset.lidar_source is None:
+        logger.warning("Lidar source not available, falling back to scene AABB")
+        return scene_dataset.get_aabb()
+    
+    lidar_source = scene_dataset.lidar_source
+    
+    # 检查lidar数据是否已加载
+    assert (
+        lidar_source.origins is not None
+        and lidar_source.directions is not None
+        and lidar_source.ranges is not None
+        and lidar_source.timesteps is not None
+    ), "Lidar points not loaded, cannot compute segment AABB."
+    
+    # 筛选段内帧的lidar点
+    frame_indices_tensor = torch.tensor(frame_indices, dtype=lidar_source.timesteps.dtype, device=lidar_source.timesteps.device)
+    mask = torch.isin(lidar_source.timesteps, frame_indices_tensor)
+    
+    if not mask.any():
+        logger.warning(f"No lidar points found for frame indices {frame_indices}, falling back to scene AABB")
+        return scene_dataset.get_aabb()
+    
+    # 获取段内帧的lidar点
+    segment_origins = lidar_source.origins[mask]
+    segment_directions = lidar_source.directions[mask]
+    segment_ranges = lidar_source.ranges[mask]
+    
+    # 计算lidar点的3D坐标
+    lidar_pts = segment_origins + segment_directions * segment_ranges
+    
+    # 下采样lidar点
+    downsample_factor = lidar_source.data_cfg.get('lidar_downsample_factor', 4)
+    if downsample_factor > 1 and len(lidar_pts) > downsample_factor:
+        lidar_pts = lidar_pts[
+            torch.randperm(len(lidar_pts))[
+                : int(len(lidar_pts) / downsample_factor)
+            ]
+        ]
+    
+    # 使用分位数计算AABB
+    percentile = lidar_source.data_cfg.get('lidar_percentile', 0.02)
+    aabb_min = torch.quantile(lidar_pts, percentile, dim=0)
+    aabb_max = torch.quantile(lidar_pts, 1 - percentile, dim=0)
+    
+    # 清理临时变量
+    del lidar_pts
+    torch.cuda.empty_cache()
+    
+    # 通常lidar的高度非常小，所以稍微增加AABB的高度
+    if aabb_max[-1] < 20:
+        aabb_max[-1] = 20.0
+    
+    # 组合为 [min, max] 格式
+    aabb = torch.stack([aabb_min, aabb_max], dim=0)  # [2, 3]
+    
+    return aabb
+```
+
+**段AABB计算的优势**：
+- **精确性**：每个段的AABB反映该段内实际数据范围，而不是整个场景的范围
+- **适应性**：不同段可能有不同的空间分布，独立AABB能更好地适应这种变化
+- **效率**：使用段内lidar数据计算，避免使用整个场景的lidar数据
+
+**与场景AABB的关系**：
+- 段AABB通常包含在场景AABB内，但可能不完全一致（由于分位数计算和下采样）
+- 如果段内没有lidar数据或lidar_source不可用，会回退到场景AABB
 
 ### 5. Source 和 Target 选择
 
