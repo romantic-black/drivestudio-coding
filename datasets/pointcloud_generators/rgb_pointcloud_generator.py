@@ -613,7 +613,7 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
                         sky_mask = sky_mask.cpu().numpy()
                     if self.filter_sky:
                         # 天空掩码为 True 表示天空区域，需要取反（保留非天空区域）
-                        sky_mask = ~sky_mask.astype(bool)
+                        sky_mask = sky_mask.astype(bool)
                     else:
                         sky_mask = np.ones((H, W), dtype=bool)
                 else:
