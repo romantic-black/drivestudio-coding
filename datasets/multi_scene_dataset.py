@@ -54,6 +54,7 @@ class MultiSceneDataset:
         min_keyframes_per_segment: int = 6,
         device: torch.device = torch.device("cpu"),
         preload_scene_count: int = 3,
+        fixed_segment_aabb: Optional[Tensor] = None,
     ):
         """
         Initialize MultiSceneDataset.
@@ -73,6 +74,10 @@ class MultiSceneDataset:
             min_keyframes_per_segment: Minimum keyframes per segment, skip if not met (default 6)
             device: Device (default CPU)
             preload_scene_count: Number of scenes to preload ahead (default 3)
+            fixed_segment_aabb: Optional fixed AABB for all segments. If provided, all segments
+                will use this AABB instead of computing from lidar data. Shape: [2, 3] where
+                aabb[0] is [x_min, y_min, z_min] and aabb[1] is [x_max, y_max, z_max].
+                Coordinate system: x=front, y=left, z=up (same as _compute_segment_aabb).
         """
         # Store configuration
         self.data_cfg = data_cfg
@@ -94,6 +99,22 @@ class MultiSceneDataset:
         
         # Initialize preload scene count
         self.preload_scene_count = preload_scene_count
+        
+        # Initialize fixed segment AABB (if provided)
+        if fixed_segment_aabb is not None:
+            # Validate shape
+            if not isinstance(fixed_segment_aabb, Tensor):
+                fixed_segment_aabb = torch.tensor(fixed_segment_aabb, dtype=torch.float32)
+            if fixed_segment_aabb.shape != (2, 3):
+                raise ValueError(f"fixed_segment_aabb must have shape [2, 3], got {fixed_segment_aabb.shape}")
+            # Validate min < max
+            if not torch.all(fixed_segment_aabb[0] < fixed_segment_aabb[1]):
+                raise ValueError("fixed_segment_aabb min must be less than max")
+            # Move to device
+            self.fixed_segment_aabb = fixed_segment_aabb.to(device)
+            logger.info(f"Using fixed segment AABB: {self.fixed_segment_aabb}")
+        else:
+            self.fixed_segment_aabb = None
         
         # Initialize scene candidate pool (unvalidated scene IDs)
         self.scene_candidate_pool = train_scene_ids.copy()
@@ -997,8 +1018,11 @@ class MultiSceneDataset:
                 all_frames.extend(kf_seg)
             
             frame_indices = sorted(list(set(all_frames)))
-            # Compute segment AABB based on segment frames
-            segment_aabb = self._compute_segment_aabb(scene_dataset, frame_indices)
+            # Use fixed AABB if configured, otherwise compute from segment frames
+            if self.fixed_segment_aabb is not None:
+                segment_aabb = self.fixed_segment_aabb
+            else:
+                segment_aabb = self._compute_segment_aabb(scene_dataset, frame_indices)
             
             segments.append({
                 'segment_id': segment_id,
@@ -1042,8 +1066,11 @@ class MultiSceneDataset:
                 # Only add segment if it has enough keyframes
                 if len(current_segment_kf_indices) >= self.min_keyframes_per_segment:
                     frame_indices = sorted(list(current_segment_frames))
-                    # Compute segment AABB based on segment frames
-                    segment_aabb = self._compute_segment_aabb(scene_dataset, frame_indices)
+                    # Use fixed AABB if configured, otherwise compute from segment frames
+                    if self.fixed_segment_aabb is not None:
+                        segment_aabb = self.fixed_segment_aabb
+                    else:
+                        segment_aabb = self._compute_segment_aabb(scene_dataset, frame_indices)
                     
                     segments.append({
                         'segment_id': segment_id,

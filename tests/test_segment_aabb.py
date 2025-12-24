@@ -300,4 +300,126 @@ class TestSegmentAABB:
             # Check that at least two segments have different AABBs
             all_same = all(torch.allclose(aabbs[0], aabb) for aabb in aabbs[1:])
             assert not all_same, "Different segments should have different AABBs"
+    
+    def test_fixed_segment_aabb(self):
+        """Test that fixed segment AABB is used when provided."""
+        # Create mock lidar source
+        lidar_source = Mock()
+        lidar_source.data_cfg = OmegaConf.create({
+            'lidar_downsample_factor': 4,
+            'lidar_percentile': 0.02,
+        })
+        
+        # Create mock lidar data
+        num_points_per_frame = 1000
+        num_frames = 10
+        total_points = num_points_per_frame * num_frames
+        
+        origins = torch.zeros(total_points, 3)
+        directions = torch.randn(total_points, 3)
+        directions = directions / (directions.norm(dim=-1, keepdim=True) + 1e-8)
+        ranges = torch.ones(total_points, 1) * 10.0
+        
+        timesteps = torch.cat([
+            torch.ones(num_points_per_frame, dtype=torch.long) * i
+            for i in range(num_frames)
+        ])
+        
+        # Compute actual points with different offsets
+        points = origins + directions * ranges
+        for i in range(num_frames):
+            points[timesteps == i] += torch.tensor([i * 5.0, 0.0, 0.0])
+        
+        origins = points - directions * ranges
+        
+        lidar_source.origins = origins
+        lidar_source.directions = directions
+        lidar_source.ranges = ranges
+        lidar_source.timesteps = timesteps
+        
+        # Create mock scene dataset
+        scene_dataset = Mock()
+        scene_dataset.lidar_source = lidar_source
+        scene_aabb = torch.tensor([
+            [0.0, 0.0, 0.0],
+            [100.0, 100.0, 100.0]
+        ])
+        scene_dataset.get_aabb.return_value = scene_aabb
+        
+        # Create keyframe segments
+        keyframe_segments = [[i] for i in range(10)]
+        keyframe_ranges = torch.tensor([
+            [i * 2.0, (i + 1) * 2.0] for i in range(10)
+        ])  # Total distance = 20.0
+        
+        # Define fixed AABB
+        fixed_aabb = torch.tensor([
+            [-20.0, -20.0, -5.0],  # [x_min, y_min, z_min]
+            [20.0, 4.8, 20.0]      # [x_max, y_max, z_max]
+        ])
+        
+        # Create dataset with fixed AABB
+        dataset = MultiSceneDataset(
+            data_cfg=OmegaConf.create({}),
+            train_scene_ids=[],
+            eval_scene_ids=[],
+            min_keyframes_per_segment=3,
+            fixed_segment_aabb=fixed_aabb,
+        )
+        
+        # Split segments
+        segments = dataset._split_segments(
+            scene_dataset=scene_dataset,
+            keyframe_segments=keyframe_segments,
+            keyframe_ranges=keyframe_ranges,
+            overlap_ratio=0.2,
+        )
+        
+        # Check that segments have AABBs
+        assert len(segments) > 0, "Should have at least one segment"
+        
+        # Check that all segments use the fixed AABB
+        for segment in segments:
+            assert 'aabb' in segment, "Segment should have AABB"
+            assert segment['aabb'].shape == (2, 3), "AABB should have shape (2, 3)"
+            assert torch.allclose(segment['aabb'], fixed_aabb), \
+                f"Segment AABB should match fixed AABB, got {segment['aabb']}, expected {fixed_aabb}"
+    
+    def test_fixed_segment_aabb_validation(self):
+        """Test that fixed segment AABB validation works correctly."""
+        # Test invalid shape
+        with pytest.raises(ValueError, match="fixed_segment_aabb must have shape"):
+            MultiSceneDataset(
+                data_cfg=OmegaConf.create({}),
+                train_scene_ids=[],
+                eval_scene_ids=[],
+                fixed_segment_aabb=torch.tensor([1.0, 2.0, 3.0]),  # Wrong shape
+            )
+        
+        # Test min >= max
+        invalid_aabb = torch.tensor([
+            [20.0, 20.0, 20.0],  # min
+            [10.0, 10.0, 10.0]   # max (should be > min)
+        ])
+        with pytest.raises(ValueError, match="fixed_segment_aabb min must be less than max"):
+            MultiSceneDataset(
+                data_cfg=OmegaConf.create({}),
+                train_scene_ids=[],
+                eval_scene_ids=[],
+                fixed_segment_aabb=invalid_aabb,
+            )
+        
+        # Test valid AABB
+        valid_aabb = torch.tensor([
+            [-20.0, -20.0, -5.0],
+            [20.0, 4.8, 20.0]
+        ])
+        dataset = MultiSceneDataset(
+            data_cfg=OmegaConf.create({}),
+            train_scene_ids=[],
+            eval_scene_ids=[],
+            fixed_segment_aabb=valid_aabb,
+        )
+        assert dataset.fixed_segment_aabb is not None
+        assert torch.allclose(dataset.fixed_segment_aabb, valid_aabb)
 

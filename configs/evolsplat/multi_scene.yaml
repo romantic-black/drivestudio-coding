@@ -49,4 +49,11 @@ multi_scene:
     num_splits: 0  # Number of splits (0 means auto-determine)
     min_count: 1  # Minimum number of frames in each keyframe segment
     min_length: 2.0  # Minimum length of each keyframe segment
+  
+  # Fixed segment AABB configuration (optional)
+  # If provided, all segments will use this fixed AABB instead of computing from lidar data
+  # Format: [min, max] where min=[x_min, y_min, z_min] and max=[x_max, y_max, z_max]
+  # Coordinate system: x=front, y=left, z=up (same as _compute_segment_aabb)
+  # Set to null to use computed AABB from lidar data
+  fixed_segment_aabb: null  # Example: [[-20.0, -20.0, -5.0], [20.0, 4.8, 20.0]]
 

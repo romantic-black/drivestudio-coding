@@ -83,6 +83,7 @@ class MultiSceneDataset:
         min_keyframes_per_segment: int = 6,  # 段的最小关键帧数量
         device: torch.device = torch.device("cpu"),
         preload_scene_count: int = 3,  # 预加载场景数量
+        fixed_segment_aabb: Optional[Tensor] = None,  # 全局固定的段AABB（可选）
     ):
         """
         Args:
@@ -100,6 +101,10 @@ class MultiSceneDataset:
             min_keyframes_per_segment: 段的最小关键帧数量，不满足则跳过（默认6）
             device: 设备（默认CPU）
             preload_scene_count: 预加载场景数量（默认3），用于控制内存占用
+            fixed_segment_aabb: 可选的全局固定段AABB。如果提供，所有段将使用此固定AABB，
+                而不是从lidar数据计算。形状：[2, 3]，其中 aabb[0] 是 [x_min, y_min, z_min]，
+                aabb[1] 是 [x_max, y_max, z_max]。坐标系：x=front, y=left, z=up
+                （与 _compute_segment_aabb 一致）。如果为 None，则使用从lidar数据计算的AABB。
         """
         pass
     
@@ -641,14 +646,16 @@ def _split_segments(
     1. 获取场景的 AABB 和轨迹
     2. 计算关键帧的合计距离
     3. 将关键帧按照距离和 AABB 长度分组为段
-    4. 为每个段计算独立的 AABB（基于段内帧的lidar数据）
+    4. 为每个段计算独立的 AABB（基于段内帧的lidar数据，或使用固定AABB如果配置了）
     5. 过滤掉关键帧数量不足的段
     
     注意：
     - 段分割不需要那么精确，关键帧的合计距离对比AABB的长度即可
     - 段内设置一个最低关键帧数量限制，不满足则跳过
     - 段与段可以部分重合（overlap_ratio）
-    - **每个段使用独立的AABB**：基于段内帧的lidar数据计算，而不是使用场景AABB
+    - **每个段使用独立的AABB**：
+      - 如果配置了 `fixed_segment_aabb`，所有段使用此固定AABB
+      - 否则，基于段内帧的lidar数据计算，而不是使用场景AABB
     
     Args:
         scene_dataset: 场景数据集
@@ -704,8 +711,11 @@ def _split_segments(
             all_frames.extend(kf_seg)
         
         frame_indices = sorted(list(set(all_frames)))
-        # 计算段的AABB（基于段内帧的lidar数据）
-        segment_aabb = self._compute_segment_aabb(scene_dataset, frame_indices)
+        # 使用固定AABB（如果配置了），否则计算段的AABB（基于段内帧的lidar数据）
+        if self.fixed_segment_aabb is not None:
+            segment_aabb = self.fixed_segment_aabb
+        else:
+            segment_aabb = self._compute_segment_aabb(scene_dataset, frame_indices)
         
         segments.append({
             'segment_id': segment_id,
@@ -749,8 +759,11 @@ def _split_segments(
             # 只添加关键帧数量足够的段
             if len(current_segment_kf_indices) >= self.min_keyframes_per_segment:
                 frame_indices = sorted(list(current_segment_frames))
-                # 计算段的AABB（基于段内帧的lidar数据）
-                segment_aabb = self._compute_segment_aabb(scene_dataset, frame_indices)
+                # 使用固定AABB（如果配置了），否则计算段的AABB（基于段内帧的lidar数据）
+                if self.fixed_segment_aabb is not None:
+                    segment_aabb = self.fixed_segment_aabb
+                else:
+                    segment_aabb = self._compute_segment_aabb(scene_dataset, frame_indices)
                 
                 segments.append({
                     'segment_id': segment_id,
@@ -1379,6 +1392,9 @@ def split_trajectory(trajectory, num_splits=0, min_count=1, min_length=0):
 - [ ] **AABB 获取正确**：使用 `scene_dataset.get_aabb()` 获取场景 AABB
 - [ ] **段分割合理**：段的大小和数量合理
 - [ ] **重叠处理正确**：段与段之间的重叠比例正确应用
+- [ ] **固定AABB使用正确**：如果配置了 `fixed_segment_aabb`，所有段使用此固定AABB
+- [ ] **固定AABB格式正确**：固定AABB的形状为 [2, 3]，min < max
+- [ ] **固定AABB坐标系正确**：固定AABB使用与 `_compute_segment_aabb` 相同的坐标系（x=front, y=left, z=up）
 
 ### 10. 与 EVolSplat Offset 机制的兼容性
 
@@ -1425,7 +1441,11 @@ data_cfg = OmegaConf.create({
     },
 })
 
-# 2. 创建数据集
+# 2. 创建数据集（使用固定段AABB）
+fixed_aabb = torch.tensor([
+    [-20.0, -20.0, -5.0],  # [x_min, y_min, z_min]
+    [20.0, 4.8, 20.0]      # [x_max, y_max, z_max]
+])
 dataset = MultiSceneDataset(
     data_cfg=data_cfg,
     train_scene_ids=[0, 1, 2, 3, 4],
@@ -1442,6 +1462,7 @@ dataset = MultiSceneDataset(
     min_keyframes_per_segment=6,
     device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     preload_scene_count=3,  # 预加载3个场景
+    fixed_segment_aabb=fixed_aabb,  # 使用固定段AABB（可选）
 )
 
 # 3. 初始化数据集（可选，会在第一次使用时自动初始化）

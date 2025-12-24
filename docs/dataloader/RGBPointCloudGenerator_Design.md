@@ -18,7 +18,8 @@
 - 从 `MultiSceneDataset` 获取段内帧数据
 - 通过 `scene_data['dataset'].pixel_source.get_image(img_idx)` 获取图像和相机信息
 - 通过 `scene_data['segments'][segment_id]['frame_indices']` 获取段内所有帧索引
-- 通过 `scene_data['dataset'].get_aabb()` 获取场景 AABB
+- 通过 `scene_data['segments'][segment_id]['aabb']` 获取段的 AABB（如果配置了固定段AABB，所有段使用相同的AABB）
+- 通过 `scene_data['dataset'].get_aabb()` 获取场景 AABB（用于场景级别的操作）
 
 ### 2. 点云生成流程
 
@@ -922,6 +923,15 @@ for scene_id in train_scene_ids:
 
 - **Notebook**：使用第一帧第一相机的pose作为参考坐标系
 - **MultiSceneDataset**：外参可能已经对齐，需要确认
+
+### 5. 段 AABB 配置
+
+- **MultiSceneDataset**：支持全局固定的段 AABB 配置（`fixed_segment_aabb`）
+  - 如果配置了 `fixed_segment_aabb`，所有段使用此固定 AABB
+  - 否则，每个段基于段内帧的 lidar 数据计算独立的 AABB
+  - 固定 AABB 格式：`[2, 3]`，其中 `aabb[0]` 是 `[x_min, y_min, z_min]`，`aabb[1]` 是 `[x_max, y_max, z_max]`
+  - 坐标系：x=front, y=left, z=up（与 `_compute_segment_aabb` 一致）
+  - 点云生成器可以通过 `scene_data['segments'][segment_id]['aabb']` 获取段的 AABB
 
 ---
 
