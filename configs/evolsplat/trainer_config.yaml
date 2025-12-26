@@ -1,0 +1,46 @@
+# EVolsplatTrainer configuration
+# This configuration file defines parameters for EVolsplat feed-forward 3DGS training
+
+# Model configuration
+model:
+  # Sparse convolution network
+  sparseConv_outdim: 32  # Output dimension of sparse convolution
+  local_radius: 1  # Local radius for 2D feature sampling
+  offset_max: 0.1  # Maximum offset range
+  # Note: num_source_views is automatically calculated from dataset configuration
+  # num_source_views = num_source_keyframes × num_cams
+  sh_degree: 1  # Spherical harmonics degree
+  voxel_size: 0.1  # Voxel size for 3D feature volume
+  freeze_volume: false  # Whether to freeze feature volume after first computation
+  enable_background: true  # Whether to enable background model
+  
+  # Bounding box (optional, will use default if not provided)
+  bbx_min: [-20.0, -20.0, -5.0]  # [x_min, y_min, z_min]
+  bbx_max: [20.0, 4.8, 20.0]  # [x_max, y_max, z_max]
+
+# Training configuration
+training:
+  max_iterations: 30000  # Maximum training iterations
+  gradient_clip_val: 1.0  # Gradient clipping value (None to disable)
+  use_mixed_precision: false  # Whether to use mixed precision training
+  save_checkpoint_freq: 5000  # Checkpoint save frequency
+  save_checkpoint_dir: "./checkpoints"  # Checkpoint save directory
+
+# Loss configuration
+loss:
+  ssim_lambda: 0.2  # SSIM loss weight
+  entropy_loss: 0.1  # Entropy loss weight
+
+# Optimizer configuration
+optimizer:
+  type: Adam  # Optimizer type: Adam or AdamW
+  lr: 0.001  # Learning rate
+  eps: 1e-15  # Epsilon for numerical stability
+  weight_decay: 0.0  # Weight decay
+  
+  # Learning rate scheduler (optional)
+  scheduler:
+    type: cosine  # Scheduler type: cosine or None
+    T_max: 30000  # Maximum iterations for cosine annealing
+    eta_min: 0.0  # Minimum learning rate
+

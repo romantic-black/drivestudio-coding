@@ -1297,9 +1297,12 @@ class MultiSceneDataset:
         
         return batch
     
-    def sample_random_batch(self) -> Dict:
+    def sample_random_batch(self, eval: bool = False) -> Dict:
         """
         Randomly sample a training batch from current scene.
+        
+        Args:
+            eval: If True, sample from eval scenes; otherwise from train scenes
         
         Returns:
             Same format as get_segment_batch()
@@ -1308,14 +1311,22 @@ class MultiSceneDataset:
         if not self._initialized:
             self.initialize()
         
-        # Get current scene ID
-        current_scene_id = self.get_current_scene_id()
-        if current_scene_id is None:
-            # Try to initialize queue
-            self._ensure_training_queue_ready()
+        # Select scene IDs based on eval flag
+        if eval:
+            scene_ids = self.eval_scene_ids
+            if len(scene_ids) == 0:
+                raise ValueError("No evaluation scenes available. Please check eval_scene_ids configuration.")
+            # Randomly select an eval scene
+            current_scene_id = random.choice(scene_ids)
+        else:
+            # Get current scene ID from training queue
             current_scene_id = self.get_current_scene_id()
             if current_scene_id is None:
-                raise ValueError("No training scenes available. Please check scene IDs and configuration.")
+                # Try to initialize queue
+                self._ensure_training_queue_ready()
+                current_scene_id = self.get_current_scene_id()
+                if current_scene_id is None:
+                    raise ValueError("No training scenes available. Please check scene IDs and configuration.")
         
         # Ensure current scene is loaded
         scene_data = self._ensure_scene_loaded(current_scene_id)
