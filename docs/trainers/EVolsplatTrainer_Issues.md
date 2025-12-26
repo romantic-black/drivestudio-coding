@@ -116,10 +116,16 @@ vis_map_flat = vis_map.reshape(-1, vis_map.shape[-1])  # [N*num_views, 4]
 
 **修复状态**: ✅ **已通过方案C修复**
 
-- 删除了 `num_neighbour_select` 配置项
-- 在初始化时直接从 dataset 配置计算实际的 source 视图数量：`num_source_views = num_source_keyframes × num_cams`
-- `gaussion_decoder` 现在使用正确的 `feature_dim_in` 构建
-- 在 `extract_shared_features` 中添加了维度验证，确保实际视图数量与预期匹配
+**修复内容**:
+- ✅ 删除了 `num_neighbour_select` 配置项（从 `trainer_config.yaml` 中移除）
+- ✅ 在 `_init_networks` 中直接从 `self.dataset` 读取实际的源视图数量：
+  - `num_source_keyframes = self.dataset.num_source_keyframes`
+  - `num_cams` 从第一个场景的 `scene_data['num_cams']` 获取，或从配置中获取
+  - `num_source_views = num_source_keyframes × num_cams`
+- ✅ `gaussion_decoder` 现在使用正确的 `feature_dim_in` 构建（基于实际的 `num_source_views`）
+- ✅ 在 `extract_shared_features` 中添加了维度验证，确保实际视图数量与预期匹配
+- ✅ 更新了所有注释，删除了对 `num_neibours` 的引用
+- ✅ 添加了 `num_target_views` 的计算（用于参考）
 
 **错误代码**:
 
@@ -231,29 +237,58 @@ if actual_feature_dim_in != self.feature_dim_in:
 - 实现复杂，需要更新优化器
 - 可能影响训练稳定性（MLP 权重重新初始化）
 
-#### 方案 C: 确保配置一致性（最佳实践）
+#### 方案 C: 删除配置项，从 dataset 读取（✅ 已采用）
 
-在初始化时确保 `num_neighbour_select` 等于实际的源视图数量：
+**实现方式**:
+1. 删除 `num_neighbour_select` 配置项
+2. 在初始化时直接从 `self.dataset` 读取实际的源视图数量
+3. 使用实际数量构建 MLP，确保维度匹配
 
+**已实现的代码**:
 ```python
-# evolsplat.py __init__ 或 _init_networks 中
-# 在构建 gaussion_decoder 之前，从 dataset 获取实际的源视图数量
-num_source_views = self.dataset.num_source_keyframes * len(self.dataset.train_scene_ids[0] if self.dataset.train_scene_ids else [])
-# 或者从配置中获取
-num_source_views = self.config.data.pixel_source.get("num_cameras", 3) * self.config.multi_scene.num_source_keyframes
+# evolsplat.py _init_networks 中
+# Calculate number of source views from dataset configuration
+num_source_keyframes = self.dataset.num_source_keyframes
 
-# 确保 num_neighbour_select 匹配
-if model_cfg.num_neighbour_select != num_source_views:
-    logger.warning(
-        f"num_neighbour_select ({model_cfg.num_neighbour_select}) doesn't match "
-        f"actual source views ({num_source_views}). Updating num_neighbour_select."
-    )
-    model_cfg.num_neighbour_select = num_source_views
-    self.num_neighbours = num_source_views
-    self.feature_dim_in = 4 * self.num_neighbours * (2 * self.local_radius + 1) ** 2
+# Get number of cameras from dataset
+num_cams = None
+if hasattr(self.dataset, 'train_scene_ids') and len(self.dataset.train_scene_ids) > 0:
+    try:
+        scene_data = self.dataset._ensure_scene_loaded(self.dataset.train_scene_ids[0])
+        if scene_data is not None and 'num_cams' in scene_data:
+            num_cams = scene_data['num_cams']
+    except Exception as e:
+        logger.debug(f"Could not get num_cams from scene data: {e}")
+
+# Fallback: get from config if available
+if num_cams is None:
+    if hasattr(self.config, 'data') and hasattr(self.config.data, 'pixel_source'):
+        cameras = self.config.data.pixel_source.get('cameras', [0, 1, 2])
+        num_cams = len(cameras) if isinstance(cameras, list) else 1
+    else:
+        num_cams = 3  # Default fallback
+
+# Number of source views = num_source_keyframes * num_cams
+self.num_source_views = num_source_keyframes * num_cams
+
+# Use actual number to calculate feature_dim_in
+self.feature_dim_in = 4 * self.num_source_views * (2 * self.local_radius + 1) ** 2
+
+# Build gaussion_decoder with correct input dimension
+self.gaussion_decoder = MLP(
+    in_dim=self.feature_dim_in + 4,  # 确保维度正确
+    ...
+)
 ```
 
-**推荐**: 方案 A（限制视图数量）是最简单可靠的修复，方案 C（配置一致性）是最佳实践但需要更早的检查。
+**优点**: 
+- ✅ 完全消除配置不一致的问题
+- ✅ 自动适配不同的数据集配置
+- ✅ 在初始化时就确保维度正确，避免运行时错误
+- ✅ 代码更简洁，不需要维护额外的配置项
+
+**缺点**: 
+- 无（这是最佳实践）
 
 ---
 
@@ -484,15 +519,15 @@ loss_dict = {
 
 ## 问题优先级总结
 
-| 优先级    | 问题               | 影响             | 修复难度 |
-| --------- | ------------------ | ---------------- | -------- |
-| 🔴 High   | 配置文件键不匹配   | 训练无法启动     | 低       |
-| 🔴 High   | 特征维度不匹配     | 特征提取崩溃     | 中       |
-| 🔴 High   | MLP 维度不匹配      | 前向传播失败     | 中       |
-| 🔴 High   | 共享特征图问题     | 多次反向传播失败 | 中       |
-| 🔴 High   | 评估批次采样错误   | 评估无法运行     | 低       |
-| 🟡 Medium | 节点状态未恢复     | 恢复训练失败     | 中       |
-| 🟡 Medium | 熵损失未加入主损失 | 正则化不生效     | 低       |
+| 优先级    | 问题               | 影响             | 修复难度 | 状态     |
+| --------- | ------------------ | ---------------- | -------- | -------- |
+| 🔴 High   | 配置文件键不匹配   | 训练无法启动     | 低       | 待修复   |
+| 🔴 High   | 特征维度不匹配     | 特征提取崩溃     | 中       | 待修复   |
+| 🔴 High   | MLP 维度不匹配      | 前向传播失败     | 中       | ✅ 已修复 |
+| 🔴 High   | 共享特征图问题     | 多次反向传播失败 | 中       | 待修复   |
+| 🔴 High   | 评估批次采样错误   | 评估无法运行     | 低       | 待修复   |
+| 🟡 Medium | 节点状态未恢复     | 恢复训练失败     | 中       | 待修复   |
+| 🟡 Medium | 熵损失未加入主损失 | 正则化不生效     | 低       | 待修复   |
 
 ---
 
@@ -504,8 +539,8 @@ loss_dict = {
    - 评估批次采样错误（问题 4）
 2. **高优先级修复**（训练会崩溃）:
 
+   - ✅ MLP 维度不匹配（问题 2.1）- **已通过方案C修复**
    - 特征维度不匹配（问题 2）
-   - MLP 维度不匹配（问题 2.1）
    - 共享特征图问题（问题 3）
 3. **中优先级修复**（功能不完整）:
 

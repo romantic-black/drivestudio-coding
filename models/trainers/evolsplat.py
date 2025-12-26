@@ -161,6 +161,7 @@ class EVolsplatTrainer(nn.Module):
                 scene_data = self.dataset._ensure_scene_loaded(self.dataset.train_scene_ids[0])
                 if scene_data is not None and 'num_cams' in scene_data:
                     num_cams = scene_data['num_cams']
+                    logger.info(f"Got num_cams={num_cams} from scene {self.dataset.train_scene_ids[0]}")
             except Exception as e:
                 logger.debug(f"Could not get num_cams from scene data: {e}")
         
@@ -177,6 +178,10 @@ class EVolsplatTrainer(nn.Module):
         
         # Number of source views = num_source_keyframes * num_cams
         self.num_source_views = num_source_keyframes * num_cams
+        
+        # Also calculate num_target_views for reference
+        num_target_keyframes = self.dataset.num_target_keyframes
+        self.num_target_views = num_target_keyframes * num_cams
         
         # feature_dim_in = 4 * num_source_views * (2*local_radius+1)^2
         # where 4 = 3 (RGB) + 1 (visibility), num_source_views = actual number of source views
@@ -589,8 +594,8 @@ class EVolsplatTrainer(nn.Module):
         # vis_map: [N, num_views, (2R+1)^2, 1] - visibility map
         # After concat: [N, num_views, (2R+1)^2, 4]
         # Reshape to: [N, num_views * (2R+1)^2 * 4] = [N, feature_dim_in]
-        # where feature_dim_in = 4 * num_neibours * (2*local_radius+1)^2
-        # and num_neibours should equal num_views (number of source views)
+        # where feature_dim_in = 4 * num_source_views * (2*local_radius+1)^2
+        # and num_source_views = num_source_keyframes * num_cams
         
         # Get actual number of views from sampled_feat
         num_points = sampled_feat.shape[0]
