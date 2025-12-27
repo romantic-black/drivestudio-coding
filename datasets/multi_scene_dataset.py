@@ -77,7 +77,7 @@ class MultiSceneDataset:
             fixed_segment_aabb: Optional fixed AABB for all segments. If provided, all segments
                 will use this AABB instead of computing from lidar data. Shape: [2, 3] where
                 aabb[0] is [x_min, y_min, z_min] and aabb[1] is [x_max, y_max, z_max].
-                Coordinate system: x=front, y=left, z=up (same as _compute_segment_aabb).
+                Coordinate system: x=left-right, y=up-down (negative is up), z=back-front (same as _compute_segment_aabb).
         """
         # Store configuration
         self.data_cfg = data_cfg

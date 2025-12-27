@@ -15,7 +15,7 @@
 **问题描述**:
 训练脚本期望的配置键与现有配置文件不匹配：
 
-- 脚本期望：`cfg.data`, `cfg.multi_scene`, `cfg.pointcloud`, `cfg.trainer`
+- 脚本期望：`cfg.data`, `cfg.multi_scene`, `cfg.data.pointcloud`, `cfg.trainer`
 - 现有配置：`multi_scene.yaml` 和 `trainer_config.yaml` 不提供这些键
 
 **错误示例**:
@@ -38,8 +38,8 @@ dataset = MultiSceneDataset(
 **根本原因**:
 
 1. 配置文件结构与脚本期望不一致
-2. `multi_scene.yaml` 包含 `data` 和 `multi_scene`，但缺少 `pointcloud` 和 `trainer`
-3. `trainer_config.yaml` 只包含 `trainer` 相关配置，缺少 `data`、`multi_scene` 和 `pointcloud`
+2. `multi_scene.yaml` 包含 `data`（其中包含 `pointcloud`）和 `multi_scene`，但缺少 `trainer`
+3. `trainer_config.yaml` 只包含 `trainer` 相关配置，缺少 `data`、`multi_scene` 和 `data.pointcloud`
 
 **解决方案**:
 

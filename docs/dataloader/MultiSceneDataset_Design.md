@@ -103,7 +103,7 @@ class MultiSceneDataset:
             preload_scene_count: 预加载场景数量（默认3），用于控制内存占用
             fixed_segment_aabb: 可选的全局固定段AABB。如果提供，所有段将使用此固定AABB，
                 而不是从lidar数据计算。形状：[2, 3]，其中 aabb[0] 是 [x_min, y_min, z_min]，
-                aabb[1] 是 [x_max, y_max, z_max]。坐标系：x=front, y=left, z=up
+                aabb[1] 是 [x_max, y_max, z_max]。坐标系：x=左右, y=上下（负数为上）, z=后前
                 （与 _compute_segment_aabb 一致）。如果为 None，则使用从lidar数据计算的AABB。
         """
         pass
@@ -1394,7 +1394,7 @@ def split_trajectory(trajectory, num_splits=0, min_count=1, min_length=0):
 - [ ] **重叠处理正确**：段与段之间的重叠比例正确应用
 - [ ] **固定AABB使用正确**：如果配置了 `fixed_segment_aabb`，所有段使用此固定AABB
 - [ ] **固定AABB格式正确**：固定AABB的形状为 [2, 3]，min < max
-- [ ] **固定AABB坐标系正确**：固定AABB使用与 `_compute_segment_aabb` 相同的坐标系（x=front, y=left, z=up）
+- [ ] **固定AABB坐标系正确**：固定AABB使用与 `_compute_segment_aabb` 相同的坐标系（x=左右, y=上下（负数为上）, z=后前）
 
 ### 10. 与 EVolSplat Offset 机制的兼容性
 

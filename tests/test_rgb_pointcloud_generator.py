@@ -14,66 +14,82 @@ from datasets.pointcloud_generators.rgb_pointcloud_generator import (
     MonocularRGBPointCloudGenerator,
 )
 
+# Default AABB for tests
+DEFAULT_CROP_AABB = np.array([[-20, -20, -20], [20, 4.8, 70]])
+DEFAULT_INPUT_AABB = np.array([[-20, -20, -20], [20, 4.8, 70]])
+
 
 class TestRGBPointCloudGeneratorBase:
     """Test base class methods."""
     
-    def test_get_bbx_default(self):
-        """Test default bounding box."""
-        generator = MonocularRGBPointCloudGenerator()
-        bbx_min, bbx_max = generator.get_bbx()
-        
-        assert bbx_min.shape == (3,)
-        assert bbx_max.shape == (3,)
-        assert np.allclose(bbx_min, np.array([-20, -20, -20]))
-        assert np.allclose(bbx_max, np.array([20, 4.8, 70]))
-    
-    def test_get_bbx_custom(self):
-        """Test custom bounding box."""
-        bbx_min = np.array([-10, -10, -10])
-        bbx_max = np.array([10, 10, 10])
+    def test_get_crop_aabb(self):
+        """Test crop AABB getter."""
+        crop_aabb = np.array([[-20, -20, -20], [20, 4.8, 70]])
+        input_aabb = np.array([[-20, -20, -20], [20, 4.8, 70]])
         generator = MonocularRGBPointCloudGenerator(
-            bbx_min=bbx_min,
-            bbx_max=bbx_max,
+            crop_aabb=crop_aabb,
+            input_aabb=input_aabb,
+        )
+        crop_min, crop_max = generator.get_crop_aabb()
+        
+        assert crop_min.shape == (3,)
+        assert crop_max.shape == (3,)
+        assert np.allclose(crop_min, np.array([-20, -20, -20]))
+        assert np.allclose(crop_max, np.array([20, 4.8, 70]))
+    
+    def test_get_input_aabb(self):
+        """Test input AABB getter."""
+        crop_aabb = np.array([[-20, -20, -20], [20, 4.8, 70]])
+        input_aabb = np.array([[-10, -10, -10], [10, 10, 10]])
+        generator = MonocularRGBPointCloudGenerator(
+            crop_aabb=crop_aabb,
+            input_aabb=input_aabb,
         )
         
-        result_min, result_max = generator.get_bbx()
-        assert np.allclose(result_min, bbx_min)
-        assert np.allclose(result_max, bbx_max)
+        input_min, input_max = generator.get_input_aabb()
+        assert np.allclose(input_min, np.array([-10, -10, -10]))
+        assert np.allclose(input_max, np.array([10, 10, 10]))
     
     def test_crop_pointcloud(self):
         """Test point cloud cropping."""
-        generator = MonocularRGBPointCloudGenerator()
-        bbx_min, bbx_max = generator.get_bbx()
+        crop_aabb = np.array([[-20, -20, -20], [20, 4.8, 70]])
+        input_aabb = np.array([[-20, -20, -20], [20, 4.8, 70]])
+        generator = MonocularRGBPointCloudGenerator(
+            crop_aabb=crop_aabb,
+            input_aabb=input_aabb,
+        )
+        crop_min, crop_max = generator.get_crop_aabb()
         
         # Create test points
-        # Note: crop_pointcloud extends Z max by 50 for background points
-        # So Z max is actually 70 + 50 = 120
         points = np.array([
             [0, 0, 0],      # Inside
             [30, 0, 0],     # Outside (x > max)
             [0, 10, 0],     # Outside (y > max)
-            [0, 0, 100],    # Inside (z < 120, extended max)
+            [0, 0, 100],    # Outside (z > max, no extension)
             [-5, -5, -5],   # Inside
         ])
         colors = np.ones((5, 3)) * 0.5
         
         cropped_points, cropped_colors = generator.crop_pointcloud(
-            bbx_min, bbx_max, points, colors
+            crop_min, crop_max, points, colors
         )
         
-        assert len(cropped_points) == 3  # 3 points inside (including extended Z)
-        assert len(cropped_colors) == 3
+        assert len(cropped_points) == 2  # 2 points inside (no Z extension)
+        assert len(cropped_colors) == 2
         # Check that all expected points are present
         cropped_points_list = cropped_points.tolist()
         assert [0, 0, 0] in cropped_points_list
-        assert [0, 0, 100] in cropped_points_list
         assert [-5, -5, -5] in cropped_points_list
     
     def test_split_pointcloud(self):
         """Test point cloud splitting."""
-        generator = MonocularRGBPointCloudGenerator()
-        bbx_min, bbx_max = generator.get_bbx()
+        crop_aabb = np.array([[-20, -20, -20], [20, 4.8, 70]])
+        input_aabb = np.array([[-20, -20, -20], [20, 4.8, 70]])
+        generator = MonocularRGBPointCloudGenerator(
+            crop_aabb=crop_aabb,
+            input_aabb=input_aabb,
+        )
+        input_min, input_max = generator.get_input_aabb()
         
         # Create test points
         points = np.array([
@@ -84,7 +100,7 @@ class TestRGBPointCloudGeneratorBase:
         colors = np.ones((3, 3)) * 0.5
         
         inside_points, inside_colors, outside_points, outside_colors = generator.split_pointcloud(
-            bbx_min, bbx_max, points, colors
+            input_min, input_max, points, colors
         )
         
         assert len(inside_points) == 2
@@ -94,7 +110,12 @@ class TestRGBPointCloudGeneratorBase:
     
     def test_filter_pointcloud(self):
         """Test point cloud filtering."""
-        generator = MonocularRGBPointCloudGenerator()
+        crop_aabb = np.array([[-20, -20, -20], [20, 4.8, 70]])
+        input_aabb = np.array([[-20, -20, -20], [20, 4.8, 70]])
+        generator = MonocularRGBPointCloudGenerator(
+            crop_aabb=crop_aabb,
+            input_aabb=input_aabb,
+        )
         
         # Create a simple point cloud
         points = np.random.rand(100, 3) * 10
@@ -115,7 +136,11 @@ class TestMonocularRGBPointCloudGenerator:
     
     def test_sparsity_filter_full(self):
         """Test sparsity filter with 'full'."""
-        generator = MonocularRGBPointCloudGenerator(sparsity='full')
+        generator = MonocularRGBPointCloudGenerator(
+            sparsity='full',
+            crop_aabb=DEFAULT_CROP_AABB,
+            input_aabb=DEFAULT_INPUT_AABB,
+        )
         frame_indices = [0, 1, 2, 3, 4, 5]
         
         filtered = generator._apply_sparsity_filter(frame_indices)
@@ -123,7 +148,11 @@ class TestMonocularRGBPointCloudGenerator:
     
     def test_sparsity_filter_drop50(self):
         """Test sparsity filter with 'Drop50'."""
-        generator = MonocularRGBPointCloudGenerator(sparsity='Drop50')
+        generator = MonocularRGBPointCloudGenerator(
+            sparsity='Drop50',
+            crop_aabb=DEFAULT_CROP_AABB,
+            input_aabb=DEFAULT_INPUT_AABB,
+        )
         frame_indices = list(range(8))
         
         filtered = generator._apply_sparsity_filter(frame_indices)
@@ -133,7 +162,11 @@ class TestMonocularRGBPointCloudGenerator:
     
     def test_sparsity_filter_drop25(self):
         """Test sparsity filter with 'Drop25'."""
-        generator = MonocularRGBPointCloudGenerator(sparsity='Drop25')
+        generator = MonocularRGBPointCloudGenerator(
+            sparsity='Drop25',
+            crop_aabb=DEFAULT_CROP_AABB,
+            input_aabb=DEFAULT_INPUT_AABB,
+        )
         frame_indices = list(range(8))
         
         filtered = generator._apply_sparsity_filter(frame_indices)
@@ -142,7 +175,11 @@ class TestMonocularRGBPointCloudGenerator:
     
     def test_sparsity_filter_drop80(self):
         """Test sparsity filter with 'Drop80'."""
-        generator = MonocularRGBPointCloudGenerator(sparsity='Drop80')
+        generator = MonocularRGBPointCloudGenerator(
+            sparsity='Drop80',
+            crop_aabb=DEFAULT_CROP_AABB,
+            input_aabb=DEFAULT_INPUT_AABB,
+        )
         frame_indices = list(range(10))
         
         filtered = generator._apply_sparsity_filter(frame_indices)
@@ -152,7 +189,11 @@ class TestMonocularRGBPointCloudGenerator:
     
     def test_sparsity_filter_drop90(self):
         """Test sparsity filter with 'Drop90'."""
-        generator = MonocularRGBPointCloudGenerator(sparsity='Drop90')
+        generator = MonocularRGBPointCloudGenerator(
+            sparsity='Drop90',
+            crop_aabb=DEFAULT_CROP_AABB,
+            input_aabb=DEFAULT_INPUT_AABB,
+        )
         frame_indices = list(range(20))
         
         filtered = generator._apply_sparsity_filter(frame_indices)
@@ -358,6 +399,8 @@ class TestDepthConsistencyFix:
         generator = MonocularRGBPointCloudGenerator(
             depth_consistency=True,
             chosen_cam_ids=[0],
+            crop_aabb=DEFAULT_CROP_AABB,
+            input_aabb=DEFAULT_INPUT_AABB,
         )
         
         H, W = 100, 200
@@ -386,6 +429,8 @@ class TestDepthConsistencyFix:
         generator = MonocularRGBPointCloudGenerator(
             depth_consistency=True,
             chosen_cam_ids=[0, 1],
+            crop_aabb=DEFAULT_CROP_AABB,
+            input_aabb=DEFAULT_INPUT_AABB,
         )
         
         # Mock dataset
@@ -417,6 +462,8 @@ class TestSkyMask:
         generator = MonocularRGBPointCloudGenerator(
             filter_sky=True,
             chosen_cam_ids=[0],
+            crop_aabb=DEFAULT_CROP_AABB,
+            input_aabb=DEFAULT_INPUT_AABB,
         )
         
         H, W = 100, 200
@@ -450,6 +497,8 @@ class TestSkyMask:
         generator = MonocularRGBPointCloudGenerator(
             filter_sky=False,
             chosen_cam_ids=[0],
+            crop_aabb=DEFAULT_CROP_AABB,
+            input_aabb=DEFAULT_INPUT_AABB,
         )
         
         H, W = 100, 200
@@ -480,6 +529,8 @@ class TestSkyMask:
         generator = MonocularRGBPointCloudGenerator(
             filter_sky=True,
             chosen_cam_ids=[0],
+            crop_aabb=DEFAULT_CROP_AABB,
+            input_aabb=DEFAULT_INPUT_AABB,
         )
         
         H, W = 100, 200

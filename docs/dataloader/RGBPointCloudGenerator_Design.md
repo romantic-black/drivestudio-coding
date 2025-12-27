@@ -930,7 +930,7 @@ for scene_id in train_scene_ids:
   - 如果配置了 `fixed_segment_aabb`，所有段使用此固定 AABB
   - 否则，每个段基于段内帧的 lidar 数据计算独立的 AABB
   - 固定 AABB 格式：`[2, 3]`，其中 `aabb[0]` 是 `[x_min, y_min, z_min]`，`aabb[1]` 是 `[x_max, y_max, z_max]`
-  - 坐标系：x=front, y=left, z=up（与 `_compute_segment_aabb` 一致）
+  - 坐标系：x=左右, y=上下（负数为上）, z=后前（与 `_compute_segment_aabb` 一致）
   - 点云生成器可以通过 `scene_data['segments'][segment_id]['aabb']` 获取段的 AABB
 
 ---

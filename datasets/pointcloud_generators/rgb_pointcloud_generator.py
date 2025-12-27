@@ -19,11 +19,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Default bounding box for nuScenes
-X_MIN, X_MAX = -20, 20
-Y_MIN, Y_MAX = -20, 4.8
-Z_MIN, Z_MAX = -20, 70
-
 
 class RGBPointCloudGenerator(ABC):
     """
@@ -42,8 +37,8 @@ class RGBPointCloudGenerator(ABC):
         depth_consistency: bool = True,
         use_bbx: bool = True,
         downscale: int = 2,
-        bbx_min: Optional[np.ndarray] = None,  # [3] - 自定义边界框最小值
-        bbx_max: Optional[np.ndarray] = None,   # [3] - 自定义边界框最大值
+        crop_aabb: np.ndarray = None,  # [2, 3] - 裁剪边界框 [[x_min, y_min, z_min], [x_max, y_max, z_max]]
+        input_aabb: np.ndarray = None,  # [2, 3] - 输入边界框（用于分割和滤波）[[x_min, y_min, z_min], [x_max, y_max, z_max]]
         device: torch.device = torch.device("cpu"),
     ):
         """
@@ -53,8 +48,10 @@ class RGBPointCloudGenerator(ABC):
             depth_consistency: 是否进行深度一致性检查
             use_bbx: 是否使用边界框裁剪
             downscale: 点云生成时的下采样倍数
-            bbx_min: 自定义边界框最小值（如果为None，使用默认值）
-            bbx_max: 自定义边界框最大值（如果为None，使用默认值）
+            crop_aabb: 裁剪边界框，shape [2, 3]，格式 [[x_min, y_min, z_min], [x_max, y_max, z_max]]
+                      用于裁剪时移除超出边界框的点云
+            input_aabb: 输入边界框，shape [2, 3]，格式 [[x_min, y_min, z_min], [x_max, y_max, z_max]]
+                       用于分割和滤波时区分内部和外部点云
             device: 设备（用于深度图处理）
         """
         self.sparsity = sparsity
@@ -64,13 +61,25 @@ class RGBPointCloudGenerator(ABC):
         self.downscale = downscale
         self.device = device
         
-        # Custom bounding box or use defaults
-        if bbx_min is not None and bbx_max is not None:
-            self.bbx_min = np.array(bbx_min)
-            self.bbx_max = np.array(bbx_max)
-        else:
-            self.bbx_min = None
-            self.bbx_max = None
+        # Validate and store crop_aabb
+        if crop_aabb is None:
+            raise ValueError("crop_aabb must be provided (shape [2, 3])")
+        crop_aabb = np.array(crop_aabb)
+        if crop_aabb.shape != (2, 3):
+            raise ValueError(f"crop_aabb must have shape [2, 3], got {crop_aabb.shape}")
+        if not np.all(crop_aabb[0] < crop_aabb[1]):
+            raise ValueError("crop_aabb min must be less than max for all dimensions")
+        self.crop_aabb = crop_aabb
+        
+        # Validate and store input_aabb
+        if input_aabb is None:
+            raise ValueError("input_aabb must be provided (shape [2, 3])")
+        input_aabb = np.array(input_aabb)
+        if input_aabb.shape != (2, 3):
+            raise ValueError(f"input_aabb must have shape [2, 3], got {input_aabb.shape}")
+        if not np.all(input_aabb[0] < input_aabb[1]):
+            raise ValueError("input_aabb min must be less than max for all dimensions")
+        self.input_aabb = input_aabb
     
     @abstractmethod
     def generate_pointcloud(
@@ -92,33 +101,39 @@ class RGBPointCloudGenerator(ABC):
         """
         pass
     
-    def get_bbx(self) -> Tuple[np.ndarray, np.ndarray]:
+    def get_crop_aabb(self) -> Tuple[np.ndarray, np.ndarray]:
         """
-        获取边界框范围。
+        获取裁剪边界框范围。
         
         Returns:
-            bbx_min: [3] - 边界框最小值
-            bbx_max: [3] - 边界框最大值
+            crop_min: [3] - 裁剪边界框最小值
+            crop_max: [3] - 裁剪边界框最大值
         """
-        if self.bbx_min is not None and self.bbx_max is not None:
-            return self.bbx_min.copy(), self.bbx_max.copy()
-        else:
-            # Use default bounding box
-            return np.array([X_MIN, Y_MIN, Z_MIN]), np.array([X_MAX, Y_MAX, Z_MAX])
+        return self.crop_aabb[0].copy(), self.crop_aabb[1].copy()
+    
+    def get_input_aabb(self) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        获取输入边界框范围（用于分割和滤波）。
+        
+        Returns:
+            input_min: [3] - 输入边界框最小值
+            input_max: [3] - 输入边界框最大值
+        """
+        return self.input_aabb[0].copy(), self.input_aabb[1].copy()
     
     def crop_pointcloud(
         self,
-        bbx_min: np.ndarray,
-        bbx_max: np.ndarray,
+        crop_min: np.ndarray,
+        crop_max: np.ndarray,
         points: np.ndarray,  # [N, 3]
         colors: np.ndarray,  # [N, 3]
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        裁剪点云到边界框。
+        裁剪点云到边界框（移除超出边界框的点）。
         
         Args:
-            bbx_min: [3] - 边界框最小值
-            bbx_max: [3] - 边界框最大值
+            crop_min: [3] - 裁剪边界框最小值
+            crop_max: [3] - 裁剪边界框最大值
             points: [N, 3] - 点云位置
             colors: [N, 3] - 点云颜色
             
@@ -127,16 +142,16 @@ class RGBPointCloudGenerator(ABC):
             cropped_colors: [M, 3] - 裁剪后的点云颜色
         """
         mask = (
-            (points[:, 0] > bbx_min[0]) & (points[:, 0] < bbx_max[0]) &
-            (points[:, 1] > bbx_min[1]) & (points[:, 1] < bbx_max[1]) &
-            (points[:, 2] > bbx_min[2]) & (points[:, 2] < bbx_max[2] + 50)  # Extended Z for background
+            (points[:, 0] > crop_min[0]) & (points[:, 0] < crop_max[0]) &
+            (points[:, 1] > crop_min[1]) & (points[:, 1] < crop_max[1]) &
+            (points[:, 2] > crop_min[2]) & (points[:, 2] < crop_max[2])
         )
         return points[mask], colors[mask]
     
     def split_pointcloud(
         self,
-        bbx_min: np.ndarray,
-        bbx_max: np.ndarray,
+        input_min: np.ndarray,
+        input_max: np.ndarray,
         points: np.ndarray,  # [N, 3]
         colors: np.ndarray,  # [N, 3]
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -144,8 +159,8 @@ class RGBPointCloudGenerator(ABC):
         将点云分割为边界框内部和外部两部分。
         
         Args:
-            bbx_min: [3] - 边界框最小值
-            bbx_max: [3] - 边界框最大值
+            input_min: [3] - 输入边界框最小值
+            input_max: [3] - 输入边界框最大值
             points: [N, 3] - 点云位置
             colors: [N, 3] - 点云颜色
             
@@ -156,9 +171,9 @@ class RGBPointCloudGenerator(ABC):
             outside_colors: [M2, 3] - 外部点云颜色
         """
         mask = (
-            (points[:, 0] > bbx_min[0]) & (points[:, 0] < bbx_max[0]) &
-            (points[:, 1] > bbx_min[1]) & (points[:, 1] < bbx_max[1]) &
-            (points[:, 2] > bbx_min[2]) & (points[:, 2] < bbx_max[2])
+            (points[:, 0] > input_min[0]) & (points[:, 0] < input_max[0]) &
+            (points[:, 1] > input_min[1]) & (points[:, 1] < input_max[1]) &
+            (points[:, 2] > input_min[2]) & (points[:, 2] < input_max[2])
         )
         inside_points, inside_colors = points[mask], colors[mask]
         outside_points, outside_colors = points[~mask], colors[~mask]
@@ -209,8 +224,8 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
         depth_consistency: bool = True,
         use_bbx: bool = True,
         downscale: int = 2,
-        bbx_min: Optional[np.ndarray] = None,
-        bbx_max: Optional[np.ndarray] = None,
+        crop_aabb: np.ndarray = None,  # [2, 3] - 裁剪边界框
+        input_aabb: np.ndarray = None,  # [2, 3] - 输入边界框
         device: torch.device = torch.device("cpu"),
     ):
         """
@@ -221,8 +236,8 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
             depth_consistency: 是否进行深度一致性检查
             use_bbx: 是否使用边界框裁剪
             downscale: 点云生成时的下采样倍数
-            bbx_min: 自定义边界框最小值
-            bbx_max: 自定义边界框最大值
+            crop_aabb: 裁剪边界框，shape [2, 3]，格式 [[x_min, y_min, z_min], [x_max, y_max, z_max]]
+            input_aabb: 输入边界框，shape [2, 3]，格式 [[x_min, y_min, z_min], [x_max, y_max, z_max]]
             device: 设备
         """
         super().__init__(
@@ -231,8 +246,8 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
             depth_consistency=depth_consistency,
             use_bbx=use_bbx,
             downscale=downscale,
-            bbx_min=bbx_min,
-            bbx_max=bbx_max,
+            crop_aabb=crop_aabb,
+            input_aabb=input_aabb,
             device=device,
         )
         self.chosen_cam_ids = chosen_cam_ids
@@ -327,9 +342,13 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
         
         # 6. 应用边界框裁剪（如果启用）
         if self.use_bbx:
-            bbx_min, bbx_max = self.get_bbx()
+            crop_min, crop_max = self.get_crop_aabb()
+            input_min, input_max = self.get_input_aabb()
+            # 先裁剪：使用 crop_aabb 移除超出边界框的点
+            points, colors = self.crop_pointcloud(crop_min, crop_max, points, colors)
+            # 再分割：使用 input_aabb 分割为内部和外部点云
             inside_points, inside_colors, outside_points, outside_colors = self.split_pointcloud(
-                bbx_min, bbx_max, points, colors
+                input_min, input_max, points, colors
             )
             
             # 分别滤波内部和外部点云

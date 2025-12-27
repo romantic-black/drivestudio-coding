@@ -37,6 +37,22 @@ data:
     lidar_downsample_factor: 4  # downsample lidar by this factor to compute percentile
     lidar_percentile: 0.02  # percentile to compute aabb from lidar
 
+  # Point cloud generation configuration
+  pointcloud:
+    sparsity: full  # Point cloud sparsity level: 'Drop90', 'Drop80', 'Drop50', 'Drop25', 'full'
+    filter_sky: true  # Whether to filter sky regions
+    depth_consistency: true  # Whether to perform depth consistency check
+    use_bbx: true  # Whether to use bounding box filtering
+    downscale: 2  # Downsampling scale for point cloud generation
+    # Crop AABB: used for cropping (removing points outside this box)
+    # Format: [[x_min, y_min, z_min], [x_max, y_max, z_max]]
+    # Coordinate system: x=left-right, y=up-down (negative is up), z=back-front
+    crop_aabb: [[-20, -20, -20], [20, 4.8, 70]]
+    # Input AABB: used for splitting and filtering (distinguishing inside/outside points)
+    # Format: [[x_min, y_min, z_min], [x_max, y_max, z_max]]
+    # Coordinate system: x=left-right, y=up-down (negative is up), z=back-front
+    input_aabb: [[-20, -20, -20], [20, 4.8, 70]]
+
 # MultiSceneDataset specific configuration
 multi_scene:
   num_source_keyframes: 3  # Number of keyframes for source (3 frames × 6 cameras = 18 images)
@@ -53,7 +69,7 @@ multi_scene:
   # Fixed segment AABB configuration (optional)
   # If provided, all segments will use this fixed AABB instead of computing from lidar data
   # Format: [min, max] where min=[x_min, y_min, z_min] and max=[x_max, y_max, z_max]
-  # Coordinate system: x=front, y=left, z=up (same as _compute_segment_aabb)
+  # Coordinate system: x=left-right, y=up-down (negative is up), z=back-front (same as _compute_segment_aabb)
   # Set to null to use computed AABB from lidar data
-  fixed_segment_aabb: null  # Example: [[-20.0, -20.0, -5.0], [20.0, 4.8, 20.0]]
+  fixed_segment_aabb: [[-20, -20, -5], [70, 20, 5]]  # Example: [[-20.0, -20.0, -5.0], [20.0, 4.8, 20.0]]
 
