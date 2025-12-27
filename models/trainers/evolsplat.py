@@ -473,9 +473,9 @@ class EVolsplatTrainer(nn.Module):
         Returns:
             grid_coords: [N, 3] normalized grid coordinates in [-1, 1]
         """
-        # Get volume dimensions (will be set during feature extraction)
+        # Get volume dimensions (will be set during 3D feature extraction)
         if not hasattr(self, "vol_dim"):
-            raise RuntimeError("Volume dimensions not set. Call extract_shared_features first.")
+            raise RuntimeError("Volume dimensions not set. Call extract_3d_features_for_target first.")
         
         bounding_min = self.bbx_min
         pts = position_w - bounding_min.to(position_w.device)
@@ -516,14 +516,17 @@ class EVolsplatTrainer(nn.Module):
         )
         return feature
     
-    def extract_shared_features(
+    def extract_reusable_2d_features(
         self,
         batch: Dict,
         node: VanillaGaussians,
         offset: torch.Tensor,
     ) -> Dict:
         """
-        Extract shared features (executed once, shared by all target views).
+        Extract reusable 2D features from source views (executed once, shared by all target views).
+        
+        These features can be safely detached as they don't involve trainable networks.
+        They only depend on source views and can be reused across all target views.
         
         Args:
             batch: Training batch
@@ -531,21 +534,10 @@ class EVolsplatTrainer(nn.Module):
             offset: Current segment's offset
             
         Returns:
-            shared_state: Dictionary containing dense_volume, sampled_feat, valid_mask, etc.
+            reusable_2d_features: Dictionary containing sampled_feat, valid_mask, projection_mask, means, etc.
         """
-        scene_id = batch["scene_id"].item() if isinstance(batch["scene_id"], torch.Tensor) else batch["scene_id"]
-        
-        # Get means and anchor features
+        # Get means
         means = node._means  # [N, 3]
-        anchor_feats = node._features_dc  # [N, 3] - RGB converted to SH
-        
-        # Convert anchor_feats back to RGB for feature extraction
-        # (EVolsplat uses RGB as anchor features)
-        if node.sh_degree > 0:
-            from models.gaussians.basics import SH2RGB
-            anchor_feats_rgb = SH2RGB(anchor_feats)  # [N, 3]
-        else:
-            anchor_feats_rgb = torch.sigmoid(anchor_feats)  # [N, 3]
         
         # Prepare source images
         source_images = batch["source"]["image"]  # [num_source_keyframes * num_cams, H, W, 3]
@@ -554,31 +546,7 @@ class EVolsplatTrainer(nn.Module):
         source_intrinsics = batch["source"]["intrinsics"]  # [num_source_keyframes * num_cams, 4, 4]
         source_depth = batch["source"]["depth"]  # [num_source_keyframes * num_cams, H, W]
         
-        # Build 3D feature volume (if not frozen)
-        if not self.freeze_volume or (scene_id, self.current_segment_id) not in self.frozen_volume_cache:
-            sparse_feat, self.vol_dim, self.valid_coords = construct_sparse_tensor(
-                raw_coords=means.clone(),
-                feats=anchor_feats_rgb,
-                Bbx_max=self.bbx_max,
-                Bbx_min=self.bbx_min,
-                voxel_size=self.voxel_size,
-            )
-            feat_3d = self.sparse_conv(sparse_feat)
-            dense_volume = sparse_to_dense_volume(
-                sparse_tensor=feat_3d,
-                coords=self.valid_coords,
-                vol_dim=self.vol_dim,
-            ).unsqueeze(dim=0)
-            dense_volume = rearrange(dense_volume, "B H W D C -> B C H W D")
-            
-            # Cache if frozen
-            if self.freeze_volume:
-                self.frozen_volume_cache[(scene_id, self.current_segment_id)] = dense_volume.cpu()
-        else:
-            # Use cached volume
-            dense_volume = self.frozen_volume_cache[(scene_id, self.current_segment_id)].to(self.device)
-        
-        # 2D feature sampling
+        # 2D feature sampling (reusable across all target views)
         sampled_feat, valid_mask, vis_map = self.projector.sample_within_window(
             xyz=means,
             train_imgs=source_images.squeeze(0),  # [N_view, c, h, w]
@@ -636,44 +604,104 @@ class EVolsplatTrainer(nn.Module):
         # Create projection mask
         projection_mask = valid_mask[..., :].sum(dim=1) > self.local_radius ** 2 + 1
         
-        shared_state = {
-            "dense_volume": dense_volume,
+        reusable_2d_features = {
             "sampled_feat": sampled_feat,
             "valid_mask": valid_mask,
             "projection_mask": projection_mask,
             "means": means,
-            "anchor_feats": anchor_feats_rgb,
-            "source_images": source_images,
-            "source_extrinsics": source_extrinsics,
-            "source_intrinsics": source_intrinsics,
         }
         
-        return shared_state
+        return reusable_2d_features
+    
+    def extract_3d_features_for_target(
+        self,
+        batch: Dict,
+        node: VanillaGaussians,
+        offset: torch.Tensor,
+        means_crop: torch.Tensor,
+        last_offset: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Extract 3D features for a specific target view (needs gradients).
+        
+        This function recomputes feat_3d through sparse_conv for each target view,
+        ensuring gradients can flow back to sparse_conv parameters.
+        
+        Args:
+            batch: Training batch
+            node: Current segment's node
+            offset: Current segment's offset
+            means_crop: Cropped means [num_points, 3] (after projection_mask)
+            last_offset: Last offset for cropped points [num_points, 3]
+            
+        Returns:
+            feat_3d: 3D features for cropped points [num_points, C] (with gradients)
+        """
+        scene_id = batch["scene_id"].item() if isinstance(batch["scene_id"], torch.Tensor) else batch["scene_id"]
+        
+        # Get means and anchor features
+        means = node._means  # [N, 3]
+        anchor_feats = node._features_dc  # [N, 3] - RGB converted to SH
+        
+        # Convert anchor_feats back to RGB for feature extraction
+        # (EVolsplat uses RGB as anchor features)
+        if node.sh_degree > 0:
+            from models.gaussians.basics import SH2RGB
+            anchor_feats_rgb = SH2RGB(anchor_feats)  # [N, 3]
+        else:
+            anchor_feats_rgb = torch.sigmoid(anchor_feats)  # [N, 3]
+        
+        # Build 3D feature volume (recompute for each target view to maintain gradients)
+        # Note: We don't use freeze_volume cache here because we need gradients
+        sparse_feat, self.vol_dim, self.valid_coords = construct_sparse_tensor(
+            raw_coords=means.clone(),
+            feats=anchor_feats_rgb,
+            Bbx_max=self.bbx_max,
+            Bbx_min=self.bbx_min,
+            voxel_size=self.voxel_size,
+        )
+        feat_3d = self.sparse_conv(sparse_feat)  # This needs gradients!
+        dense_volume = sparse_to_dense_volume(
+            sparse_tensor=feat_3d,
+            coords=self.valid_coords,
+            vol_dim=self.vol_dim,
+        ).unsqueeze(dim=0)
+        dense_volume = rearrange(dense_volume, "B H W D C -> B C H W D")
+        
+        # Trilinear interpolation of 3D features for cropped points
+        grid_coords = self.get_grid_coords(means_crop + last_offset)
+        feat_3d_crop = self.interpolate_features(
+            grid_coords=grid_coords,
+            feature_volume=dense_volume,
+        ).permute(3, 4, 1, 0, 2).squeeze()  # [num_points, C]
+        
+        return feat_3d_crop
     
     def render_for_target_view(
         self,
         target_view: Dict,
-        shared_state: Dict,
+        reusable_2d_features: Dict,
         node: VanillaGaussians,
         offset: torch.Tensor,
+        batch: Dict,
     ) -> Dict[str, torch.Tensor]:
         """
         Render image for a single target view.
         
         Args:
             target_view: Target view data (image, camera parameters, etc.)
-            shared_state: Shared feature state from extract_shared_features
+            reusable_2d_features: Reusable 2D features from extract_reusable_2d_features
             node: Current segment's node
             offset: Current segment's offset
+            batch: Training batch (needed for extract_3d_features_for_target)
             
         Returns:
             outputs: Dictionary with rgb, depth, accumulation, etc.
         """
-        # Extract shared state
-        dense_volume = shared_state["dense_volume"]
-        sampled_feat = shared_state["sampled_feat"]
-        projection_mask = shared_state["projection_mask"]
-        means = shared_state["means"]
+        # Extract reusable 2D features
+        sampled_feat = reusable_2d_features["sampled_feat"]
+        projection_mask = reusable_2d_features["projection_mask"]
+        means = reusable_2d_features["means"]
         
         # Get target camera parameters
         target_extrinsic = target_view["extrinsic"]  # [4, 4]
@@ -699,12 +727,14 @@ class EVolsplatTrainer(nn.Module):
             avg_dist = distances.mean(dim=-1, keepdim=True)
             valid_scales = torch.log(avg_dist.repeat(1, 3))
         
-        # Trilinear interpolation of 3D features
-        grid_coords = self.get_grid_coords(means_crop + last_offset)
-        feat_3d = self.interpolate_features(
-            grid_coords=grid_coords,
-            feature_volume=dense_volume,
-        ).permute(3, 4, 1, 0, 2).squeeze()
+        # Extract 3D features for this target view (recomputes with gradients)
+        feat_3d = self.extract_3d_features_for_target(
+            batch=batch,
+            node=node,
+            offset=offset,
+            means_crop=means_crop,
+            last_offset=last_offset,
+        )
         
         # Compute ob_view and ob_dist
         with torch.no_grad():
@@ -929,18 +959,16 @@ class EVolsplatTrainer(nn.Module):
         node = self.nodes[segment_key]
         offset = self.offset_cache[segment_key].to(self.device)
         
-        # 3. Extract shared features (only once) and detach non-differentiable parts
-        shared_state = self.extract_shared_features(batch, node, offset)
+        # 3. Extract reusable 2D features (only once, can be detached)
+        reusable_2d_features = self.extract_reusable_2d_features(batch, node, offset)
         
-        # Detach shared features to avoid computation graph issues with multiple backward passes
-        # The shared features (3D volume, sampled features) are computed once and reused
-        # We detach them so each target view can have its own computation graph
-        shared_state_detached = {}
-        for k, v in shared_state.items():
+        # Detach reusable 2D features (they don't involve trainable networks)
+        reusable_2d_features_detached = {}
+        for k, v in reusable_2d_features.items():
             if isinstance(v, torch.Tensor):
-                shared_state_detached[k] = v.detach()
+                reusable_2d_features_detached[k] = v.detach()
             else:
-                shared_state_detached[k] = v
+                reusable_2d_features_detached[k] = v
         
         # 4. Optimizer zero grad
         self.optimizer.zero_grad()
@@ -948,22 +976,37 @@ class EVolsplatTrainer(nn.Module):
         # 5. Loop over each target view
         num_target_views = batch["target"]["image"].shape[0]
         total_loss = 0.0
-        last_offset_crop = None
-        last_projection_mask = None
+        
+        # Aggregate losses from all target views
+        aggregated_loss_dict = {
+            "main_loss": 0.0,
+            "l1_loss": 0.0,
+            "ssim_loss": 0.0,
+            "entropy_loss": 0.0,
+        }
+        
+        # Aggregate offsets from all target views
+        # Initialize offset accumulator and counter
+        means = reusable_2d_features_detached["means"]
+        num_all_points = means.shape[0]
+        offset_accumulator = torch.zeros(num_all_points, 3, device=self.device)
+        offset_counter = torch.zeros(num_all_points, device=self.device, dtype=torch.long)
         
         use_mixed_precision = self.config.training.get("use_mixed_precision", False)
         
         for target_idx in range(num_target_views):
             target_view = self._get_target_view(batch, target_idx)
             
-            # Render (using detached shared state, but recomputing differentiable parts)
+            # Render (feat_3d will be recomputed inside render_for_target_view with gradients)
             autocast_context = torch.cuda.amp.autocast() if use_mixed_precision else nullcontext()
             with autocast_context:
-                outputs = self.render_for_target_view(target_view, shared_state_detached, node, offset)
+                outputs = self.render_for_target_view(
+                    target_view, reusable_2d_features_detached, node, offset, batch
+                )
                 loss_dict = self.compute_loss(outputs, target_view["image"])
                 loss = loss_dict["main_loss"] / num_target_views
             
-            # Backward (no retain_graph needed since shared features are detached)
+            # Backward (no retain_graph needed since 3D features are recomputed for each view)
             if use_mixed_precision:
                 self.scaler.scale(loss).backward()
             else:
@@ -971,9 +1014,17 @@ class EVolsplatTrainer(nn.Module):
             
             total_loss += loss.item()
             
-            # Store offset for update (use last one)
-            last_offset_crop = outputs["offset_crop"]
-            last_projection_mask = outputs["projection_mask"]
+            # Aggregate losses
+            for key in aggregated_loss_dict.keys():
+                aggregated_loss_dict[key] += loss_dict[key].item() / num_target_views
+            
+            # Aggregate offsets from this view
+            offset_crop = outputs["offset_crop"].detach()  # [num_points_crop, 3]
+            projection_mask = outputs["projection_mask"]  # [num_all_points]
+            
+            # Accumulate offsets for points that are projected in this view
+            offset_accumulator[projection_mask] += offset_crop
+            offset_counter[projection_mask] += 1
         
         # 6. Gradient clipping (if enabled)
         gradient_clip_val = self.config.training.get("gradient_clip_val", None)
@@ -992,9 +1043,18 @@ class EVolsplatTrainer(nn.Module):
         else:
             self.optimizer.step()
         
-        # 8. Update offset (from last rendering)
-        if last_offset_crop is not None and last_projection_mask is not None:
-            self.update_offset(scene_id, segment_id, last_offset_crop, last_projection_mask)
+        # 8. Update offset (aggregated from all target views)
+        # Compute average offset for points that were projected in at least one view
+        has_projection = offset_counter > 0
+        if has_projection.any():
+            # Average offset for points projected in multiple views
+            averaged_offset = torch.zeros_like(offset_accumulator)
+            averaged_offset[has_projection] = (
+                offset_accumulator[has_projection] / offset_counter[has_projection].float().unsqueeze(-1)
+            )
+            
+            # Update offset cache with aggregated offsets
+            self.update_offset(scene_id, segment_id, averaged_offset[has_projection], has_projection)
         
         # Update step counter
         self.step += 1
@@ -1003,9 +1063,15 @@ class EVolsplatTrainer(nn.Module):
         if self.scheduler is not None:
             self.scheduler.step()
         
+        # Convert aggregated losses to tensors
+        aggregated_loss_dict_tensors = {
+            key: torch.tensor(value, device=self.device) 
+            for key, value in aggregated_loss_dict.items()
+        }
+        
         return {
             "total_loss": torch.tensor(total_loss, device=self.device),
-            **loss_dict,
+            **aggregated_loss_dict_tensors,
         }
     
     def save_checkpoint(self, step: int, is_final: bool = False):
@@ -1205,12 +1271,12 @@ class EVolsplatTrainer(nn.Module):
             node = self.nodes[segment_key]
             offset = self.offset_cache[segment_key].to(self.device)
             
-            # Extract shared features
-            shared_state = self.extract_shared_features(batch, node, offset)
+            # Extract reusable 2D features
+            reusable_2d_features = self.extract_reusable_2d_features(batch, node, offset)
             
             # Render first target view (for evaluation)
             target_view = self._get_target_view(batch, 0)
-            outputs = self.render_for_target_view(target_view, shared_state, node, offset)
+            outputs = self.render_for_target_view(target_view, reusable_2d_features, node, offset, batch)
             
             # Compute metrics
             pred_rgb = outputs["rgb"]
