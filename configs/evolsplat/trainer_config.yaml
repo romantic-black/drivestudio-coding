@@ -15,8 +15,8 @@ model:
   enable_background: true  # Whether to enable background model
   
   # Bounding box (optional, will use default if not provided)
-  bbx_min: [-20.0, -20.0, -5.0]  # [x_min, y_min, z_min]
-  bbx_max: [20.0, 4.8, 20.0]  # [x_max, y_max, z_max]
+  bbx_min: [-20.0, -20.0, -20.0]  # [x_min, y_min, z_min]
+  bbx_max: [20.0, 4.8, 70.0]  # [x_max, y_max, z_max]
 
 # Training configuration
 training:

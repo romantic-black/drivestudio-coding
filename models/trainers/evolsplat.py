@@ -622,10 +622,10 @@ class EVolsplatTrainer(nn.Module):
         last_offset: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Extract 3D features for a specific target view (needs gradients).
+        Extract 3D features for a specific target view.
         
-        This function recomputes feat_3d through sparse_conv for each target view,
-        ensuring gradients can flow back to sparse_conv parameters.
+        In training mode: Always recomputes feat_3d through sparse_conv to maintain gradients.
+        In eval mode with freeze_volume=True: Uses cached volume if available for speed.
         
         Args:
             batch: Training batch
@@ -635,7 +635,7 @@ class EVolsplatTrainer(nn.Module):
             last_offset: Last offset for cropped points [num_points, 3]
             
         Returns:
-            feat_3d: 3D features for cropped points [num_points, C] (with gradients)
+            feat_3d: 3D features for cropped points [num_points, C] (with gradients in training mode)
         """
         scene_id = batch["scene_id"].item() if isinstance(batch["scene_id"], torch.Tensor) else batch["scene_id"]
         
@@ -651,22 +651,48 @@ class EVolsplatTrainer(nn.Module):
         else:
             anchor_feats_rgb = torch.sigmoid(anchor_feats)  # [N, 3]
         
-        # Build 3D feature volume (recompute for each target view to maintain gradients)
-        # Note: We don't use freeze_volume cache here because we need gradients
-        sparse_feat, self.vol_dim, self.valid_coords = construct_sparse_tensor(
-            raw_coords=means.clone(),
-            feats=anchor_feats_rgb,
-            Bbx_max=self.bbx_max,
-            Bbx_min=self.bbx_min,
-            voxel_size=self.voxel_size,
+        # Build 3D feature volume
+        # In training mode: Always recompute to maintain gradients (even if freeze_volume=True)
+        # In eval mode: Use cached volume if freeze_volume=True and cache exists
+        use_cached_volume = (
+            self.freeze_volume 
+            and not self.training 
+            and (scene_id, self.current_segment_id) in self.frozen_volume_cache
         )
-        feat_3d = self.sparse_conv(sparse_feat)  # This needs gradients!
-        dense_volume = sparse_to_dense_volume(
-            sparse_tensor=feat_3d,
-            coords=self.valid_coords,
-            vol_dim=self.vol_dim,
-        ).unsqueeze(dim=0)
-        dense_volume = rearrange(dense_volume, "B H W D C -> B C H W D")
+        
+        if use_cached_volume:
+            # Use cached volume (no gradients needed in eval mode)
+            dense_volume = self.frozen_volume_cache[(scene_id, self.current_segment_id)].to(self.device)
+            # vol_dim and valid_coords should already be set from previous computation
+            # If not, we need to recompute them
+            if not hasattr(self, "vol_dim") or self.vol_dim is None:
+                sparse_feat, self.vol_dim, self.valid_coords = construct_sparse_tensor(
+                    raw_coords=means.clone(),
+                    feats=anchor_feats_rgb,
+                    Bbx_max=self.bbx_max,
+                    Bbx_min=self.bbx_min,
+                    voxel_size=self.voxel_size,
+                )
+        else:
+            # Recompute volume (always in training mode, or in eval mode if no cache)
+            sparse_feat, self.vol_dim, self.valid_coords = construct_sparse_tensor(
+                raw_coords=means.clone(),
+                feats=anchor_feats_rgb,
+                Bbx_max=self.bbx_max,
+                Bbx_min=self.bbx_min,
+                voxel_size=self.voxel_size,
+            )
+            feat_3d = self.sparse_conv(sparse_feat)  # This needs gradients in training mode!
+            dense_volume = sparse_to_dense_volume(
+                sparse_tensor=feat_3d,
+                coords=self.valid_coords,
+                vol_dim=self.vol_dim,
+            ).unsqueeze(dim=0)
+            dense_volume = rearrange(dense_volume, "B H W D C -> B C H W D")
+            
+            # Cache volume if freeze_volume is enabled and in eval mode (for future use)
+            if self.freeze_volume and not self.training:
+                self.frozen_volume_cache[(scene_id, self.current_segment_id)] = dense_volume.cpu()
         
         # Trilinear interpolation of 3D features for cropped points
         grid_coords = self.get_grid_coords(means_crop + last_offset)
