@@ -72,15 +72,13 @@ def setup(args):
             if "trainer" in trainer_cfg:
                 cfg.trainer = trainer_cfg.trainer
     
-    # Add default pointcloud config if missing
-    if "pointcloud" not in cfg:
-        cfg.pointcloud = OmegaConf.create({
-            "sparsity": "full",
-            "filter_sky": True,
-            "depth_consistency": True,
-            "use_bbx": True,
-            "downscale": 2,
-        })
+    # Ensure data config exists
+    if "data" not in cfg:
+        raise ValueError("data config is required but not found")
+    
+    # Add default pointcloud config if missing (under data.pointcloud)
+    if "pointcloud" not in cfg.data:
+        raise ValueError("pointcloud config is required but not found")
     
     # Create log directory
     log_dir = os.path.join(args.output_root, args.project, args.run_name)
@@ -132,13 +130,17 @@ def main(args):
     
     # Build RGB point cloud generator
     logger.info("Building RGBPointCloudGenerator...")
+    crop_aabb = np.array(cfg.data.pointcloud.crop_aabb)
+    input_aabb = np.array(cfg.data.pointcloud.input_aabb)
     pointcloud_generator = MonocularRGBPointCloudGenerator(
         chosen_cam_ids=cfg.data.pixel_source.cameras,
-        sparsity=cfg.pointcloud.get("sparsity", "full"),
-        filter_sky=cfg.pointcloud.get("filter_sky", True),
-        depth_consistency=cfg.pointcloud.get("depth_consistency", True),
-        use_bbx=cfg.pointcloud.get("use_bbx", True),
-        downscale=cfg.pointcloud.get("downscale", 2),
+        sparsity=cfg.data.pointcloud.get("sparsity", "full"),
+        filter_sky=cfg.data.pointcloud.get("filter_sky", True),
+        depth_consistency=cfg.data.pointcloud.get("depth_consistency", True),
+        use_bbx=cfg.data.pointcloud.get("use_bbx", True),
+        downscale=cfg.data.pointcloud.get("downscale", 2),
+        crop_aabb=crop_aabb,
+        input_aabb=input_aabb,
         device=device,
     )
     
