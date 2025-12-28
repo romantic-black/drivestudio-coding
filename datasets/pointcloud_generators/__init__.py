@@ -7,10 +7,12 @@ This module provides point cloud generation functionality for MultiSceneDataset.
 from .rgb_pointcloud_generator import (
     RGBPointCloudGenerator,
     MonocularRGBPointCloudGenerator,
+    LiDARRGBPointCloudGenerator,
 )
 
 __all__ = [
     'RGBPointCloudGenerator',
     'MonocularRGBPointCloudGenerator',
+    'LiDARRGBPointCloudGenerator',
 ]
 
