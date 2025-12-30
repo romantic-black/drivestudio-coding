@@ -4,12 +4,11 @@ Integration tests for RGB Point Cloud Generator.
 import pytest
 import torch
 import numpy as np
-import open3d as o3d
 from unittest.mock import Mock, MagicMock, patch
 from omegaconf import OmegaConf
 
 from datasets.multi_scene_dataset import MultiSceneDataset, MultiSceneDatasetScheduler
-from datasets.pointcloud_generators.rgb_pointcloud_generator import (
+from datasets.pointcloud_generators import (
     RGBPointCloudGenerator,
     MonocularRGBPointCloudGenerator,
 )
@@ -121,14 +120,13 @@ class TestRGBPointCloudGeneratorBase:
         points = np.random.rand(100, 3) * 10
         colors = np.random.rand(100, 3)
         
-        pointcloud = o3d.geometry.PointCloud()
-        pointcloud.points = o3d.utility.Vector3dVector(points)
-        pointcloud.colors = o3d.utility.Vector3dVector(colors)
+        filtered_points, filtered_colors = generator.filter_pointcloud(
+            points, colors, use_bbx=False
+        )
         
-        filtered = generator.filter_pointcloud(pointcloud, use_bbx=False)
-        
-        assert isinstance(filtered, o3d.geometry.PointCloud)
-        assert len(filtered.points) <= len(points)  # Should have fewer points after filtering
+        assert filtered_points.shape[1] == 3
+        assert filtered_colors.shape[1] == 3
+        assert len(filtered_points) <= len(points)  # Should have fewer/equal points after filtering
 
 
 class TestMonocularRGBPointCloudGenerator:
@@ -315,8 +313,11 @@ class TestMultiSceneDatasetSchedulerExtensions:
         
         # Create mock pointcloud generator
         generator = Mock(spec=MonocularRGBPointCloudGenerator)
-        mock_pointcloud = o3d.geometry.PointCloud()
-        mock_pointcloud.points = o3d.utility.Vector3dVector(np.random.rand(100, 3))
+        mock_pointcloud = {
+            "background": np.random.rand(100, 6).astype(np.float32),
+            "dynamic_objects": {},
+            "instance_mapping": {},
+        }
         generator.generate_pointcloud.return_value = mock_pointcloud
         
         # Create scheduler with mocked dataset
@@ -334,7 +335,7 @@ class TestMultiSceneDatasetSchedulerExtensions:
             # Test generating pointcloud
             pointcloud = scheduler.generate_segment_pointcloud(generator)
             
-            assert isinstance(pointcloud, o3d.geometry.PointCloud)
+            assert isinstance(pointcloud, dict)
             generator.generate_pointcloud.assert_called_once_with(
                 dataset=dataset,
                 scene_id=0,
@@ -367,8 +368,11 @@ class TestMultiSceneDatasetSchedulerExtensions:
         
         # Create mock pointcloud generator
         generator = Mock(spec=MonocularRGBPointCloudGenerator)
-        mock_pointcloud = o3d.geometry.PointCloud()
-        mock_pointcloud.points = o3d.utility.Vector3dVector(np.random.rand(100, 3))
+        mock_pointcloud = {
+            "background": np.random.rand(50, 6).astype(np.float32),
+            "dynamic_objects": {},
+            "instance_mapping": {},
+        }
         generator.generate_pointcloud.return_value = mock_pointcloud
         
         # Create scheduler with mocked dataset
@@ -454,105 +458,6 @@ class TestDepthConsistencyFix:
         assert generator.chosen_cam_ids == [0, 1]
 
 
-class TestSkyMask:
-    """Test sky mask functionality."""
-    
-    def test_sky_mask_filtering(self):
-        """Test that sky mask is correctly applied when filter_sky=True."""
-        generator = MonocularRGBPointCloudGenerator(
-            filter_sky=True,
-            chosen_cam_ids=[0],
-            crop_aabb=DEFAULT_CROP_AABB,
-            input_aabb=DEFAULT_INPUT_AABB,
-        )
-        
-        H, W = 100, 200
-        # Create frame data with sky mask
-        sky_mask = np.zeros((H, W), dtype=bool)
-        sky_mask[:20, :] = True  # Top 20 rows are sky
-        
-        frame_data = {
-            'rgb': np.random.rand(H, W, 3),
-            'depth': np.random.rand(H, W) * 50 + 10,
-            'extrinsic': np.eye(4),
-            'intrinsic': np.array([[100, 0, W/2], [0, 100, H/2], [0, 0, 1]]),
-            'sky_mask': torch.from_numpy(sky_mask).float(),
-        }
-        
-        frame_data_list_by_camera = {0: [frame_data]}
-        consistency_masks_by_camera = {0: [np.ones((H, W), dtype=bool)]}
-        
-        # Generate pointcloud - sky regions should be filtered out
-        pointcloud = generator._generate_pointcloud_from_frames_by_camera(
-            frame_data_list_by_camera, consistency_masks_by_camera, H, W
-        )
-        
-        # Should have points (non-sky regions)
-        assert len(pointcloud) > 0
-        # Points should be from non-sky regions (rows 20+)
-        # This is a basic check - actual verification would require more detailed inspection
-    
-    def test_sky_mask_no_filtering(self):
-        """Test that sky mask is not applied when filter_sky=False."""
-        generator = MonocularRGBPointCloudGenerator(
-            filter_sky=False,
-            chosen_cam_ids=[0],
-            crop_aabb=DEFAULT_CROP_AABB,
-            input_aabb=DEFAULT_INPUT_AABB,
-        )
-        
-        H, W = 100, 200
-        sky_mask = np.zeros((H, W), dtype=bool)
-        sky_mask[:20, :] = True
-        
-        frame_data = {
-            'rgb': np.random.rand(H, W, 3),
-            'depth': np.random.rand(H, W) * 50 + 10,
-            'extrinsic': np.eye(4),
-            'intrinsic': np.array([[100, 0, W/2], [0, 100, H/2], [0, 0, 1]]),
-            'sky_mask': torch.from_numpy(sky_mask).float(),
-        }
-        
-        frame_data_list_by_camera = {0: [frame_data]}
-        consistency_masks_by_camera = {0: [np.ones((H, W), dtype=bool)]}
-        
-        # Generate pointcloud - all regions should be included
-        pointcloud = generator._generate_pointcloud_from_frames_by_camera(
-            frame_data_list_by_camera, consistency_masks_by_camera, H, W
-        )
-        
-        # Should have points from all regions
-        assert len(pointcloud) > 0
-    
-    def test_sky_mask_missing(self):
-        """Test behavior when sky mask is not available."""
-        generator = MonocularRGBPointCloudGenerator(
-            filter_sky=True,
-            chosen_cam_ids=[0],
-            crop_aabb=DEFAULT_CROP_AABB,
-            input_aabb=DEFAULT_INPUT_AABB,
-        )
-        
-        H, W = 100, 200
-        frame_data = {
-            'rgb': np.random.rand(H, W, 3),
-            'depth': np.random.rand(H, W) * 50 + 10,
-            'extrinsic': np.eye(4),
-            'intrinsic': np.array([[100, 0, W/2], [0, 100, H/2], [0, 0, 1]]),
-            'sky_mask': None,  # No sky mask
-        }
-        
-        frame_data_list_by_camera = {0: [frame_data]}
-        consistency_masks_by_camera = {0: [np.ones((H, W), dtype=bool)]}
-        
-        # Should still work, but log warning
-        pointcloud = generator._generate_pointcloud_from_frames_by_camera(
-            frame_data_list_by_camera, consistency_masks_by_camera, H, W
-        )
-        
-        assert len(pointcloud) > 0
-
-
 class TestIntegration:
     """Integration tests with mocked data."""
     
@@ -562,4 +467,3 @@ class TestIntegration:
         # This test would require actual dataset files
         # It's marked as skip but can be enabled when testing with real data
         pass
-

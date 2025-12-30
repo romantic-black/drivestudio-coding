@@ -114,7 +114,7 @@ EVolSplat 预处理代码的处理逻辑：
 
 ### 2.1 边界框定义
 
-在 `datasets/pointcloud_generators/rgb_pointcloud_generator.py` 中，默认边界框定义为：
+在 `datasets/pointcloud_generators/monocular.py` 或 `datasets/pointcloud_generators/base.py` 中，默认边界框定义为：
 
 ```python
 X_MIN, X_MAX = -20, 20

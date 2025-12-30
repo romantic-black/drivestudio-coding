@@ -13,7 +13,6 @@ from contextlib import nullcontext
 from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
-import open3d as o3d
 import torch
 import torch.nn as nn
 from einops import rearrange
@@ -28,7 +27,7 @@ from models.gaussians.basics import k_nearest_sklearn, RGB2SH, random_quat_tenso
 
 if TYPE_CHECKING:
     from datasets.multi_scene_dataset import MultiSceneDataset
-    from datasets.pointcloud_generators.rgb_pointcloud_generator import RGBPointCloudGenerator
+    from datasets.pointcloud_generators import RGBPointCloudGenerator
 
 # Import EVolsplat components
 try:
@@ -362,7 +361,7 @@ class EVolsplatTrainer(nn.Module):
         self,
         scene_id: int,
         segment_id: int,
-        pointcloud: o3d.geometry.PointCloud,
+        pointcloud,
     ) -> VanillaGaussians:
         """
         Initialize VanillaGaussians node from RGB point cloud.
@@ -370,14 +369,21 @@ class EVolsplatTrainer(nn.Module):
         Args:
             scene_id: Scene ID
             segment_id: Segment ID
-            pointcloud: Open3D point cloud with positions and colors
+            pointcloud: Open3D point cloud or dict with background points
             
         Returns:
             VanillaGaussians node
         """
         # Extract point cloud data
-        points = np.asarray(pointcloud.points)  # [N, 3]
-        colors = np.asarray(pointcloud.colors)  # [N, 3]
+        if isinstance(pointcloud, dict):
+            background = pointcloud.get("background", np.zeros((0, 6), dtype=np.float32))
+            points = background[:, :3]
+            colors = background[:, 3:] / 255.0 if background.shape[1] >= 6 else np.zeros_like(points)
+        else:
+            points = np.asarray(pointcloud.points)  # [N, 3]
+            colors = np.asarray(pointcloud.colors)  # [N, 3]
+            if colors.max() > 1.0 + 1e-3:
+                colors = colors / 255.0
         
         if len(points) == 0:
             raise ValueError(f"Empty point cloud for scene {scene_id}, segment {segment_id}")
@@ -1346,4 +1352,3 @@ class EVolsplatTrainer(nn.Module):
         self.mlp_offset.eval()
         if self.bg_field is not None:
             self.bg_field.eval()
-

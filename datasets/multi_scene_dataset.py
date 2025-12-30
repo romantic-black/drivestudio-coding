@@ -24,8 +24,7 @@ from datasets.driving_dataset import DrivingDataset
 from datasets.tools.trajectory_utils import split_trajectory
 
 if TYPE_CHECKING:
-    import open3d as o3d
-    from datasets.pointcloud_generators.rgb_pointcloud_generator import RGBPointCloudGenerator
+    from datasets.pointcloud_generators import RGBPointCloudGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -1853,7 +1852,7 @@ class MultiSceneDatasetScheduler:
             segment_id: 段ID（如果为None，使用当前段）
             
         Returns:
-            pointcloud: Open3D 点云对象
+            Dict: 点云结果（背景 + 动态物体）
         """
         if scene_id is None:
             scene_id = self.current_scene_id
@@ -1886,10 +1885,8 @@ class MultiSceneDatasetScheduler:
             save_dir: 保存目录（如果为None，不保存）
             
         Returns:
-            Dict[segment_id, pointcloud]: 每个段的点云字典
+            Dict[segment_id, Dict]: 每个段的点云结果字典
         """
-        import open3d as o3d
-        
         if scene_id is None:
             scene_id = self.current_scene_id
             if scene_id is None:
@@ -1912,10 +1909,17 @@ class MultiSceneDatasetScheduler:
                 pointclouds[segment_id] = pointcloud
                 
                 # 保存点云（如果指定了保存目录）
-                if save_dir is not None:
+                if save_dir is not None and isinstance(pointcloud, dict):
+                    import open3d as o3d
+                    
                     os.makedirs(save_dir, exist_ok=True)
+                    background = pointcloud.get("background", np.zeros((0, 6), dtype=np.float32))
+                    pcd = o3d.geometry.PointCloud()
+                    if len(background) > 0:
+                        pcd.points = o3d.utility.Vector3dVector(background[:, :3])
+                        pcd.colors = o3d.utility.Vector3dVector(background[:, 3:] / 255.0)
                     save_path = os.path.join(save_dir, f"scene_{scene_id}_segment_{segment_id}.ply")
-                    o3d.io.write_point_cloud(save_path, pointcloud)
+                    o3d.io.write_point_cloud(save_path, pcd)
                     logger.info(f"Saved pointcloud to {save_path}")
                 
             except Exception as e:
@@ -1923,4 +1927,3 @@ class MultiSceneDatasetScheduler:
                 continue
         
         return pointclouds
-

@@ -16,7 +16,7 @@ import torch
 from omegaconf import OmegaConf
 
 from datasets.multi_scene_dataset import MultiSceneDataset
-from datasets.pointcloud_generators.rgb_pointcloud_generator import MonocularRGBPointCloudGenerator
+from datasets.pointcloud_generators import MonocularRGBPointCloudGenerator
 from models.trainers.evolsplat import EVolsplatTrainer
 from utils.logging import MetricLogger, setup_logging
 
@@ -293,4 +293,3 @@ if __name__ == "__main__":
         args.run_name = current_time
     
     main(args)
-

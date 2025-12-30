@@ -1,16 +1,11 @@
-"""
-RGB Point Cloud Generator Module
+"""RGB point cloud generator package."""
 
-This module provides point cloud generation functionality for MultiSceneDataset.
-"""
-
-from .rgb_pointcloud_generator import (
-    RGBPointCloudGenerator,
-    MonocularRGBPointCloudGenerator,
-)
+from .base import RGBPointCloudGenerator
+from .monocular import MonocularRGBPointCloudGenerator
+from .lidar import LiDARRGBPointCloudGenerator
 
 __all__ = [
-    'RGBPointCloudGenerator',
-    'MonocularRGBPointCloudGenerator',
+    "RGBPointCloudGenerator",
+    "MonocularRGBPointCloudGenerator",
+    "LiDARRGBPointCloudGenerator",
 ]
-
