@@ -15,6 +15,8 @@ from omegaconf import OmegaConf
 from datasets.multi_scene_dataset import MultiSceneDataset
 from datasets.pointcloud_generators.rgb_pointcloud_generator import (
     LiDARRGBPointCloudGenerator,
+    StaticPointCloud,
+    DynamicPointCloud,
 )
 
 # Default AABB for tests
@@ -312,14 +314,15 @@ class TestLiDARRGBPointCloudGeneratorIntegration:
             mock_dataset.get_scene.return_value['dataset'] = mock_scene_dataset
             
             # Use generate_pointcloud_with_static_dynamic for testing the full functionality
-            frame_points, waymoid2intid, intid2inboxpoints = generator.generate_pointcloud_with_static_dynamic(
+            static_pc, dynamic_pc = generator.generate_pointcloud_with_static_dynamic(
                 mock_dataset, 0, 0
             )
             
-            assert isinstance(frame_points, list)
-            assert len(frame_points) == 2
-            assert isinstance(waymoid2intid, dict)
-            assert isinstance(intid2inboxpoints, dict)
+            assert isinstance(static_pc, StaticPointCloud)
+            assert isinstance(dynamic_pc, DynamicPointCloud)
+            assert len(static_pc.frame_points) == 2
+            assert isinstance(dynamic_pc.instance_id_mapping, dict)
+            assert isinstance(dynamic_pc.points_by_instance, dict)
             
             # Also test that generate_pointcloud returns PointCloud
             pointcloud = generator.generate_pointcloud(mock_dataset, 0, 0)
@@ -377,17 +380,20 @@ class TestLiDARRGBPointCloudGeneratorIntegration:
             mock_dataset.get_scene.return_value['dataset'] = mock_scene_dataset
             
             # Use generate_pointcloud_with_static_dynamic for testing the full functionality
-            frame_points, waymoid2intid_out, intid2inboxpoints = generator.generate_pointcloud_with_static_dynamic(
+            static_pc, dynamic_pc = generator.generate_pointcloud_with_static_dynamic(
                 mock_dataset, 0, 0
             )
             
-            assert len(frame_points) == 1
+            assert len(static_pc.frame_points) == 1
             # Should have static points (point outside instance) and/or dynamic points (point inside instance)
             # The point at origin [0,0,0] should be in the instance, point at [5,0,0] should be static
-            assert len(frame_points[0]) > 0 or len(intid2inboxpoints) > 0
+            assert len(static_pc.frame_points[0]) > 0 or len(dynamic_pc.points_by_instance) > 0
             # Verify we have both static and dynamic points
-            total_static = len(frame_points[0])
-            total_dynamic = sum(len(points) for points in intid2inboxpoints.values())
+            total_static = len(static_pc.frame_points[0])
+            total_dynamic = sum(
+                sum(len(points) for points in frame_dict.values())
+                for frame_dict in dynamic_pc.points_by_instance.values()
+            )
             assert total_static + total_dynamic == 2  # Total should be 2 points
 
 
@@ -551,4 +557,161 @@ class TestEdgeCases:
         
         with pytest.raises(ValueError, match="has no frames"):
             generator.generate_pointcloud(mock_dataset, 0, 0)
+
+
+class TestLiDARStaticDynamicStructures:
+    """Test LiDARRGBPointCloudGenerator with new data structures."""
+    
+    def test_lidar_static_pointcloud_structure(self):
+        """Test StaticPointCloud structure from LiDAR generator."""
+        generator = LiDARRGBPointCloudGenerator(
+            crop_aabb=DEFAULT_CROP_AABB,
+            input_aabb=DEFAULT_INPUT_AABB,
+        )
+        
+        # Mock dataset
+        mock_dataset = Mock(spec=MultiSceneDataset)
+        mock_dataset.get_segment_frames = Mock(return_value=[0, 1])
+        mock_dataset.get_scene = Mock(return_value={
+            'dataset': Mock(),
+        })
+        mock_dataset.get_frame_data = Mock(return_value={
+            'image': torch.rand(100, 200, 3),
+            'extrinsic': torch.eye(4),
+            'intrinsic': torch.eye(4),
+            'depth': torch.rand(100, 200),
+        })
+        
+        # Mock scene_dataset
+        mock_scene_dataset = Mock()
+        mock_lidar_source = Mock()
+        mock_lidar_source.timesteps = torch.tensor([0, 1])
+        mock_lidar_source.points = torch.tensor([
+            [0, 0, 0, 1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 4, 5, 6, 0, 0, 0, 0, 0, 0, 0, 0],
+        ])
+        mock_scene_dataset.lidar_source = mock_lidar_source
+        mock_scene_dataset.start_timestep = 0
+        
+        lidar_to_worlds_list = [
+            np.eye(4, dtype=np.float32),
+            np.eye(4, dtype=np.float32),
+        ]
+        mock_lidar_source.lidar_to_worlds = torch.stack([torch.from_numpy(x) for x in lidar_to_worlds_list])
+        
+        with patch.object(generator, '_load_instances_info', return_value=({}, {}, {})):
+            mock_dataset.get_scene.return_value['dataset'] = mock_scene_dataset
+            
+            static_pc, dynamic_pc = generator.generate_pointcloud_with_static_dynamic(
+                mock_dataset, 0, 0
+            )
+            
+            assert isinstance(static_pc, StaticPointCloud)
+            assert len(static_pc.frame_points) == 2
+            assert all(isinstance(fp, np.ndarray) for fp in static_pc.frame_points)
+            assert all(fp.shape[1] == 6 for fp in static_pc.frame_points if fp.shape[0] > 0)
+    
+    def test_lidar_dynamic_pointcloud_structure(self):
+        """Test DynamicPointCloud structure from LiDAR generator."""
+        generator = LiDARRGBPointCloudGenerator(
+            crop_aabb=DEFAULT_CROP_AABB,
+            input_aabb=DEFAULT_INPUT_AABB,
+        )
+        
+        # Mock dataset
+        mock_dataset = Mock(spec=MultiSceneDataset)
+        mock_dataset.get_segment_frames = Mock(return_value=[0])
+        mock_dataset.get_scene = Mock(return_value={
+            'dataset': Mock(),
+        })
+        mock_dataset.get_frame_data = Mock(return_value={
+            'image': torch.rand(100, 200, 3),
+            'extrinsic': torch.eye(4),
+            'intrinsic': torch.eye(4),
+            'depth': torch.rand(100, 200),
+        })
+        
+        # Mock scene_dataset
+        mock_scene_dataset = Mock()
+        mock_lidar_source = Mock()
+        mock_lidar_source.timesteps = torch.tensor([0, 0])
+        mock_lidar_source.points = torch.tensor([
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # Point at origin (in instance)
+            [0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # Point outside instance
+        ])
+        lidar_to_worlds_list = [
+            np.eye(4, dtype=np.float32),
+            np.eye(4, dtype=np.float32),
+        ]
+        mock_lidar_source.lidar_to_worlds = torch.stack([torch.from_numpy(x) for x in lidar_to_worlds_list])
+        mock_scene_dataset.lidar_source = mock_lidar_source
+        mock_scene_dataset.start_timestep = 0
+        
+        # Mock instances info
+        waymoid2intid = {0: 1}
+        id2framePoseSize = {
+            0: {
+                0: (np.eye(4), np.array([2, 2, 2]))  # Box at origin, size 2x2x2
+            }
+        }
+        frame_instances = {"0": [0]}
+        
+        with patch.object(generator, '_load_instances_info', return_value=(
+            waymoid2intid, id2framePoseSize, frame_instances
+        )):
+            mock_dataset.get_scene.return_value['dataset'] = mock_scene_dataset
+            
+            static_pc, dynamic_pc = generator.generate_pointcloud_with_static_dynamic(
+                mock_dataset, 0, 0
+            )
+            
+            assert isinstance(dynamic_pc, DynamicPointCloud)
+            assert isinstance(dynamic_pc.instance_id_mapping, dict)
+            assert isinstance(dynamic_pc.points_by_instance, dict)
+            assert isinstance(dynamic_pc.instances_info, dict)
+            
+            # If there are dynamic points, verify structure
+            if len(dynamic_pc.points_by_instance) > 0:
+                for intid, frame_dict in dynamic_pc.points_by_instance.items():
+                    assert isinstance(frame_dict, dict)
+                    for frame_idx, points in frame_dict.items():
+                        assert isinstance(points, np.ndarray)
+                        assert points.shape[1] == 6  # x, y, z, r, g, b
+    
+    def test_lidar_dynamic_transform_to_world(self):
+        """Test dynamic point cloud coordinate transformation."""
+        generator = LiDARRGBPointCloudGenerator(
+            crop_aabb=DEFAULT_CROP_AABB,
+            input_aabb=DEFAULT_INPUT_AABB,
+        )
+        
+        # Create a DynamicPointCloud with known data
+        points_by_instance = {
+            1: {
+                0: np.array([[0, 0, 0, 1, 0, 0]], dtype=np.float32),  # Local: origin
+            },
+        }
+        
+        # Instance pose: translation [10, 20, 30]
+        T_ow = np.eye(4, dtype=np.float32)
+        T_ow[:3, 3] = [10, 20, 30]
+        
+        instances_info = {
+            1: {
+                "poses": np.stack([T_ow], axis=0),  # (1, 4, 4)
+                "size": np.array([2, 2, 2], dtype=np.float32),
+                "frame_info": np.array([True], dtype=bool),
+            },
+        }
+        
+        dynamic_pc = DynamicPointCloud(
+            instance_id_mapping={0: 1},
+            points_by_instance=points_by_instance,
+            instances_info=instances_info,
+        )
+        
+        points_world = dynamic_pc.transform_to_world(1, 0)
+        assert points_world.shape == (1, 6)
+        assert np.allclose(points_world[0, :3], [10, 20, 30], atol=1e-5)
+        assert np.allclose(points_world[0, 3:], [1, 0, 0])
 

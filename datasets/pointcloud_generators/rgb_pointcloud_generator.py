@@ -9,6 +9,7 @@ import sys
 import os
 import json
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Dict, List, Literal, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
@@ -19,6 +20,162 @@ if TYPE_CHECKING:
     from datasets.multi_scene_dataset import MultiSceneDataset
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class StaticPointCloud:
+    """
+    静态点云数据结构。
+    
+    核心设计：
+    1. 点云按帧组织（可选）
+    2. 点云使用世界坐标系
+    3. 可以跨帧累积
+    """
+    # 按帧组织的静态点云列表
+    # frame_points[i] = (N, 6) 世界坐标 + RGB
+    frame_points: List[np.ndarray]
+    
+    def get_merged_points(self) -> np.ndarray:
+        """
+        合并所有帧的静态点云。
+        
+        Returns:
+            points: (N, 6) - 世界坐标 + RGB
+        """
+        if len(self.frame_points) == 0:
+            return np.zeros((0, 6), dtype=np.float32)
+        
+        return np.concatenate(self.frame_points, axis=0)
+    
+    def get_frame_points(
+        self,
+        frame_indices: Optional[List[int]] = None,
+    ) -> np.ndarray:
+        """
+        获取指定帧的静态点云。
+        
+        Args:
+            frame_indices: 帧索引列表（如果为None，返回所有帧的点）
+            
+        Returns:
+            points: (N, 6) - 世界坐标 + RGB
+        """
+        if frame_indices is None:
+            return self.get_merged_points()
+        
+        points_list = []
+        for frame_idx in frame_indices:
+            if 0 <= frame_idx < len(self.frame_points):
+                points_list.append(self.frame_points[frame_idx])
+        
+        if len(points_list) == 0:
+            return np.zeros((0, 6), dtype=np.float32)
+        
+        return np.concatenate(points_list, axis=0)
+
+
+@dataclass
+class DynamicPointCloud:
+    """
+    动态点云数据结构。
+    
+    核心设计：
+    1. 点云按实例ID组织
+    2. 每个实例的点云按帧索引组织
+    3. 点云使用物体局部坐标系
+    4. 包含实例的位姿和尺寸信息
+    """
+    # 实例ID映射：原始ID -> 连续int ID（从1开始）
+    instance_id_mapping: Dict[int, int]  # waymoid2intid
+    
+    # 动态点云：intid2inboxpoints[intid][frame_idx] = (N, 6) 局部坐标 + RGB
+    # 格式：[x_local, y_local, z_local, r, g, b]
+    points_by_instance: Dict[int, Dict[int, np.ndarray]]  # intid2inboxpoints
+    
+    # 实例信息：每个实例的位姿和尺寸
+    # instances_info[intid] = {
+    #     "poses": np.ndarray,  # (num_frames, 4, 4) - Object->World 变换
+    #     "size": np.ndarray,   # (3,) - 边界框尺寸 [l, w, h]
+    #     "frame_info": np.ndarray,  # (num_frames,) - 每帧是否出现
+    # }
+    instances_info: Dict[int, Dict[str, np.ndarray]]
+    
+    def get_instance_points(
+        self,
+        instance_id: int,
+        frame_indices: Optional[List[int]] = None,
+    ) -> np.ndarray:
+        """
+        获取指定实例的点云（局部坐标）。
+        
+        Args:
+            instance_id: 实例ID（连续int ID）
+            frame_indices: 帧索引列表（如果为None，返回所有帧的点）
+            
+        Returns:
+            points: (N, 6) - 局部坐标 + RGB
+        """
+        if instance_id not in self.points_by_instance:
+            return np.zeros((0, 6), dtype=np.float32)
+        
+        frame_dict = self.points_by_instance[instance_id]
+        if frame_indices is None:
+            frame_indices = list(frame_dict.keys())
+        
+        points_list = []
+        for frame_idx in frame_indices:
+            if frame_idx in frame_dict:
+                points_list.append(frame_dict[frame_idx])
+        
+        if len(points_list) == 0:
+            return np.zeros((0, 6), dtype=np.float32)
+        
+        return np.concatenate(points_list, axis=0)
+    
+    def transform_to_world(
+        self,
+        instance_id: int,
+        frame_idx: int,
+    ) -> np.ndarray:
+        """
+        将指定实例的点云变换到世界坐标系。
+        
+        Args:
+            instance_id: 实例ID（连续int ID）
+            frame_idx: 帧索引
+            
+        Returns:
+            points_world: (N, 6) - 世界坐标 + RGB
+        """
+        if instance_id not in self.points_by_instance:
+            return np.zeros((0, 6), dtype=np.float32)
+        
+        if frame_idx not in self.points_by_instance[instance_id]:
+            return np.zeros((0, 6), dtype=np.float32)
+        
+        points_local = self.points_by_instance[instance_id][frame_idx]  # (N, 6)
+        
+        if instance_id not in self.instances_info:
+            return points_local
+        
+        pose = self.instances_info[instance_id]["poses"][frame_idx]  # (4, 4)
+        T_ow = pose  # Object->World
+        
+        # 变换到世界坐标
+        points_local_xyz = points_local[:, :3]  # (N, 3)
+        points_local_homo = np.concatenate([
+            points_local_xyz,
+            np.ones((points_local_xyz.shape[0], 1), dtype=np.float32)
+        ], axis=1)  # (N, 4)
+        
+        points_world_xyz = (T_ow @ points_local_homo.T).T[:, :3]  # (N, 3)
+        points_world = np.concatenate([
+            points_world_xyz,
+            points_local[:, 3:6]  # RGB
+        ], axis=1)  # (N, 6)
+        
+        return points_world
 
 
 class RGBPointCloudGenerator(ABC):
@@ -90,7 +247,9 @@ class RGBPointCloudGenerator(ABC):
         segment_id: int,
     ) -> o3d.geometry.PointCloud:
         """
-        为指定场景和段生成 RGB 点云。
+        为指定场景和段生成 RGB 点云（基类接口，返回合并后的点云）。
+        
+        此方法用于向后兼容，实际实现应调用 generate_pointcloud_with_static_dynamic()。
         
         Args:
             dataset: MultiSceneDataset 实例
@@ -99,6 +258,27 @@ class RGBPointCloudGenerator(ABC):
             
         Returns:
             pointcloud: Open3D 点云对象，包含位置和颜色
+        """
+        pass
+    
+    @abstractmethod
+    def generate_pointcloud_with_static_dynamic(
+        self,
+        dataset: "MultiSceneDataset",
+        scene_id: int,
+        segment_id: int,
+    ) -> Tuple[StaticPointCloud, DynamicPointCloud]:
+        """
+        为指定场景和段生成 RGB 点云（包含静动态分割）。
+        
+        Args:
+            dataset: MultiSceneDataset 实例
+            scene_id: 场景ID
+            segment_id: 段ID（场景内索引）
+            
+        Returns:
+            static_pc: StaticPointCloud - 静态点云
+            dynamic_pc: DynamicPointCloud - 动态点云
         """
         pass
     
@@ -325,14 +505,20 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
             else:
                 consistency_masks_by_camera[cam_id] = [np.ones((H, W), dtype=bool) for _ in frame_data_list]
         
-        # 5. 生成点云（合并所有相机的数据）
-        accumulated_pointcloud = self._generate_pointcloud_from_frames_by_camera(
-            frame_data_list_by_camera, consistency_masks_by_camera, H, W
+        # 5. 使用新接口生成点云（包含静动态分割）
+        static_pc, _ = self.generate_pointcloud_with_static_dynamic(
+            dataset, scene_id, segment_id
         )
         
-        # 转换为 Open3D 点云
-        points = accumulated_pointcloud[:, :3]  # [N, 3]
-        colors = accumulated_pointcloud[:, 3:6]  # [N, 3]
+        # 合并所有帧的静态点
+        all_points = static_pc.get_merged_points()
+        if all_points.shape[0] == 0:
+            # 返回空点云
+            pointcloud = o3d.geometry.PointCloud()
+            return pointcloud
+        
+        points = all_points[:, :3]  # [N, 3]
+        colors = all_points[:, 3:6]  # [N, 3]
         
         # 确保颜色在 [0, 1] 范围内
         colors = np.clip(colors, 0.0, 1.0)
@@ -379,6 +565,489 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
             pointcloud = self.filter_pointcloud(pointcloud, use_bbx=False)
         
         return pointcloud
+    
+    def generate_pointcloud_with_static_dynamic(
+        self,
+        dataset: "MultiSceneDataset",
+        scene_id: int,
+        segment_id: int,
+    ) -> Tuple[StaticPointCloud, DynamicPointCloud]:
+        """
+        为指定场景和段生成 RGB 点云（包含静动态分割）。
+        
+        流程：
+        1. 从单目深度图生成点云（世界坐标）
+        2. 使用实例信息分割静动态点
+        3. 静态点保存为世界坐标
+        4. 动态点转换为物体局部坐标
+        
+        Args:
+            dataset: MultiSceneDataset 实例
+            scene_id: 场景ID
+            segment_id: 段ID（场景内索引）
+            
+        Returns:
+            static_pc: StaticPointCloud - 静态点云
+            dynamic_pc: DynamicPointCloud - 动态点云
+        """
+        # 1. 获取段内所有帧索引
+        frame_indices = self._get_segment_frames(dataset, scene_id, segment_id)
+        if len(frame_indices) == 0:
+            raise ValueError(f"Segment {segment_id} in scene {scene_id} has no frames")
+        
+        # 2. 根据稀疏度过滤帧
+        filtered_frame_indices = self._apply_sparsity_filter(frame_indices)
+        if len(filtered_frame_indices) == 0:
+            raise ValueError(f"No frames selected after sparsity filtering")
+        
+        # 3. 获取场景数据
+        scene_data = dataset.get_scene(scene_id)
+        if scene_data is None:
+            raise ValueError(f"Scene {scene_id} not found")
+        
+        scene_dataset = scene_data['dataset']
+        
+        # 4. 预加载实例信息
+        waymoid2intid_global, id2framePoseSize, frame_instances = self._load_instances_info(
+            scene_data, scene_id
+        )
+        
+        # 5. 按相机分组加载帧数据
+        frame_data_by_camera = {cam_id: [] for cam_id in self.chosen_cam_ids}
+        for frame_idx in filtered_frame_indices:
+            for cam_id in self.chosen_cam_ids:
+                frame_data = self._load_frame_data(dataset, scene_id, frame_idx, cam_id)
+                if frame_data is not None:
+                    frame_data_by_camera[cam_id].append((frame_idx, frame_data))
+        
+        # 检查是否有有效数据
+        total_frames = sum(len(frames) for frames in frame_data_by_camera.values())
+        if total_frames == 0:
+            raise ValueError("No valid frame data loaded")
+        
+        # 获取图像尺寸（从第一个有效帧）
+        first_cam_id = next(iter([cam_id for cam_id in self.chosen_cam_ids if len(frame_data_by_camera[cam_id]) > 0]))
+        H, W = frame_data_by_camera[first_cam_id][0][1]['rgb'].shape[:2]
+        
+        # 6. 对每个相机分别进行深度一致性检查
+        consistency_masks_by_camera = {}
+        frame_data_list_by_camera = {}
+        for cam_id in self.chosen_cam_ids:
+            frames = frame_data_by_camera[cam_id]
+            if len(frames) == 0:
+                continue
+            
+            # 按帧索引排序
+            frames_sorted = sorted(frames, key=lambda x: x[0])
+            frame_data_list = [fd for _, fd in frames_sorted]
+            frame_data_list_by_camera[cam_id] = frame_data_list
+            
+            # 对每个相机单独进行深度一致性检查
+            if self.depth_consistency:
+                consistency_masks_by_camera[cam_id] = self._depth_consistency_check(frame_data_list, H, W)
+            else:
+                consistency_masks_by_camera[cam_id] = [np.ones((H, W), dtype=bool) for _ in frame_data_list]
+        
+        # 7. 生成点云（按帧组织）
+        static_frame_points = []
+        dynamic_points_by_instance = {}
+        
+        # 创建帧索引到段内索引的映射
+        frame_idx_to_segment_idx = {frame_idx: i for i, frame_idx in enumerate(filtered_frame_indices)}
+        
+        # 遍历每个相机的帧数据
+        for cam_id, frame_data_list in frame_data_list_by_camera.items():
+            consistency_masks = consistency_masks_by_camera[cam_id]
+            
+            # 遍历该相机的所有帧
+            for frame_data_idx, frame_data in enumerate(frame_data_list):
+                # 获取原始帧索引（需要从 frame_data_by_camera 中获取）
+                # 由于已经排序，我们需要找到对应的原始帧索引
+                sorted_frames = sorted(frame_data_by_camera[cam_id], key=lambda x: x[0])
+                frame_idx = sorted_frames[frame_data_idx][0]
+                segment_idx = frame_idx_to_segment_idx.get(frame_idx, frame_data_idx)
+                
+                rgb = frame_data['rgb']  # [H, W, 3]
+                depth = frame_data['depth']  # [H, W]
+                extrinsic = frame_data['extrinsic']  # [4, 4]
+                intrinsic = frame_data['intrinsic']  # [3, 3]
+                
+                # 应用一致性掩码
+                consistency_mask = consistency_masks[frame_data_idx]  # [H, W]
+                
+                # 应用天空过滤（如果启用）
+                sky_mask = frame_data.get('sky_mask')
+                if sky_mask is not None:
+                    # 转换为 numpy 数组
+                    if isinstance(sky_mask, torch.Tensor):
+                        sky_mask = sky_mask.cpu().numpy()
+                    if self.filter_sky:
+                        # 天空掩码为 True 表示天空区域，需要取反（保留非天空区域）
+                        sky_mask = sky_mask.astype(bool)
+                    else:
+                        sky_mask = np.ones((H, W), dtype=bool)
+                else:
+                    # 如果没有天空掩码，根据 filter_sky 决定
+                    if self.filter_sky:
+                        logger.warning(f"No sky mask available for camera {cam_id}, frame {frame_idx}, skipping sky filtering")
+                        sky_mask = np.ones((H, W), dtype=bool)
+                    else:
+                        sky_mask = np.ones((H, W), dtype=bool)
+                
+                # 应用下采样掩码
+                if self.downscale != 1:
+                    downscale_mask = np.zeros((H, W), dtype=bool)
+                    downscale_mask[::self.downscale, ::self.downscale] = True
+                    final_mask = consistency_mask & sky_mask & downscale_mask
+                else:
+                    final_mask = consistency_mask & sky_mask
+                
+                # 提取有效像素
+                kept = np.argwhere(final_mask)
+                if len(kept) == 0:
+                    continue
+                
+                depth_values = depth[kept[:, 0], kept[:, 1]]
+                rgb_values = rgb[kept[:, 0], kept[:, 1]]
+                
+                # 过滤无效深度值
+                valid_depth_mask = np.isfinite(depth_values) & (depth_values > 0)
+                if not np.any(valid_depth_mask):
+                    continue
+                
+                depth_values = depth_values[valid_depth_mask]
+                rgb_values = rgb_values[valid_depth_mask]
+                kept_valid = kept[valid_depth_mask]
+                
+                # 反投影到相机坐标系
+                pixel_coords = kept_valid[:, [1, 0]]  # [x, y] 格式
+                x_cam = (pixel_coords[:, 0] - intrinsic[0, 2]) * depth_values / intrinsic[0, 0]
+                y_cam = (pixel_coords[:, 1] - intrinsic[1, 2]) * depth_values / intrinsic[1, 1]
+                z_cam = depth_values
+                coordinates = np.stack([x_cam, y_cam, z_cam], axis=1)  # [N, 3]
+                
+                # 过滤NaN/inf坐标
+                valid_coords_mask = np.isfinite(coordinates).all(axis=1)
+                if not np.any(valid_coords_mask):
+                    continue
+                
+                coordinates = coordinates[valid_coords_mask]
+                rgb_values = rgb_values[valid_coords_mask]
+                coordinates_homo = np.column_stack([coordinates, np.ones(len(coordinates))])  # [N, 4]
+                
+                # 变换到世界坐标系
+                worlds = (extrinsic @ coordinates_homo.T).T  # [N, 4]
+                worlds = worlds[:, :3]  # [N, 3]
+                
+                # 过滤NaN/inf世界坐标
+                valid_worlds_mask = np.isfinite(worlds).all(axis=1)
+                if not np.any(valid_worlds_mask):
+                    continue
+                
+                worlds = worlds[valid_worlds_mask]
+                rgb_values = rgb_values[valid_worlds_mask]
+                
+                # 组合世界坐标 + RGB
+                pts_wrgb = np.concatenate([worlds, rgb_values], axis=-1)  # [N, 6]
+                
+                # 8. 获取当前帧的实例列表
+                waymoid2intid, inst_list = self._get_instances_for_frame(
+                    waymoid2intid_global, id2framePoseSize, frame_instances, frame_idx, scene_dataset
+                )
+                
+                # 9. 分割静动态点
+                bg_points, dynamic_points = self._split_static_dynamic(pts_wrgb, inst_list)
+                
+                # 10. 保存静态背景点（按段内索引组织）
+                if segment_idx >= len(static_frame_points):
+                    # 扩展列表以容纳该索引
+                    static_frame_points.extend([np.zeros((0, 6), dtype=np.float32)] * (segment_idx + 1 - len(static_frame_points)))
+                static_frame_points[segment_idx] = np.concatenate([
+                    static_frame_points[segment_idx],
+                    bg_points.astype(np.float32)
+                ], axis=0) if static_frame_points[segment_idx].shape[0] > 0 else bg_points.astype(np.float32)
+                
+                # 11. 保存动态物体点（按实例ID和段内索引）
+                for intid, po_rgb in dynamic_points.items():
+                    if intid not in dynamic_points_by_instance:
+                        dynamic_points_by_instance[intid] = {}
+                    if segment_idx not in dynamic_points_by_instance[intid]:
+                        dynamic_points_by_instance[intid][segment_idx] = []
+                    dynamic_points_by_instance[intid][segment_idx].append(po_rgb.astype(np.float32))
+        
+        # 12. 合并同一实例同一帧的多块点云
+        for intid in dynamic_points_by_instance:
+            for segment_idx in dynamic_points_by_instance[intid]:
+                if isinstance(dynamic_points_by_instance[intid][segment_idx], list):
+                    if len(dynamic_points_by_instance[intid][segment_idx]) > 0:
+                        dynamic_points_by_instance[intid][segment_idx] = np.concatenate(
+                            dynamic_points_by_instance[intid][segment_idx], axis=0
+                        )
+                    else:
+                        dynamic_points_by_instance[intid][segment_idx] = np.zeros((0, 6), dtype=np.float32)
+        
+        # 13. 构建 instances_info
+        instances_info = {}
+        num_frames = len(filtered_frame_indices)
+        
+        # 遍历所有实例ID
+        for intid in dynamic_points_by_instance.keys():
+            # 找到对应的原始ID (sid)
+            sid = None
+            for orig_sid, mapped_intid in waymoid2intid_global.items():
+                if mapped_intid == intid:
+                    sid = orig_sid
+                    break
+            
+            if sid is None or sid not in id2framePoseSize:
+                continue
+            
+            # 构建该实例的位姿数组和帧信息
+            poses_list = []
+            frame_info_list = []
+            
+            for segment_idx, frame_idx in enumerate(filtered_frame_indices):
+                absolute_frame_idx = self._get_absolute_frame_idx(scene_dataset, frame_idx)
+                
+                if absolute_frame_idx in id2framePoseSize[sid]:
+                    T_ow, size = id2framePoseSize[sid][absolute_frame_idx]
+                    poses_list.append(T_ow)
+                    frame_info_list.append(True)
+                else:
+                    # 该帧没有该实例，使用单位矩阵作为占位符
+                    poses_list.append(np.eye(4, dtype=np.float32))
+                    frame_info_list.append(False)
+            
+            instances_info[intid] = {
+                "poses": np.stack(poses_list, axis=0),  # (num_frames, 4, 4)
+                "size": id2framePoseSize[sid][list(id2framePoseSize[sid].keys())[0]][1],  # (3,) - 使用第一帧的尺寸
+                "frame_info": np.array(frame_info_list, dtype=bool),  # (num_frames,)
+            }
+        
+        # 14. 构建并返回新数据结构
+        static_pc = StaticPointCloud(frame_points=static_frame_points)
+        dynamic_pc = DynamicPointCloud(
+            instance_id_mapping=waymoid2intid_global if waymoid2intid_global else {},
+            points_by_instance=dynamic_points_by_instance,
+            instances_info=instances_info,
+        )
+        
+        return static_pc, dynamic_pc
+    
+    def _get_absolute_frame_idx(
+        self,
+        scene_dataset,
+        frame_idx: int,
+    ) -> int:
+        """
+        将相对帧索引转换为绝对帧号。
+        
+        Args:
+            scene_dataset: 场景数据集实例
+            frame_idx: 相对帧索引（MultiSceneDataset 使用的索引）
+            
+        Returns:
+            absolute_frame_idx: 绝对帧号（用于 timesteps 和实例 JSON 查找）
+        """
+        # 从 scene_dataset 获取 start_timestep
+        # 如果 scene_dataset 是 Mock 对象或没有 start_timestep 属性，默认为 0
+        try:
+            start_timestep = getattr(scene_dataset, 'start_timestep', 0)
+            # 确保 start_timestep 是整数类型（避免 Mock 对象）
+            if not isinstance(start_timestep, (int, np.integer)):
+                start_timestep = 0
+        except (AttributeError, TypeError):
+            start_timestep = 0
+        return int(start_timestep) + frame_idx
+    
+    def _load_instances_info(
+        self,
+        scene_data: Dict,
+        scene_id: int,
+    ) -> Tuple[Dict[int, int], Dict[int, Dict[int, Tuple[np.ndarray, np.ndarray]]], Dict]:
+        """
+        从场景目录加载实例信息。
+        
+        Args:
+            scene_data: 场景数据字典
+            scene_id: 场景ID（用于缓存键）
+            
+        Returns:
+            (waymoid2intid, id2framePoseSize, frame_instances) 元组
+        """
+        # 使用缓存（如果存在）
+        if not hasattr(self, '_instances_cache'):
+            self._instances_cache = {}
+        
+        cache_key = scene_id
+        if cache_key in self._instances_cache:
+            return self._instances_cache[cache_key]
+        
+        try:
+            # 尝试从场景数据获取场景目录路径
+            scene_dataset = scene_data['dataset']
+            scene_dir = None
+            
+            # 尝试多种方式获取场景目录
+            if hasattr(scene_dataset, 'data_cfg'):
+                data_cfg = scene_dataset.data_cfg
+                if hasattr(data_cfg, 'data_root') and hasattr(data_cfg, 'scene_idx'):
+                    # 构建场景目录路径
+                    scene_dir = os.path.join(data_cfg.data_root, f"{data_cfg.scene_idx:03d}")
+            
+            if scene_dir is None or not os.path.isdir(scene_dir):
+                # 如果没有找到场景目录，返回空实例信息
+                result = ({}, {}, {})
+                self._instances_cache[cache_key] = result
+                return result
+            
+            # 读取实例文件
+            info_path = os.path.join(scene_dir, "instances", "instances_info.json")
+            frame_path = os.path.join(scene_dir, "instances", "frame_instances.json")
+            
+            if not (os.path.exists(info_path) and os.path.exists(frame_path)):
+                # 如果文件不存在，返回空实例信息
+                result = ({}, {}, {})
+                self._instances_cache[cache_key] = result
+                return result
+            
+            with open(info_path, "r") as f:
+                instances_info = json.load(f)  # keys: "0","1",...
+            with open(frame_path, "r") as f:
+                frame_instances = json.load(f)  # keys: "0","1",... -> [ids]
+            
+            # 将 instances_info 预处理为：每个 id -> {frame_idx: (T_ow, size)}
+            id2framePoseSize = {}
+            for sid_str, rec in instances_info.items():
+                sid = int(sid_str)
+                frames = rec["frame_annotations"]["frame_idx"]
+                poses = rec["frame_annotations"]["obj_to_world"]
+                sizes = rec["frame_annotations"]["box_size"]
+                mapping = {}
+                for fi, pose, sz in zip(frames, poses, sizes):
+                    T_ow = np.array(pose, dtype=np.float32).reshape(4, 4)  # Object->World
+                    sz = np.array(sz, dtype=np.float32).reshape(3,)  # [l,w,h]
+                    mapping[int(fi)] = (T_ow, sz)
+                id2framePoseSize[sid] = mapping
+            
+            # 构建稳定的 int id（1..M），保持与"旧代码的 waymoid2intid"风格一致
+            all_ids = sorted([int(k) for k in instances_info.keys()])
+            waymoid2intid = {sid: i+1 for i, sid in enumerate(all_ids)}  # 外部可用：原始（简化）id -> 连续 int
+            
+            result = (waymoid2intid, id2framePoseSize, frame_instances)
+            self._instances_cache[cache_key] = result
+            return result
+        except Exception as e:
+            logger.warning(f"Failed to load instances info for scene {scene_id}: {e}")
+            result = ({}, {}, {})
+            self._instances_cache[cache_key] = result
+            return result
+    
+    def _get_instances_for_frame(
+        self,
+        waymoid2intid: Dict[int, int],
+        id2framePoseSize: Dict[int, Dict[int, Tuple[np.ndarray, np.ndarray]]],
+        frame_instances: Dict,
+        frame_idx: int,
+        scene_dataset=None,
+    ) -> Tuple[Dict[int, int], List[Tuple[int, np.ndarray, np.ndarray]]]:
+        """
+        获取指定帧的实例列表。
+        
+        Args:
+            waymoid2intid: 实例ID映射
+            id2framePoseSize: 实例ID到帧位姿和尺寸的映射（键是绝对帧号）
+            frame_instances: 帧到实例ID列表的映射（键是绝对帧号的字符串）
+            frame_idx: 相对帧索引（MultiSceneDataset 使用的索引）
+            scene_dataset: 场景数据集实例（用于获取 start_timestep）
+            
+        Returns:
+            (waymoid2intid, inst_list) - 实例ID映射和实例列表
+        """
+        out = []
+        if not frame_instances:
+            return waymoid2intid, out
+        
+        # 将相对帧索引转换为绝对帧号
+        if scene_dataset is not None:
+            absolute_frame_idx = self._get_absolute_frame_idx(scene_dataset, frame_idx)
+        else:
+            # 如果没有提供 scene_dataset，假设 frame_idx 已经是绝对帧号（向后兼容）
+            absolute_frame_idx = frame_idx
+        
+        # 使用绝对帧号作为键
+        key = str(absolute_frame_idx)
+        if key not in frame_instances:
+            return waymoid2intid, out
+        
+        for sid in frame_instances[key]:
+            # sid 已是简化 id（int）
+            sid = int(sid)
+            # id2framePoseSize 的键也是绝对帧号
+            if sid in id2framePoseSize and absolute_frame_idx in id2framePoseSize[sid]:
+                T_ow, sz = id2framePoseSize[sid][absolute_frame_idx]
+                intid = waymoid2intid[sid]
+                out.append((intid, T_ow, sz))
+        
+        return waymoid2intid, out
+    
+    def _split_static_dynamic(
+        self,
+        pts_wrgb: np.ndarray,
+        inst_list: List[Tuple[int, np.ndarray, np.ndarray]],
+    ) -> Tuple[np.ndarray, Dict[int, np.ndarray]]:
+        """
+        将点云分割为静态背景和动态物体。
+        
+        Args:
+            pts_wrgb: (N, 6) - 世界坐标点 + RGB
+            inst_list: List[Tuple[int, np.ndarray, np.ndarray]] - 
+                每项为 (intid, T_ow(4x4), size(3,))
+            
+        Returns:
+            bg_points: (M, 6) - 静态背景点（世界坐标 + RGB）
+            dynamic_points: Dict[int, np.ndarray] - 
+                dynamic_points[intid] = (K, 6) 局部坐标 + RGB
+        """
+        # 1. 初始化掩码
+        any_obj_mask = np.zeros((pts_wrgb.shape[0],), dtype=bool)
+        dynamic_points = {}
+        
+        # 2. 遍历每个实例
+        for (intid, T_ow, size_lwh) in inst_list:
+            # World->Object
+            T_wo = np.linalg.inv(T_ow)
+            
+            # 计算每个点在物体局部的坐标
+            pw = pts_wrgb[:, :3]
+            pw_h = np.concatenate([pw, np.ones((pw.shape[0], 1), dtype=np.float32)], axis=1)
+            po = (T_wo @ pw_h.T).T[:, :3]  # (N, 3)
+            
+            # 检查点是否在边界框内
+            half = size_lwh.astype(np.float32) / 2.0
+            m = (np.abs(po) <= (half + 1e-6)).all(axis=1)  # in-box mask
+            
+            if not np.any(m):
+                continue
+            
+            # 提取局部坐标 + RGB
+            po_rgb = np.concatenate([po[m], pts_wrgb[m, 3:]], axis=1).astype(np.float32)
+            any_obj_mask |= m
+            
+            # 保存到字典
+            if intid not in dynamic_points:
+                dynamic_points[intid] = []
+            dynamic_points[intid].append(po_rgb)
+        
+        # 3. 合并同一实例的多块点云
+        for intid in dynamic_points:
+            if len(dynamic_points[intid]) > 0:
+                dynamic_points[intid] = np.concatenate(dynamic_points[intid], axis=0)
+        
+        # 4. 提取静态背景点
+        bg_points = pts_wrgb[~any_obj_mask]
+        
+        return bg_points, dynamic_points
     
     def _get_segment_frames(
         self,
@@ -924,18 +1593,14 @@ class LiDARRGBPointCloudGenerator(RGBPointCloudGenerator):
         Returns:
             pointcloud: Open3D 点云对象，包含位置和颜色（仅静态背景点）
         """
-        frame_points, _, _ = self.generate_pointcloud_with_static_dynamic(
+        static_pc, _ = self.generate_pointcloud_with_static_dynamic(
             dataset, scene_id, segment_id
         )
         
         # 合并所有帧的静态点
-        if len(frame_points) == 0:
-            # 返回空点云
-            pointcloud = o3d.geometry.PointCloud()
-            return pointcloud
-        
-        all_points = np.concatenate(frame_points, axis=0)
+        all_points = static_pc.get_merged_points()
         if all_points.shape[0] == 0:
+            # 返回空点云
             pointcloud = o3d.geometry.PointCloud()
             return pointcloud
         
@@ -956,11 +1621,7 @@ class LiDARRGBPointCloudGenerator(RGBPointCloudGenerator):
         dataset: "MultiSceneDataset",
         scene_id: int,
         segment_id: int,
-    ) -> Tuple[
-        List[np.ndarray],
-        Dict[int, int],
-        Dict[int, Dict[int, np.ndarray]],
-    ]:
+    ) -> Tuple[StaticPointCloud, DynamicPointCloud]:
         """
         为指定场景和段生成 RGB 点云（包含静动态分割）。
         
@@ -970,10 +1631,8 @@ class LiDARRGBPointCloudGenerator(RGBPointCloudGenerator):
             segment_id: 段ID（场景内索引）
             
         Returns:
-            frame_points: List[np.ndarray] - 每项为 (N, 6) 世界坐标背景点 + RGB
-            waymoid2intid: Dict[int, int] - 原始实例ID -> 连续int ID（从1开始）
-            intid2inboxpoints: Dict[int, Dict[int, np.ndarray]] - 
-                intid2inboxpoints[intid][frame_idx] = (N, 6) 局部坐标 + RGB
+            static_pc: StaticPointCloud - 静态点云
+            dynamic_pc: DynamicPointCloud - 动态点云
         """
         # 1. 获取段内所有帧索引
         frame_indices = dataset.get_segment_frames(scene_id, segment_id)
@@ -1031,9 +1690,53 @@ class LiDARRGBPointCloudGenerator(RGBPointCloudGenerator):
                 # 使用段内索引 i 作为键（与 project_lidar.py 一致）
                 intid2inboxpoints[intid][i] = po_rgb.astype(np.float32)
         
-        # 6. 返回结果
-        waymoid2intid_out = waymoid2intid_global if waymoid2intid_global else {}
-        return frame_points, waymoid2intid_out, intid2inboxpoints
+        # 6. 构建 instances_info
+        instances_info = {}
+        num_frames = len(frame_indices)
+        
+        # 遍历所有实例ID
+        for intid in intid2inboxpoints.keys():
+            # 找到对应的原始ID (sid)
+            sid = None
+            for orig_sid, mapped_intid in waymoid2intid_global.items():
+                if mapped_intid == intid:
+                    sid = orig_sid
+                    break
+            
+            if sid is None or sid not in id2framePoseSize:
+                continue
+            
+            # 构建该实例的位姿数组和帧信息
+            poses_list = []
+            frame_info_list = []
+            
+            for i, frame_idx in enumerate(frame_indices):
+                absolute_frame_idx = self._get_absolute_frame_idx(scene_dataset, frame_idx)
+                
+                if absolute_frame_idx in id2framePoseSize[sid]:
+                    T_ow, size = id2framePoseSize[sid][absolute_frame_idx]
+                    poses_list.append(T_ow)
+                    frame_info_list.append(True)
+                else:
+                    # 该帧没有该实例，使用单位矩阵作为占位符
+                    poses_list.append(np.eye(4, dtype=np.float32))
+                    frame_info_list.append(False)
+            
+            instances_info[intid] = {
+                "poses": np.stack(poses_list, axis=0),  # (num_frames, 4, 4)
+                "size": id2framePoseSize[sid][list(id2framePoseSize[sid].keys())[0]][1],  # (3,) - 使用第一帧的尺寸
+                "frame_info": np.array(frame_info_list, dtype=bool),  # (num_frames,)
+            }
+        
+        # 7. 构建并返回新数据结构
+        static_pc = StaticPointCloud(frame_points=frame_points)
+        dynamic_pc = DynamicPointCloud(
+            instance_id_mapping=waymoid2intid_global if waymoid2intid_global else {},
+            points_by_instance=intid2inboxpoints,
+            instances_info=instances_info,
+        )
+        
+        return static_pc, dynamic_pc
     
     def _get_absolute_frame_idx(
         self,

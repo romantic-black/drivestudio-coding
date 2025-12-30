@@ -12,6 +12,8 @@ from datasets.multi_scene_dataset import MultiSceneDataset, MultiSceneDatasetSch
 from datasets.pointcloud_generators.rgb_pointcloud_generator import (
     RGBPointCloudGenerator,
     MonocularRGBPointCloudGenerator,
+    StaticPointCloud,
+    DynamicPointCloud,
 )
 
 # Default AABB for tests
@@ -553,6 +555,224 @@ class TestSkyMask:
         assert len(pointcloud) > 0
 
 
+class TestStaticPointCloud:
+    """Test StaticPointCloud data structure."""
+    
+    def test_static_pointcloud_get_merged_points(self):
+        """Test merging all frame points."""
+        frame_points = [
+            np.array([[0, 0, 0, 1, 0, 0], [1, 1, 1, 0, 1, 0]], dtype=np.float32),
+            np.array([[2, 2, 2, 0, 0, 1], [3, 3, 3, 1, 1, 1]], dtype=np.float32),
+        ]
+        static_pc = StaticPointCloud(frame_points=frame_points)
+        
+        merged = static_pc.get_merged_points()
+        assert merged.shape == (4, 6)
+        assert np.allclose(merged[0], [0, 0, 0, 1, 0, 0])
+        assert np.allclose(merged[3], [3, 3, 3, 1, 1, 1])
+    
+    def test_static_pointcloud_get_frame_points(self):
+        """Test getting points for specific frames."""
+        frame_points = [
+            np.array([[0, 0, 0, 1, 0, 0]], dtype=np.float32),
+            np.array([[1, 1, 1, 0, 1, 0]], dtype=np.float32),
+            np.array([[2, 2, 2, 0, 0, 1]], dtype=np.float32),
+        ]
+        static_pc = StaticPointCloud(frame_points=frame_points)
+        
+        # Get specific frames
+        points = static_pc.get_frame_points([0, 2])
+        assert points.shape == (2, 6)
+        assert np.allclose(points[0], [0, 0, 0, 1, 0, 0])
+        assert np.allclose(points[1], [2, 2, 2, 0, 0, 1])
+        
+        # Get all frames (None)
+        all_points = static_pc.get_frame_points(None)
+        assert all_points.shape == (3, 6)
+    
+    def test_static_pointcloud_empty(self):
+        """Test empty point cloud handling."""
+        static_pc = StaticPointCloud(frame_points=[])
+        
+        merged = static_pc.get_merged_points()
+        assert merged.shape == (0, 6)
+        
+        frame_points = static_pc.get_frame_points([0, 1])
+        assert frame_points.shape == (0, 6)
+
+
+class TestDynamicPointCloud:
+    """Test DynamicPointCloud data structure."""
+    
+    def test_dynamic_pointcloud_get_instance_points(self):
+        """Test getting instance points."""
+        points_by_instance = {
+            1: {
+                0: np.array([[0, 0, 0, 1, 0, 0], [0.5, 0.5, 0.5, 0, 1, 0]], dtype=np.float32),
+                1: np.array([[1, 1, 1, 0, 0, 1]], dtype=np.float32),
+            },
+            2: {
+                0: np.array([[2, 2, 2, 1, 1, 1]], dtype=np.float32),
+            },
+        }
+        
+        dynamic_pc = DynamicPointCloud(
+            instance_id_mapping={0: 1, 1: 2},
+            points_by_instance=points_by_instance,
+            instances_info={},
+        )
+        
+        # Get all frames for instance 1
+        points = dynamic_pc.get_instance_points(1)
+        assert points.shape == (3, 6)
+        
+        # Get specific frames
+        points = dynamic_pc.get_instance_points(1, [0])
+        assert points.shape == (2, 6)
+        assert np.allclose(points[0], [0, 0, 0, 1, 0, 0])
+    
+    def test_dynamic_pointcloud_transform_to_world(self):
+        """Test transforming instance points to world coordinates."""
+        points_by_instance = {
+            1: {
+                0: np.array([[0, 0, 0, 1, 0, 0]], dtype=np.float32),  # Local: origin
+            },
+        }
+        
+        # Instance pose: translation [10, 20, 30]
+        T_ow = np.eye(4, dtype=np.float32)
+        T_ow[:3, 3] = [10, 20, 30]
+        
+        instances_info = {
+            1: {
+                "poses": np.stack([T_ow], axis=0),  # (1, 4, 4)
+                "size": np.array([2, 2, 2], dtype=np.float32),
+                "frame_info": np.array([True], dtype=bool),
+            },
+        }
+        
+        dynamic_pc = DynamicPointCloud(
+            instance_id_mapping={0: 1},
+            points_by_instance=points_by_instance,
+            instances_info=instances_info,
+        )
+        
+        points_world = dynamic_pc.transform_to_world(1, 0)
+        assert points_world.shape == (1, 6)
+        assert np.allclose(points_world[0, :3], [10, 20, 30], atol=1e-5)
+        assert np.allclose(points_world[0, 3:], [1, 0, 0])
+    
+    def test_dynamic_pointcloud_empty(self):
+        """Test empty dynamic point cloud handling."""
+        dynamic_pc = DynamicPointCloud(
+            instance_id_mapping={},
+            points_by_instance={},
+            instances_info={},
+        )
+        
+        points = dynamic_pc.get_instance_points(1)
+        assert points.shape == (0, 6)
+        
+        points_world = dynamic_pc.transform_to_world(1, 0)
+        assert points_world.shape == (0, 6)
+
+
+class TestMonocularStaticDynamic:
+    """Test MonocularRGBPointCloudGenerator static/dynamic separation."""
+    
+    def test_monocular_generate_pointcloud_with_static_dynamic(self):
+        """Test static/dynamic point cloud generation."""
+        generator = MonocularRGBPointCloudGenerator(
+            chosen_cam_ids=[0],
+            crop_aabb=DEFAULT_CROP_AABB,
+            input_aabb=DEFAULT_INPUT_AABB,
+        )
+        
+        # Mock dataset
+        mock_dataset = Mock(spec=MultiSceneDataset)
+        mock_dataset.get_segment_frames = Mock(return_value=[0])
+        mock_dataset.get_scene = Mock(return_value={
+            'dataset': Mock(),
+        })
+        mock_dataset.get_frame_data = Mock(return_value={
+            'image': torch.rand(100, 200, 3),
+            'extrinsic': torch.eye(4),
+            'intrinsic': torch.eye(4),
+            'depth': torch.rand(100, 200) * 50 + 10,
+            'sky_mask': None,
+        })
+        
+        # Mock scene_dataset
+        mock_scene_dataset = Mock()
+        mock_scene_dataset.start_timestep = 0
+        mock_dataset.get_scene.return_value['dataset'] = mock_scene_dataset
+        
+        # Mock instances info (empty for simplicity)
+        with patch.object(generator, '_load_instances_info', return_value=({}, {}, {})):
+            static_pc, dynamic_pc = generator.generate_pointcloud_with_static_dynamic(
+                mock_dataset, 0, 0
+            )
+            
+            assert isinstance(static_pc, StaticPointCloud)
+            assert isinstance(dynamic_pc, DynamicPointCloud)
+            assert len(static_pc.frame_points) > 0
+    
+    def test_monocular_static_dynamic_split(self):
+        """Test static/dynamic point splitting logic."""
+        generator = MonocularRGBPointCloudGenerator(
+            crop_aabb=DEFAULT_CROP_AABB,
+            input_aabb=DEFAULT_INPUT_AABB,
+        )
+        
+        # Create test points (world coordinates + RGB)
+        pts_wrgb = np.array([
+            [0, 0, 0, 1, 0, 0],      # Inside instance box (at origin)
+            [0.5, 0.5, 0.5, 0, 1, 0],  # Inside instance box
+            [5, 0, 0, 0, 0, 1],      # Outside instance box (x=5 > 1)
+            [0, 2, 0, 1, 1, 1],      # Outside instance box (y=2 > 1)
+        ], dtype=np.float32)
+        
+        # Create instance: box at origin, size [2, 2, 2]
+        T_ow = np.eye(4, dtype=np.float32)  # Object at origin
+        size_lwh = np.array([2, 2, 2], dtype=np.float32)
+        inst_list = [(1, T_ow, size_lwh)]
+        
+        bg_points, dynamic_points = generator._split_static_dynamic(pts_wrgb, inst_list)
+        
+        # Should have 2 static points and 1 dynamic instance with 2 points
+        assert len(bg_points) == 2
+        assert len(dynamic_points) == 1
+        assert 1 in dynamic_points
+        assert dynamic_points[1].shape[0] == 2  # 2 points in instance
+    
+    def test_monocular_dynamic_points_local_coords(self):
+        """Test that dynamic points are in local coordinates."""
+        generator = MonocularRGBPointCloudGenerator(
+            crop_aabb=DEFAULT_CROP_AABB,
+            input_aabb=DEFAULT_INPUT_AABB,
+        )
+        
+        # Create test point at world origin
+        pts_wrgb = np.array([
+            [10, 20, 30, 1, 0, 0],  # World point
+        ], dtype=np.float32)
+        
+        # Instance pose: translation [10, 20, 30]
+        T_ow = np.eye(4, dtype=np.float32)
+        T_ow[:3, 3] = [10, 20, 30]
+        size_lwh = np.array([2, 2, 2], dtype=np.float32)
+        inst_list = [(1, T_ow, size_lwh)]
+        
+        bg_points, dynamic_points = generator._split_static_dynamic(pts_wrgb, inst_list)
+        
+        # Point should be in instance (at local origin)
+        assert len(dynamic_points) == 1
+        assert 1 in dynamic_points
+        # Local coordinates should be near origin
+        local_pt = dynamic_points[1][0, :3]
+        assert np.allclose(local_pt, [0, 0, 0], atol=1e-5)
+
+
 class TestIntegration:
     """Integration tests with mocked data."""
     
@@ -562,4 +782,79 @@ class TestIntegration:
         # This test would require actual dataset files
         # It's marked as skip but can be enabled when testing with real data
         pass
+    
+    def test_integration_static_dynamic_separation(self):
+        """Test complete static/dynamic separation workflow."""
+        generator = MonocularRGBPointCloudGenerator(
+            chosen_cam_ids=[0],
+            crop_aabb=DEFAULT_CROP_AABB,
+            input_aabb=DEFAULT_INPUT_AABB,
+        )
+        
+        # Mock dataset
+        mock_dataset = Mock(spec=MultiSceneDataset)
+        mock_dataset.get_segment_frames = Mock(return_value=[0, 1])
+        mock_dataset.get_scene = Mock(return_value={
+            'dataset': Mock(),
+        })
+        mock_dataset.get_frame_data = Mock(return_value={
+            'image': torch.rand(100, 200, 3),
+            'extrinsic': torch.eye(4),
+            'intrinsic': torch.eye(4),
+            'depth': torch.rand(100, 200) * 50 + 10,
+            'sky_mask': None,
+        })
+        
+        # Mock scene_dataset
+        mock_scene_dataset = Mock()
+        mock_scene_dataset.start_timestep = 0
+        mock_dataset.get_scene.return_value['dataset'] = mock_scene_dataset
+        
+        # Mock instances info (empty for simplicity)
+        with patch.object(generator, '_load_instances_info', return_value=({}, {}, {})):
+            static_pc, dynamic_pc = generator.generate_pointcloud_with_static_dynamic(
+                mock_dataset, 0, 0
+            )
+            
+            # Verify structure
+            assert isinstance(static_pc, StaticPointCloud)
+            assert isinstance(dynamic_pc, DynamicPointCloud)
+            assert len(static_pc.frame_points) > 0
+            
+            # Verify backward compatibility
+            pointcloud = generator.generate_pointcloud(mock_dataset, 0, 0)
+            assert isinstance(pointcloud, o3d.geometry.PointCloud)
+    
+    def test_integration_backward_compatibility(self):
+        """Test backward compatibility of generate_pointcloud method."""
+        generator = MonocularRGBPointCloudGenerator(
+            chosen_cam_ids=[0],
+            crop_aabb=DEFAULT_CROP_AABB,
+            input_aabb=DEFAULT_INPUT_AABB,
+        )
+        
+        # Mock dataset
+        mock_dataset = Mock(spec=MultiSceneDataset)
+        mock_dataset.get_segment_frames = Mock(return_value=[0])
+        mock_dataset.get_scene = Mock(return_value={
+            'dataset': Mock(),
+        })
+        mock_dataset.get_frame_data = Mock(return_value={
+            'image': torch.rand(100, 200, 3),
+            'extrinsic': torch.eye(4),
+            'intrinsic': torch.eye(4),
+            'depth': torch.rand(100, 200) * 50 + 10,
+            'sky_mask': None,
+        })
+        
+        # Mock scene_dataset
+        mock_scene_dataset = Mock()
+        mock_scene_dataset.start_timestep = 0
+        mock_dataset.get_scene.return_value['dataset'] = mock_scene_dataset
+        
+        # Mock instances info
+        with patch.object(generator, '_load_instances_info', return_value=({}, {}, {})):
+            # Test that generate_pointcloud still works
+            pointcloud = generator.generate_pointcloud(mock_dataset, 0, 0)
+            assert isinstance(pointcloud, o3d.geometry.PointCloud)
 
