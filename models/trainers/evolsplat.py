@@ -113,6 +113,8 @@ class EVolsplatTrainer(nn.Module):
         self.nodes: Dict[Tuple[int, int], VanillaGaussians] = {}
         self.offset_cache: Dict[Tuple[int, int], torch.Tensor] = {}
         self.frozen_volume_cache: Dict[Tuple[int, int], torch.Tensor] = {}
+        # Keep large offset cache tensors on CPU to reduce GPU memory pressure
+        self.offset_cache_device = torch.device("cpu")
         
         # Current segment info (for tracking)
         self.current_scene_id: Optional[int] = None
@@ -423,8 +425,8 @@ class EVolsplatTrainer(nn.Module):
         # Store initial scales (for later use in MLP prediction)
         node._initial_scales = initial_scales
         
-        # Initialize offset to zero
-        offset = torch.zeros_like(means, device="cpu")
+        # Initialize offset to zero on the cache device (CPU by default)
+        offset = torch.zeros_like(means, device=self.offset_cache_device)
         
         # Store node and offset
         self.nodes[(scene_id, segment_id)] = node
@@ -544,13 +546,18 @@ class EVolsplatTrainer(nn.Module):
         """
         # Get means
         means = node._means  # [N, 3]
+        device = means.device
         
         # Prepare source images
         source_images = batch["source"]["image"]  # [num_source_keyframes * num_cams, H, W, 3]
+        source_images = source_images.to(device)
         source_images = rearrange(source_images[None, ...], "b v h w c -> b v c h w")
         source_extrinsics = batch["source"]["extrinsics"]  # [num_source_keyframes * num_cams, 4, 4]
+        source_extrinsics = source_extrinsics.to(device)
         source_intrinsics = batch["source"]["intrinsics"]  # [num_source_keyframes * num_cams, 4, 4]
+        source_intrinsics = source_intrinsics.to(device)
         source_depth = batch["source"]["depth"]  # [num_source_keyframes * num_cams, H, W]
+        source_depth = source_depth.to(device)
         
         # 2D feature sampling (reusable across all target views)
         sampled_feat, valid_mask, vis_map = self.projector.sample_within_window(
@@ -561,6 +568,9 @@ class EVolsplatTrainer(nn.Module):
             source_depth=source_depth,
             local_radius=self.local_radius,
         )
+        sampled_feat = sampled_feat.to(device)
+        valid_mask = valid_mask.to(device)
+        vis_map = vis_map.to(device)
         
         # Concatenate sampled features with visibility map
         # According to EVolsplat implementation:
@@ -739,6 +749,9 @@ class EVolsplatTrainer(nn.Module):
         target_extrinsic = target_view["extrinsic"]  # [4, 4]
         target_intrinsic = target_view["intrinsic"]  # [4, 4] or [3, 3]
         target_image = target_view["image"]  # [H, W, 3]
+        target_extrinsic = target_extrinsic.to(self.device)
+        target_intrinsic = target_intrinsic.to(self.device)
+        target_image = target_image.to(self.device)
         
         # Convert to camera format
         optimized_camera_to_world = target_extrinsic[None, ...]  # [1, 4, 4]
@@ -882,6 +895,7 @@ class EVolsplatTrainer(nn.Module):
         """
         pred_rgb = outputs["rgb"]
         accumulation = outputs["accumulation"]
+        gt_image = gt_image.to(self.device)
         
         # L1 loss
         l1_loss = torch.abs(gt_image - pred_rgb).mean()
@@ -931,22 +945,23 @@ class EVolsplatTrainer(nn.Module):
             offset_crop: Predicted offset [num_points, 3] (with gradients)
             projection_mask: Projection mask [N] (boolean)
         """
-        # Detach and move to CPU
-        offset_crop = offset_crop.detach().cpu()
-        projection_mask = projection_mask.detach().cpu()
-        
         segment_key = (scene_id, segment_id)
         
-        # Initialize offset cache if needed
+        # Ensure offset cache exists on the designated cache device (CPU by default)
         if segment_key not in self.offset_cache:
             node = self.nodes[segment_key]
-            self.offset_cache[segment_key] = torch.zeros_like(node._means, device="cpu")
+            self.offset_cache[segment_key] = torch.zeros_like(
+                node._means, device=self.offset_cache_device
+            )
         
-        # Ensure cached offsets live on CPU (they may come from checkpoints on GPU)
-        cached_offset = self.offset_cache[segment_key]
-        if cached_offset.device.type != "cpu":
-            cached_offset = cached_offset.cpu()
+        cached_offset = self.offset_cache[segment_key].to(self.offset_cache_device)
+        if cached_offset is not self.offset_cache[segment_key]:
+            # In case checkpoint loaded offsets onto GPU, keep cache on CPU to avoid device mismatch
             self.offset_cache[segment_key] = cached_offset
+        
+        # Move incoming updates to the same device as the cache to avoid cuda/cpu mismatch
+        offset_crop = offset_crop.detach().to(self.offset_cache_device)
+        projection_mask = projection_mask.detach().to(self.offset_cache_device).to(torch.bool)
         
         # Update offset at projected points
         self.offset_cache[segment_key][projection_mask] = offset_crop
@@ -1269,7 +1284,7 @@ class EVolsplatTrainer(nn.Module):
                 # Parse key: "(scene_id, segment_id)"
                 import ast
                 key = ast.literal_eval(k)
-                self.offset_cache[key] = v.to("cpu")
+                self.offset_cache[key] = v.to(self.offset_cache_device)
         
         # Restore frozen volume cache
         if "frozen_volume_cache" in checkpoint:
@@ -1319,7 +1334,7 @@ class EVolsplatTrainer(nn.Module):
             
             # Compute metrics
             pred_rgb = outputs["rgb"]
-            gt_rgb = target_view["image"]
+            gt_rgb = target_view["image"].to(self.device)
             
             # Switch to [1, C, H, W] for metrics
             pred_rgb_metric = pred_rgb.permute(2, 0, 1)[None, ...]
