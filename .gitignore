@@ -188,3 +188,5 @@ cython_debug/
 local_scripts
 
 show_dirs/
+
+checkpoints/

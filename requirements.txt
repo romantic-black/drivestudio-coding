@@ -25,6 +25,7 @@ pyquaternion==0.9.9
 chumpy
 numpy==1.23.1
 kornia==0.7.2
+einops>=0.7.0
 
 tqdm
 gdown
