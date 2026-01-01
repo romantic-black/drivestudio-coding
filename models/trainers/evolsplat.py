@@ -424,7 +424,7 @@ class EVolsplatTrainer(nn.Module):
         node._initial_scales = initial_scales
         
         # Initialize offset to zero
-        offset = torch.zeros_like(means)
+        offset = torch.zeros_like(means, device="cpu")
         
         # Store node and offset
         self.nodes[(scene_id, segment_id)] = node
@@ -933,13 +933,20 @@ class EVolsplatTrainer(nn.Module):
         """
         # Detach and move to CPU
         offset_crop = offset_crop.detach().cpu()
+        projection_mask = projection_mask.detach().cpu()
         
         segment_key = (scene_id, segment_id)
         
         # Initialize offset cache if needed
         if segment_key not in self.offset_cache:
             node = self.nodes[segment_key]
-            self.offset_cache[segment_key] = torch.zeros_like(node._means.cpu())
+            self.offset_cache[segment_key] = torch.zeros_like(node._means, device="cpu")
+        
+        # Ensure cached offsets live on CPU (they may come from checkpoints on GPU)
+        cached_offset = self.offset_cache[segment_key]
+        if cached_offset.device.type != "cpu":
+            cached_offset = cached_offset.cpu()
+            self.offset_cache[segment_key] = cached_offset
         
         # Update offset at projected points
         self.offset_cache[segment_key][projection_mask] = offset_crop
@@ -1262,7 +1269,7 @@ class EVolsplatTrainer(nn.Module):
                 # Parse key: "(scene_id, segment_id)"
                 import ast
                 key = ast.literal_eval(k)
-                self.offset_cache[key] = v.to(self.device)
+                self.offset_cache[key] = v.to("cpu")
         
         # Restore frozen volume cache
         if "frozen_volume_cache" in checkpoint:
