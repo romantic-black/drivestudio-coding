@@ -37,18 +37,15 @@ def _sh_to_rgb(sh: torch.Tensor) -> torch.Tensor:
 
 
 def _random_quat_tensor(num: int, device: torch.device) -> torch.Tensor:
+    """Generate random quaternions in wxyz format (compatible with gsplat)."""
     u = torch.rand(num, device=device)
     v = torch.rand(num, device=device)
     w = torch.rand(num, device=device)
-    return torch.stack(
-        [
-            torch.sqrt(1 - u) * torch.sin(2 * torch.pi * v),
-            torch.sqrt(1 - u) * torch.cos(2 * torch.pi * v),
-            torch.sqrt(u) * torch.sin(2 * torch.pi * w),
-            torch.sqrt(u) * torch.cos(2 * torch.pi * w),
-        ],
-        dim=-1,
-    )
+    x = torch.sqrt(1 - u) * torch.sin(2 * torch.pi * v)
+    y = torch.sqrt(1 - u) * torch.cos(2 * torch.pi * v)
+    z = torch.sqrt(u) * torch.sin(2 * torch.pi * w)
+    ww = torch.sqrt(u) * torch.cos(2 * torch.pi * w)
+    return torch.stack([ww, x, y, z], dim=-1)  # wxyz format
 
 
 def _quat_multiply(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
@@ -66,7 +63,12 @@ def _normalize_quat(q: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
 
 
 def get_viewmat(camera_to_world: torch.Tensor) -> torch.Tensor:
-    """Convert camera-to-world to world-to-camera as used by gsplat."""
+    """Convert camera-to-world to world-to-camera as used by gsplat.
+    
+    Supports both [4,4] and [B,4,4] input shapes.
+    """
+    if camera_to_world.dim() == 2:
+        camera_to_world = camera_to_world.unsqueeze(0)  # [1,4,4]
     r = camera_to_world[:, :3, :3]
     t = camera_to_world[:, :3, 3:4]
     r = r * torch.tensor([[[1, -1, -1]]], device=r.device, dtype=r.dtype)
@@ -318,7 +320,12 @@ class StreetForwardTrainer(nn.Module):
         if isinstance(pointcloud, dict):
             background = pointcloud.get("background", np.zeros((0, 6), dtype=np.float32))
             points = background[:, :3]
-            colors = background[:, 3:] / 255.0 if background.shape[1] >= 6 else np.zeros_like(points)
+            if background.shape[1] >= 6:
+                colors = background[:, 3:]
+                if colors.max() > 1.0 + 1e-3:
+                    colors = colors / 255.0
+            else:
+                colors = np.zeros_like(points)
         else:
             points = np.asarray(pointcloud.points)  # type: ignore[attr-defined]
             colors = np.asarray(pointcloud.colors)  # type: ignore[attr-defined]
@@ -358,6 +365,8 @@ class StreetForwardTrainer(nn.Module):
         if isinstance(scene_id, torch.Tensor):
             scene_id = int(scene_id.item())
         segment_id = batch["segment_id"]
+        if isinstance(segment_id, torch.Tensor):
+            segment_id = int(segment_id.item())
         key = (scene_id, segment_id)
         if key in self.node_states:
             return key, self.node_states[key]
@@ -457,9 +466,18 @@ class StreetForwardTrainer(nn.Module):
         key, node_state = self._get_or_init_node_state(batch)
         target_views = batch["target_views"]
         gt_images = batch["gt_images"]
-        view_count = max(len(target_views), 1)
+        
+        # Skip if no target views (no supervision)
+        if len(target_views) == 0:
+            return {
+                "total_loss": torch.tensor(0.0, device=self.device),
+                "node_state": node_state,
+                "outputs": [],
+            }
+        
+        view_count = len(target_views)
         outputs = []
-        total_loss = torch.tensor(0.0, device=self.device)
+        total_loss_val = 0.0  # Use scalar to avoid keeping computation graph
 
         self.optimizer.zero_grad(set_to_none=True)
 
@@ -499,6 +517,10 @@ class StreetForwardTrainer(nn.Module):
                     k_mat = view.K
                 else:
                     k_mat = torch.eye(3, device=self.device).unsqueeze(0)
+                
+                # Ensure Ks is [1,3,3] format
+                if k_mat.dim() == 2:
+                    k_mat = k_mat.unsqueeze(0)
 
                 height, width = gt_img.shape[0], gt_img.shape[1]
 
@@ -526,9 +548,19 @@ class StreetForwardTrainer(nn.Module):
                 rgb = render[:, ..., :3].squeeze(0)
                 acc = alpha.squeeze(0)
                 loss = self.compute_loss(rgb, gt_img) / view_count
-                total_loss = total_loss + loss
+                total_loss_val += float(loss.detach())  # Accumulate scalar to avoid keeping graph
                 loss.backward()
-                outputs.append({"rgb": rgb.detach(), "acc": acc.detach(), "loss": loss.detach()})
+                
+                # Only store images if explicitly requested (to save GPU memory)
+                log_images = self.config.get("log_images", False)
+                if log_images:
+                    outputs.append({
+                        "rgb": rgb.detach().cpu(),
+                        "acc": acc.detach().cpu(),
+                        "loss": loss.detach().item(),
+                    })
+                else:
+                    outputs.append({"loss": loss.detach().item()})
 
             render_tensors = [
                 render_params["means_r"],
@@ -561,7 +593,7 @@ class StreetForwardTrainer(nn.Module):
 
         self.node_states[key] = node_state.detach_clone()
         return {
-            "total_loss": total_loss,
+            "total_loss": torch.tensor(total_loss_val, device=self.device),
             "node_state": self.node_states[key],
             "outputs": outputs,
         }
