@@ -69,8 +69,11 @@ def setup(args):
         trainer_cfg_path = os.path.join("configs", "evolsplat", "trainer_config.yaml")
         if os.path.exists(trainer_cfg_path):
             trainer_cfg = OmegaConf.load(trainer_cfg_path)
-            if "trainer" in trainer_cfg:
-                cfg.trainer = trainer_cfg.trainer
+            cfg.trainer = trainer_cfg
+    
+    # Ensure trainer config exists
+    if "trainer" not in cfg:
+        raise ValueError("trainer config is required but not found. Please provide it in the config file or in configs/evolsplat/trainer_config.yaml")
     
     # Ensure data config exists
     if "data" not in cfg:

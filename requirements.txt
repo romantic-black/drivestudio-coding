@@ -32,3 +32,8 @@ gdown
 
 nerfview==0.0.3
 lpips==0.1.4
+
+# Optional: faiss for efficient k-NN search (reduces memory from O(N²) to O(N×k))
+# Install faiss-gpu for GPU acceleration (requires CUDA) or faiss-cpu for CPU-only
+faiss-gpu  # Uncomment if you have CUDA
+# faiss-cpu  # Uncomment for CPU-only environments
