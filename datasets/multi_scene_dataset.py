@@ -54,6 +54,7 @@ class MultiSceneDataset:
         device: torch.device = torch.device("cpu"),
         preload_scene_count: int = 3,
         fixed_segment_aabb: Optional[Tensor] = None,
+        pointcloud_config: Optional[Dict] = None,
     ):
         """
         Initialize MultiSceneDataset.
@@ -137,8 +138,61 @@ class MultiSceneDataset:
         # Thread lock for protecting queue and cache operations
         self._lock = threading.RLock()
         
+        # Initialize point cloud generator (if config exists)
+        self.pointcloud_generator = None
+        if pointcloud_config is not None:
+            self.pointcloud_generator = self._create_pointcloud_generator(
+                pointcloud_config, data_cfg, device
+            )
+        
         # Track if initialized
         self._initialized = False
+    
+    def _create_pointcloud_generator(
+        self,
+        pointcloud_config: Dict,
+        data_cfg: OmegaConf,
+        device: torch.device,
+    ) -> Optional["RGBPointCloudGenerator"]:
+        """
+        根据配置创建点云生成器。
+        
+        Args:
+            pointcloud_config: 点云生成器配置字典
+            data_cfg: 数据集配置（用于获取相机列表等）
+            device: 设备
+            
+        Returns:
+            点云生成器实例或 None
+        """
+        from datasets.pointcloud_generators import MonocularRGBPointCloudGenerator
+        
+        # 获取生成器类型（默认为 monocular）
+        generator_type = pointcloud_config.get("type", "monocular")
+        
+        if generator_type == "monocular":
+            chosen_cam_ids = pointcloud_config.get(
+                "chosen_cam_ids",
+                data_cfg.pixel_source.get("cameras", [0])
+            )
+            
+            crop_aabb = np.array(pointcloud_config.get("crop_aabb", [[-20, -20, -20], [20, 4.8, 70]]))
+            input_aabb = np.array(pointcloud_config.get("input_aabb", [[-20, -20, -20], [20, 4.8, 120]]))
+            
+            return MonocularRGBPointCloudGenerator(
+                chosen_cam_ids=chosen_cam_ids,
+                sparsity=pointcloud_config.get("sparsity", "full"),
+                filter_sky=pointcloud_config.get("filter_sky", True),
+                depth_consistency=pointcloud_config.get("depth_consistency", True),
+                use_bbx=pointcloud_config.get("use_bbx", True),
+                downscale=pointcloud_config.get("downscale", 2),
+                crop_aabb=crop_aabb,
+                input_aabb=input_aabb,
+                device=device,
+            )
+        else:
+            logger.warning(f"Unknown pointcloud generator type: {generator_type}")
+            return None
     
     def initialize(self):
         """
@@ -1261,7 +1315,16 @@ class MultiSceneDataset:
                 target_frame_idxs.append(frame_idx)
                 target_cam_idxs.append(cam_idx)
         
-        # 6. Assemble batch
+        # 6. Generate point cloud (if point cloud generator exists)
+        pointcloud = None
+        if self.pointcloud_generator is not None:
+            pointcloud = self.pointcloud_generator.generate_pointcloud(
+                dataset=self,
+                scene_id=scene_id,
+                segment_id=segment_id,
+            )
+        
+        # 7. Assemble batch
         batch = {
             'scene_id': torch.tensor([scene_id], dtype=torch.long),
             'segment_id': segment_id,
@@ -1293,6 +1356,10 @@ class MultiSceneDataset:
                 'keyframe_indices': torch.tensor(target_keyframe_indices, dtype=torch.long),  # [num_target_keyframes]
             }
         }
+        
+        # Add pointcloud to batch if generated
+        if pointcloud is not None:
+            batch['pointcloud'] = pointcloud
         
         return batch
     

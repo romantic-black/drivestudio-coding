@@ -1,0 +1,87 @@
+# StreetForward training configuration
+# This configuration supports multi-scene training with RGB point cloud initialization
+
+data:
+  data_root: /root/autodl-tmp/nuScenes/  # data root for the dataset
+  dataset: nuscenes  # dataset type (waymo, nuscenes, kitti, etc.)
+  start_timestep: 0
+  end_timestep: -1
+  preload_device: cpu
+  
+  # Training and evaluation scene IDs
+  train_scene_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  eval_scene_ids: [10, 11, 12, 13]
+  
+  pixel_source:
+    type: datasets.nuscenes.nuscenes_sourceloader.NuScenesPixelSource
+    cameras: [0, 1, 2]
+    downscale_when_loading: [3, 3, 3]
+    downscale: 1
+    undistort: False
+    test_image_stride: 0
+    load_sky_mask: true
+    load_dynamic_mask: true
+    load_depth_maps: true
+    load_objects: true
+    load_smpl: false
+  
+  lidar_source:
+    type: datasets.nuscenes.nuscenes_sourceloader.NuScenesLiDARSource
+    load_lidar: true
+    lidar_downsample_factor: 4
+    lidar_percentile: 0.02
+
+# MultiSceneDataset configuration
+dataset:
+  # MultiSceneDataset parameters
+  num_source_keyframes: 3
+  num_target_keyframes: 6
+  segment_overlap_ratio: 0.2
+  min_keyframes_per_scene: 10
+  min_keyframes_per_segment: 6
+  preload_scene_count: 3
+  
+  keyframe_split_config:
+    num_splits: 0
+    min_count: 1
+    min_length: 2.0
+  
+  # Fixed segment AABB (optional)
+  fixed_segment_aabb: [[-20, -20, -5], [70, 20, 5]]
+  
+  # Point cloud generator configuration (moved from data.pointcloud)
+  pointcloud:
+    type: monocular  # 生成器类型：monocular 或 lidar
+    chosen_cam_ids: [0, 1, 2]  # 使用的相机ID列表
+    sparsity: full  # Point cloud sparsity level
+    filter_sky: true
+    depth_consistency: true
+    use_bbx: true
+    downscale: 2
+    # Crop AABB: 用于裁剪（移除框外的点）
+    crop_aabb: [[-20, -20, -20], [20, 4.8, 70]]
+    # Input AABB: 用于分割和过滤
+    input_aabb: [[-20, -20, -20], [20, 4.8, 120]]
+
+# StreetForwardTrainer configuration
+model:
+  offset_max: 0.1
+  sh_degree: 1
+  voxel_size: 0.1
+  max_iterations: 1
+  sparseConv_outdim: 32
+  bbx_min: [-20.0, -20.0, -20.0]
+  bbx_max: [20.0, 4.8, 70.0]
+
+# Optimizer configuration
+optimizer:
+  lr: 1e-3
+  eps: 1e-15
+  weight_decay: 0.0
+
+# Training configuration
+training:
+  max_iterations: 10000
+  save_checkpoint_freq: 1000
+  eval_freq: 5000
+  log_images: false  # 是否保存渲染图像（节省GPU内存）
