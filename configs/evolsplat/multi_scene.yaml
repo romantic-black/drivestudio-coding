@@ -2,7 +2,7 @@
 # This configuration supports multi-scene training with keyframe-based segmentation
 
 data:
-  data_root: /mnt/f/DataSet/nuScenes/processed/trainval  # data root for the dataset
+  data_root: /root/autodl-tmp/nuScenes/  # data root for the dataset
   dataset: nuscenes  # dataset type (waymo, nuscenes, kitti, etc.)
   start_timestep: 0  # which timestep to start from
   end_timestep: -1  # which timestep to end at, -1 means the last timestep
@@ -10,7 +10,7 @@ data:
   
   # Training and evaluation scene IDs
   train_scene_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]  # List of scene IDs for training
-  eval_scene_ids: [10, 11, 12, 13, 14]  # List of scene IDs for evaluation
+  eval_scene_ids: [10, 11, 12, 13]  # List of scene IDs for evaluation
   
   pixel_source:  # image source and object annotations
     type: datasets.nuscenes.nuscenes_sourceloader.NuScenesPixelSource
@@ -51,7 +51,7 @@ data:
     # Input AABB: used for splitting and filtering (distinguishing inside/outside points)
     # Format: [[x_min, y_min, z_min], [x_max, y_max, z_max]]
     # Coordinate system: x=left-right, y=up-down (negative is up), z=back-front
-    input_aabb: [[-20, -20, -20], [20, 4.8, 70]]
+    input_aabb: [[-20, -20, -20], [20, 4.8, 120]]
 
 # MultiSceneDataset specific configuration
 multi_scene:

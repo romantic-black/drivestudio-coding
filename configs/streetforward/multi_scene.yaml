@@ -24,6 +24,10 @@ data:
     load_depth_maps: true
     load_objects: true
     load_smpl: false
+    sampler:  # error based image sampler
+      buffer_downscale: 8  # downscale factor for the buffer wrt load_size
+      buffer_ratio: 0.5  # the percentage of images sampled according to the error buffer
+      start_enhance_weight: 3  # give more chance to sample starting frames, which usually have more errors
   
   lidar_source:
     type: datasets.nuscenes.nuscenes_sourceloader.NuScenesLiDARSource
@@ -34,8 +38,8 @@ data:
 # MultiSceneDataset configuration
 dataset:
   # MultiSceneDataset parameters
-  num_source_keyframes: 3
-  num_target_keyframes: 6
+  num_source_keyframes: 1
+  num_target_keyframes: 2
   segment_overlap_ratio: 0.2
   min_keyframes_per_scene: 10
   min_keyframes_per_segment: 6

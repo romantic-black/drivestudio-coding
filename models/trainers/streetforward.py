@@ -18,7 +18,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 from omegaconf import OmegaConf
-import faiss
+try:
+    from sklearn.neighbors import NearestNeighbors
+    _sklearn_available = True
+except ImportError:
+    _sklearn_available = False
 
 logger = logging.getLogger(__name__)
 
@@ -180,7 +184,7 @@ def _fallback_sparse_to_dense_volume(
 
 def _pairwise_neighbor_distances(points: torch.Tensor, k: int = 3) -> torch.Tensor:
     """
-    Compute k-NN distances efficiently using faiss, sklearn, or batched torch.cdist.
+    Compute k-NN distances efficiently using sklearn's NearestNeighbors.
     
     This function avoids the O(N²) memory overhead of computing full pairwise distances
     by using efficient k-NN algorithms. For large point clouds (e.g., 890K points),
@@ -193,42 +197,130 @@ def _pairwise_neighbor_distances(points: torch.Tensor, k: int = 3) -> torch.Tens
     Returns:
         Tensor of shape [N, k] containing distances to k nearest neighbors
     """
-    N = points.shape[0]
-        
-        # Check if faiss-gpu is available and points are on GPU
-    use_gpu = points.is_cuda and hasattr(faiss, 'StandardGpuResources')
+    # #region agent log
+    import json
+    import time
+    log_entry = {
+        "sessionId": "debug-session",
+        "runId": "run1",
+        "hypothesisId": "A",
+        "location": "streetforward.py:196",
+        "message": "Entering _pairwise_neighbor_distances",
+        "data": {"N": points.shape[0], "k": k, "device": str(points.device)},
+        "timestamp": int(time.time() * 1000)
+    }
+    with open('/root/drivestudio-coding/.cursor/debug.log', 'a') as f:
+        f.write(json.dumps(log_entry) + '\n')
+    # #endregion agent log
     
-    if use_gpu:
-        # Use GPU-accelerated faiss
-        res = faiss.StandardGpuResources()
+    if not _sklearn_available:
+        raise ImportError("sklearn is required for k-NN search. Please install scikit-learn.")
+    
+    # #region agent log
+    log_entry = {
+        "sessionId": "debug-session",
+        "runId": "run1",
+        "hypothesisId": "A",
+        "location": "streetforward.py:220",
+        "message": "Converting to numpy for sklearn",
+        "data": {},
+        "timestamp": int(time.time() * 1000)
+    }
+    with open('/root/drivestudio-coding/.cursor/debug.log', 'a') as f:
+        f.write(json.dumps(log_entry) + '\n')
+    # #endregion agent log
+    
+    # Convert to numpy (CPU) for sklearn
+    if points.is_cuda:
         points_np = points.cpu().numpy().astype('float32')
-        dimension = points_np.shape[1]
-        index = faiss.IndexFlatL2(dimension)
-        gpu_index = faiss.index_cpu_to_gpu(res, 0, index)
-        gpu_index.add(points_np)
-        distances, _ = gpu_index.search(points_np, k + 1)
     else:
-        # Use CPU faiss
-        if points.is_cuda:
-            points_np = points.cpu().numpy().astype('float32')
-        else:
-            points_np = points.numpy().astype('float32')
-        
-        # Build faiss index
-        dimension = points_np.shape[1]
-        index = faiss.IndexFlatL2(dimension)
-        
-        # Add points to index
-        index.add(points_np)
-        
-        # Search for k+1 neighbors (k neighbors + self)
-        distances, _ = index.search(points_np, k + 1)
+        points_np = points.numpy().astype('float32')
+    
+    # #region agent log
+    log_entry = {
+        "sessionId": "debug-session",
+        "runId": "run1",
+        "hypothesisId": "A",
+        "location": "streetforward.py:232",
+        "message": "Building NearestNeighbors model",
+        "data": {"points_shape": list(points_np.shape)},
+        "timestamp": int(time.time() * 1000)
+    }
+    with open('/root/drivestudio-coding/.cursor/debug.log', 'a') as f:
+        f.write(json.dumps(log_entry) + '\n')
+    # #endregion agent log
+    
+    # Build the nearest neighbors model
+    # Use k+1 neighbors because the point itself will be included as the first neighbor
+    nn_model = NearestNeighbors(n_neighbors=k + 1, algorithm="auto", metric="euclidean")
+    nn_model.fit(points_np)
+    
+    # #region agent log
+    log_entry = {
+        "sessionId": "debug-session",
+        "runId": "run1",
+        "hypothesisId": "A",
+        "location": "streetforward.py:245",
+        "message": "Model fitted, starting k-NN search",
+        "data": {},
+        "timestamp": int(time.time() * 1000)
+    }
+    with open('/root/drivestudio-coding/.cursor/debug.log', 'a') as f:
+        f.write(json.dumps(log_entry) + '\n')
+    # #endregion agent log
+    
+    # Find the k-nearest neighbors
+    distances, _ = nn_model.kneighbors(points_np)
+    
+    # #region agent log
+    log_entry = {
+        "sessionId": "debug-session",
+        "runId": "run1",
+        "hypothesisId": "A",
+        "location": "streetforward.py:254",
+        "message": "k-NN search completed",
+        "data": {"distances_shape": list(distances.shape)},
+        "timestamp": int(time.time() * 1000)
+    }
+    with open('/root/drivestudio-coding/.cursor/debug.log', 'a') as f:
+        f.write(json.dumps(log_entry) + '\n')
+    # #endregion agent log
     
     # Exclude self (first neighbor is always the point itself)
     distances = distances[:, 1:]  # [N, k]
     
+    # #region agent log
+    log_entry = {
+        "sessionId": "debug-session",
+        "runId": "run1",
+        "hypothesisId": "A",
+        "location": "streetforward.py:264",
+        "message": "Converting back to torch tensor",
+        "data": {},
+        "timestamp": int(time.time() * 1000)
+    }
+    with open('/root/drivestudio-coding/.cursor/debug.log', 'a') as f:
+        f.write(json.dumps(log_entry) + '\n')
+    # #endregion agent log
+    
     # Convert back to torch tensor on original device
-    return torch.from_numpy(distances).to(points.device)
+    result = torch.from_numpy(distances.astype('float32')).to(points.device)
+    
+    # #region agent log
+    log_entry = {
+        "sessionId": "debug-session",
+        "runId": "run1",
+        "hypothesisId": "A",
+        "location": "streetforward.py:275",
+        "message": "Exiting _pairwise_neighbor_distances",
+        "data": {"result_shape": list(result.shape)},
+        "timestamp": int(time.time() * 1000)
+    }
+    with open('/root/drivestudio-coding/.cursor/debug.log', 'a') as f:
+        f.write(json.dumps(log_entry) + '\n')
+    # #endregion agent log
+    
+    return result
 
 @dataclass
 class NodeState:
@@ -361,6 +453,22 @@ class StreetForwardTrainer(nn.Module):
         segment_id: int,
         pointcloud,
     ) -> NodeState:
+        # #region agent log
+        import json
+        import time
+        log_entry = {
+            "sessionId": "debug-session",
+            "runId": "run1",
+            "hypothesisId": "E",
+            "location": "streetforward.py:358",
+            "message": "Entering _init_node_from_pointcloud",
+            "data": {"scene_id": scene_id, "segment_id": segment_id},
+            "timestamp": int(time.time() * 1000)
+        }
+        with open('/root/drivestudio-coding/.cursor/debug.log', 'a') as f:
+            f.write(json.dumps(log_entry) + '\n')
+        # #endregion agent log
+        
         if isinstance(pointcloud, dict):
             background = pointcloud.get("background", np.zeros((0, 6), dtype=np.float32))
             points = background[:, :3]
@@ -376,13 +484,55 @@ class StreetForwardTrainer(nn.Module):
             if colors.max() > 1.0 + 1e-3:
                 colors = colors / 255.0
 
+        # #region agent log
+        log_entry = {
+            "sessionId": "debug-session",
+            "runId": "run1",
+            "hypothesisId": "E",
+            "location": "streetforward.py:382",
+            "message": "Extracted points and colors",
+            "data": {"num_points": len(points)},
+            "timestamp": int(time.time() * 1000)
+        }
+        with open('/root/drivestudio-coding/.cursor/debug.log', 'a') as f:
+            f.write(json.dumps(log_entry) + '\n')
+        # #endregion agent log
+
         if len(points) == 0:
             raise ValueError(f"Empty point cloud for scene {scene_id}, segment {segment_id}")
 
         means = torch.from_numpy(points).float().to(self.device)
         colors_rgb = torch.from_numpy(colors).float().to(self.device)
 
+        # #region agent log
+        log_entry = {
+            "sessionId": "debug-session",
+            "runId": "run1",
+            "hypothesisId": "E",
+            "location": "streetforward.py:390",
+            "message": "Before calling _pairwise_neighbor_distances",
+            "data": {"means_shape": list(means.shape)},
+            "timestamp": int(time.time() * 1000)
+        }
+        with open('/root/drivestudio-coding/.cursor/debug.log', 'a') as f:
+            f.write(json.dumps(log_entry) + '\n')
+        # #endregion agent log
+
         distances = _pairwise_neighbor_distances(means, k=3)
+        
+        # #region agent log
+        log_entry = {
+            "sessionId": "debug-session",
+            "runId": "run1",
+            "hypothesisId": "E",
+            "location": "streetforward.py:402",
+            "message": "After _pairwise_neighbor_distances",
+            "data": {"distances_shape": list(distances.shape)},
+            "timestamp": int(time.time() * 1000)
+        }
+        with open('/root/drivestudio-coding/.cursor/debug.log', 'a') as f:
+            f.write(json.dumps(log_entry) + '\n')
+        # #endregion agent log
         avg_dist = distances.mean(dim=-1, keepdim=True)
         initial_scales = torch.log(torch.clamp(avg_dist, min=1e-3).repeat(1, 3))
 
@@ -405,6 +555,22 @@ class StreetForwardTrainer(nn.Module):
         return node_state
 
     def _get_or_init_node_state(self, batch: Dict) -> Tuple[Tuple[int, int], NodeState]:
+        # #region agent log
+        import json
+        import time
+        log_entry = {
+            "sessionId": "debug-session",
+            "runId": "run1",
+            "hypothesisId": "E",
+            "location": "streetforward.py:407",
+            "message": "Entering _get_or_init_node_state",
+            "data": {},
+            "timestamp": int(time.time() * 1000)
+        }
+        with open('/root/drivestudio-coding/.cursor/debug.log', 'a') as f:
+            f.write(json.dumps(log_entry) + '\n')
+        # #endregion agent log
+        
         scene_id = batch["scene_id"]
         if isinstance(scene_id, torch.Tensor):
             scene_id = int(scene_id.item())
@@ -412,20 +578,75 @@ class StreetForwardTrainer(nn.Module):
         if isinstance(segment_id, torch.Tensor):
             segment_id = int(segment_id.item())
         key = (scene_id, segment_id)
+        
+        # #region agent log
+        log_entry = {
+            "sessionId": "debug-session",
+            "runId": "run1",
+            "hypothesisId": "E",
+            "location": "streetforward.py:422",
+            "message": "Checking if node_state exists",
+            "data": {"scene_id": scene_id, "segment_id": segment_id, "key_exists": key in self.node_states},
+            "timestamp": int(time.time() * 1000)
+        }
+        with open('/root/drivestudio-coding/.cursor/debug.log', 'a') as f:
+            f.write(json.dumps(log_entry) + '\n')
+        # #endregion agent log
+        
         if key in self.node_states:
             return key, self.node_states[key]
+        
+        # #region agent log
+        log_entry = {
+            "sessionId": "debug-session",
+            "runId": "run1",
+            "hypothesisId": "E",
+            "location": "streetforward.py:432",
+            "message": "Node state not found, initializing from pointcloud",
+            "data": {},
+            "timestamp": int(time.time() * 1000)
+        }
+        with open('/root/drivestudio-coding/.cursor/debug.log', 'a') as f:
+            f.write(json.dumps(log_entry) + '\n')
+        # #endregion agent log
+        
         pointcloud = batch["pointcloud"]
         node_state = self._init_node_from_pointcloud(scene_id, segment_id, pointcloud)
+        
+        # #region agent log
+        log_entry = {
+            "sessionId": "debug-session",
+            "runId": "run1",
+            "hypothesisId": "E",
+            "location": "streetforward.py:442",
+            "message": "Node state initialized, returning",
+            "data": {},
+            "timestamp": int(time.time() * 1000)
+        }
+        with open('/root/drivestudio-coding/.cursor/debug.log', 'a') as f:
+            f.write(json.dumps(log_entry) + '\n')
+        # #endregion agent log
+        
         return key, node_state
 
     def get_grid_coords(
-        self, position_w: torch.Tensor, bbx_min: torch.Tensor, vol_dim: torch.Tensor, voxel_size: float
+        self, position_w: torch.Tensor, bbx_min: torch.Tensor, vol_dim, voxel_size: float
     ) -> torch.Tensor:
         pts = position_w - bbx_min.to(position_w.device)
         x_index = pts[..., 0] / voxel_size
         y_index = pts[..., 1] / voxel_size
         z_index = pts[..., 2] / voxel_size
-        w_dim, h_dim, d_dim = vol_dim[2].float(), vol_dim[1].float(), vol_dim[0].float()
+        
+        # Convert vol_dim to torch.Tensor if it's a list, tuple, or numpy array
+        # construct_sparse_tensor may return Python list from nerfstudio implementation
+        if isinstance(vol_dim, (list, tuple)):
+            vol_dim = torch.tensor(vol_dim, device=position_w.device, dtype=torch.float32)
+        elif not isinstance(vol_dim, torch.Tensor):
+            vol_dim = torch.tensor(vol_dim, device=position_w.device, dtype=torch.float32)
+        else:
+            vol_dim = vol_dim.to(position_w.device).float()
+        
+        w_dim, h_dim, d_dim = vol_dim[2], vol_dim[1], vol_dim[0]
         x_norm = x_index / (w_dim - 1).clamp(min=1.0) * 2 - 1
         y_norm = y_index / (h_dim - 1).clamp(min=1.0) * 2 - 1
         z_norm = z_index / (d_dim - 1).clamp(min=1.0) * 2 - 1
@@ -507,7 +728,38 @@ class StreetForwardTrainer(nn.Module):
         apply_update: bool = True,
         update_state: bool = True,
     ) -> Dict:
+        # #region agent log
+        import json
+        import time
+        log_entry = {
+            "sessionId": "debug-session",
+            "runId": "run1",
+            "hypothesisId": "D",
+            "location": "streetforward.py:504",
+            "message": "Entering train_iter",
+            "data": {"apply_update": apply_update, "update_state": update_state},
+            "timestamp": int(time.time() * 1000)
+        }
+        with open('/root/drivestudio-coding/.cursor/debug.log', 'a') as f:
+            f.write(json.dumps(log_entry) + '\n')
+        # #endregion agent log
+        
         key, node_state = self._get_or_init_node_state(batch)
+        
+        # #region agent log
+        log_entry = {
+            "sessionId": "debug-session",
+            "runId": "run1",
+            "hypothesisId": "D",
+            "location": "streetforward.py:516",
+            "message": "Got node_state, checking target_views",
+            "data": {},
+            "timestamp": int(time.time() * 1000)
+        }
+        with open('/root/drivestudio-coding/.cursor/debug.log', 'a') as f:
+            f.write(json.dumps(log_entry) + '\n')
+        # #endregion agent log
+        
         target_views = batch["target_views"]
         gt_images = batch["gt_images"]
         
@@ -525,9 +777,51 @@ class StreetForwardTrainer(nn.Module):
 
         self.optimizer.zero_grad(set_to_none=True)
 
-        for _ in range(self.inner_iterations):
+        # #region agent log
+        log_entry = {
+            "sessionId": "debug-session",
+            "runId": "run1",
+            "hypothesisId": "D",
+            "location": "streetforward.py:538",
+            "message": "Starting inner iterations loop",
+            "data": {"inner_iterations": self.inner_iterations, "view_count": view_count},
+            "timestamp": int(time.time() * 1000)
+        }
+        with open('/root/drivestudio-coding/.cursor/debug.log', 'a') as f:
+            f.write(json.dumps(log_entry) + '\n')
+        # #endregion agent log
+
+        for iter_idx in range(self.inner_iterations):
+            # #region agent log
+            log_entry = {
+                "sessionId": "debug-session",
+                "runId": "run1",
+                "hypothesisId": "D",
+                "location": "streetforward.py:548",
+                "message": "Inner iteration start",
+                "data": {"iter_idx": iter_idx},
+                "timestamp": int(time.time() * 1000)
+            }
+            with open('/root/drivestudio-coding/.cursor/debug.log', 'a') as f:
+                f.write(json.dumps(log_entry) + '\n')
+            # #endregion agent log
+            
             means_s = node_state.means
             anchor_rgb = _sh_to_rgb(node_state.sh_dc)
+
+            # #region agent log
+            log_entry = {
+                "sessionId": "debug-session",
+                "runId": "run1",
+                "hypothesisId": "C",
+                "location": "streetforward.py:560",
+                "message": "Before construct_sparse_tensor",
+                "data": {},
+                "timestamp": int(time.time() * 1000)
+            }
+            with open('/root/drivestudio-coding/.cursor/debug.log', 'a') as f:
+                f.write(json.dumps(log_entry) + '\n')
+            # #endregion agent log
 
             sparse_feat, vol_dim, valid_coords = self.construct_sparse_tensor(
                 raw_coords=means_s.clone(),
@@ -536,7 +830,37 @@ class StreetForwardTrainer(nn.Module):
                 Bbx_min=self.bbx_min,
                 voxel_size=self.voxel_size,
             )
+            
+            # #region agent log
+            log_entry = {
+                "sessionId": "debug-session",
+                "runId": "run1",
+                "hypothesisId": "C",
+                "location": "streetforward.py:575",
+                "message": "After construct_sparse_tensor, before sparse_conv",
+                "data": {},
+                "timestamp": int(time.time() * 1000)
+            }
+            with open('/root/drivestudio-coding/.cursor/debug.log', 'a') as f:
+                f.write(json.dumps(log_entry) + '\n')
+            # #endregion agent log
+            
             feat_3d = self.sparse_conv(sparse_feat)
+            
+            # #region agent log
+            log_entry = {
+                "sessionId": "debug-session",
+                "runId": "run1",
+                "hypothesisId": "C",
+                "location": "streetforward.py:585",
+                "message": "After sparse_conv, before sparse_to_dense_volume",
+                "data": {},
+                "timestamp": int(time.time() * 1000)
+            }
+            with open('/root/drivestudio-coding/.cursor/debug.log', 'a') as f:
+                f.write(json.dumps(log_entry) + '\n')
+            # #endregion agent log
+            
             dense_volume = self.sparse_to_dense_volume(
                 sparse_tensor=feat_3d,
                 coords=valid_coords,
@@ -551,7 +875,34 @@ class StreetForwardTrainer(nn.Module):
             render_params = self._render_params_from_offsets(node_state, offsets)
             proxies = self._create_proxy_params(render_params)
 
-            for view, gt_img in zip(target_views, gt_images):
+            # #region agent log
+            log_entry = {
+                "sessionId": "debug-session",
+                "runId": "run1",
+                "hypothesisId": "D",
+                "location": "streetforward.py:603",
+                "message": "Before rendering loop",
+                "data": {"num_views": len(target_views)},
+                "timestamp": int(time.time() * 1000)
+            }
+            with open('/root/drivestudio-coding/.cursor/debug.log', 'a') as f:
+                f.write(json.dumps(log_entry) + '\n')
+            # #endregion agent log
+
+            for view_idx, (view, gt_img) in enumerate(zip(target_views, gt_images)):
+                # #region agent log
+                log_entry = {
+                    "sessionId": "debug-session",
+                    "runId": "run1",
+                    "hypothesisId": "D",
+                    "location": "streetforward.py:612",
+                    "message": "Rendering view",
+                    "data": {"view_idx": view_idx},
+                    "timestamp": int(time.time() * 1000)
+                }
+                with open('/root/drivestudio-coding/.cursor/debug.log', 'a') as f:
+                    f.write(json.dumps(log_entry) + '\n')
+                # #endregion agent log
                 c2w = view.camtoworlds if hasattr(view, "camtoworlds") else view["camtoworlds"]
                 viewmat = get_viewmat(c2w)
                 k_mat = None
@@ -567,6 +918,20 @@ class StreetForwardTrainer(nn.Module):
                     k_mat = k_mat.unsqueeze(0)
 
                 height, width = gt_img.shape[0], gt_img.shape[1]
+
+                # #region agent log
+                log_entry = {
+                    "sessionId": "debug-session",
+                    "runId": "run1",
+                    "hypothesisId": "D",
+                    "location": "streetforward.py:625",
+                    "message": "Before renderer call",
+                    "data": {"height": height, "width": width},
+                    "timestamp": int(time.time() * 1000)
+                }
+                with open('/root/drivestudio-coding/.cursor/debug.log', 'a') as f:
+                    f.write(json.dumps(log_entry) + '\n')
+                # #endregion agent log
 
                 render, alpha, _ = self.renderer(
                     means=proxies["means_p"],
@@ -588,6 +953,20 @@ class StreetForwardTrainer(nn.Module):
                     absgrad=True,
                     rasterize_mode="classic",
                 )
+                
+                # #region agent log
+                log_entry = {
+                    "sessionId": "debug-session",
+                    "runId": "run1",
+                    "hypothesisId": "D",
+                    "location": "streetforward.py:651",
+                    "message": "After renderer call",
+                    "data": {},
+                    "timestamp": int(time.time() * 1000)
+                }
+                with open('/root/drivestudio-coding/.cursor/debug.log', 'a') as f:
+                    f.write(json.dumps(log_entry) + '\n')
+                # #endregion agent log
 
                 rgb = render[:, ..., :3].squeeze(0)
                 acc = alpha.squeeze(0)
