@@ -38,8 +38,8 @@ data:
 # MultiSceneDataset configuration
 dataset:
   # MultiSceneDataset parameters
-  num_source_keyframes: 1
-  num_target_keyframes: 2
+  num_source_keyframes: 3
+  num_target_keyframes: 6
   segment_overlap_ratio: 0.2
   min_keyframes_per_scene: 10
   min_keyframes_per_segment: 6
