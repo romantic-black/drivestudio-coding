@@ -140,10 +140,10 @@ sparse_conv()
   → feat_3d [N, outdim] (3D特征)
   ↓
 sparse_to_dense_volume() 
-  → dense_volume [1, C, D, H, W] (密集体积)
+  → dense_volume [1, X, Y, Z, C] (密集体积，其中 vol_dim 是 [X, Y, Z])
   ↓
-permute(0, 4, 3, 1, 2) 
-  → dense_volume [1, C, H, W, D] (调整维度顺序)
+permute(0, 4, 3, 2, 1) 
+  → dense_volume [1, C, Z, Y, X] = [1, C, D, H, W] (调整为 grid_sample 需要的格式)
 ```
 
 **数据维度说明：**
@@ -304,6 +304,7 @@ with torch.no_grad():
                 Bbx_max=self.bbx_max,
                 Bbx_min=self.bbx_min,
                 voxel_size=self.voxel_size,
+                device=self.device,
             )
             feat_3d = self.sparse_conv(sparse_feat)
             dense_volume = self.sparse_to_dense_volume(
@@ -311,7 +312,11 @@ with torch.no_grad():
                 coords=valid_coords,
                 vol_dim=vol_dim,
             ).unsqueeze(dim=0)
-            dense_volume = dense_volume.permute(0, 4, 3, 1, 2)
+            # sparse_to_dense_volume returns [X, Y, Z, C] where vol_dim is [X, Y, Z]
+            # After unsqueeze: [1, X, Y, Z, C]
+            # grid_sample (5D) expects [B, C, D, H, W] where D=Z, H=Y, W=X
+            # So we need: permute(0, 4, 3, 2, 1) to get [1, C, Z, Y, X] = [1, C, D, H, W]
+            dense_volume = dense_volume.permute(0, 4, 3, 2, 1)
 
             grid_coords = self.get_grid_coords(means_s, self.bbx_min, vol_dim, self.voxel_size)
             feat_3d_crop = self.interpolate_features(grid_coords, dense_volume)
@@ -645,23 +650,24 @@ def sparse_to_dense_volume(sparse_tensor, coords, vol_dim, default_val=0):
     coords = coords.to(torch.int64)
     
     # 1. 限制坐标在有效范围内（防止越界）
-    coords[:, 0] = coords[:, 0].clamp(0, vol_dim[0] - 1)  # D维度
-    coords[:, 1] = coords[:, 1].clamp(0, vol_dim[1] - 1)  # H维度
-    coords[:, 2] = coords[:, 2].clamp(0, vol_dim[2] - 1)  # W维度
+    # vol_dim 是 [X, Y, Z] 格式，coords 也是 [X, Y, Z] 格式
+    coords[:, 0] = coords[:, 0].clamp(0, vol_dim[0] - 1)  # X维度
+    coords[:, 1] = coords[:, 1].clamp(0, vol_dim[1] - 1)  # Y维度
+    coords[:, 2] = coords[:, 2].clamp(0, vol_dim[2] - 1)  # Z维度
     
     # 2. 创建密集体积（全部初始化为default_val）
     device = sparse_tensor.device
     dense = torch.full(
-        [vol_dim[0], vol_dim[1], vol_dim[2], c],  # [D, H, W, C]
+        [vol_dim[0], vol_dim[1], vol_dim[2], c],  # [X, Y, Z, C]
         float(default_val),
         device=device
     )
     
     # 3. 将稀疏特征填入对应位置
     dense[coords[:, 0], coords[:, 1], coords[:, 2]] = sparse_tensor
-    # coords[:, 0]是D索引，coords[:, 1]是H索引，coords[:, 2]是W索引
+    # coords[:, 0]是X索引，coords[:, 1]是Y索引，coords[:, 2]是Z索引
     
-    return dense  # [D, H, W, C]
+    return dense  # [X, Y, Z, C]
 ```
 
 #### 关键操作详解
@@ -693,21 +699,24 @@ dense[15, 25, 35] = [f2_0, f2_1, ...]  # 将特征填入体素(15,25,35)
 ##### 2. `unsqueeze(dim=0)`
 
 ```python
-dense_volume = dense.unsqueeze(dim=0)  # [D, H, W, C] → [1, D, H, W, C]
+dense_volume = dense.unsqueeze(dim=0)  # [X, Y, Z, C] → [1, X, Y, Z, C]
 ```
 
 **目的：** 添加 batch 维度，便于后续操作
+
+**注意：** `sparse_to_dense_volume` 返回的格式是 `[X, Y, Z, C]`，其中 `vol_dim` 是 `[X, Y, Z]` 格式（对应世界坐标系的 X、Y、Z 轴）。在后续的 `permute` 操作中，会将其转换为 `grid_sample` 需要的 `[1, C, Z, Y, X]` = `[1, C, D, H, W]` 格式。
 
 #### 输出数据
 
 **`dense_volume` - 密集体积**
 
-**形状：** `[1, D, H, W, C]`
+**形状（unsqueeze 后）：** `[1, X, Y, Z, C]`
 
 **数据说明：**
 - 大部分位置为 `default_val`（通常为 0）
 - 只有 `coords` 指定的位置有实际特征值
 - 这是一个**稀疏的密集表示**（sparse dense representation）
+- 在后续的 `permute` 操作中，会转换为 `[1, C, Z, Y, X]` = `[1, C, D, H, W]` 格式以匹配 `grid_sample` 的要求
 
 ---
 
@@ -716,36 +725,39 @@ dense_volume = dense.unsqueeze(dim=0)  # [D, H, W, C] → [1, D, H, W, C]
 #### 函数调用
 
 ```python
-dense_volume = dense_volume.permute(0, 4, 3, 1, 2)
-# [1, D, H, W, C] → [1, C, W, D, H]
+dense_volume = dense_volume.permute(0, 4, 3, 2, 1)
+# [1, D, H, W, C] → [1, C, Z, Y, X] = [1, C, D, H, W]
 ```
 
 #### 维度变换详解
 
 **原始维度：** `[1, D, H, W, C]`
 - `0`: batch维度 (1)
-- `1`: D (深度)
-- `2`: H (高度)
-- `3`: W (宽度)
+- `1`: D (深度，对应Z轴)
+- `2`: H (高度，对应Y轴)
+- `3`: W (宽度，对应X轴)
 - `4`: C (特征通道)
 
-**目标维度：** `[1, C, W, D, H]`
+**目标维度：** `[1, C, Z, Y, X]` = `[1, C, D, H, W]`
 - `0`: batch维度 (1)
 - `1`: C (特征通道)
-- `2`: W (宽度)
-- `3`: D (深度)
-- `4`: H (高度)
+- `2`: Z (深度，对应D)
+- `3`: Y (高度，对应H)
+- `4`: X (宽度，对应W)
 
 **维度映射：**
 ```
-索引映射: 0→0, 4→1, 3→2, 1→3, 2→4
+索引映射: 0→0, 4→1, 3→2, 2→3, 1→4
 ```
 
 **为什么需要这个变换？**
 
-PyTorch 的 `grid_sample` 函数期望输入格式为 `[B, C, D, H, W]`，但我们的数据是 `[B, D, H, W, C]`。通过这个变换，我们将特征通道移到第二个维度。
+PyTorch 的 `grid_sample` 函数（5D版本）期望输入格式为 `[B, C, D, H, W]`，其中：
+- `D` 是深度维度（Z轴）
+- `H` 是高度维度（Y轴）
+- `W` 是宽度维度（X轴）
 
-**注意：** 实际代码中变换后的格式是 `[1, C, W, D, H]`，这与 `grid_sample` 的要求不完全匹配。这可能是代码中的一个问题，或者 `grid_sample` 的实际行为与文档有所不同。
+`sparse_to_dense_volume` 返回的格式是 `[D, H, W, C]`，经过 `unsqueeze(0)` 后变成 `[1, D, H, W, C]`。通过 `permute(0, 4, 3, 2, 1)` 变换，我们将特征通道移到第二个维度，并确保维度顺序与 `grid_sample` 的要求匹配：`[1, C, D, H, W]`。
 
 ---
 
@@ -975,11 +987,11 @@ torch.nn.functional.grid_sample(
   → feat_3d: SparseTensor([M, C], [M, 4]) - 3D特征（C=32）
 
 步骤3: sparse_to_dense_volume
-  → dense_volume: [D, H, W, C]
-  → unsqueeze: [1, D, H, W, C]
+  → dense_volume: [X, Y, Z, C] (其中 vol_dim 是 [X, Y, Z])
+  → unsqueeze: [1, X, Y, Z, C]
 
 步骤4: permute
-  → dense_volume: [1, C, W, D, H]
+  → dense_volume: [1, C, Z, Y, X] = [1, C, D, H, W]
 
 步骤5: get_grid_coords
   → grid_coords: [N, 3] - 归一化坐标 [-1, 1]
@@ -1125,8 +1137,8 @@ batch = {
 **作用：** 从稀疏点云特征构建3D特征表示
 
 **实现：**
-- **主要实现：** `nerfstudio.model_components.sparse_conv.SparseCostRegNet`
-- **回退实现：** `_FallbackSparseConv` (简单MLP)
+- **实现：** `models.evol_splat.SparseCostRegNet`
+- **错误处理：** 如果 `SparseCostRegNet` 不可用且未提供自定义 `sparse_conv`，会抛出 `ImportError`
 
 **输入/输出：**
 - 输入：`[N, 3]` - RGB特征
@@ -1135,19 +1147,23 @@ batch = {
 ### 2. 体积构建函数
 
 #### `construct_sparse_tensor`
-- 将点云坐标和特征转换为稀疏张量格式
-- 返回：`(sparse_feat, vol_dim, valid_coords)`
+- **实现：** `models.evol_splat.construct_sparse_tensor`
+- **功能：** 将点云坐标和特征转换为稀疏张量格式
+- **返回：** `(sparse_feat, vol_dim, valid_coords)`
+- **错误处理：** 如果函数不可用且未提供自定义 `construct_sparse_tensor_fn`，会抛出 `ImportError`
 
 #### `sparse_to_dense_volume`
-- 将稀疏特征转换为密集体积
-- 输入：`[N, C]` 稀疏特征
-- 输出：`[H, W, D, C]` 密集体积
+- **实现：** `models.evol_splat.sparse_to_dense_volume`
+- **功能：** 将稀疏特征转换为密集体积
+- **输入：** `[N, C]` 稀疏特征
+- **输出：** `[D, H, W, C]` 密集体积
+- **错误处理：** 如果函数不可用且未提供自定义 `sparse_to_dense_volume_fn`，会抛出 `ImportError`
 
 ### 3. 渲染器 (Renderer)
 
 **实现：**
-- **主要实现：** `gsplat.rendering.rasterization`
-- **回退实现：** `_default_renderer` (用于测试)
+- **实现：** `gsplat.rendering.rasterization`
+- **错误处理：** 如果 `gsplat` 不可用且未提供自定义 `renderer`，会抛出 `ImportError`
 
 **输入参数：**
 - `means`: `[N, 3]` - Gaussian中心
