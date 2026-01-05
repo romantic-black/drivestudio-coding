@@ -2,7 +2,10 @@
 EVolSplat components extracted for integration with drivestudio.
 """
 from .sparse_conv import (
+    BasicSparseConvolutionBlock,
+    BasicSparseDeconvolutionBlock,
     SparseCostRegNet,
+    SparseResidualBlock,
     construct_sparse_tensor,
     sparse_to_dense_volume,
 )
@@ -17,7 +20,10 @@ from .mlp_decoders import (
 from .utils import interpolate_features, get_grid_coords
 
 __all__ = [
+    "BasicSparseConvolutionBlock",
+    "BasicSparseDeconvolutionBlock",
     "SparseCostRegNet",
+    "SparseResidualBlock",
     "construct_sparse_tensor",
     "sparse_to_dense_volume",
     "Projector",
@@ -29,4 +35,3 @@ __all__ = [
     "interpolate_features",
     "get_grid_coords",
 ]
-

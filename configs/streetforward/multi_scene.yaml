@@ -51,7 +51,7 @@ dataset:
     min_length: 2.0
   
   # Fixed segment AABB (optional)
-  fixed_segment_aabb: [[-20, -20, -5], [70, 20, 5]]
+  fixed_segment_aabb: [[-20, -20, -20], [20, 4.8, 70]]  # 用于分割 segment
   
   # Point cloud generator configuration (moved from data.pointcloud)
   pointcloud:
@@ -74,8 +74,8 @@ model:
   voxel_size: 0.1
   max_iterations: 1
   sparseConv_outdim: 32
-  bbx_min: [-20.0, -20.0, -20.0]
-  bbx_max: [20.0, 4.8, 70.0]
+  bbx_min: [-20.0, -20.0, -20.0]  # 应该与 crop_aabb[0] 一致
+  bbx_max: [20.0, 4.8, 70.0]  # 应该与 crop_aabb[1] 一致
 
 # Optimizer configuration
 optimizer:

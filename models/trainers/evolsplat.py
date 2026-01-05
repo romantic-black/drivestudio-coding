@@ -37,12 +37,12 @@ try:
 except ImportError:
     raise ImportError("Please install gsplat>=1.0.0")
 
-from nerfstudio.model_components.projection import Projector
-from nerfstudio.field_components.mlp import MLP
-from nerfstudio.model_components.sparse_conv import (
-    sparse_to_dense_volume,
+from models.evol_splat import (
+    MLP,
+    Projector,
     SparseCostRegNet,
     construct_sparse_tensor,
+    sparse_to_dense_volume,
 )
 from nerfstudio.fields.initial_BgSphere import GaussianBGInitializer
 
