@@ -87,5 +87,14 @@ optimizer:
 training:
   max_iterations: 10000
   save_checkpoint_freq: 1000
+  save_checkpoint_dir: null  # 默认写入到 log_dir/checkpoints
+  resume_from_checkpoint: null
   eval_freq: 5000
+  log_interval: 100
   log_images: false  # 是否保存渲染图像（节省GPU内存）
+  tensorboard:
+    enabled: true
+    log_dir: null  # 默认写入 log_dir/tb
+    log_every: 20  # 标量写入频率（step）
+    log_image_every: 500  # 图片写入频率（step）
+    flush_secs: 30

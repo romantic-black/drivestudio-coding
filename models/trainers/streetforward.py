@@ -11,6 +11,8 @@ are unavailable so that unit tests can exercise the gradient plumbing.
 from __future__ import annotations
 
 import logging
+import os
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -260,7 +262,61 @@ class StreetForwardTrainer(nn.Module):
             weight_decay=optim_cfg.get("weight_decay", 0.0),
         )
 
+        self.global_step = 0
+        self.checkpoint_dir: Optional[str] = None
+        self.tb_writer = None
+        self.tb_log_every = 50
+        self.tb_image_every = None
+
+        training_cfg = getattr(config, "training", {})
+        self.checkpoint_dir = (
+            training_cfg.get("save_checkpoint_dir", None)
+            if hasattr(training_cfg, "get")
+            else None
+        )
+        # allow both legacy top-level flag and training-level override
+        self.log_images = bool(config.get("log_images", False))
+        if hasattr(training_cfg, "get"):
+            self.log_images = training_cfg.get("log_images", self.log_images)
+        self._setup_tensorboard(training_cfg)
+
         self.node_states: Dict[Tuple[int, int], NodeState] = {}
+
+    def _setup_tensorboard(self, training_cfg) -> None:
+        """
+        Initialize TensorBoard writer based on config.
+
+        TensorBoard is optional to keep unit tests lightweight and avoid
+        unexpected disk writes in non-training contexts.
+        """
+        tb_cfg = training_cfg.get("tensorboard", {}) if hasattr(training_cfg, "get") else {}
+        enabled = tb_cfg.get("enabled", False)
+        if not enabled:
+            return
+
+        log_dir = tb_cfg.get("log_dir")
+        if log_dir is None:
+            # Default to run's log_dir/tb when available, otherwise local folder.
+            base_log_dir = getattr(self.config, "log_dir", None)
+            if base_log_dir is not None:
+                log_dir = os.path.join(base_log_dir, "tb")
+            else:
+                log_dir = "./logs/tensorboard"
+
+        self.tb_log_every = int(tb_cfg.get("log_every", 50))
+        self.tb_image_every = tb_cfg.get("log_image_every", None)
+        if self.tb_image_every is not None:
+            self.tb_image_every = int(self.tb_image_every)
+
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+        except ImportError:
+            logger.warning("TensorBoard not available; install tensorboard to enable logging.")
+            return
+
+        Path(log_dir).mkdir(parents=True, exist_ok=True)
+        self.tb_writer = SummaryWriter(log_dir=log_dir, flush_secs=int(tb_cfg.get("flush_secs", 30)))
+        logger.info(f"TensorBoard logging enabled at {log_dir}")
 
     def _init_node_from_pointcloud(
         self,
@@ -325,6 +381,26 @@ class StreetForwardTrainer(nn.Module):
         node_state = self._init_node_from_pointcloud(scene_id, segment_id, pointcloud)
         return key, node_state
 
+    def _node_state_to_dict(self, node_state: NodeState) -> Dict[str, torch.Tensor]:
+        return {
+            "means": node_state.means.detach().cpu(),
+            "scales_log": node_state.scales_log.detach().cpu(),
+            "quats": node_state.quats.detach().cpu(),
+            "opacity_logit": node_state.opacity_logit.detach().cpu(),
+            "sh_dc": node_state.sh_dc.detach().cpu(),
+            "sh_rest": node_state.sh_rest.detach().cpu(),
+        }
+
+    def _node_state_from_dict(self, state_dict: Dict[str, torch.Tensor]) -> NodeState:
+        return NodeState(
+            means=state_dict["means"].to(self.device),
+            scales_log=state_dict["scales_log"].to(self.device),
+            quats=state_dict["quats"].to(self.device),
+            opacity_logit=state_dict["opacity_logit"].to(self.device),
+            sh_dc=state_dict["sh_dc"].to(self.device),
+            sh_rest=state_dict["sh_rest"].to(self.device),
+        ).detach_clone()
+
     def get_grid_coords(
         self, position_w: torch.Tensor, bbx_min: torch.Tensor, vol_dim, voxel_size: float
     ) -> torch.Tensor:
@@ -360,9 +436,14 @@ class StreetForwardTrainer(nn.Module):
         # - x corresponds to W (X axis)
         # So we normalize: z_norm for Z, y_norm for Y, x_norm for X
         # And stack as [z_norm, y_norm, x_norm]
-        x_norm = x_index / vol_dim[0] * 2 - 1  # X -> W
-        y_norm = y_index / vol_dim[1] * 2 - 1  # Y -> H
-        z_norm = z_index / vol_dim[2] * 2 - 1  # Z -> D
+        # For align_corners=True: index 0 maps to -1.0, index (N-1) maps to 1.0
+        # Therefore, we use (vol_dim - 1) as denominator to ensure correct boundary mapping
+        den_x = torch.clamp(vol_dim[0] - 1.0, min=1.0)
+        den_y = torch.clamp(vol_dim[1] - 1.0, min=1.0)
+        den_z = torch.clamp(vol_dim[2] - 1.0, min=1.0)
+        x_norm = 2.0 * (x_index / den_x) - 1.0  # X -> W
+        y_norm = 2.0 * (y_index / den_y) - 1.0  # Y -> H
+        z_norm = 2.0 * (z_index / den_z) - 1.0  # Z -> D
         # grid_sample (5D) expects coordinates in [z, y, x] order for [B, C, D, H, W] input
         grid_coords = torch.stack([z_norm, y_norm, x_norm], dim=-1)
         
@@ -540,8 +621,7 @@ class StreetForwardTrainer(nn.Module):
                 loss.backward()
                 
                 # Only store images if explicitly requested (to save GPU memory)
-                log_images = self.config.get("log_images", False)
-                if log_images:
+                if self.log_images:
                     outputs.append({
                         "rgb": rgb.detach().cpu(),
                         "acc": acc.detach().cpu(),
@@ -580,6 +660,9 @@ class StreetForwardTrainer(nn.Module):
                     node_state.sh_rest.copy_(render_params["sh_rest_r"].detach())
 
         self.node_states[key] = node_state.detach_clone()
+        if apply_update:
+            self.global_step += 1
+            self._log_to_tensorboard(total_loss_val, outputs)
         return {
             "total_loss": torch.tensor(total_loss_val, device=self.device),
             "node_state": self.node_states[key],
@@ -588,3 +671,147 @@ class StreetForwardTrainer(nn.Module):
 
     def forward(self, batch: Dict) -> Dict:
         return self.train_iter(batch)
+
+    def save_checkpoint(
+        self,
+        step: Optional[int] = None,
+        is_final: bool = False,
+        checkpoint_dir: Optional[str] = None,
+    ) -> str:
+        """
+        Persist model/optimizer and detached node states.
+
+        Args:
+            step: Optional training step to record (defaults to self.global_step)
+            is_final: If True, always write to checkpoint_final.pth
+            checkpoint_dir: Override output directory
+        """
+        step_val = int(step if step is not None else self.global_step)
+        ckpt_dir = (
+            checkpoint_dir
+            or self.checkpoint_dir
+            or (os.path.join(self.config.log_dir, "checkpoints") if hasattr(self.config, "log_dir") else None)
+            or "./checkpoints"
+        )
+        Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
+        filename = "checkpoint_final.pth" if is_final else f"checkpoint_step_{step_val:06d}.pth"
+        checkpoint_path = os.path.join(ckpt_dir, filename)
+
+        model_state_dict = {
+            "sparse_conv": self.sparse_conv.state_dict(),
+            "mlp_offset_pos": self.mlp_offset_pos.state_dict(),
+            "mlp_conv": self.mlp_conv.state_dict(),
+            "mlp_opacity": self.mlp_opacity.state_dict(),
+            "gaussion_decoder": self.gaussion_decoder.state_dict(),
+        }
+
+        nodes_state_dict = {
+            f"scene_{scene}_segment_{segment}": self._node_state_to_dict(state)
+            for (scene, segment), state in self.node_states.items()
+        }
+
+        checkpoint = {
+            "step": step_val,
+            "global_step": self.global_step,
+            "model_state_dict": model_state_dict,
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "node_states": nodes_state_dict,
+        }
+        try:
+            checkpoint["config"] = OmegaConf.to_container(self.config, resolve=False)
+        except Exception:
+            logger.debug("Config not serialized into checkpoint (non-fatal).")
+
+        torch.save(checkpoint, checkpoint_path)
+        logger.info(f"Checkpoint saved to {checkpoint_path}")
+        return checkpoint_path
+
+    def load_checkpoint(
+        self,
+        checkpoint_path: str,
+        load_optimizer: bool = True,
+        strict: bool = True,
+    ) -> int:
+        """
+        Restore model/optimizer and node states.
+
+        Args:
+            checkpoint_path: Path to .pth checkpoint
+            load_optimizer: Load optimizer state if available
+            strict: Strictness for weight loading
+
+        Returns:
+            Restored global_step
+        """
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        model_state = checkpoint.get("model_state_dict", checkpoint)
+
+        self.sparse_conv.load_state_dict(model_state["sparse_conv"], strict=strict)
+        self.mlp_offset_pos.load_state_dict(model_state["mlp_offset_pos"], strict=strict)
+        self.mlp_conv.load_state_dict(model_state["mlp_conv"], strict=strict)
+        self.mlp_opacity.load_state_dict(model_state["mlp_opacity"], strict=strict)
+        self.gaussion_decoder.load_state_dict(model_state["gaussion_decoder"], strict=strict)
+
+        if load_optimizer and "optimizer_state_dict" in checkpoint:
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+        nodes_state_dict = checkpoint.get("node_states") or checkpoint.get("nodes_state_dict")
+        if nodes_state_dict is not None:
+            restored_nodes: Dict[Tuple[int, int], NodeState] = {}
+            for key, state in nodes_state_dict.items():
+                scene_id, segment_id = None, None
+                if isinstance(key, str) and key.startswith("scene_") and "_segment_" in key:
+                    try:
+                        scene_id = int(key.split("scene_")[1].split("_segment_")[0])
+                        segment_id = int(key.split("_segment_")[1])
+                    except Exception:
+                        scene_id, segment_id = None, None
+                elif isinstance(key, (tuple, list)) and len(key) == 2:
+                    scene_id, segment_id = int(key[0]), int(key[1])
+                if scene_id is None or segment_id is None:
+                    continue
+                restored_nodes[(scene_id, segment_id)] = self._node_state_from_dict(state)
+            if restored_nodes:
+                self.node_states = restored_nodes
+
+        self.global_step = int(checkpoint.get("global_step", checkpoint.get("step", 0)))
+        logger.info(f"Checkpoint loaded from {checkpoint_path} (step={self.global_step})")
+        return self.global_step
+
+    def _log_to_tensorboard(self, total_loss_val: float, outputs: List[Dict]) -> None:
+        """Write scalars/images to TensorBoard when enabled."""
+        if self.tb_writer is None:
+            return
+
+        step = self.global_step
+        if self.tb_log_every and step % self.tb_log_every == 0:
+            lr = self.optimizer.param_groups[0]["lr"]
+            self.tb_writer.add_scalar("train/total_loss", total_loss_val, step)
+            self.tb_writer.add_scalar("train/lr", lr, step)
+
+        if (
+            self.log_images
+            and self.tb_image_every is not None
+            and outputs
+            and step % self.tb_image_every == 0
+        ):
+            for idx, out in enumerate(outputs):
+                if "rgb" not in out:
+                    continue
+                rgb = out["rgb"]
+                acc = out.get("acc", None)
+                tag_prefix = f"train/view_{idx}"
+                if rgb.dim() == 3:
+                    self.tb_writer.add_image(tag_prefix + "/rgb", rgb.permute(2, 0, 1), step)
+                if acc is not None:
+                    if acc.dim() == 2:
+                        self.tb_writer.add_image(tag_prefix + "/alpha", acc.unsqueeze(0), step)
+                    elif acc.dim() == 3:
+                        self.tb_writer.add_image(tag_prefix + "/alpha", acc, step)
+                # only log the first view to limit disk usage
+                break
+
+    def close(self) -> None:
+        """Close TensorBoard writer if it was created."""
+        if self.tb_writer is not None:
+            self.tb_writer.close()

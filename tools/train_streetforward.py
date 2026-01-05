@@ -201,20 +201,32 @@ def main(args):
         config=cfg,
         device=device,
     )
-    
+
+    # Optionally resume from checkpoint
+    resume_path = args.resume or cfg.training.get("resume_from_checkpoint", None)
+    if resume_path:
+        try:
+            restored_step = trainer.load_checkpoint(resume_path, load_optimizer=True)
+            logger.info(f"Resumed from checkpoint at step {restored_step}")
+        except Exception as exc:
+            logger.error(f"Failed to resume from {resume_path}: {exc}", exc_info=True)
+            raise
+
     # Initialize metric logger
     metric_logger = MetricLogger(delimiter="  ")
     
     # Training loop
     max_iterations = cfg.training.max_iterations
     save_checkpoint_freq = cfg.training.save_checkpoint_freq
-    
+    log_interval = cfg.training.get("log_interval", 100)
+    eval_freq = cfg.training.get("eval_freq", 5000)
+
     logger.info(f"Starting training for {max_iterations} iterations")
-    
+
     trainer.train()
-    
+
     try:
-        step = 0
+        step = getattr(trainer, "global_step", 0)
         while step < max_iterations:
             # Sample random batch
             batch = dataset.sample_random_batch()
@@ -224,22 +236,22 @@ def main(args):
             
             # Training step
             result = trainer.train_iter(streetforward_batch, apply_update=True, update_state=True)
+            step = getattr(trainer, "global_step", step + 1)
             
             # Update metrics
             total_loss = result.get("total_loss", torch.tensor(0.0, device=device))
             metric_logger.update(loss=total_loss.item() if isinstance(total_loss, torch.Tensor) else total_loss)
             metric_logger.update(step=step)
-            
+
             # Logging
-            if step % 100 == 0:
+            if step % log_interval == 0:
                 logger.info(f"Step {step}: {metric_logger}")
-            
-            # Save checkpoint (如果需要实现 checkpoint 功能)
-            # if step > 0 and (step % save_checkpoint_freq == 0 or step == max_iterations - 1):
-            #     trainer.save_checkpoint(step, is_final=(step == max_iterations - 1))
-            
+
+            if step > 0 and (step % save_checkpoint_freq == 0 or step == max_iterations - 1):
+                trainer.save_checkpoint(step=step, is_final=(step >= max_iterations - 1))
+
             # Evaluation (可选)
-            if step > 0 and step % cfg.training.get("eval_freq", 5000) == 0:
+            if step > 0 and step % eval_freq == 0:
                 logger.info("Running evaluation...")
                 trainer.eval()
                 
@@ -265,8 +277,6 @@ def main(args):
                     metric_logger.update(eval_loss=avg_loss)
                 
                 trainer.train()
-            
-            step += 1
         
         logger.info("Training completed!")
         
@@ -275,6 +285,9 @@ def main(args):
     except Exception as e:
         logger.error(f"Training failed: {e}", exc_info=True)
         raise
+    finally:
+        if hasattr(trainer, "close"):
+            trainer.close()
 
 
 if __name__ == "__main__":
@@ -302,6 +315,12 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="Run name (default: timestamp)",
+    )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Path to checkpoint to resume from",
     )
     parser.add_argument(
         "opts",
