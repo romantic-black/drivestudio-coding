@@ -19,6 +19,7 @@ data:
     downscale: 1
     undistort: False
     test_image_stride: 0
+    max_test_images: 4
     load_sky_mask: true
     load_dynamic_mask: true
     load_depth_maps: true
@@ -69,7 +70,22 @@ dataset:
 
 # StreetForwardTrainer configuration
 model:
-  offset_max: 0.1
+  # Physical upper bounds (usually fixed)
+  offset_max: 0.1          # Position offset upper bound (meters)
+  scale_max: 0.1           # Scale offset upper bound (log domain)
+  omega_max: 0.1           # Rotation offset upper bound (radians, ~5.7°)
+  opacity_max: 0.1          # Opacity offset upper bound (logit domain)
+  sh_dc_max: 0.1           # SH DC offset upper bound
+  sh_rest_max: 0.05         # SH rest offset upper bound (smaller)
+  
+  # Step size factors (control offset magnitude, usually fixed)
+  eta_means: 1.0           # Position step size factor
+  eta_scales: 1.0          # Scale step size factor
+  eta_opacity: 1.0         # Opacity step size factor
+  eta_sh_dc: 1.0           # SH DC step size factor
+  eta_sh_rest: 1.0         # SH rest step size factor
+  
+  # Other model parameters
   sh_degree: 1
   voxel_size: 0.1
   max_iterations: 1

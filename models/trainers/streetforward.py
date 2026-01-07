@@ -69,6 +69,32 @@ def _normalize_quat(q: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     return q / (q.norm(dim=-1, keepdim=True) + eps)
 
 
+def _axis_angle_to_quat(omega: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Convert axis-angle representation to quaternion (wxyz format).
+    
+    Uses branchless sinc structure to avoid discontinuities near threshold,
+    providing smoother gradients.
+    
+    Args:
+        omega: [N, 3] axis-angle vector
+        eps: Small epsilon for numerical stability
+        
+    Returns:
+        quat: [N, 4] quaternion in wxyz format
+    """
+    theta = torch.norm(omega, dim=-1, keepdim=True)  # [N, 1]
+    half_theta = theta * 0.5
+    
+    # Use sinc structure: sin(θ/2) / (θ + eps), avoids division by zero and is continuously differentiable
+    # When θ → 0, sinc(θ/2) → 1/2, so xyz = ω * (1/2) = ω/2 (correct small angle approximation)
+    sinc_half = torch.sin(half_theta) / (theta + eps)  # [N, 1]
+    xyz = omega * sinc_half  # [N, 3]
+    w = torch.cos(half_theta)  # [N, 1]
+    
+    return torch.cat([w, xyz], dim=-1)  # [N, 4] wxyz format
+
+
 def get_viewmat(camera_to_world: torch.Tensor) -> torch.Tensor:
     """Convert camera-to-world to world-to-camera as used by gsplat.
     
@@ -183,6 +209,16 @@ class StreetForwardTrainer(nn.Module):
 
         model_cfg = config.model
         self.offset_max = model_cfg.get("offset_max", 0.1)
+        self.scale_max = model_cfg.get("scale_max", 0.1)
+        self.omega_max = model_cfg.get("omega_max", 0.1)
+        self.opacity_max = model_cfg.get("opacity_max", 0.1)
+        self.sh_dc_max = model_cfg.get("sh_dc_max", 0.1)
+        self.sh_rest_max = model_cfg.get("sh_rest_max", 0.05)
+        self.eta_means = model_cfg.get("eta_means", 1.0)
+        self.eta_scales = model_cfg.get("eta_scales", 1.0)
+        self.eta_opacity = model_cfg.get("eta_opacity", 1.0)
+        self.eta_sh_dc = model_cfg.get("eta_sh_dc", 1.0)
+        self.eta_sh_rest = model_cfg.get("eta_sh_rest", 1.0)
         self.sh_degree = model_cfg.get("sh_degree", 1)
         self.voxel_size = model_cfg.get("voxel_size", 0.1)
         self.inner_iterations = model_cfg.get("max_iterations", 1)
@@ -227,7 +263,7 @@ class StreetForwardTrainer(nn.Module):
             nn.ReLU(),
             nn.Linear(64, 32),
             nn.ReLU(),
-            nn.Linear(32, 7),
+            nn.Linear(32, 6),  # 3 for scales + 3 for axis-angle
         ).to(device)
 
         self.mlp_opacity = nn.Sequential(
@@ -281,6 +317,23 @@ class StreetForwardTrainer(nn.Module):
         self._setup_tensorboard(training_cfg)
 
         self.node_states: Dict[Tuple[int, int], NodeState] = {}
+        self._lpips_model = None
+        self._lpips_unavailable = False
+        self._ssim_unavailable = False
+        
+        # Initialize offset heads to output near-zero offsets
+        self._init_offset_heads()
+
+    def _init_offset_heads(self) -> None:
+        """Initialize offset prediction heads to output near-zero offsets."""
+        nn.init.zeros_(self.mlp_offset_pos[-1].weight)
+        nn.init.zeros_(self.mlp_offset_pos[-1].bias)
+        nn.init.zeros_(self.mlp_conv[-1].weight)
+        nn.init.zeros_(self.mlp_conv[-1].bias)
+        nn.init.zeros_(self.mlp_opacity[-1].weight)
+        nn.init.zeros_(self.mlp_opacity[-1].bias)
+        nn.init.zeros_(self.gaussion_decoder[-1].weight)
+        nn.init.zeros_(self.gaussion_decoder[-1].bias)
 
     def _setup_tensorboard(self, training_cfg) -> None:
         """
@@ -461,12 +514,27 @@ class StreetForwardTrainer(nn.Module):
         return feature[0, :, 0, 0, :].T
 
     def _predict_offsets(self, feat_3d_crop: torch.Tensor) -> Dict[str, torch.Tensor]:
+        # Position offset with tanh clamping
         offset_pos = self.offset_max * torch.tanh(self.mlp_offset_pos(feat_3d_crop))
-        scales_and_quats = self.mlp_conv(feat_3d_crop)
-        offset_scales, offset_quat = scales_and_quats.split([3, 4], dim=-1)
-        offset_quat = _normalize_quat(offset_quat)
-        offset_opacity = self.mlp_opacity(feat_3d_crop)
-        offset_sh = self.gaussion_decoder(feat_3d_crop)
+        
+        # Scale and rotation offsets
+        scales_and_omega = self.mlp_conv(feat_3d_crop)
+        offset_scales_raw, offset_omega_raw = scales_and_omega.split([3, 3], dim=-1)
+        offset_scales = self.scale_max * torch.tanh(offset_scales_raw)
+        offset_omega = self.omega_max * torch.tanh(offset_omega_raw)
+        offset_quat = _axis_angle_to_quat(offset_omega)
+        
+        # Opacity offset with tanh clamping
+        offset_opacity = self.opacity_max * torch.tanh(self.mlp_opacity(feat_3d_crop))
+        
+        # SH offsets with separate DC and rest
+        sh_raw = self.gaussion_decoder(feat_3d_crop)
+        sh_dc_raw = sh_raw[:, :3]
+        sh_rest_raw = sh_raw[:, 3:]
+        offset_sh_dc = self.sh_dc_max * torch.tanh(sh_dc_raw)
+        offset_sh_rest = self.sh_rest_max * torch.tanh(sh_rest_raw)
+        offset_sh = torch.cat([offset_sh_dc, offset_sh_rest], dim=-1)
+        
         return {
             "offset_pos": offset_pos,
             "offset_scales": offset_scales,
@@ -483,12 +551,14 @@ class StreetForwardTrainer(nn.Module):
         sh_rest_flat = offsets["offset_sh"][:, 3:]
         sh_rest_offset = sh_rest_flat.view(num_points, num_sh - 1, 3)
 
-        means_r = node_state.means + offsets["offset_pos"]
-        scales_log_r = node_state.scales_log + offsets["offset_scales"]
+        # Apply offsets with step size factors (eta)
+        # Note: means_r is not clamped here to preserve gradient flow
+        means_r = node_state.means + self.eta_means * offsets["offset_pos"]
+        scales_log_r = node_state.scales_log + self.eta_scales * offsets["offset_scales"]
         quats_r = _normalize_quat(_quat_multiply(node_state.quats, offsets["offset_quat"]))
-        opacity_logit_r = node_state.opacity_logit + offsets["offset_opacity"]
-        sh_dc_r = node_state.sh_dc + offsets["offset_sh"][:, :3]
-        sh_rest_r = node_state.sh_rest + sh_rest_offset
+        opacity_logit_r = node_state.opacity_logit + self.eta_opacity * offsets["offset_opacity"]
+        sh_dc_r = node_state.sh_dc + self.eta_sh_dc * offsets["offset_sh"][:, :3]
+        sh_rest_r = node_state.sh_rest + self.eta_sh_rest * sh_rest_offset
 
         scales_r = torch.exp(scales_log_r)
         opacities_r = torch.sigmoid(opacity_logit_r).squeeze(-1)
@@ -518,11 +588,97 @@ class StreetForwardTrainer(nn.Module):
     def compute_loss(self, pred_rgb: torch.Tensor, gt_image: torch.Tensor) -> torch.Tensor:
         return torch.mean((pred_rgb - gt_image) ** 2)
 
+    def _compute_render_params(self, node_state: NodeState) -> Dict[str, torch.Tensor]:
+        """
+        Shared forward pass to compute render parameters from node state.
+        """
+        means_s = node_state.means
+        anchor_rgb = _sh_to_rgb(node_state.sh_dc)
+
+        sparse_feat, vol_dim, valid_coords = self.construct_sparse_tensor(
+            raw_coords=means_s.clone(),
+            feats=anchor_rgb,
+            Bbx_max=self.bbx_max,
+            Bbx_min=self.bbx_min,
+            voxel_size=self.voxel_size,
+            device=self.device,
+        )
+        feat_3d = self.sparse_conv(sparse_feat)
+        dense_volume = self.sparse_to_dense_volume(
+            sparse_tensor=feat_3d,
+            coords=valid_coords,
+            vol_dim=vol_dim,
+        ).unsqueeze(dim=0)
+        dense_volume = dense_volume.permute(0, 4, 3, 2, 1)
+        grid_coords = self.get_grid_coords(means_s, self.bbx_min, vol_dim, self.voxel_size)
+        feat_3d_crop = self.interpolate_features(grid_coords, dense_volume)
+        del dense_volume
+
+        offsets = self._predict_offsets(feat_3d_crop)
+        render_params = self._render_params_from_offsets(node_state, offsets)
+        return render_params
+
+    def _render_single_view(
+        self,
+        render_params: Dict[str, torch.Tensor],
+        view,
+        height: int,
+        width: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Render a single view and return RGB and alpha.
+        """
+        c2w = view.camtoworlds if hasattr(view, "camtoworlds") else view["camtoworlds"]
+        viewmat = get_viewmat(c2w)
+        k_mat = None
+        if hasattr(view, "Ks"):
+            k_mat = view.Ks[0:1]
+        elif hasattr(view, "K"):
+            k_mat = view.K
+        else:
+            k_mat = torch.eye(3, device=self.device).unsqueeze(0)
+        
+        # Ensure Ks is [1,3,3] format
+        if k_mat.dim() == 2:
+            k_mat = k_mat.unsqueeze(0)
+
+        means_key = "means_p" if "means_p" in render_params else "means_r"
+        scales_key = "scales_p" if "scales_p" in render_params else "scales_r"
+        quats_key = "quats_p" if "quats_p" in render_params else "quats_r"
+        opacities_key = "opacities_p" if "opacities_p" in render_params else "opacities_r"
+        colors_key = "colors_p" if "colors_p" in render_params else "colors_r"
+
+        render, alpha, _ = self.renderer(
+            means=render_params[means_key],
+            quats=render_params[quats_key],
+            scales=render_params[scales_key],
+            opacities=render_params[opacities_key],
+            colors=render_params[colors_key],
+            viewmats=viewmat,
+            Ks=k_mat,
+            width=width,
+            height=height,
+            tile_size=16,
+            packed=False,
+            near_plane=0.01,
+            far_plane=1e10,
+            render_mode="RGB",
+            sh_degree=self.sh_degree,
+            sparse_grad=False,
+            absgrad=True,
+            rasterize_mode="classic",
+        )
+
+        rgb = render[:, ..., :3].squeeze(0)
+        acc = alpha.squeeze(0)
+        return rgb, acc
+
     def train_iter(
         self,
         batch: Dict,
         apply_update: bool = True,
         update_state: bool = True,
+        evaluate_test: bool = False,
     ) -> Dict:
         key, node_state = self._get_or_init_node_state(batch)
         target_views = batch["target_views"]
@@ -539,83 +695,17 @@ class StreetForwardTrainer(nn.Module):
         view_count = len(target_views)
         outputs = []
         total_loss_val = 0.0  # Use scalar to avoid keeping computation graph
+        test_metrics = None
 
         self.optimizer.zero_grad(set_to_none=True)
 
         for inner_iter_idx in range(self.inner_iterations):
-            means_s = node_state.means
-            # Use node_state.sh_dc directly
-            # The leaf node will be created in construct_sparse_tensor if needed
-            anchor_sh = node_state.sh_dc
-            anchor_rgb = _sh_to_rgb(anchor_sh)
-
-            sparse_feat, vol_dim, valid_coords = self.construct_sparse_tensor(
-                raw_coords=means_s.clone(),
-                feats=anchor_rgb,
-                Bbx_max=self.bbx_max,
-                Bbx_min=self.bbx_min,
-                voxel_size=self.voxel_size,
-                device=self.device,
-            )
-            feat_3d = self.sparse_conv(sparse_feat)
-            dense_volume = self.sparse_to_dense_volume(
-                sparse_tensor=feat_3d,
-                coords=valid_coords,
-                vol_dim=vol_dim,
-            ).unsqueeze(dim=0)
-            # sparse_to_dense_volume returns [X, Y, Z, C] where vol_dim is [X, Y, Z]
-            # After unsqueeze: [1, X, Y, Z, C]
-            # grid_sample (5D) expects [B, C, D, H, W] where D=Z, H=Y, W=X
-            # So we need: permute(0, 4, 3, 2, 1) to get [1, C, Z, Y, X] = [1, C, D, H, W]
-            dense_volume = dense_volume.permute(0, 4, 3, 2, 1)
-            grid_coords = self.get_grid_coords(means_s, self.bbx_min, vol_dim, self.voxel_size)
-            feat_3d_crop = self.interpolate_features(grid_coords, dense_volume)
-            del dense_volume
-
-            offsets = self._predict_offsets(feat_3d_crop)
-            render_params = self._render_params_from_offsets(node_state, offsets)
+            render_params = self._compute_render_params(node_state)
             proxies = self._create_proxy_params(render_params)
 
             for view_idx, (view, gt_img) in enumerate(zip(target_views, gt_images)):
-                c2w = view.camtoworlds if hasattr(view, "camtoworlds") else view["camtoworlds"]
-                viewmat = get_viewmat(c2w)
-                k_mat = None
-                if hasattr(view, "Ks"):
-                    k_mat = view.Ks[0:1]
-                elif hasattr(view, "K"):
-                    k_mat = view.K
-                else:
-                    k_mat = torch.eye(3, device=self.device).unsqueeze(0)
-                
-                # Ensure Ks is [1,3,3] format
-                if k_mat.dim() == 2:
-                    k_mat = k_mat.unsqueeze(0)
-
                 height, width = gt_img.shape[0], gt_img.shape[1]
-
-                render, alpha, _ = self.renderer(
-                    means=proxies["means_p"],
-                    quats=proxies["quats_p"],
-                    scales=proxies["scales_p"],
-                    opacities=proxies["opacities_p"],
-                    colors=proxies["colors_p"],
-                    viewmats=viewmat,
-                    Ks=k_mat,
-                    width=width,
-                    height=height,
-                    tile_size=16,
-                    packed=False,
-                    near_plane=0.01,
-                    far_plane=1e10,
-                    render_mode="RGB",
-                    sh_degree=self.sh_degree,
-                    sparse_grad=False,
-                    absgrad=True,
-                    rasterize_mode="classic",
-                )
-
-                rgb = render[:, ..., :3].squeeze(0)
-                acc = alpha.squeeze(0)
+                rgb, acc = self._render_single_view(proxies, view, height, width)
                 loss = self.compute_loss(rgb, gt_img) / view_count
                 total_loss_val += float(loss.detach())  # Accumulate scalar to avoid keeping graph
                 loss.backward()
@@ -652,7 +742,11 @@ class StreetForwardTrainer(nn.Module):
 
             if update_state:
                 with torch.no_grad():
-                    node_state.means.copy_(render_params["means_r"].detach())
+                    # Clamp means only when writing back to node_state (not during backprop)
+                    means_clamped = torch.clamp(
+                        render_params["means_r"].detach(), min=self.bbx_min, max=self.bbx_max
+                    )
+                    node_state.means.copy_(means_clamped)
                     node_state.scales_log.copy_(render_params["scales_log_r"].detach())
                     node_state.quats.copy_(render_params["quats_r"].detach())
                     node_state.opacity_logit.copy_(render_params["opacity_logit_r"].detach())
@@ -663,14 +757,112 @@ class StreetForwardTrainer(nn.Module):
         if apply_update:
             self.global_step += 1
             self._log_to_tensorboard(total_loss_val, outputs)
+
+        if evaluate_test and batch.get("test_views"):
+            prev_mode = self.training
+            self.eval()
+            with torch.no_grad():
+                test_metrics = self._evaluate_test_views(
+                    node_state=self.node_states[key],
+                    test_views=batch.get("test_views", []),
+                    test_images=batch.get("test_images", []),
+                )
+            if prev_mode:
+                self.train()
+
         return {
             "total_loss": torch.tensor(total_loss_val, device=self.device),
             "node_state": self.node_states[key],
             "outputs": outputs,
+            "test_metrics": test_metrics,
         }
 
     def forward(self, batch: Dict) -> Dict:
         return self.train_iter(batch)
+
+    def _evaluate_test_views(
+        self,
+        node_state: NodeState,
+        test_views: List,
+        test_images: List[torch.Tensor],
+    ) -> Optional[Dict[str, float]]:
+        if test_views is None or len(test_views) == 0:
+            return None
+        render_params = self._compute_render_params(node_state)
+        psnr_list: List[float] = []
+        ssim_list: List[float] = []
+        lpips_list: List[float] = []
+
+        for view, gt_img in zip(test_views, test_images):
+            height, width = gt_img.shape[0], gt_img.shape[1]
+            rgb_pred, _ = self._render_single_view(render_params, view, height, width)
+            rgb_gt = gt_img.to(self.device)
+
+            psnr_list.append(self._compute_psnr(rgb_pred, rgb_gt))
+            ssim_list.append(self._compute_ssim(rgb_pred, rgb_gt))
+            lpips_list.append(self._compute_lpips(rgb_pred, rgb_gt))
+
+        if len(psnr_list) == 0:
+            return None
+
+        metrics = {
+            "psnr": float(np.mean(psnr_list)),
+            "ssim": float(np.mean(ssim_list)),
+            "lpips": float(np.mean(lpips_list)),
+            "num_test_views": len(psnr_list),
+        }
+        return metrics
+
+    @torch.no_grad()
+    def evaluate(self, batch: Dict) -> Dict[str, float]:
+        """
+        Evaluate model performance on test views (no gradient updates).
+        """
+        self.eval()
+        _, node_state = self._get_or_init_node_state(batch)
+        metrics = self._evaluate_test_views(
+            node_state=node_state,
+            test_views=batch.get("test_views", []),
+            test_images=batch.get("test_images", []),
+        )
+        self.train()
+        return metrics or {}
+
+    def _compute_psnr(self, pred: torch.Tensor, gt: torch.Tensor) -> float:
+        mse = torch.mean((pred - gt) ** 2)
+        mse_val = float(mse.item())
+        if mse_val <= 0:
+            return float("inf")
+        psnr = -10 * torch.log10(torch.tensor(mse_val, device=pred.device))
+        return float(psnr.item())
+
+    def _compute_ssim(self, pred: torch.Tensor, gt: torch.Tensor) -> float:
+        try:
+            from pytorch_msssim import ssim
+        except ImportError:
+            if not getattr(self, "_ssim_unavailable", False):
+                logger.warning("pytorch_msssim not installed; returning NaN for SSIM")
+                self._ssim_unavailable = True
+            return float("nan")
+
+        pred_4d = pred.permute(2, 0, 1).unsqueeze(0)
+        gt_4d = gt.permute(2, 0, 1).unsqueeze(0)
+        return float(ssim(pred_4d, gt_4d, data_range=1.0).item())
+
+    def _compute_lpips(self, pred: torch.Tensor, gt: torch.Tensor) -> float:
+        try:
+            from lpips import LPIPS
+        except ImportError:
+            if not getattr(self, "_lpips_unavailable", False):
+                logger.warning("lpips not installed; returning NaN for LPIPS")
+                self._lpips_unavailable = True
+            return float("nan")
+
+        if not hasattr(self, "_lpips_model") or self._lpips_model is None:
+            self._lpips_model = LPIPS(net="alex").to(self.device)
+        pred_4d = pred.permute(2, 0, 1).unsqueeze(0)
+        gt_4d = gt.permute(2, 0, 1).unsqueeze(0)
+        return float(self._lpips_model(pred_4d, gt_4d).item())
 
     def save_checkpoint(
         self,

@@ -155,6 +155,21 @@ def convert_batch_to_streetforward_format(
             source_views.append(view)
             src_image = source_data["image"][i].to(device)
             src_images.append(src_image)
+
+    # 转换 test 视图（可选，用于评估）
+    test_views = []
+    test_images = []
+    if "test" in batch:
+        test_data = batch["test"]
+        num_test_images = test_data["image"].shape[0]
+        for i in range(num_test_images):
+            view = type('View', (), {
+                'camtoworlds': test_data["extrinsics"][i].to(device),
+                'Ks': test_data["intrinsics"][i][:3, :3].unsqueeze(0).to(device),
+            })()
+            test_views.append(view)
+            test_image = test_data["image"][i].to(device)
+            test_images.append(test_image)
     
     # 组装 StreetForward 格式的 batch
     streetforward_batch = {
@@ -165,6 +180,8 @@ def convert_batch_to_streetforward_format(
         "gt_images": gt_images,
         "source_views": source_views,  # 可选
         "src_images": src_images,  # 可选
+        "test_views": test_views,  # 可选
+        "test_images": test_images,  # 可选
     }
     
     return streetforward_batch
@@ -260,13 +277,21 @@ def main(args):
                 
                 for _ in range(num_eval_batches):
                     try:
-                        eval_batch = dataset.sample_random_batch(eval=True)
+                        eval_batch = dataset.sample_random_batch(eval=True, include_test=True)
                         eval_streetforward_batch = convert_batch_to_streetforward_format(eval_batch, device)
                         
-                        # 评估（如果 trainer 实现了 evaluate 方法）
+                        # 评估（包含测试视角指标）
                         with torch.no_grad():
-                            result = trainer.train_iter(eval_streetforward_batch, apply_update=False, update_state=False)
-                            eval_metrics.append({"loss": result.get("total_loss", torch.tensor(0.0)).item()})
+                            result = trainer.train_iter(
+                                eval_streetforward_batch,
+                                apply_update=False,
+                                update_state=False,
+                                evaluate_test=True,
+                            )
+                            metric_entry = {"loss": result.get("total_loss", torch.tensor(0.0)).item()}
+                            if result.get("test_metrics") is not None:
+                                metric_entry.update(result["test_metrics"])
+                            eval_metrics.append(metric_entry)
                     except Exception as e:
                         logger.warning(f"Evaluation batch failed: {e}")
                         continue
@@ -275,6 +300,16 @@ def main(args):
                     avg_loss = np.mean([m["loss"] for m in eval_metrics])
                     logger.info(f"Evaluation loss: {avg_loss}")
                     metric_logger.update(eval_loss=avg_loss)
+                    
+                    psnr_vals = [m["psnr"] for m in eval_metrics if "psnr" in m]
+                    ssim_vals = [m["ssim"] for m in eval_metrics if "ssim" in m]
+                    lpips_vals = [m["lpips"] for m in eval_metrics if "lpips" in m]
+                    if psnr_vals:
+                        logger.info(
+                            f"Evaluation PSNR: {np.mean(psnr_vals):.4f}, "
+                            f"SSIM: {np.mean(ssim_vals) if ssim_vals else float('nan'):.4f}, "
+                            f"LPIPS: {np.mean(lpips_vals) if lpips_vals else float('nan'):.4f}"
+                        )
                 
                 trainer.train()
         

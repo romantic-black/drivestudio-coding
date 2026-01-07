@@ -103,7 +103,11 @@ graph TD
     W --> Y{是否还有inner_iter?}
     X --> Y
     Y -->|是| H
-    Y -->|否| Z[保存NodeState并返回]
+    Y -->|否| AA{是否evaluate_test?}
+    AA -->|是| AB[评估测试视图]
+    AA -->|否| Z
+    AB --> AC[计算PSNR/SSIM/LPIPS]
+    AC --> Z[保存NodeState并返回]
 ```
 
 ### 详细步骤说明
@@ -176,43 +180,65 @@ interpolate_features()
 **输出：**
 ```python
 {
-    "offset_pos": [N, 3],        # 位置偏移
-    "offset_scales": [N, 3],     # 尺度对数偏移
-    "offset_quat": [N, 4],       # 四元数偏移（wxyz格式）
-    "offset_opacity": [N, 1],    # 不透明度对数偏移
-    "offset_sh": [N, 3*num_sh],  # SH系数偏移（包含DC和rest）
+    "offset_pos": [N, 3],        # 位置偏移（经过tanh限制）
+    "offset_scales": [N, 3],     # 尺度对数偏移（经过tanh限制）
+    "offset_quat": [N, 4],       # 四元数偏移（wxyz格式，从轴角转换）
+    "offset_opacity": [N, 1],    # 不透明度对数偏移（经过tanh限制）
+    "offset_sh": [N, 3*num_sh],  # SH系数偏移（包含DC和rest，分别限制）
 }
 ```
 
 **MLP 网络结构：**
 - `mlp_offset_pos`: `outdim → 64 → 32 → 3`
-- `mlp_conv`: `outdim → 64 → 32 → 7` (3个尺度 + 4个四元数)
+- `mlp_conv`: `outdim → 64 → 32 → 6` (3个尺度 + 3个轴角)
 - `mlp_opacity`: `outdim → 64 → 32 → 1`
 - `gaussion_decoder`: `outdim → 64 → 32 → 3*num_sh`
 
 **约束：**
 - `offset_pos`: 通过 `tanh` 限制在 `[-offset_max, offset_max]` 范围内
-- `offset_quat`: 归一化为单位四元数
+- `offset_scales`: 通过 `tanh` 限制在 `[-scale_max, scale_max]` 范围内
+- `offset_omega`: 通过 `tanh` 限制在 `[-omega_max, omega_max]` 范围内（轴角表示，单位：弧度）
+- `offset_quat`: 从轴角（axis-angle）转换而来，使用 `_axis_angle_to_quat` 函数，提供更平滑的梯度
+- `offset_opacity`: 通过 `tanh` 限制在 `[-opacity_max, opacity_max]` 范围内
+- `offset_sh_dc`: 通过 `tanh` 限制在 `[-sh_dc_max, sh_dc_max]` 范围内
+- `offset_sh_rest`: 通过 `tanh` 限制在 `[-sh_rest_max, sh_rest_max]` 范围内（通常比DC更小）
+
+**轴角到四元数转换**：
+- 使用 `_axis_angle_to_quat` 函数，采用无分支的 sinc 结构，避免阈值附近的不连续性
+- 提供比直接预测四元数更平滑的梯度
+- 公式：`quat = [cos(θ/2), ω * sin(θ/2) / (θ + eps)]`，其中 `θ = ||ω||`，`ω` 是轴角向量
 
 #### 5. 渲染参数计算 (`_render_params_from_offsets`)
 
 **计算过程：**
 ```
-NodeState (分离) + Offsets (可微) → Render Params (可微)
+NodeState (分离) + Offsets (可微) × Eta (步长因子) → Render Params (可微)
 ```
 
-**具体计算：**
-- `means_r = node_state.means + offset_pos`
-- `scales_log_r = node_state.scales_log + offset_scales`
+**具体计算（应用步长因子 eta）：**
+- `means_r = node_state.means + eta_means * offset_pos` （注意：不在此处clamp，保持梯度流）
+- `scales_log_r = node_state.scales_log + eta_scales * offset_scales`
 - `quats_r = normalize(quat_multiply(node_state.quats, offset_quat))`
-- `opacity_logit_r = node_state.opacity_logit + offset_opacity`
-- `sh_dc_r = node_state.sh_dc + offset_sh[:, :3]`
-- `sh_rest_r = node_state.sh_rest + offset_sh[:, 3:].view(N, num_sh-1, 3)`
+- `opacity_logit_r = node_state.opacity_logit + eta_opacity * offset_opacity`
+- `sh_dc_r = node_state.sh_dc + eta_sh_dc * offset_sh[:, :3]`
+- `sh_rest_r = node_state.sh_rest + eta_sh_rest * offset_sh[:, 3:].view(N, num_sh-1, 3)`
+
+**步长因子（Eta）**：
+- `eta_means`: 位置步长因子（默认1.0）
+- `eta_scales`: 尺度步长因子（默认1.0）
+- `eta_opacity`: 不透明度步长因子（默认1.0）
+- `eta_sh_dc`: SH DC步长因子（默认1.0）
+- `eta_sh_rest`: SH rest步长因子（默认1.0）
+- 这些因子允许精细控制不同参数类型的更新幅度，通常在训练过程中保持固定
 
 **转换：**
 - `scales_r = exp(scales_log_r)`
 - `opacities_r = sigmoid(opacity_logit_r)`
 - `colors_r = cat([sh_dc_r, sh_rest_r], dim=1)` → `[N, num_sh, 3]`
+
+**注意**：
+- `means_r` 在计算时不进行 clamp，以保持梯度流
+- 只有在写回 `NodeState` 时才进行 clamp（限制在 `[bbx_min, bbx_max]` 范围内）
 
 #### 6. 代理参数创建 (`_create_proxy_params`)
 
@@ -279,7 +305,13 @@ torch.autograd.backward(
 **操作：**
 ```python
 with torch.no_grad():
-    node_state.means.copy_(render_params["means_r"].detach())
+    # Clamp means only when writing back to node_state (not during backprop)
+    means_clamped = torch.clamp(
+        render_params["means_r"].detach(),
+        min=self.bbx_min,
+        max=self.bbx_max
+    )
+    node_state.means.copy_(means_clamped)
     node_state.scales_log.copy_(render_params["scales_log_r"].detach())
     node_state.quats.copy_(render_params["quats_r"].detach())
     node_state.opacity_logit.copy_(render_params["opacity_logit_r"].detach())
@@ -287,7 +319,9 @@ with torch.no_grad():
     node_state.sh_rest.copy_(render_params["sh_rest_r"].detach())
 ```
 
-**注意：** 所有更新都是分离的（detached），保持 NodeState 作为缓冲区
+**注意：** 
+- 所有更新都是分离的（detached），保持 NodeState 作为缓冲区
+- `means` 在写回时进行 clamp，限制在边界框范围内，但在反向传播时保持不限制以保持梯度流
 
 ---
 
@@ -1050,8 +1084,10 @@ batch = {
     "scene_id": int,                    # 场景ID
     "segment_id": int,                  # 片段ID
     "pointcloud": Union[dict, object],   # 点云数据
-    "target_views": List[View],         # 目标视角列表
-    "gt_images": List[torch.Tensor],    # 真实图像列表 [H, W, 3]
+    "target_views": List[View],         # 目标视角列表（用于训练）
+    "gt_images": List[torch.Tensor],    # 真实图像列表 [H, W, 3]（用于训练）
+    "test_views": Optional[List[View]], # 测试视角列表（可选，用于评估）
+    "test_images": Optional[List[torch.Tensor]],  # 测试图像列表 [H, W, 3]（可选，用于评估）
 }
 ```
 
@@ -1088,24 +1124,27 @@ batch = {
 |--------|------|------|
 | `grid_coords` | `[N, 3]` | 归一化网格坐标 `[-1, 1]` |
 | `feat_3d_crop` | `[N, outdim]` | 每个点插值得到的3D特征 |
-| `offset_pos` | `[N, 3]` | 位置偏移（受offset_max限制） |
-| `offset_scales` | `[N, 3]` | 尺度对数偏移 |
-| `offset_quat` | `[N, 4]` | 四元数偏移（归一化） |
-| `offset_opacity` | `[N, 1]` | 不透明度对数偏移 |
-| `offset_sh` | `[N, 3*num_sh]` | SH系数偏移（扁平化） |
+| `offset_pos` | `[N, 3]` | 位置偏移（受offset_max限制，tanh） |
+| `offset_scales` | `[N, 3]` | 尺度对数偏移（受scale_max限制，tanh） |
+| `offset_omega` | `[N, 3]` | 轴角偏移（受omega_max限制，tanh） |
+| `offset_quat` | `[N, 4]` | 四元数偏移（从轴角转换，归一化） |
+| `offset_opacity` | `[N, 1]` | 不透明度对数偏移（受opacity_max限制，tanh） |
+| `offset_sh_dc` | `[N, 3]` | SH DC偏移（受sh_dc_max限制，tanh） |
+| `offset_sh_rest` | `[N, 3*(num_sh-1)]` | SH rest偏移（受sh_rest_max限制，tanh） |
+| `offset_sh` | `[N, 3*num_sh]` | SH系数偏移（扁平化，concat([dc, rest])） |
 
 #### 渲染参数阶段
 
 | 变量名 | 形状 | 说明 |
 |--------|------|------|
-| `means_r` | `[N, 3]` | 渲染用的位置（可微） |
-| `scales_log_r` | `[N, 3]` | 渲染用的尺度对数（可微） |
+| `means_r` | `[N, 3]` | 渲染用的位置（可微，不在此处clamp） |
+| `scales_log_r` | `[N, 3]` | 渲染用的尺度对数（可微，应用eta_scales） |
 | `scales_r` | `[N, 3]` | 渲染用的尺度 `exp(scales_log_r)` |
 | `quats_r` | `[N, 4]` | 渲染用的四元数（归一化，可微） |
-| `opacity_logit_r` | `[N, 1]` | 渲染用的不透明度对数（可微） |
+| `opacity_logit_r` | `[N, 1]` | 渲染用的不透明度对数（可微，应用eta_opacity） |
 | `opacities_r` | `[N]` | 渲染用的不透明度 `sigmoid(opacity_logit_r)` |
-| `sh_dc_r` | `[N, 3]` | 渲染用的SH DC分量（可微） |
-| `sh_rest_r` | `[N, num_sh-1, 3]` | 渲染用的SH高阶分量（可微） |
+| `sh_dc_r` | `[N, 3]` | 渲染用的SH DC分量（可微，应用eta_sh_dc） |
+| `sh_rest_r` | `[N, num_sh-1, 3]` | 渲染用的SH高阶分量（可微，应用eta_sh_rest） |
 | `colors_r` | `[N, num_sh, 3]` | 完整的SH系数 `[sh_dc, sh_rest]` |
 
 #### 代理参数阶段
@@ -1127,6 +1166,68 @@ batch = {
 | `rgb` | `[H, W, 3]` | RGB图像 |
 | `loss` | `scalar` | 单个视角的损失 |
 | `total_loss_val` | `float` | 所有视角的累积损失（标量） |
+| `test_metrics` | `Optional[Dict[str, float]]` | 测试视图评估指标（如果进行了评估） |
+
+---
+
+### 4. 评估指标
+
+#### PSNR (Peak Signal-to-Noise Ratio)
+
+**计算方法：**
+```python
+mse = torch.mean((pred - gt) ** 2)
+psnr = -10 * torch.log10(mse)  # 如果 mse <= 0，返回 inf
+```
+
+**含义：** 衡量预测图像和真实图像之间的像素级差异，值越高越好（通常范围：20-40 dB）
+
+#### SSIM (Structural Similarity Index)
+
+**实现：** 使用 `pytorch_msssim` 库
+
+**含义：** 衡量预测图像和真实图像之间的结构相似性，值越高越好（范围：0-1）
+
+**注意：** 如果库不可用，返回 `NaN`
+
+#### LPIPS (Learned Perceptual Image Patch Similarity)
+
+**实现：** 使用 `lpips` 库，AlexNet 作为特征提取器
+
+**含义：** 基于感知的相似性度量，值越低越好（通常范围：0-1）
+
+**注意：** 如果库不可用，返回 `NaN`
+| `test_metrics` | `Optional[Dict[str, float]]` | 测试视图评估指标（如果进行了评估） |
+
+---
+
+### 4. 评估指标
+
+#### PSNR (Peak Signal-to-Noise Ratio)
+
+**计算方法：**
+```python
+mse = torch.mean((pred - gt) ** 2)
+psnr = -10 * torch.log10(mse)  # 如果 mse <= 0，返回 inf
+```
+
+**含义：** 衡量预测图像和真实图像之间的像素级差异，值越高越好（通常范围：20-40 dB）
+
+#### SSIM (Structural Similarity Index)
+
+**实现：** 使用 `pytorch_msssim` 库
+
+**含义：** 衡量预测图像和真实图像之间的结构相似性，值越高越好（范围：0-1）
+
+**注意：** 如果库不可用，返回 `NaN`
+
+#### LPIPS (Learned Perceptual Image Patch Similarity)
+
+**实现：** 使用 `lpips` 库，AlexNet 作为特征提取器
+
+**含义：** 基于感知的相似性度量，值越低越好（通常范围：0-1）
+
+**注意：** 如果库不可用，返回 `NaN`
 
 ---
 
@@ -1284,13 +1385,28 @@ sparse_feat
 
 ```python
 model:
-  offset_max: 0.1              # 位置偏移的最大值
-  sh_degree: 1                   # 球谐函数度数
-  voxel_size: 0.1                # 体素大小
-  max_iterations: 1              # 内部迭代次数
-  bbx_min: [-20.0, -20.0, -20.0] # 边界框最小值
-  bbx_max: [20.0, 4.8, 70.0]     # 边界框最大值
-  sparseConv_outdim: 32          # 稀疏卷积输出维度
+  # 偏移量的物理上限（通常固定）
+  offset_max: 0.1          # 位置偏移上限（米）
+  scale_max: 0.1           # 尺度偏移上限（对数域）
+  omega_max: 0.1           # 旋转偏移上限（弧度，约5.7°）
+  opacity_max: 0.1         # 不透明度偏移上限（logit域）
+  sh_dc_max: 0.1           # SH DC偏移上限
+  sh_rest_max: 0.05        # SH rest偏移上限（通常更小）
+  
+  # 步长因子（控制偏移量幅度，通常固定）
+  eta_means: 1.0           # 位置步长因子
+  eta_scales: 1.0          # 尺度步长因子
+  eta_opacity: 1.0         # 不透明度步长因子
+  eta_sh_dc: 1.0           # SH DC步长因子
+  eta_sh_rest: 1.0         # SH rest步长因子
+  
+  # 其他模型参数
+  sh_degree: 1             # 球谐函数度数
+  voxel_size: 0.1          # 体素大小
+  max_iterations: 1        # 内部迭代次数
+  bbx_min: [-20.0, -20.0, -20.0]  # 边界框最小值
+  bbx_max: [20.0, 4.8, 70.0]      # 边界框最大值
+  sparseConv_outdim: 32    # 稀疏卷积输出维度
 ```
 
 ### Optimizer 配置

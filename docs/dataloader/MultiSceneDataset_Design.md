@@ -25,7 +25,19 @@
 - **帧**：时间步，同一时刻所有相机的图像集合
 - **图像**：单张图像，由 `(frame_idx, cam_id)` 唯一标识
 
-### 2. 索引系统
+### 2. 训练/测试帧分离
+
+**帧分离机制**：
+- 根据 `test_image_stride` 配置分离训练帧和测试帧
+- 如果 `test_image_stride = 0`：所有帧同时用于训练和测试
+- 如果 `test_image_stride > 0`：每隔 `test_image_stride` 帧被标记为测试帧，其余为训练帧
+- **关键帧分割只使用训练帧**：确保训练和测试数据的分离
+
+**测试帧限制**：
+- 通过 `max_test_images` 配置限制每个段中使用的测试帧数量
+- 如果测试帧数量超过 `max_test_images`，随机采样指定数量的测试帧
+
+### 3. 索引系统
 
 **图像索引 (img_idx)**：
 - 全局图像索引：`img_idx = frame_idx * num_cams + cam_idx`
@@ -34,12 +46,13 @@
 **帧索引 (frame_idx)**：
 - 时间步索引，范围 `[0, num_frames)`
 - 同一帧的所有相机图像共享相同的 `frame_idx`
+- 根据 `test_image_stride` 分为训练帧和测试帧
 
 **相机索引 (cam_idx)**：
 - 相机在 `camera_list` 中的索引
 - 范围 `[0, num_cams)`
 
-### 3. Source 和 Target 的定义
+### 4. Source 和 Target 的定义
 
 **Source**：
 - 用于特征提取的图像集合
@@ -84,6 +97,7 @@ class MultiSceneDataset:
         device: torch.device = torch.device("cpu"),
         preload_scene_count: int = 3,  # 预加载场景数量
         fixed_segment_aabb: Optional[Tensor] = None,  # 全局固定的段AABB（可选）
+        pointcloud_config: Optional[Dict] = None,  # 点云生成器配置（可选）
     ):
         """
         Args:
@@ -105,6 +119,17 @@ class MultiSceneDataset:
                 而不是从lidar数据计算。形状：[2, 3]，其中 aabb[0] 是 [x_min, y_min, z_min]，
                 aabb[1] 是 [x_max, y_max, z_max]。坐标系：x=左右, y=上下（负数为上）, z=后前
                 （与 _compute_segment_aabb 一致）。如果为 None，则使用从lidar数据计算的AABB。
+            pointcloud_config: 可选的点云生成器配置。如果提供，数据集将创建点云生成器，
+                用于在生成批次时自动生成点云。配置字典包含：
+                - type: 生成器类型（"monocular" 等，默认 "monocular"）
+                - chosen_cam_ids: 选择的相机ID列表
+                - sparsity: 点云稀疏度（"full" 等）
+                - filter_sky: 是否过滤天空（默认True）
+                - depth_consistency: 是否使用深度一致性（默认True）
+                - use_bbx: 是否使用边界框（默认True）
+                - downscale: 下采样因子（默认2）
+                - crop_aabb: 裁剪AABB [[x_min, y_min, z_min], [x_max, y_max, z_max]]
+                - input_aabb: 输入AABB [[x_min, y_min, z_min], [x_max, y_max, z_max]]
         """
         pass
     
@@ -153,10 +178,52 @@ class MultiSceneDataset:
         """
         pass
     
+    def get_segment_frames(
+        self,
+        scene_id: int,
+        segment_id: int,
+    ) -> List[int]:
+        """
+        获取段内所有帧索引。
+        
+        Args:
+            scene_id: 场景ID
+            segment_id: 段ID（场景内索引）
+            
+        Returns:
+            frame_indices: 段内所有帧索引列表（已排序、去重）
+        """
+        pass
+    
+    def get_frame_data(
+        self,
+        scene_id: int,
+        frame_idx: int,
+        cam_idx: int,
+    ) -> Dict:
+        """
+        获取指定帧和相机的数据。
+        
+        Args:
+            scene_id: 场景ID
+            frame_idx: 帧索引
+            cam_idx: 相机索引（在 camera_list 中的索引）
+            
+        Returns:
+            Dict包含：
+                - 'image': Tensor [H, W, 3] - RGB图像
+                - 'extrinsic': Tensor [4, 4] - 外参（cam_to_world）
+                - 'intrinsic': Tensor [4, 4] - 内参（4x4矩阵）
+                - 'depth': Tensor [H, W] - 深度图（如果可用）
+                - 'sky_mask': Tensor [H, W] 或 None - 天空掩码（如果可用）
+        """
+        pass
+    
     def get_segment_batch(
         self,
         scene_id: int,
         segment_id: int,
+        include_test: bool = True,
     ) -> Dict:
         """
         获取指定场景和段的训练批次。
@@ -164,6 +231,7 @@ class MultiSceneDataset:
         Args:
             scene_id: 场景ID
             segment_id: 段ID（场景内索引）
+            include_test: 是否包含测试视角（如果可用，默认True）
             
         Returns:
             Dict包含：
@@ -191,6 +259,16 @@ class MultiSceneDataset:
                     'cam_indices': Tensor[num_target_keyframes * num_cams],
                     'keyframe_indices': Tensor[num_target_keyframes],  # 关键帧索引
                 }
+                - 'test': Optional[Dict] - 测试视角数据（如果 include_test=True 且段内包含测试帧）
+                    - 'image': Tensor[num_test_images, H, W, 3],
+                    - 'extrinsics': Tensor[num_test_images, 4, 4],
+                    - 'intrinsics': Tensor[num_test_images, 4, 4],
+                    - 'depth': Tensor[num_test_images, H, W],
+                    - 'frame_indices': Tensor[num_test_images],
+                    - 'cam_indices': Tensor[num_test_images],
+                - 'pointcloud': Optional[Dict] - 点云数据（如果配置了 pointcloud_config）
+                    - 'background': np.ndarray [N, 6] - 背景点云 [x, y, z, r, g, b]
+                    - 'dynamic': np.ndarray [M, 6] - 动态物体点云 [x, y, z, r, g, b]
         """
         pass
     
@@ -203,9 +281,13 @@ class MultiSceneDataset:
         """
         pass
     
-    def sample_random_batch(self) -> Dict:
+    def sample_random_batch(self, eval: bool = False, include_test: bool = False) -> Dict:
         """
         随机采样一个训练批次。
+        
+        Args:
+            eval: 如果为 True，从评估场景中采样；否则从训练场景中采样（默认False）
+            include_test: 是否包含测试视角（如果可用，默认False）
         
         Returns:
             与 get_segment_batch() 相同的格式
@@ -219,6 +301,7 @@ class MultiSceneDataset:
         scene_order: str = "random",
         shuffle_segments: bool = True,
         preload_next_scene: bool = True,
+        include_test: bool = False,
     ) -> 'MultiSceneDatasetScheduler':
         """
         创建调度器实例，用于管理场景和段的遍历顺序。
@@ -229,6 +312,7 @@ class MultiSceneDataset:
             scene_order: 场景遍历顺序（"random"或"sequential"，默认"random"）
             shuffle_segments: 是否在每个场景内打乱段顺序（默认True）
             preload_next_scene: 是否在最后一个段开始训练时预加载下一个场景（默认True）
+            include_test: 是否在调度器的批次中包含测试视角（默认False）
             
         Returns:
             MultiSceneDatasetScheduler实例
@@ -260,6 +344,7 @@ class MultiSceneDatasetScheduler:
         scene_order: str = "random",
         shuffle_segments: bool = True,
         preload_next_scene: bool = True,
+        include_test: bool = False,
     ):
         """
         Args:
@@ -269,6 +354,7 @@ class MultiSceneDatasetScheduler:
             scene_order: 场景遍历顺序（"random"或"sequential"，默认"random"）
             shuffle_segments: 是否在每个场景内打乱段顺序（默认True）
             preload_next_scene: 是否在最后一个段开始训练时预加载下一个场景（默认True）
+            include_test: 是否在采样批次中包含测试视角（默认False）
         """
         pass
     
@@ -313,6 +399,44 @@ class MultiSceneDatasetScheduler:
                 - 'segment_id_in_scene': 场景内的实际段ID
                 - 'batch_count': 当前段内的batch计数
                 - 'batches_per_segment': 每个段的batch数量
+        """
+        pass
+    
+    def generate_segment_pointcloud(
+        self,
+        pointcloud_generator,
+        scene_id: Optional[int] = None,
+        segment_id: Optional[int] = None,
+    ) -> Dict:
+        """
+        为当前段（或指定段）生成点云。
+        
+        Args:
+            pointcloud_generator: 点云生成器实例
+            scene_id: 场景ID（如果为None，使用当前场景）
+            segment_id: 段ID（如果为None，使用当前段）
+            
+        Returns:
+            Dict: 点云结果（背景 + 动态物体）
+        """
+        pass
+    
+    def generate_all_segment_pointclouds(
+        self,
+        pointcloud_generator,
+        scene_id: Optional[int] = None,
+        save_dir: Optional[str] = None,
+    ) -> Dict:
+        """
+        为场景的所有段生成点云。
+        
+        Args:
+            pointcloud_generator: 点云生成器实例
+            scene_id: 场景ID（如果为None，使用当前场景）
+            save_dir: 保存目录（如果为None，不保存）
+            
+        Returns:
+            Dict[segment_id, Dict]: 每个段的点云结果字典
         """
         pass
 ```
@@ -367,6 +491,13 @@ def __init__(self, ...):
     
     # 9. 跟踪是否已初始化
     self._initialized = False
+    
+    # 10. 初始化点云生成器（如果配置存在）
+    self.pointcloud_generator = None
+    if pointcloud_config is not None:
+        self.pointcloud_generator = self._create_pointcloud_generator(
+            pointcloud_config, data_cfg, device
+        )
 
 def initialize(self):
     """
@@ -444,7 +575,56 @@ def initialize(self):
    - 使用 `Event.wait()` 实现阻塞等待
    - 避免在场景未准备好时继续训练
 
-### 2. 场景加载和验证
+### 2. 训练/测试帧分离
+
+**帧分离方法**：
+```python
+def _split_train_test_frames(
+    self,
+    num_frames: int,
+    test_image_stride: int,
+) -> Tuple[List[int], List[int]]:
+    """
+    根据 test_image_stride 抽帧，分离训练帧和测试帧。
+    
+    Args:
+        num_frames: 场景总帧数
+        test_image_stride: 测试帧步长（0表示所有帧用于训练和测试）
+        
+    Returns:
+        train_frame_indices: 训练帧索引列表
+        test_frame_indices: 测试帧索引列表
+    """
+    if test_image_stride == 0:
+        train_frame_indices = list(range(num_frames))
+        test_frame_indices = list(range(num_frames))
+    else:
+        test_frame_indices = list(range(
+            test_image_stride,
+            num_frames,
+            test_image_stride,
+        ))
+        train_frame_indices = [
+            i for i in range(num_frames)
+            if i not in test_frame_indices
+        ]
+    
+    return train_frame_indices, test_frame_indices
+```
+
+**工作原理**：
+- 如果 `test_image_stride = 0`：所有帧同时用于训练和测试
+- 如果 `test_image_stride > 0`：每隔 `test_image_stride` 帧被标记为测试帧（从第 `test_image_stride` 帧开始）
+- 其余帧作为训练帧
+
+**示例**：
+```python
+# 假设 num_frames = 100, test_image_stride = 10
+# test_frame_indices = [10, 20, 30, 40, 50, 60, 70, 80, 90]
+# train_frame_indices = [0, 1, 2, ..., 9, 11, 12, ..., 19, 21, ...]
+```
+
+### 3. 场景加载和验证
 
 **场景验证流程**：
 ```python
@@ -455,24 +635,41 @@ def _validate_and_add_to_queue(self, scene_id: int) -> bool:
     此方法执行轻量级验证，通过加载场景并检查是否适合。
     如果适合，添加到队列。
     
+    注意：此方法在 I/O 操作时会释放锁，以避免阻塞其他线程。
+    
     Args:
         scene_id: 要验证的场景ID
         
     Returns:
         bool: True 如果场景适合并已添加到队列，False 否则
     """
-    # 跳过如果已在队列中或无效
+    # 跳过如果已在队列中或无效（检查时持有锁）
     if scene_id in self.scene_training_queue:
         return True
     if scene_id in self.invalid_scene_ids:
         return False
     
-    # 尝试加载并准备场景（这会进行完整验证）
-    scene_data = self._load_and_prepare_scene(scene_id)
+    # 释放锁以进行 I/O 操作（避免阻塞其他线程）
+    lock_released = False
+    try:
+        self._lock.release()
+        lock_released = True
+    except RuntimeError:
+        # 锁未被持有，继续执行
+        pass
+    
+    try:
+        # 尝试加载并准备场景（这会进行完整验证）
+        scene_data = self._load_and_prepare_scene(scene_id)
+    finally:
+        # 重新获取锁（如果之前释放了）
+        if lock_released:
+            self._lock.acquire()
     
     if scene_data is not None:
-        # 场景适合，添加到队列
-        self.scene_training_queue.append(scene_id)
+        # 场景适合，添加到队列（双重检查，可能在其他线程中已添加）
+        if scene_id not in self.scene_training_queue:
+            self.scene_training_queue.append(scene_id)
         # 不保留在缓存中，将在需要时加载
         # 清理加载的数据以节省内存
         if 'dataset' in scene_data:
@@ -517,10 +714,12 @@ def _load_scene(self, scene_id: int) -> Optional[Dict]:
     
     流程：
     1. 创建 DrivingDataset 实例
-    2. 获取场景的轨迹（用于关键帧分割）
-    3. 分割关键帧
-    4. 分割段（基于 AABB 限制）
-    5. 返回场景信息
+    2. 分离训练帧和测试帧（根据 test_image_stride）
+    3. 获取场景的轨迹（仅使用训练帧，用于关键帧分割）
+    4. 分割关键帧（基于训练帧轨迹）
+    5. 分割段（基于 AABB 限制和关键帧距离）
+    6. 记录段内测试帧
+    7. 返回场景信息
     """
     # 1. 创建场景配置
     scene_cfg = OmegaConf.create(OmegaConf.to_container(self.data_cfg))
@@ -529,22 +728,41 @@ def _load_scene(self, scene_id: int) -> Optional[Dict]:
     # 2. 创建 DrivingDataset 实例
     scene_dataset = DrivingDataset(scene_cfg)
     
-    # 3. 获取场景轨迹（使用前相机的轨迹）
-    trajectory = self._get_scene_trajectory(scene_dataset)
+    # 3. 分离训练帧和测试帧（在关键帧分割之前）
+    pixel_source_cfg = getattr(self.data_cfg, "pixel_source", {})
+    try:
+        test_image_stride = pixel_source_cfg.get("test_image_stride", 0)
+    except Exception:
+        test_image_stride = 0
+    train_frame_indices, test_frame_indices = self._split_train_test_frames(
+        num_frames=scene_dataset.num_img_timesteps,
+        test_image_stride=test_image_stride,
+    )
     
-    # 4. 分割关键帧
+    # 4. 获取场景轨迹（仅使用训练帧）
+    full_trajectory = self._get_scene_trajectory(scene_dataset)
+    trajectory = full_trajectory[train_frame_indices]
+    
+    # 5. 分割关键帧（基于训练帧轨迹）
     keyframe_segments, keyframe_ranges = self._split_keyframes(trajectory)
+    # 将关键帧索引映射回全局帧索引（训练帧）
+    keyframe_segments = [
+        [train_frame_indices[idx] for idx in seg]
+        for seg in keyframe_segments
+    ]
     
-    # 5. 检查场景是否适合训练（关键帧数量是否足够）
+    # 6. 检查场景是否适合训练（关键帧数量是否足够）
     if not self._is_scene_suitable(keyframe_segments):
         logger.warning(f"Scene {scene_id} is not suitable for training (insufficient keyframes), skipping...")
         return None  # 返回 None 表示场景不适合
     
-    # 6. 分割段（基于 AABB 限制和关键帧距离）
+    # 7. 分割段（基于 AABB 限制和关键帧距离）
     segments = self._split_segments(
         scene_dataset=scene_dataset,
         keyframe_segments=keyframe_segments,
         keyframe_ranges=keyframe_ranges,
+        train_frame_indices=train_frame_indices,
+        test_frame_indices=test_frame_indices,
         overlap_ratio=self.segment_overlap_ratio,
     )
     
@@ -555,6 +773,8 @@ def _load_scene(self, scene_id: int) -> Optional[Dict]:
     return {
         'dataset': scene_dataset,
         'trajectory': trajectory,
+        'train_frame_indices': train_frame_indices,
+        'test_frame_indices': test_frame_indices,
         'keyframe_segments': keyframe_segments,
         'keyframe_ranges': keyframe_ranges,
         'segments': segments,
@@ -638,6 +858,8 @@ def _split_segments(
     keyframe_segments: List[List[int]],
     keyframe_ranges: Tensor,  # [num_keyframes, 2] - 每个关键帧段的距离范围
     overlap_ratio: float,
+    train_frame_indices: Optional[List[int]] = None,
+    test_frame_indices: Optional[List[int]] = None,
 ) -> List[Dict]:
     """
     按照场景 AABB 限制分割段。
@@ -648,6 +870,7 @@ def _split_segments(
     3. 将关键帧按照距离和 AABB 长度分组为段
     4. 为每个段计算独立的 AABB（基于段内帧的lidar数据，或使用固定AABB如果配置了）
     5. 过滤掉关键帧数量不足的段
+    6. 记录每个段内的测试帧（如果提供了测试帧列表）
     
     注意：
     - 段分割不需要那么精确，关键帧的合计距离对比AABB的长度即可
@@ -656,18 +879,22 @@ def _split_segments(
     - **每个段使用独立的AABB**：
       - 如果配置了 `fixed_segment_aabb`，所有段使用此固定AABB
       - 否则，基于段内帧的lidar数据计算，而不是使用场景AABB
+    - **段内测试帧记录**：如果提供了测试帧列表，会记录每个段范围内包含的测试帧
     
     Args:
         scene_dataset: 场景数据集
         keyframe_segments: 关键帧段列表
         keyframe_ranges: 关键帧段的距离范围 [num_keyframes, 2]
         overlap_ratio: 段与段之间的重叠比例
+        train_frame_indices: 训练帧索引（可选，仅用于记录）
+        test_frame_indices: 测试帧索引列表（可选，用于段内测试帧记录）
     
     Returns:
         segments: List[Dict] - 每个段包含：
             - 'segment_id': int - 段ID
             - 'keyframe_indices': List[int] - 该段包含的关键帧索引（全局关键帧索引）
             - 'frame_indices': List[int] - 该段包含的所有帧索引（去重后的帧索引列表）
+            - 'test_frame_indices': List[int] - 该段范围内包含的测试帧索引（如果提供了测试帧列表）
             - 'aabb': Tensor[2, 3] - 段的 AABB 边界（基于段内帧的lidar数据计算）
     """
     # 1. 获取场景 AABB
@@ -860,14 +1087,23 @@ def _compute_segment_aabb(
             ]
         ]
     
-    # 使用分位数计算AABB
+    # 计算实际的min/max（需要在删除lidar_pts之前计算）
+    actual_min = lidar_pts.min(dim=0)[0]
+    actual_max = lidar_pts.max(dim=0)[0]
+    
+    # 使用分位数计算AABB（去除异常值）
     percentile = lidar_source.data_cfg.get('lidar_percentile', 0.02)
     aabb_min = torch.quantile(lidar_pts, percentile, dim=0)
     aabb_max = torch.quantile(lidar_pts, 1 - percentile, dim=0)
     
+    # 确保AABB包含所有点（扩展边界以确保包含分位数外的点）
+    # 这很重要，因为测试和实际使用都期望AABB包含所有点
+    # 使用更宽松的边界：取分位数和实际最小/最大值的组合
+    aabb_min = torch.minimum(aabb_min, actual_min)
+    aabb_max = torch.maximum(aabb_max, actual_max)
+    
     # 清理临时变量
     del lidar_pts
-    torch.cuda.empty_cache()
     
     # 通常lidar的高度非常小，所以稍微增加AABB的高度
     if aabb_max[-1] < 20:
@@ -875,6 +1111,8 @@ def _compute_segment_aabb(
     
     # 组合为 [min, max] 格式
     aabb = torch.stack([aabb_min, aabb_max], dim=0)  # [2, 3]
+    
+    logger.debug(f"[Segment] Computed AABB from {len(frame_indices)} frames: {aabb}")
     
     return aabb
 ```
@@ -887,6 +1125,74 @@ def _compute_segment_aabb(
 **与场景AABB的关系**：
 - 段AABB通常包含在场景AABB内，但可能不完全一致（由于分位数计算和下采样）
 - 如果段内没有lidar数据或lidar_source不可用，会回退到场景AABB
+
+### 4.2 点云生成器
+
+数据集支持可选的点云生成器，用于在生成批次时自动生成点云数据。点云生成器通过 `pointcloud_config` 参数配置。
+
+**点云生成器创建**：
+```python
+def _create_pointcloud_generator(
+    self,
+    pointcloud_config: Dict,
+    data_cfg: OmegaConf,
+    device: torch.device,
+) -> Optional["RGBPointCloudGenerator"]:
+    """
+    根据配置创建点云生成器。
+    
+    支持的类型：
+    - "monocular": 单目点云生成器（MonocularRGBPointCloudGenerator）
+    
+    配置参数：
+    - type: 生成器类型（默认 "monocular"）
+    - chosen_cam_ids: 选择的相机ID列表
+    - sparsity: 点云稀疏度（"full" 等）
+    - filter_sky: 是否过滤天空（默认True）
+    - depth_consistency: 是否使用深度一致性（默认True）
+    - use_bbx: 是否使用边界框（默认True）
+    - downscale: 下采样因子（默认2）
+    - crop_aabb: 裁剪AABB [[x_min, y_min, z_min], [x_max, y_max, z_max]]
+    - input_aabb: 输入AABB [[x_min, y_min, z_min], [x_max, y_max, z_max]]
+    """
+    from datasets.pointcloud_generators import MonocularRGBPointCloudGenerator
+    
+    generator_type = pointcloud_config.get("type", "monocular")
+    
+    if generator_type == "monocular":
+        chosen_cam_ids = pointcloud_config.get(
+            "chosen_cam_ids",
+            data_cfg.pixel_source.get("cameras", [0])
+        )
+        
+        crop_aabb = np.array(pointcloud_config.get("crop_aabb", [[-20, -20, -20], [20, 4.8, 70]]))
+        input_aabb = np.array(pointcloud_config.get("input_aabb", [[-20, -20, -20], [20, 4.8, 120]]))
+        
+        return MonocularRGBPointCloudGenerator(
+            chosen_cam_ids=chosen_cam_ids,
+            sparsity=pointcloud_config.get("sparsity", "full"),
+            filter_sky=pointcloud_config.get("filter_sky", True),
+            depth_consistency=pointcloud_config.get("depth_consistency", True),
+            use_bbx=pointcloud_config.get("use_bbx", True),
+            downscale=pointcloud_config.get("downscale", 2),
+            crop_aabb=crop_aabb,
+            input_aabb=input_aabb,
+            device=device,
+        )
+    else:
+        logger.warning(f"Unknown pointcloud generator type: {generator_type}")
+        return None
+```
+
+**点云生成时机**：
+- 在 `get_segment_batch` 方法中，如果配置了点云生成器，会自动调用生成器生成点云
+- 点云数据会添加到批次的 `pointcloud` 字段中
+- 点云格式：`{'background': np.ndarray [N, 6], 'dynamic': np.ndarray [M, 6]}`
+
+**点云生成器使用**：
+- 点云生成器通过 `dataset.pointcloud_generator` 访问
+- 调度器提供 `generate_segment_pointcloud` 和 `generate_all_segment_pointclouds` 方法
+- 点云生成器使用 `dataset.get_segment_frames` 和 `dataset.get_frame_data` 方法访问数据
 
 ### 5. Source 和 Target 选择
 
@@ -1165,7 +1471,51 @@ def get_segment_batch(
             target_frame_idxs.append(frame_idx)
             target_cam_idxs.append(cam_idx)
     
-    # 6. 组装批次
+    # 6. 生成点云（如果点云生成器存在）
+    pointcloud = None
+    if self.pointcloud_generator is not None:
+        pointcloud = self.pointcloud_generator.generate_pointcloud(
+            dataset=self,
+            scene_id=scene_id,
+            segment_id=segment_id,
+        )
+    
+    # 7. 加载测试视图（如果请求且可用）
+    test_images = []
+    test_extrinsics = []
+    test_intrinsics = []
+    test_depths = []
+    test_frame_idxs = []
+    test_cam_idxs = []
+    
+    if include_test:
+        segment_test_frames = segment.get('test_frame_indices', [])
+        if len(segment_test_frames) > 0:
+            # 获取 max_test_images 配置（如果设置了）
+            pixel_source_cfg = getattr(self.data_cfg, "pixel_source", {})
+            try:
+                max_test_images = pixel_source_cfg.get("max_test_images", 0)
+            except Exception:
+                max_test_images = 0
+            
+            # 如果设置了 max_test_images 且测试帧数量超过限制，随机采样
+            if max_test_images > 0 and len(segment_test_frames) > max_test_images:
+                selected_test_frames = random.sample(segment_test_frames, max_test_images)
+            else:
+                selected_test_frames = segment_test_frames
+            
+            # 为选中的测试帧加载所有相机的图像
+            for frame_idx in selected_test_frames:
+                for cam_idx in range(num_cams):
+                    frame_data = self.get_frame_data(scene_id, frame_idx, cam_idx)
+                    test_images.append(frame_data['image'])
+                    test_extrinsics.append(frame_data['extrinsic'])
+                    test_intrinsics.append(frame_data['intrinsic'])
+                    test_depths.append(frame_data['depth'])
+                    test_frame_idxs.append(frame_idx)
+                    test_cam_idxs.append(cam_idx)
+    
+    # 8. 组装批次
     batch = {
         'scene_id': torch.tensor([scene_id], dtype=torch.long),
         'segment_id': segment_id,
@@ -1197,6 +1547,21 @@ def get_segment_batch(
             'keyframe_indices': torch.tensor(target_keyframe_indices, dtype=torch.long),  # [num_target_keyframes]
         }
     }
+    
+    # 如果生成了点云，添加到批次中
+    if pointcloud is not None:
+        batch['pointcloud'] = pointcloud
+    
+    # 如果加载了测试视图，添加到批次中
+    if include_test and len(test_images) > 0:
+        batch['test'] = {
+            'image': torch.stack(test_images, dim=0),
+            'extrinsics': torch.stack(test_extrinsics, dim=0),
+            'intrinsics': torch.stack(test_intrinsics, dim=0),
+            'depth': torch.stack(test_depths, dim=0),
+            'frame_indices': torch.tensor(test_frame_idxs, dtype=torch.long),
+            'cam_indices': torch.tensor(test_cam_idxs, dtype=torch.long),
+        }
     
     return batch
 
@@ -1395,6 +1760,7 @@ def split_trajectory(trajectory, num_splits=0, min_count=1, min_length=0):
 - [ ] **固定AABB使用正确**：如果配置了 `fixed_segment_aabb`，所有段使用此固定AABB
 - [ ] **固定AABB格式正确**：固定AABB的形状为 [2, 3]，min < max
 - [ ] **固定AABB坐标系正确**：固定AABB使用与 `_compute_segment_aabb` 相同的坐标系（x=左右, y=上下（负数为上）, z=后前）
+- [ ] **段AABB边界扩展正确**：段AABB确保包含所有点（使用分位数和实际最小/最大值的组合）
 
 ### 10. 与 EVolSplat Offset 机制的兼容性
 
@@ -1422,6 +1788,32 @@ def split_trajectory(trajectory, num_splits=0, min_count=1, min_length=0):
 - [ ] **阻塞等待**：场景切换时，如果场景未加载，主线程阻塞等待
 - [ ] **线程安全**：所有共享状态访问都使用锁保护
 - [ ] **资源清理**：调度器销毁时正确清理线程资源
+- [ ] **锁释放机制**：`_validate_and_add_to_queue` 在 I/O 操作时释放锁，避免阻塞其他线程
+
+### 13. 点云生成器检查
+
+- [ ] **点云生成器配置正确**：如果提供了 `pointcloud_config`，正确创建点云生成器
+- [ ] **点云自动生成**：如果配置了点云生成器，批次中自动包含点云数据
+- [ ] **点云格式正确**：点云数据格式为 Dict，包含 'background' 和 'dynamic' 字段
+- [ ] **点云生成器类型支持**：支持 "monocular" 等类型的点云生成器
+- [ ] **调度器点云生成方法**：调度器提供 `generate_segment_pointcloud` 和 `generate_all_segment_pointclouds` 方法
+
+### 14. 训练/测试帧分离检查
+
+- [ ] **帧分离机制正确**：根据 `test_image_stride` 正确分离训练帧和测试帧
+- [ ] **关键帧分割使用训练帧**：关键帧分割只基于训练帧，不包含测试帧
+- [ ] **测试帧索引映射正确**：关键帧索引正确映射回全局帧索引（训练帧）
+- [ ] **段内测试帧记录正确**：每个段正确记录范围内包含的测试帧
+- [ ] **测试视图加载可选**：`get_segment_batch` 的 `include_test` 参数正确控制测试视图加载
+- [ ] **测试帧数量限制**：`max_test_images` 配置正确限制每个段的测试帧数量
+- [ ] **测试视图采样**：如果测试帧数量超过 `max_test_images`，正确随机采样
+
+### 15. 辅助方法检查
+
+- [ ] **get_segment_frames 方法**：正确返回段内所有帧索引（已排序、去重）
+- [ ] **get_frame_data 方法**：正确返回指定帧和相机的数据（图像、外参、内参、深度、天空掩码）
+- [ ] **sample_random_batch eval 参数**：支持从评估场景中采样批次
+- [ ] **_split_train_test_frames 方法**：正确分离训练帧和测试帧
 
 ---
 
@@ -1463,6 +1855,17 @@ dataset = MultiSceneDataset(
     device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     preload_scene_count=3,  # 预加载3个场景
     fixed_segment_aabb=fixed_aabb,  # 使用固定段AABB（可选）
+    pointcloud_config={  # 点云生成器配置（可选）
+        'type': 'monocular',
+        'chosen_cam_ids': [0, 1, 2],
+        'sparsity': 'full',
+        'filter_sky': True,
+        'depth_consistency': True,
+        'use_bbx': True,
+        'downscale': 2,
+        'crop_aabb': [[-20, -20, -20], [20, 4.8, 70]],
+        'input_aabb': [[-20, -20, -20], [20, 4.8, 120]],
+    },
 )
 
 # 3. 初始化数据集（可选，会在第一次使用时自动初始化）
@@ -1472,8 +1875,11 @@ dataset.initialize()
 current_scene_id = dataset.get_current_scene_id()
 print(f"当前训练场景: {current_scene_id}")
 
-# 5. 获取随机批次
-batch = dataset.sample_random_batch()
+# 5. 获取随机批次（训练场景）
+batch = dataset.sample_random_batch(eval=False)
+
+# 5.1. 获取随机批次（评估场景）
+eval_batch = dataset.sample_random_batch(eval=True)
 
 # 6. 获取指定场景和段的批次
 batch = dataset.get_segment_batch(scene_id=0, segment_id=2)
@@ -1481,6 +1887,17 @@ batch = dataset.get_segment_batch(scene_id=0, segment_id=2)
 # 7. 获取场景信息
 scene_info = dataset.get_scene(scene_id=0)
 print(f"场景 {scene_id} 有 {len(scene_info['segments'])} 个段")
+
+# 7.1. 获取段内所有帧索引
+frame_indices = dataset.get_segment_frames(scene_id=0, segment_id=0)
+print(f"段 0 包含 {len(frame_indices)} 帧")
+
+# 7.2. 获取指定帧和相机的数据
+frame_data = dataset.get_frame_data(scene_id=0, frame_idx=0, cam_idx=0)
+print(f"图像形状: {frame_data['image'].shape}")
+print(f"深度图形状: {frame_data['depth'].shape}")
+if frame_data['sky_mask'] is not None:
+    print(f"天空掩码形状: {frame_data['sky_mask'].shape}")
 
 # 8. 在训练循环中使用（方式1：使用sample_random_batch）
 for iteration in range(100):
@@ -1521,6 +1938,11 @@ try:
                 print(f"Iteration {iteration}: scene_id={info['scene_id']}, "
                       f"segment_id={info['segment_id_in_scene']}, "
                       f"batch_count={info['batch_count']}/{info['batches_per_segment']}")
+            
+            # 检查批次是否包含点云（如果配置了点云生成器）
+            if 'pointcloud' in batch:
+                print(f"Batch contains pointcloud: background={batch['pointcloud']['background'].shape}, "
+                      f"dynamic={batch['pointcloud']['dynamic'].shape}")
         except StopIteration:
             # 所有场景遍历完成
             print("All scenes have been processed")
@@ -1528,6 +1950,22 @@ try:
 finally:
     # 确保清理后台线程
     scheduler.shutdown()
+
+# 10. 使用调度器生成点云（如果配置了点云生成器）
+if dataset.pointcloud_generator is not None:
+    # 为当前段生成点云
+    pointcloud = scheduler.generate_segment_pointcloud(
+        pointcloud_generator=dataset.pointcloud_generator,
+        scene_id=None,  # 使用当前场景
+        segment_id=None,  # 使用当前段
+    )
+    
+    # 为场景的所有段生成点云
+    all_pointclouds = scheduler.generate_all_segment_pointclouds(
+        pointcloud_generator=dataset.pointcloud_generator,
+        scene_id=0,
+        save_dir="/path/to/save/pointclouds",  # 可选：保存点云
+    )
 ```
 
 ---
@@ -1660,6 +2098,9 @@ def get_segment_batch_single_target(
 10. **EVolSplat 兼容**：输出格式符合 EVolSplat 的要求，包含 keyframe_info 等元数据
 11. **Drivestudio 集成**：复用 `DrivingDataset` 和 `ScenePixelSource` 的接口
 12. **动态相机数量**：支持不同场景有不同数量的相机
+13. **点云生成支持**：可选的点云生成器，支持在批次生成时自动生成点云
+14. **辅助数据访问方法**：提供 `get_segment_frames` 和 `get_frame_data` 方法，方便访问段和帧数据
+15. **评估场景采样**：`sample_random_batch` 支持从评估场景中采样
 
 该设计允许在不修改 Drivestudio 核心代码的情况下，实现支持动态物体的 feed-forward 3DGS 训练，同时通过延迟加载和预加载机制有效控制内存占用。
 

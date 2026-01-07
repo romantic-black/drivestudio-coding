@@ -366,9 +366,23 @@ class MultiSceneDataset:
             try:
                 # Create a temporary dataset to check if scene exists and is valid
                 temp_dataset = DrivingDataset(scene_cfg)
-                # Get trajectory to check keyframes
-                trajectory = self._get_scene_trajectory(temp_dataset)
+                # Get trajectory to check keyframes (use training frames only)
+                pixel_source_cfg = getattr(self.data_cfg, "pixel_source", {})
+                try:
+                    test_image_stride = pixel_source_cfg.get("test_image_stride", 0)
+                except Exception:
+                    test_image_stride = 0
+                train_frame_indices, _ = self._split_train_test_frames(
+                    num_frames=temp_dataset.num_img_timesteps,
+                    test_image_stride=test_image_stride,
+                )
+                trajectory_full = self._get_scene_trajectory(temp_dataset)
+                trajectory = trajectory_full[train_frame_indices]
                 keyframe_segments, _ = self._split_keyframes(trajectory)
+                keyframe_segments = [
+                    [train_frame_indices[idx] for idx in seg]
+                    for seg in keyframe_segments
+                ]
                 
                 # Check if scene is suitable
                 if self._is_scene_suitable(keyframe_segments):
@@ -748,6 +762,38 @@ class MultiSceneDataset:
             'depth': depth,  # [H, W]
             'sky_mask': sky_mask,  # Tensor [H, W] or None
         }
+
+    def _split_train_test_frames(
+        self,
+        num_frames: int,
+        test_image_stride: int,
+    ) -> Tuple[List[int], List[int]]:
+        """
+        根据 test_image_stride 抽帧，分离训练帧和测试帧。
+        
+        Args:
+            num_frames: 场景总帧数
+            test_image_stride: 测试帧步长（0表示所有帧用于训练和测试）
+            
+        Returns:
+            train_frame_indices: 训练帧索引列表
+            test_frame_indices: 测试帧索引列表
+        """
+        if test_image_stride == 0:
+            train_frame_indices = list(range(num_frames))
+            test_frame_indices = list(range(num_frames))
+        else:
+            test_frame_indices = list(range(
+                test_image_stride,
+                num_frames,
+                test_image_stride,
+            ))
+            train_frame_indices = [
+                i for i in range(num_frames)
+                if i not in test_frame_indices
+            ]
+        
+        return train_frame_indices, test_frame_indices
     
     def _load_scene(self, scene_id: int) -> Optional[Dict]:
         """
@@ -755,10 +801,11 @@ class MultiSceneDataset:
         
         Process:
         1. Create DrivingDataset instance
-        2. Get scene trajectory (for keyframe splitting)
-        3. Split keyframes
-        4. Split segments (based on AABB constraints)
-        5. Return scene information
+        2. Split train/test frames before keyframe splitting
+        3. Get scene trajectory (for keyframe splitting) using training frames
+        4. Split keyframes
+        5. Split segments (based on AABB constraints)
+        6. Return scene information
         """
         # 1. Create scene configuration
         scene_cfg = OmegaConf.create(OmegaConf.to_container(self.data_cfg))
@@ -768,22 +815,41 @@ class MultiSceneDataset:
             # 2. Create DrivingDataset instance
             scene_dataset = DrivingDataset(scene_cfg)
             
-            # 3. Get scene trajectory (using front camera trajectory)
-            trajectory = self._get_scene_trajectory(scene_dataset)
+            # 3. Split train/test frames before keyframe splitting
+            pixel_source_cfg = getattr(self.data_cfg, "pixel_source", {})
+            try:
+                test_image_stride = pixel_source_cfg.get("test_image_stride", 0)
+            except Exception:
+                test_image_stride = 0
+            train_frame_indices, test_frame_indices = self._split_train_test_frames(
+                num_frames=scene_dataset.num_img_timesteps,
+                test_image_stride=test_image_stride,
+            )
             
-            # 4. Split keyframes
+            # 4. Get scene trajectory (using front camera trajectory) and filter training frames
+            full_trajectory = self._get_scene_trajectory(scene_dataset)
+            trajectory = full_trajectory[train_frame_indices]
+            
+            # 5. Split keyframes
             keyframe_segments, keyframe_ranges = self._split_keyframes(trajectory)
+            # Map keyframe frame indices back to global frame indices (training frames)
+            keyframe_segments = [
+                [train_frame_indices[idx] for idx in seg]
+                for seg in keyframe_segments
+            ]
             
-            # 5. Check if scene is suitable for training (sufficient keyframes)
+            # 6. Check if scene is suitable for training (sufficient keyframes)
             if not self._is_scene_suitable(keyframe_segments):
                 logger.warning(f"Scene {scene_id} is not suitable for training (insufficient keyframes), skipping...")
                 return None  # Return None to indicate scene is not suitable
             
-            # 6. Split segments (based on AABB constraints and keyframe distances)
+            # 7. Split segments (based on AABB constraints and keyframe distances)
             segments = self._split_segments(
                 scene_dataset=scene_dataset,
                 keyframe_segments=keyframe_segments,
                 keyframe_ranges=keyframe_ranges,
+                train_frame_indices=train_frame_indices,
+                test_frame_indices=test_frame_indices,
                 overlap_ratio=self.segment_overlap_ratio,
             )
             
@@ -794,6 +860,8 @@ class MultiSceneDataset:
             return {
                 'dataset': scene_dataset,
                 'trajectory': trajectory,
+                'train_frame_indices': train_frame_indices,
+                'test_frame_indices': test_frame_indices,
                 'keyframe_segments': keyframe_segments,
                 'keyframe_ranges': keyframe_ranges,
                 'segments': segments,
@@ -1002,6 +1070,8 @@ class MultiSceneDataset:
         keyframe_segments: List[List[int]],
         keyframe_ranges: Tensor,  # [num_keyframes, 2] - Distance ranges for each keyframe segment
         overlap_ratio: float,
+        train_frame_indices: Optional[List[int]] = None,
+        test_frame_indices: Optional[List[int]] = None,
     ) -> List[Dict]:
         """
         Split scene into segments based on AABB constraints.
@@ -1022,12 +1092,15 @@ class MultiSceneDataset:
             keyframe_segments: List of keyframe segments
             keyframe_ranges: Distance ranges for keyframe segments [num_keyframes, 2]
             overlap_ratio: Overlap ratio between segments
+            train_frame_indices: 训练帧索引（可选，仅用于记录）
+            test_frame_indices: 测试帧索引列表（可选，用于段内测试帧记录）
         
         Returns:
             segments: List[Dict] - Each segment contains:
                 - 'segment_id': int - Segment ID
                 - 'keyframe_indices': List[int] - Keyframe indices in this segment (global keyframe indices)
                 - 'frame_indices': List[int] - All frame indices in this segment (deduplicated)
+                - 'test_frame_indices': List[int] - Test frames that fall into this segment's frame range
                 - 'aabb': Tensor[2, 3] - Segment AABB bounds (computed from segment frames' lidar data)
         """
         # 1. Get scene AABB
@@ -1138,6 +1211,22 @@ class MultiSceneDataset:
             seg for seg in segments
             if len(seg['keyframe_indices']) >= self.min_keyframes_per_segment
         ]
+
+        # 7. Record test frames that fall into each segment's frame range
+        test_frame_indices = test_frame_indices or []
+        for seg in valid_segments:
+            segment_train_frames = seg.get('frame_indices', [])
+            if len(segment_train_frames) == 0:
+                seg['test_frame_indices'] = []
+                continue
+            
+            segment_min_frame = min(segment_train_frames)
+            segment_max_frame = max(segment_train_frames)
+            segment_test_frames = [
+                idx for idx in test_frame_indices
+                if segment_min_frame <= idx <= segment_max_frame
+            ]
+            seg['test_frame_indices'] = segment_test_frames
         
         return valid_segments
     
@@ -1217,9 +1306,15 @@ class MultiSceneDataset:
         self,
         scene_id: int,
         segment_id: int,
+        include_test: bool = True,
     ) -> Dict:
         """
         Get training batch for specified scene and segment.
+        
+        Args:
+            scene_id: 场景ID
+            segment_id: 段ID
+            include_test: 是否包含测试视角（如果可用）
         """
         # 1. Ensure scene is loaded
         scene_data = self._ensure_scene_loaded(scene_id)
@@ -1323,8 +1418,43 @@ class MultiSceneDataset:
                 scene_id=scene_id,
                 segment_id=segment_id,
             )
+
+        # 7. Load test views if requested and available
+        test_images: List[Tensor] = []
+        test_extrinsics: List[Tensor] = []
+        test_intrinsics: List[Tensor] = []
+        test_depths: List[Tensor] = []
+        test_frame_idxs: List[int] = []
+        test_cam_idxs: List[int] = []
         
-        # 7. Assemble batch
+        if include_test:
+            segment_test_frames = segment.get('test_frame_indices', [])
+            if len(segment_test_frames) > 0:
+                # Get max_test_images from config (if set)
+                pixel_source_cfg = getattr(self.data_cfg, "pixel_source", {})
+                try:
+                    max_test_images = pixel_source_cfg.get("max_test_images", 0)
+                except Exception:
+                    max_test_images = 0
+                
+                # Randomly sample test frames if max_test_images is set and > 0
+                if max_test_images > 0 and len(segment_test_frames) > max_test_images:
+                    selected_test_frames = random.sample(segment_test_frames, max_test_images)
+                else:
+                    selected_test_frames = segment_test_frames
+                
+                # Load all cameras for selected test frames
+                for frame_idx in selected_test_frames:
+                    for cam_idx in range(num_cams):
+                        frame_data = self.get_frame_data(scene_id, frame_idx, cam_idx)
+                        test_images.append(frame_data['image'])
+                        test_extrinsics.append(frame_data['extrinsic'])
+                        test_intrinsics.append(frame_data['intrinsic'])
+                        test_depths.append(frame_data['depth'])
+                        test_frame_idxs.append(frame_idx)
+                        test_cam_idxs.append(cam_idx)
+        
+        # 8. Assemble batch
         batch = {
             'scene_id': torch.tensor([scene_id], dtype=torch.long),
             'segment_id': segment_id,
@@ -1361,14 +1491,26 @@ class MultiSceneDataset:
         if pointcloud is not None:
             batch['pointcloud'] = pointcloud
         
+        # Add test views if available
+        if include_test and len(test_images) > 0:
+            batch['test'] = {
+                'image': torch.stack(test_images, dim=0),
+                'extrinsics': torch.stack(test_extrinsics, dim=0),
+                'intrinsics': torch.stack(test_intrinsics, dim=0),
+                'depth': torch.stack(test_depths, dim=0),
+                'frame_indices': torch.tensor(test_frame_idxs, dtype=torch.long),
+                'cam_indices': torch.tensor(test_cam_idxs, dtype=torch.long),
+            }
+        
         return batch
     
-    def sample_random_batch(self, eval: bool = False) -> Dict:
+    def sample_random_batch(self, eval: bool = False, include_test: bool = False) -> Dict:
         """
         Randomly sample a training batch from current scene.
         
         Args:
             eval: If True, sample from eval scenes; otherwise from train scenes
+            include_test: Whether to include test views if available
         
         Returns:
             Same format as get_segment_batch()
@@ -1405,7 +1547,7 @@ class MultiSceneDataset:
         
         segment_id = random.choice(range(len(scene_data['segments'])))
         
-        return self.get_segment_batch(current_scene_id, segment_id)
+        return self.get_segment_batch(current_scene_id, segment_id, include_test=include_test)
     
     def _get_depth(
         self,
@@ -1469,6 +1611,7 @@ class MultiSceneDataset:
         scene_order: str = "random",
         shuffle_segments: bool = True,
         preload_next_scene: bool = True,
+        include_test: bool = False,
     ) -> 'MultiSceneDatasetScheduler':
         """
         Create a scheduler instance for managing scene and segment traversal.
@@ -1479,6 +1622,7 @@ class MultiSceneDataset:
             scene_order: Scene traversal order ("random" or "sequential", default "random")
             shuffle_segments: Whether to shuffle segments within each scene (default True)
             preload_next_scene: Whether to preload next scene when last segment starts (default True)
+            include_test: Whether scheduler batches should include test views
             
         Returns:
             MultiSceneDatasetScheduler instance
@@ -1490,6 +1634,7 @@ class MultiSceneDataset:
             scene_order=scene_order,
             shuffle_segments=shuffle_segments,
             preload_next_scene=preload_next_scene,
+            include_test=include_test,
         )
 
 
@@ -1509,6 +1654,7 @@ class MultiSceneDatasetScheduler:
         scene_order: str = "random",
         shuffle_segments: bool = True,
         preload_next_scene: bool = True,
+        include_test: bool = False,
     ):
         """
         Initialize scheduler.
@@ -1520,6 +1666,7 @@ class MultiSceneDatasetScheduler:
             scene_order: Scene traversal order ("random" or "sequential", default "random")
             shuffle_segments: Whether to shuffle segments within each scene (default True)
             preload_next_scene: Whether to preload next scene when last segment starts (default True)
+            include_test: Whether to include test views in sampled batches
         """
         self.dataset = dataset
         self.batches_per_segment = batches_per_segment
@@ -1527,6 +1674,7 @@ class MultiSceneDatasetScheduler:
         self.scene_order = scene_order
         self.shuffle_segments = shuffle_segments
         self.preload_next_scene = preload_next_scene
+        self.include_test = include_test
         
         # State variables
         self.current_scene_id: Optional[int] = None
@@ -1846,7 +1994,11 @@ class MultiSceneDatasetScheduler:
         segment_id = self.scene_segment_order[self.current_segment_id]
         
         # Get batch
-        batch = self.dataset.get_segment_batch(self.current_scene_id, segment_id)
+        batch = self.dataset.get_segment_batch(
+            self.current_scene_id,
+            segment_id,
+            include_test=self.include_test,
+        )
         
         # Increment batch count
         self.current_batch_count += 1
