@@ -165,19 +165,22 @@ class MultiSceneDataset:
         Returns:
             点云生成器实例或 None
         """
-        from datasets.pointcloud_generators import MonocularRGBPointCloudGenerator
+        from datasets.pointcloud_generators import (
+            MonocularRGBPointCloudGenerator,
+            HybridRGBPointCloudGenerator,
+        )
         
         # 获取生成器类型（默认为 monocular）
         generator_type = pointcloud_config.get("type", "monocular")
+        
+        crop_aabb = np.array(pointcloud_config.get("crop_aabb", [[-20, -20, -20], [20, 4.8, 70]]))
+        input_aabb = np.array(pointcloud_config.get("input_aabb", [[-20, -20, -20], [20, 4.8, 120]]))
         
         if generator_type == "monocular":
             chosen_cam_ids = pointcloud_config.get(
                 "chosen_cam_ids",
                 data_cfg.pixel_source.get("cameras", [0])
             )
-            
-            crop_aabb = np.array(pointcloud_config.get("crop_aabb", [[-20, -20, -20], [20, 4.8, 70]]))
-            input_aabb = np.array(pointcloud_config.get("input_aabb", [[-20, -20, -20], [20, 4.8, 120]]))
             
             return MonocularRGBPointCloudGenerator(
                 chosen_cam_ids=chosen_cam_ids,
@@ -186,6 +189,49 @@ class MultiSceneDataset:
                 depth_consistency=pointcloud_config.get("depth_consistency", True),
                 use_bbx=pointcloud_config.get("use_bbx", True),
                 downscale=pointcloud_config.get("downscale", 2),
+                crop_aabb=crop_aabb,
+                input_aabb=input_aabb,
+                device=device,
+            )
+        elif generator_type == "hybrid":
+            # LiDAR生成器参数
+            lidar_sparsity = pointcloud_config.get("lidar_sparsity", "full")
+            lidar_use_bbx = pointcloud_config.get("lidar_use_bbx", True)
+            
+            # 单目生成器参数
+            monocular_chosen_cam_ids = pointcloud_config.get(
+                "monocular_chosen_cam_ids",
+                data_cfg.pixel_source.get("cameras", [0])
+            )
+            monocular_sparsity = pointcloud_config.get("monocular_sparsity", "full")
+            monocular_filter_sky = pointcloud_config.get("monocular_filter_sky", True)
+            monocular_depth_consistency = pointcloud_config.get("monocular_depth_consistency", True)
+            monocular_use_bbx = pointcloud_config.get("monocular_use_bbx", True)
+            monocular_downscale = pointcloud_config.get("monocular_downscale", 2)
+            
+            # 融合参数
+            max_points = pointcloud_config.get("max_points", 500000)
+            fusion_strategy = pointcloud_config.get("fusion_strategy", "adaptive")
+            dynamic_source = pointcloud_config.get("dynamic_source", "lidar_only")
+            downsample_dynamic = pointcloud_config.get("downsample_dynamic", False)
+            count_dynamic_in_max_points = pointcloud_config.get("count_dynamic_in_max_points", False)
+            background_downsample_method = pointcloud_config.get("background_downsample_method", "uniform")
+            
+            return HybridRGBPointCloudGenerator(
+                lidar_sparsity=lidar_sparsity,
+                lidar_use_bbx=lidar_use_bbx,
+                monocular_chosen_cam_ids=monocular_chosen_cam_ids,
+                monocular_sparsity=monocular_sparsity,
+                monocular_filter_sky=monocular_filter_sky,
+                monocular_depth_consistency=monocular_depth_consistency,
+                monocular_use_bbx=monocular_use_bbx,
+                monocular_downscale=monocular_downscale,
+                max_points=max_points,
+                fusion_strategy=fusion_strategy,
+                dynamic_source=dynamic_source,
+                downsample_dynamic=downsample_dynamic,
+                count_dynamic_in_max_points=count_dynamic_in_max_points,
+                background_downsample_method=background_downsample_method,
                 crop_aabb=crop_aabb,
                 input_aabb=input_aabb,
                 device=device,

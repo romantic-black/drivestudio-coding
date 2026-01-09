@@ -56,13 +56,24 @@ dataset:
   
   # Point cloud generator configuration (moved from data.pointcloud)
   pointcloud:
-    type: monocular  # 生成器类型：monocular 或 lidar
-    chosen_cam_ids: [0, 1, 2]  # 使用的相机ID列表
-    sparsity: full  # Point cloud sparsity level
-    filter_sky: true
-    depth_consistency: true
-    use_bbx: true
-    downscale: 2
+    type: hybrid  # 生成器类型：monocular, lidar, 或 hybrid
+    # LiDAR生成器参数
+    lidar_sparsity: full  # LiDAR点云稀疏度：Drop90, Drop80, Drop50, Drop25, full
+    lidar_use_bbx: true  # LiDAR是否使用边界框过滤
+    # 单目生成器参数
+    monocular_chosen_cam_ids: [0, 1, 2]  # 单目使用的相机ID列表
+    monocular_sparsity: full  # 单目点云稀疏度
+    monocular_filter_sky: true  # 单目是否过滤天空
+    monocular_depth_consistency: false  # 单目是否使用深度一致性检查
+    monocular_use_bbx: true  # 单目是否使用边界框过滤
+    monocular_downscale: 2  # 单目下采样比例
+    # 融合参数
+    max_points: 500000  # 静态背景点云最大点数（默认500K）
+    fusion_strategy: 融合策略：merge  # 融合策略：merge, lidar_first, adaptive
+    dynamic_source: lidar_only  # 动态点云来源：lidar_only（推荐）或 fuse
+    downsample_dynamic: false  # 动态点云是否下采样（默认False，推荐保持False）
+    count_dynamic_in_max_points: false  # 动态点是否计入max_points（默认False）
+    background_downsample_method: uniform  # 背景点云下采样方法：uniform, density, distance
     # Crop AABB: 用于裁剪（移除框外的点）
     crop_aabb: [[-20, -20, -20], [20, 4.8, 70]]
     # Input AABB: 用于分割和过滤
