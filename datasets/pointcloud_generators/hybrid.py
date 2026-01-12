@@ -381,9 +381,32 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
             pcd = pcd.uniform_down_sample(every_k_points=every_k)
 
             # 如果还是太多，再次下采样
-            while len(pcd.points) > target_count * 1.1:
+            # 添加循环保护，防止无限循环
+            max_iterations = 10  # 防止无限循环
+            iteration = 0
+            while len(pcd.points) > target_count * 1.1 and iteration < max_iterations:
                 every_k = max(1, len(pcd.points) // target_count)
+                if every_k == 1:
+                    # every_k=1 时不会减少点数，直接跳出循环，后续使用随机采样
+                    logger.debug(
+                        f"Downsampling: every_k=1 detected (points={len(pcd.points)}, "
+                        f"target={target_count}). Breaking loop, will use random sampling."
+                    )
+                    break
+                
+                logger.debug(
+                    f"Downsampling iteration {iteration}: {len(pcd.points)} points -> "
+                    f"target {target_count}, every_k={every_k}"
+                )
                 pcd = pcd.uniform_down_sample(every_k_points=every_k)
+                iteration += 1
+            
+            if iteration >= max_iterations:
+                logger.warning(
+                    f"Downsampling reached max iterations ({max_iterations}). "
+                    f"Current points: {len(pcd.points)}, target: {target_count}. "
+                    f"Will use random sampling to reach target."
+                )
 
             filtered_points = np.asarray(pcd.points).astype(np.float32)
             filtered_colors = np.asarray(pcd.colors).astype(np.float32)
