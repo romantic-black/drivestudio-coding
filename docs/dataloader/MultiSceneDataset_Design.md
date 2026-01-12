@@ -268,7 +268,12 @@ class MultiSceneDataset:
                     - 'cam_indices': Tensor[num_test_images],
                 - 'pointcloud': Optional[Dict] - 点云数据（如果配置了 pointcloud_config）
                     - 'background': np.ndarray [N, 6] - 背景点云 [x, y, z, r, g, b]
-                    - 'dynamic': np.ndarray [M, 6] - 动态物体点云 [x, y, z, r, g, b]
+                    - 'dynamic': Dict[int, np.ndarray] - 动态物体点云 {instance_id: [M_i, 6]}，每个实例的点云 [x, y, z, r, g, b]（局部坐标）
+                - 'dynamic_info': Optional[Dict] - 动态物体信息（如果点云包含动态物体且 pixel_source 支持）
+                    - Dict[int, Dict] - 按 frame_idx 索引，每个帧包含：
+                        - 'instances': Dict[int, Dict] - 按 instance_id 索引，每个实例包含：
+                            - 'quat': List[4] - 四元数 [w, x, y, z]（wxyz格式）
+                            - 'trans': List[3] - 平移向量 [x, y, z]
         """
         pass
     
@@ -1480,6 +1485,21 @@ def get_segment_batch(
             segment_id=segment_id,
         )
     
+    # 6.5. 构建 dynamic_info（如果点云包含动态物体）
+    dynamic_info = None
+    if pointcloud is not None and isinstance(pointcloud, dict) and "dynamic" in pointcloud:
+        # 收集所有相关的 frame_idx
+        all_frame_indices = set(source_frame_indices + target_frame_indices)
+        if include_test:
+            all_frame_indices.update(segment.get('test_frame_indices', []))
+        
+        # 从 pixel_source 获取动态物体信息
+        if scene_dataset.pixel_source is not None and scene_dataset.pixel_source.instances_pose is not None:
+            dynamic_info = self._build_dynamic_info(
+                scene_dataset=scene_dataset,
+                frame_indices=list(all_frame_indices),
+            )
+    
     # 7. 加载测试视图（如果请求且可用）
     test_images = []
     test_extrinsics = []
@@ -1552,6 +1572,10 @@ def get_segment_batch(
     if pointcloud is not None:
         batch['pointcloud'] = pointcloud
     
+    # 如果构建了 dynamic_info，添加到批次中
+    if dynamic_info is not None:
+        batch['dynamic_info'] = dynamic_info
+    
     # 如果加载了测试视图，添加到批次中
     if include_test and len(test_images) > 0:
         batch['test'] = {
@@ -1620,6 +1644,108 @@ def _convert_intrinsic_to_4x4(self, intrinsic: Tensor) -> Tensor:
     intrinsic_4x4[:3, :3] = intrinsic
     
     return intrinsic_4x4
+
+def _build_dynamic_info(
+    self,
+    scene_dataset: DrivingDataset,
+    frame_indices: List[int],
+) -> Optional[Dict]:
+    """
+    从 pixel_source 构建动态物体信息。
+    
+    从 scene_dataset.pixel_source.instances_pose 获取每个帧的实例位姿，
+    并将其转换为四元数和平移向量的格式。
+    
+    Args:
+        scene_dataset: 场景数据集实例
+        frame_indices: 需要获取动态信息的帧索引列表
+        
+    Returns:
+        Optional[Dict[int, Dict]] - 按 frame_idx 索引的动态物体信息，格式：
+            {
+                frame_idx: {
+                    "instances": {
+                        instance_id: {
+                            "quat": List[4],  # [w, x, y, z] 四元数（wxyz格式）
+                            "trans": List[3],  # [x, y, z] 平移向量
+                        }
+                    }
+                }
+            }
+        如果 pixel_source 不支持或没有动态物体，返回 None
+    """
+    if scene_dataset.pixel_source is None:
+        return None
+    
+    instances_pose = scene_dataset.pixel_source.instances_pose
+    if instances_pose is None:
+        return None
+    
+    dynamic_info = {}
+    
+    for frame_idx in frame_indices:
+        # 获取该帧的可见实例ID
+        visible_instance_ids = instances_pose.get_visible_instances(frame_idx)
+        if len(visible_instance_ids) == 0:
+            continue
+        
+        frame_instances = {}
+        
+        for instance_id in visible_instance_ids:
+            # 获取实例的位姿矩阵 [4, 4]
+            pose_matrix = instances_pose[frame_idx, instance_id]  # [4, 4]
+            
+            # 提取旋转矩阵 [3, 3] 和平移向量 [3]
+            rot_matrix = pose_matrix[:3, :3]  # [3, 3]
+            trans = pose_matrix[:3, 3]  # [3]
+            
+            # 将旋转矩阵转换为四元数 (wxyz 格式)
+            # 使用 Shepperd's method (更稳定的方法)
+            trace = rot_matrix[0, 0] + rot_matrix[1, 1] + rot_matrix[2, 2]
+            
+            if trace > 0:
+                s = torch.sqrt(trace + 1.0) * 2  # s = 4 * qw
+                w = 0.25 * s
+                x = (rot_matrix[2, 1] - rot_matrix[1, 2]) / s
+                y = (rot_matrix[0, 2] - rot_matrix[2, 0]) / s
+                z = (rot_matrix[1, 0] - rot_matrix[0, 1]) / s
+            elif rot_matrix[0, 0] > rot_matrix[1, 1] and rot_matrix[0, 0] > rot_matrix[2, 2]:
+                s = torch.sqrt(1.0 + rot_matrix[0, 0] - rot_matrix[1, 1] - rot_matrix[2, 2]) * 2
+                w = (rot_matrix[2, 1] - rot_matrix[1, 2]) / s
+                x = 0.25 * s
+                y = (rot_matrix[0, 1] + rot_matrix[1, 0]) / s
+                z = (rot_matrix[0, 2] + rot_matrix[2, 0]) / s
+            elif rot_matrix[1, 1] > rot_matrix[2, 2]:
+                s = torch.sqrt(1.0 + rot_matrix[1, 1] - rot_matrix[0, 0] - rot_matrix[2, 2]) * 2
+                w = (rot_matrix[0, 2] - rot_matrix[2, 0]) / s
+                x = (rot_matrix[0, 1] + rot_matrix[1, 0]) / s
+                y = 0.25 * s
+                z = (rot_matrix[1, 2] + rot_matrix[2, 1]) / s
+            else:
+                s = torch.sqrt(1.0 + rot_matrix[2, 2] - rot_matrix[0, 0] - rot_matrix[1, 1]) * 2
+                w = (rot_matrix[1, 0] - rot_matrix[0, 1]) / s
+                x = (rot_matrix[0, 2] + rot_matrix[2, 0]) / s
+                y = (rot_matrix[1, 2] + rot_matrix[2, 1]) / s
+                z = 0.25 * s
+            
+            quat = torch.stack([w, x, y, z])  # [4] wxyz format
+            
+            # 转换为 numpy 或 Python list (确保可以序列化)
+            if isinstance(quat, torch.Tensor):
+                quat = quat.cpu().numpy().tolist()
+            if isinstance(trans, torch.Tensor):
+                trans = trans.cpu().numpy().tolist()
+            
+            frame_instances[int(instance_id)] = {
+                "quat": quat,
+                "trans": trans,
+            }
+        
+        dynamic_info[int(frame_idx)] = {
+            "instances": frame_instances,
+        }
+    
+    return dynamic_info if len(dynamic_info) > 0 else None
 ```
 
 ---
@@ -1814,6 +1940,9 @@ def split_trajectory(trajectory, num_splits=0, min_count=1, min_length=0):
 - [ ] **get_frame_data 方法**：正确返回指定帧和相机的数据（图像、外参、内参、深度、天空掩码）
 - [ ] **sample_random_batch eval 参数**：支持从评估场景中采样批次
 - [ ] **_split_train_test_frames 方法**：正确分离训练帧和测试帧
+- [ ] **_build_dynamic_info 方法**：正确从 pixel_source.instances_pose 构建动态物体信息
+- [ ] **dynamic_info 格式正确**：dynamic_info 按 frame_idx 索引，包含 quat 和 trans 信息
+- [ ] **dynamic_info 条件检查**：只在点云包含动态物体且 pixel_source 支持时才构建 dynamic_info
 
 ---
 

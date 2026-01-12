@@ -122,11 +122,13 @@ def convert_batch_to_streetforward_format(
     pointcloud = batch.get("pointcloud")
     if pointcloud is None:
         raise ValueError("pointcloud is required but not found in batch")
+    dynamic_info = batch.get("dynamic_info")
     
     # 转换 target 视图
     target_data = batch["target"]
     target_views = []
     gt_images = []
+    targets = []
     
     num_target_images = target_data["image"].shape[0]  # [N, H, W, 3]
     for i in range(num_target_images):
@@ -140,10 +142,18 @@ def convert_batch_to_streetforward_format(
         # 提取 GT 图像
         gt_image = target_data["image"][i].to(device)  # [H, W, 3]
         gt_images.append(gt_image)
+        frame_indices = target_data.get("frame_indices")
+        frame_idx = int(frame_indices[i]) if frame_indices is not None else 0
+        targets.append({
+            "frame_idx": frame_idx,
+            "view": view,
+            "gt_image": gt_image,
+        })
     
     # 转换 source 视图（可选，用于未来扩展）
     source_views = []
     src_images = []
+    source_frame_idx = None
     if "source" in batch:
         source_data = batch["source"]
         num_source_images = source_data["image"].shape[0]
@@ -155,6 +165,10 @@ def convert_batch_to_streetforward_format(
             source_views.append(view)
             src_image = source_data["image"][i].to(device)
             src_images.append(src_image)
+            if source_frame_idx is None:
+                frame_indices = source_data.get("frame_indices")
+                if frame_indices is not None:
+                    source_frame_idx = int(frame_indices[i])
 
     # 转换 test 视图（可选，用于评估）
     test_views = []
@@ -176,8 +190,11 @@ def convert_batch_to_streetforward_format(
         "scene_id": scene_id.to(device) if isinstance(scene_id, torch.Tensor) else torch.tensor([scene_id], dtype=torch.long).to(device),
         "segment_id": segment_id.to(device) if isinstance(segment_id, torch.Tensor) else torch.tensor([segment_id], dtype=torch.long).to(device),
         "pointcloud": pointcloud,
+        "dynamic_info": dynamic_info,
         "target_views": target_views,
         "gt_images": gt_images,
+        "targets": targets,
+        "source_frame_idx": source_frame_idx if source_frame_idx is not None else 0,
         "source_views": source_views,  # 可选
         "src_images": src_images,  # 可选
         "test_views": test_views,  # 可选

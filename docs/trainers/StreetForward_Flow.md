@@ -14,46 +14,60 @@
 
 ## 整体架构
 
-StreetForwardTrainer 实现了基于代理（Proxy）的多视角梯度累积的前馈式 3D Gaussian Splatting 训练器。
+StreetForwardTrainer 实现了基于代理（Proxy）的多视角梯度累积的前馈式 3D Gaussian Splatting 训练器，支持静态背景和动态物体的联合训练。
 
 ### 核心设计理念
 
-- **NodeState 作为分离缓冲区**：每个 `(scene_id, segment_id)` 维护一个 `NodeState`，存储分离的 Gaussian 参数
-- **前馈预测**：通过 3D 特征体积预测偏移量（offsets）
+- **双 NodeState 架构**：每个 `(scene_id, segment_id)` 维护两个 `NodeState`：
+  - `NodeStateBackground`：存储静态背景的高斯参数（世界坐标系）
+  - `NodeStateRigid`：存储动态物体的高斯参数（局部坐标系）
+- **前馈预测**：通过 3D 特征体积预测偏移量（offsets），静态和动态物体共享相同的 MLP 网络
 - **代理参数渲染**：使用代理参数进行渲染，实现多视角梯度累积
 - **单次反向传播**：每个迭代只进行一次反向传播
+- **帧变换机制**：动态物体在不同帧间通过 RigidNodes 变换，支持时间一致性
 
 ### 架构图
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    StreetForwardTrainer                      │
+│              StreetForwardTrainer (with Dynamic Objects)      │
 ├─────────────────────────────────────────────────────────────┤
 │                                                               │
 │  ┌──────────────────┐         ┌──────────────────┐          │
-│  │   NodeState      │         │   Batch Input    │          │
-│  │  (Detached)      │         │  - scene_id      │          │
-│  │  - means         │         │  - segment_id    │          │
-│  │  - scales_log    │         │  - pointcloud    │          │
-│  │  - quats         │         │  - target_views  │          │
-│  │  - opacity_logit │         │  - gt_images     │          │
-│  │  - sh_dc         │         └──────────────────┘          │
-│  │  - sh_rest       │                    │                  │
-│  └──────────────────┘                    │                  │
+│  │ NodeStateBg      │         │ NodeStateRigid   │          │
+│  │ (Detached)       │         │ (Detached)       │          │
+│  │ - means          │         │ - means (local)  │          │
+│  │ - scales_log     │         │ - scales_log     │          │
+│  │ - quats          │         │ - quats          │          │
+│  │ - opacity_logit  │         │ - opacity_logit  │          │
+│  │ - sh_dc          │         │ - sh_dc          │          │
+│  │ - sh_rest        │         │ - sh_rest        │          │
+│  └──────────────────┘         │ - point_ids      │          │
+│           │                    │ - instances_*    │          │
+│           │                    └──────────────────┘          │
 │           │                              │                  │
 │           └──────────┬───────────────────┘                  │
 │                      │                                      │
 │           ┌──────────▼──────────┐                          │
 │           │  train_iter()        │                          │
+│           │  (1 source + N targets)                        │
 │           └──────────┬───────────┘                          │
 │                      │                                      │
 │    ┌─────────────────┼─────────────────┐                   │
 │    │                 │                 │                    │
 │    ▼                 ▼                 ▼                    │
 │ ┌─────────┐   ┌──────────┐   ┌──────────┐                 │
-│ │ 3D Vol  │   │ Offsets  │   │  Render  │                 │
-│ │ Builder │──▶│ Predict  │──▶│  & Loss  │                 │
+│ │Transform│   │ 3D Vol   │   │ Offsets  │                 │
+│ │to Source│──▶│ Builder   │──▶│ Predict  │                 │
 │ └─────────┘   └──────────┘   └──────────┘                 │
+│                                                               │
+│  ┌──────────────────────────────────────────────┐           │
+│  │  For each target frame:                      │           │
+│  │  1. Transform RigidNodes to target frame    │           │
+│  │  2. Merge Background + RigidNodes params     │           │
+│  │  3. Create proxy params                      │           │
+│  │  4. Render & accumulate gradients             │           │
+│  └──────────────────────────────────────────────┘           │
 │                                                               │
 │  ┌──────────────────────────────────────────────┐           │
 │  │  Neural Networks                              │           │
@@ -76,84 +90,98 @@ StreetForwardTrainer 实现了基于代理（Proxy）的多视角梯度累积的
 graph TD
     A[开始: train_iter] --> B{获取或初始化NodeState}
     B -->|已存在| C[使用现有NodeState]
-    B -->|不存在| D[从点云初始化NodeState]
+    B -->|不存在| D[从点云初始化双NodeState<br/>Background + RigidNodes]
     D --> C
-    C --> E{是否有target_views?}
+    C --> E{是否有targets?}
     E -->|否| F[返回零损失]
-    E -->|是| G[清零梯度]
-    G --> H[开始inner_iterations循环]
-    H --> I[构建3D特征体积]
-    I --> J[预测偏移量]
-    J --> K[计算渲染参数]
-    K --> L[创建代理参数]
-    L --> M[遍历所有视角]
-    M --> N[渲染图像]
-    N --> O[计算损失]
-    O --> P[反向传播到代理]
-    P --> Q{是否还有视角?}
-    Q -->|是| M
-    Q -->|否| R[反向传播到渲染参数]
-    R --> S{是否apply_update?}
-    S -->|是| T[优化器更新]
-    S -->|否| U[跳过更新]
-    T --> V{是否update_state?}
-    U --> V
-    V -->|是| W[更新NodeState]
-    V -->|否| X[保持原状态]
-    W --> Y{是否还有inner_iter?}
-    X --> Y
-    Y -->|是| H
-    Y -->|否| AA{是否evaluate_test?}
-    AA -->|是| AB[评估测试视图]
-    AA -->|否| Z
-    AB --> AC[计算PSNR/SSIM/LPIPS]
-    AC --> Z[保存NodeState并返回]
+    E -->|是| G[获取source_frame动态信息]
+    G --> H[设置RigidNodes.cur_frame = source_frame_idx]
+    H --> I[清零梯度]
+    I --> J[开始inner_iterations循环]
+    J --> K[变换RigidNodes到source帧<br/>合并静态+动态点云]
+    K --> L[构建3D特征体积]
+    L --> M[预测偏移量<br/>静态+动态共同预测]
+    M --> N[计算渲染参数<br/>分别应用到两个NodeState]
+    N --> O[创建代理参数<br/>分别创建静态和动态代理]
+    O --> P[遍历所有target帧]
+    P --> Q[设置RigidNodes.cur_frame = target.frame_idx]
+    Q --> R[变换RigidNodes到target帧]
+    R --> S[合并静态+动态参数到世界坐标]
+    S --> T[创建合并后的代理参数]
+    T --> U[渲染图像]
+    U --> V[计算损失]
+    V --> W[反向传播到代理]
+    W --> X{是否还有target帧?}
+    X -->|是| P
+    X -->|否| Y[反向传播到渲染参数<br/>分别处理静态和动态]
+    Y --> Z{是否apply_update?}
+    Z -->|是| AA[优化器更新]
+    Z -->|否| AB[跳过更新]
+    AA --> AC{是否update_state?}
+    AB --> AC
+    AC -->|是| AD[更新双NodeState]
+    AC -->|否| AE[保持原状态]
+    AD --> AF{是否还有inner_iter?}
+    AE --> AF
+    AF -->|是| J
+    AF -->|否| AG[保存NodeState并返回]
 ```
 
 ### 详细步骤说明
 
-#### 1. 初始化阶段 (`_get_or_init_node_state`)
+#### 1. 初始化阶段 (`_get_or_init_node_states`)
 
 **输入数据：**
 - `batch["scene_id"]`: 场景ID
 - `batch["segment_id"]`: 片段ID
-- `batch["pointcloud"]`: 点云数据（可以是字典或点云对象）
+- `batch["pointcloud"]`: 点云数据（字典格式，包含 `background` 和可选的 `dynamic`）
+- `batch["dynamic_info"]`: 动态物体信息（可选，如果点云包含动态物体）
 
 **处理流程：**
 ```
-点云数据 → 提取坐标和颜色 → 计算初始尺度 → 生成随机四元数 → 创建NodeState
+点云数据 → 分离静态和动态 → 
+  静态: 提取坐标和颜色 → 计算初始尺度 → 生成随机四元数 → 创建NodeStateBackground
+  动态: 提取坐标和颜色 → 计算初始尺度 → 生成随机四元数 → 创建NodeStateRigid（局部坐标）
 ```
 
 **关键操作：**
-- 使用 k-NN 计算邻居距离，初始化尺度
-- 将 RGB 颜色转换为球谐函数（SH）的 DC 分量
-- 所有参数初始化为分离（detached）状态
+- **静态背景**：使用 k-NN 计算邻居距离，初始化尺度；将 RGB 颜色转换为球谐函数（SH）的 DC 分量；所有参数初始化为分离（detached）状态
+- **动态物体**：从 `pointcloud["dynamic"]` 获取各实例的点云（局部坐标）；从 `dynamic_info` 初始化 `instances_quats` 和 `instances_trans`；记录 `point_ids` 以关联每个点到实例
 
-#### 2. 3D 特征体积构建
+#### 2. 3D 特征体积构建 (`_build_3d_feature_volume`)
 
 **步骤：**
 ```
-NodeState.means (分离) 
-  ↓
-construct_sparse_tensor() 
-  → sparse_feat [N, 3] (RGB特征)
-  → vol_dim [3] (体积维度)
-  → valid_coords [N, 3] (有效坐标)
-  ↓
-sparse_conv() 
-  → feat_3d [N, outdim] (3D特征)
-  ↓
-sparse_to_dense_volume() 
-  → dense_volume [1, X, Y, Z, C] (密集体积，其中 vol_dim 是 [X, Y, Z])
-  ↓
-permute(0, 4, 3, 2, 1) 
-  → dense_volume [1, C, Z, Y, X] = [1, C, D, H, W] (调整为 grid_sample 需要的格式)
+1. 设置 RigidNodes.cur_frame = source_frame_idx
+2. 获取静态背景点云（世界坐标）
+   NodeStateBg.means [N_bg, 3]
+3. 变换动态物体到 source 帧的世界坐标
+   NodeStateRigid.means [N_rigid, 3] (局部) 
+     → _transform_rigid_to_world() 
+     → means_rigid_world [N_rigid, 3] (世界坐标)
+4. 合并静态和动态点云
+   means_all = cat([means_bg, means_rigid_world]) [N_total, 3]
+   anchor_rgb_all = cat([anchor_rgb_bg, anchor_rgb_rigid]) [N_total, 3]
+5. 构建统一的 3D 特征体积
+   construct_sparse_tensor() 
+     → sparse_feat [M, 3] (RGB特征，M ≤ N_total)
+     → vol_dim [3] (体积维度)
+     → valid_coords [M, 3] (有效坐标)
+   sparse_conv() 
+     → feat_3d [M, outdim] (3D特征)
+   sparse_to_dense_volume() 
+     → dense_volume [1, C, D, H, W]
+6. 分别为静态和动态点插值特征
+   feat_3d_crop_bg [N_bg, outdim]
+   feat_3d_crop_rigid [N_rigid, outdim]
 ```
 
 **数据维度说明：**
-- `sparse_feat`: `[N, 3]` - N个点的RGB特征
-- `feat_3d`: `[N, outdim]` - 经过稀疏卷积后的3D特征（默认outdim=32）
-- `dense_volume`: `[1, C, H, W, D]` - 密集化的3D特征体积
+- `sparse_feat`: `[M, 3]` - M个唯一体素的RGB特征（M ≤ N_total，因为可能有重复体素）
+- `feat_3d`: `[M, outdim]` - 经过稀疏卷积后的3D特征（默认outdim=32）
+- `dense_volume`: `[1, C, D, H, W]` - 密集化的3D特征体积
+- `feat_3d_crop_bg`: `[N_bg, outdim]` - 静态背景点的3D特征
+- `feat_3d_crop_rigid`: `[N_rigid, outdim]` - 动态物体点的3D特征
 
 #### 3. 特征插值
 
@@ -175,7 +203,12 @@ interpolate_features()
 #### 4. 偏移量预测 (`_predict_offsets`)
 
 **输入：**
-- `feat_3d_crop`: `[N, outdim]` - 每个点的3D特征
+- `feat_3d_crop_bg`: `[N_bg, outdim]` - 静态背景点的3D特征（默认outdim=32）
+- `feat_3d_crop_rigid`: `[N_rigid, outdim]` - 动态物体点的3D特征（默认outdim=32）
+
+**处理：**
+- 静态和动态使用**相同的 MLP 网络**预测偏移量
+- 在 source 帧下，静态和动态都是确定的，偏移量是共同预测的，不区别对待
 
 **输出：**
 ```python
@@ -189,39 +222,132 @@ interpolate_features()
 ```
 
 **MLP 网络结构：**
-- `mlp_offset_pos`: `outdim → 64 → 32 → 3`
-- `mlp_conv`: `outdim → 64 → 32 → 6` (3个尺度 + 3个轴角)
-- `mlp_opacity`: `outdim → 64 → 32 → 1`
-- `gaussion_decoder`: `outdim → 64 → 32 → 3*num_sh`
+- `mlp_offset_pos`: `outdim → 64 → 32 → 3` (位置偏移)
+- `mlp_conv`: `outdim → 64 → 32 → 6` (3个尺度对数偏移 + 3个轴角偏移)
+- `mlp_opacity`: `outdim → 64 → 32 → 1` (不透明度对数偏移)
+- `gaussion_decoder`: `outdim → 64 → 32 → 3*num_sh` (SH系数偏移，包含DC和rest)
 
-**约束：**
-- `offset_pos`: 通过 `tanh` 限制在 `[-offset_max, offset_max]` 范围内
-- `offset_scales`: 通过 `tanh` 限制在 `[-scale_max, scale_max]` 范围内
-- `offset_omega`: 通过 `tanh` 限制在 `[-omega_max, omega_max]` 范围内（轴角表示，单位：弧度）
-- `offset_quat`: 从轴角（axis-angle）转换而来，使用 `_axis_angle_to_quat` 函数，提供更平滑的梯度
-- `offset_opacity`: 通过 `tanh` 限制在 `[-opacity_max, opacity_max]` 范围内
-- `offset_sh_dc`: 通过 `tanh` 限制在 `[-sh_dc_max, sh_dc_max]` 范围内
-- `offset_sh_rest`: 通过 `tanh` 限制在 `[-sh_rest_max, sh_rest_max]` 范围内（通常比DC更小）
+**偏移量预测流程：**
 
-**轴角到四元数转换**：
-- 使用 `_axis_angle_to_quat` 函数，采用无分支的 sinc 结构，避免阈值附近的不连续性
-- 提供比直接预测四元数更平滑的梯度
-- 公式：`quat = [cos(θ/2), ω * sin(θ/2) / (θ + eps)]`，其中 `θ = ||ω||`，`ω` 是轴角向量
+1. **位置偏移** (`offset_pos`)：
+   ```python
+   offset_pos_raw = mlp_offset_pos(feat_3d_crop)  # [N, 3]
+   offset_pos = offset_max * tanh(offset_pos_raw)  # 限制在 [-offset_max, offset_max]
+   ```
+
+2. **尺度与旋转偏移** (`offset_scales`, `offset_quat`)：
+   ```python
+   scales_and_omega = mlp_conv(feat_3d_crop)  # [N, 6]
+   offset_scales_raw, offset_omega_raw = split([3, 3])  # 分别提取尺度和轴角
+   offset_scales = scale_max * tanh(offset_scales_raw)  # 限制在 [-scale_max, scale_max]
+   offset_omega = omega_max * tanh(offset_omega_raw)    # 限制在 [-omega_max, omega_max]
+   offset_quat = _axis_angle_to_quat(offset_omega)      # 转换为四元数
+   ```
+
+3. **不透明度偏移** (`offset_opacity`)：
+   ```python
+   offset_opacity_raw = mlp_opacity(feat_3d_crop)  # [N, 1]
+   offset_opacity = opacity_max * tanh(offset_opacity_raw)  # 限制在 [-opacity_max, opacity_max]
+   ```
+
+4. **SH系数偏移** (`offset_sh`)：
+   ```python
+   sh_raw = gaussion_decoder(feat_3d_crop)  # [N, 3*num_sh]
+   sh_dc_raw = sh_raw[:, :3]                # DC分量
+   sh_rest_raw = sh_raw[:, 3:]              # rest分量
+   offset_sh_dc = sh_dc_max * tanh(sh_dc_raw)      # 限制在 [-sh_dc_max, sh_dc_max]
+   offset_sh_rest = sh_rest_max * tanh(sh_rest_raw)  # 限制在 [-sh_rest_max, sh_rest_max]
+   offset_sh = concat([offset_sh_dc, offset_sh_rest], dim=-1)  # [N, 3*num_sh]
+   ```
+
+**约束参数（默认值）：**
+- `offset_max`: 0.1 (米) - 位置偏移上限
+- `scale_max`: 0.1 (对数域) - 尺度偏移上限
+- `omega_max`: 0.1 (弧度，约5.7°) - 旋转偏移上限
+- `opacity_max`: 0.1 (logit域) - 不透明度偏移上限
+- `sh_dc_max`: 0.1 - SH DC偏移上限
+- `sh_rest_max`: 0.05 - SH rest偏移上限（通常比DC更小，因为rest分量通常更小）
+
+**轴角到四元数转换** (`_axis_angle_to_quat`)：
+- **目的**：将轴角表示转换为四元数，提供比直接预测四元数更平滑的梯度
+- **实现**：使用无分支的 sinc 结构，避免阈值附近的不连续性
+- **公式**：
+  ```python
+  theta = ||omega||  # [N, 1] - 旋转角度
+  half_theta = theta * 0.5
+  sinc_half = sin(half_theta) / (theta + eps)  # 避免除零，提供平滑梯度
+  xyz = omega * sinc_half  # [N, 3] - 四元数的xyz分量
+  w = cos(half_theta)      # [N, 1] - 四元数的w分量
+  quat = [w, xyz]          # [N, 4] - wxyz格式
+  ```
+- **优势**：
+  - 当 `theta → 0` 时，`sinc_half → 0.5`，因此 `xyz → omega/2`（正确的小角度近似）
+  - 避免了直接除法可能导致的数值不稳定
+  - 提供连续可微的梯度流
+
+**偏移头初始化**：
+- 所有偏移预测头的最后一层（输出层）被初始化为零权重和零偏置
+- 这确保训练开始时预测的偏移量接近零，避免初始阶段的大幅跳跃
+- 初始化代码：`nn.init.zeros_(layer.weight)` 和 `nn.init.zeros_(layer.bias)`
 
 #### 5. 渲染参数计算 (`_render_params_from_offsets`)
 
 **计算过程：**
 ```
-NodeState (分离) + Offsets (可微) × Eta (步长因子) → Render Params (可微)
+静态背景:
+  NodeStateBg (分离) + OffsetsBg (可微) × Eta → Render ParamsBg (可微，世界坐标)
+
+动态物体:
+  NodeStateRigid (分离) + OffsetsRigid (可微，局部坐标) × Eta → Render ParamsRigid (可微，局部坐标)
+  注意：偏移量需要从世界坐标变换到局部坐标（_transform_offsets_world_to_local）
 ```
 
+**关键点：**
+- 静态背景的渲染参数是**世界坐标**
+- 动态物体的渲染参数是**局部坐标**（需要在渲染前变换到目标帧）
+
 **具体计算（应用步长因子 eta）：**
-- `means_r = node_state.means + eta_means * offset_pos` （注意：不在此处clamp，保持梯度流）
-- `scales_log_r = node_state.scales_log + eta_scales * offset_scales`
-- `quats_r = normalize(quat_multiply(node_state.quats, offset_quat))`
-- `opacity_logit_r = node_state.opacity_logit + eta_opacity * offset_opacity`
-- `sh_dc_r = node_state.sh_dc + eta_sh_dc * offset_sh[:, :3]`
-- `sh_rest_r = node_state.sh_rest + eta_sh_rest * offset_sh[:, 3:].view(N, num_sh-1, 3)`
+
+1. **位置参数** (`means_r`)：
+   ```python
+   means_r = node_state.means + eta_means * offset_pos  # [N, 3]
+   ```
+   - **注意**：不在此处进行 clamp，以保持梯度流
+   - 只有在写回 `NodeState` 时才进行 clamp（限制在 `[bbx_min, bbx_max]` 范围内）
+
+2. **尺度参数** (`scales_log_r`, `scales_r`)：
+   ```python
+   scales_log_r = node_state.scales_log + eta_scales * offset_scales  # [N, 3]
+   scales_r = exp(scales_log_r)  # [N, 3] - 转换到线性域
+   ```
+
+3. **旋转参数** (`quats_r`)：
+   ```python
+   quats_r = normalize(quat_multiply(node_state.quats, offset_quat))  # [N, 4]
+   ```
+   - 使用四元数乘法组合旋转：`q_result = q_node * q_offset`
+   - 然后归一化以确保单位四元数
+
+4. **不透明度参数** (`opacity_logit_r`, `opacities_r`)：
+   ```python
+   opacity_logit_r = node_state.opacity_logit + eta_opacity * offset_opacity  # [N, 1]
+   opacities_r = sigmoid(opacity_logit_r).squeeze(-1)  # [N] - 转换到[0,1]范围
+   ```
+
+5. **SH颜色参数** (`sh_dc_r`, `sh_rest_r`, `colors_r`)：
+   ```python
+   # 提取DC和rest分量
+   offset_sh_dc = offset_sh[:, :3]  # [N, 3]
+   sh_rest_flat = offset_sh[:, 3:]   # [N, 3*(num_sh-1)]
+   sh_rest_offset = sh_rest_flat.view(N, num_sh-1, 3)  # [N, num_sh-1, 3]
+   
+   # 应用偏移
+   sh_dc_r = node_state.sh_dc + eta_sh_dc * offset_sh_dc  # [N, 3]
+   sh_rest_r = node_state.sh_rest + eta_sh_rest * sh_rest_offset  # [N, num_sh-1, 3]
+   
+   # 组合成完整的SH系数
+   colors_r = cat([sh_dc_r[:, None, :], sh_rest_r], dim=1)  # [N, num_sh, 3]
+   ```
 
 **步长因子（Eta）**：
 - `eta_means`: 位置步长因子（默认1.0）
@@ -229,16 +355,29 @@ NodeState (分离) + Offsets (可微) × Eta (步长因子) → Render Params (�
 - `eta_opacity`: 不透明度步长因子（默认1.0）
 - `eta_sh_dc`: SH DC步长因子（默认1.0）
 - `eta_sh_rest`: SH rest步长因子（默认1.0）
-- 这些因子允许精细控制不同参数类型的更新幅度，通常在训练过程中保持固定
+- **作用**：允许精细控制不同参数类型的更新幅度，通常在训练过程中保持固定
+- **设计考虑**：通过调整这些因子，可以平衡不同参数类型的更新速度，避免某些参数更新过快导致训练不稳定
 
-**转换：**
-- `scales_r = exp(scales_log_r)`
-- `opacities_r = sigmoid(opacity_logit_r)`
-- `colors_r = cat([sh_dc_r, sh_rest_r], dim=1)` → `[N, num_sh, 3]`
+**输出字典结构：**
+```python
+{
+    "means_r": [N, 3],           # 渲染用的位置（可微，未clamp）
+    "scales_log_r": [N, 3],      # 渲染用的尺度对数（可微）
+    "scales_r": [N, 3],          # 渲染用的尺度（exp(scales_log_r)）
+    "quats_r": [N, 4],           # 渲染用的四元数（归一化，可微）
+    "opacity_logit_r": [N, 1],   # 渲染用的不透明度对数（可微）
+    "opacities_r": [N],          # 渲染用的不透明度（sigmoid(opacity_logit_r)）
+    "sh_dc_r": [N, 3],           # 渲染用的SH DC分量（可微）
+    "sh_rest_r": [N, num_sh-1, 3], # 渲染用的SH高阶分量（可微）
+    "colors_r": [N, num_sh, 3],  # 完整的SH系数（用于渲染）
+}
+```
 
-**注意**：
-- `means_r` 在计算时不进行 clamp，以保持梯度流
-- 只有在写回 `NodeState` 时才进行 clamp（限制在 `[bbx_min, bbx_max]` 范围内）
+**关键设计点**：
+1. **梯度流保护**：`means_r` 在计算时不进行 clamp，确保梯度可以正常反向传播
+2. **数值稳定性**：使用对数域（log域）进行尺度更新，避免指数爆炸
+3. **旋转组合**：通过四元数乘法组合旋转，确保旋转的连续性和可微性
+4. **参数分离**：SH的DC和rest分量分别应用步长因子，允许独立控制
 
 #### 6. 代理参数创建 (`_create_proxy_params`)
 
@@ -253,50 +392,89 @@ proxy = render_param.detach().requires_grad_(True)
 - 代理参数从渲染参数中分离（detach），但重新启用梯度
 - 这样可以在多个视角上累积梯度，然后一次性反向传播到渲染参数
 
-#### 7. 多视角渲染与损失计算
+#### 7. 多 Target 帧渲染与损失计算
 
 **循环结构：**
 ```python
-for view, gt_img in zip(target_views, gt_images):
-    # 1. 准备相机参数
-    viewmat = get_viewmat(c2w)  # [1, 4, 4]
-    K = ...                     # [1, 3, 3]
+# 在循环外创建代理参数（所有 target 帧共享）
+proxies_bg = _create_proxy_params(render_params_bg)
+proxies_rigid = _create_proxy_params(render_params_rigid)  # 局部坐标
+
+for target in targets:
+    target_frame_idx = target["frame_idx"]
+    view = target["view"]
+    gt_img = target["gt_image"]
     
-    # 2. 渲染
+    # 1. 设置 RigidNodes 的当前帧
+    node_state_rigid.cur_frame = target_frame_idx
+    
+    # 2. 变换动态物体到 target 帧的世界坐标（保持梯度连接）
+    means_rigid_world = _transform_rigid_to_world(
+        node_state_rigid, proxies_rigid["means_p"]
+    )
+    quats_rigid_world = _transform_rigid_quats_to_world(
+        node_state_rigid, proxies_rigid["quats_p"]
+    )
+    
+    # 3. 合并静态和动态参数（使用 torch.cat，保持梯度连接）
+    merged_means = torch.cat([proxies_bg["means_p"], means_rigid_world], dim=0)
+    merged_quats = torch.cat([proxies_bg["quats_p"], quats_rigid_world], dim=0)
+    merged_scales = torch.cat([proxies_bg["scales_p"], proxies_rigid["scales_p"]], dim=0)
+    merged_opacities = torch.cat([proxies_bg["opacities_p"], proxies_rigid["opacities_p"]], dim=0)
+    merged_colors = torch.cat([proxies_bg["colors_p"], proxies_rigid["colors_p"]], dim=0)
+    
+    # 4. 渲染
     render, alpha, _ = renderer(
-        means=proxies["means_p"],
-        quats=proxies["quats_p"],
-        scales=proxies["scales_p"],
-        opacities=proxies["opacities_p"],
-        colors=proxies["colors_p"],
+        means=merged_means,
+        quats=merged_quats,
+        scales=merged_scales,
+        opacities=merged_opacities,
+        colors=merged_colors,
         ...
     )
     
-    # 3. 计算损失
+    # 5. 计算损失
     rgb = render[:, ..., :3]  # [H, W, 3]
-    loss = compute_loss(rgb, gt_img) / view_count
-    loss.backward()  # 梯度累积到代理参数
+    loss = compute_loss(rgb, gt_img) / len(targets)
+    loss.backward()  # 梯度自动反向传播：
+    # - 通过 cat 操作反向传播到 proxies_bg 和 means_rigid_world/quats_rigid_world
+    # - 通过变换操作反向传播到 proxies_rigid
+    # - 梯度会在 proxies_bg 和 proxies_rigid 上累积（因为它们在所有 target 帧中共享）
 ```
 
 **损失函数：**
 - `L2 Loss`: `mean((pred_rgb - gt_image) ** 2)`
-- 每个视角的损失除以视角数量，实现平均
+- 每个 target 帧的损失除以 target 帧数量，实现平均
+
+**关键设计点：**
+- **代理参数共享**：`proxies_bg` 和 `proxies_rigid` 在所有 target 帧中共享，梯度自动累积
+- **可微变换**：坐标变换保持梯度连接，不使用 detach，让 PyTorch 自动处理梯度反向传播
+- **自动梯度分离**：`torch.cat` 操作会自动处理梯度分离，不需要手动使用 `pts_labels`
 
 #### 8. 梯度反向传播机制
 
 **两步反向传播：**
 
-**第一步：** 从代理参数到渲染参数
+**第一步：** 从代理参数到渲染参数（分别处理静态和动态）
 ```python
+# 静态背景
 torch.autograd.backward(
-    tensors=render_tensors,      # [means_r, scales_r, quats_r, opacities_r, colors_r]
-    grad_tensors=proxy_grads     # 从代理参数收集的梯度
+    tensors=render_tensors_bg,      # [means_r, scales_r, quats_r, opacities_r, colors_r]
+    grad_tensors=proxy_grads_bg     # 从代理参数收集的梯度
 )
+
+# 动态物体
+if render_params_rigid is not None:
+    torch.autograd.backward(
+        tensors=render_tensors_rigid,      # [means_r, scales_r, quats_r, opacities_r, colors_r]
+        grad_tensors=proxy_grads_rigid     # 从代理参数收集的梯度
+    )
 ```
 
 **第二步：** 从渲染参数到网络参数（自动）
 - 通过 `offset_*` 参数链
 - 最终更新所有 MLP 和 sparse_conv 的参数
+- **注意**：静态和动态使用相同的 MLP 网络，梯度会自动合并
 
 #### 9. 状态更新
 
@@ -305,23 +483,33 @@ torch.autograd.backward(
 **操作：**
 ```python
 with torch.no_grad():
-    # Clamp means only when writing back to node_state (not during backprop)
+    # 更新静态背景 NodeState
     means_clamped = torch.clamp(
-        render_params["means_r"].detach(),
+        render_params_bg["means_r"].detach(),
         min=self.bbx_min,
         max=self.bbx_max
     )
-    node_state.means.copy_(means_clamped)
-    node_state.scales_log.copy_(render_params["scales_log_r"].detach())
-    node_state.quats.copy_(render_params["quats_r"].detach())
-    node_state.opacity_logit.copy_(render_params["opacity_logit_r"].detach())
-    node_state.sh_dc.copy_(render_params["sh_dc_r"].detach())
-    node_state.sh_rest.copy_(render_params["sh_rest_r"].detach())
+    node_state_bg.means.copy_(means_clamped)
+    node_state_bg.scales_log.copy_(render_params_bg["scales_log_r"].detach())
+    node_state_bg.quats.copy_(render_params_bg["quats_r"].detach())
+    node_state_bg.opacity_logit.copy_(render_params_bg["opacity_logit_r"].detach())
+    node_state_bg.sh_dc.copy_(render_params_bg["sh_dc_r"].detach())
+    node_state_bg.sh_rest.copy_(render_params_bg["sh_rest_r"].detach())
+    
+    # 更新动态物体 NodeState（局部坐标）
+    if node_state_rigid is not None and render_params_rigid is not None:
+        node_state_rigid.means.copy_(render_params_rigid["means_r"].detach())
+        node_state_rigid.scales_log.copy_(render_params_rigid["scales_log_r"].detach())
+        node_state_rigid.quats.copy_(render_params_rigid["quats_r"].detach())
+        node_state_rigid.opacity_logit.copy_(render_params_rigid["opacity_logit_r"].detach())
+        node_state_rigid.sh_dc.copy_(render_params_rigid["sh_dc_r"].detach())
+        node_state_rigid.sh_rest.copy_(render_params_rigid["sh_rest_r"].detach())
 ```
 
 **注意：** 
 - 所有更新都是分离的（detached），保持 NodeState 作为缓冲区
-- `means` 在写回时进行 clamp，限制在边界框范围内，但在反向传播时保持不限制以保持梯度流
+- 静态背景的 `means` 在写回时进行 clamp，限制在边界框范围内，但在反向传播时保持不限制以保持梯度流
+- 动态物体的 `means` 是局部坐标，不需要 clamp（边界框限制在变换到世界坐标时处理）
 
 ---
 
@@ -1049,32 +1237,71 @@ torch.nn.functional.grid_sample(
 
 ## 数据结构详解
 
-### 1. NodeState
+### 1. NodeStateBackground
 
 **定义：**
 ```python
 @dataclass
-class NodeState:
-    means: torch.Tensor          # [N, 3] - Gaussian中心位置
-    scales_log: torch.Tensor     # [N, 3] - 尺度的对数（3个轴）
-    quats: torch.Tensor          # [N, 4] - 旋转四元数（wxyz格式）
-    opacity_logit: torch.Tensor  # [N, 1] - 不透明度的logit值
-    sh_dc: torch.Tensor          # [N, 3] - 球谐函数DC分量（RGB）
-    sh_rest: torch.Tensor        # [N, num_sh-1, 3] - 球谐函数高阶分量
+class NodeStateBackground:
+    means: torch.Tensor          # [N_bg, 3] - Gaussian中心位置（世界坐标）
+    scales_log: torch.Tensor     # [N_bg, 3] - 尺度的对数（3个轴）
+    quats: torch.Tensor          # [N_bg, 4] - 旋转四元数（wxyz格式）
+    opacity_logit: torch.Tensor  # [N_bg, 1] - 不透明度的logit值
+    sh_dc: torch.Tensor          # [N_bg, 3] - 球谐函数DC分量（RGB）
+    sh_rest: torch.Tensor        # [N_bg, num_sh-1, 3] - 球谐函数高阶分量
 ```
 
 **特性：**
 - 所有张量都是分离的（detached），不参与梯度计算
-- 每个 `(scene_id, segment_id)` 对应一个 NodeState
-- 存储在 `self.node_states: Dict[Tuple[int, int], NodeState]` 中
+- 每个 `(scene_id, segment_id)` 对应一个 NodeStateBackground
+- 存储在 `self.node_states: Dict[Tuple[int, int], NodeStateBackground]` 中（兼容旧代码，实际是 Background）
 
 **初始化：**
-- `means`: 从点云坐标初始化
+- `means`: 从静态背景点云坐标初始化（世界坐标）
 - `scales_log`: 基于 k-NN 距离计算（`log(clamp(avg_dist, min=1e-3))`）
 - `quats`: 随机生成单位四元数
 - `opacity_logit`: 初始化为 `logit(0.1)`
 - `sh_dc`: 从点云颜色转换（`(rgb - 0.5) / c0`）
 - `sh_rest`: 初始化为零
+
+### 1.1. NodeStateRigid
+
+**定义：**
+```python
+@dataclass
+class NodeStateRigid:
+    means: torch.Tensor          # [N_rigid, 3] - Gaussian中心位置（局部坐标）
+    scales_log: torch.Tensor     # [N_rigid, 3] - 尺度的对数（3个轴）
+    quats: torch.Tensor          # [N_rigid, 4] - 旋转四元数（wxyz格式，局部旋转）
+    opacity_logit: torch.Tensor  # [N_rigid, 1] - 不透明度的logit值
+    sh_dc: torch.Tensor          # [N_rigid, 3] - 球谐函数DC分量（RGB）
+    sh_rest: torch.Tensor        # [N_rigid, num_sh-1, 3] - 球谐函数高阶分量
+    point_ids: torch.Tensor      # [N_rigid, 1] - 每个点属于哪个实例
+    instances_quats: torch.Tensor # [num_frames, num_instances, 4] - 实例旋转（wxyz格式）
+    instances_trans: torch.Tensor # [num_frames, num_instances, 3] - 实例平移
+    instances_fv: torch.Tensor   # [num_frames, num_instances] - 实例可见性（bool）
+    instance_ids: List[int]      # 实例ID列表
+    frame_ids: List[int]         # 帧ID列表（用于索引 instances_*）
+    cur_frame: int               # 当前帧索引（用于变换）
+```
+
+**特性：**
+- 所有张量都是分离的（detached），不参与梯度计算
+- 每个 `(scene_id, segment_id)` 对应一个 NodeStateRigid（如果存在动态物体）
+- 存储在 `self.node_states_rigid: Dict[Tuple[int, int], Optional[NodeStateRigid]]` 中
+- 如果场景没有动态物体，值为 `None`
+
+**初始化：**
+- `means`: 从动态物体点云坐标初始化（局部坐标）
+- `scales_log`: 基于 k-NN 距离计算
+- `quats`: 随机生成单位四元数（局部旋转）
+- `opacity_logit`: 初始化为 `logit(0.1)`
+- `sh_dc`: 从点云颜色转换
+- `sh_rest`: 初始化为零
+- `point_ids`: 从点云生成时记录每个点属于哪个实例
+- `instances_quats`: 从 `dynamic_info` 初始化，包含所有帧的实例旋转
+- `instances_trans`: 从 `dynamic_info` 初始化，包含所有帧的实例平移
+- `instances_fv`: 从 `dynamic_info` 初始化，记录每个帧每个实例的可见性
 
 ### 2. Batch 输入数据
 
@@ -1083,22 +1310,52 @@ class NodeState:
 batch = {
     "scene_id": int,                    # 场景ID
     "segment_id": int,                  # 片段ID
+    "source_frame_idx": int,            # Source 帧索引（场景全局 frame_idx）
     "pointcloud": Union[dict, object],   # 点云数据
-    "target_views": List[View],         # 目标视角列表（用于训练）
-    "gt_images": List[torch.Tensor],    # 真实图像列表 [H, W, 3]（用于训练）
+    "dynamic_info": Optional[Dict],      # 动态物体信息（可选）
+    "targets": List[Dict],              # Target 帧列表（推荐格式）
+    "target_views": List[View],         # 目标视角列表（兼容旧格式）
+    "gt_images": List[torch.Tensor],    # 真实图像列表（兼容旧格式）
     "test_views": Optional[List[View]], # 测试视角列表（可选，用于评估）
-    "test_images": Optional[List[torch.Tensor]],  # 测试图像列表 [H, W, 3]（可选，用于评估）
+    "test_images": Optional[List[torch.Tensor]],  # 测试图像列表（可选，用于评估）
 }
 ```
 
 **点云格式：**
-- **字典格式：**
+- **字典格式（推荐）：**
   ```python
   {
-      "background": np.ndarray  # [N, 6] - [x, y, z, r, g, b]
+      "background": np.ndarray,  # [N_bg, 6] - 静态背景 [x, y, z, r, g, b]（世界坐标）
+      "dynamic": Dict[int, np.ndarray],  # {instance_id: [N_i, 6]} - 动态物体点云（局部坐标）
   }
   ```
 - **对象格式：** 需有 `points` 和 `colors` 属性
+
+**动态物体信息格式：**
+```python
+dynamic_info = {
+    frame_idx: {
+        "instances": {
+            instance_id: {
+                "quat": List[4],  # [w, x, y, z] 四元数（wxyz格式）
+                "trans": List[3],  # [x, y, z] 平移向量
+            }
+        }
+    }
+}
+```
+
+**Target 格式（推荐）：**
+```python
+targets = [
+    {
+        "frame_idx": int,           # 场景全局 frame_idx
+        "view": View,               # 相机视角
+        "gt_image": torch.Tensor,   # [H, W, 3] 真实图像
+    },
+    ...
+]
+```
 
 **View 对象：**
 - `camtoworlds`: `[4, 4]` 或 `[B, 4, 4]` - 相机到世界变换矩阵
@@ -1110,47 +1367,82 @@ batch = {
 
 | 变量名 | 形状 | 说明 |
 |--------|------|------|
-| `means_s` | `[N, 3]` | 从NodeState获取的位置（分离） |
-| `anchor_rgb` | `[N, 3]` | 从SH DC分量转换的RGB |
-| `sparse_feat` | `[N, 3]` | 稀疏特征（RGB） |
+| `means_bg` | `[N_bg, 3]` | 从NodeStateBg获取的静态背景位置（分离，世界坐标） |
+| `means_rigid_local` | `[N_rigid, 3]` | 从NodeStateRigid获取的动态物体位置（分离，局部坐标） |
+| `means_rigid_world` | `[N_rigid, 3]` | 变换到source帧的动态物体位置（分离，世界坐标） |
+| `means_all` | `[N_total, 3]` | 合并后的所有点位置（N_total = N_bg + N_rigid） |
+| `anchor_rgb_bg` | `[N_bg, 3]` | 从SH DC分量转换的静态背景RGB |
+| `anchor_rgb_rigid` | `[N_rigid, 3]` | 从SH DC分量转换的动态物体RGB |
+| `anchor_rgb_all` | `[N_total, 3]` | 合并后的所有点RGB |
+| `sparse_feat` | `[M, 3]` | 稀疏特征（RGB，M ≤ N_total） |
 | `vol_dim` | `[3]` | 体积维度 `[D, H, W]` |
-| `valid_coords` | `[N, 3]` | 有效体素坐标 |
-| `feat_3d` | `[N, outdim]` | 稀疏卷积后的3D特征 |
-| `dense_volume` | `[1, C, H, W, D]` | 密集化的3D特征体积 |
+| `valid_coords` | `[M, 3]` | 有效体素坐标 |
+| `feat_3d` | `[M, outdim]` | 稀疏卷积后的3D特征 |
+| `dense_volume` | `[1, C, D, H, W]` | 密集化的3D特征体积 |
+| `feat_3d_crop_bg` | `[N_bg, outdim]` | 静态背景点的3D特征 |
+| `feat_3d_crop_rigid` | `[N_rigid, outdim]` | 动态物体点的3D特征 |
 
 #### 偏移量预测阶段
 
 | 变量名 | 形状 | 说明 |
 |--------|------|------|
-| `grid_coords` | `[N, 3]` | 归一化网格坐标 `[-1, 1]` |
-| `feat_3d_crop` | `[N, outdim]` | 每个点插值得到的3D特征 |
-| `offset_pos` | `[N, 3]` | 位置偏移（受offset_max限制，tanh） |
-| `offset_scales` | `[N, 3]` | 尺度对数偏移（受scale_max限制，tanh） |
-| `offset_omega` | `[N, 3]` | 轴角偏移（受omega_max限制，tanh） |
-| `offset_quat` | `[N, 4]` | 四元数偏移（从轴角转换，归一化） |
-| `offset_opacity` | `[N, 1]` | 不透明度对数偏移（受opacity_max限制，tanh） |
-| `offset_sh_dc` | `[N, 3]` | SH DC偏移（受sh_dc_max限制，tanh） |
-| `offset_sh_rest` | `[N, 3*(num_sh-1)]` | SH rest偏移（受sh_rest_max限制，tanh） |
-| `offset_sh` | `[N, 3*num_sh]` | SH系数偏移（扁平化，concat([dc, rest])） |
+| `grid_coords_bg` | `[N_bg, 3]` | 静态背景点的归一化网格坐标 `[-1, 1]` |
+| `grid_coords_rigid` | `[N_rigid, 3]` | 动态物体点的归一化网格坐标 `[-1, 1]` |
+| `feat_3d_crop_bg` | `[N_bg, outdim]` | 静态背景点插值得到的3D特征（默认outdim=32） |
+| `feat_3d_crop_rigid` | `[N_rigid, outdim]` | 动态物体点插值得到的3D特征（默认outdim=32） |
+| `offsets_bg` | Dict | 静态背景的偏移量字典 |
+| `offsets_rigid_world` | Dict | 动态物体的偏移量字典（世界坐标） |
+| `offsets_rigid_local` | Dict | 动态物体的偏移量字典（局部坐标，从世界坐标变换而来） |
+| `offset_pos` | `[N, 3]` | 位置偏移（`offset_max * tanh(mlp_output)`，范围`[-offset_max, offset_max]`） |
+| `offset_scales_raw` | `[N, 3]` | 尺度偏移原始输出（从`mlp_conv`的前3维） |
+| `offset_scales` | `[N, 3]` | 尺度对数偏移（`scale_max * tanh(offset_scales_raw)`，范围`[-scale_max, scale_max]`） |
+| `offset_omega_raw` | `[N, 3]` | 轴角偏移原始输出（从`mlp_conv`的后3维） |
+| `offset_omega` | `[N, 3]` | 轴角偏移（`omega_max * tanh(offset_omega_raw)`，范围`[-omega_max, omega_max]`，单位：弧度） |
+| `offset_quat` | `[N, 4]` | 四元数偏移（从轴角转换，wxyz格式，单位四元数） |
+| `offset_opacity` | `[N, 1]` | 不透明度对数偏移（`opacity_max * tanh(mlp_output)`，范围`[-opacity_max, opacity_max]`） |
+| `sh_raw` | `[N, 3*num_sh]` | SH系数原始输出（从`gaussion_decoder`） |
+| `sh_dc_raw` | `[N, 3]` | SH DC原始输出（`sh_raw`的前3维） |
+| `sh_rest_raw` | `[N, 3*(num_sh-1)]` | SH rest原始输出（`sh_raw`的后`3*(num_sh-1)`维） |
+| `offset_sh_dc` | `[N, 3]` | SH DC偏移（`sh_dc_max * tanh(sh_dc_raw)`，范围`[-sh_dc_max, sh_dc_max]`） |
+| `offset_sh_rest` | `[N, 3*(num_sh-1)]` | SH rest偏移（`sh_rest_max * tanh(sh_rest_raw)`，范围`[-sh_rest_max, sh_rest_max]`） |
+| `offset_sh` | `[N, 3*num_sh]` | SH系数偏移（扁平化，`concat([offset_sh_dc, offset_sh_rest], dim=-1)`） |
 
 #### 渲染参数阶段
 
 | 变量名 | 形状 | 说明 |
 |--------|------|------|
-| `means_r` | `[N, 3]` | 渲染用的位置（可微，不在此处clamp） |
-| `scales_log_r` | `[N, 3]` | 渲染用的尺度对数（可微，应用eta_scales） |
-| `scales_r` | `[N, 3]` | 渲染用的尺度 `exp(scales_log_r)` |
-| `quats_r` | `[N, 4]` | 渲染用的四元数（归一化，可微） |
-| `opacity_logit_r` | `[N, 1]` | 渲染用的不透明度对数（可微，应用eta_opacity） |
-| `opacities_r` | `[N]` | 渲染用的不透明度 `sigmoid(opacity_logit_r)` |
-| `sh_dc_r` | `[N, 3]` | 渲染用的SH DC分量（可微，应用eta_sh_dc） |
-| `sh_rest_r` | `[N, num_sh-1, 3]` | 渲染用的SH高阶分量（可微，应用eta_sh_rest） |
-| `colors_r` | `[N, num_sh, 3]` | 完整的SH系数 `[sh_dc, sh_rest]` |
+| `render_params_bg` | Dict | 静态背景的渲染参数字典（世界坐标） |
+| `render_params_rigid` | Dict | 动态物体的渲染参数字典（局部坐标） |
+| `means_r_bg` | `[N_bg, 3]` | 静态背景渲染用的位置（世界坐标，可微，不在此处clamp） |
+| `means_r_rigid` | `[N_rigid, 3]` | 动态物体渲染用的位置（局部坐标，可微） |
+| `means_r` | `[N, 3]` | 渲染用的位置（`node_state.means + eta_means * offset_pos`，可微，不在此处clamp） |
+| `scales_log_r` | `[N, 3]` | 渲染用的尺度对数（`node_state.scales_log + eta_scales * offset_scales`，可微） |
+| `scales_r` | `[N, 3]` | 渲染用的尺度（`exp(scales_log_r)`，转换到线性域） |
+| `quats_r` | `[N, 4]` | 渲染用的四元数（`normalize(quat_multiply(node_state.quats, offset_quat))`，归一化，可微） |
+| `opacity_logit_r` | `[N, 1]` | 渲染用的不透明度对数（`node_state.opacity_logit + eta_opacity * offset_opacity`，可微） |
+| `opacities_r` | `[N]` | 渲染用的不透明度（`sigmoid(opacity_logit_r).squeeze(-1)`，范围[0,1]） |
+| `offset_sh_dc` | `[N, 3]` | SH DC偏移（从`offset_sh[:, :3]`提取） |
+| `sh_rest_flat` | `[N, 3*(num_sh-1)]` | SH rest偏移（扁平化，从`offset_sh[:, 3:]`提取） |
+| `sh_rest_offset` | `[N, num_sh-1, 3]` | SH rest偏移（重塑为`[N, num_sh-1, 3]`） |
+| `sh_dc_r` | `[N, 3]` | 渲染用的SH DC分量（`node_state.sh_dc + eta_sh_dc * offset_sh_dc`，可微） |
+| `sh_rest_r` | `[N, num_sh-1, 3]` | 渲染用的SH高阶分量（`node_state.sh_rest + eta_sh_rest * sh_rest_offset`，可微） |
+| `colors_r` | `[N, num_sh, 3]` | 完整的SH系数（`cat([sh_dc_r[:, None, :], sh_rest_r], dim=1)`，用于渲染） |
 
 #### 代理参数阶段
 
 | 变量名 | 形状 | 说明 |
 |--------|------|------|
+| `proxies_bg` | Dict | 静态背景的代理参数字典（世界坐标，所有target帧共享） |
+| `proxies_rigid` | Dict | 动态物体的代理参数字典（局部坐标，所有target帧共享） |
+| `means_p_bg` | `[N_bg, 3]` | 静态背景代理位置（分离但可微，世界坐标） |
+| `means_p_rigid` | `[N_rigid, 3]` | 动态物体代理位置（分离但可微，局部坐标） |
+| `means_rigid_world` | `[N_rigid, 3]` | 变换到target帧的动态物体位置（可微，世界坐标） |
+| `quats_rigid_world` | `[N_rigid, 4]` | 变换到target帧的动态物体旋转（可微，世界坐标） |
+| `merged_means` | `[N_total, 3]` | 合并后的位置（`cat([means_p_bg, means_rigid_world])`） |
+| `merged_quats` | `[N_total, 4]` | 合并后的旋转（`cat([quats_p_bg, quats_rigid_world])`） |
+| `merged_scales` | `[N_total, 3]` | 合并后的尺度 |
+| `merged_opacities` | `[N_total]` | 合并后的不透明度 |
+| `merged_colors` | `[N_total, num_sh, 3]` | 合并后的颜色 |
 | `means_p` | `[N, 3]` | 代理位置（分离但可微） |
 | `scales_p` | `[N, 3]` | 代理尺度（分离但可微） |
 | `quats_p` | `[N, 4]` | 代理四元数（分离但可微） |
@@ -1233,7 +1525,49 @@ psnr = -10 * torch.log10(mse)  # 如果 mse <= 0，返回 inf
 
 ## 关键组件说明
 
-### 1. 稀疏卷积网络 (SparseConv)
+### 1. 偏移量预测网络 (Offset Prediction Networks)
+
+**作用：** 从3D特征预测Gaussian参数的偏移量
+
+**网络结构：**
+
+#### `mlp_offset_pos` - 位置偏移预测
+- **结构：** `outdim → 64 → 32 → 3`
+- **输出：** 位置偏移原始值 `[N, 3]`
+- **处理：** `offset_pos = offset_max * tanh(mlp_output)`
+- **初始化：** 最后一层初始化为零（输出接近零偏移）
+
+#### `mlp_conv` - 尺度与旋转偏移预测
+- **结构：** `outdim → 64 → 32 → 6`
+- **输出：** 尺度偏移（前3维）+ 轴角偏移（后3维）
+- **处理：**
+  - `offset_scales = scale_max * tanh(scales_raw)`
+  - `offset_omega = omega_max * tanh(omega_raw)`
+  - `offset_quat = _axis_angle_to_quat(offset_omega)`
+- **初始化：** 最后一层初始化为零（输出接近零偏移）
+
+#### `mlp_opacity` - 不透明度偏移预测
+- **结构：** `outdim → 64 → 32 → 1`
+- **输出：** 不透明度对数偏移原始值 `[N, 1]`
+- **处理：** `offset_opacity = opacity_max * tanh(mlp_output)`
+- **初始化：** 最后一层初始化为零（输出接近零偏移）
+
+#### `gaussion_decoder` - SH系数偏移预测
+- **结构：** `outdim → 64 → 32 → 3*num_sh`
+- **输出：** SH系数偏移原始值（包含DC和rest）
+- **处理：**
+  - `offset_sh_dc = sh_dc_max * tanh(sh_dc_raw)`
+  - `offset_sh_rest = sh_rest_max * tanh(sh_rest_raw)`
+  - `offset_sh = concat([offset_sh_dc, offset_sh_rest])`
+- **初始化：** 最后一层初始化为零（输出接近零偏移）
+
+**共同特性：**
+- 所有网络使用 `ReLU` 激活函数（中间层）
+- 所有网络的最后一层**无激活函数**（直接输出原始值）
+- 所有偏移量通过 `tanh` 函数限制在指定范围内
+- 初始化策略确保训练开始时预测接近零偏移，避免初始阶段的大幅跳跃
+
+### 2. 稀疏卷积网络 (SparseConv)
 
 **作用：** 从稀疏点云特征构建3D特征表示
 
@@ -1245,7 +1579,7 @@ psnr = -10 * torch.log10(mse)  # 如果 mse <= 0，返回 inf
 - 输入：`[N, 3]` - RGB特征
 - 输出：`[N, outdim]` - 3D特征（默认outdim=32）
 
-### 2. 体积构建函数
+### 3. 体积构建函数
 
 #### `construct_sparse_tensor`
 - **实现：** `models.evol_splat.construct_sparse_tensor`
@@ -1260,7 +1594,7 @@ psnr = -10 * torch.log10(mse)  # 如果 mse <= 0，返回 inf
 - **输出：** `[D, H, W, C]` 密集体积
 - **错误处理：** 如果函数不可用且未提供自定义 `sparse_to_dense_volume_fn`，会抛出 `ImportError`
 
-### 3. 渲染器 (Renderer)
+### 4. 渲染器 (Renderer)
 
 **实现：**
 - **实现：** `gsplat.rendering.rasterization`
@@ -1279,12 +1613,13 @@ psnr = -10 * torch.log10(mse)  # 如果 mse <= 0，返回 inf
 - `render`: `[1, H, W, 4]` - RGB + alpha
 - `alpha`: `[1, H, W]` - 累积不透明度
 
-### 4. 辅助函数
+### 5. 辅助函数
 
 #### 四元数操作
 - `_random_quat_tensor()`: 生成随机单位四元数（wxyz格式）
-- `_quat_multiply()`: 四元数乘法
-- `_normalize_quat()`: 四元数归一化
+- `_quat_multiply()`: 四元数乘法（用于组合旋转）
+- `_normalize_quat()`: 四元数归一化（确保单位四元数）
+- `_axis_angle_to_quat()`: 轴角到四元数转换（使用无分支sinc结构，提供平滑梯度）
 
 #### 球谐函数转换
 - `_rgb_to_sh()`: RGB → SH DC分量

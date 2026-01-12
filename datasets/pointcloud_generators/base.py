@@ -57,7 +57,7 @@ class RGBPointCloudGenerator(ABC):
 
         Expected keys:
             - background: np.ndarray [N, 6] (world xyz + rgb)
-            - dynamic_objects: Dict[int, np.ndarray] ({intid: [M, 6]} in local coords)
+            - dynamic: Dict[int, np.ndarray] ({intid: [M, 6]} in local coords)
             - instance_mapping: Dict[int, int] (original id -> intid)
             - metadata: Dict (optional extras)
         """

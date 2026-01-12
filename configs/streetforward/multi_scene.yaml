@@ -69,7 +69,7 @@ dataset:
     monocular_downscale: 2  # 单目下采样比例
     # 融合参数
     max_points: 500000  # 静态背景点云最大点数（默认500K）
-    fusion_strategy: 融合策略：merge  # 融合策略：merge, lidar_first, adaptive
+    fusion_strategy: merge  # 融合策略：merge, lidar_first, adaptive
     dynamic_source: lidar_only  # 动态点云来源：lidar_only（推荐）或 fuse
     downsample_dynamic: false  # 动态点云是否下采样（默认False，推荐保持False）
     count_dynamic_in_max_points: false  # 动态点是否计入max_points（默认False）

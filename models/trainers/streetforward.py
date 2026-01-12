@@ -65,8 +65,33 @@ def _quat_multiply(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
     return torch.stack([w, x, y, z], dim=-1)
 
 
+def _quat_conjugate(q: torch.Tensor) -> torch.Tensor:
+    w, x, y, z = q.unbind(-1)
+    return torch.stack([w, -x, -y, -z], dim=-1)
+
+
 def _normalize_quat(q: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     return q / (q.norm(dim=-1, keepdim=True) + eps)
+
+
+def _quat_to_rotmat(q: torch.Tensor) -> torch.Tensor:
+    """Convert quaternion in wxyz to rotation matrix."""
+    q = _normalize_quat(q)
+    w, x, y, z = q.unbind(-1)
+    ww = w * w
+    xx = x * x
+    yy = y * y
+    zz = z * z
+    wx = w * x
+    wy = w * y
+    wz = w * z
+    xy = x * y
+    xz = x * z
+    yz = y * z
+    row0 = torch.stack([1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy)], dim=-1)
+    row1 = torch.stack([2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)], dim=-1)
+    row2 = torch.stack([2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)], dim=-1)
+    return torch.stack([row0, row1, row2], dim=-2)
 
 
 def _axis_angle_to_quat(omega: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
@@ -165,7 +190,7 @@ def _pairwise_neighbor_distances(points: torch.Tensor, k: int = 3) -> torch.Tens
     return result
 
 @dataclass
-class NodeState:
+class NodeStateBackground:
     means: torch.Tensor
     scales_log: torch.Tensor
     quats: torch.Tensor
@@ -173,8 +198,8 @@ class NodeState:
     sh_dc: torch.Tensor
     sh_rest: torch.Tensor
 
-    def detach_clone(self) -> "NodeState":
-        return NodeState(
+    def detach_clone(self) -> "NodeStateBackground":
+        return NodeStateBackground(
             means=self.means.detach().clone(),
             scales_log=self.scales_log.detach().clone(),
             quats=self.quats.detach().clone(),
@@ -182,6 +207,43 @@ class NodeState:
             sh_dc=self.sh_dc.detach().clone(),
             sh_rest=self.sh_rest.detach().clone(),
         )
+
+
+@dataclass
+class NodeStateRigid:
+    means: torch.Tensor
+    scales_log: torch.Tensor
+    quats: torch.Tensor
+    opacity_logit: torch.Tensor
+    sh_dc: torch.Tensor
+    sh_rest: torch.Tensor
+    point_ids: torch.Tensor
+    instances_quats: torch.Tensor
+    instances_trans: torch.Tensor
+    instances_fv: torch.Tensor
+    instance_ids: List[int]
+    frame_ids: List[int]
+    cur_frame: int
+
+    def detach_clone(self) -> "NodeStateRigid":
+        return NodeStateRigid(
+            means=self.means.detach().clone(),
+            scales_log=self.scales_log.detach().clone(),
+            quats=self.quats.detach().clone(),
+            opacity_logit=self.opacity_logit.detach().clone(),
+            sh_dc=self.sh_dc.detach().clone(),
+            sh_rest=self.sh_rest.detach().clone(),
+            point_ids=self.point_ids.detach().clone(),
+            instances_quats=self.instances_quats.detach().clone(),
+            instances_trans=self.instances_trans.detach().clone(),
+            instances_fv=self.instances_fv.detach().clone(),
+            instance_ids=list(self.instance_ids),
+            frame_ids=list(self.frame_ids),
+            cur_frame=int(self.cur_frame),
+        )
+
+
+NodeState = NodeStateBackground
 
 
 class StreetForwardTrainer(nn.Module):
@@ -317,6 +379,8 @@ class StreetForwardTrainer(nn.Module):
         self._setup_tensorboard(training_cfg)
 
         self.node_states: Dict[Tuple[int, int], NodeState] = {}
+        self.node_states_bg = self.node_states
+        self.node_states_rigid: Dict[Tuple[int, int], Optional[NodeStateRigid]] = {}
         self._lpips_model = None
         self._lpips_unavailable = False
         self._ssim_unavailable = False
@@ -371,6 +435,11 @@ class StreetForwardTrainer(nn.Module):
         self.tb_writer = SummaryWriter(log_dir=log_dir, flush_secs=int(tb_cfg.get("flush_secs", 30)))
         logger.info(f"TensorBoard logging enabled at {log_dir}")
 
+    def _compute_initial_scales(self, means: torch.Tensor) -> torch.Tensor:
+        distances = _pairwise_neighbor_distances(means, k=3)
+        avg_dist = distances.mean(dim=-1, keepdim=True)
+        return torch.log(torch.clamp(avg_dist, min=1e-3).repeat(1, 3))
+
     def _init_node_from_pointcloud(
         self,
         scene_id: int,
@@ -398,9 +467,7 @@ class StreetForwardTrainer(nn.Module):
         means = torch.from_numpy(points).float().to(self.device)
         colors_rgb = torch.from_numpy(colors).float().to(self.device)
 
-        distances = _pairwise_neighbor_distances(means, k=3)
-        avg_dist = distances.mean(dim=-1, keepdim=True)
-        initial_scales = torch.log(torch.clamp(avg_dist, min=1e-3).repeat(1, 3))
+        initial_scales = self._compute_initial_scales(means)
 
         quats = _random_quat_tensor(means.shape[0], device=self.device)
         opacity_logit = torch.logit(torch.full((means.shape[0], 1), 0.1, device=self.device))
@@ -409,7 +476,7 @@ class StreetForwardTrainer(nn.Module):
         sh_dc = _rgb_to_sh(colors_rgb)
         sh_rest = torch.zeros((means.shape[0], num_sh - 1, 3), device=self.device)
 
-        node_state = NodeState(
+        node_state = NodeStateBackground(
             means=means.detach().clone(),
             scales_log=initial_scales.detach().clone(),
             quats=quats.detach().clone(),
@@ -420,7 +487,74 @@ class StreetForwardTrainer(nn.Module):
         self.node_states[(scene_id, segment_id)] = node_state
         return node_state
 
-    def _get_or_init_node_state(self, batch: Dict) -> Tuple[Tuple[int, int], NodeState]:
+    def _init_rigid_node_state_from_pcd(
+        self,
+        points: np.ndarray,
+        colors: np.ndarray,
+        point_ids: torch.Tensor,
+        dynamic_info: Dict,
+        frame_ids: List[int],
+        instance_id_map: Dict[int, int],
+        instance_ids: List[int],
+    ) -> NodeStateRigid:
+        means = torch.tensor(points, dtype=torch.float32, device=self.device)
+        colors_tensor = torch.tensor(colors, dtype=torch.float32, device=self.device)
+        if colors_tensor.numel() > 0 and colors_tensor.max() > 1.0 + 1e-3:
+            colors_tensor = colors_tensor / 255.0
+        colors_rgb = colors_tensor
+        scales_log = self._compute_initial_scales(means)
+        quats = _random_quat_tensor(means.shape[0], device=self.device)
+        opacity_logit = torch.logit(torch.full((means.shape[0], 1), 0.1, device=self.device))
+
+        num_sh = _num_sh_bases(self.sh_degree)
+        sh_dc = _rgb_to_sh(colors_rgb)
+        sh_rest = torch.zeros((means.shape[0], num_sh - 1, 3), device=self.device)
+
+        num_frames = len(frame_ids)
+        num_instances = len(instance_id_map)
+        instances_quats = torch.zeros(num_frames, num_instances, 4, device=self.device)
+        instances_trans = torch.zeros(num_frames, num_instances, 3, device=self.device)
+        instances_fv = torch.zeros(num_frames, num_instances, dtype=torch.bool, device=self.device)
+        instances_quats[..., 0] = 1.0
+
+        frame_id_map = {fid: idx for idx, fid in enumerate(frame_ids)}
+        for frame_id, frame_info in dynamic_info.items():
+            frame_idx = int(frame_id)
+            if frame_idx not in frame_id_map:
+                continue
+            frame_slot = frame_id_map[frame_idx]
+            instances = frame_info.get("instances", {})
+            if isinstance(instances, dict):
+                for instance_id, instance_pose in instances.items():
+                    ins_id = int(instance_id)
+                    if ins_id not in instance_id_map:
+                        continue
+                    ins_slot = instance_id_map[ins_id]
+                    quat = torch.tensor(instance_pose["quat"], device=self.device)
+                    trans = torch.tensor(instance_pose["trans"], device=self.device)
+                    instances_quats[frame_slot, ins_slot] = quat
+                    instances_trans[frame_slot, ins_slot] = trans
+                    instances_fv[frame_slot, ins_slot] = True
+
+        return NodeStateRigid(
+            means=means.detach().clone(),
+            scales_log=scales_log.detach().clone(),
+            quats=quats.detach().clone(),
+            opacity_logit=opacity_logit.detach().clone(),
+            sh_dc=sh_dc.detach().clone(),
+            sh_rest=sh_rest.detach().clone(),
+            point_ids=point_ids.detach().clone(),
+            instances_quats=instances_quats.detach().clone(),
+            instances_trans=instances_trans.detach().clone(),
+            instances_fv=instances_fv.detach().clone(),
+            instance_ids=list(instance_ids),
+            frame_ids=list(frame_ids),
+            cur_frame=0,
+        )
+
+    def _get_or_init_node_states(
+        self, batch: Dict
+    ) -> Tuple[Tuple[int, int], NodeState, Optional[NodeStateRigid]]:
         scene_id = batch["scene_id"]
         if isinstance(scene_id, torch.Tensor):
             scene_id = int(scene_id.item())
@@ -429,10 +563,55 @@ class StreetForwardTrainer(nn.Module):
             segment_id = int(segment_id.item())
         key = (scene_id, segment_id)
         if key in self.node_states:
-            return key, self.node_states[key]
+            node_state_rigid = self.node_states_rigid.get(key)
+            dynamic_info = batch.get("dynamic_info")
+            if node_state_rigid is not None and dynamic_info:
+                node_state_rigid = self._extend_rigid_frames(node_state_rigid, dynamic_info)
+                self.node_states_rigid[key] = node_state_rigid
+            return key, self.node_states[key], node_state_rigid
         pointcloud = batch["pointcloud"]
-        node_state = self._init_node_from_pointcloud(scene_id, segment_id, pointcloud)
-        return key, node_state
+        node_state_bg = self._init_node_from_pointcloud(scene_id, segment_id, pointcloud)
+
+        node_state_rigid: Optional[NodeStateRigid] = None
+        if isinstance(pointcloud, dict) and pointcloud.get("dynamic"):
+            dynamic_points = []
+            dynamic_colors = []
+            point_ids = []
+            instance_ids = sorted(int(ins_id) for ins_id in pointcloud["dynamic"].keys())
+            instance_id_map = {ins_id: idx for idx, ins_id in enumerate(instance_ids)}
+            for ins_id in instance_ids:
+                instance_pcd = pointcloud["dynamic"][ins_id]
+                if instance_pcd is None or len(instance_pcd) == 0:
+                    continue
+                n_points = instance_pcd.shape[0]
+                dynamic_points.append(instance_pcd[:, :3])
+                dynamic_colors.append(instance_pcd[:, 3:6])
+                point_ids.extend([instance_id_map[ins_id]] * n_points)
+
+            if dynamic_points:
+                dynamic_points = np.concatenate(dynamic_points, axis=0)
+                dynamic_colors = np.concatenate(dynamic_colors, axis=0)
+                point_ids_tensor = torch.tensor(point_ids, dtype=torch.long, device=self.device).unsqueeze(-1)
+                dynamic_info = batch.get("dynamic_info")
+                if not dynamic_info:
+                    raise ValueError("dynamic_info is required when dynamic pointclouds are provided.")
+                frame_ids = sorted(int(fid) for fid in dynamic_info.keys())
+                node_state_rigid = self._init_rigid_node_state_from_pcd(
+                    points=dynamic_points,
+                    colors=dynamic_colors,
+                    point_ids=point_ids_tensor,
+                    dynamic_info=dynamic_info,
+                    frame_ids=frame_ids,
+                    instance_id_map=instance_id_map,
+                    instance_ids=instance_ids,
+                )
+
+        self.node_states_rigid[key] = node_state_rigid
+        return key, node_state_bg, node_state_rigid
+
+    def _get_or_init_node_state(self, batch: Dict) -> Tuple[Tuple[int, int], NodeState]:
+        key, node_state_bg, _ = self._get_or_init_node_states(batch)
+        return key, node_state_bg
 
     def _node_state_to_dict(self, node_state: NodeState) -> Dict[str, torch.Tensor]:
         return {
@@ -453,6 +632,274 @@ class StreetForwardTrainer(nn.Module):
             sh_dc=state_dict["sh_dc"].to(self.device),
             sh_rest=state_dict["sh_rest"].to(self.device),
         ).detach_clone()
+
+    def _node_state_rigid_to_dict(self, node_state: NodeStateRigid) -> Dict:
+        return {
+            "means": node_state.means.detach().cpu(),
+            "scales_log": node_state.scales_log.detach().cpu(),
+            "quats": node_state.quats.detach().cpu(),
+            "opacity_logit": node_state.opacity_logit.detach().cpu(),
+            "sh_dc": node_state.sh_dc.detach().cpu(),
+            "sh_rest": node_state.sh_rest.detach().cpu(),
+            "point_ids": node_state.point_ids.detach().cpu(),
+            "instances_quats": node_state.instances_quats.detach().cpu(),
+            "instances_trans": node_state.instances_trans.detach().cpu(),
+            "instances_fv": node_state.instances_fv.detach().cpu(),
+            "instance_ids": list(node_state.instance_ids),
+            "frame_ids": list(node_state.frame_ids),
+            "cur_frame": int(node_state.cur_frame),
+        }
+
+    def _node_state_rigid_from_dict(self, state_dict: Dict) -> NodeStateRigid:
+        instance_ids = state_dict.get("instance_ids")
+        if instance_ids is None:
+            num_instances = state_dict["instances_quats"].shape[1]
+            instance_ids = list(range(num_instances))
+        elif isinstance(instance_ids, torch.Tensor):
+            instance_ids = instance_ids.tolist()
+        return NodeStateRigid(
+            means=state_dict["means"].to(self.device),
+            scales_log=state_dict["scales_log"].to(self.device),
+            quats=state_dict["quats"].to(self.device),
+            opacity_logit=state_dict["opacity_logit"].to(self.device),
+            sh_dc=state_dict["sh_dc"].to(self.device),
+            sh_rest=state_dict["sh_rest"].to(self.device),
+            point_ids=state_dict["point_ids"].to(self.device),
+            instances_quats=state_dict["instances_quats"].to(self.device),
+            instances_trans=state_dict["instances_trans"].to(self.device),
+            instances_fv=state_dict["instances_fv"].to(self.device),
+            instance_ids=list(instance_ids),
+            frame_ids=list(state_dict.get("frame_ids", [])),
+            cur_frame=int(state_dict.get("cur_frame", 0)),
+        ).detach_clone()
+
+    def _extend_rigid_frames(self, node_state_rigid: NodeStateRigid, dynamic_info: Dict) -> NodeStateRigid:
+        if not dynamic_info:
+            return node_state_rigid
+        existing_frame_ids = set(node_state_rigid.frame_ids)
+        candidate_frame_ids = [int(fid) for fid in dynamic_info.keys()]
+        new_frame_ids = [fid for fid in candidate_frame_ids if fid not in existing_frame_ids]
+        if not new_frame_ids:
+            return node_state_rigid
+
+        new_frame_ids = sorted(new_frame_ids)
+        num_new_frames = len(new_frame_ids)
+        num_instances = node_state_rigid.instances_quats.shape[1]
+        device = node_state_rigid.instances_quats.device
+
+        new_quats = torch.zeros((num_new_frames, num_instances, 4), device=device)
+        new_trans = torch.zeros((num_new_frames, num_instances, 3), device=device)
+        new_fv = torch.zeros((num_new_frames, num_instances), dtype=torch.bool, device=device)
+        new_quats[..., 0] = 1.0
+
+        if node_state_rigid.instance_ids:
+            instance_id_map = {int(ins_id): idx for idx, ins_id in enumerate(node_state_rigid.instance_ids)}
+        else:
+            instance_id_map = {int(idx): idx for idx in range(num_instances)}
+
+        for frame_slot, frame_id in enumerate(new_frame_ids):
+            frame_info = dynamic_info.get(frame_id)
+            if frame_info is None:
+                frame_info = dynamic_info.get(str(frame_id))
+            if not frame_info:
+                continue
+            instances = frame_info.get("instances", {})
+            if isinstance(instances, dict):
+                for instance_id, instance_pose in instances.items():
+                    ins_id = int(instance_id)
+                    if ins_id not in instance_id_map:
+                        continue
+                    ins_slot = instance_id_map[ins_id]
+                    quat = torch.tensor(instance_pose["quat"], device=device)
+                    trans = torch.tensor(instance_pose["trans"], device=device)
+                    new_quats[frame_slot, ins_slot] = quat
+                    new_trans[frame_slot, ins_slot] = trans
+                    new_fv[frame_slot, ins_slot] = True
+
+        node_state_rigid.instances_quats = torch.cat([node_state_rigid.instances_quats, new_quats], dim=0)
+        node_state_rigid.instances_trans = torch.cat([node_state_rigid.instances_trans, new_trans], dim=0)
+        node_state_rigid.instances_fv = torch.cat([node_state_rigid.instances_fv, new_fv], dim=0)
+        node_state_rigid.frame_ids.extend(new_frame_ids)
+        return node_state_rigid
+
+    def _resolve_rigid_frame_idx(self, node_state_rigid: NodeStateRigid, frame_idx: int) -> int:
+        """
+        将 frame_idx（frame ID）解析为 frame_ids 列表中的索引。
+        
+        Args:
+            frame_idx: 场景全局 frame ID（不是索引）
+            
+        Returns:
+            frame_ids 列表中的索引
+            
+        Raises:
+            ValueError: 如果 frame_idx 不在 frame_ids 列表中
+        """
+        if not node_state_rigid.frame_ids:
+            # 如果没有 frame_ids，假设 frame_idx 就是索引
+            return int(frame_idx)
+        
+        # 首先检查 frame_idx 是否是 frame ID
+        if frame_idx in node_state_rigid.frame_ids:
+            return node_state_rigid.frame_ids.index(frame_idx)
+        
+        # 如果找不到，抛出错误
+        raise ValueError(
+            f"Frame ID {frame_idx} not found in frame_ids {node_state_rigid.frame_ids}. "
+            f"Please ensure the frame_idx is a valid frame ID, not an index."
+        )
+
+    def _transform_rigid_to_world(
+        self, node_state_rigid: NodeStateRigid, means_local: torch.Tensor
+    ) -> torch.Tensor:
+        frame_idx = self._resolve_rigid_frame_idx(node_state_rigid, node_state_rigid.cur_frame)
+        quats_cur_frame = node_state_rigid.instances_quats[frame_idx]
+        trans_cur_frame = node_state_rigid.instances_trans[frame_idx]
+        rot_cur_frame = _quat_to_rotmat(quats_cur_frame)
+        rot_per_pts = rot_cur_frame[node_state_rigid.point_ids[..., 0]]
+        trans_per_pts = trans_cur_frame[node_state_rigid.point_ids[..., 0]]
+        means_world = torch.bmm(rot_per_pts, means_local.unsqueeze(-1)).squeeze(-1) + trans_per_pts
+        return means_world
+
+    def _transform_rigid_quats_to_world(
+        self, node_state_rigid: NodeStateRigid, quats_local: torch.Tensor
+    ) -> torch.Tensor:
+        frame_idx = self._resolve_rigid_frame_idx(node_state_rigid, node_state_rigid.cur_frame)
+        quats_cur_frame = node_state_rigid.instances_quats[frame_idx]
+        quats_per_pts = quats_cur_frame[node_state_rigid.point_ids[..., 0]]
+        return _normalize_quat(_quat_multiply(quats_per_pts, quats_local))
+
+    def _transform_offsets_world_to_local(
+        self, node_state_rigid: NodeStateRigid, offsets_world: Dict[str, torch.Tensor], frame_idx: int
+    ) -> Dict[str, torch.Tensor]:
+        """
+        将世界坐标的偏移量变换到局部坐标系。
+        
+        关键：offsets 是向量，变换方式与位置不同（只需要旋转，不需要平移）。
+        
+        Args:
+            node_state_rigid: Rigid node state
+            offsets_world: 世界坐标的偏移量字典
+            frame_idx: 当前帧的 frame ID
+            
+        Returns:
+            局部坐标的偏移量字典
+        """
+        resolved_frame_idx = self._resolve_rigid_frame_idx(node_state_rigid, frame_idx)
+        
+        # 获取当前帧的旋转矩阵
+        quats_cur_frame = node_state_rigid.instances_quats[resolved_frame_idx]  # [num_instances, 4]
+        rot_cur_frame = _quat_to_rotmat(quats_cur_frame)  # [num_instances, 3, 3]
+        rot_per_pts = rot_cur_frame[node_state_rigid.point_ids[..., 0]]  # [N_rigid, 3, 3]
+        
+        # 将世界坐标的位置偏移量变换到局部坐标
+        # 对于向量（偏移量），只需要旋转，不需要平移
+        offset_pos_world = offsets_world["offset_pos"]  # [N_rigid, 3]
+        offset_pos_local = torch.bmm(
+            rot_per_pts.transpose(-2, -1),  # R^T: [N_rigid, 3, 3]
+            offset_pos_world.unsqueeze(-1)  # [N_rigid, 3, 1]
+        ).squeeze(-1)  # [N_rigid, 3]
+        
+        # 将世界坐标的旋转增量转换到局部坐标：q_local = q_inst^{-1} * q_world * q_inst
+        offset_quat_world = offsets_world["offset_quat"]
+        quats_per_pts = _normalize_quat(node_state_rigid.instances_quats[resolved_frame_idx][node_state_rigid.point_ids[..., 0]])
+        quats_inv = _quat_conjugate(quats_per_pts)
+        offset_quat = _normalize_quat(_quat_multiply(_quat_multiply(quats_inv, offset_quat_world), quats_per_pts))
+        
+        # 其他偏移量（scales, opacity, sh）是标量或颜色，不需要坐标变换
+        return {
+            "offset_pos": offset_pos_local,
+            "offset_scales": offsets_world["offset_scales"],  # 尺度不变
+            "offset_quat": offset_quat,
+            "offset_opacity": offsets_world["offset_opacity"],  # 不变
+            "offset_sh": offsets_world["offset_sh"],  # 不变
+        }
+
+    def _build_3d_feature_volume(
+        self,
+        node_state_bg: NodeState,
+        node_state_rigid: Optional[NodeStateRigid],
+        source_frame_idx: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        rigid_visible_mask = None
+        if node_state_rigid is not None:
+            node_state_rigid.cur_frame = source_frame_idx
+            resolved_frame_idx = self._resolve_rigid_frame_idx(node_state_rigid, source_frame_idx)
+            visibility = node_state_rigid.instances_fv[resolved_frame_idx]
+            rigid_visible_mask = visibility[node_state_rigid.point_ids[..., 0]].bool()
+
+        means_bg = node_state_bg.means
+        anchor_rgb_bg = _sh_to_rgb(node_state_bg.sh_dc)
+
+        means_rigid_world_all = torch.empty(0, 3, device=self.device)
+        anchor_rgb_rigid_all = torch.empty(0, 3, device=self.device)
+        if node_state_rigid is not None:
+            means_rigid_world_all = self._transform_rigid_to_world(node_state_rigid, node_state_rigid.means)
+            anchor_rgb_rigid_all = _sh_to_rgb(node_state_rigid.sh_dc)
+
+        if rigid_visible_mask is not None:
+            means_rigid_world = means_rigid_world_all[rigid_visible_mask]
+            anchor_rgb_rigid = anchor_rgb_rigid_all[rigid_visible_mask]
+        else:
+            means_rigid_world = means_rigid_world_all
+            anchor_rgb_rigid = anchor_rgb_rigid_all
+
+        means_all = torch.cat([means_bg, means_rigid_world], dim=0)
+        anchor_rgb_all = torch.cat([anchor_rgb_bg, anchor_rgb_rigid], dim=0)
+
+        sparse_feat, vol_dim, valid_coords = self.construct_sparse_tensor(
+            raw_coords=means_all.clone(),
+            feats=anchor_rgb_all,
+            Bbx_max=self.bbx_max,
+            Bbx_min=self.bbx_min,
+            voxel_size=self.voxel_size,
+            device=self.device,
+        )
+        feat_3d = self.sparse_conv(sparse_feat)
+        dense_volume = self.sparse_to_dense_volume(
+            sparse_tensor=feat_3d,
+            coords=valid_coords,
+            vol_dim=vol_dim,
+        ).unsqueeze(dim=0)
+        dense_volume = dense_volume.permute(0, 4, 3, 2, 1)
+
+        grid_coords_bg = self.get_grid_coords(means_bg, self.bbx_min, vol_dim, self.voxel_size)
+        feat_3d_crop_bg = self.interpolate_features(grid_coords_bg, dense_volume)
+
+        if node_state_rigid is not None:
+            feat_3d_crop_rigid = torch.zeros(
+                (means_rigid_world_all.shape[0], feat_3d_crop_bg.shape[1]), device=self.device
+            )
+            if means_rigid_world.shape[0] > 0:
+                grid_coords_rigid = self.get_grid_coords(means_rigid_world, self.bbx_min, vol_dim, self.voxel_size)
+                feat_3d_crop_rigid_visible = self.interpolate_features(grid_coords_rigid, dense_volume)
+                if rigid_visible_mask is not None:
+                    feat_3d_crop_rigid[rigid_visible_mask] = feat_3d_crop_rigid_visible
+                else:
+                    feat_3d_crop_rigid = feat_3d_crop_rigid_visible
+        else:
+            feat_3d_crop_rigid = torch.empty(0, feat_3d_crop_bg.shape[1], device=self.device)
+
+        del dense_volume
+        return feat_3d_crop_bg, feat_3d_crop_rigid, rigid_visible_mask
+
+    def _mask_rigid_offsets(
+        self, offsets: Dict[str, torch.Tensor], visible_mask: Optional[torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        if visible_mask is None or visible_mask.numel() == 0:
+            return offsets
+        mask = visible_mask.to(offsets["offset_pos"].device)
+        mask_vec = mask.unsqueeze(-1).float()
+        offset_quat = offsets["offset_quat"]
+        identity_quat = torch.zeros_like(offset_quat)
+        identity_quat[..., 0] = 1.0
+        return {
+            "offset_pos": offsets["offset_pos"] * mask_vec,
+            "offset_scales": offsets["offset_scales"] * mask_vec,
+            "offset_quat": torch.where(mask.unsqueeze(-1), offset_quat, identity_quat),
+            "offset_opacity": offsets["offset_opacity"] * mask_vec,
+            "offset_sh": offsets["offset_sh"] * mask_vec,
+        }
 
     def get_grid_coords(
         self, position_w: torch.Tensor, bbx_min: torch.Tensor, vol_dim, voxel_size: float
@@ -680,19 +1127,39 @@ class StreetForwardTrainer(nn.Module):
         update_state: bool = True,
         evaluate_test: bool = False,
     ) -> Dict:
-        key, node_state = self._get_or_init_node_state(batch)
-        target_views = batch["target_views"]
-        gt_images = batch["gt_images"]
-        
+        key, node_state_bg, node_state_rigid = self._get_or_init_node_states(batch)
+        targets = []
+        if "targets" in batch:
+            for target in batch["targets"]:
+                targets.append(
+                    {
+                        "frame_idx": target.get("frame_idx", batch.get("source_frame_idx", 0)),
+                        "view": target["view"],
+                        "gt_image": target["gt_image"],
+                    }
+                )
+        else:
+            target_views = batch.get("target_views", [])
+            gt_images = batch.get("gt_images", [])
+            for view, gt_img in zip(target_views, gt_images):
+                targets.append(
+                    {
+                        "frame_idx": batch.get("source_frame_idx", 0),
+                        "view": view,
+                        "gt_image": gt_img,
+                    }
+                )
+
         # Skip if no target views (no supervision)
-        if len(target_views) == 0:
+        if len(targets) == 0:
             return {
                 "total_loss": torch.tensor(0.0, device=self.device),
-                "node_state": node_state,
+                "node_state": node_state_bg,
+                "node_state_rigid": node_state_rigid,
                 "outputs": [],
             }
         
-        view_count = len(target_views)
+        view_count = len(targets)
         outputs = []
         total_loss_val = 0.0  # Use scalar to avoid keeping computation graph
         test_metrics = None
@@ -700,12 +1167,77 @@ class StreetForwardTrainer(nn.Module):
         self.optimizer.zero_grad(set_to_none=True)
 
         for inner_iter_idx in range(self.inner_iterations):
-            render_params = self._compute_render_params(node_state)
-            proxies = self._create_proxy_params(render_params)
+            source_frame_idx = batch.get("source_frame_idx")
+            if source_frame_idx is None:
+                raise ValueError(
+                    "source_frame_idx is required but not found in batch. "
+                    "Please ensure the batch contains source_frame_idx."
+                )
+            source_frame_idx = int(source_frame_idx)
+            feat_bg, feat_rigid, rigid_visible_mask = self._build_3d_feature_volume(
+                node_state_bg=node_state_bg,
+                node_state_rigid=node_state_rigid,
+                source_frame_idx=source_frame_idx,
+            )
+            offsets_bg = self._predict_offsets(feat_bg)
+            offsets_rigid_world = None
+            if node_state_rigid is not None and feat_rigid.shape[0] > 0:
+                offsets_rigid_world = self._predict_offsets(feat_rigid)
+                offsets_rigid_world = self._mask_rigid_offsets(offsets_rigid_world, rigid_visible_mask)
 
-            for view_idx, (view, gt_img) in enumerate(zip(target_views, gt_images)):
+            render_params_bg = self._render_params_from_offsets(node_state_bg, offsets_bg)
+            render_params_rigid = None
+            if node_state_rigid is not None and offsets_rigid_world is not None:
+                # 将世界坐标的偏移量变换到局部坐标
+                offsets_rigid_local = self._transform_offsets_world_to_local(
+                    node_state_rigid, offsets_rigid_world, source_frame_idx
+                )
+                render_params_rigid = self._render_params_from_offsets(node_state_rigid, offsets_rigid_local)
+
+            proxies_bg = self._create_proxy_params(render_params_bg)
+            proxies_rigid = self._create_proxy_params(render_params_rigid) if render_params_rigid is not None else None
+
+            for view_idx, target in enumerate(targets):
+                view = target["view"]
+                gt_img = target["gt_image"]
+                target_frame_idx = int(target.get("frame_idx", source_frame_idx))
                 height, width = gt_img.shape[0], gt_img.shape[1]
-                rgb, acc = self._render_single_view(proxies, view, height, width)
+                resolved_frame_idx = None
+                if node_state_rigid is not None:
+                    node_state_rigid.cur_frame = target_frame_idx
+                    resolved_frame_idx = self._resolve_rigid_frame_idx(node_state_rigid, target_frame_idx)
+                if proxies_rigid is not None and node_state_rigid is not None:
+                    means_rigid_world = self._transform_rigid_to_world(node_state_rigid, proxies_rigid["means_p"])
+                    quats_rigid_world = self._transform_rigid_quats_to_world(node_state_rigid, proxies_rigid["quats_p"])
+                    if resolved_frame_idx is not None:
+                        visibility = node_state_rigid.instances_fv[resolved_frame_idx]
+                        valid_mask = visibility[node_state_rigid.point_ids[..., 0]].float()
+                        opacities_rigid = proxies_rigid["opacities_p"] * valid_mask
+                    else:
+                        opacities_rigid = proxies_rigid["opacities_p"]
+                else:
+                    means_rigid_world = torch.empty(0, 3, device=self.device)
+                    quats_rigid_world = torch.empty(0, 4, device=self.device)
+                    opacities_rigid = None
+                merged_means = torch.cat([proxies_bg["means_p"], means_rigid_world], dim=0)
+                merged_quats = torch.cat([proxies_bg["quats_p"], quats_rigid_world], dim=0)
+                if proxies_rigid is not None:
+                    merged_scales = torch.cat([proxies_bg["scales_p"], proxies_rigid["scales_p"]], dim=0)
+                    merged_opacities = torch.cat([proxies_bg["opacities_p"], opacities_rigid], dim=0)
+                    merged_colors = torch.cat([proxies_bg["colors_p"], proxies_rigid["colors_p"]], dim=0)
+                else:
+                    merged_scales = proxies_bg["scales_p"]
+                    merged_opacities = proxies_bg["opacities_p"]
+                    merged_colors = proxies_bg["colors_p"]
+
+                merged_params = {
+                    "means_p": merged_means,
+                    "scales_p": merged_scales,
+                    "quats_p": merged_quats,
+                    "opacities_p": merged_opacities,
+                    "colors_p": merged_colors,
+                }
+                rgb, acc = self._render_single_view(merged_params, view, height, width)
                 loss = self.compute_loss(rgb, gt_img) / view_count
                 total_loss_val += float(loss.detach())  # Accumulate scalar to avoid keeping graph
                 loss.backward()
@@ -720,21 +1252,38 @@ class StreetForwardTrainer(nn.Module):
                 else:
                     outputs.append({"loss": loss.detach().item()})
 
-            render_tensors = [
-                render_params["means_r"],
-                render_params["scales_r"],
-                render_params["quats_r"],
-                render_params["opacities_r"],
-                render_params["colors_r"],
+            render_tensors_bg = [
+                render_params_bg["means_r"],
+                render_params_bg["scales_r"],
+                render_params_bg["quats_r"],
+                render_params_bg["opacities_r"],
+                render_params_bg["colors_r"],
             ]
-            proxy_grads = [
-                proxies["means_p"].grad if proxies["means_p"].grad is not None else torch.zeros_like(proxies["means_p"]),
-                proxies["scales_p"].grad if proxies["scales_p"].grad is not None else torch.zeros_like(proxies["scales_p"]),
-                proxies["quats_p"].grad if proxies["quats_p"].grad is not None else torch.zeros_like(proxies["quats_p"]),
-                proxies["opacities_p"].grad if proxies["opacities_p"].grad is not None else torch.zeros_like(proxies["opacities_p"]),
-                proxies["colors_p"].grad if proxies["colors_p"].grad is not None else torch.zeros_like(proxies["colors_p"]),
+            proxy_grads_bg = [
+                proxies_bg["means_p"].grad if proxies_bg["means_p"].grad is not None else torch.zeros_like(proxies_bg["means_p"]),
+                proxies_bg["scales_p"].grad if proxies_bg["scales_p"].grad is not None else torch.zeros_like(proxies_bg["scales_p"]),
+                proxies_bg["quats_p"].grad if proxies_bg["quats_p"].grad is not None else torch.zeros_like(proxies_bg["quats_p"]),
+                proxies_bg["opacities_p"].grad if proxies_bg["opacities_p"].grad is not None else torch.zeros_like(proxies_bg["opacities_p"]),
+                proxies_bg["colors_p"].grad if proxies_bg["colors_p"].grad is not None else torch.zeros_like(proxies_bg["colors_p"]),
             ]
-            torch.autograd.backward(tensors=render_tensors, grad_tensors=proxy_grads)
+            torch.autograd.backward(tensors=render_tensors_bg, grad_tensors=proxy_grads_bg)
+
+            if render_params_rigid is not None and proxies_rigid is not None:
+                render_tensors_rigid = [
+                    render_params_rigid["means_r"],
+                    render_params_rigid["scales_r"],
+                    render_params_rigid["quats_r"],
+                    render_params_rigid["opacities_r"],
+                    render_params_rigid["colors_r"],
+                ]
+                proxy_grads_rigid = [
+                    proxies_rigid["means_p"].grad if proxies_rigid["means_p"].grad is not None else torch.zeros_like(proxies_rigid["means_p"]),
+                    proxies_rigid["scales_p"].grad if proxies_rigid["scales_p"].grad is not None else torch.zeros_like(proxies_rigid["scales_p"]),
+                    proxies_rigid["quats_p"].grad if proxies_rigid["quats_p"].grad is not None else torch.zeros_like(proxies_rigid["quats_p"]),
+                    proxies_rigid["opacities_p"].grad if proxies_rigid["opacities_p"].grad is not None else torch.zeros_like(proxies_rigid["opacities_p"]),
+                    proxies_rigid["colors_p"].grad if proxies_rigid["colors_p"].grad is not None else torch.zeros_like(proxies_rigid["colors_p"]),
+                ]
+                torch.autograd.backward(tensors=render_tensors_rigid, grad_tensors=proxy_grads_rigid)
 
             if apply_update:
                 self.optimizer.step()
@@ -744,16 +1293,27 @@ class StreetForwardTrainer(nn.Module):
                 with torch.no_grad():
                     # Clamp means only when writing back to node_state (not during backprop)
                     means_clamped = torch.clamp(
-                        render_params["means_r"].detach(), min=self.bbx_min, max=self.bbx_max
+                        render_params_bg["means_r"].detach(), min=self.bbx_min, max=self.bbx_max
                     )
-                    node_state.means.copy_(means_clamped)
-                    node_state.scales_log.copy_(render_params["scales_log_r"].detach())
-                    node_state.quats.copy_(render_params["quats_r"].detach())
-                    node_state.opacity_logit.copy_(render_params["opacity_logit_r"].detach())
-                    node_state.sh_dc.copy_(render_params["sh_dc_r"].detach())
-                    node_state.sh_rest.copy_(render_params["sh_rest_r"].detach())
+                    node_state_bg.means.copy_(means_clamped)
+                    node_state_bg.scales_log.copy_(render_params_bg["scales_log_r"].detach())
+                    node_state_bg.quats.copy_(render_params_bg["quats_r"].detach())
+                    node_state_bg.opacity_logit.copy_(render_params_bg["opacity_logit_r"].detach())
+                    node_state_bg.sh_dc.copy_(render_params_bg["sh_dc_r"].detach())
+                    node_state_bg.sh_rest.copy_(render_params_bg["sh_rest_r"].detach())
+                    if node_state_rigid is not None and render_params_rigid is not None:
+                        node_state_rigid.means.copy_(render_params_rigid["means_r"].detach())
+                        node_state_rigid.scales_log.copy_(render_params_rigid["scales_log_r"].detach())
+                        node_state_rigid.quats.copy_(render_params_rigid["quats_r"].detach())
+                        node_state_rigid.opacity_logit.copy_(render_params_rigid["opacity_logit_r"].detach())
+                        node_state_rigid.sh_dc.copy_(render_params_rigid["sh_dc_r"].detach())
+                        node_state_rigid.sh_rest.copy_(render_params_rigid["sh_rest_r"].detach())
 
-        self.node_states[key] = node_state.detach_clone()
+        self.node_states[key] = node_state_bg.detach_clone()
+        if node_state_rigid is not None:
+            self.node_states_rigid[key] = node_state_rigid.detach_clone()
+        else:
+            self.node_states_rigid[key] = None
         if apply_update:
             self.global_step += 1
             self._log_to_tensorboard(total_loss_val, outputs)
@@ -773,6 +1333,7 @@ class StreetForwardTrainer(nn.Module):
         return {
             "total_loss": torch.tensor(total_loss_val, device=self.device),
             "node_state": self.node_states[key],
+            "node_state_rigid": self.node_states_rigid.get(key),
             "outputs": outputs,
             "test_metrics": test_metrics,
         }
@@ -901,6 +1462,11 @@ class StreetForwardTrainer(nn.Module):
             f"scene_{scene}_segment_{segment}": self._node_state_to_dict(state)
             for (scene, segment), state in self.node_states.items()
         }
+        rigid_state_dict = {
+            f"scene_{scene}_segment_{segment}": self._node_state_rigid_to_dict(state)
+            for (scene, segment), state in self.node_states_rigid.items()
+            if state is not None
+        }
 
         checkpoint = {
             "step": step_val,
@@ -908,6 +1474,7 @@ class StreetForwardTrainer(nn.Module):
             "model_state_dict": model_state_dict,
             "optimizer_state_dict": self.optimizer.state_dict(),
             "node_states": nodes_state_dict,
+            "node_states_rigid": rigid_state_dict,
         }
         try:
             checkpoint["config"] = OmegaConf.to_container(self.config, resolve=False)
@@ -965,6 +1532,26 @@ class StreetForwardTrainer(nn.Module):
                 restored_nodes[(scene_id, segment_id)] = self._node_state_from_dict(state)
             if restored_nodes:
                 self.node_states = restored_nodes
+                self.node_states_bg = self.node_states
+
+        rigid_state_dict = checkpoint.get("node_states_rigid")
+        if rigid_state_dict is not None:
+            restored_rigid: Dict[Tuple[int, int], Optional[NodeStateRigid]] = {}
+            for key, state in rigid_state_dict.items():
+                scene_id, segment_id = None, None
+                if isinstance(key, str) and key.startswith("scene_") and "_segment_" in key:
+                    try:
+                        scene_id = int(key.split("scene_")[1].split("_segment_")[0])
+                        segment_id = int(key.split("_segment_")[1])
+                    except Exception:
+                        scene_id, segment_id = None, None
+                elif isinstance(key, (tuple, list)) and len(key) == 2:
+                    scene_id, segment_id = int(key[0]), int(key[1])
+                if scene_id is None or segment_id is None:
+                    continue
+                restored_rigid[(scene_id, segment_id)] = self._node_state_rigid_from_dict(state)
+            if restored_rigid:
+                self.node_states_rigid = restored_rigid
 
         self.global_step = int(checkpoint.get("global_step", checkpoint.get("step", 0)))
         logger.info(f"Checkpoint loaded from {checkpoint_path} (step={self.global_step})")

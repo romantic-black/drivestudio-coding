@@ -1348,6 +1348,112 @@ class MultiSceneDataset:
         
         return frame_idx
     
+    def _build_dynamic_info(
+        self,
+        scene_dataset: DrivingDataset,
+        frame_indices: List[int],
+    ) -> Optional[Dict]:
+        """
+        从 scene_dataset 的 instances_pose 构建 dynamic_info。
+        
+        Args:
+            scene_dataset: 场景数据集实例
+            frame_indices: 需要构建 dynamic_info 的帧索引列表
+            
+        Returns:
+            dynamic_info: Dict[int, Dict] 格式，{frame_idx: {"instances": {instance_id: {"quat": ..., "trans": ...}}}}
+            如果 instances_pose 不存在，返回 None
+        """
+        pixel_source = scene_dataset.pixel_source
+        if pixel_source is None or pixel_source.instances_pose is None:
+            return None
+        
+        instances_pose = pixel_source.instances_pose  # [num_frames, num_instances, 4, 4]
+        per_frame_mask = getattr(pixel_source, "per_frame_instance_mask", None)
+        if not isinstance(instances_pose, torch.Tensor):
+            instances_pose = torch.as_tensor(instances_pose, device=self.device)
+        if per_frame_mask is not None and not isinstance(per_frame_mask, torch.Tensor):
+            per_frame_mask = torch.as_tensor(per_frame_mask, device=instances_pose.device)
+        if per_frame_mask is not None:
+            per_frame_mask = per_frame_mask.to(device=instances_pose.device, dtype=torch.bool)
+        
+        # 检查 frame_indices 是否在有效范围内
+        num_frames = instances_pose.shape[0]
+        valid_frame_indices = [fidx for fidx in frame_indices if 0 <= fidx < num_frames]
+        
+        if len(valid_frame_indices) == 0:
+            return None
+        
+        dynamic_info = {}
+        num_instances = instances_pose.shape[1]
+        
+        for frame_idx in valid_frame_indices:
+            frame_instances = {}
+            
+            if per_frame_mask is not None:
+                if frame_idx >= per_frame_mask.shape[0]:
+                    visible_instance_ids = []
+                else:
+                    visible_instance_ids = torch.nonzero(per_frame_mask[frame_idx], as_tuple=False).view(-1).tolist()
+            else:
+                visible_instance_ids = list(range(num_instances))
+
+            for instance_id in visible_instance_ids:
+                # 获取实例的位姿矩阵 [4, 4]
+                pose_matrix = instances_pose[frame_idx, instance_id]  # [4, 4]
+                
+                # 提取旋转矩阵 [3, 3] 和平移向量 [3]
+                rot_matrix = pose_matrix[:3, :3]  # [3, 3]
+                trans = pose_matrix[:3, 3]  # [3]
+                
+                # 将旋转矩阵转换为四元数 (wxyz 格式)
+                # 使用 Shepperd's method (更稳定的方法)
+                trace = rot_matrix[0, 0] + rot_matrix[1, 1] + rot_matrix[2, 2]
+                
+                if trace > 0:
+                    s = torch.sqrt(trace + 1.0) * 2  # s = 4 * qw
+                    w = 0.25 * s
+                    x = (rot_matrix[2, 1] - rot_matrix[1, 2]) / s
+                    y = (rot_matrix[0, 2] - rot_matrix[2, 0]) / s
+                    z = (rot_matrix[1, 0] - rot_matrix[0, 1]) / s
+                elif rot_matrix[0, 0] > rot_matrix[1, 1] and rot_matrix[0, 0] > rot_matrix[2, 2]:
+                    s = torch.sqrt(1.0 + rot_matrix[0, 0] - rot_matrix[1, 1] - rot_matrix[2, 2]) * 2
+                    w = (rot_matrix[2, 1] - rot_matrix[1, 2]) / s
+                    x = 0.25 * s
+                    y = (rot_matrix[0, 1] + rot_matrix[1, 0]) / s
+                    z = (rot_matrix[0, 2] + rot_matrix[2, 0]) / s
+                elif rot_matrix[1, 1] > rot_matrix[2, 2]:
+                    s = torch.sqrt(1.0 + rot_matrix[1, 1] - rot_matrix[0, 0] - rot_matrix[2, 2]) * 2
+                    w = (rot_matrix[0, 2] - rot_matrix[2, 0]) / s
+                    x = (rot_matrix[0, 1] + rot_matrix[1, 0]) / s
+                    y = 0.25 * s
+                    z = (rot_matrix[1, 2] + rot_matrix[2, 1]) / s
+                else:
+                    s = torch.sqrt(1.0 + rot_matrix[2, 2] - rot_matrix[0, 0] - rot_matrix[1, 1]) * 2
+                    w = (rot_matrix[1, 0] - rot_matrix[0, 1]) / s
+                    x = (rot_matrix[0, 2] + rot_matrix[2, 0]) / s
+                    y = (rot_matrix[1, 2] + rot_matrix[2, 1]) / s
+                    z = 0.25 * s
+                
+                quat = torch.stack([w, x, y, z])  # [4] wxyz format
+                
+                # 转换为 numpy 或 Python list (确保可以序列化)
+                if isinstance(quat, torch.Tensor):
+                    quat = quat.cpu().numpy().tolist()
+                if isinstance(trans, torch.Tensor):
+                    trans = trans.cpu().numpy().tolist()
+                
+                frame_instances[int(instance_id)] = {
+                    "quat": quat,
+                    "trans": trans,
+                }
+            
+            dynamic_info[int(frame_idx)] = {
+                "instances": frame_instances,
+            }
+        
+        return dynamic_info if len(dynamic_info) > 0 else None
+    
     def get_segment_batch(
         self,
         scene_id: int,
@@ -1464,6 +1570,21 @@ class MultiSceneDataset:
                 scene_id=scene_id,
                 segment_id=segment_id,
             )
+        
+        # 6.5. Build dynamic_info (if pointcloud contains dynamic objects)
+        dynamic_info = None
+        if pointcloud is not None and isinstance(pointcloud, dict) and "dynamic" in pointcloud:
+            # 收集所有相关的 frame_idx
+            all_frame_indices = set(source_frame_indices + target_frame_indices)
+            if include_test:
+                all_frame_indices.update(segment.get('test_frame_indices', []))
+            
+            # 从 pixel_source 获取动态物体信息
+            if scene_dataset.pixel_source is not None and scene_dataset.pixel_source.instances_pose is not None:
+                dynamic_info = self._build_dynamic_info(
+                    scene_dataset=scene_dataset,
+                    frame_indices=list(all_frame_indices),
+                )
 
         # 7. Load test views if requested and available
         test_images: List[Tensor] = []
@@ -1536,6 +1657,10 @@ class MultiSceneDataset:
         # Add pointcloud to batch if generated
         if pointcloud is not None:
             batch['pointcloud'] = pointcloud
+        
+        # Add dynamic_info to batch if available
+        if dynamic_info is not None:
+            batch['dynamic_info'] = dynamic_info
         
         # Add test views if available
         if include_test and len(test_images) > 0:

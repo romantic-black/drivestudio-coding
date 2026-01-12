@@ -166,11 +166,11 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
 
         # 提取背景和动态点云
         lidar_background = lidar_result["background"]  # [N1, 6]
-        lidar_dynamic = lidar_result["dynamic_objects"]  # Dict[int, np.ndarray]
+        lidar_dynamic = lidar_result["dynamic"]  # Dict[int, np.ndarray]
         lidar_instance_mapping = lidar_result["instance_mapping"]
 
         monocular_background = monocular_result["background"]  # [N2, 6]
-        monocular_dynamic = monocular_result["dynamic_objects"]  # Dict[int, np.ndarray]
+        monocular_dynamic = monocular_result["dynamic"]  # Dict[int, np.ndarray]
         monocular_instance_mapping = monocular_result["instance_mapping"]
 
         # 统一实例映射（使用LiDAR的映射，因为它是更稳定的来源）
@@ -206,7 +206,7 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
 
         return {
             "background": fused_background,
-            "dynamic_objects": fused_dynamic,
+            "dynamic": fused_dynamic,
             "instance_mapping": instance_mapping,
             "metadata": metadata,
         }

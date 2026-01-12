@@ -159,7 +159,7 @@ class LiDARRGBPointCloudGenerator(RGBPointCloudGenerator):
 
         return {
             "background": background,
-            "dynamic_objects": dynamic_objects,
+            "dynamic": dynamic_objects,
             "instance_mapping": instance_mapping,
             "metadata": metadata,
         }
