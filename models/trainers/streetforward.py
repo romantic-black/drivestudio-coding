@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import logging
 import os
+import json
+import time
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
@@ -27,6 +29,27 @@ except ImportError:
     _sklearn_available = False
 
 logger = logging.getLogger(__name__)
+
+# Debug logging configuration
+_DEBUG_LOG_PATH = "/root/drivestudio-coding/.cursor/debug.log"
+
+def _debug_log(location: str, message: str, data: dict, hypothesis_id: str = None, run_id: str = "initial"):
+    """Write debug log entry in NDJSON format."""
+    try:
+        entry = {
+            "timestamp": int(time.time() * 1000),
+            "location": location,
+            "message": message,
+            "data": data,
+            "sessionId": "debug-session",
+            "runId": run_id,
+        }
+        if hypothesis_id:
+            entry["hypothesisId"] = hypothesis_id
+        with open(_DEBUG_LOG_PATH, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception as e:
+        logger.debug(f"Failed to write debug log: {e}")
 
 
 def _num_sh_bases(degree: int) -> int:
@@ -752,6 +775,19 @@ class StreetForwardTrainer(nn.Module):
     def _transform_rigid_to_world(
         self, node_state_rigid: NodeStateRigid, means_local: torch.Tensor
     ) -> torch.Tensor:
+        # #region agent log
+        _debug_log(
+            "streetforward.py:_transform_rigid_to_world",
+            "Transforming rigid to world",
+            {
+                "num_points": means_local.shape[0],
+                "cur_frame": node_state_rigid.cur_frame,
+                "means_local_requires_grad": means_local.requires_grad,
+                "means_local_is_leaf": means_local.is_leaf,
+            },
+            hypothesis_id="H2",
+        )
+        # #endregion
         frame_idx = self._resolve_rigid_frame_idx(node_state_rigid, node_state_rigid.cur_frame)
         quats_cur_frame = node_state_rigid.instances_quats[frame_idx]
         trans_cur_frame = node_state_rigid.instances_trans[frame_idx]
@@ -759,6 +795,18 @@ class StreetForwardTrainer(nn.Module):
         rot_per_pts = rot_cur_frame[node_state_rigid.point_ids[..., 0]]
         trans_per_pts = trans_cur_frame[node_state_rigid.point_ids[..., 0]]
         means_world = torch.bmm(rot_per_pts, means_local.unsqueeze(-1)).squeeze(-1) + trans_per_pts
+        # #region agent log
+        _debug_log(
+            "streetforward.py:_transform_rigid_to_world",
+            "Transformation complete",
+            {
+                "means_world_requires_grad": means_world.requires_grad,
+                "means_world_is_leaf": means_world.is_leaf,
+                "grad_fn": str(means_world.grad_fn),
+            },
+            hypothesis_id="H2",
+        )
+        # #endregion
         return means_world
 
     def _transform_rigid_quats_to_world(
@@ -821,6 +869,21 @@ class StreetForwardTrainer(nn.Module):
         node_state_rigid: Optional[NodeStateRigid],
         source_frame_idx: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        # #region agent log
+        if torch.cuda.is_available():
+            _debug_log(
+                "streetforward.py:_build_3d_feature_volume",
+                "Start building 3D feature volume",
+                {
+                    "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
+                    "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
+                    "num_bg_points": node_state_bg.means.shape[0],
+                    "has_rigid": node_state_rigid is not None,
+                },
+                hypothesis_id="H5",
+            )
+        # #endregion
+        
         rigid_visible_mask = None
         if node_state_rigid is not None:
             node_state_rigid.cur_frame = source_frame_idx
@@ -847,6 +910,22 @@ class StreetForwardTrainer(nn.Module):
         means_all = torch.cat([means_bg, means_rigid_world], dim=0)
         anchor_rgb_all = torch.cat([anchor_rgb_bg, anchor_rgb_rigid], dim=0)
 
+        # #region agent log
+        if torch.cuda.is_available():
+            _debug_log(
+                "streetforward.py:_build_3d_feature_volume",
+                "Before construct_sparse_tensor",
+                {
+                    "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
+                    "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
+                    "num_total_points": means_all.shape[0],
+                    "means_all_size_mb": means_all.numel() * 4 / 1024**2,
+                    "anchor_rgb_all_size_mb": anchor_rgb_all.numel() * 4 / 1024**2,
+                },
+                hypothesis_id="H5",
+            )
+        # #endregion
+
         sparse_feat, vol_dim, valid_coords = self.construct_sparse_tensor(
             raw_coords=means_all.clone(),
             feats=anchor_rgb_all,
@@ -855,32 +934,192 @@ class StreetForwardTrainer(nn.Module):
             voxel_size=self.voxel_size,
             device=self.device,
         )
+        
+        # #region agent log
+        if torch.cuda.is_available():
+            num_voxels = sparse_feat.feats.shape[0] if hasattr(sparse_feat, 'feats') else 0
+            sparse_feat_size = sparse_feat.feats.numel() * 4 / 1024**2 if hasattr(sparse_feat, 'feats') else 0
+            _debug_log(
+                "streetforward.py:_build_3d_feature_volume",
+                "After construct_sparse_tensor, before sparse_conv",
+                {
+                    "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
+                    "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
+                    "num_voxels": num_voxels,
+                    "vol_dim": vol_dim.tolist() if isinstance(vol_dim, torch.Tensor) else vol_dim,
+                    "sparse_feat_size_mb": sparse_feat_size,
+                    "valid_coords_size_mb": valid_coords.numel() * 4 / 1024**2,
+                },
+                hypothesis_id="H5",
+            )
+        # #endregion
+        
         feat_3d = self.sparse_conv(sparse_feat)
-        dense_volume = self.sparse_to_dense_volume(
-            sparse_tensor=feat_3d,
-            coords=valid_coords,
-            vol_dim=vol_dim,
-        ).unsqueeze(dim=0)
+        
+        # #region agent log
+        if torch.cuda.is_available():
+            # sparse_conv returns torch.Tensor (x.F), not SparseTensor
+            if isinstance(feat_3d, torch.Tensor):
+                feat_3d_size = feat_3d.numel() * 4 / 1024**2
+                feat_3d_shape = list(feat_3d.shape)
+            elif hasattr(feat_3d, 'feats'):
+                feat_3d_size = feat_3d.feats.numel() * 4 / 1024**2
+                feat_3d_shape = list(feat_3d.feats.shape)
+            else:
+                feat_3d_size = 0
+                feat_3d_shape = None
+            
+            # Calculate expected dense volume size
+            vol_dim_list = vol_dim.tolist() if isinstance(vol_dim, torch.Tensor) else vol_dim
+            if isinstance(feat_3d, torch.Tensor):
+                outdim = feat_3d.shape[-1]
+            elif hasattr(feat_3d, 'feats'):
+                outdim = feat_3d.feats.shape[-1]
+            else:
+                outdim = 32  # default
+            expected_dense_size_mb = vol_dim_list[0] * vol_dim_list[1] * vol_dim_list[2] * outdim * 4 / 1024**2
+            
+            _debug_log(
+                "streetforward.py:_build_3d_feature_volume",
+                "After sparse_conv, before sparse_to_dense_volume",
+                {
+                    "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
+                    "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
+                    "feat_3d_size_mb": feat_3d_size,
+                    "feat_3d_shape": feat_3d_shape,
+                    "feat_3d_type": str(type(feat_3d)),
+                    "expected_dense_size_mb": expected_dense_size_mb,
+                    "vol_dim": vol_dim_list,
+                    "outdim": outdim,
+                },
+                hypothesis_id="H5",
+            )
+        # #endregion
+        
+        # #region agent log
+        if torch.cuda.is_available():
+            _debug_log(
+                "streetforward.py:_build_3d_feature_volume",
+                "Right before sparse_to_dense_volume (critical memory point)",
+                {
+                    "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
+                    "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
+                    "free_mb": (torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_reserved() * 1024**2) / 1024**2,
+                },
+                hypothesis_id="H5",
+            )
+        # #endregion
+        
+        try:
+            dense_volume = self.sparse_to_dense_volume(
+                sparse_tensor=feat_3d,
+                coords=valid_coords,
+                vol_dim=vol_dim,
+            ).unsqueeze(dim=0)
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                # #region agent log
+                if torch.cuda.is_available():
+                    _debug_log(
+                        "streetforward.py:_build_3d_feature_volume",
+                        "OOM ERROR in sparse_to_dense_volume",
+                        {
+                            "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
+                            "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
+                            "error": str(e),
+                            "vol_dim": vol_dim.tolist() if isinstance(vol_dim, torch.Tensor) else vol_dim,
+                        },
+                        hypothesis_id="H5",
+                    )
+                # #endregion
+            raise
+        
+        # #region agent log
+        if torch.cuda.is_available():
+            vol_dim_list = vol_dim.tolist() if isinstance(vol_dim, torch.Tensor) else vol_dim
+            dense_volume_size = dense_volume.numel() * 4 / 1024**2
+            expected_dense_size = vol_dim_list[0] * vol_dim_list[1] * vol_dim_list[2] * dense_volume.shape[-1] * 4 / 1024**2
+            _debug_log(
+                "streetforward.py:_build_3d_feature_volume",
+                "After sparse_to_dense_volume, before permute",
+                {
+                    "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
+                    "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
+                    "dense_volume_size_mb": dense_volume_size,
+                    "dense_volume_shape": list(dense_volume.shape),
+                    "expected_dense_size_mb": expected_dense_size,
+                    "vol_dim": vol_dim_list,
+                    "memory_increase_mb": torch.cuda.memory_allocated() / 1024**2 - 11048.23,  # Compare with before sparse_conv
+                },
+                hypothesis_id="H5",
+            )
+        # #endregion
+        
         dense_volume = dense_volume.permute(0, 4, 3, 2, 1)
 
         grid_coords_bg = self.get_grid_coords(means_bg, self.bbx_min, vol_dim, self.voxel_size)
         feat_3d_crop_bg = self.interpolate_features(grid_coords_bg, dense_volume)
 
-        if node_state_rigid is not None:
-            feat_3d_crop_rigid = torch.zeros(
-                (means_rigid_world_all.shape[0], feat_3d_crop_bg.shape[1]), device=self.device
+        # #region agent log
+        if torch.cuda.is_available():
+            _debug_log(
+                "streetforward.py:_build_3d_feature_volume",
+                "After interpolate_features for bg",
+                {
+                    "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
+                    "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
+                    "feat_3d_crop_bg_size_mb": feat_3d_crop_bg.numel() * 4 / 1024**2,
+                    "feat_3d_crop_bg_shape": list(feat_3d_crop_bg.shape),
+                },
+                hypothesis_id="H5",
             )
-            if means_rigid_world.shape[0] > 0:
-                grid_coords_rigid = self.get_grid_coords(means_rigid_world, self.bbx_min, vol_dim, self.voxel_size)
-                feat_3d_crop_rigid_visible = self.interpolate_features(grid_coords_rigid, dense_volume)
+        # #endregion
+
+        if node_state_rigid is not None:
+            if means_rigid_world_all.shape[0] > 0:
+                grid_coords_rigid_all = self.get_grid_coords(
+                    means_rigid_world_all, self.bbx_min, vol_dim, self.voxel_size
+                )
+                feat_3d_crop_rigid_all = self.interpolate_features(grid_coords_rigid_all, dense_volume)
                 if rigid_visible_mask is not None:
-                    feat_3d_crop_rigid[rigid_visible_mask] = feat_3d_crop_rigid_visible
-                else:
-                    feat_3d_crop_rigid = feat_3d_crop_rigid_visible
+                    feat_3d_crop_rigid_all = feat_3d_crop_rigid_all * rigid_visible_mask[:, None].float()
+                feat_3d_crop_rigid = feat_3d_crop_rigid_all
+            else:
+                feat_3d_crop_rigid = torch.empty(
+                    0, feat_3d_crop_bg.shape[1], device=self.device
+                )
         else:
             feat_3d_crop_rigid = torch.empty(0, feat_3d_crop_bg.shape[1], device=self.device)
 
+        # #region agent log
+        if torch.cuda.is_available():
+            _debug_log(
+                "streetforward.py:_build_3d_feature_volume",
+                "Before deleting dense_volume",
+                {
+                    "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
+                    "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
+                    "feat_3d_crop_rigid_size_mb": feat_3d_crop_rigid.numel() * 4 / 1024**2 if feat_3d_crop_rigid.numel() > 0 else 0,
+                },
+                hypothesis_id="H5",
+            )
+        # #endregion
+
         del dense_volume
+        
+        # #region agent log
+        if torch.cuda.is_available():
+            _debug_log(
+                "streetforward.py:_build_3d_feature_volume",
+                "After deleting dense_volume",
+                {
+                    "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
+                    "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
+                },
+                hypothesis_id="H5",
+            )
+        # #endregion
+        
         return feat_3d_crop_bg, feat_3d_crop_rigid, rigid_visible_mask
 
     def _mask_rigid_offsets(
@@ -961,6 +1200,21 @@ class StreetForwardTrainer(nn.Module):
         return feature[0, :, 0, 0, :].T
 
     def _predict_offsets(self, feat_3d_crop: torch.Tensor) -> Dict[str, torch.Tensor]:
+        # #region agent log
+        if torch.cuda.is_available():
+            _debug_log(
+                "streetforward.py:_predict_offsets",
+                "Start predicting offsets",
+                {
+                    "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
+                    "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
+                    "feat_3d_crop_size_mb": feat_3d_crop.numel() * 4 / 1024**2,
+                    "feat_3d_crop_shape": list(feat_3d_crop.shape),
+                },
+                hypothesis_id="H5",
+            )
+        # #endregion
+        
         # Position offset with tanh clamping
         offset_pos = self.offset_max * torch.tanh(self.mlp_offset_pos(feat_3d_crop))
         
@@ -981,6 +1235,31 @@ class StreetForwardTrainer(nn.Module):
         offset_sh_dc = self.sh_dc_max * torch.tanh(sh_dc_raw)
         offset_sh_rest = self.sh_rest_max * torch.tanh(sh_rest_raw)
         offset_sh = torch.cat([offset_sh_dc, offset_sh_rest], dim=-1)
+        
+        # #region agent log
+        if torch.cuda.is_available():
+            total_offset_size = sum(
+                offset_pos.numel() * 4 + offset_scales.numel() * 4 + offset_quat.numel() * 4 +
+                offset_opacity.numel() * 4 + offset_sh.numel() * 4
+            ) / 1024**2
+            _debug_log(
+                "streetforward.py:_predict_offsets",
+                "After predicting offsets",
+                {
+                    "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
+                    "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
+                    "total_offset_size_mb": total_offset_size,
+                    "offset_shapes": {
+                        "offset_pos": list(offset_pos.shape),
+                        "offset_scales": list(offset_scales.shape),
+                        "offset_quat": list(offset_quat.shape),
+                        "offset_opacity": list(offset_opacity.shape),
+                        "offset_sh": list(offset_sh.shape),
+                    },
+                },
+                hypothesis_id="H5",
+            )
+        # #endregion
         
         return {
             "offset_pos": offset_pos,
@@ -1024,13 +1303,37 @@ class StreetForwardTrainer(nn.Module):
         }
 
     def _create_proxy_params(self, render_params: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        return {
+        # #region agent log
+        _debug_log(
+            "streetforward.py:_create_proxy_params",
+            "Creating proxy params",
+            {
+                "num_points": render_params["means_r"].shape[0],
+                "requires_grad_before": render_params["means_r"].requires_grad,
+            },
+            hypothesis_id="H1",
+        )
+        # #endregion
+        proxies = {
             "means_p": render_params["means_r"].detach().requires_grad_(True),
             "scales_p": render_params["scales_r"].detach().requires_grad_(True),
             "quats_p": render_params["quats_r"].detach().requires_grad_(True),
             "opacities_p": render_params["opacities_r"].detach().requires_grad_(True),
             "colors_p": render_params["colors_r"].detach().requires_grad_(True),
         }
+        # #region agent log
+        _debug_log(
+            "streetforward.py:_create_proxy_params",
+            "Proxy params created",
+            {
+                "requires_grad_after": proxies["means_p"].requires_grad,
+                "is_leaf": proxies["means_p"].is_leaf,
+                "grad_fn": str(proxies["means_p"].grad_fn),
+            },
+            hypothesis_id="H1",
+        )
+        # #endregion
+        return proxies
 
     def compute_loss(self, pred_rgb: torch.Tensor, gt_image: torch.Tensor) -> torch.Tensor:
         return torch.mean((pred_rgb - gt_image) ** 2)
@@ -1166,6 +1469,21 @@ class StreetForwardTrainer(nn.Module):
 
         self.optimizer.zero_grad(set_to_none=True)
 
+        # #region agent log
+        if torch.cuda.is_available():
+            _debug_log(
+                "streetforward.py:train_iter",
+                "Before inner iterations",
+                {
+                    "num_targets": len(targets),
+                    "inner_iterations": self.inner_iterations,
+                    "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
+                    "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
+                },
+                hypothesis_id="H4",
+            )
+        # #endregion
+
         for inner_iter_idx in range(self.inner_iterations):
             source_frame_idx = batch.get("source_frame_idx")
             if source_frame_idx is None:
@@ -1179,11 +1497,46 @@ class StreetForwardTrainer(nn.Module):
                 node_state_rigid=node_state_rigid,
                 source_frame_idx=source_frame_idx,
             )
+            
+            # #region agent log
+            if torch.cuda.is_available():
+                _debug_log(
+                    "streetforward.py:train_iter",
+                    "After _build_3d_feature_volume, before _predict_offsets",
+                    {
+                        "inner_iter": inner_iter_idx,
+                        "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
+                        "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
+                        "feat_bg_size_mb": feat_bg.numel() * 4 / 1024**2,
+                        "feat_rigid_size_mb": feat_rigid.numel() * 4 / 1024**2 if feat_rigid.numel() > 0 else 0,
+                    },
+                    hypothesis_id="H5",
+                )
+            # #endregion
+            
             offsets_bg = self._predict_offsets(feat_bg)
             offsets_rigid_world = None
             if node_state_rigid is not None and feat_rigid.shape[0] > 0:
                 offsets_rigid_world = self._predict_offsets(feat_rigid)
                 offsets_rigid_world = self._mask_rigid_offsets(offsets_rigid_world, rigid_visible_mask)
+            
+            # #region agent log
+            if torch.cuda.is_available():
+                _debug_log(
+                    "streetforward.py:train_iter",
+                    "After _predict_offsets, before _render_params_from_offsets",
+                    {
+                        "inner_iter": inner_iter_idx,
+                        "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
+                        "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
+                    },
+                    hypothesis_id="H5",
+                )
+            # #endregion
+
+            # Store offsets for gradient checking (avoid accessing non-leaf tensor grads)
+            self._last_offsets_bg = offsets_bg
+            self._last_offsets_rigid = offsets_rigid_world
 
             render_params_bg = self._render_params_from_offsets(node_state_bg, offsets_bg)
             render_params_rigid = None
@@ -1197,6 +1550,19 @@ class StreetForwardTrainer(nn.Module):
             proxies_bg = self._create_proxy_params(render_params_bg)
             proxies_rigid = self._create_proxy_params(render_params_rigid) if render_params_rigid is not None else None
 
+            # #region agent log
+            _debug_log(
+                "streetforward.py:train_iter",
+                "Before target views loop",
+                {
+                    "num_targets": len(targets),
+                    "has_rigid": proxies_rigid is not None,
+                    "inner_iter": inner_iter_idx,
+                },
+                hypothesis_id="H1",
+            )
+            # #endregion
+
             for view_idx, target in enumerate(targets):
                 view = target["view"]
                 gt_img = target["gt_image"]
@@ -1207,8 +1573,34 @@ class StreetForwardTrainer(nn.Module):
                     node_state_rigid.cur_frame = target_frame_idx
                     resolved_frame_idx = self._resolve_rigid_frame_idx(node_state_rigid, target_frame_idx)
                 if proxies_rigid is not None and node_state_rigid is not None:
+                    # #region agent log
+                    _debug_log(
+                        "streetforward.py:train_iter",
+                        f"Before rigid transform for view {view_idx}",
+                        {
+                            "view_idx": view_idx,
+                            "target_frame_idx": target_frame_idx,
+                            "proxies_rigid_means_requires_grad": proxies_rigid["means_p"].requires_grad,
+                            "proxies_rigid_means_grad": proxies_rigid["means_p"].grad is not None,
+                        },
+                        hypothesis_id="H2",
+                    )
+                    # #endregion
                     means_rigid_world = self._transform_rigid_to_world(node_state_rigid, proxies_rigid["means_p"])
                     quats_rigid_world = self._transform_rigid_quats_to_world(node_state_rigid, proxies_rigid["quats_p"])
+                    # #region agent log
+                    _debug_log(
+                        "streetforward.py:train_iter",
+                        f"After rigid transform for view {view_idx}",
+                        {
+                            "view_idx": view_idx,
+                            "means_rigid_world_requires_grad": means_rigid_world.requires_grad,
+                            "means_rigid_world_grad_fn": str(means_rigid_world.grad_fn),
+                            "quats_rigid_world_requires_grad": quats_rigid_world.requires_grad,
+                        },
+                        hypothesis_id="H2",
+                    )
+                    # #endregion
                     if resolved_frame_idx is not None:
                         visibility = node_state_rigid.instances_fv[resolved_frame_idx]
                         valid_mask = visibility[node_state_rigid.point_ids[..., 0]].float()
@@ -1237,10 +1629,123 @@ class StreetForwardTrainer(nn.Module):
                     "opacities_p": merged_opacities,
                     "colors_p": merged_colors,
                 }
+                # #region agent log
+                if torch.cuda.is_available() and (view_idx % 5 == 0 or view_idx == len(targets) - 1):
+                    _debug_log(
+                        "streetforward.py:train_iter",
+                        f"Before _render_single_view for view {view_idx}",
+                        {
+                            "view_idx": view_idx,
+                            "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
+                            "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
+                            "merged_means_size_mb": merged_means.numel() * 4 / 1024**2,
+                            "merged_colors_size_mb": merged_colors.numel() * 4 / 1024**2,
+                        },
+                        hypothesis_id="H5",
+                    )
+                # #endregion
+                
                 rgb, acc = self._render_single_view(merged_params, view, height, width)
+                
+                # #region agent log
+                if torch.cuda.is_available() and (view_idx % 5 == 0 or view_idx == len(targets) - 1):
+                    _debug_log(
+                        "streetforward.py:train_iter",
+                        f"After _render_single_view for view {view_idx}",
+                        {
+                            "view_idx": view_idx,
+                            "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
+                            "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
+                            "rgb_size_mb": rgb.numel() * 4 / 1024**2,
+                        },
+                        hypothesis_id="H5",
+                    )
+                # #endregion
+                
                 loss = self.compute_loss(rgb, gt_img) / view_count
                 total_loss_val += float(loss.detach())  # Accumulate scalar to avoid keeping graph
+                
+                # #region agent log
+                # Check proxy gradients before backward (only log every 3 views to reduce overhead)
+                if view_idx % 3 == 0 or view_idx == len(targets) - 1:
+                    bg_grad_norms_before = {}
+                    rigid_grad_norms_before = {}
+                    for key in ["means_p", "scales_p", "quats_p", "opacities_p", "colors_p"]:
+                        if proxies_bg[key].grad is not None:
+                            bg_grad_norms_before[key] = float(proxies_bg[key].grad.norm().item())
+                        else:
+                            bg_grad_norms_before[key] = 0.0
+                        if proxies_rigid is not None and proxies_rigid[key].grad is not None:
+                            rigid_grad_norms_before[key] = float(proxies_rigid[key].grad.norm().item())
+                        elif proxies_rigid is not None:
+                            rigid_grad_norms_before[key] = 0.0
+                    
+                    _debug_log(
+                        "streetforward.py:train_iter",
+                        f"Before backward for view {view_idx}",
+                        {
+                            "view_idx": view_idx,
+                            "target_frame_idx": target_frame_idx,
+                            "loss_value": float(loss.item()),
+                            "bg_grad_norms": bg_grad_norms_before,
+                            "rigid_grad_norms": rigid_grad_norms_before if proxies_rigid else None,
+                        },
+                        hypothesis_id="H1",
+                    )
+                # #endregion
+                
                 loss.backward()
+                
+                # #region agent log
+                # Check proxy gradients after backward (only log every 3 views to reduce overhead)
+                if view_idx % 3 == 0 or view_idx == len(targets) - 1:
+                    bg_grad_norms_after = {}
+                    rigid_grad_norms_after = {}
+                    for key in ["means_p", "scales_p", "quats_p", "opacities_p", "colors_p"]:
+                        if proxies_bg[key].grad is not None:
+                            bg_grad_norms_after[key] = float(proxies_bg[key].grad.norm().item())
+                        else:
+                            bg_grad_norms_after[key] = 0.0
+                        if proxies_rigid is not None and proxies_rigid[key].grad is not None:
+                            rigid_grad_norms_after[key] = float(proxies_rigid[key].grad.norm().item())
+                        elif proxies_rigid is not None:
+                            rigid_grad_norms_after[key] = 0.0
+                    
+                    # Check if gradients accumulated
+                    bg_grad_accumulated = {}
+                    rigid_grad_accumulated = {}
+                    for key in ["means_p", "scales_p", "quats_p", "opacities_p", "colors_p"]:
+                        bg_grad_accumulated[key] = bg_grad_norms_after[key] > bg_grad_norms_before.get(key, 0.0) if view_idx > 0 else True
+                        if proxies_rigid is not None:
+                            rigid_grad_accumulated[key] = rigid_grad_norms_after[key] > rigid_grad_norms_before.get(key, 0.0) if view_idx > 0 else True
+                    
+                    _debug_log(
+                        "streetforward.py:train_iter",
+                        f"After backward for view {view_idx}",
+                        {
+                            "view_idx": view_idx,
+                            "bg_grad_norms": bg_grad_norms_after,
+                            "rigid_grad_norms": rigid_grad_norms_after if proxies_rigid else None,
+                            "bg_grad_accumulated": bg_grad_accumulated,
+                            "rigid_grad_accumulated": rigid_grad_accumulated if proxies_rigid else None,
+                        },
+                        hypothesis_id="H1",
+                    )
+                
+                # Check GPU memory (only log every 5 views to reduce overhead)
+                if torch.cuda.is_available() and (view_idx % 5 == 0 or view_idx == len(targets) - 1):
+                    _debug_log(
+                        "streetforward.py:train_iter",
+                        f"GPU memory after view {view_idx}",
+                        {
+                            "view_idx": view_idx,
+                            "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
+                            "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
+                            "max_allocated_mb": torch.cuda.max_memory_allocated() / 1024**2,
+                        },
+                        hypothesis_id="H4",
+                    )
+                # #endregion
                 
                 # Only store images if explicitly requested (to save GPU memory)
                 if self.log_images:
@@ -1252,38 +1757,115 @@ class StreetForwardTrainer(nn.Module):
                 else:
                     outputs.append({"loss": loss.detach().item()})
 
-            render_tensors_bg = [
+            grad_report: Dict[str, float] = {}
+            grad_warned = getattr(self, "_proxy_grad_warned", set())
+
+            def _grad_or_zero(proxy_tensor: torch.Tensor, name: str) -> torch.Tensor:
+                grad = proxy_tensor.grad
+                if grad is None:
+                    if name not in grad_warned:
+                        logger.warning(f"Proxy gradient for {name} is None; using zeros for backward.")
+                        grad_warned.add(name)
+                    grad_report[name] = 0.0
+                    return torch.zeros_like(proxy_tensor)
+                grad_report[name] = float(grad.norm().detach())
+                return grad
+
+            render_tensors = [
                 render_params_bg["means_r"],
                 render_params_bg["scales_r"],
                 render_params_bg["quats_r"],
                 render_params_bg["opacities_r"],
                 render_params_bg["colors_r"],
             ]
-            proxy_grads_bg = [
-                proxies_bg["means_p"].grad if proxies_bg["means_p"].grad is not None else torch.zeros_like(proxies_bg["means_p"]),
-                proxies_bg["scales_p"].grad if proxies_bg["scales_p"].grad is not None else torch.zeros_like(proxies_bg["scales_p"]),
-                proxies_bg["quats_p"].grad if proxies_bg["quats_p"].grad is not None else torch.zeros_like(proxies_bg["quats_p"]),
-                proxies_bg["opacities_p"].grad if proxies_bg["opacities_p"].grad is not None else torch.zeros_like(proxies_bg["opacities_p"]),
-                proxies_bg["colors_p"].grad if proxies_bg["colors_p"].grad is not None else torch.zeros_like(proxies_bg["colors_p"]),
+            grad_tensors = [
+                _grad_or_zero(proxies_bg["means_p"], "bg.means"),
+                _grad_or_zero(proxies_bg["scales_p"], "bg.scales"),
+                _grad_or_zero(proxies_bg["quats_p"], "bg.quats"),
+                _grad_or_zero(proxies_bg["opacities_p"], "bg.opacities"),
+                _grad_or_zero(proxies_bg["colors_p"], "bg.colors"),
             ]
-            torch.autograd.backward(tensors=render_tensors_bg, grad_tensors=proxy_grads_bg)
 
             if render_params_rigid is not None and proxies_rigid is not None:
-                render_tensors_rigid = [
+                render_tensors += [
                     render_params_rigid["means_r"],
                     render_params_rigid["scales_r"],
                     render_params_rigid["quats_r"],
                     render_params_rigid["opacities_r"],
                     render_params_rigid["colors_r"],
                 ]
-                proxy_grads_rigid = [
-                    proxies_rigid["means_p"].grad if proxies_rigid["means_p"].grad is not None else torch.zeros_like(proxies_rigid["means_p"]),
-                    proxies_rigid["scales_p"].grad if proxies_rigid["scales_p"].grad is not None else torch.zeros_like(proxies_rigid["scales_p"]),
-                    proxies_rigid["quats_p"].grad if proxies_rigid["quats_p"].grad is not None else torch.zeros_like(proxies_rigid["quats_p"]),
-                    proxies_rigid["opacities_p"].grad if proxies_rigid["opacities_p"].grad is not None else torch.zeros_like(proxies_rigid["opacities_p"]),
-                    proxies_rigid["colors_p"].grad if proxies_rigid["colors_p"].grad is not None else torch.zeros_like(proxies_rigid["colors_p"]),
+                grad_tensors += [
+                    _grad_or_zero(proxies_rigid["means_p"], "rigid.means"),
+                    _grad_or_zero(proxies_rigid["scales_p"], "rigid.scales"),
+                    _grad_or_zero(proxies_rigid["quats_p"], "rigid.quats"),
+                    _grad_or_zero(proxies_rigid["opacities_p"], "rigid.opacities"),
+                    _grad_or_zero(proxies_rigid["colors_p"], "rigid.colors"),
                 ]
-                torch.autograd.backward(tensors=render_tensors_rigid, grad_tensors=proxy_grads_rigid)
+
+            self._proxy_grad_warned = grad_warned
+            self._last_proxy_grad_norms = grad_report
+            
+            # #region agent log
+            # Check render params gradients before autograd.backward (only for leaf tensors)
+            render_params_grad_before = {}
+            for key in ["means_r", "scales_r", "quats_r", "opacities_r", "colors_r"]:
+                # Only check grad for leaf tensors to avoid warnings
+                if render_params_bg[key].is_leaf and render_params_bg[key].grad is not None:
+                    render_params_grad_before[f"bg.{key}"] = float(render_params_bg[key].grad.norm().item())
+                else:
+                    render_params_grad_before[f"bg.{key}"] = 0.0
+                if render_params_rigid is not None:
+                    if render_params_rigid[key].is_leaf and render_params_rigid[key].grad is not None:
+                        render_params_grad_before[f"rigid.{key}"] = float(render_params_rigid[key].grad.norm().item())
+                    else:
+                        render_params_grad_before[f"rigid.{key}"] = 0.0
+            
+            _debug_log(
+                "streetforward.py:train_iter",
+                "Before autograd.backward",
+                {
+                    "inner_iter": inner_iter_idx,
+                    "proxy_grad_norms": grad_report,
+                    "render_params_grad_before": render_params_grad_before,
+                },
+                hypothesis_id="H3",
+            )
+            # #endregion
+            
+            torch.autograd.backward(tensors=render_tensors, grad_tensors=grad_tensors)
+            
+            # #region agent log
+            # Check render params gradients after autograd.backward (only for leaf tensors)
+            # Note: render_params are non-leaf tensors, so we check the underlying computation graph
+            # by checking if the offsets have gradients instead
+            render_params_grad_after = {}
+            # Check if offsets have gradients (these are the actual leaf tensors)
+            offset_keys = ["offset_pos", "offset_scales", "offset_quat", "offset_opacity", "offset_sh"]
+            offset_grads = {}
+            if hasattr(self, '_last_offsets_bg') and self._last_offsets_bg is not None:
+                for key in offset_keys:
+                    if key in self._last_offsets_bg and self._last_offsets_bg[key].grad is not None:
+                        offset_grads[f"bg.{key}"] = float(self._last_offsets_bg[key].grad.norm().item())
+                    else:
+                        offset_grads[f"bg.{key}"] = 0.0
+            if hasattr(self, '_last_offsets_rigid') and self._last_offsets_rigid is not None:
+                for key in offset_keys:
+                    if key in self._last_offsets_rigid and self._last_offsets_rigid[key].grad is not None:
+                        offset_grads[f"rigid.{key}"] = float(self._last_offsets_rigid[key].grad.norm().item())
+                    else:
+                        offset_grads[f"rigid.{key}"] = 0.0
+            
+            _debug_log(
+                "streetforward.py:train_iter",
+                "After autograd.backward",
+                {
+                    "inner_iter": inner_iter_idx,
+                    "offset_grads": offset_grads,
+                    "grad_propagated": {k: offset_grads[k] > 0 for k in offset_grads},
+                },
+                hypothesis_id="H3",
+            )
+            # #endregion
 
             if apply_update:
                 self.optimizer.step()
