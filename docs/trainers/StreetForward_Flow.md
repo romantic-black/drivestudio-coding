@@ -21,7 +21,8 @@ StreetForwardTrainer 实现了基于代理（Proxy）的多视角梯度累积的
 - **双 NodeState 架构**：每个 `(scene_id, segment_id)` 维护两个 `NodeState`：
   - `NodeStateBackground`：存储静态背景的高斯参数（世界坐标系）
   - `NodeStateRigid`：存储动态物体的高斯参数（局部坐标系）
-- **前馈预测**：通过 3D 特征体积预测偏移量（offsets），静态和动态物体共享相同的 MLP 网络
+- **前馈预测**：通过 3D 特征体积和 2D 语义特征融合预测偏移量（offsets），静态和动态物体共享相同的 MLP 网络
+- **2D+3D 特征融合**：从 source 帧的多相机图像提取 2D 语义特征，通过 αT 权重反投影到高斯点，与 3D 体积特征融合
 - **代理参数渲染**：使用代理参数进行渲染，实现多视角梯度累积
 - **单次反向传播**：每个迭代只进行一次反向传播
 - **帧变换机制**：动态物体在不同帧间通过 RigidNodes 变换，支持时间一致性
@@ -30,7 +31,7 @@ StreetForwardTrainer 实现了基于代理（Proxy）的多视角梯度累积的
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│              StreetForwardTrainer (with Dynamic Objects)      │
+│      StreetForwardTrainer (with 2D+3D Features & Dynamic)    │
 ├─────────────────────────────────────────────────────────────┤
 │                                                               │
 │  ┌──────────────────┐         ┌──────────────────┐          │
@@ -57,9 +58,31 @@ StreetForwardTrainer 实现了基于代理（Proxy）的多视角梯度累积的
 │    │                 │                 │                    │
 │    ▼                 ▼                 ▼                    │
 │ ┌─────────┐   ┌──────────┐   ┌──────────┐                 │
-│ │Transform│   │ 3D Vol   │   │ Offsets  │                 │
-│ │to Source│──▶│ Builder   │──▶│ Predict  │                 │
+│ │Transform│   │ 2D CNN   │   │ 3D Vol   │                 │
+│ │to Source│   │ Extract   │   │ Builder  │                 │
 │ └─────────┘   └──────────┘   └──────────┘                 │
+│     │              │                 │                      │
+│     └──────┬───────┴────────┬────────┘                     │
+│            │                │                              │
+│     ┌──────▼────────────────▼──────┐                      │
+│     │  αT Backprojection             │                      │
+│     │  (scatter-add aggregation)     │                      │
+│     └──────┬───────────────────────┘                      │
+│            │                                                │
+│     ┌──────▼───────────────────────┐                       │
+│     │  2D+3D Feature Fusion        │                       │
+│     │  concat([feat_3d, feat_2d, vis])                     │
+│     └──────┬────────────────────────┘                       │
+│            │                                                │
+│     ┌──────▼────────────────────────┐                      │
+│     │  MLP Offsets Prediction       │                      │
+│     │  (existing MLPs with wider input)                    │
+│     └──────┬─────────────────────────┘                      │
+│            │                                                │
+│     ┌──────▼────────────────────────┐                     │
+│     │  Proxy Params + Multi-target   │                     │
+│     │  Gradient Accumulation         │                     │
+│     └────────────────────────────────┘                     │
 │                                                               │
 │  ┌──────────────────────────────────────────────┐           │
 │  │  For each target frame:                      │           │
@@ -71,6 +94,10 @@ StreetForwardTrainer 实现了基于代理（Proxy）的多视角梯度累积的
 │                                                               │
 │  ┌──────────────────────────────────────────────┐           │
 │  │  Neural Networks                              │           │
+│  │  - image_feature_extractor: 2D特征提取        │           │
+│  │  - alpha_t_extractor: αT权重提取              │           │
+│  │  - feature_2d_backprojector: 2D特征反投影     │           │
+│  │  - feature_fusion: 2D+3D特征融合             │           │
 │  │  - sparse_conv: 3D特征提取                    │           │
 │  │  - mlp_offset_pos: 位置偏移预测               │           │
 │  │  - mlp_conv: 尺度与旋转偏移预测               │           │
@@ -99,8 +126,15 @@ graph TD
     H --> I[清零梯度]
     I --> J[开始inner_iterations循环]
     J --> K[变换RigidNodes到source帧<br/>合并静态+动态点云]
-    K --> L[构建3D特征体积]
-    L --> M[预测偏移量<br/>静态+动态共同预测]
+    K --> K1{是否启用2D特征?}
+    K1 -->|是| K2[提取source帧2D特征<br/>CNN处理多相机图像]
+    K1 -->|否| L
+    K2 --> K3[αT权重反投影<br/>将2D特征聚合到高斯点]
+    K3 --> L[构建3D特征体积]
+    L --> L1{是否启用2D特征?}
+    L1 -->|是| L2[特征融合<br/>concat([feat_3d, feat_2d, vis])]
+    L1 -->|否| M
+    L2 --> M[预测偏移量<br/>静态+动态共同预测]
     M --> N[计算渲染参数<br/>分别应用到两个NodeState]
     N --> O[创建代理参数<br/>分别创建静态和动态代理]
     O --> P[遍历所有target帧]
@@ -148,7 +182,54 @@ graph TD
 - **静态背景**：使用 k-NN 计算邻居距离，初始化尺度；将 RGB 颜色转换为球谐函数（SH）的 DC 分量；所有参数初始化为分离（detached）状态
 - **动态物体**：从 `pointcloud["dynamic"]` 获取各实例的点云（局部坐标）；从 `dynamic_info` 初始化 `instances_quats` 和 `instances_trans`；记录 `point_ids` 以关联每个点到实例
 
-#### 2. 3D 特征体积构建 (`_build_3d_feature_volume`)
+#### 2. 2D 特征提取与反投影（可选，当 `use_2d_features=True` 时）
+
+**步骤：**
+```
+1. 准备 source 帧的多相机图像
+   _prepare_source_views_for_2d_features()
+     → source_views: List[View] (同一时间戳的多相机视角)
+     → source_images: List[Tensor] [H, W, 3] (对应的图像)
+
+2. 提取 2D 语义特征
+   image_feature_extractor(source_images)
+     → features_2d: List[Tensor] [C2, Hf, Wf] (每个视图的特征图)
+     - C2: 特征通道数（默认16或32）
+     - Hf, Wf: 下采样后的特征分辨率（通常为原图的1/4）
+
+3. 变换 rigid 到 source 帧并合并高斯参数
+   - 设置 node_state_rigid.cur_frame = source_frame_idx
+   - 变换到世界坐标：means_rigid_world, quats_rigid_world
+   - 合并 bg 和 rigid 的高斯参数（用于反投影渲染）
+
+4. 提取 αT 权重
+   alpha_t_extractor.extract_alpha_t_weights()
+     - 使用低分辨率渲染（分辨率 = (Hf, Wf)）
+     - 使用缩放后的相机内参 K' = K * scale
+     - 输出：
+       * gaussian_indices: List[Tensor] [Hf, Wf, K] (每个像素的K个高斯id)
+       * alpha_t_weights: List[Tensor] [Hf, Wf, K] (对应的αT权重，已detach)
+
+5. 反投影聚合 2D 特征
+   feature_2d_backprojector()
+     - 使用 scatter-add 聚合特征：
+       num_k += Σ_{p,v} w_{k,p,v} · F2D_v(p)
+       den_k += Σ_{p,v} w_{k,p,v}
+       f2d_k = num_k / (den_k + ε)
+     - 输出：
+       * feat_2d_bg: [N_bg, C2] (静态背景的2D特征)
+       * feat_2d_rigid: [N_rigid, C2] (动态物体的2D特征)
+       * vis_bg: [N_bg] (静态背景的可见性)
+       * vis_rigid: [N_rigid] (动态物体的可见性)
+```
+
+**关键设计点：**
+- **时间戳一致性**：所有 2D 特征来自同一 source 时间戳，保证动态物体状态一致
+- **αT 权重 stop-grad**：权重使用 `detach()`，避免高阶梯度耦合
+- **分辨率对齐**：反投影渲染分辨率必须与 CNN 特征图分辨率一致
+- **可见性对齐**：使用与 RGB 渲染相同的排序/截断规则
+
+#### 3. 3D 特征体积构建 (`_build_3d_feature_volume`)
 
 **步骤：**
 ```
@@ -176,6 +257,34 @@ graph TD
    feat_3d_crop_rigid [N_rigid, outdim]
 ```
 
+#### 4. 特征融合（可选，当 `use_2d_features=True` 时）
+
+**步骤：**
+```
+feature_fusion()
+  输入：
+    - feat_3d_crop_bg: [N_bg, C3] (3D特征，C3=outdim，默认32)
+    - feat_3d_crop_rigid: [N_rigid, C3] (3D特征)
+    - feat_2d_bg: [N_bg, C2] (2D特征，C2默认16/32)
+    - feat_2d_rigid: [N_rigid, C2] (2D特征)
+    - vis_bg: [N_bg] (可见性)
+    - vis_rigid: [N_rigid] (可见性)
+  
+  融合方式（简单拼接）：
+    feat_fused_bg = concat([feat_3d_crop_bg, feat_2d_bg, vis_bg.unsqueeze(-1)])
+      → [N_bg, C3+C2+1] (例如：32+16+1=49)
+    feat_fused_rigid = concat([feat_3d_crop_rigid, feat_2d_rigid, vis_rigid.unsqueeze(-1)])
+      → [N_rigid, C3+C2+1]
+  
+  输出：
+    - feat_fused_bg: [N_bg, C3+C2+1] (融合后的静态背景特征)
+    - feat_fused_rigid: [N_rigid, C3+C2+1] (融合后的动态物体特征)
+```
+
+**注意：** 如果未启用 2D 特征，则 `feat_fused_bg = feat_3d_crop_bg`，`feat_fused_rigid = feat_3d_crop_rigid`。
+
+#### 5. 偏移量预测 (`_predict_offsets`)
+
 **数据维度说明：**
 - `sparse_feat`: `[M, 3]` - M个唯一体素的RGB特征（M ≤ N_total，因为可能有重复体素）
 - `feat_3d`: `[M, outdim]` - 经过稀疏卷积后的3D特征（默认outdim=32）
@@ -200,11 +309,13 @@ interpolate_features()
 - `get_grid_coords()`: 将世界坐标转换为体积网格的归一化坐标
 - `interpolate_features()`: 使用双线性插值从密集体积中提取每个点的特征
 
-#### 4. 偏移量预测 (`_predict_offsets`)
+#### 5. 偏移量预测 (`_predict_offsets`)
 
 **输入：**
-- `feat_3d_crop_bg`: `[N_bg, outdim]` - 静态背景点的3D特征（默认outdim=32）
-- `feat_3d_crop_rigid`: `[N_rigid, outdim]` - 动态物体点的3D特征（默认outdim=32）
+- `feat_fused_bg`: `[N_bg, feat_dim]` - 静态背景点的融合特征
+  - 如果启用2D特征：`feat_dim = outdim + feat_2d_channels + 1`（例如：32+16+1=49）
+  - 如果未启用2D特征：`feat_dim = outdim`（默认32）
+- `feat_fused_rigid`: `[N_rigid, feat_dim]` - 动态物体点的融合特征
 
 **处理：**
 - 静态和动态使用**相同的 MLP 网络**预测偏移量
@@ -222,22 +333,23 @@ interpolate_features()
 ```
 
 **MLP 网络结构：**
-- `mlp_offset_pos`: `outdim → 64 → 32 → 3` (位置偏移)
-- `mlp_conv`: `outdim → 64 → 32 → 6` (3个尺度对数偏移 + 3个轴角偏移)
-- `mlp_opacity`: `outdim → 64 → 32 → 1` (不透明度对数偏移)
-- `gaussion_decoder`: `outdim → 64 → 32 → 3*num_sh` (SH系数偏移，包含DC和rest)
+- `mlp_offset_pos`: `feat_dim → 64 → 32 → 3` (位置偏移)
+  - `feat_dim = outdim`（未启用2D特征）或 `outdim + feat_2d_channels + 1`（启用2D特征）
+- `mlp_conv`: `feat_dim → 64 → 32 → 6` (3个尺度对数偏移 + 3个轴角偏移)
+- `mlp_opacity`: `feat_dim → 64 → 32 → 1` (不透明度对数偏移)
+- `gaussion_decoder`: `feat_dim → 64 → 32 → 3*num_sh` (SH系数偏移，包含DC和rest)
 
 **偏移量预测流程：**
 
 1. **位置偏移** (`offset_pos`)：
    ```python
-   offset_pos_raw = mlp_offset_pos(feat_3d_crop)  # [N, 3]
+   offset_pos_raw = mlp_offset_pos(feat_fused)  # [N, 3]
    offset_pos = offset_max * tanh(offset_pos_raw)  # 限制在 [-offset_max, offset_max]
    ```
 
 2. **尺度与旋转偏移** (`offset_scales`, `offset_quat`)：
    ```python
-   scales_and_omega = mlp_conv(feat_3d_crop)  # [N, 6]
+   scales_and_omega = mlp_conv(feat_fused)  # [N, 6]
    offset_scales_raw, offset_omega_raw = split([3, 3])  # 分别提取尺度和轴角
    offset_scales = scale_max * tanh(offset_scales_raw)  # 限制在 [-scale_max, scale_max]
    offset_omega = omega_max * tanh(offset_omega_raw)    # 限制在 [-omega_max, omega_max]
@@ -246,13 +358,13 @@ interpolate_features()
 
 3. **不透明度偏移** (`offset_opacity`)：
    ```python
-   offset_opacity_raw = mlp_opacity(feat_3d_crop)  # [N, 1]
+   offset_opacity_raw = mlp_opacity(feat_fused)  # [N, 1]
    offset_opacity = opacity_max * tanh(offset_opacity_raw)  # 限制在 [-opacity_max, opacity_max]
    ```
 
 4. **SH系数偏移** (`offset_sh`)：
    ```python
-   sh_raw = gaussion_decoder(feat_3d_crop)  # [N, 3*num_sh]
+   sh_raw = gaussion_decoder(feat_fused)  # [N, 3*num_sh]
    sh_dc_raw = sh_raw[:, :3]                # DC分量
    sh_rest_raw = sh_raw[:, 3:]              # rest分量
    offset_sh_dc = sh_dc_max * tanh(sh_dc_raw)      # 限制在 [-sh_dc_max, sh_dc_max]
@@ -290,7 +402,7 @@ interpolate_features()
 - 这确保训练开始时预测的偏移量接近零，避免初始阶段的大幅跳跃
 - 初始化代码：`nn.init.zeros_(layer.weight)` 和 `nn.init.zeros_(layer.bias)`
 
-#### 5. 渲染参数计算 (`_render_params_from_offsets`)
+#### 6. 渲染参数计算 (`_render_params_from_offsets`)
 
 **计算过程：**
 ```
@@ -379,7 +491,7 @@ interpolate_features()
 3. **旋转组合**：通过四元数乘法组合旋转，确保旋转的连续性和可微性
 4. **参数分离**：SH的DC和rest分量分别应用步长因子，允许独立控制
 
-#### 6. 代理参数创建 (`_create_proxy_params`)
+#### 7. 代理参数创建 (`_create_proxy_params`)
 
 **目的：** 创建可微的代理参数，用于多视角梯度累积
 
@@ -392,7 +504,7 @@ proxy = render_param.detach().requires_grad_(True)
 - 代理参数从渲染参数中分离（detach），但重新启用梯度
 - 这样可以在多个视角上累积梯度，然后一次性反向传播到渲染参数
 
-#### 7. 多 Target 帧渲染与损失计算
+#### 8. 多 Target 帧渲染与损失计算
 
 **循环结构：**
 ```python
@@ -451,7 +563,7 @@ for target in targets:
 - **可微变换**：坐标变换保持梯度连接，不使用 detach，让 PyTorch 自动处理梯度反向传播
 - **自动梯度分离**：`torch.cat` 操作会自动处理梯度分离，不需要手动使用 `pts_labels`
 
-#### 8. 梯度反向传播机制
+#### 9. 梯度反向传播机制
 
 **两步反向传播：**
 
@@ -476,7 +588,7 @@ if render_params_rigid is not None:
 - 最终更新所有 MLP 和 sparse_conv 的参数
 - **注意**：静态和动态使用相同的 MLP 网络，梯度会自动合并
 
-#### 9. 状态更新
+#### 10. 状态更新
 
 **条件：** `update_state == True`
 
@@ -1363,6 +1475,21 @@ targets = [
 
 ### 3. 中间数据流
 
+#### 2D 特征提取与反投影阶段（可选）
+
+| 变量名 | 形状 | 说明 |
+|--------|------|------|
+| `source_views` | `List[View]` | Source 帧的多相机视角列表（同一时间戳） |
+| `source_images` | `List[Tensor]` | Source 帧的多相机图像列表 `[H, W, 3]` |
+| `features_2d` | `List[Tensor]` | 每个视图的2D特征图 `[C2, Hf, Wf]` |
+| `Hf, Wf` | `int, int` | 特征图分辨率（通常为原图的1/4） |
+| `gaussian_indices` | `List[Tensor]` | 每个视图的高斯索引 `[Hf, Wf, K]`（K=top_k，默认8） |
+| `alpha_t_weights` | `List[Tensor]` | 每个视图的αT权重 `[Hf, Wf, K]`（已detach） |
+| `feat_2d_bg` | `[N_bg, C2]` | 静态背景的2D特征（C2默认16/32） |
+| `feat_2d_rigid` | `[N_rigid, C2]` | 动态物体的2D特征 |
+| `vis_bg` | `[N_bg]` | 静态背景的可见性（clamp(den, 0, 1)） |
+| `vis_rigid` | `[N_rigid]` | 动态物体的可见性 |
+
 #### 3D 特征体积构建阶段
 
 | 变量名 | 形状 | 说明 |
@@ -1382,14 +1509,26 @@ targets = [
 | `feat_3d_crop_bg` | `[N_bg, outdim]` | 静态背景点的3D特征 |
 | `feat_3d_crop_rigid` | `[N_rigid, outdim]` | 动态物体点的3D特征 |
 
+#### 特征融合阶段（可选）
+
+| 变量名 | 形状 | 说明 |
+|--------|------|------|
+| `feat_fused_bg` | `[N_bg, feat_dim]` | 融合后的静态背景特征 |
+| `feat_fused_rigid` | `[N_rigid, feat_dim]` | 融合后的动态物体特征 |
+| `feat_dim` | `int` | 融合特征维度 |
+|  |  | - 启用2D特征：`feat_dim = outdim + feat_2d_channels + 1`（例如：32+16+1=49） |
+|  |  | - 未启用2D特征：`feat_dim = outdim`（默认32） |
+
 #### 偏移量预测阶段
 
 | 变量名 | 形状 | 说明 |
 |--------|------|------|
 | `grid_coords_bg` | `[N_bg, 3]` | 静态背景点的归一化网格坐标 `[-1, 1]` |
 | `grid_coords_rigid` | `[N_rigid, 3]` | 动态物体点的归一化网格坐标 `[-1, 1]` |
-| `feat_3d_crop_bg` | `[N_bg, outdim]` | 静态背景点插值得到的3D特征（默认outdim=32） |
-| `feat_3d_crop_rigid` | `[N_rigid, outdim]` | 动态物体点插值得到的3D特征（默认outdim=32） |
+| `feat_fused_bg` | `[N_bg, feat_dim]` | 静态背景点的融合特征（用于预测偏移量） |
+| `feat_fused_rigid` | `[N_rigid, feat_dim]` | 动态物体点的融合特征（用于预测偏移量） |
+|  |  | - 启用2D特征：`feat_dim = outdim + feat_2d_channels + 1` |
+|  |  | - 未启用2D特征：`feat_dim = outdim`（默认32） |
 | `offsets_bg` | Dict | 静态背景的偏移量字典 |
 | `offsets_rigid_world` | Dict | 动态物体的偏移量字典（世界坐标） |
 | `offsets_rigid_local` | Dict | 动态物体的偏移量字典（局部坐标，从世界坐标变换而来） |
@@ -1525,20 +1664,132 @@ psnr = -10 * torch.log10(mse)  # 如果 mse <= 0，返回 inf
 
 ## 关键组件说明
 
-### 1. 偏移量预测网络 (Offset Prediction Networks)
+### 1. 2D 特征提取器 (ImageFeatureExtractor)
+
+**作用：** 从 source 帧的多相机图像中提取 2D 语义特征
+
+**实现：** `models.feature_extractors.ImageFeatureExtractor`
+
+**网络结构：**
+- **Backbone**：ResNet18（默认）或其他 ResNet 变体
+  - 使用 `layer1`（`feature_resolution >= 0.25`）
+  - 可选 `layer2`（`feature_resolution <= 0.125`）
+  - 可选 `layer3`（`feature_resolution <= 0.0625`）
+- **投影层**：`nn.Conv2d(backbone_out_dim, out_channels, kernel_size=1)`
+- **Fallback**：如果 torchvision 不可用，使用轻量级 CNN
+
+**输入/输出：**
+- 输入：`List[Tensor]` - 每个视图的图像 `[H, W, 3]`
+- 输出：`List[Tensor]` - 每个视图的特征图 `[C2, Hf, Wf]`
+  - `C2`：特征通道数（默认16或32，由 `feat_2d_channels` 配置）
+  - `Hf, Wf`：下采样后的特征分辨率（由 `feat_2d_resolution` 配置，默认0.25，即原图的1/4）
+
+**关键方法：**
+- `get_feature_resolution(image_height, image_width)`: 计算特征图分辨率
+- `forward(images)`: 提取特征，自动处理 batch 和插值
+
+### 2. αT 权重提取器 (AlphaTWeightExtractor)
+
+**作用：** 从低分辨率渲染中提取每个像素的 top-K 高斯索引和 αT 权重
+
+**实现：** `models.feature_extractors.AlphaTWeightExtractor`
+
+**关键功能：**
+- **内参缩放**：根据目标特征分辨率缩放相机内参 `K' = K * scale`
+- **低分辨率渲染**：使用与特征图相同的分辨率 `(Hf, Wf)` 进行渲染
+- **Top-K 选择**：对每个像素选择贡献最大的 K 个高斯（默认 K=8）
+- **权重计算**：计算 αT 权重（`weight = exp(-0.5 * sigma_term) * opacity * T`）
+
+**输入/输出：**
+- 输入：
+  - `means, quats, scales, opacities, colors`: 合并后的高斯参数
+  - `views`: Source 帧的多相机视角列表
+  - `height, width`: 目标特征分辨率 `(Hf, Wf)`
+- 输出：
+  - `gaussian_indices`: `List[Tensor]` - 每个视图的高斯索引 `[Hf, Wf, K]`
+  - `alpha_t_weights`: `List[Tensor]` - 每个视图的 αT 权重 `[Hf, Wf, K]`（已 detach）
+
+**关键设计：**
+- 权重使用 `detach()`，避免高阶梯度耦合
+- 使用与 RGB 渲染相同的排序/截断规则，保证可见性对齐
+
+### 3. 2D 特征反投影器 (Feature2DBackprojector)
+
+**作用：** 使用 αT 权重将 2D 特征反投影聚合到每个高斯点
+
+**实现：** `models.feature_extractors.Feature2DBackprojector`
+
+**聚合公式：**
+```
+num_k += Σ_{p,v} w_{k,p,v} · F2D_v(p)
+den_k += Σ_{p,v} w_{k,p,v}
+f2d_k = num_k / (den_k + ε)
+```
+
+**实现方式：**
+- 使用 `torch.index_add` 进行 scatter-add 累加
+- 累加器使用 `fp32` 精度（避免精度损失）
+- 处理 `idx == -1` 的无效项（mask 掉）
+- 处理 `den ≈ 0` 的情况（输出 0 + vis=0）
+
+**输入/输出：**
+- 输入：
+  - `features_2d`: `List[Tensor]` - 每个视图的特征图 `[C2, Hf, Wf]`
+  - `gaussian_indices`: `List[Tensor]` - 每个视图的高斯索引 `[Hf, Wf, K]`
+  - `alpha_t_weights`: `List[Tensor]` - 每个视图的 αT 权重 `[Hf, Wf, K]`
+  - `num_gaussians`: 总高斯数量 `N_bg + N_rigid`
+  - `bg_indices, rigid_indices`: 静态和动态的索引范围
+- 输出：
+  - `feat_2d_bg`: `[N_bg, C2]` - 静态背景的 2D 特征
+  - `feat_2d_rigid`: `[N_rigid, C2]` - 动态物体的 2D 特征
+  - `vis_bg`: `[N_bg]` - 静态背景的可见性
+  - `vis_rigid`: `[N_rigid]` - 动态物体的可见性
+
+**关键设计：**
+- 累加器使用 `fp32` 精度，最终输出转换为输入 dtype
+- 可见性计算：`vis = clamp(den, 0, 1)`
+
+### 4. 特征融合模块 (FeatureFusion)
+
+**作用：** 将 2D 和 3D 特征拼接，加上可见性，形成融合特征
+
+**实现：** `models.feature_extractors.FeatureFusion`
+
+**融合方式：**
+```python
+feat_fused = concat([feat_3d, feat_2d, vis.unsqueeze(-1)], dim=-1)
+```
+
+**输入/输出：**
+- 输入：
+  - `feat_3d_bg`: `[N_bg, C3]` - 静态背景的 3D 特征（C3=outdim，默认32）
+  - `feat_3d_rigid`: `[N_rigid, C3]` - 动态物体的 3D 特征
+  - `feat_2d_bg`: `[N_bg, C2]` - 静态背景的 2D 特征（C2默认16/32）
+  - `feat_2d_rigid`: `[N_rigid, C2]` - 动态物体的 2D 特征
+  - `vis_bg`: `[N_bg]` - 静态背景的可见性
+  - `vis_rigid`: `[N_rigid]` - 动态物体的可见性
+- 输出：
+  - `feat_fused_bg`: `[N_bg, C3+C2+1]` - 融合后的静态背景特征
+  - `feat_fused_rigid`: `[N_rigid, C3+C2+1]` - 融合后的动态物体特征
+
+**配置参数：**
+- `include_visibility`: 是否包含可见性特征（默认 True）
+
+### 5. 偏移量预测网络 (Offset Prediction Networks)
 
 **作用：** 从3D特征预测Gaussian参数的偏移量
 
 **网络结构：**
 
 #### `mlp_offset_pos` - 位置偏移预测
-- **结构：** `outdim → 64 → 32 → 3`
+- **结构：** `feat_dim → 64 → 32 → 3`
+  - `feat_dim = outdim`（未启用2D特征）或 `outdim + feat_2d_channels + 1`（启用2D特征）
 - **输出：** 位置偏移原始值 `[N, 3]`
 - **处理：** `offset_pos = offset_max * tanh(mlp_output)`
 - **初始化：** 最后一层初始化为零（输出接近零偏移）
 
 #### `mlp_conv` - 尺度与旋转偏移预测
-- **结构：** `outdim → 64 → 32 → 6`
+- **结构：** `feat_dim → 64 → 32 → 6`
 - **输出：** 尺度偏移（前3维）+ 轴角偏移（后3维）
 - **处理：**
   - `offset_scales = scale_max * tanh(scales_raw)`
@@ -1547,13 +1798,13 @@ psnr = -10 * torch.log10(mse)  # 如果 mse <= 0，返回 inf
 - **初始化：** 最后一层初始化为零（输出接近零偏移）
 
 #### `mlp_opacity` - 不透明度偏移预测
-- **结构：** `outdim → 64 → 32 → 1`
+- **结构：** `feat_dim → 64 → 32 → 1`
 - **输出：** 不透明度对数偏移原始值 `[N, 1]`
 - **处理：** `offset_opacity = opacity_max * tanh(mlp_output)`
 - **初始化：** 最后一层初始化为零（输出接近零偏移）
 
 #### `gaussion_decoder` - SH系数偏移预测
-- **结构：** `outdim → 64 → 32 → 3*num_sh`
+- **结构：** `feat_dim → 64 → 32 → 3*num_sh`
 - **输出：** SH系数偏移原始值（包含DC和rest）
 - **处理：**
   - `offset_sh_dc = sh_dc_max * tanh(sh_dc_raw)`
@@ -1567,7 +1818,7 @@ psnr = -10 * torch.log10(mse)  # 如果 mse <= 0，返回 inf
 - 所有偏移量通过 `tanh` 函数限制在指定范围内
 - 初始化策略确保训练开始时预测接近零偏移，避免初始阶段的大幅跳跃
 
-### 2. 稀疏卷积网络 (SparseConv)
+### 6. 稀疏卷积网络 (SparseConv)
 
 **作用：** 从稀疏点云特征构建3D特征表示
 
@@ -1579,7 +1830,7 @@ psnr = -10 * torch.log10(mse)  # 如果 mse <= 0，返回 inf
 - 输入：`[N, 3]` - RGB特征
 - 输出：`[N, outdim]` - 3D特征（默认outdim=32）
 
-### 3. 体积构建函数
+### 7. 体积构建函数
 
 #### `construct_sparse_tensor`
 - **实现：** `models.evol_splat.construct_sparse_tensor`
@@ -1594,7 +1845,7 @@ psnr = -10 * torch.log10(mse)  # 如果 mse <= 0，返回 inf
 - **输出：** `[D, H, W, C]` 密集体积
 - **错误处理：** 如果函数不可用且未提供自定义 `sparse_to_dense_volume_fn`，会抛出 `ImportError`
 
-### 4. 渲染器 (Renderer)
+### 8. 渲染器 (Renderer)
 
 **实现：**
 - **实现：** `gsplat.rendering.rasterization`
@@ -1613,7 +1864,7 @@ psnr = -10 * torch.log10(mse)  # 如果 mse <= 0，返回 inf
 - `render`: `[1, H, W, 4]` - RGB + alpha
 - `alpha`: `[1, H, W]` - 累积不透明度
 
-### 5. 辅助函数
+### 9. 辅助函数
 
 #### 四元数操作
 - `_random_quat_tensor()`: 生成随机单位四元数（wxyz格式）
@@ -1663,6 +1914,7 @@ psnr = -10 * torch.log10(mse)  # 如果 mse <= 0，返回 inf
 
 ### 梯度流图
 
+**基础版本（未启用2D特征）：**
 ```
 gt_image
   ↓
@@ -1701,6 +1953,54 @@ sparse_feat
   ↓
 网络参数更新
 ```
+
+**2D+3D 融合版本（启用2D特征）：**
+```
+gt_image
+  ↓
+loss (L2)
+  ↓
+rgb (renderer输出)
+  ↓
+proxies (代理参数)
+  ├─ means_p.grad
+  ├─ scales_p.grad
+  ├─ quats_p.grad
+  ├─ opacities_p.grad
+  └─ colors_p.grad
+  ↓ (autograd.backward)
+render_params (渲染参数)
+  ├─ means_r
+  ├─ scales_r
+  ├─ quats_r
+  ├─ opacities_r
+  └─ colors_r
+  ↓ (自动反向传播)
+offsets (偏移量)
+  ├─ offset_pos ← mlp_offset_pos
+  ├─ offset_scales ← mlp_conv
+  ├─ offset_quat ← mlp_conv
+  ├─ offset_opacity ← mlp_opacity
+  └─ offset_sh ← gaussion_decoder
+  ↓
+feat_fused (融合特征)
+  ↑                    ↑
+feat_3d_crop       feat_2d (2D特征)
+  ↑                    ↑
+dense_volume       feature_2d_backprojector
+  ↑                    ↑ (scatter-add聚合)
+feat_3d ← sparse_conv  features_2d (CNN特征图)
+  ↑                    ↑
+sparse_feat         image_feature_extractor (CNN)
+  ↓                    ↓
+网络参数更新        CNN参数更新
+```
+
+**关键点：**
+- **CNN 只跑一次**：在 inner-iteration 开始时对 source 图像跑一次 CNN
+- **梯度来自所有 target**：通过 proxy 机制，所有 target 的损失梯度最终回传到 CNN
+- **αT 权重 stop-grad**：`alpha_t_weights` 使用 `detach()`，不参与梯度计算
+- **反投影聚合可微**：`feature_2d_backprojector` 使用 `torch.index_add`，梯度能正常回传
 
 ### 关键设计点
 
@@ -1742,6 +2042,14 @@ model:
   bbx_min: [-20.0, -20.0, -20.0]  # 边界框最小值
   bbx_max: [20.0, 4.8, 70.0]      # 边界框最大值
   sparseConv_outdim: 32    # 稀疏卷积输出维度
+  
+  # 2D特征相关参数（可选）
+  use_2d_features: False    # 是否启用2D特征融合
+  feat_2d_channels: 16      # 2D特征通道数（默认16或32）
+  feat_2d_resolution: 0.25   # 特征图分辨率比例（默认0.25，即原图的1/4）
+  feat_2d_backbone: "resnet18"  # CNN backbone（默认resnet18）
+  feat_2d_pretrained: True   # 是否使用预训练权重
+  alpha_t_top_k: 8          # αT权重提取的top-K值（默认8）
 ```
 
 ### Optimizer 配置
@@ -1767,8 +2075,15 @@ StreetForwardTrainer 通过以下关键机制实现了高效的前馈式 3DGS �
 
 1. **分离的 NodeState：** 作为稳定的参数缓冲区，避免梯度干扰
 2. **3D 特征体积：** 通过稀疏卷积构建空间特征表示
-3. **偏移量预测：** 使用 MLP 从 3D 特征预测参数偏移
-4. **代理参数机制：** 实现多视角梯度累积
-5. **单次反向传播：** 每个迭代只进行一次完整的梯度更新
+3. **2D+3D 特征融合（可选）：** 从 source 帧提取 2D 语义特征，通过 αT 权重反投影到高斯点，与 3D 特征融合
+4. **偏移量预测：** 使用 MLP 从融合特征（或仅 3D 特征）预测参数偏移
+5. **代理参数机制：** 实现多视角梯度累积
+6. **单次反向传播：** 每个迭代只进行一次完整的梯度更新
 
-这种设计既保证了训练效率，又实现了多视角监督的有效利用。
+**2D 特征融合的优势：**
+- **时间一致性**：只对 source 帧提取 2D 特征，避免动态一致性问题
+- **梯度兼容**：CNN 梯度通过现有 proxy 机制回传，不破坏训练范式
+- **显存高效**：CNN 只跑一次，不随 target 数量增加显存
+- **实现简单**：特征融合使用简单拼接，易于实现和调试
+
+这种设计既保证了训练效率，又实现了多视角监督的有效利用，同时通过 2D+3D 特征融合提升了偏移量预测的准确性。

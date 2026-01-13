@@ -287,6 +287,10 @@ class StreetForwardTrainer(nn.Module):
         sparse_conv: Optional[nn.Module] = None,
         construct_sparse_tensor_fn: Optional[Callable] = None,
         sparse_to_dense_volume_fn: Optional[Callable] = None,
+        image_feature_extractor: Optional[nn.Module] = None,
+        alpha_t_extractor: Optional[Callable] = None,
+        feature_2d_backprojector: Optional[nn.Module] = None,
+        feature_fusion: Optional[nn.Module] = None,
     ):
         super().__init__()
         self.config = config
@@ -334,9 +338,72 @@ class StreetForwardTrainer(nn.Module):
         if self.sparse_to_dense_volume is None:
             raise ImportError("sparse_to_dense_volume not available. Install models.evol_splat or provide a custom sparse_to_dense_volume_fn.")
 
-        # MLP heads (only 3D features are used per design)
+        model_2d_flags = model_cfg.get("use_2d_features", False)
+        self.use_2d_features = bool(model_2d_flags)
+        self.feat_2d_channels = model_cfg.get("feat_2d_channels", 16)
+        self.feat_2d_resolution = model_cfg.get("feat_2d_resolution", 0.25)
+        self.alpha_t_top_k = model_cfg.get("alpha_t_top_k", 8)
+
+        if self.use_2d_features:
+            if image_feature_extractor is not None:
+                self.image_feature_extractor = image_feature_extractor.to(device)
+            else:
+                from models.feature_extractors import ImageFeatureExtractor
+
+                self.image_feature_extractor = ImageFeatureExtractor(
+                    in_channels=3,
+                    out_channels=self.feat_2d_channels,
+                    backbone=model_cfg.get("feat_2d_backbone", "resnet18"),
+                    feature_resolution=self.feat_2d_resolution,
+                    pretrained=model_cfg.get("feat_2d_pretrained", True),
+                    device=device,
+                )
+
+            if alpha_t_extractor is not None:
+                self.alpha_t_extractor = alpha_t_extractor
+            else:
+                from models.feature_extractors import AlphaTWeightExtractor
+
+                self.alpha_t_extractor = AlphaTWeightExtractor(
+                    renderer=self.renderer,
+                    top_k=self.alpha_t_top_k,
+                    device=device,
+                )
+
+            if feature_2d_backprojector is not None:
+                self.feature_2d_backprojector = feature_2d_backprojector.to(device)
+            else:
+                from models.feature_extractors import Feature2DBackprojector
+
+                self.feature_2d_backprojector = Feature2DBackprojector(
+                    feature_channels=self.feat_2d_channels,
+                    eps=1e-8,
+                    device=device,
+                )
+
+            if feature_fusion is not None:
+                self.feature_fusion = feature_fusion.to(device)
+            else:
+                from models.feature_extractors import FeatureFusion
+
+                self.feature_fusion = FeatureFusion(
+                    feat_3d_dim=outdim,
+                    feat_2d_dim=self.feat_2d_channels,
+                    include_visibility=True,
+                ).to(device)
+
+            self.feat_fused_dim = outdim + self.feat_2d_channels + 1
+        else:
+            self.image_feature_extractor = None
+            self.alpha_t_extractor = None
+            self.feature_2d_backprojector = None
+            self.feature_fusion = None
+            self.feat_fused_dim = outdim
+
+        mlp_input_dim = self.feat_fused_dim
+
         self.mlp_offset_pos = nn.Sequential(
-            nn.Linear(outdim, 64),
+            nn.Linear(mlp_input_dim, 64),
             nn.ReLU(),
             nn.Linear(64, 32),
             nn.ReLU(),
@@ -344,7 +411,7 @@ class StreetForwardTrainer(nn.Module):
         ).to(device)
 
         self.mlp_conv = nn.Sequential(
-            nn.Linear(outdim, 64),
+            nn.Linear(mlp_input_dim, 64),
             nn.ReLU(),
             nn.Linear(64, 32),
             nn.ReLU(),
@@ -352,7 +419,7 @@ class StreetForwardTrainer(nn.Module):
         ).to(device)
 
         self.mlp_opacity = nn.Sequential(
-            nn.Linear(outdim, 64),
+            nn.Linear(mlp_input_dim, 64),
             nn.ReLU(),
             nn.Linear(64, 32),
             nn.ReLU(),
@@ -361,7 +428,7 @@ class StreetForwardTrainer(nn.Module):
 
         num_sh = _num_sh_bases(self.sh_degree)
         self.gaussion_decoder = nn.Sequential(
-            nn.Linear(outdim, 64),
+            nn.Linear(mlp_input_dim, 64),
             nn.ReLU(),
             nn.Linear(64, 32),
             nn.ReLU(),
@@ -370,6 +437,10 @@ class StreetForwardTrainer(nn.Module):
 
         params: List[torch.nn.Parameter] = []
         params += list(self.sparse_conv.parameters())
+        if self.use_2d_features:
+            params += list(self.image_feature_extractor.parameters())
+            params += list(self.feature_2d_backprojector.parameters())
+            params += list(self.feature_fusion.parameters())
         params += list(self.mlp_offset_pos.parameters())
         params += list(self.mlp_conv.parameters())
         params += list(self.mlp_opacity.parameters())
@@ -863,6 +934,37 @@ class StreetForwardTrainer(nn.Module):
             "offset_sh": offsets_world["offset_sh"],  # 不变
         }
 
+    def _prepare_source_views_for_2d_features(
+        self,
+        batch: Dict,
+        source_frame_idx: int,
+    ) -> Tuple[List, List[torch.Tensor]]:
+        source_views: List = []
+        source_images: List[torch.Tensor] = []
+        if "source_views" in batch and "source_images" in batch:
+            source_views = batch["source_views"]
+            source_images = batch["source_images"]
+        elif "source_data" in batch:
+            for item in batch["source_data"]:
+                if item.get("frame_idx") == source_frame_idx:
+                    if "view" in item:
+                        source_views.append(item["view"])
+                    if "image" in item:
+                        source_images.append(item["image"])
+        else:
+            logger.warning("No source views/images found in batch for 2D feature extraction.")
+
+        processed_images: List[torch.Tensor] = []
+        for img in source_images:
+            if img.dim() == 3:
+                processed_images.append(img.to(self.device))
+            elif img.dim() == 4:
+                processed_images.append(img.squeeze(0).to(self.device))
+            else:
+                raise ValueError(f"Unexpected image shape: {img.shape}")
+
+        return source_views, processed_images
+
     def _build_3d_feature_volume(
         self,
         node_state_bg: NodeState,
@@ -1238,7 +1340,7 @@ class StreetForwardTrainer(nn.Module):
         
         # #region agent log
         if torch.cuda.is_available():
-            total_offset_size = sum(
+            total_offset_size = (
                 offset_pos.numel() * 4 + offset_scales.numel() * 4 + offset_quat.numel() * 4 +
                 offset_opacity.numel() * 4 + offset_sh.numel() * 4
             ) / 1024**2
@@ -1364,7 +1466,36 @@ class StreetForwardTrainer(nn.Module):
         feat_3d_crop = self.interpolate_features(grid_coords, dense_volume)
         del dense_volume
 
-        offsets = self._predict_offsets(feat_3d_crop)
+        feat_for_offsets = feat_3d_crop
+        if self.use_2d_features:
+            # In eval/test we may not have source images; fall back to zero 2D features to keep shapes consistent.
+            if not getattr(self, "_warned_eval_no_2d", False):
+                logger.warning(
+                    "use_2d_features is enabled but _compute_render_params has no source views/images; "
+                    "using zero 2D features for evaluation."
+                )
+                self._warned_eval_no_2d = True
+            num_bg = feat_3d_crop.shape[0]
+            feat_2d_bg = torch.zeros(
+                (num_bg, self.feat_2d_channels),
+                device=feat_3d_crop.device,
+                dtype=feat_3d_crop.dtype,
+            )
+            vis_bg = torch.zeros(num_bg, device=feat_3d_crop.device, dtype=feat_3d_crop.dtype)
+            feat_for_offsets, _ = self.feature_fusion(
+                feat_3d_bg=feat_3d_crop,
+                feat_3d_rigid=torch.zeros(
+                    0, feat_3d_crop.shape[1], device=feat_3d_crop.device, dtype=feat_3d_crop.dtype
+                ),
+                feat_2d_bg=feat_2d_bg,
+                feat_2d_rigid=torch.zeros(
+                    0, self.feat_2d_channels, device=feat_3d_crop.device, dtype=feat_3d_crop.dtype
+                ),
+                vis_bg=vis_bg,
+                vis_rigid=torch.zeros(0, device=feat_3d_crop.device, dtype=feat_3d_crop.dtype),
+            )
+
+        offsets = self._predict_offsets(feat_for_offsets)
         render_params = self._render_params_from_offsets(node_state, offsets)
         return render_params
 
@@ -1492,11 +1623,140 @@ class StreetForwardTrainer(nn.Module):
                     "Please ensure the batch contains source_frame_idx."
                 )
             source_frame_idx = int(source_frame_idx)
+            feat_2d_bg = None
+            feat_2d_rigid = None
+            vis_bg = None
+            vis_rigid = None
+
+            if self.use_2d_features:
+                source_views, source_images = self._prepare_source_views_for_2d_features(
+                    batch=batch, source_frame_idx=source_frame_idx
+                )
+                if len(source_views) == 0 or len(source_images) == 0:
+                    logger.warning(
+                        "2D features enabled but no source views/images provided. Using zeros for this iteration."
+                    )
+                    feat_2d_bg = torch.zeros(
+                        node_state_bg.means.shape[0],
+                        self.feat_2d_channels,
+                        device=self.device,
+                    )
+                    vis_bg = torch.zeros(node_state_bg.means.shape[0], device=self.device)
+                    if node_state_rigid is not None:
+                        feat_2d_rigid = torch.zeros(
+                            node_state_rigid.means.shape[0],
+                            self.feat_2d_channels,
+                            device=self.device,
+                        )
+                        vis_rigid = torch.zeros(node_state_rigid.means.shape[0], device=self.device)
+                    else:
+                        feat_2d_rigid = torch.zeros(
+                            0, self.feat_2d_channels, device=self.device
+                        )
+                        vis_rigid = torch.zeros(0, device=self.device)
+                else:
+                    features_2d = self.image_feature_extractor(source_images)
+                    node_state_rigid_temp = node_state_rigid
+                    means_rigid_world = torch.empty(0, 3, device=self.device)
+                    quats_rigid_world = torch.empty(0, 4, device=self.device)
+                    scales_rigid = torch.empty(0, 3, device=self.device)
+                    opacities_rigid = torch.empty(0, device=self.device)
+                    num_sh_total = _num_sh_bases(self.sh_degree)
+                    colors_rigid = torch.empty(0, num_sh_total, 3, device=self.device)
+                    if node_state_rigid_temp is not None:
+                        node_state_rigid_temp.cur_frame = source_frame_idx
+                        means_rigid_world = self._transform_rigid_to_world(
+                            node_state_rigid_temp, node_state_rigid_temp.means
+                        )
+                        quats_rigid_world = self._transform_rigid_quats_to_world(
+                            node_state_rigid_temp, node_state_rigid_temp.quats
+                        )
+                        scales_rigid = torch.exp(node_state_rigid_temp.scales_log)
+                        opacities_rigid = torch.sigmoid(node_state_rigid_temp.opacity_logit).squeeze(-1)
+                        colors_rigid = torch.cat(
+                            [
+                                node_state_rigid_temp.sh_dc[:, None, :],
+                                node_state_rigid_temp.sh_rest,
+                            ],
+                            dim=1,
+                        )
+
+                    means_bg = node_state_bg.means
+                    quats_bg = node_state_bg.quats
+                    scales_bg = torch.exp(node_state_bg.scales_log)
+                    opacities_bg = torch.sigmoid(node_state_bg.opacity_logit).squeeze(-1)
+                    colors_bg = torch.cat(
+                        [node_state_bg.sh_dc[:, None, :], node_state_bg.sh_rest], dim=1
+                    )
+
+                    means_merged = torch.cat([means_bg, means_rigid_world], dim=0)
+                    quats_merged = torch.cat([quats_bg, quats_rigid_world], dim=0)
+                    scales_merged = torch.cat([scales_bg, scales_rigid], dim=0)
+                    opacities_merged = torch.cat([opacities_bg, opacities_rigid], dim=0)
+                    colors_merged = torch.cat([colors_bg, colors_rigid], dim=0)
+
+                    Hf, Wf = self.image_feature_extractor.get_feature_resolution(
+                        source_images[0].shape[-2], source_images[0].shape[-1]
+                    )
+
+                    gaussian_indices, alpha_t_weights = self.alpha_t_extractor.extract_alpha_t_weights(
+                        means=means_merged,
+                        quats=quats_merged,
+                        scales=scales_merged,
+                        opacities=opacities_merged,
+                        colors=colors_merged,
+                        views=source_views,
+                        height=Hf,
+                        width=Wf,
+                        sh_degree=self.sh_degree,
+                    )
+
+                    N_bg = node_state_bg.means.shape[0]
+                    N_rigid = means_rigid_world.shape[0]
+                    bg_indices = torch.arange(N_bg, device=self.device)
+                    rigid_indices = (
+                        torch.arange(N_bg, N_bg + N_rigid, device=self.device) if N_rigid > 0 else None
+                    )
+
+                    (
+                        _,
+                        _,
+                        feat_2d_bg,
+                        feat_2d_rigid,
+                        vis_bg,
+                        vis_rigid,
+                    ) = self.feature_2d_backprojector(
+                        features_2d=features_2d,
+                        gaussian_indices=gaussian_indices,
+                        alpha_t_weights=alpha_t_weights,
+                        num_gaussians=N_bg + N_rigid,
+                        bg_indices=bg_indices,
+                        rigid_indices=rigid_indices,
+                    )
             feat_bg, feat_rigid, rigid_visible_mask = self._build_3d_feature_volume(
                 node_state_bg=node_state_bg,
                 node_state_rigid=node_state_rigid,
                 source_frame_idx=source_frame_idx,
             )
+
+            if self.use_2d_features and feat_2d_bg is not None:
+                feat_fused_bg, feat_fused_rigid = self.feature_fusion(
+                    feat_3d_bg=feat_bg,
+                    feat_3d_rigid=feat_rigid
+                    if feat_rigid.shape[0] > 0
+                    else torch.empty(0, feat_bg.shape[1], device=self.device),
+                    feat_2d_bg=feat_2d_bg,
+                    feat_2d_rigid=feat_2d_rigid
+                    if feat_2d_rigid is not None and feat_2d_rigid.shape[0] > 0
+                    else torch.empty(0, self.feat_2d_channels, device=self.device),
+                    vis_bg=vis_bg if vis_bg is not None else torch.zeros(feat_bg.shape[0], device=self.device),
+                    vis_rigid=vis_rigid if vis_rigid is not None else torch.zeros(0, device=self.device),
+                )
+            else:
+                feat_fused_bg = feat_bg
+                feat_fused_rigid = feat_rigid if feat_rigid.shape[0] > 0 else torch.empty(
+                    0, feat_bg.shape[1], device=self.device
+                )
             
             # #region agent log
             if torch.cuda.is_available():
@@ -1514,10 +1774,10 @@ class StreetForwardTrainer(nn.Module):
                 )
             # #endregion
             
-            offsets_bg = self._predict_offsets(feat_bg)
+            offsets_bg = self._predict_offsets(feat_fused_bg)
             offsets_rigid_world = None
-            if node_state_rigid is not None and feat_rigid.shape[0] > 0:
-                offsets_rigid_world = self._predict_offsets(feat_rigid)
+            if node_state_rigid is not None and feat_fused_rigid.shape[0] > 0:
+                offsets_rigid_world = self._predict_offsets(feat_fused_rigid)
                 offsets_rigid_world = self._mask_rigid_offsets(offsets_rigid_world, rigid_visible_mask)
             
             # #region agent log
@@ -1537,6 +1797,28 @@ class StreetForwardTrainer(nn.Module):
             # Store offsets for gradient checking (avoid accessing non-leaf tensor grads)
             self._last_offsets_bg = offsets_bg
             self._last_offsets_rigid = offsets_rigid_world
+            
+            # #region agent log
+            # Check offsets requires_grad and is_leaf status
+            if offsets_bg:
+                offset_status = {}
+                for key in ["offset_pos", "offset_scales", "offset_quat", "offset_opacity", "offset_sh"]:
+                    if key in offsets_bg:
+                        offset_status[f"bg.{key}"] = {
+                            "requires_grad": offsets_bg[key].requires_grad,
+                            "is_leaf": offsets_bg[key].is_leaf,
+                            "grad_fn": str(type(offsets_bg[key].grad_fn)) if offsets_bg[key].grad_fn else "None",
+                        }
+                _debug_log(
+                    "streetforward.py:train_iter",
+                    "Offsets status before render_params",
+                    {
+                        "inner_iter": inner_iter_idx,
+                        "offset_status": offset_status,
+                    },
+                    hypothesis_id="H3",
+                )
+            # #endregion
 
             render_params_bg = self._render_params_from_offsets(node_state_bg, offsets_bg)
             render_params_rigid = None
@@ -1835,6 +2117,25 @@ class StreetForwardTrainer(nn.Module):
             torch.autograd.backward(tensors=render_tensors, grad_tensors=grad_tensors)
             
             # #region agent log
+            # Check MLP parameters gradients (these are the actual leaf tensors that should have gradients)
+            mlp_grads = {}
+            mlp_params = {
+                "mlp_offset_pos": list(self.mlp_offset_pos.parameters()),
+                "mlp_conv": list(self.mlp_conv.parameters()),
+                "mlp_opacity": list(self.mlp_opacity.parameters()),
+                "gaussion_decoder": list(self.gaussion_decoder.parameters()),
+            }
+            for mlp_name, params in mlp_params.items():
+                for i, param in enumerate(params):
+                    param_key = f"{mlp_name}.param_{i}"
+                    if param.grad is not None:
+                        mlp_grads[param_key] = float(param.grad.norm().item())
+                    else:
+                        mlp_grads[param_key] = 0.0
+            
+            # #endregion
+            
+            # #region agent log
             # Check render params gradients after autograd.backward (only for leaf tensors)
             # Note: render_params are non-leaf tensors, so we check the underlying computation graph
             # by checking if the offsets have gradients instead
@@ -1842,18 +2143,43 @@ class StreetForwardTrainer(nn.Module):
             # Check if offsets have gradients (these are the actual leaf tensors)
             offset_keys = ["offset_pos", "offset_scales", "offset_quat", "offset_opacity", "offset_sh"]
             offset_grads = {}
+            offset_status_after = {}
             if hasattr(self, '_last_offsets_bg') and self._last_offsets_bg is not None:
                 for key in offset_keys:
-                    if key in self._last_offsets_bg and self._last_offsets_bg[key].grad is not None:
-                        offset_grads[f"bg.{key}"] = float(self._last_offsets_bg[key].grad.norm().item())
+                    if key in self._last_offsets_bg:
+                        offset_tensor = self._last_offsets_bg[key]
+                        has_grad = offset_tensor.grad is not None
+                        grad_norm = float(offset_tensor.grad.norm().item()) if has_grad else 0.0
+                        offset_grads[f"bg.{key}"] = grad_norm
+                        offset_status_after[f"bg.{key}"] = {
+                            "has_grad": has_grad,
+                            "requires_grad": offset_tensor.requires_grad,
+                            "is_leaf": offset_tensor.is_leaf,
+                            "grad_fn": str(type(offset_tensor.grad_fn)) if offset_tensor.grad_fn else "None",
+                        }
                     else:
                         offset_grads[f"bg.{key}"] = 0.0
             if hasattr(self, '_last_offsets_rigid') and self._last_offsets_rigid is not None:
                 for key in offset_keys:
-                    if key in self._last_offsets_rigid and self._last_offsets_rigid[key].grad is not None:
-                        offset_grads[f"rigid.{key}"] = float(self._last_offsets_rigid[key].grad.norm().item())
+                    if key in self._last_offsets_rigid:
+                        offset_tensor = self._last_offsets_rigid[key]
+                        has_grad = offset_tensor.grad is not None
+                        grad_norm = float(offset_tensor.grad.norm().item()) if has_grad else 0.0
+                        offset_grads[f"rigid.{key}"] = grad_norm
                     else:
                         offset_grads[f"rigid.{key}"] = 0.0
+            
+            # Check if render_params are connected to offsets in computation graph
+            render_params_connected = {}
+            if hasattr(self, '_last_offsets_bg') and self._last_offsets_bg is not None:
+                # Check if render_params_bg are connected to offsets
+                for key in ["means_r", "scales_r", "quats_r", "opacities_r", "colors_r"]:
+                    render_tensor = render_params_bg[key]
+                    render_params_connected[f"bg.{key}"] = {
+                        "requires_grad": render_tensor.requires_grad,
+                        "is_leaf": render_tensor.is_leaf,
+                        "grad_fn": str(type(render_tensor.grad_fn)) if render_tensor.grad_fn else "None",
+                    }
             
             _debug_log(
                 "streetforward.py:train_iter",
@@ -1862,6 +2188,10 @@ class StreetForwardTrainer(nn.Module):
                     "inner_iter": inner_iter_idx,
                     "offset_grads": offset_grads,
                     "grad_propagated": {k: offset_grads[k] > 0 for k in offset_grads},
+                    "offset_status_after": offset_status_after,
+                    "render_params_connected": render_params_connected,
+                    "mlp_grads": mlp_grads,
+                    "mlp_has_grad": {k: mlp_grads[k] > 0 for k in mlp_grads},
                 },
                 hypothesis_id="H3",
             )
@@ -2039,6 +2369,12 @@ class StreetForwardTrainer(nn.Module):
             "mlp_opacity": self.mlp_opacity.state_dict(),
             "gaussion_decoder": self.gaussion_decoder.state_dict(),
         }
+        if self.use_2d_features and self.image_feature_extractor is not None:
+            model_state_dict["image_feature_extractor"] = self.image_feature_extractor.state_dict()
+        if self.use_2d_features and self.feature_2d_backprojector is not None:
+            model_state_dict["feature_2d_backprojector"] = self.feature_2d_backprojector.state_dict()
+        if self.use_2d_features and self.feature_fusion is not None:
+            model_state_dict["feature_fusion"] = self.feature_fusion.state_dict()
 
         nodes_state_dict = {
             f"scene_{scene}_segment_{segment}": self._node_state_to_dict(state)
@@ -2092,6 +2428,14 @@ class StreetForwardTrainer(nn.Module):
         self.mlp_conv.load_state_dict(model_state["mlp_conv"], strict=strict)
         self.mlp_opacity.load_state_dict(model_state["mlp_opacity"], strict=strict)
         self.gaussion_decoder.load_state_dict(model_state["gaussion_decoder"], strict=strict)
+        if self.use_2d_features and "image_feature_extractor" in model_state and self.image_feature_extractor is not None:
+            self.image_feature_extractor.load_state_dict(model_state["image_feature_extractor"], strict=strict)
+        if self.use_2d_features and "feature_2d_backprojector" in model_state and self.feature_2d_backprojector is not None:
+            self.feature_2d_backprojector.load_state_dict(
+                model_state["feature_2d_backprojector"], strict=strict
+            )
+        if self.use_2d_features and "feature_fusion" in model_state and self.feature_fusion is not None:
+            self.feature_fusion.load_state_dict(model_state["feature_fusion"], strict=strict)
 
         if load_optimizer and "optimizer_state_dict" in checkpoint:
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
