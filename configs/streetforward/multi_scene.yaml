@@ -105,9 +105,9 @@ model:
   bbx_max: [20.0, 4.8, 70.0]  # 应该与 crop_aabb[1] 一致
   
   # 2D feature fusion configuration (optional)
-  use_2d_features: false    # Enable 2D+3D feature fusion
+  use_2d_features: true    # Enable 2D+3D feature fusion
   feat_2d_channels: 16     # 2D feature channels (default: 16 or 32)
-  feat_2d_resolution: 0.25  # Feature map resolution ratio (default: 0.25, i.e., 1/4 of original image)
+  feat_2d_resolution: 1  # Feature map resolution ratio (default: 0.25, i.e., 1/4 of original image)
   feat_2d_backbone: "resnet18"  # CNN backbone (default: resnet18)
   feat_2d_pretrained: true  # Use pretrained weights (default: true)
   alpha_t_top_k: 8          # Top-K value for αT weight extraction (default: 8)

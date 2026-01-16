@@ -94,23 +94,111 @@ class ImageFeatureExtractor(nn.Module):
         return h, w
 
     def forward(self, images: List[torch.Tensor]) -> List[torch.Tensor]:
+        # #region agent log
+        import json
+        import time
+        import os
+        _debug_log_path = "/root/drivestudio-coding/.cursor/debug.log"
+        try:
+            entry = {
+                "timestamp": int(time.time() * 1000),
+                "location": "image_feature_extractor.py:forward",
+                "message": "2D feature extraction start",
+                "data": {
+                    "num_images": len(images),
+                    "image_shapes": [list(img.shape) if isinstance(img, torch.Tensor) else None for img in images],
+                },
+                "sessionId": "debug-session",
+                "runId": "initial",
+                "hypothesisId": "H1",
+            }
+            with open(_debug_log_path, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+        except Exception:
+            pass
+        # #endregion
+        
         if len(images) == 0:
             return []
         processed = []
         for img in images:
+            # Handle different input formats
             if img.dim() == 3:
-                processed.append(img.unsqueeze(0))
-            elif img.dim() == 4 and img.shape[0] == 1:
-                processed.append(img)
+                # [H, W, C] -> [C, H, W] for CNN
+                if img.shape[-1] == 3 or img.shape[-1] == 1:  # HWC format
+                    img = img.permute(2, 0, 1)  # [H, W, C] -> [C, H, W]
+                # Now img is [C, H, W], add batch dimension
+                processed.append(img.unsqueeze(0))  # [C, H, W] -> [1, C, H, W]
+            elif img.dim() == 4:
+                if img.shape[1] == 3 or img.shape[1] == 1:  # Already [B, C, H, W]
+                    processed.append(img)
+                elif img.shape[-1] == 3 or img.shape[-1] == 1:  # [B, H, W, C] format
+                    img = img.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
+                    processed.append(img)
+                else:
+                    raise ValueError(f"Unexpected 4D image shape: {img.shape}")
             else:
                 raise ValueError(f"Unexpected image shape: {img.shape}")
 
         x = torch.cat(processed, dim=0).to(self.proj.weight.device)
+        
+        # #region agent log
+        try:
+            if torch.cuda.is_available():
+                entry = {
+                    "timestamp": int(time.time() * 1000),
+                    "location": "image_feature_extractor.py:forward",
+                    "message": "Before backbone forward",
+                    "data": {
+                        "batch_shape": list(x.shape),
+                        "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
+                        "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
+                    },
+                    "sessionId": "debug-session",
+                    "runId": "initial",
+                    "hypothesisId": "H1",
+                }
+                with open(_debug_log_path, "a") as f:
+                    f.write(json.dumps(entry) + "\n")
+        except Exception:
+            pass
+        # #endregion
+        
         feats = self.backbone(x)
         feats = self.proj(feats)
 
         target_h, target_w = self.get_feature_resolution(x.shape[-2], x.shape[-1])
         if feats.shape[-2] != target_h or feats.shape[-1] != target_w:
             feats = F.interpolate(feats, size=(target_h, target_w), mode="bilinear", align_corners=False)
+
+        # #region agent log
+        try:
+            if torch.cuda.is_available():
+                feat_stats = {
+                    "mean": float(feats.mean().item()),
+                    "std": float(feats.std().item()),
+                    "min": float(feats.min().item()),
+                    "max": float(feats.max().item()),
+                }
+                entry = {
+                    "timestamp": int(time.time() * 1000),
+                    "location": "image_feature_extractor.py:forward",
+                    "message": "After feature extraction",
+                    "data": {
+                        "feat_shape": list(feats.shape),
+                        "target_resolution": [target_h, target_w],
+                        "feat_stats": feat_stats,
+                        "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
+                        "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
+                    },
+                    "sessionId": "debug-session",
+                    "runId": "initial",
+                    "hypothesisId": "H1",
+                }
+                with open(_debug_log_path, "a") as f:
+                    f.write(json.dumps(entry) + "\n")
+        except Exception:
+            pass
+        # #endregion
 
         return [feats[i] for i in range(feats.shape[0])]

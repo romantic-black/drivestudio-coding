@@ -323,6 +323,7 @@ class StreetForwardTrainer(nn.Module):
             raise ImportError("Renderer not available. Install gsplat or provide a custom renderer.")
 
         outdim = model_cfg.get("sparseConv_outdim", 32)
+        self.sparseConv_outdim = outdim
         if sparse_conv is not None:
             self.sparse_conv = sparse_conv.to(device)
         elif _SparseCostRegNet is not None:
@@ -941,9 +942,16 @@ class StreetForwardTrainer(nn.Module):
     ) -> Tuple[List, List[torch.Tensor]]:
         source_views: List = []
         source_images: List[torch.Tensor] = []
-        if "source_views" in batch and "source_images" in batch:
+        # Support both "source_images" and "src_images" keys
+        source_images_key = None
+        if "source_images" in batch:
+            source_images_key = "source_images"
+        elif "src_images" in batch:
+            source_images_key = "src_images"
+        
+        if "source_views" in batch and source_images_key is not None:
             source_views = batch["source_views"]
-            source_images = batch["source_images"]
+            source_images = batch[source_images_key]
         elif "source_data" in batch:
             for item in batch["source_data"]:
                 if item.get("frame_idx") == source_frame_idx:
@@ -1608,10 +1616,12 @@ class StreetForwardTrainer(nn.Module):
                 {
                     "num_targets": len(targets),
                     "inner_iterations": self.inner_iterations,
+                    "use_2d_features": self.use_2d_features,
                     "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
                     "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
+                    "max_allocated_mb": torch.cuda.max_memory_allocated() / 1024**2,
                 },
-                hypothesis_id="H4",
+                hypothesis_id="H6",
             )
         # #endregion
 
@@ -1629,9 +1639,42 @@ class StreetForwardTrainer(nn.Module):
             vis_rigid = None
 
             if self.use_2d_features:
+                # #region agent log
+                if torch.cuda.is_available():
+                    _debug_log(
+                        "streetforward.py:train_iter",
+                        "Before preparing source views for 2D features",
+                        {
+                            "inner_iter": inner_iter_idx,
+                            "source_frame_idx": source_frame_idx,
+                            "batch_keys": list(batch.keys()),
+                            "has_source_views": "source_views" in batch,
+                            "has_source_images": "source_images" in batch,
+                            "has_source_data": "source_data" in batch,
+                        },
+                        hypothesis_id="H1",
+                    )
+                # #endregion
+                
                 source_views, source_images = self._prepare_source_views_for_2d_features(
                     batch=batch, source_frame_idx=source_frame_idx
                 )
+                
+                # #region agent log
+                if torch.cuda.is_available():
+                    _debug_log(
+                        "streetforward.py:train_iter",
+                        "After preparing source views for 2D features",
+                        {
+                            "inner_iter": inner_iter_idx,
+                            "num_source_views": len(source_views),
+                            "num_source_images": len(source_images),
+                            "will_use_zero_features": len(source_views) == 0 or len(source_images) == 0,
+                        },
+                        hypothesis_id="H1",
+                    )
+                # #endregion
+                
                 if len(source_views) == 0 or len(source_images) == 0:
                     logger.warning(
                         "2D features enabled but no source views/images provided. Using zeros for this iteration."
@@ -1655,7 +1698,41 @@ class StreetForwardTrainer(nn.Module):
                         )
                         vis_rigid = torch.zeros(0, device=self.device)
                 else:
+                    # #region agent log
+                    if torch.cuda.is_available():
+                        _debug_log(
+                            "streetforward.py:train_iter",
+                            "Before 2D feature extraction",
+                            {
+                                "inner_iter": inner_iter_idx,
+                                "num_source_images": len(source_images),
+                                "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
+                                "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
+                            },
+                            hypothesis_id="H1",
+                        )
+                    # #endregion
+                    
                     features_2d = self.image_feature_extractor(source_images)
+                    
+                    # #region agent log
+                    if torch.cuda.is_available():
+                        feat_2d_size_mb = sum(f.numel() * 4 / 1024**2 for f in features_2d)
+                        _debug_log(
+                            "streetforward.py:train_iter",
+                            "After 2D feature extraction",
+                            {
+                                "inner_iter": inner_iter_idx,
+                                "num_features": len(features_2d),
+                                "feat_shapes": [list(f.shape) for f in features_2d],
+                                "feat_2d_total_size_mb": feat_2d_size_mb,
+                                "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
+                                "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
+                            },
+                            hypothesis_id="H1",
+                        )
+                    # #endregion
+                    
                     node_state_rigid_temp = node_state_rigid
                     means_rigid_world = torch.empty(0, 3, device=self.device)
                     quats_rigid_world = torch.empty(0, 4, device=self.device)
@@ -1695,10 +1772,65 @@ class StreetForwardTrainer(nn.Module):
                     opacities_merged = torch.cat([opacities_bg, opacities_rigid], dim=0)
                     colors_merged = torch.cat([colors_bg, colors_rigid], dim=0)
 
-                    Hf, Wf = self.image_feature_extractor.get_feature_resolution(
-                        source_images[0].shape[-2], source_images[0].shape[-1]
-                    )
+                    # Get image dimensions
+                    # After image_feature_extractor.forward, source_images is List[torch.Tensor]
+                    # where each tensor is [C, H, W] format
+                    img0 = source_images[0]
+                    # #region agent log
+                    try:
+                        _debug_log(
+                            "streetforward.py:train_iter",
+                            "Before calculating Hf and Wf",
+                            {
+                                "inner_iter": inner_iter_idx,
+                                "img0_shape": list(img0.shape),
+                                "img0_dim": img0.dim(),
+                            },
+                            hypothesis_id="H2",
+                        )
+                    except Exception:
+                        pass
+                    # #endregion
+                    
+                    if img0.dim() == 3:
+                        # After image_feature_extractor.forward, images are [C, H, W]
+                        img_h, img_w = img0.shape[1], img0.shape[2]
+                    else:
+                        raise ValueError(f"Unexpected image shape: {img0.shape}")
+                    
+                    # #region agent log
+                    try:
+                        _debug_log(
+                            "streetforward.py:train_iter",
+                            "After calculating img_h and img_w",
+                            {
+                                "inner_iter": inner_iter_idx,
+                                "img_h": int(img_h),
+                                "img_w": int(img_w),
+                            },
+                            hypothesis_id="H2",
+                        )
+                    except Exception:
+                        pass
+                    # #endregion
+                    
+                    Hf, Wf = self.image_feature_extractor.get_feature_resolution(img_h, img_w)
 
+                    # #region agent log
+                    if torch.cuda.is_available():
+                        _debug_log(
+                            "streetforward.py:train_iter",
+                            "Before alphaT extraction",
+                            {
+                                "inner_iter": inner_iter_idx,
+                                "num_merged_gaussians": means_merged.shape[0],
+                                "target_resolution": [Hf, Wf],
+                                "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
+                            },
+                            hypothesis_id="H2",
+                        )
+                    # #endregion
+                    
                     gaussian_indices, alpha_t_weights = self.alpha_t_extractor.extract_alpha_t_weights(
                         means=means_merged,
                         quats=quats_merged,
@@ -1710,6 +1842,24 @@ class StreetForwardTrainer(nn.Module):
                         width=Wf,
                         sh_degree=self.sh_degree,
                     )
+                    
+                    # #region agent log
+                    if torch.cuda.is_available():
+                        idx_size_mb = sum(idx.numel() * 4 / 1024**2 for idx in gaussian_indices)
+                        w_size_mb = sum(w.numel() * 4 / 1024**2 for w in alpha_t_weights)
+                        _debug_log(
+                            "streetforward.py:train_iter",
+                            "After alphaT extraction",
+                            {
+                                "inner_iter": inner_iter_idx,
+                                "num_views": len(gaussian_indices),
+                                "idx_total_size_mb": idx_size_mb,
+                                "w_total_size_mb": w_size_mb,
+                                "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
+                            },
+                            hypothesis_id="H2",
+                        )
+                    # #endregion
 
                     N_bg = node_state_bg.means.shape[0]
                     N_rigid = means_rigid_world.shape[0]
@@ -1718,6 +1868,21 @@ class StreetForwardTrainer(nn.Module):
                         torch.arange(N_bg, N_bg + N_rigid, device=self.device) if N_rigid > 0 else None
                     )
 
+                    # #region agent log
+                    if torch.cuda.is_available():
+                        _debug_log(
+                            "streetforward.py:train_iter",
+                            "Before 2D backprojection",
+                            {
+                                "inner_iter": inner_iter_idx,
+                                "N_bg": N_bg,
+                                "N_rigid": N_rigid,
+                                "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
+                            },
+                            hypothesis_id="H3",
+                        )
+                    # #endregion
+                    
                     (
                         _,
                         _,
@@ -1733,6 +1898,23 @@ class StreetForwardTrainer(nn.Module):
                         bg_indices=bg_indices,
                         rigid_indices=rigid_indices,
                     )
+                    
+                    # #region agent log
+                    if torch.cuda.is_available():
+                        _debug_log(
+                            "streetforward.py:train_iter",
+                            "After 2D backprojection",
+                            {
+                                "inner_iter": inner_iter_idx,
+                                "feat_2d_bg_shape": list(feat_2d_bg.shape),
+                                "feat_2d_rigid_shape": list(feat_2d_rigid.shape),
+                                "feat_2d_bg_requires_grad": feat_2d_bg.requires_grad,
+                                "feat_2d_rigid_requires_grad": feat_2d_rigid.requires_grad if feat_2d_rigid.numel() > 0 else False,
+                                "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
+                            },
+                            hypothesis_id="H3",
+                        )
+                    # #endregion
             feat_bg, feat_rigid, rigid_visible_mask = self._build_3d_feature_volume(
                 node_state_bg=node_state_bg,
                 node_state_rigid=node_state_rigid,
@@ -1740,6 +1922,22 @@ class StreetForwardTrainer(nn.Module):
             )
 
             if self.use_2d_features and feat_2d_bg is not None:
+                # #region agent log
+                if torch.cuda.is_available():
+                    _debug_log(
+                        "streetforward.py:train_iter",
+                        "Before feature fusion",
+                        {
+                            "inner_iter": inner_iter_idx,
+                            "feat_3d_bg_shape": list(feat_bg.shape),
+                            "feat_3d_rigid_shape": list(feat_rigid.shape),
+                            "feat_2d_bg_shape": list(feat_2d_bg.shape),
+                            "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
+                        },
+                        hypothesis_id="H4",
+                    )
+                # #endregion
+                
                 feat_fused_bg, feat_fused_rigid = self.feature_fusion(
                     feat_3d_bg=feat_bg,
                     feat_3d_rigid=feat_rigid
@@ -1752,6 +1950,23 @@ class StreetForwardTrainer(nn.Module):
                     vis_bg=vis_bg if vis_bg is not None else torch.zeros(feat_bg.shape[0], device=self.device),
                     vis_rigid=vis_rigid if vis_rigid is not None else torch.zeros(0, device=self.device),
                 )
+                
+                # #region agent log
+                if torch.cuda.is_available():
+                    _debug_log(
+                        "streetforward.py:train_iter",
+                        "After feature fusion",
+                        {
+                            "inner_iter": inner_iter_idx,
+                            "feat_fused_bg_shape": list(feat_fused_bg.shape),
+                            "feat_fused_rigid_shape": list(feat_fused_rigid.shape),
+                            "feat_fused_bg_requires_grad": feat_fused_bg.requires_grad,
+                            "expected_dim": self.feat_fused_dim,
+                            "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
+                        },
+                        hypothesis_id="H4",
+                    )
+                # #endregion
             else:
                 feat_fused_bg = feat_bg
                 feat_fused_rigid = feat_rigid if feat_rigid.shape[0] > 0 else torch.empty(
@@ -2133,6 +2348,47 @@ class StreetForwardTrainer(nn.Module):
                     else:
                         mlp_grads[param_key] = 0.0
             
+            # Check CNN parameters gradients (2D feature extractor)
+            cnn_grads = {}
+            if self.use_2d_features and self.image_feature_extractor is not None:
+                for name, param in self.image_feature_extractor.named_parameters():
+                    if param.grad is not None:
+                        cnn_grads[name] = float(param.grad.norm().item())
+                    else:
+                        cnn_grads[name] = 0.0
+            
+            # Check backprojector gradients (should have gradients if feat_2d has gradients)
+            backprojector_grads = {}
+            if self.use_2d_features and self.feature_2d_backprojector is not None:
+                for name, param in self.feature_2d_backprojector.named_parameters():
+                    if param.grad is not None:
+                        backprojector_grads[name] = float(param.grad.norm().item())
+                    else:
+                        backprojector_grads[name] = 0.0
+            
+            # Check feature fusion gradients
+            fusion_grads = {}
+            if self.use_2d_features and self.feature_fusion is not None:
+                for name, param in self.feature_fusion.named_parameters():
+                    if param.grad is not None:
+                        fusion_grads[name] = float(param.grad.norm().item())
+                    else:
+                        fusion_grads[name] = 0.0
+            
+            _debug_log(
+                "streetforward.py:train_iter",
+                "Gradient check after autograd.backward",
+                {
+                    "inner_iter": inner_iter_idx,
+                    "mlp_grads": mlp_grads,
+                    "mlp_has_grad": {k: mlp_grads[k] > 0 for k in mlp_grads},
+                    "cnn_grads": cnn_grads,
+                    "cnn_has_grad": {k: cnn_grads[k] > 0 for k in cnn_grads},
+                    "backprojector_grads": backprojector_grads,
+                    "fusion_grads": fusion_grads,
+                },
+                hypothesis_id="H5",
+            )
             # #endregion
             
             # #region agent log
@@ -2190,16 +2446,44 @@ class StreetForwardTrainer(nn.Module):
                     "grad_propagated": {k: offset_grads[k] > 0 for k in offset_grads},
                     "offset_status_after": offset_status_after,
                     "render_params_connected": render_params_connected,
-                    "mlp_grads": mlp_grads,
-                    "mlp_has_grad": {k: mlp_grads[k] > 0 for k in mlp_grads},
                 },
                 hypothesis_id="H3",
             )
             # #endregion
 
             if apply_update:
+                # #region agent log
+                if torch.cuda.is_available():
+                    _debug_log(
+                        "streetforward.py:train_iter",
+                        "Before optimizer.step",
+                        {
+                            "inner_iter": inner_iter_idx,
+                            "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
+                            "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
+                            "max_allocated_mb": torch.cuda.max_memory_allocated() / 1024**2,
+                        },
+                        hypothesis_id="H6",
+                    )
+                # #endregion
+                
                 self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)
+                
+                # #region agent log
+                if torch.cuda.is_available():
+                    _debug_log(
+                        "streetforward.py:train_iter",
+                        "After optimizer.step",
+                        {
+                            "inner_iter": inner_iter_idx,
+                            "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
+                            "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
+                            "max_allocated_mb": torch.cuda.max_memory_allocated() / 1024**2,
+                        },
+                        hypothesis_id="H6",
+                    )
+                # #endregion
 
             if update_state:
                 with torch.no_grad():
