@@ -7,6 +7,7 @@
 **相关文档**：
 - 流程文档：`docs/trainers/StreetForward_Flow.md` - 包含完整的训练流程和 2D 特征融合步骤
 - 问题分析：`docs/trainers/StreetForward_2DFeat_Issues.md` - 实现过程中的关键问题和解决方案
+- 性能优化：`docs/trainers/StreetForward_2DFeat_AlphaT_Optimization.md` - αT 权重计算的 GPU 优化方案
 
 ## 目录
 1. [方案概述](#方案概述)
@@ -171,6 +172,8 @@
    - 计算每个高斯的贡献：`weight = exp(-0.5 * sigma_term) * opacity * T`
    - 使用 `torch.topk` 选择 top-K 贡献最大的高斯
    - 存储到 `idx_map[Hf, Wf, K]` 和 `w_map[Hf, Wf, K]`
+
+**性能优化**：当前实现存在性能瓶颈（CPU 循环），详见 `docs/trainers/StreetForward_2DFeat_AlphaT_Optimization.md` 中的 GPU 优化方案。
 
 **输出接口**：
 - `gaussian_indices: List[Tensor]` - 每个视图的高斯索引 `[Hf, Wf, K]`（无效填 -1）
@@ -521,3 +524,5 @@ mlp_offset_pos = nn.Sequential(
   - `models/feature_extractors/feature_fusion.py` - 特征融合模块
 - 配置文件：`configs/streetforward/multi_scene.yaml`
 - 问题分析：`docs/trainers/StreetForward_2DFeat_Issues.md` - 实现过程中的关键问题和解决方案
+- 性能优化：`docs/trainers/StreetForward_2DFeat_AlphaT_Optimization.md` - αT 权重计算的 GPU 优化方案
+- API 详解：`docs/trainers/gsplat_RasterizeToIndices_API.md` - gsplat 索引函数的详细输入输出说明

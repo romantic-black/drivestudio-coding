@@ -9,6 +9,7 @@
 4. [数据结构详解](#数据结构详解)
 5. [关键组件说明](#关键组件说明)
 6. [梯度反向传播机制](#梯度反向传播机制)
+7. [相关文档](#相关文档)
 
 ---
 
@@ -1713,6 +1714,12 @@ psnr = -10 * torch.log10(mse)  # 如果 mse <= 0，返回 inf
 - 权重使用 `detach()`，避免高阶梯度耦合
 - 使用与 RGB 渲染相同的排序/截断规则，保证可见性对齐
 
+**性能优化：**
+- 当前实现使用 CPU 循环进行 top-K 选择（见 `_compute_alpha_topk_for_view` 方法）
+- **GPU 优化方案**：可以使用 `gsplat.rasterize_to_indices_in_range` + `nerfacc.render_weight_from_alpha` 实现完全 GPU 加速
+- 详细优化方案请参考：`docs/trainers/StreetForward_2DFeat_AlphaT_Optimization.md`
+- gsplat API 详解请参考：`docs/trainers/gsplat_RasterizeToIndices_API.md`
+
 ### 3. 2D 特征反投影器 (Feature2DBackprojector)
 
 **作用：** 使用 αT 权重将 2D 特征反投影聚合到每个高斯点
@@ -1850,6 +1857,8 @@ feat_fused = concat([feat_3d, feat_2d, vis.unsqueeze(-1)], dim=-1)
 **实现：**
 - **实现：** `gsplat.rendering.rasterization`
 - **错误处理：** 如果 `gsplat` 不可用且未提供自定义 `renderer`，会抛出 `ImportError`
+- **可编辑安装：** gsplat 支持可编辑模式安装，便于实时修改代码，详见 `docs/installation/gsplat_editable_install.md`
+- **可编辑安装：** gsplat 支持可编辑模式安装，便于实时修改代码，详见 `docs/installation/gsplat_editable_install.md`
 
 **输入参数：**
 - `means`: `[N, 3]` - Gaussian中心
@@ -2087,3 +2096,18 @@ StreetForwardTrainer 通过以下关键机制实现了高效的前馈式 3DGS �
 - **实现简单**：特征融合使用简单拼接，易于实现和调试
 
 这种设计既保证了训练效率，又实现了多视角监督的有效利用，同时通过 2D+3D 特征融合提升了偏移量预测的准确性。
+
+---
+
+## 相关文档
+
+### 核心设计文档
+- **2D+3D 特征融合设计**：`docs/trainers/StreetForward_2DFeat_Design.md` - 详细的设计方案和实现细节
+- **Alpha*T 权重优化**：`docs/trainers/StreetForward_2DFeat_AlphaT_Optimization.md` - GPU 加速优化方案
+
+### API 参考文档
+- **gsplat 索引 API**：`docs/trainers/gsplat_RasterizeToIndices_API.md` - `rasterize_to_indices_in_range` 等 API 详解
+- **gsplat Transmittances 改进**：`docs/trainers/gsplat_Transmittances_Improvement.md` - Transmittances 相关改进
+
+### 安装与部署
+- **gsplat 可编辑安装**：`docs/installation/gsplat_editable_install.md` - 可编辑模式安装指南，支持实时修改代码
