@@ -1,11 +1,16 @@
 """
-StreetForward trainer implementing the proxy-based multi-view gradient accumulation
-described in docs/FeedForward_3DGS_Design.md.
+StreetForward 训练器：实现基于代理参数的多视角梯度累积的前馈式 3D Gaussian Splatting 训练。
 
-The implementation keeps node_state as detached buffers, predicts offsets with
-MLP heads, renders with proxy parameters, and back-propagates once per iteration.
-Fallback implementations are provided when external dependencies (gsplat, nerfstudio)
-are unavailable so that unit tests can exercise the gradient plumbing.
+本实现参考 docs/FeedForward_3DGS_Design.md 和 docs/trainers/StreetForward_Flow.md。
+
+核心设计：
+- 将 node_state 作为分离的缓冲区（detached buffers）维护
+- 使用 MLP 头预测参数偏移量（offsets）
+- 通过代理参数进行渲染，实现多视角梯度累积
+- 每个迭代只进行一次反向传播
+- 支持静态背景和动态物体的联合训练
+
+当外部依赖（gsplat, nerfstudio）不可用时，提供回退实现以便单元测试可以验证梯度流。
 """
 
 from __future__ import annotations
@@ -34,7 +39,16 @@ logger = logging.getLogger(__name__)
 _DEBUG_LOG_PATH = "/root/drivestudio-coding/.cursor/debug.log"
 
 def _debug_log(location: str, message: str, data: dict, hypothesis_id: str = None, run_id: str = "initial"):
-    """Write debug log entry in NDJSON format."""
+    """
+    以 NDJSON 格式写入调试日志条目。
+    
+    Args:
+        location: 日志位置标识（通常是函数名）
+        message: 日志消息
+        data: 日志数据字典
+        hypothesis_id: 假设ID（可选）
+        run_id: 运行ID（默认为 "initial"）
+    """
     try:
         entry = {
             "timestamp": int(time.time() * 1000),
@@ -53,21 +67,65 @@ def _debug_log(location: str, message: str, data: dict, hypothesis_id: str = Non
 
 
 def _num_sh_bases(degree: int) -> int:
+    """
+    计算球谐函数（Spherical Harmonics）基函数的数量。
+    
+    Args:
+        degree: SH 度数
+        
+    Returns:
+        基函数数量，公式为 (degree + 1)²
+    """
     return (degree + 1) ** 2
 
 
 def _rgb_to_sh(rgb: torch.Tensor) -> torch.Tensor:
+    """
+    将 RGB 颜色转换为球谐函数的 DC（直流）分量。
+    
+    Args:
+        rgb: RGB 颜色张量，形状 [N, 3]，值域 [0, 1]
+        
+    Returns:
+        SH DC 分量，形状 [N, 3]
+        
+    公式: sh_dc = (rgb - 0.5) / c0
+    其中 c0 = 0.28209479177387814 是 SH 基函数的归一化常数
+    """
     c0 = 0.28209479177387814
     return (rgb - 0.5) / c0
 
 
 def _sh_to_rgb(sh: torch.Tensor) -> torch.Tensor:
+    """
+    将球谐函数的 DC（直流）分量转换为 RGB 颜色。
+    
+    Args:
+        sh: SH DC 分量，形状 [N, 3]
+        
+    Returns:
+        RGB 颜色张量，形状 [N, 3]，值域 [0, 1]
+        
+    公式: rgb = sh * c0 + 0.5
+    其中 c0 = 0.28209479177387814 是 SH 基函数的归一化常数
+    """
     c0 = 0.28209479177387814
     return sh * c0 + 0.5
 
 
 def _random_quat_tensor(num: int, device: torch.device) -> torch.Tensor:
-    """Generate random quaternions in wxyz format (compatible with gsplat)."""
+    """
+    生成随机单位四元数（wxyz 格式，与 gsplat 兼容）。
+    
+    Args:
+        num: 需要生成的四元数数量
+        device: 张量设备
+        
+    Returns:
+        随机四元数张量，形状 [num, 4]，格式为 [w, x, y, z]
+        
+    使用均匀采样方法生成单位球面上的随机四元数。
+    """
     u = torch.rand(num, device=device)
     v = torch.rand(num, device=device)
     w = torch.rand(num, device=device)
@@ -79,6 +137,18 @@ def _random_quat_tensor(num: int, device: torch.device) -> torch.Tensor:
 
 
 def _quat_multiply(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+    """
+    四元数乘法：计算 q1 * q2（用于组合旋转）。
+    
+    Args:
+        q1: 第一个四元数，形状 [..., 4]，格式 [w, x, y, z]
+        q2: 第二个四元数，形状 [..., 4]，格式 [w, x, y, z]
+        
+    Returns:
+        四元数乘积，形状 [..., 4]，格式 [w, x, y, z]
+        
+    注意：四元数乘法不满足交换律，q1 * q2 ≠ q2 * q1
+    """
     w1, x1, y1, z1 = q1.unbind(-1)
     w2, x2, y2, z2 = q2.unbind(-1)
     w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
@@ -89,16 +159,49 @@ def _quat_multiply(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
 
 
 def _quat_conjugate(q: torch.Tensor) -> torch.Tensor:
+    """
+    计算四元数的共轭（用于表示逆旋转）。
+    
+    Args:
+        q: 四元数，形状 [..., 4]，格式 [w, x, y, z]
+        
+    Returns:
+        四元数共轭，形状 [..., 4]，格式 [w, -x, -y, -z]
+        
+    对于单位四元数，共轭等于逆四元数。
+    """
     w, x, y, z = q.unbind(-1)
     return torch.stack([w, -x, -y, -z], dim=-1)
 
 
 def _normalize_quat(q: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+    归一化四元数，确保为单位四元数。
+    
+    Args:
+        q: 四元数，形状 [..., 4]
+        eps: 防止除零的小常数
+        
+    Returns:
+        归一化后的四元数，形状 [..., 4]
+        
+    单位四元数用于表示旋转，必须满足 ||q|| = 1
+    """
     return q / (q.norm(dim=-1, keepdim=True) + eps)
 
 
 def _quat_to_rotmat(q: torch.Tensor) -> torch.Tensor:
-    """Convert quaternion in wxyz to rotation matrix."""
+    """
+    将四元数（wxyz 格式）转换为旋转矩阵。
+    
+    Args:
+        q: 四元数，形状 [..., 4]，格式 [w, x, y, z]
+        
+    Returns:
+        旋转矩阵，形状 [..., 3, 3]
+        
+    使用标准的四元数到旋转矩阵的转换公式。
+    """
     q = _normalize_quat(q)
     w, x, y, z = q.unbind(-1)
     ww = w * w
@@ -144,9 +247,16 @@ def _axis_angle_to_quat(omega: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
 
 
 def get_viewmat(camera_to_world: torch.Tensor) -> torch.Tensor:
-    """Convert camera-to-world to world-to-camera as used by gsplat.
+    """
+    将相机到世界的变换矩阵转换为世界到相机的视图矩阵（gsplat 使用的格式）。
     
-    Supports both [4,4] and [B,4,4] input shapes.
+    Args:
+        camera_to_world: 相机到世界的变换矩阵，形状 [4, 4] 或 [B, 4, 4]
+        
+    Returns:
+        世界到相机的视图矩阵，形状 [B, 4, 4]
+        
+    注意：gsplat 使用特殊的坐标系约定，需要对旋转矩阵的 Y 和 Z 轴取反。
     """
     if camera_to_world.dim() == 2:
         camera_to_world = camera_to_world.unsqueeze(0)  # [1,4,4]
@@ -214,6 +324,20 @@ def _pairwise_neighbor_distances(points: torch.Tensor, k: int = 3) -> torch.Tens
 
 @dataclass
 class NodeStateBackground:
+    """
+    静态背景的节点状态，存储分离的高斯参数（世界坐标系）。
+    
+    所有参数都是分离的（detached），不参与梯度计算，作为稳定的参数缓冲区。
+    每个 (scene_id, segment_id) 对应一个 NodeStateBackground。
+    
+    Attributes:
+        means: Gaussian 中心位置，形状 [N_bg, 3]，世界坐标系
+        scales_log: 尺度的对数，形状 [N_bg, 3]（3个轴）
+        quats: 旋转四元数，形状 [N_bg, 4]，wxyz 格式
+        opacity_logit: 不透明度的 logit 值，形状 [N_bg, 1]
+        sh_dc: 球谐函数 DC 分量（RGB），形状 [N_bg, 3]
+        sh_rest: 球谐函数高阶分量，形状 [N_bg, num_sh-1, 3]
+    """
     means: torch.Tensor
     scales_log: torch.Tensor
     quats: torch.Tensor
@@ -222,6 +346,12 @@ class NodeStateBackground:
     sh_rest: torch.Tensor
 
     def detach_clone(self) -> "NodeStateBackground":
+        """
+        创建节点状态的分离副本。
+        
+        Returns:
+            新的 NodeStateBackground 实例，所有张量都是分离的副本
+        """
         return NodeStateBackground(
             means=self.means.detach().clone(),
             scales_log=self.scales_log.detach().clone(),
@@ -234,6 +364,27 @@ class NodeStateBackground:
 
 @dataclass
 class NodeStateRigid:
+    """
+    动态物体的节点状态，存储分离的高斯参数（局部坐标系）。
+    
+    所有参数都是分离的（detached），不参与梯度计算，作为稳定的参数缓冲区。
+    每个 (scene_id, segment_id) 对应一个 NodeStateRigid（如果存在动态物体）。
+    
+    Attributes:
+        means: Gaussian 中心位置，形状 [N_rigid, 3]，局部坐标系
+        scales_log: 尺度的对数，形状 [N_rigid, 3]（3个轴）
+        quats: 旋转四元数，形状 [N_rigid, 4]，wxyz 格式，局部旋转
+        opacity_logit: 不透明度的 logit 值，形状 [N_rigid, 1]
+        sh_dc: 球谐函数 DC 分量（RGB），形状 [N_rigid, 3]
+        sh_rest: 球谐函数高阶分量，形状 [N_rigid, num_sh-1, 3]
+        point_ids: 每个点属于哪个实例，形状 [N_rigid, 1]
+        instances_quats: 实例旋转，形状 [num_frames, num_instances, 4]，wxyz 格式
+        instances_trans: 实例平移，形状 [num_frames, num_instances, 3]
+        instances_fv: 实例可见性，形状 [num_frames, num_instances]，bool 类型
+        instance_ids: 实例ID列表
+        frame_ids: 帧ID列表（用于索引 instances_*）
+        cur_frame: 当前帧索引（用于变换）
+    """
     means: torch.Tensor
     scales_log: torch.Tensor
     quats: torch.Tensor
@@ -249,6 +400,12 @@ class NodeStateRigid:
     cur_frame: int
 
     def detach_clone(self) -> "NodeStateRigid":
+        """
+        创建节点状态的分离副本。
+        
+        Returns:
+            新的 NodeStateRigid 实例，所有张量都是分离的副本
+        """
         return NodeStateRigid(
             means=self.means.detach().clone(),
             scales_log=self.scales_log.detach().clone(),
@@ -271,12 +428,28 @@ NodeState = NodeStateBackground
 
 class StreetForwardTrainer(nn.Module):
     """
-    Feed-forward 3DGS trainer with proxy-based multi-view accumulation.
-
-    The trainer maintains a node_state per (scene_id, segment_id) consisting of detached
-    Gaussian parameters. Each iteration builds a 3D feature volume, predicts offsets,
-    renders via proxy parameters, back-propagates once through the feed-forward graph,
-    and writes detached results back to node_state.
+    基于代理参数的多视角梯度累积的前馈式 3D Gaussian Splatting 训练器。
+    
+    核心设计理念：
+    - 双 NodeState 架构：每个 (scene_id, segment_id) 维护两个 NodeState：
+      * NodeStateBackground：存储静态背景的高斯参数（世界坐标系）
+      * NodeStateRigid：存储动态物体的高斯参数（局部坐标系）
+    - 前馈预测：通过 3D 特征体积预测偏移量（offsets），静态和动态物体共享相同的 MLP 网络
+    - 代理参数渲染：使用代理参数进行渲染，实现多视角梯度累积
+    - 单次反向传播：每个迭代只进行一次反向传播
+    - 帧变换机制：动态物体在不同帧间通过 RigidNodes 变换，支持时间一致性
+    
+    训练流程：
+    1. 获取或初始化双 NodeState（Background + RigidNodes）
+    2. 构建 3D 特征体积（合并静态和动态点云）
+    3. 预测偏移量（静态和动态共同预测）
+    4. 计算渲染参数（分别应用到两个 NodeState）
+    5. 创建代理参数（分别创建静态和动态代理）
+    6. 遍历所有 target 帧，渲染并累积梯度
+    7. 反向传播到渲染参数，然后自动传播到网络参数
+    8. 更新双 NodeState
+    
+    详细流程请参考 docs/trainers/StreetForward_Flow.md
     """
 
     def __init__(
@@ -288,25 +461,40 @@ class StreetForwardTrainer(nn.Module):
         construct_sparse_tensor_fn: Optional[Callable] = None,
         sparse_to_dense_volume_fn: Optional[Callable] = None,
     ):
+        """
+        初始化 StreetForwardTrainer。
+        
+        Args:
+            config: OmegaConf 配置对象，包含模型、优化器和训练配置
+            device: 计算设备（CPU 或 CUDA）
+            renderer: 可选的渲染器函数（默认使用 gsplat.rendering.rasterization）
+            sparse_conv: 可选的稀疏卷积网络（默认使用 SparseCostRegNet）
+            construct_sparse_tensor_fn: 可选的稀疏张量构建函数
+            sparse_to_dense_volume_fn: 可选的稀疏到密集体积转换函数
+        """
         super().__init__()
         self.config = config
         self.device = device
 
+        # 从配置中读取模型参数
         model_cfg = config.model
-        self.offset_max = model_cfg.get("offset_max", 0.1)
-        self.scale_max = model_cfg.get("scale_max", 0.1)
-        self.omega_max = model_cfg.get("omega_max", 0.1)
-        self.opacity_max = model_cfg.get("opacity_max", 0.1)
-        self.sh_dc_max = model_cfg.get("sh_dc_max", 0.1)
-        self.sh_rest_max = model_cfg.get("sh_rest_max", 0.05)
-        self.eta_means = model_cfg.get("eta_means", 1.0)
-        self.eta_scales = model_cfg.get("eta_scales", 1.0)
-        self.eta_opacity = model_cfg.get("eta_opacity", 1.0)
-        self.eta_sh_dc = model_cfg.get("eta_sh_dc", 1.0)
-        self.eta_sh_rest = model_cfg.get("eta_sh_rest", 1.0)
-        self.sh_degree = model_cfg.get("sh_degree", 1)
-        self.voxel_size = model_cfg.get("voxel_size", 0.1)
-        self.inner_iterations = model_cfg.get("max_iterations", 1)
+        # 偏移量的物理上限（用于 tanh 限制）
+        self.offset_max = model_cfg.get("offset_max", 0.1)  # 位置偏移上限（米）
+        self.scale_max = model_cfg.get("scale_max", 0.1)  # 尺度偏移上限（对数域）
+        self.omega_max = model_cfg.get("omega_max", 0.1)  # 旋转偏移上限（弧度，约5.7°）
+        self.opacity_max = model_cfg.get("opacity_max", 0.1)  # 不透明度偏移上限（logit域）
+        self.sh_dc_max = model_cfg.get("sh_dc_max", 0.1)  # SH DC偏移上限
+        self.sh_rest_max = model_cfg.get("sh_rest_max", 0.05)  # SH rest偏移上限（通常更小）
+        # 步长因子（控制偏移量幅度）
+        self.eta_means = model_cfg.get("eta_means", 1.0)  # 位置步长因子
+        self.eta_scales = model_cfg.get("eta_scales", 1.0)  # 尺度步长因子
+        self.eta_opacity = model_cfg.get("eta_opacity", 1.0)  # 不透明度步长因子
+        self.eta_sh_dc = model_cfg.get("eta_sh_dc", 1.0)  # SH DC步长因子
+        self.eta_sh_rest = model_cfg.get("eta_sh_rest", 1.0)  # SH rest步长因子
+        # 其他模型参数
+        self.sh_degree = model_cfg.get("sh_degree", 1)  # 球谐函数度数
+        self.voxel_size = model_cfg.get("voxel_size", 0.1)  # 体素大小（米）
+        self.inner_iterations = model_cfg.get("max_iterations", 1)  # 内部迭代次数
 
         bbx_min = model_cfg.get("bbx_min", [-20.0, -20.0, -20.0])
         bbx_max = model_cfg.get("bbx_max", [20.0, 4.8, 70.0])
@@ -334,15 +522,18 @@ class StreetForwardTrainer(nn.Module):
         if self.sparse_to_dense_volume is None:
             raise ImportError("sparse_to_dense_volume not available. Install models.evol_splat or provide a custom sparse_to_dense_volume_fn.")
 
-        # MLP heads (only 3D features are used per design)
+        # MLP 偏移量预测头（根据设计，只使用 3D 特征）
+        # 位置偏移预测网络：outdim → 64 → 32 → 3
         self.mlp_offset_pos = nn.Sequential(
             nn.Linear(outdim, 64),
             nn.ReLU(),
             nn.Linear(64, 32),
             nn.ReLU(),
-            nn.Linear(32, 3),
+            nn.Linear(32, 3),  # 输出位置偏移 [N, 3]
         ).to(device)
 
+        # 尺度与旋转偏移预测网络：outdim → 64 → 32 → 6
+        # 输出前3维为尺度偏移，后3维为轴角偏移
         self.mlp_conv = nn.Sequential(
             nn.Linear(outdim, 64),
             nn.ReLU(),
@@ -351,21 +542,23 @@ class StreetForwardTrainer(nn.Module):
             nn.Linear(32, 6),  # 3 for scales + 3 for axis-angle
         ).to(device)
 
+        # 不透明度偏移预测网络：outdim → 64 → 32 → 1
         self.mlp_opacity = nn.Sequential(
             nn.Linear(outdim, 64),
             nn.ReLU(),
             nn.Linear(64, 32),
             nn.ReLU(),
-            nn.Linear(32, 1),
+            nn.Linear(32, 1),  # 输出不透明度对数偏移 [N, 1]
         ).to(device)
 
+        # SH 系数偏移预测网络：outdim → 64 → 32 → 3*num_sh
         num_sh = _num_sh_bases(self.sh_degree)
         self.gaussion_decoder = nn.Sequential(
             nn.Linear(outdim, 64),
             nn.ReLU(),
             nn.Linear(64, 32),
             nn.ReLU(),
-            nn.Linear(32, 3 * num_sh),
+            nn.Linear(32, 3 * num_sh),  # 输出SH系数偏移 [N, 3*num_sh]
         ).to(device)
 
         params: List[torch.nn.Parameter] = []
@@ -412,7 +605,12 @@ class StreetForwardTrainer(nn.Module):
         self._init_offset_heads()
 
     def _init_offset_heads(self) -> None:
-        """Initialize offset prediction heads to output near-zero offsets."""
+        """
+        初始化偏移量预测头，使其输出接近零的偏移量。
+        
+        这确保训练开始时预测的偏移量接近零，避免初始阶段的大幅跳跃。
+        所有偏移预测头的最后一层（输出层）被初始化为零权重和零偏置。
+        """
         nn.init.zeros_(self.mlp_offset_pos[-1].weight)
         nn.init.zeros_(self.mlp_offset_pos[-1].bias)
         nn.init.zeros_(self.mlp_conv[-1].weight)
@@ -424,10 +622,12 @@ class StreetForwardTrainer(nn.Module):
 
     def _setup_tensorboard(self, training_cfg) -> None:
         """
-        Initialize TensorBoard writer based on config.
-
-        TensorBoard is optional to keep unit tests lightweight and avoid
-        unexpected disk writes in non-training contexts.
+        根据配置初始化 TensorBoard writer。
+        
+        TensorBoard 是可选的，以保持单元测试轻量级，并避免在非训练上下文中意外写入磁盘。
+        
+        Args:
+            training_cfg: 训练配置字典，需包含 "tensorboard" 键
         """
         tb_cfg = training_cfg.get("tensorboard", {}) if hasattr(training_cfg, "get") else {}
         enabled = tb_cfg.get("enabled", False)
@@ -459,6 +659,18 @@ class StreetForwardTrainer(nn.Module):
         logger.info(f"TensorBoard logging enabled at {log_dir}")
 
     def _compute_initial_scales(self, means: torch.Tensor) -> torch.Tensor:
+        """
+        基于 k-NN 距离计算初始尺度（对数域）。
+        
+        Args:
+            means: 点位置，形状 [N, 3]
+            
+        Returns:
+            初始尺度对数，形状 [N, 3]
+            
+        方法：计算每个点到 k 个最近邻的平均距离，取对数作为初始尺度。
+        使用 clamp 确保距离不小于 1e-3，避免对数域中的数值问题。
+        """
         distances = _pairwise_neighbor_distances(means, k=3)
         avg_dist = distances.mean(dim=-1, keepdim=True)
         return torch.log(torch.clamp(avg_dist, min=1e-3).repeat(1, 3))
@@ -469,6 +681,27 @@ class StreetForwardTrainer(nn.Module):
         segment_id: int,
         pointcloud,
     ) -> NodeState:
+        """
+        从点云初始化静态背景的 NodeState。
+        
+        Args:
+            scene_id: 场景ID
+            segment_id: 片段ID
+            pointcloud: 点云数据，可以是字典格式 {"background": [N, 6]} 或对象格式（需有 points 和 colors 属性）
+            
+        Returns:
+            初始化的 NodeStateBackground
+            
+        处理流程：
+        1. 提取点坐标和颜色（如果是字典格式，从 "background" 键获取）
+        2. 将颜色归一化到 [0, 1] 范围（如果值域是 [0, 255]）
+        3. 计算初始尺度（基于 k-NN 距离）
+        4. 生成随机四元数
+        5. 初始化不透明度为 logit(0.1)
+        6. 将 RGB 转换为 SH DC 分量
+        7. 初始化 SH rest 分量为零
+        8. 所有参数初始化为分离状态
+        """
         if isinstance(pointcloud, dict):
             background = pointcloud.get("background", np.zeros((0, 6), dtype=np.float32))
             points = background[:, :3]
@@ -520,6 +753,31 @@ class StreetForwardTrainer(nn.Module):
         instance_id_map: Dict[int, int],
         instance_ids: List[int],
     ) -> NodeStateRigid:
+        """
+        从点云初始化动态物体的 NodeStateRigid。
+        
+        Args:
+            points: 点坐标数组，形状 [N_rigid, 3]，局部坐标系
+            colors: 颜色数组，形状 [N_rigid, 3]
+            point_ids: 每个点属于哪个实例，形状 [N_rigid, 1]
+            dynamic_info: 动态物体信息字典，包含各帧的实例位姿
+            frame_ids: 帧ID列表
+            instance_id_map: 实例ID到索引的映射
+            instance_ids: 实例ID列表
+            
+        Returns:
+            初始化的 NodeStateRigid
+            
+        处理流程：
+        1. 将点坐标和颜色转换为张量，归一化颜色到 [0, 1]
+        2. 计算初始尺度（基于 k-NN 距离）
+        3. 生成随机四元数（局部旋转）
+        4. 初始化不透明度为 logit(0.1)
+        5. 将 RGB 转换为 SH DC 分量
+        6. 初始化 SH rest 分量为零
+        7. 从 dynamic_info 初始化 instances_quats、instances_trans 和 instances_fv
+        8. 所有参数初始化为分离状态
+        """
         means = torch.tensor(points, dtype=torch.float32, device=self.device)
         colors_tensor = torch.tensor(colors, dtype=torch.float32, device=self.device)
         if colors_tensor.numel() > 0 and colors_tensor.max() > 1.0 + 1e-3:
@@ -578,6 +836,30 @@ class StreetForwardTrainer(nn.Module):
     def _get_or_init_node_states(
         self, batch: Dict
     ) -> Tuple[Tuple[int, int], NodeState, Optional[NodeStateRigid]]:
+        """
+        获取或初始化双 NodeState（Background + RigidNodes）。
+        
+        Args:
+            batch: 批次数据字典，需包含：
+                - "scene_id": 场景ID
+                - "segment_id": 片段ID
+                - "pointcloud": 点云数据（字典格式包含 "background" 和可选的 "dynamic"）
+                - "dynamic_info": 动态物体信息（可选）
+                
+        Returns:
+            (key, node_state_bg, node_state_rigid) 元组：
+                - key: (scene_id, segment_id) 元组
+                - node_state_bg: NodeStateBackground（静态背景）
+                - node_state_rigid: NodeStateRigid 或 None（动态物体，如果存在）
+                
+        处理流程：
+        1. 如果 NodeState 已存在，直接返回（支持动态扩展帧信息）
+        2. 如果 NodeState 不存在（新段开始），清空所有缓存以释放显存，然后从点云初始化
+        3. 如果点云包含动态物体，会同时初始化 NodeStateRigid
+        
+        注意：当遇到新的 (scene_id, segment_id) 时，会自动清空之前的 node_states 缓存，
+        只保留当前段的状态，以节省显存。这对于顺序训练多个段的场景特别有用。
+        """
         scene_id = batch["scene_id"]
         if isinstance(scene_id, torch.Tensor):
             scene_id = int(scene_id.item())
@@ -592,6 +874,16 @@ class StreetForwardTrainer(nn.Module):
                 node_state_rigid = self._extend_rigid_frames(node_state_rigid, dynamic_info)
                 self.node_states_rigid[key] = node_state_rigid
             return key, self.node_states[key], node_state_rigid
+        
+        # 如果 key 不存在，说明已经开始下一个段的训练，清空之前的缓存以释放显存
+        if len(self.node_states) > 0:
+            logger.debug(f"Clearing node_states cache before initializing new segment {key}. Previous cache had {len(self.node_states)} entries.")
+            self.node_states.clear()
+            self.node_states_rigid.clear()
+            # 强制垃圾回收以释放显存
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
         pointcloud = batch["pointcloud"]
         node_state_bg = self._init_node_from_pointcloud(scene_id, segment_id, pointcloud)
 
@@ -633,10 +925,30 @@ class StreetForwardTrainer(nn.Module):
         return key, node_state_bg, node_state_rigid
 
     def _get_or_init_node_state(self, batch: Dict) -> Tuple[Tuple[int, int], NodeState]:
+        """
+        获取或初始化单个 NodeState（仅静态背景，兼容旧代码）。
+        
+        Args:
+            batch: 批次数据字典
+            
+        Returns:
+            (key, node_state_bg) 元组
+        
+        这是 _get_or_init_node_states 的简化版本，只返回静态背景。
+        """
         key, node_state_bg, _ = self._get_or_init_node_states(batch)
         return key, node_state_bg
 
     def _node_state_to_dict(self, node_state: NodeState) -> Dict[str, torch.Tensor]:
+        """
+        将 NodeState 转换为字典（用于保存检查点）。
+        
+        Args:
+            node_state: NodeState 对象
+            
+        Returns:
+            状态字典，所有张量都已分离并移到 CPU
+        """
         return {
             "means": node_state.means.detach().cpu(),
             "scales_log": node_state.scales_log.detach().cpu(),
@@ -647,6 +959,15 @@ class StreetForwardTrainer(nn.Module):
         }
 
     def _node_state_from_dict(self, state_dict: Dict[str, torch.Tensor]) -> NodeState:
+        """
+        从字典恢复 NodeState（用于加载检查点）。
+        
+        Args:
+            state_dict: 状态字典
+            
+        Returns:
+            恢复的 NodeState，所有张量都已移到设备并分离
+        """
         return NodeState(
             means=state_dict["means"].to(self.device),
             scales_log=state_dict["scales_log"].to(self.device),
@@ -657,6 +978,15 @@ class StreetForwardTrainer(nn.Module):
         ).detach_clone()
 
     def _node_state_rigid_to_dict(self, node_state: NodeStateRigid) -> Dict:
+        """
+        将 NodeStateRigid 转换为字典（用于保存检查点）。
+        
+        Args:
+            node_state: NodeStateRigid 对象
+            
+        Returns:
+            状态字典，所有张量都已分离并移到 CPU
+        """
         return {
             "means": node_state.means.detach().cpu(),
             "scales_log": node_state.scales_log.detach().cpu(),
@@ -674,6 +1004,15 @@ class StreetForwardTrainer(nn.Module):
         }
 
     def _node_state_rigid_from_dict(self, state_dict: Dict) -> NodeStateRigid:
+        """
+        从字典恢复 NodeStateRigid（用于加载检查点）。
+        
+        Args:
+            state_dict: 状态字典
+            
+        Returns:
+            恢复的 NodeStateRigid，所有张量都已移到设备并分离
+        """
         instance_ids = state_dict.get("instance_ids")
         if instance_ids is None:
             num_instances = state_dict["instances_quats"].shape[1]
@@ -697,6 +1036,18 @@ class StreetForwardTrainer(nn.Module):
         ).detach_clone()
 
     def _extend_rigid_frames(self, node_state_rigid: NodeStateRigid, dynamic_info: Dict) -> NodeStateRigid:
+        """
+        扩展 RigidNodes 的帧信息，添加新的帧数据。
+        
+        Args:
+            node_state_rigid: 现有的 RigidNodes
+            dynamic_info: 动态物体信息字典，包含新帧的实例位姿
+            
+        Returns:
+            扩展后的 RigidNodes
+        
+        如果 dynamic_info 中包含新的帧ID，会将这些帧的实例位姿添加到 instances_* 张量中。
+        """
         if not dynamic_info:
             return node_state_rigid
         existing_frame_ids = set(node_state_rigid.frame_ids)
@@ -775,6 +1126,23 @@ class StreetForwardTrainer(nn.Module):
     def _transform_rigid_to_world(
         self, node_state_rigid: NodeStateRigid, means_local: torch.Tensor
     ) -> torch.Tensor:
+        """
+        将动态物体的局部坐标位置变换到世界坐标。
+        
+        Args:
+            node_state_rigid: Rigid node state，包含实例位姿信息
+            means_local: 局部坐标的位置，形状 [N_rigid, 3]（可微）
+            
+        Returns:
+            世界坐标的位置，形状 [N_rigid, 3]（可微）
+        
+        变换公式：means_world = R * means_local + t
+        其中 R 和 t 从 node_state_rigid.instances_* 中获取，根据 cur_frame 和 point_ids 选择。
+        
+        关键点：
+        - 保持梯度连接，不使用 detach，让 PyTorch 自动处理梯度反向传播
+        - 使用当前帧（cur_frame）的实例位姿进行变换
+        """
         # #region agent log
         _debug_log(
             "streetforward.py:_transform_rigid_to_world",
@@ -812,6 +1180,19 @@ class StreetForwardTrainer(nn.Module):
     def _transform_rigid_quats_to_world(
         self, node_state_rigid: NodeStateRigid, quats_local: torch.Tensor
     ) -> torch.Tensor:
+        """
+        将动态物体的局部坐标旋转变换到世界坐标。
+        
+        Args:
+            node_state_rigid: Rigid node state，包含实例旋转信息
+            quats_local: 局部坐标的四元数，形状 [N_rigid, 4]（可微）
+            
+        Returns:
+            世界坐标的四元数，形状 [N_rigid, 4]（可微）
+        
+        变换公式：quats_world = normalize(quats_instance * quats_local)
+        使用四元数乘法组合实例旋转和局部旋转。
+        """
         frame_idx = self._resolve_rigid_frame_idx(node_state_rigid, node_state_rigid.cur_frame)
         quats_cur_frame = node_state_rigid.instances_quats[frame_idx]
         quats_per_pts = quats_cur_frame[node_state_rigid.point_ids[..., 0]]
@@ -869,6 +1250,31 @@ class StreetForwardTrainer(nn.Module):
         node_state_rigid: Optional[NodeStateRigid],
         source_frame_idx: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """
+        构建 3D 特征体积，为静态背景和动态物体提取特征。
+        
+        这是训练流程中的核心步骤，详细流程请参考 docs/trainers/StreetForward_Flow.md。
+        
+        Args:
+            node_state_bg: 静态背景的 NodeState（世界坐标系）
+            node_state_rigid: 动态物体的 NodeStateRigid（局部坐标系），可选
+            source_frame_idx: Source 帧的 frame ID（场景全局 frame_idx）
+            
+        Returns:
+            (feat_3d_crop_bg, feat_3d_crop_rigid, rigid_visible_mask) 元组：
+                - feat_3d_crop_bg: 静态背景点的3D特征，形状 [N_bg, outdim]
+                - feat_3d_crop_rigid: 动态物体点的3D特征，形状 [N_rigid, outdim]
+                - rigid_visible_mask: 动态物体可见性掩码，形状 [N_rigid]，可选
+        
+        处理流程：
+        1. 设置 RigidNodes.cur_frame = source_frame_idx
+        2. 获取静态背景点云（世界坐标）
+        3. 变换动态物体到 source 帧的世界坐标
+        4. 合并静态和动态点云
+        5. 构建统一的 3D 特征体积（稀疏张量 → 稀疏卷积 → 密集体积）
+        6. 分别为静态和动态点插值特征
+        7. 删除密集体积以释放内存
+        """
         # #region agent log
         if torch.cuda.is_available():
             _debug_log(
@@ -1125,6 +1531,18 @@ class StreetForwardTrainer(nn.Module):
     def _mask_rigid_offsets(
         self, offsets: Dict[str, torch.Tensor], visible_mask: Optional[torch.Tensor]
     ) -> Dict[str, torch.Tensor]:
+        """
+        使用可见性掩码屏蔽动态物体的偏移量。
+        
+        Args:
+            offsets: 偏移量字典
+            visible_mask: 可见性掩码，形状 [N_rigid]，bool 类型，可选
+            
+        Returns:
+            屏蔽后的偏移量字典
+        
+        对于不可见的点，将偏移量置零（位置、尺度、不透明度、SH）或设为单位四元数（旋转）。
+        """
         if visible_mask is None or visible_mask.numel() == 0:
             return offsets
         mask = visible_mask.to(offsets["offset_pos"].device)
@@ -1143,6 +1561,28 @@ class StreetForwardTrainer(nn.Module):
     def get_grid_coords(
         self, position_w: torch.Tensor, bbx_min: torch.Tensor, vol_dim, voxel_size: float
     ) -> torch.Tensor:
+        """
+        将世界坐标转换为体积网格的归一化坐标（用于 grid_sample）。
+        
+        Args:
+            position_w: 世界坐标位置，形状 [N, 3]
+            bbx_min: 边界框最小值，形状 [3]
+            vol_dim: 体积维度，[D, H, W] 格式（可以是 list、tuple 或 Tensor）
+            voxel_size: 体素大小（米）
+            
+        Returns:
+            归一化网格坐标，形状 [N, 3]，格式 [z_norm, y_norm, x_norm]，值域 [-1, 1]
+        
+        处理流程：
+        1. 将坐标相对于边界框原点：pts = position_w - bbx_min
+        2. 转换为体素索引（浮点数）：index = pts / voxel_size
+        3. 归一化到 [-1, 1] 范围：norm = 2.0 * (index / (vol_dim - 1)) - 1.0
+        4. 堆叠为 [z_norm, y_norm, x_norm] 格式（grid_sample 要求）
+        
+        注意：
+        - grid_sample 期望坐标顺序为 [z, y, x]，对应 [D, H, W] 维度
+        - 使用 align_corners=True，所以 index 0 映射到 -1.0，index (N-1) 映射到 1.0
+        """
         # Clamp positions to bbox range to match construct_sparse_tensor behavior
         # This ensures coordinates are within the volume bounds
         # Use self.bbx_max directly instead of recalculating from vol_dim
@@ -1189,17 +1629,53 @@ class StreetForwardTrainer(nn.Module):
         return grid_coords
 
     def interpolate_features(self, grid_coords: torch.Tensor, feature_volume: torch.Tensor) -> torch.Tensor:
+        """
+        从 3D 特征体积中插值提取每个点的特征。
+        
+        Args:
+            grid_coords: 归一化网格坐标，形状 [N, 3]，格式 [z_norm, y_norm, x_norm]
+            feature_volume: 特征体积，形状 [1, C, D, H, W]（经过 permute 后）
+            
+        Returns:
+            每个点的特征，形状 [N, C]
+        
+        使用三线性插值（grid_sample 在 3D 中）从体积中提取特征。
+        grid_sample 期望输入格式为 [B, C, D, H, W]，坐标格式为 [B, D_out, H_out, W_out, 3]。
+        我们扩展 grid_coords 为 [1, 1, 1, N, 3] 以匹配要求。
+        """
         grid_coords_expanded = grid_coords[None, None, None, ...]
         feature = torch.nn.functional.grid_sample(
             feature_volume,
             grid_coords_expanded,
-            mode="bilinear",
+            mode="bilinear",  # 在3D中实际是三线性插值
             align_corners=True,
             padding_mode="zeros",
         )
-        return feature[0, :, 0, 0, :].T
+        return feature[0, :, 0, 0, :].T  # [1, C, 1, 1, N] → [C, N] → [N, C]
 
     def _predict_offsets(self, feat_3d_crop: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        从 3D 特征预测 Gaussian 参数的偏移量。
+        
+        Args:
+            feat_3d_crop: 3D 特征，形状 [N, outdim]（默认 outdim=32）
+            
+        Returns:
+            偏移量字典，包含：
+                - "offset_pos": 位置偏移，形状 [N, 3]，范围 [-offset_max, offset_max]
+                - "offset_scales": 尺度对数偏移，形状 [N, 3]，范围 [-scale_max, scale_max]
+                - "offset_quat": 四元数偏移，形状 [N, 4]，wxyz 格式（从轴角转换）
+                - "offset_opacity": 不透明度对数偏移，形状 [N, 1]，范围 [-opacity_max, opacity_max]
+                - "offset_sh": SH系数偏移，形状 [N, 3*num_sh]，包含DC和rest分量
+        
+        处理流程：
+        1. 位置偏移：mlp_offset_pos → tanh → offset_max 缩放
+        2. 尺度与旋转：mlp_conv → 分离尺度和轴角 → 分别 tanh 限制 → 轴角转四元数
+        3. 不透明度偏移：mlp_opacity → tanh → opacity_max 缩放
+        4. SH系数偏移：gaussion_decoder → 分离DC和rest → 分别 tanh 限制 → 合并
+        
+        注意：静态和动态使用相同的 MLP 网络预测偏移量。
+        """
         # #region agent log
         if torch.cuda.is_available():
             _debug_log(
@@ -1272,6 +1748,31 @@ class StreetForwardTrainer(nn.Module):
     def _render_params_from_offsets(
         self, node_state: NodeState, offsets: Dict[str, torch.Tensor]
     ) -> Dict[str, torch.Tensor]:
+        """
+        从 NodeState 和偏移量计算渲染参数。
+        
+        Args:
+            node_state: NodeState（Background 或 RigidNodes），所有参数都是分离的
+            offsets: 偏移量字典（可微）
+            
+        Returns:
+            渲染参数字典，包含：
+                - "means_r": 渲染用的位置，形状 [N, 3]（可微，未clamp）
+                - "scales_log_r": 渲染用的尺度对数，形状 [N, 3]（可微）
+                - "scales_r": 渲染用的尺度，形状 [N, 3]（exp(scales_log_r)）
+                - "quats_r": 渲染用的四元数，形状 [N, 4]（归一化，可微）
+                - "opacity_logit_r": 渲染用的不透明度对数，形状 [N, 1]（可微）
+                - "opacities_r": 渲染用的不透明度，形状 [N]（sigmoid(opacity_logit_r)）
+                - "sh_dc_r": 渲染用的SH DC分量，形状 [N, 3]（可微）
+                - "sh_rest_r": 渲染用的SH高阶分量，形状 [N, num_sh-1, 3]（可微）
+                - "colors_r": 完整的SH系数，形状 [N, num_sh, 3]（用于渲染）
+        
+        关键点：
+        - 应用步长因子（eta）控制偏移量幅度
+        - means_r 不在此处进行 clamp，以保持梯度流
+        - 使用四元数乘法组合旋转
+        - 静态背景的渲染参数是世界坐标，动态物体的是局部坐标
+        """
         num_points = node_state.means.shape[0]
         num_sh = _num_sh_bases(self.sh_degree)
         sh_rest_flat = offsets["offset_sh"][:, 3:]
@@ -1303,6 +1804,27 @@ class StreetForwardTrainer(nn.Module):
         }
 
     def _create_proxy_params(self, render_params: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """
+        创建代理参数，用于多视角梯度累积。
+        
+        Args:
+            render_params: 渲染参数字典（可微）
+            
+        Returns:
+            代理参数字典，包含：
+                - "means_p": 代理位置（分离但可微）
+                - "scales_p": 代理尺度（分离但可微）
+                - "quats_p": 代理四元数（分离但可微）
+                - "opacities_p": 代理不透明度（分离但可微）
+                - "colors_p": 代理颜色（分离但可微）
+        
+        操作：proxy = render_param.detach().requires_grad_(True)
+        
+        关键点：
+        - 代理参数从渲染参数中分离（detach），但重新启用梯度
+        - 这样可以在多个视角上累积梯度，然后一次性反向传播到渲染参数
+        - 所有 target 帧共享同一组代理参数
+        """
         # #region agent log
         _debug_log(
             "streetforward.py:_create_proxy_params",
@@ -1336,11 +1858,34 @@ class StreetForwardTrainer(nn.Module):
         return proxies
 
     def compute_loss(self, pred_rgb: torch.Tensor, gt_image: torch.Tensor) -> torch.Tensor:
+        """
+        计算 L2 损失（均方误差）。
+        
+        Args:
+            pred_rgb: 预测的RGB图像，形状 [H, W, 3]
+            gt_image: 真实图像，形状 [H, W, 3]
+            
+        Returns:
+            标量损失值：mean((pred_rgb - gt_image)²)
+        """
         return torch.mean((pred_rgb - gt_image) ** 2)
 
     def _compute_render_params(self, node_state: NodeState) -> Dict[str, torch.Tensor]:
         """
-        Shared forward pass to compute render parameters from node state.
+        共享的前向传播：从节点状态计算渲染参数。
+        
+        Args:
+            node_state: NodeState（Background 或 RigidNodes）
+            
+        Returns:
+            渲染参数字典
+        
+        这是评估时使用的简化流程：
+        1. 构建 3D 特征体积（只使用单个 NodeState）
+        2. 预测偏移量
+        3. 计算渲染参数
+        
+        注意：此方法不处理动态物体的坐标变换，适用于静态背景或已变换到目标帧的动态物体。
         """
         means_s = node_state.means
         anchor_rgb = _sh_to_rgb(node_state.sh_dc)
@@ -1376,7 +1921,20 @@ class StreetForwardTrainer(nn.Module):
         width: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Render a single view and return RGB and alpha.
+        渲染单个视角，返回 RGB 图像和 alpha 通道。
+        
+        Args:
+            render_params: 渲染参数字典，可以是代理参数（"means_p"等）或渲染参数（"means_r"等）
+            view: 相机视角对象，需有 camtoworlds 和 Ks/K 属性
+            height: 图像高度
+            width: 图像宽度
+            
+        Returns:
+            (rgb, acc) 元组：
+                - rgb: RGB 图像，形状 [H, W, 3]
+                - acc: 累积不透明度，形状 [H, W]
+        
+        使用 gsplat 渲染器进行高斯点渲染。
         """
         c2w = view.camtoworlds if hasattr(view, "camtoworlds") else view["camtoworlds"]
         viewmat = get_viewmat(c2w)
@@ -1430,6 +1988,52 @@ class StreetForwardTrainer(nn.Module):
         update_state: bool = True,
         evaluate_test: bool = False,
     ) -> Dict:
+        """
+        执行一次训练迭代。
+        
+        这是训练流程的主函数，详细流程请参考 docs/trainers/StreetForward_Flow.md。
+        
+        Args:
+            batch: 批次数据字典，需包含：
+                - "scene_id": 场景ID
+                - "segment_id": 片段ID
+                - "source_frame_idx": Source 帧的 frame ID
+                - "pointcloud": 点云数据
+                - "dynamic_info": 动态物体信息（可选）
+                - "targets": Target 帧列表（推荐格式），或
+                - "target_views" + "gt_images": 兼容旧格式
+                - "test_views" + "test_images": 测试视图（可选，用于评估）
+            apply_update: 是否应用优化器更新
+            update_state: 是否更新 NodeState
+            evaluate_test: 是否评估测试视图
+            
+        Returns:
+            结果字典，包含：
+                - "total_loss": 总损失值（标量）
+                - "node_state": 更新后的 NodeStateBackground
+                - "node_state_rigid": 更新后的 NodeStateRigid（如果存在）
+                - "outputs": 输出列表（如果 log_images=True，包含渲染图像）
+                - "test_metrics": 测试指标（如果进行了评估）
+        
+        训练流程：
+        1. 获取或初始化双 NodeState
+        2. 解析 target 帧列表
+        3. 开始 inner_iterations 循环：
+           a. 构建 3D 特征体积（合并静态和动态点云）
+           b. 预测偏移量（静态和动态共同预测）
+           c. 计算渲染参数（分别应用到两个 NodeState）
+           d. 创建代理参数（分别创建静态和动态代理）
+           e. 遍历所有 target 帧：
+              - 设置 RigidNodes.cur_frame = target.frame_idx
+              - 变换动态物体到 target 帧的世界坐标
+              - 合并静态和动态参数
+              - 渲染图像并计算损失
+              - 反向传播到代理参数（梯度累积）
+           f. 反向传播到渲染参数（分别处理静态和动态）
+           g. 优化器更新（如果 apply_update=True）
+           h. 更新双 NodeState（如果 update_state=True）
+        4. 保存 NodeState 并返回结果
+        """
         key, node_state_bg, node_state_rigid = self._get_or_init_node_states(batch)
         targets = []
         if "targets" in batch:
@@ -1929,6 +2533,22 @@ class StreetForwardTrainer(nn.Module):
         test_views: List,
         test_images: List[torch.Tensor],
     ) -> Optional[Dict[str, float]]:
+        """
+        评估测试视图的性能指标（无梯度更新）。
+        
+        Args:
+            node_state: NodeState（用于渲染）
+            test_views: 测试视角列表
+            test_images: 测试图像列表
+            
+        Returns:
+            评估指标字典，包含：
+                - "psnr": 平均 PSNR（峰值信噪比）
+                - "ssim": 平均 SSIM（结构相似性）
+                - "lpips": 平均 LPIPS（感知相似性）
+                - "num_test_views": 测试视图数量
+            如果没有测试视图，返回 None
+        """
         if test_views is None or len(test_views) == 0:
             return None
         render_params = self._compute_render_params(node_state)
@@ -1959,7 +2579,14 @@ class StreetForwardTrainer(nn.Module):
     @torch.no_grad()
     def evaluate(self, batch: Dict) -> Dict[str, float]:
         """
-        Evaluate model performance on test views (no gradient updates).
+        评估模型在测试视图上的性能（无梯度更新）。
+        
+        Args:
+            batch: 批次数据字典，需包含 "test_views" 和 "test_images"
+            
+        Returns:
+            评估指标字典，包含 PSNR、SSIM、LPIPS 等
+            如果没有测试视图，返回空字典
         """
         self.eval()
         _, node_state = self._get_or_init_node_state(batch)
@@ -1972,6 +2599,17 @@ class StreetForwardTrainer(nn.Module):
         return metrics or {}
 
     def _compute_psnr(self, pred: torch.Tensor, gt: torch.Tensor) -> float:
+        """
+        计算 PSNR（峰值信噪比）。
+        
+        Args:
+            pred: 预测图像，形状 [H, W, 3]
+            gt: 真实图像，形状 [H, W, 3]
+            
+        Returns:
+            PSNR 值（dB），公式：-10 * log10(MSE)
+            如果 MSE <= 0，返回 inf
+        """
         mse = torch.mean((pred - gt) ** 2)
         mse_val = float(mse.item())
         if mse_val <= 0:
@@ -1980,6 +2618,17 @@ class StreetForwardTrainer(nn.Module):
         return float(psnr.item())
 
     def _compute_ssim(self, pred: torch.Tensor, gt: torch.Tensor) -> float:
+        """
+        计算 SSIM（结构相似性指数）。
+        
+        Args:
+            pred: 预测图像，形状 [H, W, 3]
+            gt: 真实图像，形状 [H, W, 3]
+            
+        Returns:
+            SSIM 值（范围 0-1），值越高越好
+            如果 pytorch_msssim 不可用，返回 NaN
+        """
         try:
             from pytorch_msssim import ssim
         except ImportError:
@@ -1993,6 +2642,19 @@ class StreetForwardTrainer(nn.Module):
         return float(ssim(pred_4d, gt_4d, data_range=1.0).item())
 
     def _compute_lpips(self, pred: torch.Tensor, gt: torch.Tensor) -> float:
+        """
+        计算 LPIPS（学习感知图像块相似性）。
+        
+        Args:
+            pred: 预测图像，形状 [H, W, 3]
+            gt: 真实图像，形状 [H, W, 3]
+            
+        Returns:
+            LPIPS 值（通常范围 0-1），值越低越好
+            如果 lpips 库不可用，返回 NaN
+        
+        使用 AlexNet 作为特征提取器。
+        """
         try:
             from lpips import LPIPS
         except ImportError:
@@ -2014,12 +2676,22 @@ class StreetForwardTrainer(nn.Module):
         checkpoint_dir: Optional[str] = None,
     ) -> str:
         """
-        Persist model/optimizer and detached node states.
-
+        持久化模型/优化器和分离的节点状态。
+        
         Args:
-            step: Optional training step to record (defaults to self.global_step)
-            is_final: If True, always write to checkpoint_final.pth
-            checkpoint_dir: Override output directory
+            step: 可选的训练步数（默认为 self.global_step）
+            is_final: 如果为 True，总是写入 checkpoint_final.pth
+            checkpoint_dir: 覆盖输出目录
+            
+        Returns:
+            检查点文件路径
+        
+        保存内容：
+        - 模型状态（sparse_conv、所有 MLP 头）
+        - 优化器状态
+        - 所有 NodeStateBackground（静态背景）
+        - 所有 NodeStateRigid（动态物体）
+        - 配置（如果可序列化）
         """
         step_val = int(step if step is not None else self.global_step)
         ckpt_dir = (
@@ -2074,15 +2746,15 @@ class StreetForwardTrainer(nn.Module):
         strict: bool = True,
     ) -> int:
         """
-        Restore model/optimizer and node states.
-
+        恢复模型/优化器和节点状态。
+        
         Args:
-            checkpoint_path: Path to .pth checkpoint
-            load_optimizer: Load optimizer state if available
-            strict: Strictness for weight loading
-
+            checkpoint_path: .pth 检查点文件路径
+            load_optimizer: 如果可用，加载优化器状态
+            strict: 权重加载的严格性
+            
         Returns:
-            Restored global_step
+            恢复的 global_step
         """
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         model_state = checkpoint.get("model_state_dict", checkpoint)
@@ -2140,7 +2812,13 @@ class StreetForwardTrainer(nn.Module):
         return self.global_step
 
     def _log_to_tensorboard(self, total_loss_val: float, outputs: List[Dict]) -> None:
-        """Write scalars/images to TensorBoard when enabled."""
+        """
+        在启用时向 TensorBoard 写入标量和图像。
+        
+        Args:
+            total_loss_val: 总损失值
+            outputs: 输出列表（如果 log_images=True，包含渲染图像）
+        """
         if self.tb_writer is None:
             return
 
@@ -2173,6 +2851,10 @@ class StreetForwardTrainer(nn.Module):
                 break
 
     def close(self) -> None:
-        """Close TensorBoard writer if it was created."""
+        """
+        关闭 TensorBoard writer（如果已创建）。
+        
+        应在训练结束时调用，确保所有日志都已写入磁盘。
+        """
         if self.tb_writer is not None:
             self.tb_writer.close()
