@@ -4,3 +4,6 @@
 [submodule "third_party/EVolSplat"]
 	path = third_party/EVolSplat
 	url = https://github.com/romantic-black/EVolSplat
+[submodule "third_party/gsplat"]
+	path = third_party/gsplat
+	url = https://github.com/romantic-black/gsplat

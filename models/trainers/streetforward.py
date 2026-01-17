@@ -27,6 +27,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 from omegaconf import OmegaConf
+from models.feature_extractors import (
+    AlphaTWeightExtractor,
+    FeatureBackprojector,
+    FeatureFusion,
+    ImageFeatureExtractor,
+)
 try:
     from sklearn.neighbors import NearestNeighbors
     _sklearn_available = True
@@ -495,6 +501,9 @@ class StreetForwardTrainer(nn.Module):
         self.sh_degree = model_cfg.get("sh_degree", 1)  # 球谐函数度数
         self.voxel_size = model_cfg.get("voxel_size", 0.1)  # 体素大小（米）
         self.inner_iterations = model_cfg.get("max_iterations", 1)  # 内部迭代次数
+        self.use_2d_features = bool(model_cfg.get("use_2d_features", False))
+        self.feat_2d_channels = int(model_cfg.get("feat_2d_channels", 16))
+        self.feat_2d_downscale = int(model_cfg.get("feat_2d_downscale", 1))
 
         bbx_min = model_cfg.get("bbx_min", [-20.0, -20.0, -20.0])
         bbx_max = model_cfg.get("bbx_max", [20.0, 4.8, 70.0])
@@ -522,39 +531,59 @@ class StreetForwardTrainer(nn.Module):
         if self.sparse_to_dense_volume is None:
             raise ImportError("sparse_to_dense_volume not available. Install models.evol_splat or provide a custom sparse_to_dense_volume_fn.")
 
-        # MLP 偏移量预测头（根据设计，只使用 3D 特征）
-        # 位置偏移预测网络：outdim → 64 → 32 → 3
+        fused_in_dim = outdim
+        if self.use_2d_features:
+            self.image_feature_extractor = ImageFeatureExtractor(
+                feat_channels=self.feat_2d_channels,
+                feature_downscale=self.feat_2d_downscale,
+            ).to(device)
+            self.alpha_t_extractor = AlphaTWeightExtractor(
+                renderer=self.renderer,
+                sh_degree=self.sh_degree,
+                tile_size=16,
+            )
+            self.feature_backprojector = FeatureBackprojector()
+            self.feature_fusion = FeatureFusion(use_visibility=True)
+            fused_in_dim = outdim + self.feat_2d_channels + 1  # 3D + 2D + visibility
+        else:
+            self.image_feature_extractor = None
+            self.alpha_t_extractor = None
+            self.feature_backprojector = None
+            self.feature_fusion = None
+
+        # MLP 偏移量预测头（支持 2D+3D 融合特征）
+        # 位置偏移预测网络：fused_in_dim → 64 → 32 → 3
         self.mlp_offset_pos = nn.Sequential(
-            nn.Linear(outdim, 64),
+            nn.Linear(fused_in_dim, 64),
             nn.ReLU(),
             nn.Linear(64, 32),
             nn.ReLU(),
             nn.Linear(32, 3),  # 输出位置偏移 [N, 3]
         ).to(device)
 
-        # 尺度与旋转偏移预测网络：outdim → 64 → 32 → 6
+        # 尺度与旋转偏移预测网络：fused_in_dim → 64 → 32 → 6
         # 输出前3维为尺度偏移，后3维为轴角偏移
         self.mlp_conv = nn.Sequential(
-            nn.Linear(outdim, 64),
+            nn.Linear(fused_in_dim, 64),
             nn.ReLU(),
             nn.Linear(64, 32),
             nn.ReLU(),
             nn.Linear(32, 6),  # 3 for scales + 3 for axis-angle
         ).to(device)
 
-        # 不透明度偏移预测网络：outdim → 64 → 32 → 1
+        # 不透明度偏移预测网络：fused_in_dim → 64 → 32 → 1
         self.mlp_opacity = nn.Sequential(
-            nn.Linear(outdim, 64),
+            nn.Linear(fused_in_dim, 64),
             nn.ReLU(),
             nn.Linear(64, 32),
             nn.ReLU(),
             nn.Linear(32, 1),  # 输出不透明度对数偏移 [N, 1]
         ).to(device)
 
-        # SH 系数偏移预测网络：outdim → 64 → 32 → 3*num_sh
+        # SH 系数偏移预测网络：fused_in_dim → 64 → 32 → 3*num_sh
         num_sh = _num_sh_bases(self.sh_degree)
         self.gaussion_decoder = nn.Sequential(
-            nn.Linear(outdim, 64),
+            nn.Linear(fused_in_dim, 64),
             nn.ReLU(),
             nn.Linear(64, 32),
             nn.ReLU(),
@@ -567,6 +596,8 @@ class StreetForwardTrainer(nn.Module):
         params += list(self.mlp_conv.parameters())
         params += list(self.mlp_opacity.parameters())
         params += list(self.gaussion_decoder.parameters())
+        if self.image_feature_extractor is not None:
+            params += list(self.image_feature_extractor.parameters())
 
         optim_cfg = config.optimizer
         self.optimizer = torch.optim.Adam(
@@ -1528,6 +1559,123 @@ class StreetForwardTrainer(nn.Module):
         
         return feat_3d_crop_bg, feat_3d_crop_rigid, rigid_visible_mask
 
+    def _prepare_gaussians_for_source(
+        self,
+        node_state_bg: NodeState,
+        node_state_rigid: Optional[NodeStateRigid],
+        source_frame_idx: int,
+    ) -> Tuple[Dict[str, torch.Tensor], int, int]:
+        """
+        合并静态与动态高斯参数（动态先变换到 source 帧），用于 2D 特征反投影。
+        返回合并后的高斯字典以及静态/动态数量。
+        """
+        num_sh = _num_sh_bases(self.sh_degree)
+        means_bg = node_state_bg.means
+        quats_bg = node_state_bg.quats
+        scales_bg = torch.exp(node_state_bg.scales_log)
+        opacities_bg = torch.sigmoid(node_state_bg.opacity_logit).squeeze(-1)
+        colors_bg = torch.cat([node_state_bg.sh_dc[:, None, :], node_state_bg.sh_rest], dim=1)
+
+        means_rigid_world = torch.empty(0, 3, device=self.device)
+        quats_rigid_world = torch.empty(0, 4, device=self.device)
+        scales_rigid = torch.empty(0, 3, device=self.device)
+        opacities_rigid = torch.empty(0, device=self.device)
+        colors_rigid = torch.zeros(0, num_sh, 3, device=self.device)
+        if node_state_rigid is not None and node_state_rigid.means.numel() > 0:
+            node_state_rigid.cur_frame = source_frame_idx
+            means_rigid_world = self._transform_rigid_to_world(node_state_rigid, node_state_rigid.means)
+            quats_rigid_world = self._transform_rigid_quats_to_world(node_state_rigid, node_state_rigid.quats)
+            scales_rigid = torch.exp(node_state_rigid.scales_log)
+            opacities_rigid = torch.sigmoid(node_state_rigid.opacity_logit).squeeze(-1)
+            colors_rigid = torch.cat([node_state_rigid.sh_dc[:, None, :], node_state_rigid.sh_rest], dim=1)
+
+        gaussians = {
+            "means": torch.cat([means_bg, means_rigid_world], dim=0),
+            "quats": torch.cat([quats_bg, quats_rigid_world], dim=0),
+            "scales": torch.cat([scales_bg, scales_rigid], dim=0),
+            "opacities": torch.cat([opacities_bg, opacities_rigid], dim=0),
+            "colors": torch.cat([colors_bg, colors_rigid], dim=0),
+        }
+        return gaussians, means_bg.shape[0], means_rigid_world.shape[0]
+
+    def _compute_2d_features(
+        self,
+        node_state_bg: NodeState,
+        node_state_rigid: Optional[NodeStateRigid],
+        source_views: List,
+        source_images: List[torch.Tensor],
+        source_frame_idx: int,
+        rigid_visible_mask: Optional[torch.Tensor],
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        提取 source 帧的 2D 特征并按 αT 权重反投影到高斯点。
+        """
+        if (
+            not self.use_2d_features
+            or self.image_feature_extractor is None
+            or self.alpha_t_extractor is None
+            or self.feature_backprojector is None
+        ):
+            return None, None
+        if source_images is None or len(source_images) == 0 or source_views is None or len(source_views) == 0:
+            return None, None
+
+        imgs = [img.to(self.device) for img in source_images if img is not None]
+        if len(imgs) == 0:
+            return None, None
+        sample_img = imgs[0]
+        if sample_img.dim() == 3 and sample_img.shape[-1] == 3:
+            height, width = sample_img.shape[0], sample_img.shape[1]
+        elif sample_img.dim() == 3 and sample_img.shape[0] == 3:
+            height, width = sample_img.shape[1], sample_img.shape[2]
+        else:
+            height, width = sample_img.shape[-2], sample_img.shape[-1]
+        image_batch = torch.stack(imgs, dim=0)
+
+        features_2d = self.image_feature_extractor(image_batch)  # [V, H_feat, W_feat, C2]
+        features_2d_list = [feat for feat in features_2d]
+
+        gaussians, num_bg, num_rigid = self._prepare_gaussians_for_source(
+            node_state_bg=node_state_bg,
+            node_state_rigid=node_state_rigid,
+            source_frame_idx=source_frame_idx,
+        )
+        meta_list = self.alpha_t_extractor.render_meta(gaussians, source_views, height, width)
+        weight_info = self.alpha_t_extractor.extract_weights(meta_list, height, width)
+        view_count = min(len(features_2d_list), len(weight_info))
+        if view_count == 0:
+            return None, None
+        features_2d_list = features_2d_list[:view_count]
+        weight_info = weight_info[:view_count]
+        feat_2d_all = self.feature_backprojector.backproject(
+            features_2d_list=features_2d_list,
+            weights_info=weight_info,
+            height=height,
+            width=width,
+            num_gaussians=num_bg + num_rigid,
+        )
+
+        feat_2d_bg = feat_2d_all[:num_bg]
+        feat_2d_rigid = feat_2d_all[num_bg:]
+        if rigid_visible_mask is not None and feat_2d_rigid.shape[0] == rigid_visible_mask.shape[0]:
+            feat_2d_rigid = feat_2d_rigid * rigid_visible_mask.float().unsqueeze(-1)
+        return feat_2d_bg, feat_2d_rigid
+
+    def _fuse_features(
+        self,
+        feat_3d: torch.Tensor,
+        feat_2d: Optional[torch.Tensor],
+        visibility: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        融合 2D/3D 特征与可见性标量。
+        """
+        if not self.use_2d_features or feat_2d is None or self.feature_fusion is None:
+            return feat_3d
+        if visibility is None:
+            visibility = torch.ones(feat_3d.shape[0], device=feat_3d.device)
+        return self.feature_fusion.fuse(feat_3d, feat_2d, visibility)
+
     def _mask_rigid_offsets(
         self, offsets: Dict[str, torch.Tensor], visible_mask: Optional[torch.Tensor]
     ) -> Dict[str, torch.Tensor]:
@@ -2117,11 +2265,36 @@ class StreetForwardTrainer(nn.Module):
                     hypothesis_id="H5",
                 )
             # #endregion
+
+            feat_bg_input = feat_bg
+            feat_rigid_input = feat_rigid
+            if self.use_2d_features:
+                feat_2d_bg, feat_2d_rigid = self._compute_2d_features(
+                    node_state_bg=node_state_bg,
+                    node_state_rigid=node_state_rigid,
+                    source_views=batch.get("source_views", []),
+                    source_images=batch.get("src_images", []),
+                    source_frame_idx=source_frame_idx,
+                    rigid_visible_mask=rigid_visible_mask,
+                )
+                vis_bg = torch.ones(feat_bg.shape[0], device=self.device)
+                vis_rigid = (
+                    rigid_visible_mask.float() if rigid_visible_mask is not None else torch.ones(feat_rigid.shape[0], device=self.device)
+                )
+                if feat_2d_bg is not None and feat_2d_bg.shape[0] == feat_bg.shape[0]:
+                    feat_bg_input = self._fuse_features(feat_bg, feat_2d_bg, vis_bg)
+                if (
+                    node_state_rigid is not None
+                    and feat_rigid.shape[0] > 0
+                    and feat_2d_rigid is not None
+                    and feat_2d_rigid.shape[0] == feat_rigid.shape[0]
+                ):
+                    feat_rigid_input = self._fuse_features(feat_rigid, feat_2d_rigid, vis_rigid)
             
-            offsets_bg = self._predict_offsets(feat_bg)
+            offsets_bg = self._predict_offsets(feat_bg_input)
             offsets_rigid_world = None
-            if node_state_rigid is not None and feat_rigid.shape[0] > 0:
-                offsets_rigid_world = self._predict_offsets(feat_rigid)
+            if node_state_rigid is not None and feat_rigid_input.shape[0] > 0:
+                offsets_rigid_world = self._predict_offsets(feat_rigid_input)
                 offsets_rigid_world = self._mask_rigid_offsets(offsets_rigid_world, rigid_visible_mask)
             
             # #region agent log
@@ -2711,6 +2884,8 @@ class StreetForwardTrainer(nn.Module):
             "mlp_opacity": self.mlp_opacity.state_dict(),
             "gaussion_decoder": self.gaussion_decoder.state_dict(),
         }
+        if self.image_feature_extractor is not None:
+            model_state_dict["image_feature_extractor"] = self.image_feature_extractor.state_dict()
 
         nodes_state_dict = {
             f"scene_{scene}_segment_{segment}": self._node_state_to_dict(state)
@@ -2764,6 +2939,8 @@ class StreetForwardTrainer(nn.Module):
         self.mlp_conv.load_state_dict(model_state["mlp_conv"], strict=strict)
         self.mlp_opacity.load_state_dict(model_state["mlp_opacity"], strict=strict)
         self.gaussion_decoder.load_state_dict(model_state["gaussion_decoder"], strict=strict)
+        if "image_feature_extractor" in model_state and self.image_feature_extractor is not None:
+            self.image_feature_extractor.load_state_dict(model_state["image_feature_extractor"], strict=strict)
 
         if load_optimizer and "optimizer_state_dict" in checkpoint:
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
