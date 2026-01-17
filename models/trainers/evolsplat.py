@@ -32,10 +32,35 @@ if TYPE_CHECKING:
 # Import EVolsplat components
 try:
     from gsplat.rendering import rasterization
-    from gsplat.cuda_legacy._wrapper import num_sh_bases
-    from gsplat.cuda_legacy._torch_impl import quat_to_rotmat
 except ImportError:
     raise ImportError("Please install gsplat>=1.0.0")
+
+# Compatibility functions for deprecated gsplat.cuda_legacy API
+def num_sh_bases(degree: int) -> int:
+    """Calculate the number of spherical harmonic basis functions."""
+    return (degree + 1) ** 2
+
+
+def quat_to_rotmat(quats: Tensor) -> Tensor:
+    """Convert quaternion to rotation matrix."""
+    import torch.nn.functional as F
+    quats = F.normalize(quats, p=2, dim=-1)
+    w, x, y, z = torch.unbind(quats, dim=-1)
+    R = torch.stack(
+        [
+            1 - 2 * (y**2 + z**2),
+            2 * (x * y - w * z),
+            2 * (x * z + w * y),
+            2 * (x * y + w * z),
+            1 - 2 * (x**2 + z**2),
+            2 * (y * z - w * x),
+            2 * (x * z - w * y),
+            2 * (y * z + w * x),
+            1 - 2 * (x**2 + y**2),
+        ],
+        dim=-1,
+    )
+    return R.reshape(quats.shape[:-1] + (3, 3))
 
 from models.evol_splat import (
     MLP,

@@ -98,7 +98,7 @@ model:
   
   # Other model parameters
   sh_degree: 1
-  voxel_size: 0.1
+  voxel_size: 0.4
   max_iterations: 1
   sparseConv_outdim: 32
   use_2d_features: true

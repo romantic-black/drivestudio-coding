@@ -26,6 +26,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from omegaconf import OmegaConf
 from models.feature_extractors import (
     AlphaTWeightExtractor,
@@ -533,7 +534,9 @@ class StreetForwardTrainer(nn.Module):
 
         fused_in_dim = outdim
         if self.use_2d_features:
+            # Deep fusion: 6 channels (original RGB + rendered RGB)
             self.image_feature_extractor = ImageFeatureExtractor(
+                in_channels=6,  # 3 (original) + 3 (rendered)
                 feat_channels=self.feat_2d_channels,
                 feature_downscale=self.feat_2d_downscale,
             ).to(device)
@@ -1632,16 +1635,51 @@ class StreetForwardTrainer(nn.Module):
             height, width = sample_img.shape[-2], sample_img.shape[-1]
         image_batch = torch.stack(imgs, dim=0)
 
-        features_2d = self.image_feature_extractor(image_batch)  # [V, H_feat, W_feat, C2]
-        features_2d_list = [feat for feat in features_2d]
-
+        # Step 1: Prepare Gaussians
         gaussians, num_bg, num_rigid = self._prepare_gaussians_for_source(
             node_state_bg=node_state_bg,
             node_state_rigid=node_state_rigid,
             source_frame_idx=source_frame_idx,
         )
-        meta_list = self.alpha_t_extractor.render_meta(gaussians, source_views, height, width)
+        
+        # Step 2: Render to get meta and RGB (for CNN guidance)
+        meta_list, rendered_rgbs = self.alpha_t_extractor.render_meta(
+            gaussians, source_views, height, width, return_rgb=True
+        )
         weight_info = self.alpha_t_extractor.extract_weights(meta_list, height, width)
+        
+        # Step 3: Concatenate original images with rendered RGB (deep fusion)
+        if rendered_rgbs is None or len(rendered_rgbs) == 0:
+            raise ValueError("Failed to get rendered RGB images for CNN guidance")
+        
+        # Convert images to [V, H, W, 3] format if needed
+        if image_batch.dim() == 4:
+            if image_batch.shape[1] == 3:
+                # [V, 3, H, W] -> [V, H, W, 3]
+                image_batch = image_batch.permute(0, 2, 3, 1)
+            elif image_batch.shape[-1] != 3:
+                # Assume [V, H, W, 3]
+                pass
+        
+        # Stack rendered RGBs: rendered_rgbs is List[Tensor[H, W, 3]]
+        rendered_batch = torch.stack(rendered_rgbs, dim=0)  # [V, H, W, 3]
+        
+        # Ensure rendered_batch has the same spatial dimensions as image_batch
+        if rendered_batch.shape[:2] != image_batch.shape[:2]:
+            # Resize rendered_batch to match image_batch spatial dimensions
+            rendered_batch = F.interpolate(
+                rendered_batch.permute(0, 3, 1, 2),  # [V, H, W, 3] -> [V, 3, H, W]
+                size=(image_batch.shape[1], image_batch.shape[2]),
+                mode="bilinear",
+                align_corners=False,
+            ).permute(0, 2, 3, 1)  # [V, 3, H, W] -> [V, H, W, 3]
+        
+        # Concatenate along channel dimension: [V, H, W, 6]
+        multi_channel_input = torch.cat([image_batch, rendered_batch], dim=-1)  # [V, H, W, 6]
+        
+        # Step 4: CNN feature extraction with 6-channel input
+        features_2d = self.image_feature_extractor(multi_channel_input)  # [V, H_feat, W_feat, C2]
+        features_2d_list = [feat for feat in features_2d]
         view_count = min(len(features_2d_list), len(weight_info))
         if view_count == 0:
             return None, None
@@ -1862,7 +1900,7 @@ class StreetForwardTrainer(nn.Module):
         
         # #region agent log
         if torch.cuda.is_available():
-            total_offset_size = sum(
+            total_offset_size = (
                 offset_pos.numel() * 4 + offset_scales.numel() * 4 + offset_quat.numel() * 4 +
                 offset_opacity.numel() * 4 + offset_sh.numel() * 4
             ) / 1024**2

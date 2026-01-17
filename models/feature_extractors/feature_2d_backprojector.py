@@ -15,8 +15,16 @@ class FeatureBackprojector:
     Aggregate per-pixel CNN features into per-Gaussian descriptors.
     """
 
-    def __init__(self, eps: float = 1e-8) -> None:
+    def __init__(self, eps: float = 1e-8, weight_threshold: float = 1e-2) -> None:
+        """
+        Args:
+            eps: Small epsilon for numerical stability in division.
+            weight_threshold: Minimum αT weight threshold. Gaussian-pixel pairs with weights 
+                            below this threshold will be filtered out to reduce memory usage.
+                            Default: 0.0 (no filtering). Suggested: 1e-4 to 1e-3.
+        """
         self.eps = eps
+        self.weight_threshold = weight_threshold
 
     @staticmethod
     def sample_features_at_pixels(
@@ -46,13 +54,17 @@ class FeatureBackprojector:
             feat_v = features_2d[v].permute(2, 0, 1).unsqueeze(0)  # [1, C2, H, W]
             coords_v = coords[mask].view(1, 1, -1, 2)
             sampled_v = F.grid_sample(
-                feat_v,
-                coords_v,
+                feat_v,  # [1, C2, H, W]
+                coords_v,  # [1, 1, n_mask, 2]
                 mode="bilinear",
                 align_corners=True,
                 padding_mode="zeros",
-            )
-            sampled[mask] = sampled_v.squeeze(0).squeeze(2).t()
+            )  # Output: [1, C2, 1, n_mask]
+            
+            # Remove batch and height dimensions, then transpose
+            # [1, C2, 1, n_mask] -> [C2, n_mask] -> [n_mask, C2]
+            sampled_v_processed = sampled_v.squeeze(0).squeeze(1).t()  # [n_mask, C2]
+            sampled[mask] = sampled_v_processed
         return sampled
 
     def aggregate_features_per_gaussian(
@@ -99,17 +111,31 @@ class FeatureBackprojector:
         gaussian_ids = torch.cat([w["gaussian_ids"] for w in weights_info], dim=0).long().to(device)
         pixel_ids = torch.cat([w["pixel_ids"] for w in weights_info], dim=0).long().to(device)
         weights = torch.cat([w["weights"] for w in weights_info], dim=0).to(device).detach()
-
-        if gaussian_ids.numel() == 0:
-            return torch.zeros(num_gaussians, channels, device=device)
-
-        view_ids = torch.cat(
+        view_ids_raw = torch.cat(
             [
                 torch.full((len(w["gaussian_ids"]),), idx, device=device, dtype=torch.long)
                 for idx, w in enumerate(weights_info)
             ],
             dim=0,
         )
+        
+        # Filter out low-weight gaussian-pixel pairs to reduce memory usage
+        M_before_filter = len(gaussian_ids)
+        if self.weight_threshold > 0.0:
+            mask = weights >= self.weight_threshold
+            gaussian_ids = gaussian_ids[mask]
+            pixel_ids = pixel_ids[mask]
+            weights = weights[mask]
+            view_ids = view_ids_raw[mask]  # Apply same filter to view_ids
+            M_after_filter = len(gaussian_ids)
+            filter_ratio = 1.0 - (M_after_filter / M_before_filter) if M_before_filter > 0 else 0.0
+        else:
+            view_ids = view_ids_raw
+            M_after_filter = M_before_filter
+            filter_ratio = 0.0
+
+        if gaussian_ids.numel() == 0:
+            return torch.zeros(num_gaussians, channels, device=device)
 
         features_2d = torch.stack(features_2d_list, dim=0).to(device)
         sampled = self.sample_features_at_pixels(features_2d, pixel_ids, view_ids, height, width)

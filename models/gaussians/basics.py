@@ -10,9 +10,53 @@ from sklearn.neighbors import NearestNeighbors
 from pytorch3d.transforms import matrix_to_quaternion
 
 from gsplat.rendering import rasterization
-from gsplat.cuda_legacy._wrapper import num_sh_bases
-from gsplat.cuda_legacy._torch_impl import quat_to_rotmat
 from gsplat.cuda._wrapper import spherical_harmonics
+
+# Compatibility functions for deprecated gsplat.cuda_legacy API
+def num_sh_bases(degree: int) -> int:
+    """
+    Calculate the number of spherical harmonic basis functions.
+    
+    Args:
+        degree: SH degree
+        
+    Returns:
+        Number of basis functions: (degree + 1)²
+    """
+    return (degree + 1) ** 2
+
+
+def quat_to_rotmat(quats: torch.Tensor) -> torch.Tensor:
+    """
+    Convert quaternion to rotation matrix.
+    
+    Args:
+        quats: Quaternion tensor of shape [..., 4] in wxyz format
+        
+    Returns:
+        Rotation matrix tensor of shape [..., 3, 3]
+    """
+    import torch.nn.functional as F
+    # Normalize quaternions
+    quats = F.normalize(quats, p=2, dim=-1)
+    w, x, y, z = torch.unbind(quats, dim=-1)
+    
+    # Build rotation matrix
+    R = torch.stack(
+        [
+            1 - 2 * (y**2 + z**2),
+            2 * (x * y - w * z),
+            2 * (x * z + w * y),
+            2 * (x * y + w * z),
+            1 - 2 * (x**2 + z**2),
+            2 * (y * z - w * x),
+            2 * (x * z - w * y),
+            2 * (y * z + w * x),
+            1 - 2 * (x**2 + y**2),
+        ],
+        dim=-1,
+    )
+    return R.reshape(quats.shape[:-1] + (3, 3))
 
 def interpolate_quats(q1, q2, fraction=0.5):
     q1 = q1 / torch.norm(q1, dim=-1, keepdim=True)

@@ -66,16 +66,30 @@ class AlphaTWeightExtractor:
         cameras: List,
         height: int,
         width: int,
-    ) -> List[Dict[str, torch.Tensor]]:
+        return_rgb: bool = False,
+    ) -> tuple[List[Dict[str, torch.Tensor]], Optional[List[torch.Tensor]]]:
         """
         Render each source view in packed mode to collect metadata for weight extraction.
+        
+        Args:
+            gaussians: Gaussian parameters dictionary
+            cameras: List of camera views
+            height: Image height
+            width: Image width
+            return_rgb: If True, also return rendered RGB images for CNN guidance
+            
+        Returns:
+            meta_list: List of metadata dictionaries
+            rendered_rgbs: Optional list of rendered RGB images [H, W, 3] (if return_rgb=True)
         """
         meta_list: List[Dict[str, torch.Tensor]] = []
+        rendered_rgbs: List[torch.Tensor] = [] if return_rgb else None
         with torch.no_grad():
             for cam in cameras:
-                viewmat = _get_viewmat(cam.camtoworlds if hasattr(cam, "camtoworlds") else cam["camtoworlds"])
+                cam_ctw = cam.camtoworlds if hasattr(cam, "camtoworlds") else cam["camtoworlds"]
+                viewmat = _get_viewmat(cam_ctw)
                 k_mat = self._resolve_intrinsics(cam)
-                _, _, meta = self.renderer(
+                render_colors, _, meta = self.renderer(
                     means=gaussians["means"],
                     quats=gaussians["quats"],
                     scales=gaussians["scales"],
@@ -96,7 +110,26 @@ class AlphaTWeightExtractor:
                     rasterize_mode="classic",
                 )
                 meta_list.append(meta)
-        return meta_list
+                
+                if return_rgb:
+                    # render_colors shape: [..., C, H, W, 3] for packed mode
+                    # Extract RGB image: [H, W, 3]
+                    if render_colors.dim() == 5:
+                        # [1, 1, H, W, 3] -> [H, W, 3]
+                        rgb = render_colors.squeeze(0).squeeze(0)
+                    elif render_colors.dim() == 4:
+                        # [1, H, W, 3] -> [H, W, 3]
+                        rgb = render_colors.squeeze(0)
+                    else:
+                        # [H, W, 3]
+                        rgb = render_colors
+                    # Clamp to [0, 1] and detach
+                    rgb = torch.clamp(rgb, 0.0, 1.0).detach()
+                    rendered_rgbs.append(rgb)
+        
+        if return_rgb:
+            return meta_list, rendered_rgbs
+        return meta_list, None
 
     def extract_weights(
         self,
@@ -120,37 +153,39 @@ class AlphaTWeightExtractor:
                 continue
             device = meta["means2d"].device
             transmittances = torch.ones((height, width), device=device, dtype=meta["means2d"].dtype)
-            try:
-                gaussian_ids, pixel_ids, _, weights = rasterize_to_indices_in_range(
-                    range_start=0,
-                    range_end=int(1e9),
-                    transmittances=transmittances,
-                    means2d=meta["means2d"],
-                    conics=meta["conics"],
-                    opacities=meta["opacities"],
-                    image_width=width,
-                    image_height=height,
-                    tile_size=int(meta.get("tile_size", 16)),
-                    isect_offsets=meta["isect_offsets"],
-                    flatten_ids=meta["flatten_ids"],
-                    return_weights=True,
-                )
-            except ValueError:
-                gaussian_ids, pixel_ids, _ = rasterize_to_indices_in_range(
-                    range_start=0,
-                    range_end=int(1e9),
-                    transmittances=transmittances,
-                    means2d=meta["means2d"],
-                    conics=meta["conics"],
-                    opacities=meta["opacities"],
-                    image_width=width,
-                    image_height=height,
-                    tile_size=int(meta.get("tile_size", 16)),
-                    isect_offsets=meta["isect_offsets"],
-                    flatten_ids=meta["flatten_ids"],
-                    return_weights=False,
-                )
-                weights = torch.zeros_like(gaussian_ids, dtype=transmittances.dtype)
+            # Fix isect_offsets shape: in packed mode, means2d has shape [nnz, 2], so image_dims = []
+            # rasterize_to_indices_in_range expects isect_offsets.shape == image_dims + (tile_height, tile_width)
+            # But meta["isect_offsets"] has shape [batch_dims..., C, tile_height, tile_width] or similar
+            # We need to extract the correct slice to match image_dims
+            image_dims = meta["means2d"].shape[:-2]  # Should be () for packed mode
+            isect_offsets_raw = meta["isect_offsets"]
+            # If isect_offsets has more dimensions than expected, remove the extra batch/camera dimensions
+            # Expected shape: image_dims + (tile_height, tile_width)
+            # Actual shape from renderer: [batch_dims..., C, tile_height, tile_width]
+            # In packed mode with single batch/camera: [1, tile_height, tile_width] or [1, 1, tile_height, tile_width]
+            if len(isect_offsets_raw.shape) > len(image_dims) + 2:
+                # Remove extra leading dimensions to match image_dims
+                n_dims_to_remove = len(isect_offsets_raw.shape) - len(image_dims) - 2
+                for _ in range(n_dims_to_remove):
+                    if isect_offsets_raw.shape[0] == 1:
+                        isect_offsets_raw = isect_offsets_raw.squeeze(0)
+                    else:
+                        break  # Only squeeze dimensions of size 1
+            isect_offsets_fixed = isect_offsets_raw
+            gaussian_ids, pixel_ids, _, weights = rasterize_to_indices_in_range(
+                range_start=0,
+                range_end=int(1e9),
+                transmittances=transmittances,
+                means2d=meta["means2d"],
+                conics=meta["conics"],
+                opacities=meta["opacities"],
+                image_width=width,
+                image_height=height,
+                tile_size=int(meta.get("tile_size", 16)),
+                isect_offsets=isect_offsets_fixed,
+                flatten_ids=meta["flatten_ids"],
+                return_weights=True,
+            )
 
             weight_info.append(
                 {

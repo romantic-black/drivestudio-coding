@@ -160,14 +160,16 @@ class ImageFeatureExtractor(nn.Module):
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            images: Tensor shaped [B, 3, H, W] or [B, H, W, 3]
+            images: Tensor shaped [B, C, H, W] or [B, H, W, C]
+                   where C can be 3 (RGB) or 6 (RGB + rendered RGB)
 
         Returns:
             Feature maps shaped [B, H_feat, W_feat, C]
         """
         if images.dim() != 4:
             raise ValueError(f"Expected 4D input, got shape {images.shape}")
-        if images.shape[1] != 3 and images.shape[-1] == 3:
+        # Handle channels_last format: [B, H, W, C] -> [B, C, H, W]
+        if images.shape[1] != 3 and images.shape[1] != 6 and images.shape[-1] in [3, 6]:
             images = images.permute(0, 3, 1, 2)
 
         # Optional downscaling before UNet
