@@ -195,3 +195,170 @@ class AlphaTWeightExtractor:
                 }
             )
         return weight_info
+
+    def _extract_rgb(self, render_colors: torch.Tensor) -> torch.Tensor:
+        """
+        From packed renderer output, extract an RGB image tensor with shape [H, W, 3].
+        """
+        if render_colors.dim() == 5:
+            rgb = render_colors.squeeze(0).squeeze(0)
+        elif render_colors.dim() == 4:
+            rgb = render_colors.squeeze(0)
+        else:
+            rgb = render_colors
+        return torch.clamp(rgb, 0.0, 1.0).detach()
+
+    def render_rgb_only(
+        self,
+        gaussians: Dict[str, torch.Tensor],
+        cameras: List,
+        height: int,
+        width: int,
+    ) -> List[torch.Tensor]:
+        """
+        First render pass: collect RGB only and release meta immediately.
+        """
+        rendered_rgbs: List[torch.Tensor] = []
+        with torch.no_grad():
+            for cam in cameras:
+                cam_ctw = cam.camtoworlds if hasattr(cam, "camtoworlds") else cam["camtoworlds"]
+                viewmat = _get_viewmat(cam_ctw)
+                k_mat = self._resolve_intrinsics(cam)
+                render_colors, _, meta = self.renderer(
+                    means=gaussians["means"],
+                    quats=gaussians["quats"],
+                    scales=gaussians["scales"],
+                    opacities=gaussians["opacities"],
+                    colors=gaussians["colors"],
+                    viewmats=viewmat,
+                    Ks=k_mat,
+                    width=width,
+                    height=height,
+                    tile_size=self.tile_size,
+                    packed=True,
+                    near_plane=0.01,
+                    far_plane=1e10,
+                    render_mode="RGB",
+                    sh_degree=self.sh_degree,
+                    sparse_grad=False,
+                    absgrad=True,
+                    rasterize_mode="classic",
+                )
+                rgb = self._extract_rgb(render_colors)
+                rendered_rgbs.append(rgb)
+                del meta, render_colors
+        return rendered_rgbs
+
+    def extract_single_weight(
+        self,
+        meta: Dict[str, torch.Tensor],
+        height: int,
+        width: int,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Extract sparse weight tuples from a single packed-meta output.
+        """
+        if meta is None:
+            return {
+                "gaussian_ids": torch.empty(0, dtype=torch.long),
+                "pixel_ids": torch.empty(0, dtype=torch.long),
+                "weights": torch.empty(0),
+            }
+
+        device = meta["means2d"].device
+        transmittances = torch.ones((height, width), device=device, dtype=meta["means2d"].dtype)
+
+        image_dims = meta["means2d"].shape[:-2]
+        isect_offsets_raw = meta["isect_offsets"]
+        if len(isect_offsets_raw.shape) > len(image_dims) + 2:
+            n_dims_to_remove = len(isect_offsets_raw.shape) - len(image_dims) - 2
+            for _ in range(n_dims_to_remove):
+                if isect_offsets_raw.shape[0] == 1:
+                    isect_offsets_raw = isect_offsets_raw.squeeze(0)
+                else:
+                    break
+
+        gaussian_ids, pixel_ids, _, weights = rasterize_to_indices_in_range(
+            range_start=0,
+            range_end=int(1e9),
+            transmittances=transmittances,
+            means2d=meta["means2d"],
+            conics=meta["conics"],
+            opacities=meta["opacities"],
+            image_width=width,
+            image_height=height,
+            tile_size=int(meta.get("tile_size", 16)),
+            isect_offsets=isect_offsets_raw,
+            flatten_ids=meta["flatten_ids"],
+            return_weights=True,
+        )
+
+        return {
+            "gaussian_ids": gaussian_ids.to(device),
+            "pixel_ids": pixel_ids.to(device),
+            "weights": weights.to(device),
+        }
+
+    def render_and_backproject_streaming(
+        self,
+        gaussians: Dict[str, torch.Tensor],
+        cameras: List,
+        features_2d: torch.Tensor,
+        height: int,
+        width: int,
+        num_gaussians: int,
+        backprojector: "FeatureBackprojector",
+    ) -> torch.Tensor:
+        """
+        Second render pass: stream per-view weights and accumulate backprojection.
+        """
+        device = features_2d.device
+        channels = features_2d.shape[-1]
+        eps = getattr(backprojector, "eps", 1e-8)
+
+        accumulated_feat = torch.zeros(num_gaussians, channels, device=device)
+        accumulated_weight = torch.zeros(num_gaussians, device=device)
+
+        for i, cam in enumerate(cameras):
+            cam_ctw = cam.camtoworlds if hasattr(cam, "camtoworlds") else cam["camtoworlds"]
+            viewmat = _get_viewmat(cam_ctw)
+            k_mat = self._resolve_intrinsics(cam)
+            with torch.no_grad():
+                _, _, meta = self.renderer(
+                    means=gaussians["means"],
+                    quats=gaussians["quats"],
+                    scales=gaussians["scales"],
+                    opacities=gaussians["opacities"],
+                    colors=gaussians["colors"],
+                    viewmats=viewmat,
+                    Ks=k_mat,
+                    width=width,
+                    height=height,
+                    tile_size=self.tile_size,
+                    packed=True,
+                    near_plane=0.01,
+                    far_plane=1e10,
+                    render_mode="RGB",
+                    sh_degree=self.sh_degree,
+                    sparse_grad=False,
+                    absgrad=True,
+                    rasterize_mode="classic",
+                )
+
+                weight_info = self.extract_single_weight(meta, height, width)
+                del meta
+
+            feat_sum, weight_sum = backprojector.backproject_single_view(
+                features_2d[i],
+                weight_info,
+                height,
+                width,
+                num_gaussians,
+            )
+            del weight_info
+
+            accumulated_feat += feat_sum
+            accumulated_weight += weight_sum
+            del feat_sum, weight_sum
+
+        return accumulated_feat / (accumulated_weight.unsqueeze(-1) + eps)

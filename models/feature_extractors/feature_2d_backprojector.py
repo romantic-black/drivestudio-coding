@@ -4,7 +4,7 @@ Backproject 2D features to Gaussians using alpha-T weights.
 
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -88,6 +88,80 @@ class FeatureBackprojector:
         den.scatter_add_(0, gaussian_ids, weights)
         return num / (den.unsqueeze(-1) + self.eps)
 
+    def _sample_features_single_view(
+        self,
+        feat_2d: torch.Tensor,
+        pixel_ids: torch.Tensor,
+        height: int,
+        width: int,
+    ) -> torch.Tensor:
+        """
+        Bilinearly sample a single-view feature map at the specified pixel ids.
+        """
+        device = feat_2d.device
+        coords = torch.zeros(len(pixel_ids), 2, device=device, dtype=feat_2d.dtype)
+        coords[:, 0] = (pixel_ids % width).float() / float(width)
+        coords[:, 1] = (pixel_ids // width).float() / float(height)
+        coords = coords * 2.0 - 1.0  # [-1, 1]
+
+        feat_2d_chw = feat_2d.permute(2, 0, 1).unsqueeze(0)  # [1, C, H, W]
+        coords_grid = coords.view(1, 1, -1, 2)  # [1, 1, M, 2]
+
+        sampled = F.grid_sample(
+            feat_2d_chw,
+            coords_grid,
+            mode="bilinear",
+            align_corners=True,
+            padding_mode="zeros",
+        )  # [1, C, 1, M]
+        return sampled.squeeze(0).squeeze(1).t()  # [M, C]
+
+    def backproject_single_view(
+        self,
+        feat_2d: torch.Tensor,
+        weight_info: Dict[str, torch.Tensor],
+        height: int,
+        width: int,
+        num_gaussians: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Backproject a single view: return weighted feature sums and weight sums.
+        """
+        gaussian_ids = weight_info["gaussian_ids"].long()
+        pixel_ids = weight_info["pixel_ids"].long()
+        weights = weight_info["weights"].detach()
+
+        device = feat_2d.device
+        channels = feat_2d.shape[-1]
+
+        if gaussian_ids.numel() == 0:
+            return (
+                torch.zeros(num_gaussians, channels, device=device, dtype=feat_2d.dtype),
+                torch.zeros(num_gaussians, device=device, dtype=feat_2d.dtype),
+            )
+
+        if self.weight_threshold > 0.0:
+            mask = weights >= self.weight_threshold
+            gaussian_ids = gaussian_ids[mask]
+            pixel_ids = pixel_ids[mask]
+            weights = weights[mask]
+
+        if gaussian_ids.numel() == 0:
+            return (
+                torch.zeros(num_gaussians, channels, device=device, dtype=feat_2d.dtype),
+                torch.zeros(num_gaussians, device=device, dtype=feat_2d.dtype),
+            )
+
+        sampled = self._sample_features_single_view(feat_2d, pixel_ids, height, width)
+        weighted_feat = sampled * weights.unsqueeze(-1)
+
+        feat_sum = torch.zeros(num_gaussians, channels, device=device, dtype=feat_2d.dtype)
+        feat_sum.scatter_add_(0, gaussian_ids.unsqueeze(-1).expand(-1, channels), weighted_feat)
+
+        weight_sum = torch.zeros(num_gaussians, device=device, dtype=feat_2d.dtype)
+        weight_sum.scatter_add_(0, gaussian_ids, weights)
+        return feat_sum, weight_sum
+
     def backproject(
         self,
         features_2d_list: List[torch.Tensor],
@@ -128,15 +202,14 @@ class FeatureBackprojector:
             weights = weights[mask]
             view_ids = view_ids_raw[mask]  # Apply same filter to view_ids
             M_after_filter = len(gaussian_ids)
-            filter_ratio = 1.0 - (M_after_filter / M_before_filter) if M_before_filter > 0 else 0.0
         else:
             view_ids = view_ids_raw
             M_after_filter = M_before_filter
-            filter_ratio = 0.0
 
         if gaussian_ids.numel() == 0:
             return torch.zeros(num_gaussians, channels, device=device)
 
         features_2d = torch.stack(features_2d_list, dim=0).to(device)
         sampled = self.sample_features_at_pixels(features_2d, pixel_ids, view_ids, height, width)
-        return self.aggregate_features_per_gaussian(sampled, weights, gaussian_ids, num_gaussians)
+        aggregated = self.aggregate_features_per_gaussian(sampled, weights, gaussian_ids, num_gaussians)
+        return aggregated
