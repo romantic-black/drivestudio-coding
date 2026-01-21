@@ -430,6 +430,34 @@ class NodeStateRigid:
         )
 
 
+@dataclass
+class NodeStateDistant:
+    """
+    背景静态点的状态（crop_aabb 外、input_aabb 内）。
+
+    与 NodeStateBackground 类似，使用世界坐标系，但不参与 3D 特征体积构建。
+    """
+    means: torch.Tensor
+    scales_log: torch.Tensor
+    quats: torch.Tensor
+    opacity_logit: torch.Tensor
+    sh_dc: torch.Tensor
+    sh_rest: torch.Tensor
+
+    def detach_clone(self) -> "NodeStateDistant":
+        """
+        创建节点状态的分离副本。
+        """
+        return NodeStateDistant(
+            means=self.means.detach().clone(),
+            scales_log=self.scales_log.detach().clone(),
+            quats=self.quats.detach().clone(),
+            opacity_logit=self.opacity_logit.detach().clone(),
+            sh_dc=self.sh_dc.detach().clone(),
+            sh_rest=self.sh_rest.detach().clone(),
+        )
+
+
 NodeState = NodeStateBackground
 
 
@@ -511,12 +539,31 @@ class StreetForwardTrainer(nn.Module):
         self.bbx_min = torch.tensor(bbx_min, dtype=torch.float32, device=device)
         self.bbx_max = torch.tensor(bbx_max, dtype=torch.float32, device=device)
 
+        input_aabb_cfg = model_cfg.get("input_aabb", None)
+        if input_aabb_cfg is None and hasattr(config, "data") and hasattr(config.data, "pointcloud"):
+            pc_cfg = config.data.pointcloud
+            if hasattr(pc_cfg, "get"):
+                input_aabb_cfg = pc_cfg.get("input_aabb")
+            elif hasattr(pc_cfg, "input_aabb"):
+                input_aabb_cfg = pc_cfg.input_aabb
+        if input_aabb_cfg is None and hasattr(config, "dataset") and hasattr(config.dataset, "pointcloud"):
+            pc_cfg = config.dataset.pointcloud
+            if hasattr(pc_cfg, "get"):
+                input_aabb_cfg = pc_cfg.get("input_aabb")
+            elif hasattr(pc_cfg, "input_aabb"):
+                input_aabb_cfg = pc_cfg.input_aabb
+        if input_aabb_cfg is None:
+            input_aabb_cfg = [bbx_min, bbx_max]
+        self.input_aabb_min = torch.tensor(input_aabb_cfg[0], dtype=torch.float32, device=device)
+        self.input_aabb_max = torch.tensor(input_aabb_cfg[1], dtype=torch.float32, device=device)
+
         # Renderer and sparse conv dependencies
         self.renderer = renderer or _gsplat_rasterization
         if self.renderer is None:
             raise ImportError("Renderer not available. Install gsplat or provide a custom renderer.")
 
         outdim = model_cfg.get("sparseConv_outdim", 32)
+        self.feat_3d_dim = outdim
         if sparse_conv is not None:
             self.sparse_conv = sparse_conv.to(device)
         elif _SparseCostRegNet is not None:
@@ -546,8 +593,9 @@ class StreetForwardTrainer(nn.Module):
                 tile_size=16,
             )
             self.feature_backprojector = FeatureBackprojector()
-            self.feature_fusion = FeatureFusion(use_visibility=True)
-            fused_in_dim = outdim + self.feat_2d_channels + 1  # 3D + 2D + visibility
+            # 不再使用可见性通道，保持 3D+2D 融合
+            self.feature_fusion = FeatureFusion(use_visibility=False)
+            fused_in_dim = outdim + self.feat_2d_channels
         else:
             self.image_feature_extractor = None
             self.alpha_t_extractor = None
@@ -631,6 +679,7 @@ class StreetForwardTrainer(nn.Module):
         self.node_states: Dict[Tuple[int, int], NodeState] = {}
         self.node_states_bg = self.node_states
         self.node_states_rigid: Dict[Tuple[int, int], Optional[NodeStateRigid]] = {}
+        self.node_states_distant: Dict[Tuple[int, int], Optional[NodeStateDistant]] = {}
         self._lpips_model = None
         self._lpips_unavailable = False
         self._ssim_unavailable = False
@@ -709,6 +758,41 @@ class StreetForwardTrainer(nn.Module):
         avg_dist = distances.mean(dim=-1, keepdim=True)
         return torch.log(torch.clamp(avg_dist, min=1e-3).repeat(1, 3))
 
+    def _init_node_state_from_arrays(
+        self,
+        points: np.ndarray,
+        colors: np.ndarray,
+        state_cls,
+    ):
+        """
+        从点和颜色数组初始化节点状态。
+        """
+        if len(points) == 0:
+            raise ValueError("Empty point cloud provided for node state initialization.")
+
+        means = torch.from_numpy(points).float().to(self.device)
+        colors_tensor = torch.from_numpy(colors).float().to(self.device)
+        if colors_tensor.numel() > 0 and colors_tensor.max() > 1.0 + 1e-3:
+            colors_tensor = colors_tensor / 255.0
+        colors_rgb = colors_tensor
+
+        initial_scales = self._compute_initial_scales(means)
+        quats = _random_quat_tensor(means.shape[0], device=self.device)
+        opacity_logit = torch.logit(torch.full((means.shape[0], 1), 0.1, device=self.device))
+
+        num_sh = _num_sh_bases(self.sh_degree)
+        sh_dc = _rgb_to_sh(colors_rgb)
+        sh_rest = torch.zeros((means.shape[0], num_sh - 1, 3), device=self.device)
+
+        return state_cls(
+            means=means.detach().clone(),
+            scales_log=initial_scales.detach().clone(),
+            quats=quats.detach().clone(),
+            opacity_logit=opacity_logit.detach().clone(),
+            sh_dc=sh_dc.detach().clone(),
+            sh_rest=sh_rest.detach().clone(),
+        )
+
     def _init_node_from_pointcloud(
         self,
         scene_id: int,
@@ -754,26 +838,7 @@ class StreetForwardTrainer(nn.Module):
         if len(points) == 0:
             raise ValueError(f"Empty point cloud for scene {scene_id}, segment {segment_id}")
 
-        means = torch.from_numpy(points).float().to(self.device)
-        colors_rgb = torch.from_numpy(colors).float().to(self.device)
-
-        initial_scales = self._compute_initial_scales(means)
-
-        quats = _random_quat_tensor(means.shape[0], device=self.device)
-        opacity_logit = torch.logit(torch.full((means.shape[0], 1), 0.1, device=self.device))
-
-        num_sh = _num_sh_bases(self.sh_degree)
-        sh_dc = _rgb_to_sh(colors_rgb)
-        sh_rest = torch.zeros((means.shape[0], num_sh - 1, 3), device=self.device)
-
-        node_state = NodeStateBackground(
-            means=means.detach().clone(),
-            scales_log=initial_scales.detach().clone(),
-            quats=quats.detach().clone(),
-            opacity_logit=opacity_logit.detach().clone(),
-            sh_dc=sh_dc.detach().clone(),
-            sh_rest=sh_rest.detach().clone(),
-        )
+        node_state = self._init_node_state_from_arrays(points, colors, NodeStateBackground)
         self.node_states[(scene_id, segment_id)] = node_state
         return node_state
 
@@ -869,7 +934,7 @@ class StreetForwardTrainer(nn.Module):
 
     def _get_or_init_node_states(
         self, batch: Dict
-    ) -> Tuple[Tuple[int, int], NodeState, Optional[NodeStateRigid]]:
+    ) -> Tuple[Tuple[int, int], NodeState, Optional[NodeStateRigid], Optional[NodeStateDistant]]:
         """
         获取或初始化双 NodeState（Background + RigidNodes）。
         
@@ -881,10 +946,11 @@ class StreetForwardTrainer(nn.Module):
                 - "dynamic_info": 动态物体信息（可选）
                 
         Returns:
-            (key, node_state_bg, node_state_rigid) 元组：
+            (key, node_state_bg, node_state_rigid, node_state_distant) 元组：
                 - key: (scene_id, segment_id) 元组
                 - node_state_bg: NodeStateBackground（静态背景）
                 - node_state_rigid: NodeStateRigid 或 None（动态物体，如果存在）
+                - node_state_distant: NodeStateDistant 或 None（背景远景，如果启用）
                 
         处理流程：
         1. 如果 NodeState 已存在，直接返回（支持动态扩展帧信息）
@@ -903,23 +969,73 @@ class StreetForwardTrainer(nn.Module):
         key = (scene_id, segment_id)
         if key in self.node_states:
             node_state_rigid = self.node_states_rigid.get(key)
+            node_state_distant = self.node_states_distant.get(key)
             dynamic_info = batch.get("dynamic_info")
             if node_state_rigid is not None and dynamic_info:
                 node_state_rigid = self._extend_rigid_frames(node_state_rigid, dynamic_info)
                 self.node_states_rigid[key] = node_state_rigid
-            return key, self.node_states[key], node_state_rigid
+            return key, self.node_states[key], node_state_rigid, node_state_distant
         
         # 如果 key 不存在，说明已经开始下一个段的训练，清空之前的缓存以释放显存
         if len(self.node_states) > 0:
             logger.debug(f"Clearing node_states cache before initializing new segment {key}. Previous cache had {len(self.node_states)} entries.")
             self.node_states.clear()
             self.node_states_rigid.clear()
+            self.node_states_distant.clear()
             # 强制垃圾回收以释放显存
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         
         pointcloud = batch["pointcloud"]
-        node_state_bg = self._init_node_from_pointcloud(scene_id, segment_id, pointcloud)
+        if isinstance(pointcloud, dict):
+            background = pointcloud.get("background", np.zeros((0, 6), dtype=np.float32))
+            points = background[:, :3].astype(np.float32)
+            if background.shape[1] >= 6:
+                colors = background[:, 3:6].astype(np.float32)
+            else:
+                colors = np.zeros_like(points, dtype=np.float32)
+        else:
+            points = np.asarray(getattr(pointcloud, "points", np.zeros((0, 3))), dtype=np.float32)
+            raw_colors = getattr(pointcloud, "colors", None)
+            if raw_colors is not None:
+                colors = np.asarray(raw_colors, dtype=np.float32)
+                if colors.ndim == 1:
+                    colors = np.expand_dims(colors, axis=0)
+                if colors.shape[0] != points.shape[0]:
+                    colors = np.zeros_like(points, dtype=np.float32)
+            else:
+                colors = np.zeros_like(points, dtype=np.float32)
+        # 过滤到 input_aabb 范围内
+        input_min = self.input_aabb_min.cpu().numpy()
+        input_max = self.input_aabb_max.cpu().numpy()
+        if points.size > 0:
+            inside_mask = (
+                (points >= input_min)
+                & (points <= input_max)
+            ).all(axis=1)
+            points = points[inside_mask]
+            colors = colors[inside_mask]
+
+        crop_min = self.bbx_min.cpu().numpy()
+        crop_max = self.bbx_max.cpu().numpy()
+        in_crop_mask = (
+            (points >= crop_min)
+            & (points <= crop_max)
+        ).all(axis=1)
+        fg_points = points[in_crop_mask]
+        fg_colors = colors[in_crop_mask]
+        distant_points = points[~in_crop_mask]
+        distant_colors = colors[~in_crop_mask]
+
+        node_state_bg = self._init_node_state_from_arrays(fg_points, fg_colors, NodeStateBackground)
+        node_state_distant: Optional[NodeStateDistant] = None
+        if len(distant_points) > 0:
+            node_state_distant = self._init_node_state_from_arrays(
+                distant_points.astype(np.float32),
+                distant_colors.astype(np.float32),
+                NodeStateDistant,
+            )
+        self.node_states[(scene_id, segment_id)] = node_state_bg
 
         node_state_rigid: Optional[NodeStateRigid] = None
         if isinstance(pointcloud, dict) and pointcloud.get("dynamic"):
@@ -956,7 +1072,8 @@ class StreetForwardTrainer(nn.Module):
                 )
 
         self.node_states_rigid[key] = node_state_rigid
-        return key, node_state_bg, node_state_rigid
+        self.node_states_distant[key] = node_state_distant
+        return key, node_state_bg, node_state_rigid, node_state_distant
 
     def _get_or_init_node_state(self, batch: Dict) -> Tuple[Tuple[int, int], NodeState]:
         """
@@ -970,7 +1087,7 @@ class StreetForwardTrainer(nn.Module):
         
         这是 _get_or_init_node_states 的简化版本，只返回静态背景。
         """
-        key, node_state_bg, _ = self._get_or_init_node_states(batch)
+        key, node_state_bg, _, _ = self._get_or_init_node_states(batch)
         return key, node_state_bg
 
     def _node_state_to_dict(self, node_state: NodeState) -> Dict[str, torch.Tensor]:
@@ -1003,6 +1120,19 @@ class StreetForwardTrainer(nn.Module):
             恢复的 NodeState，所有张量都已移到设备并分离
         """
         return NodeState(
+            means=state_dict["means"].to(self.device),
+            scales_log=state_dict["scales_log"].to(self.device),
+            quats=state_dict["quats"].to(self.device),
+            opacity_logit=state_dict["opacity_logit"].to(self.device),
+            sh_dc=state_dict["sh_dc"].to(self.device),
+            sh_rest=state_dict["sh_rest"].to(self.device),
+        ).detach_clone()
+
+    def _node_state_distant_from_dict(self, state_dict: Dict[str, torch.Tensor]) -> NodeStateDistant:
+        """
+        从字典恢复 NodeStateDistant（用于加载检查点）。
+        """
+        return NodeStateDistant(
             means=state_dict["means"].to(self.device),
             scales_log=state_dict["scales_log"].to(self.device),
             quats=state_dict["quats"].to(self.device),
@@ -1068,6 +1198,7 @@ class StreetForwardTrainer(nn.Module):
             frame_ids=list(state_dict.get("frame_ids", [])),
             cur_frame=int(state_dict.get("cur_frame", 0)),
         ).detach_clone()
+
 
     def _extend_rigid_frames(self, node_state_rigid: NodeStateRigid, dynamic_info: Dict) -> NodeStateRigid:
         """
@@ -1283,7 +1414,7 @@ class StreetForwardTrainer(nn.Module):
         node_state_bg: NodeState,
         node_state_rigid: Optional[NodeStateRigid],
         source_frame_idx: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         构建 3D 特征体积，为静态背景和动态物体提取特征。
         
@@ -1295,10 +1426,11 @@ class StreetForwardTrainer(nn.Module):
             source_frame_idx: Source 帧的 frame ID（场景全局 frame_idx）
             
         Returns:
-            (feat_3d_crop_bg, feat_3d_crop_rigid, rigid_visible_mask) 元组：
+            (feat_3d_crop_bg, feat_3d_crop_rigid, rigid_visible_mask, rigid_in_crop_mask) 元组：
                 - feat_3d_crop_bg: 静态背景点的3D特征，形状 [N_bg, outdim]
                 - feat_3d_crop_rigid: 动态物体点的3D特征，形状 [N_rigid, outdim]
                 - rigid_visible_mask: 动态物体可见性掩码，形状 [N_rigid]，可选
+                - rigid_in_crop_mask: 动态物体是否在 crop_aabb 内的掩码，形状 [N_rigid]，可选
         
         处理流程：
         1. 设置 RigidNodes.cur_frame = source_frame_idx
@@ -1325,6 +1457,7 @@ class StreetForwardTrainer(nn.Module):
         # #endregion
         
         rigid_visible_mask = None
+        rigid_in_crop_mask = None
         if node_state_rigid is not None:
             node_state_rigid.cur_frame = source_frame_idx
             resolved_frame_idx = self._resolve_rigid_frame_idx(node_state_rigid, source_frame_idx)
@@ -1339,16 +1472,27 @@ class StreetForwardTrainer(nn.Module):
         if node_state_rigid is not None:
             means_rigid_world_all = self._transform_rigid_to_world(node_state_rigid, node_state_rigid.means)
             anchor_rgb_rigid_all = _sh_to_rgb(node_state_rigid.sh_dc)
+            rigid_in_crop_mask = torch.all(
+                (means_rigid_world_all >= self.bbx_min) & (means_rigid_world_all <= self.bbx_max),
+                dim=-1,
+            )
 
-        if rigid_visible_mask is not None:
-            means_rigid_world = means_rigid_world_all[rigid_visible_mask]
-            anchor_rgb_rigid = anchor_rgb_rigid_all[rigid_visible_mask]
-        else:
-            means_rigid_world = means_rigid_world_all
-            anchor_rgb_rigid = anchor_rgb_rigid_all
+        effective_mask = None
+        if node_state_rigid is not None and means_rigid_world_all.numel() > 0:
+            effective_mask = rigid_in_crop_mask
+            if effective_mask is None:
+                effective_mask = torch.ones(means_rigid_world_all.shape[0], dtype=torch.bool, device=self.device)
+            if rigid_visible_mask is not None:
+                effective_mask = effective_mask & rigid_visible_mask
 
-        means_all = torch.cat([means_bg, means_rigid_world], dim=0)
-        anchor_rgb_all = torch.cat([anchor_rgb_bg, anchor_rgb_rigid], dim=0)
+        means_list = [means_bg]
+        rgb_list = [anchor_rgb_bg]
+        if node_state_rigid is not None and means_rigid_world_all.numel() > 0 and effective_mask is not None and effective_mask.any():
+            means_list.append(means_rigid_world_all[effective_mask])
+            rgb_list.append(anchor_rgb_rigid_all[effective_mask])
+
+        means_all = torch.cat(means_list, dim=0)
+        anchor_rgb_all = torch.cat(rgb_list, dim=0)
 
         # #region agent log
         if torch.cuda.is_available():
@@ -1515,19 +1659,24 @@ class StreetForwardTrainer(nn.Module):
             )
         # #endregion
 
-        if node_state_rigid is not None:
-            if means_rigid_world_all.shape[0] > 0:
-                grid_coords_rigid_all = self.get_grid_coords(
-                    means_rigid_world_all, self.bbx_min, vol_dim, self.voxel_size
+        if node_state_rigid is not None and means_rigid_world_all.shape[0] > 0:
+            feat_dim = feat_3d_crop_bg.shape[1]
+            feat_3d_crop_rigid = torch.zeros(
+                means_rigid_world_all.shape[0],
+                feat_dim,
+                device=self.device,
+            )
+            if rigid_in_crop_mask is not None and rigid_in_crop_mask.any():
+                means_in_crop = means_rigid_world_all[rigid_in_crop_mask]
+                grid_coords_rigid_in_crop = self.get_grid_coords(
+                    means_in_crop, self.bbx_min, vol_dim, self.voxel_size
                 )
-                feat_3d_crop_rigid_all = self.interpolate_features(grid_coords_rigid_all, dense_volume)
-                if rigid_visible_mask is not None:
-                    feat_3d_crop_rigid_all = feat_3d_crop_rigid_all * rigid_visible_mask[:, None].float()
-                feat_3d_crop_rigid = feat_3d_crop_rigid_all
-            else:
-                feat_3d_crop_rigid = torch.empty(
-                    0, feat_3d_crop_bg.shape[1], device=self.device
+                feat_3d_rigid_in_crop = self.interpolate_features(
+                    grid_coords_rigid_in_crop, dense_volume
                 )
+                feat_3d_crop_rigid[rigid_in_crop_mask] = feat_3d_rigid_in_crop
+            if rigid_visible_mask is not None:
+                feat_3d_crop_rigid = feat_3d_crop_rigid * rigid_visible_mask[:, None].float()
         else:
             feat_3d_crop_rigid = torch.empty(0, feat_3d_crop_bg.shape[1], device=self.device)
 
@@ -1560,7 +1709,7 @@ class StreetForwardTrainer(nn.Module):
             )
         # #endregion
         
-        return feat_3d_crop_bg, feat_3d_crop_rigid, rigid_visible_mask
+        return feat_3d_crop_bg, feat_3d_crop_rigid, rigid_visible_mask, rigid_in_crop_mask
 
     def _prepare_gaussians_for_source(
         self,
@@ -1600,6 +1749,63 @@ class StreetForwardTrainer(nn.Module):
             "colors": torch.cat([colors_bg, colors_rigid], dim=0),
         }
         return gaussians, means_bg.shape[0], means_rigid_world.shape[0]
+
+    def _prepare_all_gaussians(
+        self,
+        node_state_bg: NodeState,
+        node_state_rigid: Optional[NodeStateRigid],
+        node_state_distant: Optional[NodeStateDistant],
+        source_frame_idx: int,
+    ) -> Tuple[Dict[str, torch.Tensor], int, int, int]:
+        """
+        合并三类点（前景、动态、背景远景）用于 2D 特征计算。
+        """
+        num_sh = _num_sh_bases(self.sh_degree)
+
+        means_bg = node_state_bg.means
+        quats_bg = node_state_bg.quats
+        scales_bg = torch.exp(node_state_bg.scales_log)
+        opacities_bg = torch.sigmoid(node_state_bg.opacity_logit).squeeze(-1)
+        colors_bg = torch.cat([node_state_bg.sh_dc[:, None, :], node_state_bg.sh_rest], dim=1)
+        num_bg = means_bg.shape[0]
+
+        means_rigid_world = torch.empty(0, 3, device=self.device)
+        quats_rigid_world = torch.empty(0, 4, device=self.device)
+        scales_rigid = torch.empty(0, 3, device=self.device)
+        opacities_rigid = torch.empty(0, device=self.device)
+        colors_rigid = torch.zeros(0, num_sh, 3, device=self.device)
+        num_rigid = 0
+        if node_state_rigid is not None and node_state_rigid.means.numel() > 0:
+            node_state_rigid.cur_frame = source_frame_idx
+            means_rigid_world = self._transform_rigid_to_world(node_state_rigid, node_state_rigid.means)
+            quats_rigid_world = self._transform_rigid_quats_to_world(node_state_rigid, node_state_rigid.quats)
+            scales_rigid = torch.exp(node_state_rigid.scales_log)
+            opacities_rigid = torch.sigmoid(node_state_rigid.opacity_logit).squeeze(-1)
+            colors_rigid = torch.cat([node_state_rigid.sh_dc[:, None, :], node_state_rigid.sh_rest], dim=1)
+            num_rigid = means_rigid_world.shape[0]
+
+        means_distant = torch.empty(0, 3, device=self.device)
+        quats_distant = torch.empty(0, 4, device=self.device)
+        scales_distant = torch.empty(0, 3, device=self.device)
+        opacities_distant = torch.empty(0, device=self.device)
+        colors_distant = torch.zeros(0, num_sh, 3, device=self.device)
+        num_distant = 0
+        if node_state_distant is not None and node_state_distant.means.numel() > 0:
+            means_distant = node_state_distant.means
+            quats_distant = node_state_distant.quats
+            scales_distant = torch.exp(node_state_distant.scales_log)
+            opacities_distant = torch.sigmoid(node_state_distant.opacity_logit).squeeze(-1)
+            colors_distant = torch.cat([node_state_distant.sh_dc[:, None, :], node_state_distant.sh_rest], dim=1)
+            num_distant = means_distant.shape[0]
+
+        gaussians = {
+            "means": torch.cat([means_bg, means_rigid_world, means_distant], dim=0),
+            "quats": torch.cat([quats_bg, quats_rigid_world, quats_distant], dim=0),
+            "scales": torch.cat([scales_bg, scales_rigid, scales_distant], dim=0),
+            "opacities": torch.cat([opacities_bg, opacities_rigid, opacities_distant], dim=0),
+            "colors": torch.cat([colors_bg, colors_rigid, colors_distant], dim=0),
+        }
+        return gaussians, num_bg, num_rigid, num_distant
 
     def _compute_2d_features(
         self,
@@ -1685,6 +1891,94 @@ class StreetForwardTrainer(nn.Module):
         if rigid_visible_mask is not None and feat_2d_rigid.shape[0] == rigid_visible_mask.shape[0]:
             feat_2d_rigid = feat_2d_rigid * rigid_visible_mask.float().unsqueeze(-1)
         return feat_2d_bg, feat_2d_rigid
+
+    def _compute_2d_features_all(
+        self,
+        node_state_bg: NodeState,
+        node_state_rigid: Optional[NodeStateRigid],
+        node_state_distant: Optional[NodeStateDistant],
+        source_views: List,
+        source_images: List[torch.Tensor],
+        source_frame_idx: int,
+        rigid_visible_mask: Optional[torch.Tensor],
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        计算所有点（前景+动态+背景远景）的 2D 特征。
+        """
+        if (
+            not self.use_2d_features
+            or self.image_feature_extractor is None
+            or self.alpha_t_extractor is None
+            or self.feature_backprojector is None
+        ):
+            return None, None, None
+        if source_images is None or len(source_images) == 0 or source_views is None or len(source_views) == 0:
+            return None, None, None
+
+        imgs = [img.to(self.device) for img in source_images if img is not None]
+        if len(imgs) == 0:
+            return None, None, None
+        sample_img = imgs[0]
+        if sample_img.dim() == 3 and sample_img.shape[-1] == 3:
+            height, width = sample_img.shape[0], sample_img.shape[1]
+        elif sample_img.dim() == 3 and sample_img.shape[0] == 3:
+            height, width = sample_img.shape[1], sample_img.shape[2]
+        else:
+            height, width = sample_img.shape[-2], sample_img.shape[-1]
+        image_batch = torch.stack(imgs, dim=0)
+
+        gaussians_all, num_bg, num_rigid, num_distant = self._prepare_all_gaussians(
+            node_state_bg=node_state_bg,
+            node_state_rigid=node_state_rigid,
+            node_state_distant=node_state_distant,
+            source_frame_idx=source_frame_idx,
+        )
+        total_points = num_bg + num_rigid + num_distant
+        if total_points == 0:
+            return None, None, None
+
+        rendered_rgbs = self.alpha_t_extractor.render_rgb_only(
+            gaussians_all, source_views, height, width
+        )
+
+        if image_batch.dim() == 4 and image_batch.shape[1] == 3:
+            image_batch = image_batch.permute(0, 2, 3, 1)
+
+        rendered_batch = torch.stack(rendered_rgbs, dim=0)
+        del rendered_rgbs
+
+        if rendered_batch.shape[1:3] != image_batch.shape[1:3]:
+            rendered_batch = F.interpolate(
+                rendered_batch.permute(0, 3, 1, 2),
+                size=(image_batch.shape[1], image_batch.shape[2]),
+                mode="bilinear",
+                align_corners=False,
+            ).permute(0, 2, 3, 1)
+
+        multi_channel_input = torch.cat([image_batch, rendered_batch], dim=-1)
+        del rendered_batch, image_batch
+
+        features_2d = self.image_feature_extractor(multi_channel_input)
+        del multi_channel_input
+
+        feat_2d_all = self.alpha_t_extractor.render_and_backproject_streaming(
+            gaussians=gaussians_all,
+            cameras=source_views,
+            features_2d=features_2d,
+            height=height,
+            width=width,
+            num_gaussians=total_points,
+            backprojector=self.feature_backprojector,
+        )
+
+        feat_2d_bg = feat_2d_all[:num_bg] if num_bg > 0 else None
+        feat_2d_rigid = feat_2d_all[num_bg:num_bg + num_rigid] if num_rigid > 0 else None
+        feat_2d_distant = feat_2d_all[num_bg + num_rigid:] if num_distant > 0 else None
+
+        if feat_2d_rigid is not None and rigid_visible_mask is not None and feat_2d_rigid.shape[0] == rigid_visible_mask.shape[0]:
+            feat_2d_rigid = feat_2d_rigid * rigid_visible_mask.float().unsqueeze(-1)
+
+        return feat_2d_bg, feat_2d_rigid, feat_2d_distant
 
     def _fuse_features(
         self,
@@ -2032,6 +2326,46 @@ class StreetForwardTrainer(nn.Module):
         # #endregion
         return proxies
 
+    def _merge_all_params(
+        self,
+        proxies_bg: Dict[str, torch.Tensor],
+        proxies_rigid: Optional[Dict[str, torch.Tensor]],
+        proxies_distant: Optional[Dict[str, torch.Tensor]],
+        means_rigid_world: torch.Tensor,
+        quats_rigid_world: torch.Tensor,
+        opacities_rigid: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        合并前景、动态和背景远景的渲染参数。
+        """
+        means_list = [proxies_bg["means_p"]]
+        quats_list = [proxies_bg["quats_p"]]
+        scales_list = [proxies_bg["scales_p"]]
+        opacities_list = [proxies_bg["opacities_p"]]
+        colors_list = [proxies_bg["colors_p"]]
+
+        if proxies_rigid is not None and means_rigid_world.numel() > 0:
+            means_list.append(means_rigid_world)
+            quats_list.append(quats_rigid_world)
+            scales_list.append(proxies_rigid["scales_p"])
+            opacities_list.append(opacities_rigid if opacities_rigid is not None else proxies_rigid["opacities_p"])
+            colors_list.append(proxies_rigid["colors_p"])
+
+        if proxies_distant is not None:
+            means_list.append(proxies_distant["means_p"])
+            quats_list.append(proxies_distant["quats_p"])
+            scales_list.append(proxies_distant["scales_p"])
+            opacities_list.append(proxies_distant["opacities_p"])
+            colors_list.append(proxies_distant["colors_p"])
+
+        return (
+            torch.cat(means_list, dim=0),
+            torch.cat(quats_list, dim=0),
+            torch.cat(scales_list, dim=0),
+            torch.cat(opacities_list, dim=0),
+            torch.cat(colors_list, dim=0),
+        )
+
     def compute_loss(self, pred_rgb: torch.Tensor, gt_image: torch.Tensor) -> torch.Tensor:
         """
         计算 L2 损失（均方误差）。
@@ -2187,6 +2521,7 @@ class StreetForwardTrainer(nn.Module):
                 - "total_loss": 总损失值（标量）
                 - "node_state": 更新后的 NodeStateBackground
                 - "node_state_rigid": 更新后的 NodeStateRigid（如果存在）
+                - "node_state_distant": 更新后的 NodeStateDistant（如果存在）
                 - "outputs": 输出列表（如果 log_images=True，包含渲染图像）
                 - "test_metrics": 测试指标（如果进行了评估）
         
@@ -2209,7 +2544,7 @@ class StreetForwardTrainer(nn.Module):
            h. 更新双 NodeState（如果 update_state=True）
         4. 保存 NodeState 并返回结果
         """
-        key, node_state_bg, node_state_rigid = self._get_or_init_node_states(batch)
+        key, node_state_bg, node_state_rigid, node_state_distant = self._get_or_init_node_states(batch)
         targets = []
         if "targets" in batch:
             for target in batch["targets"]:
@@ -2238,6 +2573,7 @@ class StreetForwardTrainer(nn.Module):
                 "total_loss": torch.tensor(0.0, device=self.device),
                 "node_state": node_state_bg,
                 "node_state_rigid": node_state_rigid,
+                "node_state_distant": node_state_distant,
                 "outputs": [],
             }
         
@@ -2271,7 +2607,7 @@ class StreetForwardTrainer(nn.Module):
                     "Please ensure the batch contains source_frame_idx."
                 )
             source_frame_idx = int(source_frame_idx)
-            feat_bg, feat_rigid, rigid_visible_mask = self._build_3d_feature_volume(
+            feat_bg, feat_rigid, rigid_visible_mask, rigid_in_crop_mask = self._build_3d_feature_volume(
                 node_state_bg=node_state_bg,
                 node_state_rigid=node_state_rigid,
                 source_frame_idx=source_frame_idx,
@@ -2295,22 +2631,22 @@ class StreetForwardTrainer(nn.Module):
 
             feat_bg_input = feat_bg
             feat_rigid_input = feat_rigid
+            feat_distant_input = None
             feat_2d_bg = None
             feat_2d_rigid = None
+            feat_2d_distant = None
             if self.use_2d_features:
-                feat_2d_bg, feat_2d_rigid = self._compute_2d_features(
+                feat_2d_bg, feat_2d_rigid, feat_2d_distant = self._compute_2d_features_all(
                     node_state_bg=node_state_bg,
                     node_state_rigid=node_state_rigid,
+                    node_state_distant=node_state_distant,
                     source_views=batch.get("source_views", []),
                     source_images=batch.get("src_images", []),
                     source_frame_idx=source_frame_idx,
                     rigid_visible_mask=rigid_visible_mask,
                 )
-                vis_bg = torch.ones(feat_bg.shape[0], device=self.device)
-                vis_rigid = (
-                    rigid_visible_mask.float() if rigid_visible_mask is not None else torch.ones(feat_rigid.shape[0], device=self.device)
-                )
-                if feat_2d_bg is not None and feat_2d_bg.shape[0] == feat_bg.shape[0]:
+                if feat_2d_bg is not None and feat_bg.shape[0] == feat_2d_bg.shape[0]:
+                    vis_bg = torch.ones(feat_bg.shape[0], device=self.device)
                     feat_bg_input = self._fuse_features(feat_bg, feat_2d_bg, vis_bg)
                 if (
                     node_state_rigid is not None
@@ -2318,7 +2654,12 @@ class StreetForwardTrainer(nn.Module):
                     and feat_2d_rigid is not None
                     and feat_2d_rigid.shape[0] == feat_rigid.shape[0]
                 ):
+                    vis_rigid = rigid_visible_mask.float() if rigid_visible_mask is not None else torch.ones(feat_rigid.shape[0], device=self.device)
                     feat_rigid_input = self._fuse_features(feat_rigid, feat_2d_rigid, vis_rigid)
+                if node_state_distant is not None and feat_2d_distant is not None:
+                    zeros_3d = torch.zeros(feat_2d_distant.shape[0], self.feat_3d_dim, device=self.device)
+                    vis_distant = torch.ones(feat_2d_distant.shape[0], device=self.device)
+                    feat_distant_input = self._fuse_features(zeros_3d, feat_2d_distant, vis_distant)
             
             # #region agent log
             _debug_log(
@@ -2344,6 +2685,9 @@ class StreetForwardTrainer(nn.Module):
             if node_state_rigid is not None and feat_rigid_input.shape[0] > 0:
                 offsets_rigid_world = self._predict_offsets(feat_rigid_input)
                 offsets_rigid_world = self._mask_rigid_offsets(offsets_rigid_world, rigid_visible_mask)
+            offsets_distant = None
+            if node_state_distant is not None and feat_distant_input is not None and feat_distant_input.numel() > 0:
+                offsets_distant = self._predict_offsets(feat_distant_input)
             
             # #region agent log
             if torch.cuda.is_available():
@@ -2362,7 +2706,6 @@ class StreetForwardTrainer(nn.Module):
             # Store offsets for gradient checking (avoid accessing non-leaf tensor grads)
             self._last_offsets_bg = offsets_bg
             self._last_offsets_rigid = offsets_rigid_world
-
             render_params_bg = self._render_params_from_offsets(node_state_bg, offsets_bg)
             render_params_rigid = None
             if node_state_rigid is not None and offsets_rigid_world is not None:
@@ -2371,9 +2714,13 @@ class StreetForwardTrainer(nn.Module):
                     node_state_rigid, offsets_rigid_world, source_frame_idx
                 )
                 render_params_rigid = self._render_params_from_offsets(node_state_rigid, offsets_rigid_local)
+            render_params_distant = None
+            if offsets_distant is not None and node_state_distant is not None:
+                render_params_distant = self._render_params_from_offsets(node_state_distant, offsets_distant)
 
             proxies_bg = self._create_proxy_params(render_params_bg)
             proxies_rigid = self._create_proxy_params(render_params_rigid) if render_params_rigid is not None else None
+            proxies_distant = self._create_proxy_params(render_params_distant) if render_params_distant is not None else None
 
             # #region agent log
             _debug_log(
@@ -2436,17 +2783,14 @@ class StreetForwardTrainer(nn.Module):
                     means_rigid_world = torch.empty(0, 3, device=self.device)
                     quats_rigid_world = torch.empty(0, 4, device=self.device)
                     opacities_rigid = None
-                merged_means = torch.cat([proxies_bg["means_p"], means_rigid_world], dim=0)
-                merged_quats = torch.cat([proxies_bg["quats_p"], quats_rigid_world], dim=0)
-                if proxies_rigid is not None:
-                    merged_scales = torch.cat([proxies_bg["scales_p"], proxies_rigid["scales_p"]], dim=0)
-                    merged_opacities = torch.cat([proxies_bg["opacities_p"], opacities_rigid], dim=0)
-                    merged_colors = torch.cat([proxies_bg["colors_p"], proxies_rigid["colors_p"]], dim=0)
-                else:
-                    merged_scales = proxies_bg["scales_p"]
-                    merged_opacities = proxies_bg["opacities_p"]
-                    merged_colors = proxies_bg["colors_p"]
-
+                merged_means, merged_quats, merged_scales, merged_opacities, merged_colors = self._merge_all_params(
+                    proxies_bg=proxies_bg,
+                    proxies_rigid=proxies_rigid,
+                    proxies_distant=proxies_distant,
+                    means_rigid_world=means_rigid_world,
+                    quats_rigid_world=quats_rigid_world,
+                    opacities_rigid=opacities_rigid,
+                )
                 merged_params = {
                     "means_p": merged_means,
                     "scales_p": merged_scales,
@@ -2626,6 +2970,21 @@ class StreetForwardTrainer(nn.Module):
                     _grad_or_zero(proxies_rigid["opacities_p"], "rigid.opacities"),
                     _grad_or_zero(proxies_rigid["colors_p"], "rigid.colors"),
                 ]
+            if render_params_distant is not None and proxies_distant is not None:
+                render_tensors += [
+                    render_params_distant["means_r"],
+                    render_params_distant["scales_r"],
+                    render_params_distant["quats_r"],
+                    render_params_distant["opacities_r"],
+                    render_params_distant["colors_r"],
+                ]
+                grad_tensors += [
+                    _grad_or_zero(proxies_distant["means_p"], "distant.means"),
+                    _grad_or_zero(proxies_distant["scales_p"], "distant.scales"),
+                    _grad_or_zero(proxies_distant["quats_p"], "distant.quats"),
+                    _grad_or_zero(proxies_distant["opacities_p"], "distant.opacities"),
+                    _grad_or_zero(proxies_distant["colors_p"], "distant.colors"),
+                ]
 
             self._proxy_grad_warned = grad_warned
             self._last_proxy_grad_norms = grad_report
@@ -2644,6 +3003,13 @@ class StreetForwardTrainer(nn.Module):
                         render_params_grad_before[f"rigid.{key}"] = float(render_params_rigid[key].grad.norm().item())
                     else:
                         render_params_grad_before[f"rigid.{key}"] = 0.0
+                if render_params_distant is not None:
+                    if render_params_distant[key].is_leaf and render_params_distant[key].grad is not None:
+                        render_params_grad_before[f"distant.{key}"] = float(render_params_distant[key].grad.norm().item())
+                    else:
+                        render_params_grad_before[f"distant.{key}"] = 0.0
+                else:
+                    render_params_grad_before[f"distant.{key}"] = 0.0
             
             _debug_log(
                 "streetforward.py:train_iter",
@@ -2716,12 +3082,28 @@ class StreetForwardTrainer(nn.Module):
                         node_state_rigid.opacity_logit.copy_(render_params_rigid["opacity_logit_r"].detach())
                         node_state_rigid.sh_dc.copy_(render_params_rigid["sh_dc_r"].detach())
                         node_state_rigid.sh_rest.copy_(render_params_rigid["sh_rest_r"].detach())
+                    if node_state_distant is not None and render_params_distant is not None:
+                        means_distant = torch.clamp(
+                            render_params_distant["means_r"].detach(),
+                            min=self.input_aabb_min,
+                            max=self.input_aabb_max,
+                        )
+                        node_state_distant.means.copy_(means_distant)
+                        node_state_distant.scales_log.copy_(render_params_distant["scales_log_r"].detach())
+                        node_state_distant.quats.copy_(render_params_distant["quats_r"].detach())
+                        node_state_distant.opacity_logit.copy_(render_params_distant["opacity_logit_r"].detach())
+                        node_state_distant.sh_dc.copy_(render_params_distant["sh_dc_r"].detach())
+                        node_state_distant.sh_rest.copy_(render_params_distant["sh_rest_r"].detach())
 
         self.node_states[key] = node_state_bg.detach_clone()
         if node_state_rigid is not None:
             self.node_states_rigid[key] = node_state_rigid.detach_clone()
         else:
             self.node_states_rigid[key] = None
+        if node_state_distant is not None:
+            self.node_states_distant[key] = node_state_distant.detach_clone()
+        else:
+            self.node_states_distant[key] = None
         if apply_update:
             self.global_step += 1
             self._log_to_tensorboard(total_loss_val, outputs)
@@ -2742,6 +3124,7 @@ class StreetForwardTrainer(nn.Module):
             "total_loss": torch.tensor(total_loss_val, device=self.device),
             "node_state": self.node_states[key],
             "node_state_rigid": self.node_states_rigid.get(key),
+            "node_state_distant": self.node_states_distant.get(key),
             "outputs": outputs,
             "test_metrics": test_metrics,
         }
@@ -2945,6 +3328,11 @@ class StreetForwardTrainer(nn.Module):
             for (scene, segment), state in self.node_states_rigid.items()
             if state is not None
         }
+        distant_state_dict = {
+            f"scene_{scene}_segment_{segment}": self._node_state_to_dict(state)
+            for (scene, segment), state in self.node_states_distant.items()
+            if state is not None
+        }
 
         checkpoint = {
             "step": step_val,
@@ -2953,6 +3341,7 @@ class StreetForwardTrainer(nn.Module):
             "optimizer_state_dict": self.optimizer.state_dict(),
             "node_states": nodes_state_dict,
             "node_states_rigid": rigid_state_dict,
+            "node_states_distant": distant_state_dict,
         }
         try:
             checkpoint["config"] = OmegaConf.to_container(self.config, resolve=False)
@@ -3032,6 +3421,25 @@ class StreetForwardTrainer(nn.Module):
                 restored_rigid[(scene_id, segment_id)] = self._node_state_rigid_from_dict(state)
             if restored_rigid:
                 self.node_states_rigid = restored_rigid
+
+        distant_state_dict = checkpoint.get("node_states_distant")
+        if distant_state_dict is not None:
+            restored_distant: Dict[Tuple[int, int], Optional[NodeStateDistant]] = {}
+            for key, state in distant_state_dict.items():
+                scene_id, segment_id = None, None
+                if isinstance(key, str) and key.startswith("scene_") and "_segment_" in key:
+                    try:
+                        scene_id = int(key.split("scene_")[1].split("_segment_")[0])
+                        segment_id = int(key.split("_segment_")[1])
+                    except Exception:
+                        scene_id, segment_id = None, None
+                elif isinstance(key, (tuple, list)) and len(key) == 2:
+                    scene_id, segment_id = int(key[0]), int(key[1])
+                if scene_id is None or segment_id is None:
+                    continue
+                restored_distant[(scene_id, segment_id)] = self._node_state_distant_from_dict(state)
+            if restored_distant:
+                self.node_states_distant = restored_distant
 
         self.global_step = int(checkpoint.get("global_step", checkpoint.get("step", 0)))
         logger.info(f"Checkpoint loaded from {checkpoint_path} (step={self.global_step})")

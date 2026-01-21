@@ -104,6 +104,7 @@ model:
   use_2d_features: true
   feat_2d_channels: 16
   feat_2d_downscale: 4
+  input_aabb: [[-20.0, -20.0, -20.0], [20.0, 4.8, 120.0]]
   bbx_min: [-20.0, -20.0, -20.0]  # 应该与 crop_aabb[0] 一致
   bbx_max: [20.0, 4.8, 70.0]  # 应该与 crop_aabb[1] 一致
 
