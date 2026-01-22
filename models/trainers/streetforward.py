@@ -1075,20 +1075,6 @@ class StreetForwardTrainer(nn.Module):
         self.node_states_distant[key] = node_state_distant
         return key, node_state_bg, node_state_rigid, node_state_distant
 
-    def _get_or_init_node_state(self, batch: Dict) -> Tuple[Tuple[int, int], NodeState]:
-        """
-        获取或初始化单个 NodeState（仅静态背景，兼容旧代码）。
-        
-        Args:
-            batch: 批次数据字典
-            
-        Returns:
-            (key, node_state_bg) 元组
-        
-        这是 _get_or_init_node_states 的简化版本，只返回静态背景。
-        """
-        key, node_state_bg, _, _ = self._get_or_init_node_states(batch)
-        return key, node_state_bg
 
     def _node_state_to_dict(self, node_state: NodeState) -> Dict[str, torch.Tensor]:
         """
@@ -1198,7 +1184,6 @@ class StreetForwardTrainer(nn.Module):
             frame_ids=list(state_dict.get("frame_ids", [])),
             cur_frame=int(state_dict.get("cur_frame", 0)),
         ).detach_clone()
-
 
     def _extend_rigid_frames(self, node_state_rigid: NodeStateRigid, dynamic_info: Dict) -> NodeStateRigid:
         """
@@ -2707,6 +2692,23 @@ class StreetForwardTrainer(nn.Module):
             self._last_offsets_bg = offsets_bg
             self._last_offsets_rigid = offsets_rigid_world
             render_params_bg = self._render_params_from_offsets(node_state_bg, offsets_bg)
+            
+            # #region agent log
+            _debug_log(
+                "streetforward.py:train_iter",
+                "After _render_params_from_offsets for bg",
+                {
+                    "inner_iter": inner_iter_idx,
+                    "offsets_bg_offset_pos_requires_grad": bool(offsets_bg["offset_pos"].requires_grad),
+                    "offsets_bg_offset_pos_grad_fn": str(offsets_bg["offset_pos"].grad_fn)[:60] if offsets_bg["offset_pos"].grad_fn else "None",
+                    "render_params_bg_means_r_requires_grad": bool(render_params_bg["means_r"].requires_grad),
+                    "render_params_bg_means_r_grad_fn": str(render_params_bg["means_r"].grad_fn)[:60] if render_params_bg["means_r"].grad_fn else "None",
+                    "render_params_bg_scales_r_requires_grad": bool(render_params_bg["scales_r"].requires_grad),
+                    "render_params_bg_colors_r_requires_grad": bool(render_params_bg["colors_r"].requires_grad),
+                },
+                hypothesis_id="H6",
+            )
+            # #endregion
             render_params_rigid = None
             if node_state_rigid is not None and offsets_rigid_world is not None:
                 # 将世界坐标的偏移量变换到局部坐标
@@ -3011,6 +3013,16 @@ class StreetForwardTrainer(nn.Module):
                 else:
                     render_params_grad_before[f"distant.{key}"] = 0.0
             
+            # Check render_tensors requires_grad status
+            render_tensors_requires_grad = {}
+            render_tensors_grad_fn = {}
+            for i, (name, t) in enumerate(zip(
+                ["bg.means_r", "bg.scales_r", "bg.quats_r", "bg.opacities_r", "bg.colors_r"],
+                render_tensors[:5]
+            )):
+                render_tensors_requires_grad[name] = bool(t.requires_grad)
+                render_tensors_grad_fn[name] = str(t.grad_fn)[:50] if t.grad_fn else "None"
+            
             _debug_log(
                 "streetforward.py:train_iter",
                 "Before autograd.backward",
@@ -3018,6 +3030,15 @@ class StreetForwardTrainer(nn.Module):
                     "inner_iter": inner_iter_idx,
                     "proxy_grad_norms": grad_report,
                     "render_params_grad_before": render_params_grad_before,
+                    "render_tensors_requires_grad": render_tensors_requires_grad,
+                    "render_tensors_grad_fn": render_tensors_grad_fn,
+                    "grad_tensors_norms": {
+                        "bg.means": float(grad_tensors[0].norm().item()) if grad_tensors[0] is not None else 0.0,
+                        "bg.scales": float(grad_tensors[1].norm().item()) if grad_tensors[1] is not None else 0.0,
+                        "bg.quats": float(grad_tensors[2].norm().item()) if grad_tensors[2] is not None else 0.0,
+                        "bg.opacities": float(grad_tensors[3].norm().item()) if grad_tensors[3] is not None else 0.0,
+                        "bg.colors": float(grad_tensors[4].norm().item()) if grad_tensors[4] is not None else 0.0,
+                    },
                 },
                 hypothesis_id="H3",
             )
@@ -3046,6 +3067,17 @@ class StreetForwardTrainer(nn.Module):
                     else:
                         offset_grads[f"rigid.{key}"] = 0.0
             
+            # Check MLP parameter gradients
+            mlp_param_grads = {}
+            for name, param in self.named_parameters():
+                if param.grad is not None:
+                    mlp_param_grads[name] = float(param.grad.norm().item())
+                else:
+                    mlp_param_grads[name] = 0.0
+            # Only log a few key MLP parameters to avoid log bloat
+            key_params = ["mlp_offset_pos.0.weight", "mlp_conv.0.weight", "gaussion_decoder.0.weight"]
+            key_mlp_grads = {k: mlp_param_grads.get(k, 0.0) for k in key_params}
+            
             _debug_log(
                 "streetforward.py:train_iter",
                 "After autograd.backward",
@@ -3053,6 +3085,8 @@ class StreetForwardTrainer(nn.Module):
                     "inner_iter": inner_iter_idx,
                     "offset_grads": offset_grads,
                     "grad_propagated": {k: offset_grads[k] > 0 for k in offset_grads},
+                    "key_mlp_param_grads": key_mlp_grads,
+                    "any_mlp_grad": any(v > 0 for v in mlp_param_grads.values()),
                 },
                 hypothesis_id="H3",
             )
