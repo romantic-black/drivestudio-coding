@@ -333,8 +333,14 @@ class LiDARRGBPointCloudGenerator(RGBPointCloudGenerator):
                 continue
 
             sampled_colors = image_np[v[sample_idx], u[sample_idx]]
+            # 修复：更准确地判断颜色范围，避免重复乘以255
+            # 如果最大值 <= 1.0 + 1e-3，说明是 [0, 1] 范围，需要乘以 255
+            # 但如果最大值 > 1.0 + 1e-3，说明已经是 [0, 255] 范围，不需要乘以 255
             if sampled_colors.max() <= 1.0 + 1e-3:
                 sampled_colors = sampled_colors * 255.0
+            else:
+                # 确保颜色值在 [0, 255] 范围内（防止超出范围的值）
+                sampled_colors = np.clip(sampled_colors, 0.0, 255.0)
             colors[sample_idx] = sampled_colors.astype(np.float32)
             colored_mask[sample_idx] = True
 

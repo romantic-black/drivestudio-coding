@@ -327,19 +327,31 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
                 if len(points) > 1000:  # 只对较大的点云下采样
                     pcd = o3d.geometry.PointCloud()
                     pcd.points = o3d.utility.Vector3dVector(points[:, :3])
-                    colors_normalized = (
-                        points[:, 3:] / 255.0
-                        if points[:, 3:].max() > 1.0 + 1e-3
-                        else points[:, 3:]
-                    )
+                    # 修复：更准确地判断颜色范围，避免错误的归一化/反归一化
+                    # 如果最大值 > 1.0 + 1e-3，说明是 [0, 255] 范围，需要归一化到 [0, 1] 供 Open3D 使用
+                    # 如果最大值 <= 1.0 + 1e-3，说明已经是 [0, 1] 范围，不需要归一化
+                    points_colors = points[:, 3:]
+                    if points_colors.max() > 1.0 + 1e-3:
+                        # 已经是 [0, 255] 范围，归一化到 [0, 1]
+                        colors_normalized = points_colors / 255.0
+                    else:
+                        # 已经是 [0, 1] 范围，不需要归一化
+                        colors_normalized = points_colors
                     pcd.colors = o3d.utility.Vector3dVector(colors_normalized)
                     # 下采样到原来的50%
                     every_k = max(1, len(points) // (len(points) // 2))
                     pcd = pcd.uniform_down_sample(every_k_points=every_k)
                     filtered_points = np.asarray(pcd.points).astype(np.float32)
                     filtered_colors = np.asarray(pcd.colors).astype(np.float32)
+                    # 修复：确保颜色值转换回 [0, 255] 范围
+                    # Open3D 返回的颜色值应该在 [0, 1] 范围内
+                    # 如果最大值 <= 1.0 + 1e-3，说明是 [0, 1] 范围，需要乘以 255 转换到 [0, 255]
+                    # 如果最大值 > 1.0 + 1e-3，说明已经是 [0, 255] 范围（不应该发生，但为了安全起见处理）
                     if filtered_colors.max() <= 1.0 + 1e-3:
                         filtered_colors = filtered_colors * 255.0
+                    else:
+                        # 如果已经是 [0, 255] 范围，确保值在有效范围内
+                        filtered_colors = np.clip(filtered_colors, 0.0, 255.0)
                     result[intid] = np.concatenate([filtered_points, filtered_colors], axis=1)
 
         return result
@@ -410,8 +422,15 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
 
             filtered_points = np.asarray(pcd.points).astype(np.float32)
             filtered_colors = np.asarray(pcd.colors).astype(np.float32)
+            # 修复：确保颜色值转换回 [0, 255] 范围
+            # Open3D 返回的颜色值应该在 [0, 1] 范围内
+            # 如果最大值 <= 1.0 + 1e-3，说明是 [0, 1] 范围，需要乘以 255 转换到 [0, 255]
+            # 如果最大值 > 1.0 + 1e-3，说明已经是 [0, 255] 范围（不应该发生，但为了安全起见处理）
             if filtered_colors.max() <= 1.0 + 1e-3:
                 filtered_colors = filtered_colors * 255.0
+            else:
+                # 如果已经是 [0, 255] 范围，确保值在有效范围内
+                filtered_colors = np.clip(filtered_colors, 0.0, 255.0)
 
             result = np.concatenate([filtered_points, filtered_colors], axis=1)
 
