@@ -1455,20 +1455,35 @@ class StreetForwardTrainer(nn.Module):
         means_rigid_world_all = torch.empty(0, 3, device=self.device)
         anchor_rgb_rigid_all = torch.empty(0, 3, device=self.device)
         if node_state_rigid is not None:
+            # 1. 变换到 source 帧的世界坐标（使用原始局部坐标）
             means_rigid_world_all = self._transform_rigid_to_world(node_state_rigid, node_state_rigid.means)
             anchor_rgb_rigid_all = _sh_to_rgb(node_state_rigid.sh_dc)
+            
+            # 2. 将 source 帧不可见点移到 input_aabb 边界外（在世界坐标）
+            if rigid_visible_mask is not None:
+                invisible_mask = ~rigid_visible_mask
+                if invisible_mask.any():
+                    # 将不可见点移到 input_aabb_max 之外（例如：+10 米）
+                    offset = torch.tensor([10.0, 10.0, 10.0], device=means_rigid_world_all.device)
+                    means_rigid_world_all[invisible_mask] = self.input_aabb_max + offset
+            
+            # 3. 检查是否在 crop_aabb (bbx) 内
             rigid_in_crop_mask = torch.all(
                 (means_rigid_world_all >= self.bbx_min) & (means_rigid_world_all <= self.bbx_max),
                 dim=-1,
             )
+        else:
+            rigid_in_crop_mask = None
 
+        # 4. 只将 source 帧可见且在 crop 内的点加入稀疏张量
         effective_mask = None
         if node_state_rigid is not None and means_rigid_world_all.numel() > 0:
-            effective_mask = rigid_in_crop_mask
+            if rigid_visible_mask is not None:
+                effective_mask = rigid_visible_mask & rigid_in_crop_mask
+            else:
+                effective_mask = rigid_in_crop_mask
             if effective_mask is None:
                 effective_mask = torch.ones(means_rigid_world_all.shape[0], dtype=torch.bool, device=self.device)
-            if rigid_visible_mask is not None:
-                effective_mask = effective_mask & rigid_visible_mask
 
         means_list = [means_bg]
         rgb_list = [anchor_rgb_bg]
@@ -1843,9 +1858,14 @@ class StreetForwardTrainer(nn.Module):
         )
         
         # Phase 1: Render RGB only (meta discarded immediately)
-        rendered_rgbs = self.alpha_t_extractor.render_rgb_only(
-            gaussians, source_views, height, width
-        )
+        # Important: rendered_batch should not have gradients to avoid:
+        # 1. Memory/computation graph explosion
+        # 2. Unwanted gradient paths from 2D CNN back to renderer/Gaussian state
+        # The 2D CNN is only a conditioning feature extractor, should not backprop to rendering
+        with torch.no_grad():
+            rendered_rgbs = self.alpha_t_extractor.render_rgb_only(
+                gaussians, source_views, height, width
+            )
 
         # Convert images to [V, H, W, 3] format if needed
         if image_batch.dim() == 4 and image_batch.shape[1] == 3:
@@ -1853,6 +1873,11 @@ class StreetForwardTrainer(nn.Module):
 
         rendered_batch = torch.stack(rendered_rgbs, dim=0)  # [V, H, W, 3]
         del rendered_rgbs
+        
+        # Ensure rendered_batch is detached (defensive check)
+        rendered_batch = rendered_batch.detach()
+        assert not rendered_batch.requires_grad, \
+            "rendered_batch should not require gradients - this would cause gradient graph explosion"
 
         if rendered_batch.shape[1:3] != image_batch.shape[1:3]:
             rendered_batch = F.interpolate(
@@ -1931,15 +1956,26 @@ class StreetForwardTrainer(nn.Module):
         if total_points == 0:
             return None, None, None
 
-        rendered_rgbs = self.alpha_t_extractor.render_rgb_only(
-            gaussians_all, source_views, height, width
-        )
+        # Phase 1: Render RGB only (meta discarded immediately)
+        # Important: rendered_batch should not have gradients to avoid:
+        # 1. Memory/computation graph explosion
+        # 2. Unwanted gradient paths from 2D CNN back to renderer/Gaussian state
+        # The 2D CNN is only a conditioning feature extractor, should not backprop to rendering
+        with torch.no_grad():
+            rendered_rgbs = self.alpha_t_extractor.render_rgb_only(
+                gaussians_all, source_views, height, width
+            )
 
         if image_batch.dim() == 4 and image_batch.shape[1] == 3:
             image_batch = image_batch.permute(0, 2, 3, 1)
 
         rendered_batch = torch.stack(rendered_rgbs, dim=0)
         del rendered_rgbs
+        
+        # Ensure rendered_batch is detached (defensive check)
+        rendered_batch = rendered_batch.detach()
+        assert not rendered_batch.requires_grad, \
+            "rendered_batch should not require gradients - this would cause gradient graph explosion"
 
         if rendered_batch.shape[1:3] != image_batch.shape[1:3]:
             rendered_batch = F.interpolate(
@@ -2772,8 +2808,30 @@ class StreetForwardTrainer(nn.Module):
                         hypothesis_id="H2",
                     )
                     # #endregion
+                    # 1. 变换到 target 帧的世界坐标
                     means_rigid_world = self._transform_rigid_to_world(node_state_rigid, proxies_rigid["means_p"])
                     quats_rigid_world = self._transform_rigid_quats_to_world(node_state_rigid, proxies_rigid["quats_p"])
+                    
+                    # 2. 计算 target 帧可见性
+                    target_visible_mask = None
+                    if resolved_frame_idx is not None:
+                        visibility = node_state_rigid.instances_fv[resolved_frame_idx]
+                        target_visible_mask = visibility[node_state_rigid.point_ids[..., 0]].bool()
+                        
+                        # 3. 将 target 帧不可见点移到 input_aabb 边界外（在世界坐标）
+                        if target_visible_mask is not None:
+                            invisible_mask = ~target_visible_mask
+                            if invisible_mask.any():
+                                # 将不可见点移到 input_aabb_max 之外（例如：+10 米）
+                                offset = torch.tensor([10.0, 10.0, 10.0], device=means_rigid_world.device)
+                                means_rigid_world[invisible_mask] = self.input_aabb_max + offset
+                        
+                        # 4. 应用可见性掩码到不透明度（双重保险）
+                        valid_mask = target_visible_mask.float()
+                        opacities_rigid = proxies_rigid["opacities_p"] * valid_mask
+                    else:
+                        opacities_rigid = proxies_rigid["opacities_p"]
+                    
                     # #region agent log
                     _debug_log(
                         "streetforward.py:train_iter",
@@ -2783,16 +2841,11 @@ class StreetForwardTrainer(nn.Module):
                             "means_rigid_world_requires_grad": means_rigid_world.requires_grad,
                             "means_rigid_world_grad_fn": str(means_rigid_world.grad_fn),
                             "quats_rigid_world_requires_grad": quats_rigid_world.requires_grad,
+                            "target_visible_mask_sum": int(target_visible_mask.sum().item()) if target_visible_mask is not None else None,
                         },
                         hypothesis_id="H2",
                     )
                     # #endregion
-                    if resolved_frame_idx is not None:
-                        visibility = node_state_rigid.instances_fv[resolved_frame_idx]
-                        valid_mask = visibility[node_state_rigid.point_ids[..., 0]].float()
-                        opacities_rigid = proxies_rigid["opacities_p"] * valid_mask
-                    else:
-                        opacities_rigid = proxies_rigid["opacities_p"]
                 else:
                     means_rigid_world = torch.empty(0, 3, device=self.device)
                     quats_rigid_world = torch.empty(0, 4, device=self.device)
