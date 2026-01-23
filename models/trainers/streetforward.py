@@ -1565,15 +1565,20 @@ class StreetForwardTrainer(nn.Module):
             )
         # #endregion
         
+        # 记录调用 sparse_to_dense_volume 前的内存状态作为基线
+        memory_before_dense = None
+        if torch.cuda.is_available():
+            memory_before_dense = torch.cuda.memory_allocated() / 1024**2
+        
         # #region agent log
         if torch.cuda.is_available():
             _debug_log(
                 "streetforward.py:_build_3d_feature_volume",
                 "Right before sparse_to_dense_volume (critical memory point)",
                 {
-                    "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
+                    "allocated_mb": memory_before_dense,
                     "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
-                    "free_mb": (torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_reserved() * 1024**2) / 1024**2,
+                    "free_mb": (torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_reserved()) / 1024**2,
                 },
                 hypothesis_id="H5",
             )
@@ -1608,17 +1613,19 @@ class StreetForwardTrainer(nn.Module):
             vol_dim_list = vol_dim.tolist() if isinstance(vol_dim, torch.Tensor) else vol_dim
             dense_volume_size = dense_volume.numel() * 4 / 1024**2
             expected_dense_size = vol_dim_list[0] * vol_dim_list[1] * vol_dim_list[2] * dense_volume.shape[-1] * 4 / 1024**2
+            memory_after_dense = torch.cuda.memory_allocated() / 1024**2
+            memory_increase_mb = memory_after_dense - memory_before_dense if memory_before_dense is not None else None
             _debug_log(
                 "streetforward.py:_build_3d_feature_volume",
                 "After sparse_to_dense_volume, before permute",
                 {
-                    "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
+                    "allocated_mb": memory_after_dense,
                     "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
                     "dense_volume_size_mb": dense_volume_size,
                     "dense_volume_shape": list(dense_volume.shape),
                     "expected_dense_size_mb": expected_dense_size,
                     "vol_dim": vol_dim_list,
-                    "memory_increase_mb": torch.cuda.memory_allocated() / 1024**2 - 11048.23,  # Compare with before sparse_conv
+                    "memory_increase_mb": memory_increase_mb,  # Compare with before sparse_to_dense_volume
                 },
                 hypothesis_id="H5",
             )
@@ -1762,6 +1769,8 @@ class StreetForwardTrainer(nn.Module):
         num_rigid = 0
         if node_state_rigid is not None and node_state_rigid.means.numel() > 0:
             node_state_rigid.cur_frame = source_frame_idx
+            # 解析帧索引以确保使用正确的帧位姿
+            resolved_frame_idx = self._resolve_rigid_frame_idx(node_state_rigid, source_frame_idx)
             means_rigid_world = self._transform_rigid_to_world(node_state_rigid, node_state_rigid.means)
             quats_rigid_world = self._transform_rigid_quats_to_world(node_state_rigid, node_state_rigid.quats)
             scales_rigid = torch.exp(node_state_rigid.scales_log)
@@ -3228,9 +3237,10 @@ class StreetForwardTrainer(nn.Module):
             如果没有测试视图，返回空字典
         """
         self.eval()
-        _, node_state = self._get_or_init_node_state(batch)
+        key, node_state_bg, node_state_rigid, node_state_distant = self._get_or_init_node_states(batch)
+        # 评估时只需要使用 node_state_bg，因为测试视图通常不包含动态物体
         metrics = self._evaluate_test_views(
-            node_state=node_state,
+            node_state=node_state_bg,
             test_views=batch.get("test_views", []),
             test_images=batch.get("test_images", []),
         )
