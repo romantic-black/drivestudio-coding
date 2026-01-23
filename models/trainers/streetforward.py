@@ -2034,16 +2034,18 @@ class StreetForwardTrainer(nn.Module):
             voxel_size: 体素大小（米）
             
         Returns:
-            归一化网格坐标，形状 [N, 3]，格式 [z_norm, y_norm, x_norm]，值域 [-1, 1]
+            归一化网格坐标，形状 [N, 3]，格式 [x_norm, y_norm, z_norm]，值域 [-1, 1]
         
         处理流程：
         1. 将坐标相对于边界框原点：pts = position_w - bbx_min
         2. 转换为体素索引（浮点数）：index = pts / voxel_size
         3. 归一化到 [-1, 1] 范围：norm = 2.0 * (index / (vol_dim - 1)) - 1.0
-        4. 堆叠为 [z_norm, y_norm, x_norm] 格式（grid_sample 要求）
+        4. 堆叠为 [x_norm, y_norm, z_norm] 格式（grid_sample 要求）
         
         注意：
-        - grid_sample 期望坐标顺序为 [z, y, x]，对应 [D, H, W] 维度
+        - grid_sample (5D) 期望坐标顺序为 [x, y, z]，对应 [W, H, D] 维度
+        - 由于 dense_volume 是 [1, C, Z, Y, X] = [B, C, D, H, W]，其中 D=Z, H=Y, W=X
+        - 因此 grid 坐标必须是 [x_norm, y_norm, z_norm] 对应 [W, H, D]
         - 使用 align_corners=True，所以 index 0 映射到 -1.0，index (N-1) 映射到 1.0
         """
         # Clamp positions to bbox range to match construct_sparse_tensor behavior
@@ -2069,15 +2071,15 @@ class StreetForwardTrainer(nn.Module):
         # vol_dim is [X, Y, Z] from construct_sparse_tensor (world coordinates)
         # sparse_to_dense_volume creates dense volume as [X, Y, Z, C]
         # After unsqueeze: [1, X, Y, Z, C]
-        # After permute(0, 4, 1, 2, 3): [1, C, X, Y, Z]
-        # But grid_sample expects [B, C, D, H, W] where D=Z, H=Y, W=X
-        # So we need permute(0, 4, 3, 2, 1) to get [1, C, Z, Y, X] = [1, C, D, H, W]
-        # For grid_sample [B, C, D, H, W], coordinates should be [z, y, x] where:
-        # - z corresponds to D (Z axis)
-        # - y corresponds to H (Y axis)
-        # - x corresponds to W (X axis)
-        # So we normalize: z_norm for Z, y_norm for Y, x_norm for X
-        # And stack as [z_norm, y_norm, x_norm]
+        # After permute(0, 4, 3, 2, 1): [1, C, Z, Y, X] = [1, C, D, H, W]
+        # where D=Z, H=Y, W=X
+        # 
+        # PyTorch grid_sample (5D) for input [B, C, D, H, W] expects grid coordinates
+        # in the format [x, y, z] corresponding to [W, H, D] dimensions.
+        # This is the standard convention: the last dimension of grid is [x, y, z]
+        # which maps to [width, height, depth] of the input volume.
+        #
+        # Therefore, we must return [x_norm, y_norm, z_norm] to match [W, H, D].
         # For align_corners=True: index 0 maps to -1.0, index (N-1) maps to 1.0
         # Therefore, we use (vol_dim - 1) as denominator to ensure correct boundary mapping
         den_x = torch.clamp(vol_dim[0] - 1.0, min=1.0)
@@ -2086,8 +2088,9 @@ class StreetForwardTrainer(nn.Module):
         x_norm = 2.0 * (x_index / den_x) - 1.0  # X -> W
         y_norm = 2.0 * (y_index / den_y) - 1.0  # Y -> H
         z_norm = 2.0 * (z_index / den_z) - 1.0  # Z -> D
-        # grid_sample (5D) expects coordinates in [z, y, x] order for [B, C, D, H, W] input
-        grid_coords = torch.stack([z_norm, y_norm, x_norm], dim=-1)
+        # grid_sample (5D) expects coordinates in [x, y, z] order for [B, C, D, H, W] input
+        # This corresponds to [W, H, D] = [X, Y, Z]
+        grid_coords = torch.stack([x_norm, y_norm, z_norm], dim=-1)
         
         return grid_coords
 
@@ -2096,8 +2099,8 @@ class StreetForwardTrainer(nn.Module):
         从 3D 特征体积中插值提取每个点的特征。
         
         Args:
-            grid_coords: 归一化网格坐标，形状 [N, 3]，格式 [z_norm, y_norm, x_norm]
-            feature_volume: 特征体积，形状 [1, C, D, H, W]（经过 permute 后）
+            grid_coords: 归一化网格坐标，形状 [N, 3]，格式 [x_norm, y_norm, z_norm]
+            feature_volume: 特征体积，形状 [1, C, D, H, W]（经过 permute 后，其中 D=Z, H=Y, W=X）
             
         Returns:
             每个点的特征，形状 [N, C]
