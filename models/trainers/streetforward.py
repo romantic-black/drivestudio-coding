@@ -1246,7 +1246,7 @@ class StreetForwardTrainer(nn.Module):
         node_state_rigid.frame_ids.extend(new_frame_ids)
         return node_state_rigid
 
-    def _resolve_rigid_frame_idx(self, node_state_rigid: NodeStateRigid, frame_idx: int) -> int:
+    def _resolve_rigid_frame_idx(self, node_state_rigid: NodeStateRigid, frame_idx: int) -> Optional[int]:
         """
         将 frame_idx（frame ID）解析为 frame_ids 列表中的索引。
         
@@ -1254,10 +1254,7 @@ class StreetForwardTrainer(nn.Module):
             frame_idx: 场景全局 frame ID（不是索引）
             
         Returns:
-            frame_ids 列表中的索引
-            
-        Raises:
-            ValueError: 如果 frame_idx 不在 frame_ids 列表中
+            frame_ids 列表中的索引，如果找不到则返回 None
         """
         if not node_state_rigid.frame_ids:
             # 如果没有 frame_ids，假设 frame_idx 就是索引
@@ -1267,14 +1264,59 @@ class StreetForwardTrainer(nn.Module):
         if frame_idx in node_state_rigid.frame_ids:
             return node_state_rigid.frame_ids.index(frame_idx)
         
-        # 如果找不到，抛出错误
-        raise ValueError(
-            f"Frame ID {frame_idx} not found in frame_ids {node_state_rigid.frame_ids}. "
-            f"Please ensure the frame_idx is a valid frame ID, not an index."
-        )
+        # 如果找不到，返回 None（而不是抛出错误）
+        return None
+
+    def _per_point_pose_valid(self, node_state_rigid: NodeStateRigid, frame_idx: int) -> torch.Tensor:
+        """
+        计算每个 rigid 点在该帧是否有有效的位姿。
+        
+        Args:
+            node_state_rigid: Rigid node state
+            frame_idx: 帧索引（场景全局 frame_idx）
+            
+        Returns:
+            [Nr] bool tensor，True 表示该点在该帧有有效位姿
+        """
+        resolved_frame_idx = self._resolve_rigid_frame_idx(node_state_rigid, frame_idx)
+        if resolved_frame_idx is None:
+            return torch.zeros(node_state_rigid.means.shape[0], dtype=torch.bool, device=self.device)
+        
+        # 获取该帧的实例可见性（作为 pose_valid 的代理）
+        visibility = node_state_rigid.instances_fv[resolved_frame_idx]  # [num_instances]
+        
+        # 扩展到每个点
+        point_ids = node_state_rigid.point_ids[..., 0]  # [Nr]
+        pose_valid = visibility[point_ids]  # [Nr]
+        
+        return pose_valid.bool()
+
+    def _visible_mask_from_instances_fv(self, node_state_rigid: NodeStateRigid, frame_idx: int) -> torch.Tensor:
+        """
+        使用 instances_fv 计算可见性 mask。
+        
+        Args:
+            node_state_rigid: Rigid node state
+            frame_idx: 帧索引（场景全局 frame_idx）
+            
+        Returns:
+            [Nr] bool tensor，True 表示该点在该帧可见
+        """
+        resolved_frame_idx = self._resolve_rigid_frame_idx(node_state_rigid, frame_idx)
+        if resolved_frame_idx is None:
+            return torch.zeros(node_state_rigid.means.shape[0], dtype=torch.bool, device=self.device)
+        
+        # 获取该帧的实例可见性
+        visibility = node_state_rigid.instances_fv[resolved_frame_idx]  # [num_instances]
+        
+        # 扩展到每个点
+        point_ids = node_state_rigid.point_ids[..., 0]  # [Nr]
+        visible = visibility[point_ids]  # [Nr]
+        
+        return visible.bool()
 
     def _transform_rigid_to_world(
-        self, node_state_rigid: NodeStateRigid, means_local: torch.Tensor
+        self, node_state_rigid: NodeStateRigid, means_local: torch.Tensor, point_indices: torch.Tensor = None
     ) -> torch.Tensor:
         """
         将动态物体的局部坐标位置变换到世界坐标。
@@ -1282,6 +1324,7 @@ class StreetForwardTrainer(nn.Module):
         Args:
             node_state_rigid: Rigid node state，包含实例位姿信息
             means_local: 局部坐标的位置，形状 [N_rigid, 3]（可微）
+            point_indices: 可选的索引，用于指定 means_local 对应的点索引。如果为 None，假设 means_local 对应所有点。
             
         Returns:
             世界坐标的位置，形状 [N_rigid, 3]（可微）
@@ -1292,43 +1335,29 @@ class StreetForwardTrainer(nn.Module):
         关键点：
         - 保持梯度连接，不使用 detach，让 PyTorch 自动处理梯度反向传播
         - 使用当前帧（cur_frame）的实例位姿进行变换
+        - 如果提供了 point_indices，使用对应的 point_ids 子集来索引旋转和平移
         """
-        # #region agent log
-        _debug_log(
-            "streetforward.py:_transform_rigid_to_world",
-            "Transforming rigid to world",
-            {
-                "num_points": means_local.shape[0],
-                "cur_frame": node_state_rigid.cur_frame,
-                "means_local_requires_grad": means_local.requires_grad,
-                "means_local_is_leaf": means_local.is_leaf,
-            },
-            hypothesis_id="H2",
-        )
-        # #endregion
         frame_idx = self._resolve_rigid_frame_idx(node_state_rigid, node_state_rigid.cur_frame)
+        if frame_idx is None:
+            # 如果没有有效的帧索引，返回零向量
+            return torch.zeros_like(means_local)
         quats_cur_frame = node_state_rigid.instances_quats[frame_idx]
         trans_cur_frame = node_state_rigid.instances_trans[frame_idx]
         rot_cur_frame = _quat_to_rotmat(quats_cur_frame)
-        rot_per_pts = rot_cur_frame[node_state_rigid.point_ids[..., 0]]
-        trans_per_pts = trans_cur_frame[node_state_rigid.point_ids[..., 0]]
+        
+        # 如果提供了 point_indices，使用对应的 point_ids 子集；否则使用完整的 point_ids
+        if point_indices is not None:
+            point_ids_subset = node_state_rigid.point_ids[point_indices, 0]  # [N_subset]
+        else:
+            point_ids_subset = node_state_rigid.point_ids[..., 0]  # [N_full]
+        
+        rot_per_pts = rot_cur_frame[point_ids_subset]
+        trans_per_pts = trans_cur_frame[point_ids_subset]
         means_world = torch.bmm(rot_per_pts, means_local.unsqueeze(-1)).squeeze(-1) + trans_per_pts
-        # #region agent log
-        _debug_log(
-            "streetforward.py:_transform_rigid_to_world",
-            "Transformation complete",
-            {
-                "means_world_requires_grad": means_world.requires_grad,
-                "means_world_is_leaf": means_world.is_leaf,
-                "grad_fn": str(means_world.grad_fn),
-            },
-            hypothesis_id="H2",
-        )
-        # #endregion
         return means_world
 
     def _transform_rigid_quats_to_world(
-        self, node_state_rigid: NodeStateRigid, quats_local: torch.Tensor
+        self, node_state_rigid: NodeStateRigid, quats_local: torch.Tensor, point_indices: torch.Tensor = None
     ) -> torch.Tensor:
         """
         将动态物体的局部坐标旋转变换到世界坐标。
@@ -1336,6 +1365,7 @@ class StreetForwardTrainer(nn.Module):
         Args:
             node_state_rigid: Rigid node state，包含实例旋转信息
             quats_local: 局部坐标的四元数，形状 [N_rigid, 4]（可微）
+            point_indices: 可选的索引，用于指定 quats_local 对应的点索引。如果为 None，假设 quats_local 对应所有点。
             
         Returns:
             世界坐标的四元数，形状 [N_rigid, 4]（可微）
@@ -1344,8 +1374,18 @@ class StreetForwardTrainer(nn.Module):
         使用四元数乘法组合实例旋转和局部旋转。
         """
         frame_idx = self._resolve_rigid_frame_idx(node_state_rigid, node_state_rigid.cur_frame)
+        if frame_idx is None:
+            # 如果没有有效的帧索引，返回单位四元数
+            return quats_local
         quats_cur_frame = node_state_rigid.instances_quats[frame_idx]
-        quats_per_pts = quats_cur_frame[node_state_rigid.point_ids[..., 0]]
+        
+        # 如果提供了 point_indices，使用对应的 point_ids 子集；否则使用完整的 point_ids
+        if point_indices is not None:
+            point_ids_subset = node_state_rigid.point_ids[point_indices, 0]  # [N_subset]
+        else:
+            point_ids_subset = node_state_rigid.point_ids[..., 0]  # [N_full]
+        
+        quats_per_pts = quats_cur_frame[point_ids_subset]
         return _normalize_quat(_quat_multiply(quats_per_pts, quats_local))
 
     def _transform_offsets_world_to_local(
@@ -1365,6 +1405,21 @@ class StreetForwardTrainer(nn.Module):
             局部坐标的偏移量字典
         """
         resolved_frame_idx = self._resolve_rigid_frame_idx(node_state_rigid, frame_idx)
+        if resolved_frame_idx is None:
+            # 没有对应的帧姿态时，返回全零/单位四元数，避免索引错误
+            zero_like_pos = torch.zeros_like(offsets_world["offset_pos"])
+            zero_like_scales = torch.zeros_like(offsets_world["offset_scales"])
+            zero_like_opacity = torch.zeros_like(offsets_world["offset_opacity"])
+            zero_like_sh = torch.zeros_like(offsets_world["offset_sh"])
+            identity_quat = torch.zeros_like(offsets_world["offset_quat"])
+            identity_quat[..., 0] = 1.0
+            return {
+                "offset_pos": zero_like_pos,
+                "offset_scales": zero_like_scales,
+                "offset_quat": identity_quat,
+                "offset_opacity": zero_like_opacity,
+                "offset_sh": zero_like_sh,
+            }
         
         # 获取当前帧的旋转矩阵
         quats_cur_frame = node_state_rigid.instances_quats[resolved_frame_idx]  # [num_instances, 4]
@@ -1399,6 +1454,8 @@ class StreetForwardTrainer(nn.Module):
         node_state_bg: NodeState,
         node_state_rigid: Optional[NodeStateRigid],
         source_frame_idx: int,
+        mask_src_rigid: Optional[torch.Tensor] = None,
+        idx_src_rigid: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         构建 3D 特征体积，为静态背景和动态物体提取特征。
@@ -1446,8 +1503,16 @@ class StreetForwardTrainer(nn.Module):
         if node_state_rigid is not None:
             node_state_rigid.cur_frame = source_frame_idx
             resolved_frame_idx = self._resolve_rigid_frame_idx(node_state_rigid, source_frame_idx)
-            visibility = node_state_rigid.instances_fv[resolved_frame_idx]
-            rigid_visible_mask = visibility[node_state_rigid.point_ids[..., 0]].bool()
+            if resolved_frame_idx is None:
+                # 帧索引无法解析时，保守返回全 False 的可见性，避免索引错误
+                rigid_visible_mask = torch.zeros(
+                    node_state_rigid.means.shape[0],
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+            else:
+                visibility = node_state_rigid.instances_fv[resolved_frame_idx]
+                rigid_visible_mask = visibility[node_state_rigid.point_ids[..., 0]].bool()
 
         means_bg = node_state_bg.means
         anchor_rgb_bg = _sh_to_rgb(node_state_bg.sh_dc)
@@ -1459,15 +1524,7 @@ class StreetForwardTrainer(nn.Module):
             means_rigid_world_all = self._transform_rigid_to_world(node_state_rigid, node_state_rigid.means)
             anchor_rgb_rigid_all = _sh_to_rgb(node_state_rigid.sh_dc)
             
-            # 2. 将 source 帧不可见点移到 input_aabb 边界外（在世界坐标）
-            if rigid_visible_mask is not None:
-                invisible_mask = ~rigid_visible_mask
-                if invisible_mask.any():
-                    # 将不可见点移到 input_aabb_max 之外（例如：+10 米）
-                    offset = torch.tensor([10.0, 10.0, 10.0], device=means_rigid_world_all.device)
-                    means_rigid_world_all[invisible_mask] = self.input_aabb_max + offset
-            
-            # 3. 检查是否在 crop_aabb (bbx) 内
+            # 2. 检查是否在 crop_aabb (bbx) 内
             rigid_in_crop_mask = torch.all(
                 (means_rigid_world_all >= self.bbx_min) & (means_rigid_world_all <= self.bbx_max),
                 dim=-1,
@@ -1475,21 +1532,22 @@ class StreetForwardTrainer(nn.Module):
         else:
             rigid_in_crop_mask = None
 
-        # 4. 只将 source 帧可见且在 crop 内的点加入稀疏张量
-        effective_mask = None
-        if node_state_rigid is not None and means_rigid_world_all.numel() > 0:
-            if rigid_visible_mask is not None:
-                effective_mask = rigid_visible_mask & rigid_in_crop_mask
-            else:
-                effective_mask = rigid_in_crop_mask
-            if effective_mask is None:
-                effective_mask = torch.ones(means_rigid_world_all.shape[0], dtype=torch.bool, device=self.device)
-
+        # 3. 只将 source 帧可见且在 crop 内的点加入稀疏张量（使用 mask_src_rigid）
         means_list = [means_bg]
         rgb_list = [anchor_rgb_bg]
-        if node_state_rigid is not None and means_rigid_world_all.numel() > 0 and effective_mask is not None and effective_mask.any():
-            means_list.append(means_rigid_world_all[effective_mask])
-            rgb_list.append(anchor_rgb_rigid_all[effective_mask])
+        if node_state_rigid is not None and means_rigid_world_all.numel() > 0:
+            if mask_src_rigid is not None and idx_src_rigid is not None and len(idx_src_rigid) > 0:
+                # 使用 mask_src_rigid 和 idx_src_rigid 过滤
+                effective_mask = mask_src_rigid & rigid_in_crop_mask
+                if effective_mask.any():
+                    means_list.append(means_rigid_world_all[effective_mask])
+                    rgb_list.append(anchor_rgb_rigid_all[effective_mask])
+            elif rigid_visible_mask is not None:
+                # 回退到旧的逻辑（兼容性）
+                effective_mask = rigid_visible_mask & rigid_in_crop_mask
+                if effective_mask.any():
+                    means_list.append(means_rigid_world_all[effective_mask])
+                    rgb_list.append(anchor_rgb_rigid_all[effective_mask])
 
         means_all = torch.cat(means_list, dim=0)
         anchor_rgb_all = torch.cat(rgb_list, dim=0)
@@ -2640,10 +2698,52 @@ class StreetForwardTrainer(nn.Module):
                     "Please ensure the batch contains source_frame_idx."
                 )
             source_frame_idx = int(source_frame_idx)
+            
+            # ===== 新增：预计算 rigid 可见性 mask（方案 1：最小改动） =====
+            mask_src_rigid = None
+            mask_tgt_rigid = []
+            mask_any_tgt_rigid = None
+            mask_update_rigid = None
+            idx_tgt_rigid = []
+            idx_src_rigid = None
+            
+            if node_state_rigid is not None:
+                with torch.no_grad():
+                    # Nr = rigid 点数（local coords）
+                    Nr = node_state_rigid.means.shape[0]
+                    
+                    # 1) pose_valid：按 instance 粒度 -> per-point mask
+                    pose_valid_src = self._per_point_pose_valid(node_state_rigid, source_frame_idx)  # [Nr] bool
+                    pose_valid_tgt = []  # list of [Nr] bool
+                    
+                    for tgt in targets:
+                        pose_valid_tgt.append(self._per_point_pose_valid(node_state_rigid, tgt["frame_idx"]))
+                    
+                    # 2) visible：使用 instances_fv
+                    visible_src = self._visible_mask_from_instances_fv(node_state_rigid, source_frame_idx)  # [Nr] bool
+                    
+                    visible_tgt = []
+                    for tgt in targets:
+                        visible_tgt.append(self._visible_mask_from_instances_fv(node_state_rigid, tgt["frame_idx"]))
+                    
+                    # 3) 组合 mask
+                    mask_src_rigid = pose_valid_src & visible_src  # [Nr]
+                    mask_tgt_rigid = [pv & vis for pv, vis in zip(pose_valid_tgt, visible_tgt)]  # list([Nr])
+                    mask_any_tgt_rigid = torch.zeros_like(mask_src_rigid)
+                    for m in mask_tgt_rigid:
+                        mask_any_tgt_rigid |= m
+                    
+                    mask_update_rigid = mask_src_rigid & mask_any_tgt_rigid  # [Nr]
+                    idx_tgt_rigid = [torch.nonzero(m, as_tuple=False).squeeze(1) for m in mask_tgt_rigid]  # list([Nt])
+                    idx_src_rigid = torch.nonzero(mask_src_rigid, as_tuple=False).squeeze(1)  # [Ns]
+            # ===== 结束：mask 预计算 =====
+            
             feat_bg, feat_rigid, rigid_visible_mask, rigid_in_crop_mask = self._build_3d_feature_volume(
                 node_state_bg=node_state_bg,
                 node_state_rigid=node_state_rigid,
                 source_frame_idx=source_frame_idx,
+                mask_src_rigid=mask_src_rigid,  # 传递 mask
+                idx_src_rigid=idx_src_rigid,  # 传递索引
             )
             
             # #region agent log
@@ -2717,7 +2817,17 @@ class StreetForwardTrainer(nn.Module):
             offsets_rigid_world = None
             if node_state_rigid is not None and feat_rigid_input.shape[0] > 0:
                 offsets_rigid_world = self._predict_offsets(feat_rigid_input)
-                offsets_rigid_world = self._mask_rigid_offsets(offsets_rigid_world, rigid_visible_mask)
+                # 使用 mask_update_rigid 进行 gate（方案 1：最小改动）
+                if mask_update_rigid is not None:
+                    gate = mask_update_rigid.to(offsets_rigid_world["offset_pos"].dtype).unsqueeze(-1).detach()  # [Nr,1]
+                    offsets_rigid_world["offset_pos"] = offsets_rigid_world["offset_pos"] * gate
+                    offsets_rigid_world["offset_scales"] = offsets_rigid_world["offset_scales"] * gate
+                    offsets_rigid_world["offset_quat"] = offsets_rigid_world["offset_quat"] * gate  # [Nr,4]
+                    offsets_rigid_world["offset_opacity"] = offsets_rigid_world["offset_opacity"] * gate
+                    offsets_rigid_world["offset_sh"] = offsets_rigid_world["offset_sh"] * gate  # [Nr, C]
+                else:
+                    # 回退到旧的逻辑（兼容性）
+                    offsets_rigid_world = self._mask_rigid_offsets(offsets_rigid_world, rigid_visible_mask)
             offsets_distant = None
             if node_state_distant is not None and feat_distant_input is not None and feat_distant_input.numel() > 0:
                 offsets_distant = self._predict_offsets(feat_distant_input)
@@ -2739,6 +2849,22 @@ class StreetForwardTrainer(nn.Module):
             # Store offsets for gradient checking (avoid accessing non-leaf tensor grads)
             self._last_offsets_bg = offsets_bg
             self._last_offsets_rigid = offsets_rigid_world
+            
+            # ===== Sanity checks（方案 1：最小改动） =====
+            if mask_update_rigid is not None and offsets_rigid_world is not None:
+                # A) 没有监督的 rigid 点，offset 应该被 gate 成 0
+                offset_pos_gated = offsets_rigid_world["offset_pos"][~mask_update_rigid]
+                if offset_pos_gated.numel() > 0:
+                    max_gated = offset_pos_gated.abs().max().item()
+                    if max_gated > 1e-6:
+                        import warnings
+                        warnings.warn(
+                            f"[Sanity Check A] Offsets for points without supervision should be gated to 0, "
+                            f"but max abs value is {max_gated:.2e}. This may indicate a bug."
+                        )
+            
+            # ===== 结束：Sanity checks =====
+            
             render_params_bg = self._render_params_from_offsets(node_state_bg, offsets_bg)
             
             # #region agent log
@@ -2790,47 +2916,36 @@ class StreetForwardTrainer(nn.Module):
                 gt_img = target["gt_image"]
                 target_frame_idx = int(target.get("frame_idx", source_frame_idx))
                 height, width = gt_img.shape[0], gt_img.shape[1]
+                num_sh = _num_sh_bases(self.sh_degree)
                 resolved_frame_idx = None
                 if node_state_rigid is not None:
                     node_state_rigid.cur_frame = target_frame_idx
                     resolved_frame_idx = self._resolve_rigid_frame_idx(node_state_rigid, target_frame_idx)
                 if proxies_rigid is not None and node_state_rigid is not None:
-                    # #region agent log
-                    _debug_log(
-                        "streetforward.py:train_iter",
-                        f"Before rigid transform for view {view_idx}",
-                        {
-                            "view_idx": view_idx,
-                            "target_frame_idx": target_frame_idx,
-                            "proxies_rigid_means_requires_grad": proxies_rigid["means_p"].requires_grad,
-                            "proxies_rigid_means_grad": proxies_rigid["means_p"].grad is not None,
-                        },
-                        hypothesis_id="H2",
-                    )
-                    # #endregion
-                    # 1. 变换到 target 帧的世界坐标
-                    means_rigid_world = self._transform_rigid_to_world(node_state_rigid, proxies_rigid["means_p"])
-                    quats_rigid_world = self._transform_rigid_quats_to_world(node_state_rigid, proxies_rigid["quats_p"])
-                    
-                    # 2. 计算 target 帧可见性
-                    target_visible_mask = None
-                    if resolved_frame_idx is not None:
-                        visibility = node_state_rigid.instances_fv[resolved_frame_idx]
-                        target_visible_mask = visibility[node_state_rigid.point_ids[..., 0]].bool()
+                    # ===== 方案 1：使用 idx_tgt_rigid[k] 子集索引 =====
+                    if view_idx < len(idx_tgt_rigid) and len(idx_tgt_rigid[view_idx]) > 0:
+                        idx = idx_tgt_rigid[view_idx]  # [Nt]
                         
-                        # 3. 将 target 帧不可见点移到 input_aabb 边界外（在世界坐标）
-                        if target_visible_mask is not None:
-                            invisible_mask = ~target_visible_mask
-                            if invisible_mask.any():
-                                # 将不可见点移到 input_aabb_max 之外（例如：+10 米）
-                                offset = torch.tensor([10.0, 10.0, 10.0], device=means_rigid_world.device)
-                                means_rigid_world[invisible_mask] = self.input_aabb_max + offset
+                        # 1) 把 rigid proxies（local）先取子集再 transform 到 target world
+                        rigid_means_local_subset = proxies_rigid["means_p"][idx]  # [Nt, 3]
+                        rigid_quats_local_subset = proxies_rigid["quats_p"][idx]  # [Nt, 4]
+                        rigid_scales_subset = proxies_rigid["scales_p"][idx]  # [Nt, 3]
+                        rigid_opacity_subset = proxies_rigid["opacities_p"][idx]  # [Nt]
+                        rigid_sh_subset = proxies_rigid["colors_p"][idx]  # [Nt, num_sh, 3]
                         
-                        # 4. 应用可见性掩码到不透明度（双重保险）
-                        valid_mask = target_visible_mask.float()
-                        opacities_rigid = proxies_rigid["opacities_p"] * valid_mask
+                        # 2) Transform 到 target 帧的世界坐标
+                        # 传入 idx 作为 point_indices，因为 rigid_means_local_subset 是通过 idx 索引得到的子集
+                        means_rigid_world = self._transform_rigid_to_world(node_state_rigid, rigid_means_local_subset, point_indices=idx)
+                        quats_rigid_world = self._transform_rigid_quats_to_world(node_state_rigid, rigid_quats_local_subset, point_indices=idx)
+                        opacities_rigid = rigid_opacity_subset
                     else:
-                        opacities_rigid = proxies_rigid["opacities_p"]
+                        # 如果没有可见点，创建空 tensor
+                        means_rigid_world = torch.empty(0, 3, device=self.device)
+                        quats_rigid_world = torch.empty(0, 4, device=self.device)
+                        opacities_rigid = None
+                        rigid_scales_subset = torch.empty(0, 3, device=self.device)
+                        rigid_sh_subset = torch.empty(0, num_sh, 3, device=self.device)
+                    # ===== 结束：子集索引 =====
                     
                     # #region agent log
                     _debug_log(
@@ -2841,7 +2956,7 @@ class StreetForwardTrainer(nn.Module):
                             "means_rigid_world_requires_grad": means_rigid_world.requires_grad,
                             "means_rigid_world_grad_fn": str(means_rigid_world.grad_fn),
                             "quats_rigid_world_requires_grad": quats_rigid_world.requires_grad,
-                            "target_visible_mask_sum": int(target_visible_mask.sum().item()) if target_visible_mask is not None else None,
+                            "num_visible_rigid": len(idx_tgt_rigid[view_idx]) if view_idx < len(idx_tgt_rigid) else 0,
                         },
                         hypothesis_id="H2",
                     )
@@ -2850,14 +2965,58 @@ class StreetForwardTrainer(nn.Module):
                     means_rigid_world = torch.empty(0, 3, device=self.device)
                     quats_rigid_world = torch.empty(0, 4, device=self.device)
                     opacities_rigid = None
-                merged_means, merged_quats, merged_scales, merged_opacities, merged_colors = self._merge_all_params(
-                    proxies_bg=proxies_bg,
-                    proxies_rigid=proxies_rigid,
-                    proxies_distant=proxies_distant,
-                    means_rigid_world=means_rigid_world,
-                    quats_rigid_world=quats_rigid_world,
-                    opacities_rigid=opacities_rigid,
-                )
+                    rigid_scales_subset = torch.empty(0, 3, device=self.device)
+                    rigid_sh_subset = torch.empty(0, num_sh, 3, device=self.device)
+                
+                # 合并参数（使用子集）
+                if proxies_rigid is not None and node_state_rigid is not None:
+                    if len(means_rigid_world) > 0:
+                        # 有可见的 rigid 点，使用子集合并
+                        merged_means = torch.cat([
+                            proxies_bg["means_p"], 
+                            means_rigid_world, 
+                            proxies_distant["means_p"] if proxies_distant is not None and proxies_distant["means_p"].numel() > 0 else torch.empty(0, 3, device=self.device)
+                        ], dim=0)
+                        merged_quats = torch.cat([
+                            proxies_bg["quats_p"], 
+                            quats_rigid_world, 
+                            proxies_distant["quats_p"] if proxies_distant is not None and proxies_distant["quats_p"].numel() > 0 else torch.empty(0, 4, device=self.device)
+                        ], dim=0)
+                        merged_scales = torch.cat([
+                            proxies_bg["scales_p"], 
+                            rigid_scales_subset, 
+                            proxies_distant["scales_p"] if proxies_distant is not None and proxies_distant["scales_p"].numel() > 0 else torch.empty(0, 3, device=self.device)
+                        ], dim=0)
+                        merged_opacities = torch.cat([
+                            proxies_bg["opacities_p"], 
+                            opacities_rigid, 
+                            proxies_distant["opacities_p"] if proxies_distant is not None and proxies_distant["opacities_p"].numel() > 0 else torch.empty(0, device=self.device)
+                        ], dim=0)
+                        merged_colors = torch.cat([
+                            proxies_bg["colors_p"], 
+                            rigid_sh_subset, 
+                            proxies_distant["colors_p"] if proxies_distant is not None and proxies_distant["colors_p"].numel() > 0 else torch.empty(0, num_sh, 3, device=self.device)
+                        ], dim=0)
+                    else:
+                        # 没有可见的 rigid 点，使用 _merge_all_params（传入 None）
+                        merged_means, merged_quats, merged_scales, merged_opacities, merged_colors = self._merge_all_params(
+                            proxies_bg=proxies_bg,
+                            proxies_rigid=None,
+                            proxies_distant=proxies_distant,
+                            means_rigid_world=means_rigid_world,
+                            quats_rigid_world=quats_rigid_world,
+                            opacities_rigid=opacities_rigid,
+                        )
+                else:
+                    # 没有 rigid proxies，使用 _merge_all_params
+                    merged_means, merged_quats, merged_scales, merged_opacities, merged_colors = self._merge_all_params(
+                        proxies_bg=proxies_bg,
+                        proxies_rigid=proxies_rigid,
+                        proxies_distant=proxies_distant,
+                        means_rigid_world=means_rigid_world,
+                        quats_rigid_world=quats_rigid_world,
+                        opacities_rigid=opacities_rigid,
+                    )
                 merged_params = {
                     "means_p": merged_means,
                     "scales_p": merged_scales,
@@ -2931,6 +3090,32 @@ class StreetForwardTrainer(nn.Module):
                 # #endregion
                 
                 loss.backward()
+                
+                # ===== Sanity checks（方案 1：最小改动） =====
+                if mask_any_tgt_rigid is not None and proxies_rigid is not None:
+                    # B) 没参与任何 target 渲染的 rigid 点，proxy.grad 应该接近 0
+                    if proxies_rigid["means_p"].grad is not None:
+                        grad_means_not_rendered = proxies_rigid["means_p"].grad[~mask_any_tgt_rigid]
+                        if grad_means_not_rendered.numel() > 0:
+                            max_grad_not_rendered = grad_means_not_rendered.abs().max().item()
+                            if max_grad_not_rendered > 1e-6:
+                                import warnings
+                                warnings.warn(
+                                    f"[Sanity Check B] Gradients for points not rendered in any target should be 0, "
+                                    f"but max abs value is {max_grad_not_rendered:.2e}. This may indicate a bug."
+                                )
+                
+                # C) 每个 target 的 idx 数量合理（别全空/全满）
+                if view_idx < len(idx_tgt_rigid):
+                    num_visible = len(idx_tgt_rigid[view_idx])
+                    num_total = node_state_rigid.means.shape[0] if node_state_rigid is not None else 0
+                    if num_total > 0 and num_visible == 0:
+                        import warnings
+                        warnings.warn(
+                            f"[Sanity Check C] Target {view_idx} has no visible rigid points "
+                            f"({num_visible}/{num_total}). This may indicate a visibility issue."
+                        )
+                # ===== 结束：Sanity checks =====
                 
                 # #region agent log
                 # Check proxy gradients after backward (only log every 3 views to reduce overhead)

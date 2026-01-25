@@ -156,16 +156,16 @@ class RGBPointCloudGenerator(ABC):
         # Statistical outlier removal
         if use_bbx:
             # Inside points: stricter filtering
-            cl, ind = pcd.remove_statistical_outlier(nb_neighbors=35, std_ratio=1.5)
-            pcd = pcd.select_by_index(ind)
+            #cl, ind = pcd.remove_statistical_outlier(nb_neighbors=35, std_ratio=1.5)
+            #pcd = pcd.select_by_index(ind)
             # Uniform downsampling
             pcd = pcd.uniform_down_sample(every_k_points=2)
         else:
             # Outside points: looser filtering
-            cl, ind = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
-            pcd = pcd.select_by_index(ind)
+            #cl, ind = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+            #pcd = pcd.select_by_index(ind)
             # Uniform downsampling
-            pcd = pcd.uniform_down_sample(every_k_points=5)
+            pcd = pcd.uniform_down_sample(every_k_points=4)
 
         # Convert back to numpy arrays
         filtered_points = np.asarray(pcd.points).astype(np.float32)
