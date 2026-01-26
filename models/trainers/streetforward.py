@@ -908,7 +908,10 @@ class StreetForwardTrainer(nn.Module):
                 for instance_id, instance_pose in instances.items():
                     ins_id = int(instance_id)
                     if ins_id not in instance_id_map:
-                        continue
+                        raise ValueError(
+                            f"Instance ID {ins_id} from dynamic_info not found in pointcloud dynamic keys. "
+                            f"Available instance IDs: {sorted(instance_id_map.keys())}"
+                        )
                     ins_slot = instance_id_map[ins_id]
                     quat = torch.tensor(instance_pose["quat"], device=self.device)
                     trans = torch.tensor(instance_pose["trans"], device=self.device)
@@ -1232,7 +1235,10 @@ class StreetForwardTrainer(nn.Module):
                 for instance_id, instance_pose in instances.items():
                     ins_id = int(instance_id)
                     if ins_id not in instance_id_map:
-                        continue
+                        raise ValueError(
+                            f"Instance ID {ins_id} from dynamic_info not found in existing instance_ids. "
+                            f"Existing instance IDs: {sorted(instance_id_map.keys())}"
+                        )
                     ins_slot = instance_id_map[ins_id]
                     quat = torch.tensor(instance_pose["quat"], device=device)
                     trans = torch.tensor(instance_pose["trans"], device=device)

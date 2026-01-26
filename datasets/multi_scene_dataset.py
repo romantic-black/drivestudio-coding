@@ -29,6 +29,41 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _safe_json_serialize(obj):
+    """
+    Safely serialize an object to JSON, handling Mock objects and other non-serializable types.
+    
+    Args:
+        obj: Object to serialize
+        
+    Returns:
+        JSON-serializable representation of the object
+    """
+    import json
+    from unittest.mock import Mock
+    
+    if isinstance(obj, Mock):
+        return f"<Mock: {type(obj).__name__}>"
+    elif isinstance(obj, dict):
+        return {k: _safe_json_serialize(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [_safe_json_serialize(item) for item in obj]
+    elif isinstance(obj, (str, int, float, bool, type(None))):
+        return obj
+    elif isinstance(obj, torch.Tensor):
+        return f"<Tensor: shape={list(obj.shape)}, dtype={obj.dtype}>"
+    elif isinstance(obj, np.ndarray):
+        return f"<ndarray: shape={obj.shape}, dtype={obj.dtype}>"
+    else:
+        try:
+            # Try to serialize normally
+            json.dumps(obj)
+            return obj
+        except (TypeError, ValueError):
+            # If serialization fails, return string representation
+            return f"<{type(obj).__name__}: {str(obj)[:100]}>"
+
+
 class MultiSceneDataset:
     """
     Multi-scene dataset class for EVolSplat feed-forward 3DGS training.
@@ -83,7 +118,16 @@ class MultiSceneDataset:
         self.data_cfg = data_cfg
         self.train_scene_ids = train_scene_ids
         self.eval_scene_ids = eval_scene_ids
-        self.num_source_keyframes = num_source_keyframes
+        if num_source_keyframes != 1:
+            logger.warning(
+                "StreetForward requires a single source keyframe; overriding num_source_keyframes=%s to 1",
+                num_source_keyframes,
+            )
+        self.num_source_keyframes = 1
+        if num_target_keyframes < self.num_source_keyframes:
+            raise ValueError(
+                f"num_target_keyframes ({num_target_keyframes}) must be >= num_source_keyframes (1)"
+            )
         self.num_target_keyframes = num_target_keyframes
         self.segment_overlap_ratio = segment_overlap_ratio
         self.device = device
@@ -139,10 +183,18 @@ class MultiSceneDataset:
         self._lock = threading.RLock()
         
         # Initialize point cloud generator (if config exists)
-        self.pointcloud_generator = None
-        if pointcloud_config is not None:
-            self.pointcloud_generator = self._create_pointcloud_generator(
-                pointcloud_config, data_cfg, device
+        if pointcloud_config is None:
+            raise ValueError(
+                "pointcloud_config is required for MultiSceneDataset; "
+                "StreetForward training depends on point cloud initialization."
+            )
+        self.pointcloud_generator = self._create_pointcloud_generator(
+            pointcloud_config, data_cfg, device
+        )
+        if self.pointcloud_generator is None:
+            raise ValueError(
+                "Failed to create pointcloud generator from pointcloud_config; "
+                "please check the configuration."
             )
         
         # Track if initialized
@@ -1352,6 +1404,7 @@ class MultiSceneDataset:
         self,
         scene_dataset: DrivingDataset,
         frame_indices: List[int],
+        instance_mapping: Optional[Dict[int, int]] = None,
     ) -> Optional[Dict]:
         """
         从 scene_dataset 的 instances_pose 构建 dynamic_info。
@@ -1359,10 +1412,13 @@ class MultiSceneDataset:
         Args:
             scene_dataset: 场景数据集实例
             frame_indices: 需要构建 dynamic_info 的帧索引列表
+            instance_mapping: 可选的实例ID映射，格式为 {original_id: intid}，用于将原始的 instance_id 
+                            转换为点云中使用的 intid。如果提供，dynamic_info 中的 instance_id 将使用 intid。
             
         Returns:
             dynamic_info: Dict[int, Dict] 格式，{frame_idx: {"instances": {instance_id: {"quat": ..., "trans": ...}}}}
             如果 instances_pose 不存在，返回 None
+            注意：如果提供了 instance_mapping，返回的 instance_id 将是 intid（与点云中的 instance_id 一致）
         """
         pixel_source = scene_dataset.pixel_source
         if pixel_source is None or pixel_source.instances_pose is None:
@@ -1370,12 +1426,21 @@ class MultiSceneDataset:
         
         instances_pose = pixel_source.instances_pose  # [num_frames, num_instances, 4, 4]
         per_frame_mask = getattr(pixel_source, "per_frame_instance_mask", None)
+        instances_true_id = getattr(pixel_source, "instances_true_id", None)
+        
         if not isinstance(instances_pose, torch.Tensor):
             instances_pose = torch.as_tensor(instances_pose, device=self.device)
         if per_frame_mask is not None and not isinstance(per_frame_mask, torch.Tensor):
             per_frame_mask = torch.as_tensor(per_frame_mask, device=instances_pose.device)
         if per_frame_mask is not None:
             per_frame_mask = per_frame_mask.to(device=instances_pose.device, dtype=torch.bool)
+        if instances_true_id is not None and not isinstance(instances_true_id, torch.Tensor):
+            instances_true_id = torch.as_tensor(instances_true_id, device=self.device)
+        if instance_mapping is not None and instances_true_id is None:
+            raise ValueError(
+                "instance_mapping is provided but pixel_source.instances_true_id is missing; "
+                "cannot align dynamic instances without original IDs."
+            )
         
         # 检查 frame_indices 是否在有效范围内
         num_frames = instances_pose.shape[0]
@@ -1386,6 +1451,11 @@ class MultiSceneDataset:
         
         dynamic_info = {}
         num_instances = instances_pose.shape[1]
+        
+        # 如果没有提供 instance_mapping，尝试从 instances_true_id 构建
+        if instance_mapping is None and instances_true_id is not None:
+            instances_true_id_np = instances_true_id.cpu().numpy() if isinstance(instances_true_id, torch.Tensor) else instances_true_id
+            instance_mapping = {int(instances_true_id_np[i]): int(i) for i in range(num_instances)}
         
         for frame_idx in valid_frame_indices:
             frame_instances = {}
@@ -1443,7 +1513,29 @@ class MultiSceneDataset:
                 if isinstance(trans, torch.Tensor):
                     trans = trans.cpu().numpy().tolist()
                 
-                frame_instances[int(instance_id)] = {
+                # 确定要使用的 instance_id
+                # 点云中的 dynamic 字典的 key 是 instances_pose 的索引（intid）
+                # 所以 dynamic_info 中的 instance_id 也应该使用 instances_pose 的索引
+                # 如果提供了 instance_mapping，我们需要确保使用正确的 intid
+                if instance_mapping is not None and instances_true_id is not None:
+                    # 获取原始ID
+                    original_id = int(instances_true_id[instance_id].item() if isinstance(instances_true_id, torch.Tensor) else instances_true_id[instance_id])
+                    # 映射到 intid（点云中使用的 instance_id）
+                    # instance_mapping 格式: {original_id: intid}，其中 intid 是 instances_pose 的索引
+                    intid = instance_mapping.get(original_id)
+                    if intid is None:
+                        available_keys = sorted(instance_mapping.keys())
+                        raise ValueError(
+                            f"Instance mapping missing for original_id={original_id} (instance_index={instance_id}). "
+                            f"Available mapping keys: {available_keys}"
+                        )
+                    final_instance_id = int(intid)
+                else:
+                    # 如果没有映射，直接使用 instance_id（instances_pose 的索引）
+                    # 这与点云中的 dynamic 字典的 key 一致
+                    final_instance_id = int(instance_id)
+                
+                frame_instances[final_instance_id] = {
                     "quat": quat,
                     "trans": trans,
                 }
@@ -1574,6 +1666,12 @@ class MultiSceneDataset:
         # 6.5. Build dynamic_info (if pointcloud contains dynamic objects)
         dynamic_info = None
         if pointcloud is not None and isinstance(pointcloud, dict) and "dynamic" in pointcloud:
+            dynamic_pcd = pointcloud.get("dynamic")
+            if isinstance(dynamic_pcd, dict) and len(dynamic_pcd) > 0 and pointcloud.get("instance_mapping") is None:
+                raise ValueError(
+                    "Dynamic pointcloud provided but instance_mapping is missing; "
+                    "cannot build dynamic_info without mapping original IDs to pointcloud intids."
+                )
             # 收集所有相关的 frame_idx
             all_frame_indices = set(source_frame_indices + target_frame_indices)
             if include_test:
@@ -1581,9 +1679,12 @@ class MultiSceneDataset:
             
             # 从 pixel_source 获取动态物体信息
             if scene_dataset.pixel_source is not None and scene_dataset.pixel_source.instances_pose is not None:
+                # 获取点云的 instance_mapping（如果存在），用于确保 dynamic_info 中的 instance_id 与点云中的一致
+                instance_mapping = pointcloud.get("instance_mapping")
                 dynamic_info = self._build_dynamic_info(
                     scene_dataset=scene_dataset,
                     frame_indices=list(all_frame_indices),
+                    instance_mapping=instance_mapping,
                 )
 
         # 7. Load test views if requested and available
@@ -1622,8 +1723,11 @@ class MultiSceneDataset:
                         test_cam_idxs.append(cam_idx)
         
         # 8. Assemble batch
+        # Get actual scene folder path for debugging
+        scene_folder_name = f"{int(scene_id):03d}" if self.data_cfg.get("dataset") not in ["kitti", "nuplan"] else str(scene_id)
         batch = {
             'scene_id': torch.tensor([scene_id], dtype=torch.long),
+            'scene_folder_name': scene_folder_name,  # Actual folder name (e.g., "001", "007")
             'segment_id': segment_id,
             
             # Keyframe information for debugging/display

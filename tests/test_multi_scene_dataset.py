@@ -14,6 +14,16 @@ from datasets.driving_dataset import DrivingDataset
 class TestSceneSuitability:
     """Test scene suitability checking."""
     
+    @pytest.mark.no_pointcloud_patch
+    def test_pointcloud_config_required(self):
+        """Dataset should require a pointcloud generator configuration."""
+        with pytest.raises(ValueError, match="pointcloud_config"):
+            MultiSceneDataset(
+                data_cfg=OmegaConf.create({}),
+                train_scene_ids=[],
+                eval_scene_ids=[],
+            )
+
     def test_sufficient_keyframes(self):
         """Test scene with sufficient keyframes."""
         keyframe_segments = [[0, 1], [2, 3], [4, 5], [6, 7], [8, 9], 
@@ -227,11 +237,11 @@ class TestKeyframeSelection:
         
         source_kf_indices, target_kf_indices = dataset._select_source_and_target_keyframes(
             segment=segment,
-            num_source_keyframes=3,
+            num_source_keyframes=dataset.num_source_keyframes,
             num_target_keyframes=6,
         )
         
-        assert len(source_kf_indices) == 3
+        assert len(source_kf_indices) == 1
         assert len(target_kf_indices) == 6
         # Target should include all source keyframes
         assert all(kf in target_kf_indices for kf in source_kf_indices)
@@ -252,12 +262,12 @@ class TestKeyframeSelection:
         
         source_kf_indices, target_kf_indices = dataset._select_source_and_target_keyframes(
             segment=segment,
-            num_source_keyframes=3,
+            num_source_keyframes=dataset.num_source_keyframes,
             num_target_keyframes=6,
         )
         
         # Should repeat keyframes to meet requirements
-        assert len(source_kf_indices) == 3
+        assert len(source_kf_indices) == 1
         assert len(target_kf_indices) == 6
 
 
@@ -1474,4 +1484,3 @@ class TestBackgroundPreloading:
         # Cleanup
         scheduler.shutdown()
         mock_driving_dataset_class.side_effect = original_load
-
