@@ -908,10 +908,8 @@ class StreetForwardTrainer(nn.Module):
                 for instance_id, instance_pose in instances.items():
                     ins_id = int(instance_id)
                     if ins_id not in instance_id_map:
-                        raise ValueError(
-                            f"Instance ID {ins_id} from dynamic_info not found in pointcloud dynamic keys. "
-                            f"Available instance IDs: {sorted(instance_id_map.keys())}"
-                        )
+                        # Skip unmatched dynamic instances to tolerate annotation/pointcloud drift
+                        continue
                     ins_slot = instance_id_map[ins_id]
                     quat = torch.tensor(instance_pose["quat"], device=self.device)
                     trans = torch.tensor(instance_pose["trans"], device=self.device)
@@ -1064,6 +1062,19 @@ class StreetForwardTrainer(nn.Module):
                 if not dynamic_info:
                     raise ValueError("dynamic_info is required when dynamic pointclouds are provided.")
                 frame_ids = sorted(int(fid) for fid in dynamic_info.keys())
+                # Filter dynamic_info to only instances present in pointcloud
+                filtered_dynamic_info = {}
+                for fid, finfo in dynamic_info.items():
+                    inst = finfo.get("instances", {})
+                    if not isinstance(inst, dict):
+                        continue
+                    filtered = {iid: pose for iid, pose in inst.items() if int(iid) in instance_id_map}
+                    if filtered:
+                        filtered_dynamic_info[int(fid)] = {"instances": filtered}
+                if not filtered_dynamic_info:
+                    dynamic_info = None
+                else:
+                    dynamic_info = filtered_dynamic_info
                 node_state_rigid = self._init_rigid_node_state_from_pcd(
                     points=dynamic_points,
                     colors=dynamic_colors,

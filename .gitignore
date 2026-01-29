@@ -5,6 +5,9 @@ __pycache__/
 smpl_models/
 *.zip
 *.html
+*.pt
+
+docs/trainers/golden/
 
 # self added
 data/waymo
