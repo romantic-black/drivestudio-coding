@@ -8,6 +8,12 @@ and other project deps. Use the project conda env (e.g. drivestudio-new) to run:
 Uses CUDA baseline by default when CUDA is available and the cuda baseline file exists.
 Batch cache is taken from baseline meta when present, or from STREETFORWARD_BATCH_CACHE.
 """
+from pathlib import Path
+import sys
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 import os
 from pathlib import Path
 

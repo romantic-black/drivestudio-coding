@@ -2810,7 +2810,18 @@ class StreetForwardTrainer(nn.Module):
                     zeros_3d = torch.zeros(feat_2d_distant.shape[0], self.feat_3d_dim, device=self.device)
                     vis_distant = torch.ones(feat_2d_distant.shape[0], device=self.device)
                     feat_distant_input = self._fuse_features(zeros_3d, feat_2d_distant, vis_distant)
-            
+
+            # Store feature tensors for baseline recording (value alignment)
+            self._last_feat_3d_bg = feat_bg
+            self._last_feat_3d_rigid = feat_rigid
+            self._last_feat_3d_distant = feat_distant_input[:, : self.feat_3d_dim].detach().clone() if feat_distant_input is not None and feat_distant_input.numel() > 0 else None
+            self._last_feat_2d_bg = feat_2d_bg
+            self._last_feat_2d_rigid = feat_2d_rigid
+            self._last_feat_2d_distant = feat_2d_distant
+            self._last_feat_bg_input = feat_bg_input
+            self._last_feat_rigid_input = feat_rigid_input
+            self._last_feat_distant_input = feat_distant_input
+
             # #region agent log
             _debug_log(
                 "streetforward.py:train_iter",
@@ -2866,7 +2877,8 @@ class StreetForwardTrainer(nn.Module):
             # Store offsets for gradient checking (avoid accessing non-leaf tensor grads)
             self._last_offsets_bg = offsets_bg
             self._last_offsets_rigid = offsets_rigid_world
-            
+            self._last_offsets_distant = offsets_distant
+
             # ===== Sanity checks（方案 1：最小改动） =====
             if mask_update_rigid is not None and offsets_rigid_world is not None:
                 # A) 没有监督的 rigid 点，offset 应该被 gate 成 0

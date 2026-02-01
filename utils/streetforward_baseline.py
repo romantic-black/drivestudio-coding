@@ -294,6 +294,13 @@ def _tensor_stats(t: torch.Tensor) -> Dict:
     }
 
 
+def feature_tensor_summary(t: Optional[torch.Tensor]) -> Optional[Dict]:
+    """Summary for 2D feature tensors [N, C] for baseline value alignment."""
+    if t is None or t.numel() == 0:
+        return None
+    return _tensor_stats(t)
+
+
 def node_state_background_summary(ns: Optional[Any]) -> Optional[Dict]:
     if ns is None:
         return None
@@ -387,6 +394,15 @@ class BaselineStep:
     offset_bg_summary: Optional[Dict]
     offset_rigid_summary: Optional[Dict]
     offset_distant_summary: Optional[Dict]
+    feat_3d_bg_summary: Optional[Dict]
+    feat_3d_rigid_summary: Optional[Dict]
+    feat_3d_distant_summary: Optional[Dict]
+    feat_2d_bg_summary: Optional[Dict]
+    feat_2d_rigid_summary: Optional[Dict]
+    feat_2d_distant_summary: Optional[Dict]
+    feat_bg_input_summary: Optional[Dict]
+    feat_rigid_input_summary: Optional[Dict]
+    feat_distant_input_summary: Optional[Dict]
     grad_norms: Dict[str, float]
 
     def to_dict(self) -> Dict:
@@ -405,6 +421,15 @@ class BaselineStep:
             "offset_bg_summary": self.offset_bg_summary,
             "offset_rigid_summary": self.offset_rigid_summary,
             "offset_distant_summary": self.offset_distant_summary,
+            "feat_3d_bg_summary": self.feat_3d_bg_summary,
+            "feat_3d_rigid_summary": self.feat_3d_rigid_summary,
+            "feat_3d_distant_summary": self.feat_3d_distant_summary,
+            "feat_2d_bg_summary": self.feat_2d_bg_summary,
+            "feat_2d_rigid_summary": self.feat_2d_rigid_summary,
+            "feat_2d_distant_summary": self.feat_2d_distant_summary,
+            "feat_bg_input_summary": self.feat_bg_input_summary,
+            "feat_rigid_input_summary": self.feat_rigid_input_summary,
+            "feat_distant_input_summary": self.feat_distant_input_summary,
             "grad_norms": self.grad_norms,
         }
 
@@ -425,6 +450,16 @@ def record_step(
     offsets_bg = getattr(trainer, "_last_offsets_bg", None)
     offsets_rigid = getattr(trainer, "_last_offsets_rigid", None)
     offsets_distant = getattr(trainer, "_last_offsets_distant", None)
+
+    feat_3d_bg = getattr(trainer, "_last_feat_3d_bg", None)
+    feat_3d_rigid = getattr(trainer, "_last_feat_3d_rigid", None)
+    feat_3d_distant = getattr(trainer, "_last_feat_3d_distant", None)
+    feat_2d_bg = getattr(trainer, "_last_feat_2d_bg", None)
+    feat_2d_rigid = getattr(trainer, "_last_feat_2d_rigid", None)
+    feat_2d_distant = getattr(trainer, "_last_feat_2d_distant", None)
+    feat_bg_input = getattr(trainer, "_last_feat_bg_input", None)
+    feat_rigid_input = getattr(trainer, "_last_feat_rigid_input", None)
+    feat_distant_input = getattr(trainer, "_last_feat_distant_input", None)
 
     total_loss = result.get("total_loss", torch.tensor(0.0))
     if isinstance(total_loss, torch.Tensor):
@@ -447,6 +482,15 @@ def record_step(
         offset_bg_summary=offsets_summary(offsets_bg),
         offset_rigid_summary=offsets_summary(offsets_rigid),
         offset_distant_summary=offsets_summary(offsets_distant),
+        feat_3d_bg_summary=feature_tensor_summary(feat_3d_bg),
+        feat_3d_rigid_summary=feature_tensor_summary(feat_3d_rigid),
+        feat_3d_distant_summary=feature_tensor_summary(feat_3d_distant),
+        feat_2d_bg_summary=feature_tensor_summary(feat_2d_bg),
+        feat_2d_rigid_summary=feature_tensor_summary(feat_2d_rigid),
+        feat_2d_distant_summary=feature_tensor_summary(feat_2d_distant),
+        feat_bg_input_summary=feature_tensor_summary(feat_bg_input),
+        feat_rigid_input_summary=feature_tensor_summary(feat_rigid_input),
+        feat_distant_input_summary=feature_tensor_summary(feat_distant_input),
         grad_norms=grad_norms_summary(trainer),
     )
 
@@ -539,6 +583,39 @@ def compare_step(
     ok, msg = _compare_summary(baseline_step.get("node_state_distant_summary"), current_step.get("node_state_distant_summary"), "distant", stat_rtol, stat_atol)
     if not ok:
         return ok, msg
+
+    # Value alignment for offset summaries (skip when baseline lacks key for backward compatibility)
+    for _offset_key, _name in (
+        ("offset_bg_summary", "offset_bg"),
+        ("offset_rigid_summary", "offset_rigid"),
+        ("offset_distant_summary", "offset_distant"),
+    ):
+        _base_off = baseline_step.get(_offset_key)
+        if _base_off is None:
+            continue
+        _cur_off = current_step.get(_offset_key)
+        if _cur_off is None:
+            return False, f"{_offset_key} missing in current step (baseline has it)"
+        ok, msg = _compare_summary(_base_off, _cur_off, _name, stat_rtol, stat_atol)
+        if not ok:
+            return ok, msg
+
+    # Value alignment for all feature summaries (skip when baseline lacks key for backward compatibility)
+    _FEAT_SUMMARY_KEYS = (
+        "feat_3d_bg_summary", "feat_3d_rigid_summary", "feat_3d_distant_summary",
+        "feat_2d_bg_summary", "feat_2d_rigid_summary", "feat_2d_distant_summary",
+        "feat_bg_input_summary", "feat_rigid_input_summary", "feat_distant_input_summary",
+    )
+    for key in _FEAT_SUMMARY_KEYS:
+        base_feat = baseline_step.get(key)
+        if base_feat is None:
+            continue
+        cur_feat = current_step.get(key)
+        if cur_feat is None:
+            return False, f"{key} missing in current step (baseline has it)"
+        ok, msg = _compare_summary(base_feat, cur_feat, key.replace("_summary", ""), stat_rtol, stat_atol)
+        if not ok:
+            return ok, msg
 
     for key, base_val in baseline_step.get("grad_norms", {}).items():
         cur_val = current_step.get("grad_norms", {}).get(key, 0.0)
