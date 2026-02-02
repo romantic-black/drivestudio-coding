@@ -5,7 +5,6 @@ import os
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -24,7 +23,8 @@ from models.streetforward.node_states import (
     NodeStateRigid,
     NodeStateDistant,
 )
-from models.streetforward.node_state_mixin import NodeStateMixin
+from models.streetforward import metrics
+from models.streetforward.node_state_mixin import NodeStateMixin, RigidMasks
 from models.streetforward.feature_volume_mixin import FeatureVolumeMixin
 from models.streetforward.offsets_mixin import OffsetsMixin
 from models.streetforward.proxy_rendering_mixin import ProxyRenderingMixin
@@ -236,8 +236,6 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
         self.node_states_rigid: Dict[Tuple[int, int], Optional[NodeStateRigid]] = {}
         self.node_states_distant: Dict[Tuple[int, int], Optional[NodeStateDistant]] = {}
         self._lpips_model = None
-        self._lpips_unavailable = False
-        self._ssim_unavailable = False
         
         # Initialize offset heads to output near-zero offsets
         self._init_offset_heads()
@@ -351,29 +349,8 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
         4. 保存 NodeState 并返回结果
         """
         key, node_state_bg, node_state_rigid, node_state_distant = self._get_or_init_node_states(batch)
-        targets = []
-        if "targets" in batch:
-            for target in batch["targets"]:
-                targets.append(
-                    {
-                        "frame_idx": target.get("frame_idx", batch.get("source_frame_idx", 0)),
-                        "view": target["view"],
-                        "gt_image": target["gt_image"],
-                    }
-                )
-        else:
-            target_views = batch.get("target_views", [])
-            gt_images = batch.get("gt_images", [])
-            for view, gt_img in zip(target_views, gt_images):
-                targets.append(
-                    {
-                        "frame_idx": batch.get("source_frame_idx", 0),
-                        "view": view,
-                        "gt_image": gt_img,
-                    }
-                )
+        targets = self._parse_targets(batch)
 
-        # Skip if no target views (no supervision)
         if len(targets) == 0:
             return {
                 "total_loss": torch.tensor(0.0, device=self.device),
@@ -382,15 +359,13 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
                 "node_state_distant": node_state_distant,
                 "outputs": [],
             }
-        
-        view_count = len(targets)
-        outputs = []
-        total_loss_val = 0.0  # Use scalar to avoid keeping computation graph
+
+        outputs: List[Dict] = []
+        total_loss_val = 0.0
         test_metrics = None
 
         self.optimizer.zero_grad(set_to_none=True)
 
-        # #region agent log
         if torch.cuda.is_available():
             _debug_log(
                 "streetforward.py:train_iter",
@@ -403,718 +378,36 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
                 },
                 hypothesis_id="H4",
             )
-        # #endregion
 
-        for inner_iter_idx in range(self.inner_iterations):
-            source_frame_idx = batch.get("source_frame_idx")
-            if source_frame_idx is None:
-                raise ValueError(
-                    "source_frame_idx is required but not found in batch. "
-                    "Please ensure the batch contains source_frame_idx."
-                )
-            source_frame_idx = int(source_frame_idx)
-            
-            # ===== 新增：预计算 rigid 可见性 mask（方案 1：最小改动） =====
-            mask_src_rigid = None
-            mask_tgt_rigid = []
-            mask_any_tgt_rigid = None
-            mask_update_rigid = None
-            idx_tgt_rigid = []
-            idx_src_rigid = None
-            
-            if node_state_rigid is not None:
-                with torch.no_grad():
-                    # Nr = rigid 点数（local coords）
-                    Nr = node_state_rigid.means.shape[0]
-                    
-                    # 1) pose_valid：按 instance 粒度 -> per-point mask
-                    pose_valid_src = self._per_point_pose_valid(node_state_rigid, source_frame_idx)  # [Nr] bool
-                    pose_valid_tgt = []  # list of [Nr] bool
-                    
-                    for tgt in targets:
-                        pose_valid_tgt.append(self._per_point_pose_valid(node_state_rigid, tgt["frame_idx"]))
-                    
-                    # 2) visible：使用 instances_fv
-                    visible_src = self._visible_mask_from_instances_fv(node_state_rigid, source_frame_idx)  # [Nr] bool
-                    
-                    visible_tgt = []
-                    for tgt in targets:
-                        visible_tgt.append(self._visible_mask_from_instances_fv(node_state_rigid, tgt["frame_idx"]))
-                    
-                    # 3) 组合 mask
-                    mask_src_rigid = pose_valid_src & visible_src  # [Nr]
-                    mask_tgt_rigid = [pv & vis for pv, vis in zip(pose_valid_tgt, visible_tgt)]  # list([Nr])
-                    mask_any_tgt_rigid = torch.zeros_like(mask_src_rigid)
-                    for m in mask_tgt_rigid:
-                        mask_any_tgt_rigid |= m
-                    
-                    mask_update_rigid = mask_src_rigid & mask_any_tgt_rigid  # [Nr]
-                    idx_tgt_rigid = [torch.nonzero(m, as_tuple=False).squeeze(1) for m in mask_tgt_rigid]  # list([Nt])
-                    idx_src_rigid = torch.nonzero(mask_src_rigid, as_tuple=False).squeeze(1)  # [Ns]
-            # ===== 结束：mask 预计算 =====
-            
-            feat_bg, feat_rigid, rigid_visible_mask, rigid_in_crop_mask = self._build_3d_feature_volume(
+        for _ in range(self.inner_iterations):
+            result = self._train_inner_iteration(
+                batch=batch,
+                targets=targets,
                 node_state_bg=node_state_bg,
                 node_state_rigid=node_state_rigid,
-                source_frame_idx=source_frame_idx,
-                mask_src_rigid=mask_src_rigid,  # 传递 mask
-                idx_src_rigid=idx_src_rigid,  # 传递索引
+                node_state_distant=node_state_distant,
             )
-            
-            # #region agent log
-            if torch.cuda.is_available():
-                _debug_log(
-                    "streetforward.py:train_iter",
-                    "After _build_3d_feature_volume, before _predict_offsets",
-                    {
-                        "inner_iter": inner_iter_idx,
-                        "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
-                        "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
-                        "feat_bg_size_mb": feat_bg.numel() * 4 / 1024**2,
-                        "feat_rigid_size_mb": feat_rigid.numel() * 4 / 1024**2 if feat_rigid.numel() > 0 else 0,
-                    },
-                    hypothesis_id="H5",
-                )
-            # #endregion
+            total_loss_val += result["loss_val"]
+            outputs.extend(result["outputs"])
 
-            feat_bg_input = feat_bg
-            feat_rigid_input = feat_rigid
-            feat_distant_input = None
-            feat_2d_bg = None
-            feat_2d_rigid = None
-            feat_2d_distant = None
-            if self.use_2d_features:
-                feat_2d_bg, feat_2d_rigid, feat_2d_distant = self._compute_2d_features_all(
-                    node_state_bg=node_state_bg,
-                    node_state_rigid=node_state_rigid,
-                    node_state_distant=node_state_distant,
-                    source_views=batch.get("source_views", []),
-                    source_images=batch.get("src_images", []),
-                    source_frame_idx=source_frame_idx,
-                    rigid_visible_mask=rigid_visible_mask,
-                )
-                if feat_2d_bg is not None and feat_bg.shape[0] == feat_2d_bg.shape[0]:
-                    vis_bg = torch.ones(feat_bg.shape[0], device=self.device)
-                    feat_bg_input = self._fuse_features(feat_bg, feat_2d_bg, vis_bg)
-                if (
-                    node_state_rigid is not None
-                    and feat_rigid.shape[0] > 0
-                    and feat_2d_rigid is not None
-                    and feat_2d_rigid.shape[0] == feat_rigid.shape[0]
-                ):
-                    vis_rigid = rigid_visible_mask.float() if rigid_visible_mask is not None else torch.ones(feat_rigid.shape[0], device=self.device)
-                    feat_rigid_input = self._fuse_features(feat_rigid, feat_2d_rigid, vis_rigid)
-                if node_state_distant is not None and feat_2d_distant is not None:
-                    zeros_3d = torch.zeros(feat_2d_distant.shape[0], self.feat_3d_dim, device=self.device)
-                    vis_distant = torch.ones(feat_2d_distant.shape[0], device=self.device)
-                    feat_distant_input = self._fuse_features(zeros_3d, feat_2d_distant, vis_distant)
-
-            # Store feature tensors for baseline recording (value alignment)
-            self._last_feat_3d_bg = feat_bg
-            self._last_feat_3d_rigid = feat_rigid
-            self._last_feat_3d_distant = feat_distant_input[:, : self.feat_3d_dim].detach().clone() if feat_distant_input is not None and feat_distant_input.numel() > 0 else None
-            self._last_feat_2d_bg = feat_2d_bg
-            self._last_feat_2d_rigid = feat_2d_rigid
-            self._last_feat_2d_distant = feat_2d_distant
-            self._last_feat_bg_input = feat_bg_input
-            self._last_feat_rigid_input = feat_rigid_input
-            self._last_feat_distant_input = feat_distant_input
-
-            # #region agent log
-            _debug_log(
-                "streetforward.py:train_iter",
-                "After 2D/3D fusion before _predict_offsets",
-                {
-                    "use_2d_features": bool(self.use_2d_features),
-                    "feat_bg_requires_grad": bool(feat_bg.requires_grad),
-                    "feat_bg_input_requires_grad": bool(feat_bg_input.requires_grad),
-                    "feat_rigid_requires_grad": bool(feat_rigid.requires_grad),
-                    "feat_rigid_input_requires_grad": bool(feat_rigid_input.requires_grad),
-                    "feat_bg_input_shape": list(feat_bg_input.shape),
-                    "feat_rigid_input_shape": list(feat_rigid_input.shape),
-                    "feat_2d_bg_present": feat_2d_bg is not None,
-                    "feat_2d_rigid_present": feat_2d_rigid is not None,
-                },
-                hypothesis_id="H4",
-            )
-            # #endregion
-            
-            offsets_bg = self._predict_offsets(feat_bg_input)
-            offsets_rigid_world = None
-            if node_state_rigid is not None and feat_rigid_input.shape[0] > 0:
-                offsets_rigid_world = self._predict_offsets(feat_rigid_input)
-                # 使用 mask_update_rigid 进行 gate（方案 1：最小改动）
-                if mask_update_rigid is not None:
-                    gate = mask_update_rigid.to(offsets_rigid_world["offset_pos"].dtype).unsqueeze(-1).detach()  # [Nr,1]
-                    offsets_rigid_world["offset_pos"] = offsets_rigid_world["offset_pos"] * gate
-                    offsets_rigid_world["offset_scales"] = offsets_rigid_world["offset_scales"] * gate
-                    offsets_rigid_world["offset_quat"] = offsets_rigid_world["offset_quat"] * gate  # [Nr,4]
-                    offsets_rigid_world["offset_opacity"] = offsets_rigid_world["offset_opacity"] * gate
-                    offsets_rigid_world["offset_sh"] = offsets_rigid_world["offset_sh"] * gate  # [Nr, C]
-                else:
-                    # 回退到旧的逻辑（兼容性）
-                    offsets_rigid_world = self._mask_rigid_offsets(offsets_rigid_world, rigid_visible_mask)
-            offsets_distant = None
-            if node_state_distant is not None and feat_distant_input is not None and feat_distant_input.numel() > 0:
-                offsets_distant = self._predict_offsets(feat_distant_input)
-            
-            # #region agent log
-            if torch.cuda.is_available():
-                _debug_log(
-                    "streetforward.py:train_iter",
-                    "After _predict_offsets, before _render_params_from_offsets",
-                    {
-                        "inner_iter": inner_iter_idx,
-                        "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
-                        "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
-                    },
-                    hypothesis_id="H5",
-                )
-            # #endregion
-
-            # Store offsets for gradient checking (avoid accessing non-leaf tensor grads)
-            self._last_offsets_bg = offsets_bg
-            self._last_offsets_rigid = offsets_rigid_world
-            self._last_offsets_distant = offsets_distant
-
-            # ===== Sanity checks（方案 1：最小改动） =====
-            if mask_update_rigid is not None and offsets_rigid_world is not None:
-                # A) 没有监督的 rigid 点，offset 应该被 gate 成 0
-                offset_pos_gated = offsets_rigid_world["offset_pos"][~mask_update_rigid]
-                if offset_pos_gated.numel() > 0:
-                    max_gated = offset_pos_gated.abs().max().item()
-                    if max_gated > 1e-6:
-                        import warnings
-                        warnings.warn(
-                            f"[Sanity Check A] Offsets for points without supervision should be gated to 0, "
-                            f"but max abs value is {max_gated:.2e}. This may indicate a bug."
-                        )
-            
-            # ===== 结束：Sanity checks =====
-            
-            render_params_bg = self._render_params_from_offsets(node_state_bg, offsets_bg)
-            
-            # #region agent log
-            _debug_log(
-                "streetforward.py:train_iter",
-                "After _render_params_from_offsets for bg",
-                {
-                    "inner_iter": inner_iter_idx,
-                    "offsets_bg_offset_pos_requires_grad": bool(offsets_bg["offset_pos"].requires_grad),
-                    "offsets_bg_offset_pos_grad_fn": str(offsets_bg["offset_pos"].grad_fn)[:60] if offsets_bg["offset_pos"].grad_fn else "None",
-                    "render_params_bg_means_r_requires_grad": bool(render_params_bg["means_r"].requires_grad),
-                    "render_params_bg_means_r_grad_fn": str(render_params_bg["means_r"].grad_fn)[:60] if render_params_bg["means_r"].grad_fn else "None",
-                    "render_params_bg_scales_r_requires_grad": bool(render_params_bg["scales_r"].requires_grad),
-                    "render_params_bg_colors_r_requires_grad": bool(render_params_bg["colors_r"].requires_grad),
-                },
-                hypothesis_id="H6",
-            )
-            # #endregion
-            render_params_rigid = None
-            if node_state_rigid is not None and offsets_rigid_world is not None:
-                # 将世界坐标的偏移量变换到局部坐标
-                offsets_rigid_local = self._transform_offsets_world_to_local(
-                    node_state_rigid, offsets_rigid_world, source_frame_idx
-                )
-                render_params_rigid = self._render_params_from_offsets(node_state_rigid, offsets_rigid_local)
-            render_params_distant = None
-            if offsets_distant is not None and node_state_distant is not None:
-                render_params_distant = self._render_params_from_offsets(node_state_distant, offsets_distant)
-
-            proxies_bg = self._create_proxy_params(render_params_bg)
-            proxies_rigid = self._create_proxy_params(render_params_rigid) if render_params_rigid is not None else None
-            proxies_distant = self._create_proxy_params(render_params_distant) if render_params_distant is not None else None
-
-            # #region agent log
-            _debug_log(
-                "streetforward.py:train_iter",
-                "Before target views loop",
-                {
-                    "num_targets": len(targets),
-                    "has_rigid": proxies_rigid is not None,
-                    "inner_iter": inner_iter_idx,
-                },
-                hypothesis_id="H1",
-            )
-            # #endregion
-
-            for view_idx, target in enumerate(targets):
-                view = target["view"]
-                gt_img = target["gt_image"]
-                target_frame_idx = int(target.get("frame_idx", source_frame_idx))
-                height, width = gt_img.shape[0], gt_img.shape[1]
-                num_sh = _num_sh_bases(self.sh_degree)
-                resolved_frame_idx = None
-                if node_state_rigid is not None:
-                    node_state_rigid.cur_frame = target_frame_idx
-                    resolved_frame_idx = self._resolve_rigid_frame_idx(node_state_rigid, target_frame_idx)
-                if proxies_rigid is not None and node_state_rigid is not None:
-                    # ===== 方案 1：使用 idx_tgt_rigid[k] 子集索引 =====
-                    if view_idx < len(idx_tgt_rigid) and len(idx_tgt_rigid[view_idx]) > 0:
-                        idx = idx_tgt_rigid[view_idx]  # [Nt]
-                        
-                        # 1) 把 rigid proxies（local）先取子集再 transform 到 target world
-                        rigid_means_local_subset = proxies_rigid["means_p"][idx]  # [Nt, 3]
-                        rigid_quats_local_subset = proxies_rigid["quats_p"][idx]  # [Nt, 4]
-                        rigid_scales_subset = proxies_rigid["scales_p"][idx]  # [Nt, 3]
-                        rigid_opacity_subset = proxies_rigid["opacities_p"][idx]  # [Nt]
-                        rigid_sh_subset = proxies_rigid["colors_p"][idx]  # [Nt, num_sh, 3]
-                        
-                        # 2) Transform 到 target 帧的世界坐标
-                        # 传入 idx 作为 point_indices，因为 rigid_means_local_subset 是通过 idx 索引得到的子集
-                        means_rigid_world = self._transform_rigid_to_world(node_state_rigid, rigid_means_local_subset, point_indices=idx)
-                        quats_rigid_world = self._transform_rigid_quats_to_world(node_state_rigid, rigid_quats_local_subset, point_indices=idx)
-                        opacities_rigid = rigid_opacity_subset
-                    else:
-                        # 如果没有可见点，创建空 tensor
-                        means_rigid_world = torch.empty(0, 3, device=self.device)
-                        quats_rigid_world = torch.empty(0, 4, device=self.device)
-                        opacities_rigid = None
-                        rigid_scales_subset = torch.empty(0, 3, device=self.device)
-                        rigid_sh_subset = torch.empty(0, num_sh, 3, device=self.device)
-                    # ===== 结束：子集索引 =====
-                    
-                    # #region agent log
-                    _debug_log(
-                        "streetforward.py:train_iter",
-                        f"After rigid transform for view {view_idx}",
-                        {
-                            "view_idx": view_idx,
-                            "means_rigid_world_requires_grad": means_rigid_world.requires_grad,
-                            "means_rigid_world_grad_fn": str(means_rigid_world.grad_fn),
-                            "quats_rigid_world_requires_grad": quats_rigid_world.requires_grad,
-                            "num_visible_rigid": len(idx_tgt_rigid[view_idx]) if view_idx < len(idx_tgt_rigid) else 0,
-                        },
-                        hypothesis_id="H2",
-                    )
-                    # #endregion
-                else:
-                    means_rigid_world = torch.empty(0, 3, device=self.device)
-                    quats_rigid_world = torch.empty(0, 4, device=self.device)
-                    opacities_rigid = None
-                    rigid_scales_subset = torch.empty(0, 3, device=self.device)
-                    rigid_sh_subset = torch.empty(0, num_sh, 3, device=self.device)
-                
-                # 合并参数（使用子集）
-                if proxies_rigid is not None and node_state_rigid is not None:
-                    if len(means_rigid_world) > 0:
-                        # 有可见的 rigid 点，使用子集合并
-                        merged_means = torch.cat([
-                            proxies_bg["means_p"], 
-                            means_rigid_world, 
-                            proxies_distant["means_p"] if proxies_distant is not None and proxies_distant["means_p"].numel() > 0 else torch.empty(0, 3, device=self.device)
-                        ], dim=0)
-                        merged_quats = torch.cat([
-                            proxies_bg["quats_p"], 
-                            quats_rigid_world, 
-                            proxies_distant["quats_p"] if proxies_distant is not None and proxies_distant["quats_p"].numel() > 0 else torch.empty(0, 4, device=self.device)
-                        ], dim=0)
-                        merged_scales = torch.cat([
-                            proxies_bg["scales_p"], 
-                            rigid_scales_subset, 
-                            proxies_distant["scales_p"] if proxies_distant is not None and proxies_distant["scales_p"].numel() > 0 else torch.empty(0, 3, device=self.device)
-                        ], dim=0)
-                        merged_opacities = torch.cat([
-                            proxies_bg["opacities_p"], 
-                            opacities_rigid, 
-                            proxies_distant["opacities_p"] if proxies_distant is not None and proxies_distant["opacities_p"].numel() > 0 else torch.empty(0, device=self.device)
-                        ], dim=0)
-                        merged_colors = torch.cat([
-                            proxies_bg["colors_p"], 
-                            rigid_sh_subset, 
-                            proxies_distant["colors_p"] if proxies_distant is not None and proxies_distant["colors_p"].numel() > 0 else torch.empty(0, num_sh, 3, device=self.device)
-                        ], dim=0)
-                    else:
-                        # 没有可见的 rigid 点，使用 _merge_all_params（传入 None）
-                        merged_means, merged_quats, merged_scales, merged_opacities, merged_colors = self._merge_all_params(
-                            proxies_bg=proxies_bg,
-                            proxies_rigid=None,
-                            proxies_distant=proxies_distant,
-                            means_rigid_world=means_rigid_world,
-                            quats_rigid_world=quats_rigid_world,
-                            opacities_rigid=opacities_rigid,
-                        )
-                else:
-                    # 没有 rigid proxies，使用 _merge_all_params
-                    merged_means, merged_quats, merged_scales, merged_opacities, merged_colors = self._merge_all_params(
-                        proxies_bg=proxies_bg,
-                        proxies_rigid=proxies_rigid,
-                        proxies_distant=proxies_distant,
-                        means_rigid_world=means_rigid_world,
-                        quats_rigid_world=quats_rigid_world,
-                        opacities_rigid=opacities_rigid,
-                    )
-                merged_params = {
-                    "means_p": merged_means,
-                    "scales_p": merged_scales,
-                    "quats_p": merged_quats,
-                    "opacities_p": merged_opacities,
-                    "colors_p": merged_colors,
-                }
-                # #region agent log
-                if torch.cuda.is_available() and (view_idx % 5 == 0 or view_idx == len(targets) - 1):
-                    _debug_log(
-                        "streetforward.py:train_iter",
-                        f"Before _render_single_view for view {view_idx}",
-                        {
-                            "view_idx": view_idx,
-                            "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
-                            "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
-                            "merged_means_size_mb": merged_means.numel() * 4 / 1024**2,
-                            "merged_colors_size_mb": merged_colors.numel() * 4 / 1024**2,
-                        },
-                        hypothesis_id="H5",
-                    )
-                # #endregion
-                
-                rgb, acc = self._render_single_view(merged_params, view, height, width)
-                
-                # #region agent log
-                if torch.cuda.is_available() and (view_idx % 5 == 0 or view_idx == len(targets) - 1):
-                    _debug_log(
-                        "streetforward.py:train_iter",
-                        f"After _render_single_view for view {view_idx}",
-                        {
-                            "view_idx": view_idx,
-                            "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
-                            "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
-                            "rgb_size_mb": rgb.numel() * 4 / 1024**2,
-                        },
-                        hypothesis_id="H5",
-                    )
-                # #endregion
-                
-                loss = self.compute_loss(rgb, gt_img) / view_count
-                total_loss_val += float(loss.detach())  # Accumulate scalar to avoid keeping graph
-                
-                # #region agent log
-                # Check proxy gradients before backward (only log every 3 views to reduce overhead)
-                if view_idx % 3 == 0 or view_idx == len(targets) - 1:
-                    bg_grad_norms_before = {}
-                    rigid_grad_norms_before = {}
-                    for key in ["means_p", "scales_p", "quats_p", "opacities_p", "colors_p"]:
-                        if proxies_bg[key].grad is not None:
-                            bg_grad_norms_before[key] = float(proxies_bg[key].grad.norm().item())
-                        else:
-                            bg_grad_norms_before[key] = 0.0
-                        if proxies_rigid is not None and proxies_rigid[key].grad is not None:
-                            rigid_grad_norms_before[key] = float(proxies_rigid[key].grad.norm().item())
-                        elif proxies_rigid is not None:
-                            rigid_grad_norms_before[key] = 0.0
-                    
-                    _debug_log(
-                        "streetforward.py:train_iter",
-                        f"Before backward for view {view_idx}",
-                        {
-                            "view_idx": view_idx,
-                            "target_frame_idx": target_frame_idx,
-                            "loss_value": float(loss.item()),
-                            "bg_grad_norms": bg_grad_norms_before,
-                            "rigid_grad_norms": rigid_grad_norms_before if proxies_rigid else None,
-                        },
-                        hypothesis_id="H1",
-                    )
-                # #endregion
-                
-                loss.backward()
-                
-                # ===== Sanity checks（方案 1：最小改动） =====
-                if mask_any_tgt_rigid is not None and proxies_rigid is not None:
-                    # B) 没参与任何 target 渲染的 rigid 点，proxy.grad 应该接近 0
-                    if proxies_rigid["means_p"].grad is not None:
-                        grad_means_not_rendered = proxies_rigid["means_p"].grad[~mask_any_tgt_rigid]
-                        if grad_means_not_rendered.numel() > 0:
-                            max_grad_not_rendered = grad_means_not_rendered.abs().max().item()
-                            if max_grad_not_rendered > 1e-6:
-                                import warnings
-                                warnings.warn(
-                                    f"[Sanity Check B] Gradients for points not rendered in any target should be 0, "
-                                    f"but max abs value is {max_grad_not_rendered:.2e}. This may indicate a bug."
-                                )
-                
-                # C) 每个 target 的 idx 数量合理（别全空/全满）
-                if view_idx < len(idx_tgt_rigid):
-                    num_visible = len(idx_tgt_rigid[view_idx])
-                    num_total = node_state_rigid.means.shape[0] if node_state_rigid is not None else 0
-                    if num_total > 0 and num_visible == 0:
-                        import warnings
-                        warnings.warn(
-                            f"[Sanity Check C] Target {view_idx} has no visible rigid points "
-                            f"({num_visible}/{num_total}). This may indicate a visibility issue."
-                        )
-                # ===== 结束：Sanity checks =====
-                
-                # #region agent log
-                # Check proxy gradients after backward (only log every 3 views to reduce overhead)
-                if view_idx % 3 == 0 or view_idx == len(targets) - 1:
-                    bg_grad_norms_after = {}
-                    rigid_grad_norms_after = {}
-                    for key in ["means_p", "scales_p", "quats_p", "opacities_p", "colors_p"]:
-                        if proxies_bg[key].grad is not None:
-                            bg_grad_norms_after[key] = float(proxies_bg[key].grad.norm().item())
-                        else:
-                            bg_grad_norms_after[key] = 0.0
-                        if proxies_rigid is not None and proxies_rigid[key].grad is not None:
-                            rigid_grad_norms_after[key] = float(proxies_rigid[key].grad.norm().item())
-                        elif proxies_rigid is not None:
-                            rigid_grad_norms_after[key] = 0.0
-                    
-                    # Check if gradients accumulated
-                    bg_grad_accumulated = {}
-                    rigid_grad_accumulated = {}
-                    for key in ["means_p", "scales_p", "quats_p", "opacities_p", "colors_p"]:
-                        bg_grad_accumulated[key] = bg_grad_norms_after[key] > bg_grad_norms_before.get(key, 0.0) if view_idx > 0 else True
-                        if proxies_rigid is not None:
-                            rigid_grad_accumulated[key] = rigid_grad_norms_after[key] > rigid_grad_norms_before.get(key, 0.0) if view_idx > 0 else True
-                    
-                    _debug_log(
-                        "streetforward.py:train_iter",
-                        f"After backward for view {view_idx}",
-                        {
-                            "view_idx": view_idx,
-                            "bg_grad_norms": bg_grad_norms_after,
-                            "rigid_grad_norms": rigid_grad_norms_after if proxies_rigid else None,
-                            "bg_grad_accumulated": bg_grad_accumulated,
-                            "rigid_grad_accumulated": rigid_grad_accumulated if proxies_rigid else None,
-                        },
-                        hypothesis_id="H1",
-                    )
-                
-                # Check GPU memory (only log every 5 views to reduce overhead)
-                if torch.cuda.is_available() and (view_idx % 5 == 0 or view_idx == len(targets) - 1):
-                    _debug_log(
-                        "streetforward.py:train_iter",
-                        f"GPU memory after view {view_idx}",
-                        {
-                            "view_idx": view_idx,
-                            "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
-                            "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
-                            "max_allocated_mb": torch.cuda.max_memory_allocated() / 1024**2,
-                        },
-                        hypothesis_id="H4",
-                    )
-                # #endregion
-                
-                # Only store images if explicitly requested (to save GPU memory)
-                if self.log_images:
-                    outputs.append({
-                        "rgb": rgb.detach().cpu(),
-                        "acc": acc.detach().cpu(),
-                        "loss": loss.detach().item(),
-                    })
-                else:
-                    outputs.append({"loss": loss.detach().item()})
-
-            grad_report: Dict[str, float] = {}
-            grad_warned = getattr(self, "_proxy_grad_warned", set())
-
-            def _grad_or_zero(proxy_tensor: torch.Tensor, name: str) -> torch.Tensor:
-                grad = proxy_tensor.grad
-                if grad is None:
-                    if name not in grad_warned:
-                        logger.warning(f"Proxy gradient for {name} is None; using zeros for backward.")
-                        grad_warned.add(name)
-                    grad_report[name] = 0.0
-                    return torch.zeros_like(proxy_tensor)
-                grad_report[name] = float(grad.norm().detach())
-                return grad
-
-            render_tensors = [
-                render_params_bg["means_r"],
-                render_params_bg["scales_r"],
-                render_params_bg["quats_r"],
-                render_params_bg["opacities_r"],
-                render_params_bg["colors_r"],
-            ]
-            grad_tensors = [
-                _grad_or_zero(proxies_bg["means_p"], "bg.means"),
-                _grad_or_zero(proxies_bg["scales_p"], "bg.scales"),
-                _grad_or_zero(proxies_bg["quats_p"], "bg.quats"),
-                _grad_or_zero(proxies_bg["opacities_p"], "bg.opacities"),
-                _grad_or_zero(proxies_bg["colors_p"], "bg.colors"),
-            ]
-
-            if render_params_rigid is not None and proxies_rigid is not None:
-                render_tensors += [
-                    render_params_rigid["means_r"],
-                    render_params_rigid["scales_r"],
-                    render_params_rigid["quats_r"],
-                    render_params_rigid["opacities_r"],
-                    render_params_rigid["colors_r"],
-                ]
-                grad_tensors += [
-                    _grad_or_zero(proxies_rigid["means_p"], "rigid.means"),
-                    _grad_or_zero(proxies_rigid["scales_p"], "rigid.scales"),
-                    _grad_or_zero(proxies_rigid["quats_p"], "rigid.quats"),
-                    _grad_or_zero(proxies_rigid["opacities_p"], "rigid.opacities"),
-                    _grad_or_zero(proxies_rigid["colors_p"], "rigid.colors"),
-                ]
-            if render_params_distant is not None and proxies_distant is not None:
-                render_tensors += [
-                    render_params_distant["means_r"],
-                    render_params_distant["scales_r"],
-                    render_params_distant["quats_r"],
-                    render_params_distant["opacities_r"],
-                    render_params_distant["colors_r"],
-                ]
-                grad_tensors += [
-                    _grad_or_zero(proxies_distant["means_p"], "distant.means"),
-                    _grad_or_zero(proxies_distant["scales_p"], "distant.scales"),
-                    _grad_or_zero(proxies_distant["quats_p"], "distant.quats"),
-                    _grad_or_zero(proxies_distant["opacities_p"], "distant.opacities"),
-                    _grad_or_zero(proxies_distant["colors_p"], "distant.colors"),
-                ]
-
-            self._proxy_grad_warned = grad_warned
-            self._last_proxy_grad_norms = grad_report
-            
-            # #region agent log
-            # Check render params gradients before autograd.backward (only for leaf tensors)
-            render_params_grad_before = {}
-            for key in ["means_r", "scales_r", "quats_r", "opacities_r", "colors_r"]:
-                # Only check grad for leaf tensors to avoid warnings
-                if render_params_bg[key].is_leaf and render_params_bg[key].grad is not None:
-                    render_params_grad_before[f"bg.{key}"] = float(render_params_bg[key].grad.norm().item())
-                else:
-                    render_params_grad_before[f"bg.{key}"] = 0.0
-                if render_params_rigid is not None:
-                    if render_params_rigid[key].is_leaf and render_params_rigid[key].grad is not None:
-                        render_params_grad_before[f"rigid.{key}"] = float(render_params_rigid[key].grad.norm().item())
-                    else:
-                        render_params_grad_before[f"rigid.{key}"] = 0.0
-                if render_params_distant is not None:
-                    if render_params_distant[key].is_leaf and render_params_distant[key].grad is not None:
-                        render_params_grad_before[f"distant.{key}"] = float(render_params_distant[key].grad.norm().item())
-                    else:
-                        render_params_grad_before[f"distant.{key}"] = 0.0
-                else:
-                    render_params_grad_before[f"distant.{key}"] = 0.0
-            
-            # Check render_tensors requires_grad status
-            render_tensors_requires_grad = {}
-            render_tensors_grad_fn = {}
-            for i, (name, t) in enumerate(zip(
-                ["bg.means_r", "bg.scales_r", "bg.quats_r", "bg.opacities_r", "bg.colors_r"],
-                render_tensors[:5]
-            )):
-                render_tensors_requires_grad[name] = bool(t.requires_grad)
-                render_tensors_grad_fn[name] = str(t.grad_fn)[:50] if t.grad_fn else "None"
-            
-            _debug_log(
-                "streetforward.py:train_iter",
-                "Before autograd.backward",
-                {
-                    "inner_iter": inner_iter_idx,
-                    "proxy_grad_norms": grad_report,
-                    "render_params_grad_before": render_params_grad_before,
-                    "render_tensors_requires_grad": render_tensors_requires_grad,
-                    "render_tensors_grad_fn": render_tensors_grad_fn,
-                    "grad_tensors_norms": {
-                        "bg.means": float(grad_tensors[0].norm().item()) if grad_tensors[0] is not None else 0.0,
-                        "bg.scales": float(grad_tensors[1].norm().item()) if grad_tensors[1] is not None else 0.0,
-                        "bg.quats": float(grad_tensors[2].norm().item()) if grad_tensors[2] is not None else 0.0,
-                        "bg.opacities": float(grad_tensors[3].norm().item()) if grad_tensors[3] is not None else 0.0,
-                        "bg.colors": float(grad_tensors[4].norm().item()) if grad_tensors[4] is not None else 0.0,
-                    },
-                },
-                hypothesis_id="H3",
-            )
-            # #endregion
-            
-            torch.autograd.backward(tensors=render_tensors, grad_tensors=grad_tensors)
-            
-            # #region agent log
-            # Check render params gradients after autograd.backward (only for leaf tensors)
-            # Note: render_params are non-leaf tensors, so we check the underlying computation graph
-            # by checking if the offsets have gradients instead
-            render_params_grad_after = {}
-            # Check if offsets have gradients (these are the actual leaf tensors)
-            offset_keys = ["offset_pos", "offset_scales", "offset_quat", "offset_opacity", "offset_sh"]
-            offset_grads = {}
-            if hasattr(self, '_last_offsets_bg') and self._last_offsets_bg is not None:
-                for key in offset_keys:
-                    if key in self._last_offsets_bg and self._last_offsets_bg[key].grad is not None:
-                        offset_grads[f"bg.{key}"] = float(self._last_offsets_bg[key].grad.norm().item())
-                    else:
-                        offset_grads[f"bg.{key}"] = 0.0
-            if hasattr(self, '_last_offsets_rigid') and self._last_offsets_rigid is not None:
-                for key in offset_keys:
-                    if key in self._last_offsets_rigid and self._last_offsets_rigid[key].grad is not None:
-                        offset_grads[f"rigid.{key}"] = float(self._last_offsets_rigid[key].grad.norm().item())
-                    else:
-                        offset_grads[f"rigid.{key}"] = 0.0
-            
-            # Check MLP parameter gradients
-            mlp_param_grads = {}
-            for name, param in self.named_parameters():
-                if param.grad is not None:
-                    mlp_param_grads[name] = float(param.grad.norm().item())
-                else:
-                    mlp_param_grads[name] = 0.0
-            # Only log a few key MLP parameters to avoid log bloat
-            key_params = ["mlp_offset_pos.0.weight", "mlp_conv.0.weight", "gaussion_decoder.0.weight"]
-            key_mlp_grads = {k: mlp_param_grads.get(k, 0.0) for k in key_params}
-            
-            _debug_log(
-                "streetforward.py:train_iter",
-                "After autograd.backward",
-                {
-                    "inner_iter": inner_iter_idx,
-                    "offset_grads": offset_grads,
-                    "grad_propagated": {k: offset_grads[k] > 0 for k in offset_grads},
-                    "key_mlp_param_grads": key_mlp_grads,
-                    "any_mlp_grad": any(v > 0 for v in mlp_param_grads.values()),
-                },
-                hypothesis_id="H3",
-            )
-            # #endregion
-            
-            # #region agent log
             if apply_update:
                 self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)
 
             if update_state:
-                with torch.no_grad():
-                    # Clamp means only when writing back to node_state (not during backprop)
-                    means_clamped = torch.clamp(
-                        render_params_bg["means_r"].detach(), min=self.bbx_min, max=self.bbx_max
-                    )
-                    node_state_bg.means.copy_(means_clamped)
-                    node_state_bg.scales_log.copy_(render_params_bg["scales_log_r"].detach())
-                    node_state_bg.quats.copy_(render_params_bg["quats_r"].detach())
-                    node_state_bg.opacity_logit.copy_(render_params_bg["opacity_logit_r"].detach())
-                    node_state_bg.sh_dc.copy_(render_params_bg["sh_dc_r"].detach())
-                    node_state_bg.sh_rest.copy_(render_params_bg["sh_rest_r"].detach())
-                    if node_state_rigid is not None and render_params_rigid is not None:
-                        node_state_rigid.means.copy_(render_params_rigid["means_r"].detach())
-                        node_state_rigid.scales_log.copy_(render_params_rigid["scales_log_r"].detach())
-                        node_state_rigid.quats.copy_(render_params_rigid["quats_r"].detach())
-                        node_state_rigid.opacity_logit.copy_(render_params_rigid["opacity_logit_r"].detach())
-                        node_state_rigid.sh_dc.copy_(render_params_rigid["sh_dc_r"].detach())
-                        node_state_rigid.sh_rest.copy_(render_params_rigid["sh_rest_r"].detach())
-                    if node_state_distant is not None and render_params_distant is not None:
-                        means_distant = torch.clamp(
-                            render_params_distant["means_r"].detach(),
-                            min=self.input_aabb_min,
-                            max=self.input_aabb_max,
-                        )
-                        node_state_distant.means.copy_(means_distant)
-                        node_state_distant.scales_log.copy_(render_params_distant["scales_log_r"].detach())
-                        node_state_distant.quats.copy_(render_params_distant["quats_r"].detach())
-                        node_state_distant.opacity_logit.copy_(render_params_distant["opacity_logit_r"].detach())
-                        node_state_distant.sh_dc.copy_(render_params_distant["sh_dc_r"].detach())
-                        node_state_distant.sh_rest.copy_(render_params_distant["sh_rest_r"].detach())
+                self._update_node_states(
+                    render_params_bg=result["render_params_bg"],
+                    render_params_rigid=result["render_params_rigid"],
+                    render_params_distant=result["render_params_distant"],
+                    node_state_bg=node_state_bg,
+                    node_state_rigid=node_state_rigid,
+                    node_state_distant=node_state_distant,
+                )
 
         self.node_states[key] = node_state_bg.detach_clone()
-        if node_state_rigid is not None:
-            self.node_states_rigid[key] = node_state_rigid.detach_clone()
-        else:
-            self.node_states_rigid[key] = None
-        if node_state_distant is not None:
-            self.node_states_distant[key] = node_state_distant.detach_clone()
-        else:
-            self.node_states_distant[key] = None
+        self.node_states_rigid[key] = node_state_rigid.detach_clone() if node_state_rigid is not None else None
+        self.node_states_distant[key] = node_state_distant.detach_clone() if node_state_distant is not None else None
+
         if apply_update:
             self.global_step += 1
             self._log_to_tensorboard(total_loss_val, outputs)
@@ -1138,6 +431,154 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
             "node_state_distant": self.node_states_distant.get(key),
             "outputs": outputs,
             "test_metrics": test_metrics,
+        }
+
+    def _parse_targets(self, batch: Dict) -> List[Dict]:
+        """
+        统一解析 target 视角，兼容旧字段。
+        """
+        targets: List[Dict] = []
+        if "targets" in batch:
+            for target in batch["targets"]:
+                targets.append(
+                    {
+                        "frame_idx": target.get("frame_idx", batch.get("source_frame_idx", 0)),
+                        "view": target["view"],
+                        "gt_image": target["gt_image"],
+                    }
+                )
+        else:
+            target_views = batch.get("target_views", [])
+            gt_images = batch.get("gt_images", [])
+            for view, gt_img in zip(target_views, gt_images):
+                targets.append(
+                    {
+                        "frame_idx": batch.get("source_frame_idx", 0),
+                        "view": view,
+                        "gt_image": gt_img,
+                    }
+                )
+        return targets
+
+    def _get_source_frame_idx(self, batch: Dict) -> int:
+        source_frame_idx = batch.get("source_frame_idx")
+        if source_frame_idx is None:
+            raise ValueError(
+                "source_frame_idx is required but not found in batch. "
+                "Please ensure the batch contains source_frame_idx."
+            )
+        return int(source_frame_idx)
+
+    def _train_inner_iteration(
+        self,
+        batch: Dict,
+        targets: List[Dict],
+        node_state_bg: NodeState,
+        node_state_rigid: Optional[NodeStateRigid],
+        node_state_distant: Optional[NodeStateDistant],
+    ) -> Dict:
+        """
+        单次 inner iteration 的编排：构建特征 → 偏移 → 渲染参数 → 渲染 & 反传。
+        """
+        source_frame_idx = self._get_source_frame_idx(batch)
+        masks = self._precompute_rigid_masks(node_state_rigid, source_frame_idx, targets)
+
+        feat_bg, feat_rigid, rigid_visible_mask, _rigid_in_crop_mask = self._build_3d_feature_volume(
+            node_state_bg=node_state_bg,
+            node_state_rigid=node_state_rigid,
+            source_frame_idx=source_frame_idx,
+            mask_src_rigid=masks.mask_src_rigid,
+            idx_src_rigid=masks.idx_src_rigid,
+        )
+
+        feat_bg_input, feat_rigid_input, feat_distant_input, feat_2d_bg, feat_2d_rigid, feat_2d_distant = self._compute_and_fuse_features(
+            node_state_bg=node_state_bg,
+            node_state_rigid=node_state_rigid,
+            node_state_distant=node_state_distant,
+            source_frame_idx=source_frame_idx,
+            rigid_visible_mask=rigid_visible_mask,
+            feat_bg=feat_bg,
+            feat_rigid=feat_rigid,
+            source_views=batch.get("source_views", []),
+            source_images=batch.get("src_images", []),
+        )
+
+        self._last_feat_3d_bg = feat_bg
+        self._last_feat_3d_rigid = feat_rigid
+        self._last_feat_3d_distant = (
+            feat_distant_input[:, : self.feat_3d_dim].detach().clone()
+            if feat_distant_input is not None and feat_distant_input.numel() > 0
+            else None
+        )
+        self._last_feat_2d_bg = feat_2d_bg
+        self._last_feat_2d_rigid = feat_2d_rigid
+        self._last_feat_2d_distant = feat_2d_distant
+        self._last_feat_bg_input = feat_bg_input
+        self._last_feat_rigid_input = feat_rigid_input
+        self._last_feat_distant_input = feat_distant_input
+
+        offsets_bg, offsets_rigid_world, offsets_distant = self._predict_and_gate_offsets(
+            feat_bg_input=feat_bg_input,
+            feat_rigid_input=feat_rigid_input,
+            feat_distant_input=feat_distant_input,
+            node_state_rigid=node_state_rigid,
+            node_state_distant=node_state_distant,
+            mask_update_rigid=masks.mask_update_rigid,
+        )
+
+        self._last_offsets_bg = offsets_bg
+        self._last_offsets_rigid = offsets_rigid_world
+        self._last_offsets_distant = offsets_distant
+
+        if masks.mask_update_rigid is not None and offsets_rigid_world is not None:
+            offset_pos_gated = offsets_rigid_world["offset_pos"][~masks.mask_update_rigid]
+            if offset_pos_gated.numel() > 0:
+                max_gated = offset_pos_gated.abs().max().item()
+                if max_gated > 1e-6:
+                    import warnings
+                    warnings.warn(
+                        f"[Sanity Check A] Offsets for points without supervision should be gated to 0, "
+                        f"but max abs value is {max_gated:.2e}. This may indicate a bug."
+                    )
+
+        render_params_bg, render_params_rigid, render_params_distant = self._compute_render_params_for_inner_iter(
+            node_state_bg=node_state_bg,
+            node_state_rigid=node_state_rigid,
+            node_state_distant=node_state_distant,
+            offsets_bg=offsets_bg,
+            offsets_rigid_world=offsets_rigid_world,
+            offsets_distant=offsets_distant,
+            source_frame_idx=source_frame_idx,
+        )
+
+        proxies_bg = self._create_proxy_params(render_params_bg)
+        proxies_rigid = self._create_proxy_params(render_params_rigid) if render_params_rigid is not None else None
+        proxies_distant = self._create_proxy_params(render_params_distant) if render_params_distant is not None else None
+
+        total_loss, outputs = self._render_targets_and_accumulate_loss(
+            targets=targets,
+            proxies_bg=proxies_bg,
+            proxies_rigid=proxies_rigid,
+            proxies_distant=proxies_distant,
+            node_state_rigid=node_state_rigid,
+            masks=masks,
+        )
+
+        self._backward_to_render_params(
+            render_params_bg=render_params_bg,
+            render_params_rigid=render_params_rigid,
+            render_params_distant=render_params_distant,
+            proxies_bg=proxies_bg,
+            proxies_rigid=proxies_rigid,
+            proxies_distant=proxies_distant,
+        )
+
+        return {
+            "loss_val": total_loss,
+            "outputs": outputs,
+            "render_params_bg": render_params_bg,
+            "render_params_rigid": render_params_rigid,
+            "render_params_distant": render_params_distant,
         }
 
     def forward(self, batch: Dict) -> Dict:
@@ -1167,30 +608,20 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
         """
         if test_views is None or len(test_views) == 0:
             return None
+
         render_params = self._compute_render_params(node_state)
-        psnr_list: List[float] = []
-        ssim_list: List[float] = []
-        lpips_list: List[float] = []
 
-        for view, gt_img in zip(test_views, test_images):
-            height, width = gt_img.shape[0], gt_img.shape[1]
-            rgb_pred, _ = self._render_single_view(render_params, view, height, width)
-            rgb_gt = gt_img.to(self.device)
+        def render_fn(view, height, width):
+            return self._render_single_view(render_params, view, height, width)
 
-            psnr_list.append(self._compute_psnr(rgb_pred, rgb_gt))
-            ssim_list.append(self._compute_ssim(rgb_pred, rgb_gt))
-            lpips_list.append(self._compute_lpips(rgb_pred, rgb_gt))
-
-        if len(psnr_list) == 0:
-            return None
-
-        metrics = {
-            "psnr": float(np.mean(psnr_list)),
-            "ssim": float(np.mean(ssim_list)),
-            "lpips": float(np.mean(lpips_list)),
-            "num_test_views": len(psnr_list),
-        }
-        return metrics
+        metrics_result, self._lpips_model = metrics.evaluate_test_views(
+            render_fn=render_fn,
+            test_views=test_views,
+            test_images=test_images,
+            device=self.device,
+            lpips_model=self._lpips_model,
+        )
+        return metrics_result
 
     def evaluate(self, batch: Dict) -> Dict[str, float]:
         """
@@ -1213,77 +644,6 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
         )
         self.train()
         return metrics or {}
-
-    def _compute_psnr(self, pred: torch.Tensor, gt: torch.Tensor) -> float:
-        """
-        计算 PSNR（峰值信噪比）。
-        
-        Args:
-            pred: 预测图像，形状 [H, W, 3]
-            gt: 真实图像，形状 [H, W, 3]
-            
-        Returns:
-            PSNR 值（dB），公式：-10 * log10(MSE)
-            如果 MSE <= 0，返回 inf
-        """
-        mse = torch.mean((pred - gt) ** 2)
-        mse_val = float(mse.item())
-        if mse_val <= 0:
-            return float("inf")
-        psnr = -10 * torch.log10(torch.tensor(mse_val, device=pred.device))
-        return float(psnr.item())
-
-    def _compute_ssim(self, pred: torch.Tensor, gt: torch.Tensor) -> float:
-        """
-        计算 SSIM（结构相似性指数）。
-        
-        Args:
-            pred: 预测图像，形状 [H, W, 3]
-            gt: 真实图像，形状 [H, W, 3]
-            
-        Returns:
-            SSIM 值（范围 0-1），值越高越好
-            如果 pytorch_msssim 不可用，返回 NaN
-        """
-        try:
-            from pytorch_msssim import ssim
-        except ImportError:
-            if not getattr(self, "_ssim_unavailable", False):
-                logger.warning("pytorch_msssim not installed; returning NaN for SSIM")
-                self._ssim_unavailable = True
-            return float("nan")
-
-        pred_4d = pred.permute(2, 0, 1).unsqueeze(0)
-        gt_4d = gt.permute(2, 0, 1).unsqueeze(0)
-        return float(ssim(pred_4d, gt_4d, data_range=1.0).item())
-
-    def _compute_lpips(self, pred: torch.Tensor, gt: torch.Tensor) -> float:
-        """
-        计算 LPIPS（学习感知图像块相似性）。
-        
-        Args:
-            pred: 预测图像，形状 [H, W, 3]
-            gt: 真实图像，形状 [H, W, 3]
-            
-        Returns:
-            LPIPS 值（通常范围 0-1），值越低越好
-            如果 lpips 库不可用，返回 NaN
-        
-        使用 AlexNet 作为特征提取器。
-        """
-        try:
-            from lpips import LPIPS
-        except ImportError:
-            if not getattr(self, "_lpips_unavailable", False):
-                logger.warning("lpips not installed; returning NaN for LPIPS")
-                self._lpips_unavailable = True
-            return float("nan")
-
-        if not hasattr(self, "_lpips_model") or self._lpips_model is None:
-            self._lpips_model = LPIPS(net="alex").to(self.device)
-        pred_4d = pred.permute(2, 0, 1).unsqueeze(0)
-        gt_4d = gt.permute(2, 0, 1).unsqueeze(0)
-        return float(self._lpips_model(pred_4d, gt_4d).item())
 
     def _log_to_tensorboard(self, total_loss_val: float, outputs: List[Dict]) -> None:
         """

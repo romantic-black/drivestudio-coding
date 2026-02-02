@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -19,6 +20,16 @@ from models.streetforward.math_utils import (
 from models.streetforward.node_states import NodeState, NodeStateBackground, NodeStateRigid, NodeStateDistant
 
 logger = logging.getLogger(__name__)
+
+@dataclass
+class RigidMasks:
+    """Container for precomputed rigid visibility masks used during an iteration."""
+    mask_src_rigid: Optional[torch.Tensor] = None
+    mask_tgt_rigid: List[torch.Tensor] = field(default_factory=list)
+    mask_any_tgt_rigid: Optional[torch.Tensor] = None
+    mask_update_rigid: Optional[torch.Tensor] = None
+    idx_tgt_rigid: List[torch.Tensor] = field(default_factory=list)
+    idx_src_rigid: Optional[torch.Tensor] = None
 
 
 class NodeStateMixin:
@@ -455,6 +466,47 @@ class NodeStateMixin:
         # 如果找不到，返回 None（而不是抛出错误）
         return None
 
+    def _precompute_rigid_masks(
+        self,
+        node_state_rigid: Optional[NodeStateRigid],
+        source_frame_idx: int,
+        targets: List[Dict],
+    ) -> RigidMasks:
+        """
+        预计算 rigid 节点在 source/target 帧的可见性与索引，用于 gate offsets 与渲染子集。
+        """
+        if node_state_rigid is None:
+            return RigidMasks()
+
+        pose_valid_src = self._per_point_pose_valid(node_state_rigid, source_frame_idx)
+        visible_src = self._visible_mask_from_instances_fv(node_state_rigid, source_frame_idx)
+        mask_src_rigid = pose_valid_src & visible_src
+
+        pose_valid_tgt = []
+        visible_tgt = []
+        for tgt in targets:
+            frame_idx = int(tgt.get("frame_idx", source_frame_idx))
+            pose_valid_tgt.append(self._per_point_pose_valid(node_state_rigid, frame_idx))
+            visible_tgt.append(self._visible_mask_from_instances_fv(node_state_rigid, frame_idx))
+
+        mask_tgt_rigid = [pv & vis for pv, vis in zip(pose_valid_tgt, visible_tgt)]
+        mask_any_tgt_rigid = torch.zeros_like(mask_src_rigid)
+        for m in mask_tgt_rigid:
+            mask_any_tgt_rigid |= m
+
+        mask_update_rigid = mask_src_rigid & mask_any_tgt_rigid
+        idx_tgt_rigid = [torch.nonzero(m, as_tuple=False).squeeze(1) for m in mask_tgt_rigid]
+        idx_src_rigid = torch.nonzero(mask_src_rigid, as_tuple=False).squeeze(1)
+
+        return RigidMasks(
+            mask_src_rigid=mask_src_rigid,
+            mask_tgt_rigid=mask_tgt_rigid,
+            mask_any_tgt_rigid=mask_any_tgt_rigid,
+            mask_update_rigid=mask_update_rigid,
+            idx_tgt_rigid=idx_tgt_rigid,
+            idx_src_rigid=idx_src_rigid,
+        )
+
     def _per_point_pose_valid(self, node_state_rigid: NodeStateRigid, frame_idx: int) -> torch.Tensor:
         """
         计算每个 rigid 点在该帧是否有有效的位姿。
@@ -502,6 +554,48 @@ class NodeStateMixin:
         visible = visibility[point_ids]  # [Nr]
         
         return visible.bool()
+
+    def _update_node_states(
+        self,
+        render_params_bg: Dict[str, torch.Tensor],
+        render_params_rigid: Optional[Dict[str, torch.Tensor]],
+        render_params_distant: Optional[Dict[str, torch.Tensor]],
+        node_state_bg: NodeState,
+        node_state_rigid: Optional[NodeStateRigid],
+        node_state_distant: Optional[NodeStateDistant],
+    ) -> None:
+        """
+        将渲染参数写回 NodeState，并在必要时进行 clamp。
+        """
+        with torch.no_grad():
+            means_clamped = torch.clamp(render_params_bg["means_r"].detach(), min=self.bbx_min, max=self.bbx_max)
+            node_state_bg.means.copy_(means_clamped)
+            node_state_bg.scales_log.copy_(render_params_bg["scales_log_r"].detach())
+            node_state_bg.quats.copy_(render_params_bg["quats_r"].detach())
+            node_state_bg.opacity_logit.copy_(render_params_bg["opacity_logit_r"].detach())
+            node_state_bg.sh_dc.copy_(render_params_bg["sh_dc_r"].detach())
+            node_state_bg.sh_rest.copy_(render_params_bg["sh_rest_r"].detach())
+
+            if node_state_rigid is not None and render_params_rigid is not None:
+                node_state_rigid.means.copy_(render_params_rigid["means_r"].detach())
+                node_state_rigid.scales_log.copy_(render_params_rigid["scales_log_r"].detach())
+                node_state_rigid.quats.copy_(render_params_rigid["quats_r"].detach())
+                node_state_rigid.opacity_logit.copy_(render_params_rigid["opacity_logit_r"].detach())
+                node_state_rigid.sh_dc.copy_(render_params_rigid["sh_dc_r"].detach())
+                node_state_rigid.sh_rest.copy_(render_params_rigid["sh_rest_r"].detach())
+
+            if node_state_distant is not None and render_params_distant is not None:
+                means_distant = torch.clamp(
+                    render_params_distant["means_r"].detach(),
+                    min=self.input_aabb_min,
+                    max=self.input_aabb_max,
+                )
+                node_state_distant.means.copy_(means_distant)
+                node_state_distant.scales_log.copy_(render_params_distant["scales_log_r"].detach())
+                node_state_distant.quats.copy_(render_params_distant["quats_r"].detach())
+                node_state_distant.opacity_logit.copy_(render_params_distant["opacity_logit_r"].detach())
+                node_state_distant.sh_dc.copy_(render_params_distant["sh_dc_r"].detach())
+                node_state_distant.sh_rest.copy_(render_params_distant["sh_rest_r"].detach())
 
     def _transform_rigid_to_world(
         self, node_state_rigid: NodeStateRigid, means_local: torch.Tensor, point_indices: torch.Tensor = None

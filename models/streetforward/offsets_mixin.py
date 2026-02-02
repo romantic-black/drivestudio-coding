@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 
@@ -259,3 +259,64 @@ class OffsetsMixin:
             "offset_opacity": offsets_world["offset_opacity"],  # 不变
             "offset_sh": offsets_world["offset_sh"],  # 不变
         }
+
+    def _predict_and_gate_offsets(
+        self,
+        feat_bg_input: torch.Tensor,
+        feat_rigid_input: torch.Tensor,
+        feat_distant_input: Optional[torch.Tensor],
+        node_state_rigid: Optional[NodeStateRigid],
+        node_state_distant: Optional[NodeState],
+        mask_update_rigid: Optional[torch.Tensor],
+    ) -> Tuple[Dict[str, torch.Tensor], Optional[Dict[str, torch.Tensor]], Optional[Dict[str, torch.Tensor]]]:
+        """
+        预测偏移量并对动态物体应用 gate。
+        """
+        offsets_bg = self._predict_offsets(feat_bg_input)
+
+        offsets_rigid_world = None
+        if node_state_rigid is not None and feat_rigid_input is not None and feat_rigid_input.numel() > 0:
+            offsets_rigid_world = self._predict_offsets(feat_rigid_input)
+            if mask_update_rigid is not None:
+                gate = mask_update_rigid.to(offsets_rigid_world["offset_pos"].dtype).unsqueeze(-1).detach()
+                offsets_rigid_world["offset_pos"] = offsets_rigid_world["offset_pos"] * gate
+                offsets_rigid_world["offset_scales"] = offsets_rigid_world["offset_scales"] * gate
+                offsets_rigid_world["offset_quat"] = offsets_rigid_world["offset_quat"] * gate
+                offsets_rigid_world["offset_opacity"] = offsets_rigid_world["offset_opacity"] * gate
+                offsets_rigid_world["offset_sh"] = offsets_rigid_world["offset_sh"] * gate
+            else:
+                raise ValueError("mask_update_rigid is not provided")
+
+        offsets_distant = None
+        if node_state_distant is not None and feat_distant_input is not None and feat_distant_input.numel() > 0:
+            offsets_distant = self._predict_offsets(feat_distant_input)
+
+        return offsets_bg, offsets_rigid_world, offsets_distant
+
+    def _compute_render_params_for_inner_iter(
+        self,
+        node_state_bg: NodeState,
+        node_state_rigid: Optional[NodeStateRigid],
+        node_state_distant: Optional[NodeState],
+        offsets_bg: Dict[str, torch.Tensor],
+        offsets_rigid_world: Optional[Dict[str, torch.Tensor]],
+        offsets_distant: Optional[Dict[str, torch.Tensor]],
+        source_frame_idx: int,
+    ) -> Tuple[Dict[str, torch.Tensor], Optional[Dict[str, torch.Tensor]], Optional[Dict[str, torch.Tensor]]]:
+        """
+        训练内一次迭代的渲染参数计算，处理 rigid 世界→局部变换。
+        """
+        render_params_bg = self._render_params_from_offsets(node_state_bg, offsets_bg)
+
+        render_params_rigid = None
+        if node_state_rigid is not None and offsets_rigid_world is not None:
+            offsets_rigid_local = self._transform_offsets_world_to_local(
+                node_state_rigid, offsets_rigid_world, source_frame_idx
+            )
+            render_params_rigid = self._render_params_from_offsets(node_state_rigid, offsets_rigid_local)
+
+        render_params_distant = None
+        if node_state_distant is not None and offsets_distant is not None:
+            render_params_distant = self._render_params_from_offsets(node_state_distant, offsets_distant)
+
+        return render_params_bg, render_params_rigid, render_params_distant

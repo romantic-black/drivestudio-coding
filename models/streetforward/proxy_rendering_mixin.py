@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict, Optional, Tuple
+import logging
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 
 from models.streetforward.logging_utils import _debug_log
 from models.streetforward.math_utils import _num_sh_bases, _sh_to_rgb, get_viewmat
+from models.streetforward.node_state_mixin import RigidMasks
 
 if TYPE_CHECKING:
     from models.streetforward.node_states import NodeState
@@ -108,6 +110,43 @@ class ProxyRenderingMixin:
             torch.cat(colors_list, dim=0),
         )
 
+    def _merge_params_with_rigid_subset(
+        self,
+        proxies_bg: Dict[str, torch.Tensor],
+        proxies_distant: Optional[Dict[str, torch.Tensor]],
+        rigid_subset: Dict[str, torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        合并参数，支持只渲染可见的 rigid 子集。
+        """
+        means_list = [proxies_bg["means_p"]]
+        quats_list = [proxies_bg["quats_p"]]
+        scales_list = [proxies_bg["scales_p"]]
+        opacities_list = [proxies_bg["opacities_p"]]
+        colors_list = [proxies_bg["colors_p"]]
+
+        if rigid_subset["means"].numel() > 0:
+            means_list.append(rigid_subset["means"])
+            quats_list.append(rigid_subset["quats"])
+            scales_list.append(rigid_subset["scales"])
+            opacities_list.append(rigid_subset["opacities"])
+            colors_list.append(rigid_subset["colors"])
+
+        if proxies_distant is not None:
+            means_list.append(proxies_distant["means_p"])
+            quats_list.append(proxies_distant["quats_p"])
+            scales_list.append(proxies_distant["scales_p"])
+            opacities_list.append(proxies_distant["opacities_p"])
+            colors_list.append(proxies_distant["colors_p"])
+
+        return (
+            torch.cat(means_list, dim=0),
+            torch.cat(quats_list, dim=0),
+            torch.cat(scales_list, dim=0),
+            torch.cat(opacities_list, dim=0),
+            torch.cat(colors_list, dim=0),
+        )
+
     def compute_loss(self, pred_rgb: torch.Tensor, gt_image: torch.Tensor) -> torch.Tensor:
         """
         计算 L2 损失（均方误差）。
@@ -120,6 +159,202 @@ class ProxyRenderingMixin:
             标量损失值：mean((pred_rgb - gt_image)²)
         """
         return torch.mean((pred_rgb - gt_image) ** 2)
+
+    def _render_targets_and_accumulate_loss(
+        self,
+        targets: List[Dict],
+        proxies_bg: Dict[str, torch.Tensor],
+        proxies_rigid: Optional[Dict[str, torch.Tensor]],
+        proxies_distant: Optional[Dict[str, torch.Tensor]],
+        node_state_rigid,
+        masks: RigidMasks,
+    ) -> Tuple[float, List[Dict]]:
+        """
+        遍历 target 视角，渲染并累积梯度到代理参数。
+        """
+        outputs: List[Dict] = []
+        total_loss_val = 0.0
+        view_count = max(len(targets), 1)
+        num_sh = _num_sh_bases(self.sh_degree)
+
+        for view_idx, target in enumerate(targets):
+            view = target["view"]
+            gt_img = target["gt_image"]
+            target_frame_idx = int(target.get("frame_idx", 0))
+            height, width = gt_img.shape[0], gt_img.shape[1]
+
+            means_rigid_world = torch.empty(0, 3, device=self.device)
+            quats_rigid_world = torch.empty(0, 4, device=self.device)
+            rigid_scales_subset = torch.empty(0, 3, device=self.device)
+            opacities_rigid = None
+            rigid_sh_subset = torch.empty(0, num_sh, 3, device=self.device)
+
+            if proxies_rigid is not None and node_state_rigid is not None:
+                node_state_rigid.cur_frame = target_frame_idx
+                if view_idx < len(masks.idx_tgt_rigid) and masks.idx_tgt_rigid[view_idx].numel() > 0:
+                    idx = masks.idx_tgt_rigid[view_idx]
+                    rigid_means_local_subset = proxies_rigid["means_p"][idx]
+                    rigid_quats_local_subset = proxies_rigid["quats_p"][idx]
+                    rigid_scales_subset = proxies_rigid["scales_p"][idx]
+                    opacities_rigid = proxies_rigid["opacities_p"][idx]
+                    rigid_sh_subset = proxies_rigid["colors_p"][idx]
+
+                    means_rigid_world = self._transform_rigid_to_world(
+                        node_state_rigid, rigid_means_local_subset, point_indices=idx
+                    )
+                    quats_rigid_world = self._transform_rigid_quats_to_world(
+                        node_state_rigid, rigid_quats_local_subset, point_indices=idx
+                    )
+
+            rigid_subset = {
+                "means": means_rigid_world,
+                "quats": quats_rigid_world,
+                "scales": rigid_scales_subset,
+                "opacities": opacities_rigid if opacities_rigid is not None else torch.empty(0, device=self.device),
+                "colors": rigid_sh_subset,
+            }
+
+            if proxies_rigid is not None and rigid_subset["means"].numel() > 0:
+                merged_means, merged_quats, merged_scales, merged_opacities, merged_colors = self._merge_params_with_rigid_subset(
+                    proxies_bg=proxies_bg,
+                    proxies_distant=proxies_distant,
+                    rigid_subset=rigid_subset,
+                )
+            else:
+                merged_means, merged_quats, merged_scales, merged_opacities, merged_colors = self._merge_all_params(
+                    proxies_bg=proxies_bg,
+                    proxies_rigid=proxies_rigid,
+                    proxies_distant=proxies_distant,
+                    means_rigid_world=means_rigid_world,
+                    quats_rigid_world=quats_rigid_world,
+                    opacities_rigid=opacities_rigid,
+                )
+
+            merged_params = {
+                "means_p": merged_means,
+                "scales_p": merged_scales,
+                "quats_p": merged_quats,
+                "opacities_p": merged_opacities,
+                "colors_p": merged_colors,
+            }
+
+            rgb, acc = self._render_single_view(merged_params, view, height, width)
+            loss = self.compute_loss(rgb, gt_img) / view_count
+            total_loss_val += float(loss.detach())
+            loss.backward()
+
+            if masks.mask_any_tgt_rigid is not None and proxies_rigid is not None and proxies_rigid["means_p"].grad is not None:
+                grad_means_not_rendered = proxies_rigid["means_p"].grad[~masks.mask_any_tgt_rigid]
+                if grad_means_not_rendered.numel() > 0:
+                    max_grad_not_rendered = grad_means_not_rendered.abs().max().item()
+                    if max_grad_not_rendered > 1e-6:
+                        import warnings
+                        warnings.warn(
+                            f"[Sanity Check B] Gradients for points not rendered in any target should be 0, "
+                            f"but max abs value is {max_grad_not_rendered:.2e}. This may indicate a bug."
+                        )
+
+            if view_idx < len(masks.idx_tgt_rigid):
+                num_visible = len(masks.idx_tgt_rigid[view_idx])
+                num_total = node_state_rigid.means.shape[0] if node_state_rigid is not None else 0
+                if num_total > 0 and num_visible == 0:
+                    import warnings
+                    warnings.warn(
+                        f"[Sanity Check C] Target {view_idx} has no visible rigid points ({num_visible}/{num_total}). "
+                        f"This may indicate a visibility issue."
+                    )
+
+            if getattr(self, "log_images", False):
+                outputs.append(
+                    {
+                        "rgb": rgb.detach().cpu(),
+                        "acc": acc.detach().cpu(),
+                        "loss": loss.detach().item(),
+                    }
+                )
+            else:
+                outputs.append({"loss": loss.detach().item()})
+
+        return total_loss_val, outputs
+
+    def _backward_to_render_params(
+        self,
+        render_params_bg: Dict[str, torch.Tensor],
+        render_params_rigid: Optional[Dict[str, torch.Tensor]],
+        render_params_distant: Optional[Dict[str, torch.Tensor]],
+        proxies_bg: Dict[str, torch.Tensor],
+        proxies_rigid: Optional[Dict[str, torch.Tensor]],
+        proxies_distant: Optional[Dict[str, torch.Tensor]],
+    ) -> Dict[str, float]:
+        """
+        将 proxy 梯度反传到渲染参数。
+        """
+        grad_report: Dict[str, float] = {}
+        grad_warned = getattr(self, "_proxy_grad_warned", set())
+
+        def _grad_or_zero(proxy_tensor: torch.Tensor, name: str) -> torch.Tensor:
+            grad = proxy_tensor.grad
+            if grad is None:
+                if name not in grad_warned:
+                    logger = logging.getLogger(__name__)
+                    logger.warning(f"Proxy gradient for {name} is None; using zeros for backward.")
+                    grad_warned.add(name)
+                grad_report[name] = 0.0
+                return torch.zeros_like(proxy_tensor)
+            grad_report[name] = float(grad.norm().detach())
+            return grad
+
+        render_tensors = [
+            render_params_bg["means_r"],
+            render_params_bg["scales_r"],
+            render_params_bg["quats_r"],
+            render_params_bg["opacities_r"],
+            render_params_bg["colors_r"],
+        ]
+        grad_tensors = [
+            _grad_or_zero(proxies_bg["means_p"], "bg.means"),
+            _grad_or_zero(proxies_bg["scales_p"], "bg.scales"),
+            _grad_or_zero(proxies_bg["quats_p"], "bg.quats"),
+            _grad_or_zero(proxies_bg["opacities_p"], "bg.opacities"),
+            _grad_or_zero(proxies_bg["colors_p"], "bg.colors"),
+        ]
+
+        if render_params_rigid is not None and proxies_rigid is not None:
+            render_tensors += [
+                render_params_rigid["means_r"],
+                render_params_rigid["scales_r"],
+                render_params_rigid["quats_r"],
+                render_params_rigid["opacities_r"],
+                render_params_rigid["colors_r"],
+            ]
+            grad_tensors += [
+                _grad_or_zero(proxies_rigid["means_p"], "rigid.means"),
+                _grad_or_zero(proxies_rigid["scales_p"], "rigid.scales"),
+                _grad_or_zero(proxies_rigid["quats_p"], "rigid.quats"),
+                _grad_or_zero(proxies_rigid["opacities_p"], "rigid.opacities"),
+                _grad_or_zero(proxies_rigid["colors_p"], "rigid.colors"),
+            ]
+
+        if render_params_distant is not None and proxies_distant is not None:
+            render_tensors += [
+                render_params_distant["means_r"],
+                render_params_distant["scales_r"],
+                render_params_distant["quats_r"],
+                render_params_distant["opacities_r"],
+                render_params_distant["colors_r"],
+            ]
+            grad_tensors += [
+                _grad_or_zero(proxies_distant["means_p"], "distant.means"),
+                _grad_or_zero(proxies_distant["scales_p"], "distant.scales"),
+                _grad_or_zero(proxies_distant["quats_p"], "distant.quats"),
+                _grad_or_zero(proxies_distant["opacities_p"], "distant.opacities"),
+                _grad_or_zero(proxies_distant["colors_p"], "distant.colors"),
+            ]
+
+        self._proxy_grad_warned = grad_warned
+        self._last_proxy_grad_norms = grad_report
+        torch.autograd.backward(tensors=render_tensors, grad_tensors=grad_tensors)
+        return grad_report
 
     def _compute_render_params(self, node_state: NodeState) -> Dict[str, torch.Tensor]:
         """

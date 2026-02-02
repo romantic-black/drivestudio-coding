@@ -106,11 +106,7 @@ class FeatureVolumeMixin:
                     means_list.append(means_rigid_world_all[effective_mask])
                     rgb_list.append(anchor_rgb_rigid_all[effective_mask])
             elif rigid_visible_mask is not None:
-                # 回退到旧的逻辑（兼容性）
-                effective_mask = rigid_visible_mask & rigid_in_crop_mask
-                if effective_mask.any():
-                    means_list.append(means_rigid_world_all[effective_mask])
-                    rgb_list.append(anchor_rgb_rigid_all[effective_mask])
+                raise ValueError("mask_src_rigid and idx_src_rigid are not provided")
 
         means_all = torch.cat(means_list, dim=0)
         anchor_rgb_all = torch.cat(rgb_list, dim=0)
@@ -338,6 +334,66 @@ class FeatureVolumeMixin:
         # #endregion
         
         return feat_3d_crop_bg, feat_3d_crop_rigid, rigid_visible_mask, rigid_in_crop_mask
+
+    def _compute_and_fuse_features(
+        self,
+        node_state_bg: NodeState,
+        node_state_rigid: Optional[NodeStateRigid],
+        node_state_distant: Optional[NodeStateDistant],
+        source_frame_idx: int,
+        rigid_visible_mask: Optional[torch.Tensor],
+        feat_bg: torch.Tensor,
+        feat_rigid: torch.Tensor,
+        source_views: List,
+        source_images: List[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        计算 2D 特征并与 3D 特征融合，返回融合后的输入及原始 2D 特征。
+        """
+        feat_bg_input = feat_bg
+        feat_rigid_input = feat_rigid
+        feat_distant_input = None
+        feat_2d_bg = None
+        feat_2d_rigid = None
+        feat_2d_distant = None
+
+        if self.use_2d_features:
+            feat_2d_bg, feat_2d_rigid, feat_2d_distant = self._compute_2d_features_all(
+                node_state_bg=node_state_bg,
+                node_state_rigid=node_state_rigid,
+                node_state_distant=node_state_distant,
+                source_views=source_views,
+                source_images=source_images,
+                source_frame_idx=source_frame_idx,
+                rigid_visible_mask=rigid_visible_mask,
+            )
+
+            if feat_2d_bg is not None and feat_bg.shape[0] == feat_2d_bg.shape[0]:
+                vis_bg = torch.ones(feat_bg.shape[0], device=self.device)
+                feat_bg_input = self._fuse_features(feat_bg, feat_2d_bg, vis_bg)
+
+            if (
+                node_state_rigid is not None
+                and feat_rigid.shape[0] > 0
+                and feat_2d_rigid is not None
+                and feat_2d_rigid.shape[0] == feat_rigid.shape[0]
+            ):
+                vis_rigid = rigid_visible_mask.float() if rigid_visible_mask is not None else torch.ones(feat_rigid.shape[0], device=self.device)
+                feat_rigid_input = self._fuse_features(feat_rigid, feat_2d_rigid, vis_rigid)
+
+            if node_state_distant is not None and feat_2d_distant is not None:
+                zeros_3d = torch.zeros(feat_2d_distant.shape[0], self.feat_3d_dim, device=self.device)
+                vis_distant = torch.ones(feat_2d_distant.shape[0], device=self.device)
+                feat_distant_input = self._fuse_features(zeros_3d, feat_2d_distant, vis_distant)
+
+        return (
+            feat_bg_input,
+            feat_rigid_input,
+            feat_distant_input,
+            feat_2d_bg,
+            feat_2d_rigid,
+            feat_2d_distant,
+        )
 
     def _prepare_gaussians_for_source(
         self,
