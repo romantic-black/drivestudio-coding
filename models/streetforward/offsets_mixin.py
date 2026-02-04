@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Dict, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 
 from models.streetforward.logging_utils import _debug_log
 from models.streetforward.math_utils import (
@@ -15,6 +16,12 @@ from models.streetforward.math_utils import (
 )
 from models.streetforward.node_states import NodeStateRigid, NodeState
 
+
+def _quat_to_rot6d(quats: torch.Tensor) -> torch.Tensor:
+    """Convert unit quaternions (wxyz) to 6D rotation representation (first two columns of R)."""
+    rot = _quat_to_rotmat(_normalize_quat(quats))
+    rot6d = rot[..., :3, :2].reshape(quats.shape[:-1] + (6,))
+    return rot6d
 
 
 class OffsetsMixin:
@@ -140,6 +147,167 @@ class OffsetsMixin:
             "offset_opacity": offset_opacity,
             "offset_sh": offset_sh,
         }
+
+    # --- GRU-style offset prediction helpers ---
+    def _normalize_params_for_embed(
+        self,
+        params: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Normalize and compress NodeState params into a fixed-length vector for embedding.
+
+        Returns:
+            param_vec: [N, 17] tensor = means(3) + rot6d(6) + scales_norm(3) +
+                       opacity_norm(1) + sh_dc(3) + sh_rest_energy(1)
+        """
+        means = params["means"]  # assumed world coords for bg/distant; world-transformed for rigid
+        scales_log = params["scales_log"]
+        quats = params["quats"]
+        opacity_logit = params["opacity_logit"]
+        sh_dc = params["sh_dc"]
+        sh_rest = params["sh_rest"]
+
+        # means -> [-1,1] using bbox
+        bbx_min = self.bbx_min.to(means.device)
+        bbx_max = self.bbx_max.to(means.device)
+        denom = (bbx_max - bbx_min).clamp(min=1e-6)
+        means_norm = (means - bbx_min) / denom * 2.0 - 1.0
+
+        # scales log clamp + layer norm
+        scales_clamped = scales_log.clamp(-10.0, 10.0)
+        scales_norm = F.layer_norm(scales_clamped, scales_clamped.shape[1:])
+
+        # rotation 6d
+        rot6d = _quat_to_rot6d(quats)
+
+        # opacity logit normalize (tanh keeps within [-1,1])
+        opacity_norm = torch.tanh(opacity_logit)
+
+        # sh_dc keep raw; sh_rest energy scalar
+        sh_rest_energy = torch.linalg.norm(sh_rest.reshape(sh_rest.shape[0], -1), dim=-1, keepdim=True)
+
+        param_vec = torch.cat(
+            [
+                means_norm,
+                rot6d,
+                scales_norm,
+                opacity_norm,
+                sh_dc,
+                sh_rest_energy,
+            ],
+            dim=-1,
+        )
+        return param_vec
+
+    def _build_params_for_embed(
+        self,
+        node_state: NodeState,
+        coord_space: str = "world",
+        frame_idx: Optional[int] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Gather parameters for embedding. For rigid, coord_space='world' transforms to world frame.
+        """
+        params = {
+            "means": node_state.means,
+            "scales_log": node_state.scales_log,
+            "quats": node_state.quats,
+            "opacity_logit": node_state.opacity_logit,
+            "sh_dc": node_state.sh_dc,
+            "sh_rest": node_state.sh_rest,
+        }
+
+        if isinstance(node_state, NodeStateRigid) and coord_space == "world":
+            assert frame_idx is not None, "frame_idx is required for rigid world transform"
+            params["means"] = self._transform_rigid_to_world(node_state, node_state.means, frame_idx=frame_idx)
+            params["quats"] = self._transform_rigid_quats_to_world(node_state, node_state.quats, frame_idx=frame_idx)
+
+        return params
+
+    def _predict_offsets_gru(
+        self,
+        feat: torch.Tensor,
+        params_for_embed: Dict[str, torch.Tensor],
+        h_old: torch.Tensor,
+        mask_update_rigid: Optional[torch.Tensor] = None,
+    ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
+        """
+        GRU-style fusion of features + params to predict offsets and updated hidden state.
+
+        Args:
+            feat: [N, C_fused]
+            params_for_embed: dict with means/quats/scales_log/opacity_logit/sh_dc/sh_rest
+            h_old: [N, H]
+            mask_update_rigid: optional [N] bool for rigid gating
+        """
+        if feat is None or feat.numel() == 0:
+            # Empty case: no features → return "no-change" offsets.
+            # offset_quat must be identity [1,0,0,0] so quat_multiply(q, identity)=q; zeros would be invalid.
+            num_points = params_for_embed["means"].shape[0]
+            device = self.device if hasattr(self, "device") else params_for_embed["means"].device
+            dtype = params_for_embed["means"].dtype
+            identity_quat = torch.zeros(num_points, 4, device=device, dtype=dtype)
+            identity_quat[..., 0] = 1.0
+            zero_offsets = {
+                "offset_pos": torch.zeros_like(params_for_embed["means"]),
+                "offset_scales": torch.zeros_like(params_for_embed["scales_log"]),
+                "offset_quat": identity_quat.clone(),  # identity = no rotation change
+                "offset_opacity": torch.zeros_like(params_for_embed["opacity_logit"]),
+                "offset_sh": torch.zeros(
+                    num_points,
+                    self.gaussion_decoder[-1].out_features if hasattr(self.gaussion_decoder[-1], "out_features") else _num_sh_bases(self.sh_degree) * 3,
+                    device=device,
+                    dtype=dtype,
+                ),
+            }
+            h_new = h_old
+            if mask_update_rigid is not None:
+                gate = mask_update_rigid.unsqueeze(-1).float().detach()
+                identity_quat = torch.zeros(num_points, 4, device=device, dtype=dtype)
+                identity_quat[..., 0] = 1.0
+                for k in zero_offsets:
+                    if k == "offset_quat":
+                        zero_offsets[k] = torch.where(
+                            gate.expand_as(zero_offsets[k]).bool(), zero_offsets[k], identity_quat
+                        )
+                    else:
+                        zero_offsets[k] = zero_offsets[k] * gate
+                h_new = h_old * (1 - gate) + h_new * gate
+            return zero_offsets, h_new
+
+        param_vec = self._normalize_params_for_embed(params_for_embed)
+        param_embed = self.mlp_params_embed(param_vec)
+        param_embed = self.param_embed_norm(param_embed)
+
+        x = torch.cat([feat, param_embed], dim=-1)
+        hx = torch.cat([h_old, x], dim=-1)
+
+        z = torch.sigmoid(self.gru_update(hx))
+        if self.gru_reset is not None:
+            r = torch.sigmoid(self.gru_reset(hx))
+            h_cand = torch.tanh(self.gru_candidate(torch.cat([r * h_old, x], dim=-1)))
+        else:
+            h_cand = torch.tanh(self.gru_candidate(hx))
+        h_new = (1.0 - z) * h_old + z * h_cand
+
+        # Project to offset head input dim if needed
+        head_input = self.gru_to_head(h_new)
+        offsets = self._predict_offsets(head_input)
+
+        if mask_update_rigid is not None:
+            gate = mask_update_rigid.to(offsets["offset_pos"].dtype).unsqueeze(-1).detach()
+            identity_quat = torch.zeros_like(offsets["offset_quat"])
+            identity_quat[..., 0] = 1.0
+            for k in offsets:
+                if k == "offset_quat":
+                    offsets[k] = torch.where(
+                        gate.expand_as(offsets[k]).bool(), offsets[k], identity_quat
+                    )
+                else:
+                    offsets[k] = offsets[k] * gate
+            h_new = h_old * (1 - gate) + h_new * gate
+
+        return offsets, h_new
 
     def _render_params_from_offsets(
         self, node_state: NodeState, offsets: Dict[str, torch.Tensor]

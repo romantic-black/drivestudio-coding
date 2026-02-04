@@ -157,6 +157,36 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
             self.feature_backprojector = None
             self.feature_fusion = None
 
+        # GRU-style hidden fusion settings
+        self.param_embed_input_dim = 17  # means(3) + rot6d(6) + scales(3) + opacity(1) + sh_dc(3) + sh_rest_energy(1)
+        self.param_embed_dim = int(model_cfg.get("param_embed_dim", fused_in_dim))
+        self.offset_gru_hidden_dim = int(model_cfg.get("offset_gru_hidden_dim", fused_in_dim))
+        self.offset_gru_use_reset_gate = bool(model_cfg.get("offset_gru_use_reset_gate", True))
+
+        # Parameter embedding MLP (shared by bg/rigid/distant)
+        self.mlp_params_embed = nn.Sequential(
+            nn.Linear(self.param_embed_input_dim, self.param_embed_dim),
+            nn.ReLU(),
+            nn.Linear(self.param_embed_dim, self.param_embed_dim),
+        ).to(device)
+        self.param_embed_norm = nn.LayerNorm(self.param_embed_dim).to(device)
+
+        # GRU-style fusion layers
+        gru_in_dim = fused_in_dim + self.param_embed_dim
+        self.gru_update = nn.Linear(gru_in_dim + self.offset_gru_hidden_dim, self.offset_gru_hidden_dim).to(device)
+        self.gru_candidate = nn.Linear(gru_in_dim + self.offset_gru_hidden_dim, self.offset_gru_hidden_dim).to(device)
+        self.gru_reset = (
+            nn.Linear(gru_in_dim + self.offset_gru_hidden_dim, self.offset_gru_hidden_dim).to(device)
+            if self.offset_gru_use_reset_gate
+            else None
+        )
+
+        # Hidden → offset head projection (keeps head shapes backward compatible)
+        if self.offset_gru_hidden_dim != fused_in_dim:
+            self.gru_to_head = nn.Linear(self.offset_gru_hidden_dim, fused_in_dim).to(device)
+        else:
+            self.gru_to_head = nn.Identity()
+
         # MLP 偏移量预测头（支持 2D+3D 融合特征）
         # 位置偏移预测网络：fused_in_dim → 64 → 32 → 3
         self.mlp_offset_pos = nn.Sequential(
@@ -198,6 +228,14 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
 
         params: List[torch.nn.Parameter] = []
         params += list(self.sparse_conv.parameters())
+        params += list(self.mlp_params_embed.parameters())
+        params += list(self.param_embed_norm.parameters())
+        params += list(self.gru_update.parameters())
+        params += list(self.gru_candidate.parameters())
+        if self.gru_reset is not None:
+            params += list(self.gru_reset.parameters())
+        if not isinstance(self.gru_to_head, nn.Identity):
+            params += list(self.gru_to_head.parameters())
         params += list(self.mlp_offset_pos.parameters())
         params += list(self.mlp_conv.parameters())
         params += list(self.mlp_opacity.parameters())
@@ -235,8 +273,12 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
         self.node_states_bg = self.node_states
         self.node_states_rigid: Dict[Tuple[int, int], Optional[NodeStateRigid]] = {}
         self.node_states_distant: Dict[Tuple[int, int], Optional[NodeStateDistant]] = {}
+        # Hidden state caches for GRU-style offsets
+        self.h_cache_bg: Dict[Tuple[int, int], torch.Tensor] = {}
+        self.h_cache_rigid: Dict[Tuple[int, int], torch.Tensor] = {}
+        self.h_cache_distant: Dict[Tuple[int, int], torch.Tensor] = {}
         self._lpips_model = None
-        
+
         # Initialize offset heads to output near-zero offsets
         self._init_offset_heads()
 
@@ -255,6 +297,17 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
         nn.init.zeros_(self.mlp_opacity[-1].bias)
         nn.init.zeros_(self.gaussion_decoder[-1].weight)
         nn.init.zeros_(self.gaussion_decoder[-1].bias)
+
+    def _get_or_init_hidden(self, cache: Dict[Tuple[int, int], torch.Tensor], key: Tuple[int, int], num_points: int) -> torch.Tensor:
+        """
+        Fetch hidden state from cache or initialize zeros. Detach to truncate BPTT across train_iter.
+        """
+        h = cache.get(key)
+        if h is None:
+            return torch.zeros(num_points, self.offset_gru_hidden_dim, device=self.device)
+        if h.shape[0] != num_points:
+            raise ValueError(f"h_cache shape mismatch for key {key}: cached {h.shape[0]} vs current {num_points}")
+        return h.detach()
 
     def _setup_tensorboard(self, training_cfg) -> None:
         """
@@ -379,6 +432,11 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
                 hypothesis_id="H4",
             )
 
+        # Hidden state seeds (detach to stop grad across train_iter)
+        h_bg = self._get_or_init_hidden(self.h_cache_bg, key, node_state_bg.means.shape[0])
+        h_rigid = self._get_or_init_hidden(self.h_cache_rigid, key, node_state_rigid.means.shape[0]) if node_state_rigid is not None else None
+        h_distant = self._get_or_init_hidden(self.h_cache_distant, key, node_state_distant.means.shape[0]) if node_state_distant is not None else None
+
         for _ in range(self.inner_iterations):
             result = self._train_inner_iteration(
                 batch=batch,
@@ -386,6 +444,9 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
                 node_state_bg=node_state_bg,
                 node_state_rigid=node_state_rigid,
                 node_state_distant=node_state_distant,
+                h_old_bg=h_bg,
+                h_old_rigid=h_rigid,
+                h_old_distant=h_distant,
             )
             total_loss_val += result["loss_val"]
             outputs.extend(result["outputs"])
@@ -393,6 +454,10 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
             if apply_update:
                 self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)
+
+            h_bg = result["h_new_bg"]
+            h_rigid = result["h_new_rigid"]
+            h_distant = result["h_new_distant"]
 
             if update_state:
                 self._update_node_states(
@@ -407,6 +472,13 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
         self.node_states[key] = node_state_bg.detach_clone()
         self.node_states_rigid[key] = node_state_rigid.detach_clone() if node_state_rigid is not None else None
         self.node_states_distant[key] = node_state_distant.detach_clone() if node_state_distant is not None else None
+
+        if update_state:
+            self.h_cache_bg[key] = h_bg.detach()
+            if node_state_rigid is not None:
+                self.h_cache_rigid[key] = h_rigid.detach()
+            if node_state_distant is not None:
+                self.h_cache_distant[key] = h_distant.detach()
 
         if apply_update:
             self.global_step += 1
@@ -476,6 +548,9 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
         node_state_bg: NodeState,
         node_state_rigid: Optional[NodeStateRigid],
         node_state_distant: Optional[NodeStateDistant],
+        h_old_bg: torch.Tensor,
+        h_old_rigid: Optional[torch.Tensor],
+        h_old_distant: Optional[torch.Tensor],
     ) -> Dict:
         """
         单次 inner iteration 的编排：构建特征 → 偏移 → 渲染参数 → 渲染 & 反传。
@@ -517,14 +592,50 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
         self._last_feat_rigid_input = feat_rigid_input
         self._last_feat_distant_input = feat_distant_input
 
-        offsets_bg, offsets_rigid_world, offsets_distant = self._predict_and_gate_offsets(
-            feat_bg_input=feat_bg_input,
-            feat_rigid_input=feat_rigid_input,
-            feat_distant_input=feat_distant_input,
-            node_state_rigid=node_state_rigid,
-            node_state_distant=node_state_distant,
-            mask_update_rigid=masks.mask_update_rigid,
+        # Build params for embedding (transform rigid to world for alignment)
+        params_bg = self._build_params_for_embed(node_state_bg, coord_space="world")
+        params_rigid = None
+        if node_state_rigid is not None:
+            params_rigid = self._build_params_for_embed(node_state_rigid, coord_space="world", frame_idx=source_frame_idx)
+        params_distant = None
+        if node_state_distant is not None:
+            params_distant = self._build_params_for_embed(node_state_distant, coord_space="world")
+
+        offsets_bg, h_new_bg = self._predict_offsets_gru(
+            feat=feat_bg_input,
+            params_for_embed=params_bg,
+            h_old=h_old_bg,
+            mask_update_rigid=None,
         )
+
+        offsets_rigid_world, h_new_rigid = None, h_old_rigid
+        if node_state_rigid is not None and feat_rigid_input is not None and feat_rigid_input.numel() > 0:
+            offsets_rigid_world, h_new_rigid = self._predict_offsets_gru(
+                feat=feat_rigid_input,
+                params_for_embed=params_rigid,
+                h_old=h_old_rigid if h_old_rigid is not None else torch.zeros(
+                    node_state_rigid.means.shape[0],
+                    self.offset_gru_hidden_dim,
+                    device=self.device,
+                ),
+                mask_update_rigid=masks.mask_update_rigid,
+            )
+        elif node_state_rigid is not None:
+            # keep hidden unchanged if no features
+            h_new_rigid = h_old_rigid
+
+        offsets_distant, h_new_distant = None, h_old_distant
+        if node_state_distant is not None and feat_distant_input is not None and feat_distant_input.numel() > 0:
+            offsets_distant, h_new_distant = self._predict_offsets_gru(
+                feat=feat_distant_input,
+                params_for_embed=params_distant,
+                h_old=h_old_distant if h_old_distant is not None else torch.zeros(
+                    node_state_distant.means.shape[0],
+                    self.offset_gru_hidden_dim,
+                    device=self.device,
+                ),
+                mask_update_rigid=None,
+            )
 
         self._last_offsets_bg = offsets_bg
         self._last_offsets_rigid = offsets_rigid_world
@@ -579,6 +690,9 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
             "render_params_bg": render_params_bg,
             "render_params_rigid": render_params_rigid,
             "render_params_distant": render_params_distant,
+            "h_new_bg": h_new_bg,
+            "h_new_rigid": h_new_rigid,
+            "h_new_distant": h_new_distant,
         }
 
     def forward(self, batch: Dict) -> Dict:

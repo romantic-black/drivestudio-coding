@@ -2,6 +2,14 @@
 
 本文档详细梳理了 `StreetForwardTrainer` 的训练流程、数据结构和关键组件。
 
+> **模块结构（Phase 2 重构后）**：训练逻辑分布在 `models/streetforward/` 下：
+> - `trainer.py`：主编排、`train_iter`、`_train_inner_iteration`、`_parse_targets`、`_get_source_frame_idx`
+> - `node_state_mixin.py`：`_get_or_init_node_states`、`_precompute_rigid_masks`、`_update_node_states`、Rigid 变换
+> - `feature_volume_mixin.py`：`_build_3d_feature_volume`、`_compute_and_fuse_features`
+> - `offsets_mixin.py`：`_predict_offsets`、`_predict_offsets_gru`、`_compute_render_params_for_inner_iter`、`_render_params_from_offsets`
+> - `proxy_rendering_mixin.py`：`_create_proxy_params`、`_render_targets_and_accumulate_loss`、`_backward_to_render_params`、`_merge_params_with_rigid_subset`
+> - `metrics.py`：`compute_psnr`、`compute_ssim`、`compute_lpips`、`evaluate_test_views`
+
 ## 目录
 1. [整体架构](#整体架构)
 2. [训练流程](#训练流程)
@@ -23,6 +31,7 @@ StreetForwardTrainer 实现了基于代理（Proxy）的多视角梯度累积的
   - `NodeStateRigid`：存储动态物体的高斯参数（局部坐标系）
   - `NodeStateDistant`：存储背景远景的高斯参数（世界坐标系，可选）
 - **前馈预测**：通过 3D 特征体积（可选融合 2D 特征）预测偏移量（offsets），静态和动态物体共享相同的 MLP 网络
+- **GRU-style Hidden Fusion（当前实现）**：训练时将「点的融合特征」与「NodeState 参数 embedding」通过 GRU 风格更新得到 `h_new`，再用 `h_new` 作为偏移头输入预测 offsets；并在 `train_iter` 级别缓存 `h_cache_{bg,rigid,distant}`，实现跨 iter 的状态记忆（每次 `train_iter` 起始处对 `h_old` 做 `detach()` 截断跨 iter 梯度）
 - **2D/3D 特征融合**：可选地从源视图提取 2D 图像特征，与 3D 特征融合以增强表示能力
 - **代理参数渲染**：使用代理参数进行渲染，实现多视角梯度累积
 - **单次反向传播**：每个迭代只进行一次反向传播
@@ -104,49 +113,43 @@ StreetForwardTrainer 实现了基于代理（Proxy）的多视角梯度累积的
 
 ```mermaid
 graph TD
-    A[开始: train_iter] --> B{获取或初始化NodeState}
-    B -->|已存在| C[使用现有NodeState]
-    B -->|不存在| D[从点云初始化多NodeState<br/>Background + RigidNodes + Distant]
-    D --> C
-    C --> E{是否有targets?}
-    E -->|否| F[返回零损失]
-    E -->|是| G[获取source_frame动态信息]
-    G --> H[设置RigidNodes.cur_frame = source_frame_idx]
-    H --> I[清零梯度]
-    I --> J[开始inner_iterations循环]
-    J --> K[变换RigidNodes到source帧<br/>合并静态+动态点云]
-    K --> L[构建3D特征体积]
-    L --> L1{是否启用2D特征?}
-    L1 -->|是| L2[计算2D特征<br/>从源视图提取]
-    L1 -->|否| M
-    L2 --> L3[融合2D/3D特征]
-    L3 --> M[预测偏移量<br/>静态+动态+远景共同预测]
-    M --> M1[屏蔽不可见动态物体偏移量]
-    M1 --> N[计算渲染参数<br/>分别应用到各NodeState]
-    N --> O[创建代理参数<br/>分别创建各类型代理]
-    O --> P[遍历所有target帧]
-    P --> Q[设置RigidNodes.cur_frame = target.frame_idx]
-    Q --> R[变换RigidNodes到target帧]
-    R --> S[合并静态+动态+远景参数到世界坐标]
-    S --> T[应用动态物体可见性掩码]
-    T --> U[渲染图像]
-    U --> V[计算损失]
-    V --> W[反向传播到代理]
-    W --> X{是否还有target帧?}
-    X -->|是| P
-    X -->|否| Y[反向传播到渲染参数<br/>分别处理静态、动态和远景]
-    Y --> Z{是否apply_update?}
-    Z -->|是| AA[优化器更新]
-    Z -->|否| AB[跳过更新]
-    AA --> AC{是否update_state?}
-    AB --> AC
-    AC -->|是| AD[更新所有NodeState<br/>Background + Rigid + Distant]
-    AC -->|否| AE[保持原状态]
-    AD --> AF{是否还有inner_iter?}
-    AE --> AF
-    AF -->|是| J
-    AF -->|否| AG[保存所有NodeState并返回]
+    A[开始: train_iter] --> B[_get_or_init_node_states]
+    B --> C[_parse_targets]
+    C --> D{是否有targets?}
+    D -->|否| E[返回零损失]
+    D -->|是| F[清零梯度]
+    F --> F1[从 h_cache 取 h_old 并 detach]
+    F1 --> G[开始inner_iterations循环]
+    G --> H[_train_inner_iteration]
+    H --> H1[预计算RigidMasks]
+    H1 --> H2[构建3D特征+2D融合]
+    H2 --> H3[GRU-style 预测偏移量+gate(rigid)]
+    H3 --> H4[计算渲染参数]
+    H4 --> H5[创建代理参数]
+    H5 --> H6[多target渲染+损失]
+    H6 --> H7[反向传播到渲染参数]
+    H7 --> I{是否apply_update?}
+    I -->|是| J[优化器更新]
+    I -->|否| K[跳过更新]
+    J --> L{是否update_state?}
+    K --> L
+    L -->|是| M[_update_node_states]
+    L -->|否| N[保持原状态]
+    M --> O{是否还有inner_iter?}
+    N --> O
+    O -->|是| G
+    O -->|否| P[保存NodeState + 写回 h_cache 并返回]
 ```
+
+**_train_inner_iteration 内部步骤（对应方法）：**
+1. `_get_source_frame_idx` → `_precompute_rigid_masks`（返回 `RigidMasks`）
+2. `_build_3d_feature_volume`（传入 `mask_src_rigid`, `idx_src_rigid`）
+3. `_compute_and_fuse_features`（2D 特征 + 融合）
+4. `_build_params_for_embed` + `_predict_offsets_gru`（GRU-style 融合 + `mask_update_rigid` gate，仅 rigid 需要）
+5. `_compute_render_params_for_inner_iter`
+6. `_create_proxy_params`
+7. `_render_targets_and_accumulate_loss`（含 `_merge_params_with_rigid_subset` 支持 rigid 子集）
+8. `_backward_to_render_params`
 
 ### 详细步骤说明
 
@@ -160,10 +163,10 @@ graph TD
 
 **处理流程：**
 ```
-点云数据 → 分离静态、动态和远景 → 
-  静态: 提取坐标和颜色 → 计算初始尺度 → 生成随机四元数 → 创建NodeStateBackground
+点云数据 → 先按 input_aabb 过滤 → 再按 bbx(crop) 切分前景/远景 →
+  前景(在bbx内): 提取坐标和颜色 → 计算初始尺度 → 生成随机四元数 → 创建NodeStateBackground
   动态: 提取坐标和颜色 → 计算初始尺度 → 生成随机四元数 → 创建NodeStateRigid（局部坐标）
-  远景: 提取坐标和颜色 → 计算初始尺度 → 生成随机四元数 → 创建NodeStateDistant（世界坐标，可选）
+  远景(在bbx外但仍在input_aabb内): 提取坐标和颜色 → 计算初始尺度 → 生成随机四元数 → 创建NodeStateDistant（世界坐标，可选）
 ```
 
 **关键操作：**
@@ -171,24 +174,42 @@ graph TD
 - **动态物体**：从 `pointcloud["dynamic"]` 获取各实例的点云（局部坐标）；从 `dynamic_info` 初始化 `instances_quats` 和 `instances_trans`；记录 `point_ids` 以关联每个点到实例；初始化 `instances_fv` 记录可见性
 - **背景远景**：从 `pointcloud["distant"]` 获取远景点云（世界坐标，可选）；使用与静态背景相同的初始化方法
 
-#### 2. 3D 特征体积构建 (`_build_3d_feature_volume`)
+#### 2. 预计算 Rigid 掩码 (`_precompute_rigid_masks`)
+
+**归属：** NodeStateMixin
+
+**输入：** `node_state_rigid`, `source_frame_idx`, `targets`
+
+**返回：** `RigidMasks` 数据类，包含：
+- `mask_src_rigid`: source 帧有有效位姿且可见的点
+- `mask_tgt_rigid`: 各 target 帧的可见点掩码列表
+- `mask_update_rigid`: `mask_src_rigid & mask_any_tgt_rigid`，用于 gate 偏移量
+- `idx_tgt_rigid`: 各 target 帧可见点的索引列表，用于渲染时只合并可见 rigid 子集
+- `idx_src_rigid`: source 帧可见点索引，供 `_build_3d_feature_volume` 使用
+
+**说明：** 调用方必须在 `_build_3d_feature_volume` 前调用此方法，并传入 `mask_src_rigid` 与 `idx_src_rigid`。
+
+#### 3. 3D 特征体积构建 (`_build_3d_feature_volume`)
+
+**归属：** FeatureVolumeMixin
 
 **步骤：**
 ```
-1. 设置 RigidNodes.cur_frame = source_frame_idx
-2. 获取静态背景点云（世界坐标）
+1. 接收 mask_src_rigid, idx_src_rigid（来自 _precompute_rigid_masks）
+2. 设置 RigidNodes.cur_frame = source_frame_idx
+3. 获取静态背景点云（世界坐标）
    NodeStateBg.means [N_bg, 3]
-3. 变换动态物体到 source 帧的世界坐标
+4. 变换动态物体到 source 帧的世界坐标
    NodeStateRigid.means [N_rigid, 3] (局部) 
      → _transform_rigid_to_world() 
      → means_rigid_world [N_rigid, 3] (世界坐标)
-4. 计算动态物体可见性掩码
+5. 计算动态物体可见性掩码
    rigid_visible_mask [N_rigid] - 基于 instances_fv
    rigid_in_crop_mask [N_rigid] - 基于边界框检查
-5. 合并静态和动态点云（仅包含可见且在crop内的动态点）
+6. 合并静态和动态点云（使用 idx_src_rigid 筛选可见且在 crop 内的动态点）
    means_all = cat([means_bg, means_rigid_world[effective_mask]]) [N_total, 3]
    anchor_rgb_all = cat([anchor_rgb_bg, anchor_rgb_rigid[effective_mask]]) [N_total, 3]
-6. 构建统一的 3D 特征体积
+7. 构建统一的 3D 特征体积
    construct_sparse_tensor() 
      → sparse_feat [M, 3] (RGB特征，M ≤ N_total)
      → vol_dim [3] (体积维度)
@@ -197,10 +218,10 @@ graph TD
      → feat_3d [M, outdim] (3D特征)
    sparse_to_dense_volume() 
      → dense_volume [1, C, D, H, W]
-7. 分别为静态和动态点插值特征
+8. 分别为静态和动态点插值特征
    feat_3d_crop_bg [N_bg, outdim]
    feat_3d_crop_rigid [N_rigid, outdim] (不可见点特征为零)
-8. 删除密集体积以释放内存
+9. 删除密集体积以释放内存
    del dense_volume
 ```
 
@@ -213,7 +234,13 @@ graph TD
 - `rigid_visible_mask`: `[N_rigid]` - 动态物体可见性掩码（bool）
 - `rigid_in_crop_mask`: `[N_rigid]` - 动态物体是否在crop内的掩码（bool）
 
-#### 2.1. 2D 特征计算 (`_compute_2d_features_all`) - 可选
+#### 3.1. 2D 特征计算与融合 (`_compute_and_fuse_features`) - 可选
+
+**归属：** FeatureVolumeMixin
+
+**说明：** 封装 2D 特征计算（`_compute_2d_features_all`）与融合（`_fuse_features`），返回 `feat_bg_input`, `feat_rigid_input`, `feat_distant_input` 及原始 2D 特征。
+
+#### 3.2. 2D 特征计算 (`_compute_2d_features_all`) - 可选
 
 **条件：** `use_2d_features == True` 且提供了 `source_views` 和 `src_images`
 
@@ -247,7 +274,7 @@ graph TD
 - `feat_2d_rigid`: `[N_rigid, C_2d]` - 动态物体点的2D特征（不可见点为零）
 - `feat_2d_distant`: `[N_distant, C_2d]` - 背景远景点的2D特征（如果存在）
 
-#### 2.2. 特征融合 (`_fuse_features`) - 可选
+#### 3.3. 特征融合 (`_fuse_features`) - 可选
 
 **条件：** `use_2d_features == True` 且 `feature_fusion` 已初始化
 
@@ -263,7 +290,7 @@ graph TD
 - `visibility` 用于加权2D特征的贡献
 - 如果 `feat_2d` 为 `None`，直接返回 `feat_3d`
 
-#### 3. 特征插值
+#### 4. 特征插值
 
 **步骤：**
 ```
@@ -280,7 +307,13 @@ interpolate_features()
 - `get_grid_coords()`: 将世界坐标转换为体积网格的归一化坐标
 - `interpolate_features()`: 使用双线性插值从密集体积中提取每个点的特征
 
-#### 4. 偏移量预测 (`_predict_offsets`)
+#### 5. 偏移量预测与 Gate (`_predict_and_gate_offsets`)
+
+**归属：** OffsetsMixin
+
+**说明（当前实现优先）**：训练主路径已切换到 **GRU-style** 的 `_predict_offsets_gru()`（特征 + 参数 embedding + GRU 更新 → offsets）。旧的 `_predict_and_gate_offsets()` 仍保留（封装 `_predict_offsets` 并对 rigid 做 gate），但不再是 `StreetForwardTrainer._train_inner_iteration` 的主调用路径。
+
+#### 5.1. 偏移量预测 (`_predict_offsets`)
 
 **输入：**
 - `feat_bg_input`: `[N_bg, C_input]` - 静态背景点的融合特征（如果启用2D特征则为融合特征，否则为3D特征）
@@ -292,23 +325,24 @@ interpolate_features()
 - 在 source 帧下，静态和动态都是确定的，偏移量是共同预测的，不区别对待
 - 如果启用了2D特征，输入特征维度可能大于3D特征维度（`C_input > outdim`）
 
-#### 4.1. 动态物体偏移量掩码 (`_mask_rigid_offsets`)
+#### 5.2. 动态物体偏移量 Gate（`_predict_and_gate_offsets` 内）
 
-**目的：** 屏蔽不可见动态物体的偏移量，避免对不可见点进行更新
+**目的：** 使用 `mask_update_rigid` 屏蔽无监督 rigid 点的偏移量
 
 **处理：**
 ```
-对于不可见的点（visible_mask == False）：
-  - offset_pos → 0
-  - offset_scales → 0
-  - offset_quat → 单位四元数 [1, 0, 0, 0]
-  - offset_opacity → 0
-  - offset_sh → 0
+gate = mask_update_rigid.unsqueeze(-1).detach()  # [Nr, 1]
+offsets_rigid_world["offset_pos"] *= gate
+offsets_rigid_world["offset_scales"] *= gate
+offsets_rigid_world["offset_quat"] *= gate
+offsets_rigid_world["offset_opacity"] *= gate
+offsets_rigid_world["offset_sh"] *= gate
 ```
 
 **关键点：**
-- 使用 `rigid_visible_mask` 确定哪些点是可见的
-- 不可见点的偏移量被置零或设为单位值，确保这些点不会被更新
+- `mask_update_rigid = mask_src_rigid & mask_any_tgt_rigid`，仅在 source 和至少一个 target 可见时更新
+- 无监督点的偏移量被 gate 成 0，确保这些点不会被更新
+- **注意**：GRU-style 主路径中，`offset_quat` 对无监督点会被置为 **identity quaternion**（不是乘 0）
 
 **输出：**
 ```python
@@ -326,6 +360,43 @@ interpolate_features()
 - `mlp_conv`: `outdim → 64 → 32 → 6` (3个尺度对数偏移 + 3个轴角偏移)
 - `mlp_opacity`: `outdim → 64 → 32 → 1` (不透明度对数偏移)
 - `gaussion_decoder`: `outdim → 64 → 32 → 3*num_sh` (SH系数偏移，包含DC和rest)
+
+#### 5.1.1. GRU-style 偏移量预测（训练主路径：`_predict_offsets_gru`）⭐
+
+**目的：** 将「融合特征」与「当前 NodeState 参数」融合后再预测 offsets，并维护每类点（bg/rigid/distant）的隐藏状态缓存 \(h\)。
+
+**关键输入：**
+- `feat`: `[N, C_fused]`（3D 或 3D+2D 融合特征）
+- `params_for_embed`: 来自 `_build_params_for_embed()`，包含 `means/quats/scales_log/opacity_logit/sh_dc/sh_rest`
+  - 对 rigid：会先将 `means/quats` 变换到 source 帧世界坐标对齐（便于跨类型统一归一化）
+- `h_old`: `[N, H]`（来自 `h_cache_*`，在 `train_iter` 起始处 `detach()` 截断跨 iter 梯度）
+- `mask_update_rigid`（仅 rigid 传入）：`[N_rigid]` bool
+
+**参数 embedding（固定 17 维 param_vec）**：
+- `means_norm(3)`: 以 `bbx_min/bbx_max` 归一化到 `[-1, 1]`
+- `rot6d(6)`: quaternion → rot6d（旋转矩阵前两列）
+- `scales_norm(3)`: `scales_log` clamp 后做 layer_norm
+- `opacity_norm(1)`: `tanh(opacity_logit)`
+- `sh_dc(3)`: 原值
+- `sh_rest_energy(1)`: `||sh_rest||_2`（高阶能量标量）
+
+**GRU-style 更新与 offsets：**
+1. `param_embed = LayerNorm(MLP(param_vec))`
+2. `x = concat([feat, param_embed])`
+3. 使用 update/reset/candidate 线性层得到 `h_new`
+4. `head_input = gru_to_head(h_new)`（若 hidden_dim != head_dim 会线性投影）
+5. `offsets = _predict_offsets(head_input)`（复用原偏移头）
+
+**Rigid gate（训练关键约束）**：
+- gate 的目标：仅允许 source & 任意 target 可见的 rigid 点更新  
+  `mask_update_rigid = mask_src_rigid & mask_any_tgt_rigid`
+- 对 offsets：
+  - `offset_pos/offset_scales/offset_opacity/offset_sh`：乘以 `gate`（并 `detach()`）
+  - `offset_quat`：对 gate==False 的点使用 **identity quaternion** `[1,0,0,0]`（`torch.where`），而不是数值乘零
+- 对隐藏状态：`h_new = h_old*(1-gate) + h_new*gate`，保证无监督点 hidden 不漂移
+
+**空特征边界情况：**
+- 当 `feat` 为空时返回“零更新” offsets（`offset_quat` 返回 identity），并保持 `h_new = h_old`（rigid 仍会按 gate 保持一致性）。
 
 **偏移量预测流程：**
 
@@ -390,7 +461,11 @@ interpolate_features()
 - 这确保训练开始时预测的偏移量接近零，避免初始阶段的大幅跳跃
 - 初始化代码：`nn.init.zeros_(layer.weight)` 和 `nn.init.zeros_(layer.bias)`
 
-#### 5. 渲染参数计算 (`_render_params_from_offsets`)
+#### 6. 渲染参数计算 (`_compute_render_params_for_inner_iter` / `_render_params_from_offsets`)
+
+**归属：** OffsetsMixin
+
+**说明：** 训练时使用 `_compute_render_params_for_inner_iter`，内部对 rigid 做 `_transform_offsets_world_to_local` 后调用 `_render_params_from_offsets`。评估时使用 `_compute_render_params`（ProxyRenderingMixin）。
 
 **计算过程：**
 ```
@@ -479,7 +554,9 @@ interpolate_features()
 3. **旋转组合**：通过四元数乘法组合旋转，确保旋转的连续性和可微性
 4. **参数分离**：SH的DC和rest分量分别应用步长因子，允许独立控制
 
-#### 6. 代理参数创建 (`_create_proxy_params`)
+#### 7. 代理参数创建 (`_create_proxy_params`)
+
+**归属：** ProxyRenderingMixin
 
 **目的：** 创建可微的代理参数，用于多视角梯度累积
 
@@ -492,76 +569,35 @@ proxy = render_param.detach().requires_grad_(True)
 - 代理参数从渲染参数中分离（detach），但重新启用梯度
 - 这样可以在多个视角上累积梯度，然后一次性反向传播到渲染参数
 
-#### 7. 多 Target 帧渲染与损失计算
+#### 8. 多 Target 帧渲染与损失计算 (`_render_targets_and_accumulate_loss`)
+
+**归属：** ProxyRenderingMixin
 
 **循环结构：**
 ```python
-# 在循环外创建代理参数（所有 target 帧共享）
-proxies_bg = _create_proxy_params(render_params_bg)
-proxies_rigid = _create_proxy_params(render_params_rigid) if render_params_rigid is not None else None
-proxies_distant = _create_proxy_params(render_params_distant) if render_params_distant is not None else None
-
-for target in targets:
+# 代理参数在 _train_inner_iteration 中创建，传入此方法
+for view_idx, target in enumerate(targets):
     target_frame_idx = target["frame_idx"]
     view = target["view"]
     gt_img = target["gt_image"]
     
-    # 1. 设置 RigidNodes 的当前帧
-    if node_state_rigid is not None:
-        node_state_rigid.cur_frame = target_frame_idx
-        resolved_frame_idx = _resolve_rigid_frame_idx(node_state_rigid, target_frame_idx)
+    # 1. 设置 RigidNodes.cur_frame = target_frame_idx
+    # 2. 按 idx_tgt_rigid[view_idx] 取 rigid 子集，变换到 target 帧世界坐标
+    if view_idx < len(masks.idx_tgt_rigid) and masks.idx_tgt_rigid[view_idx].numel() > 0:
+        idx = masks.idx_tgt_rigid[view_idx]
+        rigid_means_local_subset = proxies_rigid["means_p"][idx]
+        # ... 取子集后 _transform_rigid_to_world / _transform_rigid_quats_to_world
     
-    # 2. 变换动态物体到 target 帧的世界坐标（保持梯度连接）
-    if proxies_rigid is not None and node_state_rigid is not None:
-        means_rigid_world = _transform_rigid_to_world(
-            node_state_rigid, proxies_rigid["means_p"]
-        )
-        quats_rigid_world = _transform_rigid_quats_to_world(
-            node_state_rigid, proxies_rigid["quats_p"]
-        )
-        # 应用可见性掩码到不透明度
-        if resolved_frame_idx is not None:
-            visibility = node_state_rigid.instances_fv[resolved_frame_idx]
-            valid_mask = visibility[node_state_rigid.point_ids[..., 0]].float()
-            opacities_rigid = proxies_rigid["opacities_p"] * valid_mask
-        else:
-            opacities_rigid = proxies_rigid["opacities_p"]
+    # 3. 合并参数：有可见 rigid 时用 _merge_params_with_rigid_subset，否则用 _merge_all_params
+    if rigid_subset["means"].numel() > 0:
+        merged_* = _merge_params_with_rigid_subset(proxies_bg, proxies_distant, rigid_subset)
     else:
-        means_rigid_world = torch.empty(0, 3, device=device)
-        quats_rigid_world = torch.empty(0, 4, device=device)
-        opacities_rigid = None
+        merged_* = _merge_all_params(...)
     
-    # 3. 合并所有参数（使用 _merge_all_params，保持梯度连接）
-    merged_means, merged_quats, merged_scales, merged_opacities, merged_colors = _merge_all_params(
-        proxies_bg=proxies_bg,
-        proxies_rigid=proxies_rigid,
-        proxies_distant=proxies_distant,
-        means_rigid_world=means_rigid_world,
-        quats_rigid_world=quats_rigid_world,
-        opacities_rigid=opacities_rigid,
-    )
-    
-    # 4. 渲染
-    rgb, acc = _render_single_view(
-        merged_params={
-            "means_p": merged_means,
-            "quats_p": merged_quats,
-            "scales_p": merged_scales,
-            "opacities_p": merged_opacities,
-            "colors_p": merged_colors,
-        },
-        view=view,
-        height=height,
-        width=width,
-    )
-    
-    # 5. 计算损失
-    loss = compute_loss(rgb, gt_img) / len(targets)
-    total_loss_val += float(loss.detach())  # 累积标量值，避免保持计算图
-    loss.backward()  # 梯度自动反向传播：
-    # - 通过 cat 操作反向传播到 proxies_bg、means_rigid_world/quats_rigid_world 和 proxies_distant
-    # - 通过变换操作反向传播到 proxies_rigid
-    # - 梯度会在所有代理参数上累积（因为它们在所有 target 帧中共享）
+    # 4. 渲染、计算损失、loss.backward()
+    rgb, acc = _render_single_view(merged_params, view, height, width)
+    loss = compute_loss(rgb, gt_img) / view_count
+    loss.backward()
 ```
 
 **损失函数：**
@@ -569,11 +605,15 @@ for target in targets:
 - 每个 target 帧的损失除以 target 帧数量，实现平均
 
 **关键设计点：**
+- **Rigid 子集渲染**：仅渲染 `idx_tgt_rigid[view_idx]` 指定的可见点，使用 `_merge_params_with_rigid_subset` 合并
 - **代理参数共享**：`proxies_bg` 和 `proxies_rigid` 在所有 target 帧中共享，梯度自动累积
-- **可微变换**：坐标变换保持梯度连接，不使用 detach，让 PyTorch 自动处理梯度反向传播
-- **自动梯度分离**：`torch.cat` 操作会自动处理梯度分离，不需要手动使用 `pts_labels`
+- **可微变换**：坐标变换保持梯度连接，不使用 detach
 
-#### 8. 梯度反向传播机制
+#### 9. 梯度反向传播 (`_backward_to_render_params`)
+
+**归属：** ProxyRenderingMixin
+
+#### 9.1. 梯度反向传播机制
 
 **两步反向传播：**
 
@@ -638,7 +678,11 @@ torch.autograd.backward(tensors=render_tensors, grad_tensors=grad_tensors)
 - 最终更新所有 MLP、sparse_conv 和 feature_fusion 的参数
 - **注意**：静态、动态和远景使用相同的 MLP 网络，梯度会自动合并
 
-#### 9. 状态更新
+**grad_warned 状态**：`_grad_or_zero` 使用 `self._proxy_grad_warned` 避免重复打印 "Proxy gradient is None" 的 warning。
+
+#### 10. 状态更新 (`_update_node_states`)
+
+**归属：** NodeStateMixin
 
 **条件：** `update_state == True`
 
@@ -692,33 +736,34 @@ with torch.no_grad():
 
 ## 3D特征体积构建详细流程
 
-本节深入讲解代码533-550行的详细实现，这是整个训练流程中的核心部分。
+本节深入讲解 3D 特征体积构建的详细实现，这是整个训练流程中的核心部分。
 
 ### 代码片段
 
-```533:550:models/trainers/streetforward.py
-            sparse_feat, vol_dim, valid_coords = self.construct_sparse_tensor(
-                raw_coords=means_s.clone(),
-                feats=anchor_rgb,
-                Bbx_max=self.bbx_max,
-                Bbx_min=self.bbx_min,
-                voxel_size=self.voxel_size,
-                device=self.device,
-            )
-            feat_3d = self.sparse_conv(sparse_feat)
-            dense_volume = self.sparse_to_dense_volume(
-                sparse_tensor=feat_3d,
-                coords=valid_coords,
-                vol_dim=vol_dim,
-            ).unsqueeze(dim=0)
-            # sparse_to_dense_volume returns [X, Y, Z, C] where vol_dim is [X, Y, Z]
-            # After unsqueeze: [1, X, Y, Z, C]
-            # grid_sample (5D) expects [B, C, D, H, W] where D=Z, H=Y, W=X
-            # So we need: permute(0, 4, 3, 2, 1) to get [1, C, Z, Y, X] = [1, C, D, H, W]
-            dense_volume = dense_volume.permute(0, 4, 3, 2, 1)
+**归属：** `models/streetforward/feature_volume_mixin.py` 的 `_build_3d_feature_volume`
 
-            grid_coords = self.get_grid_coords(means_s, self.bbx_min, vol_dim, self.voxel_size)
-            feat_3d_crop = self.interpolate_features(grid_coords, dense_volume)
+```python
+# 合并 means_all, anchor_rgb_all 后（来自静态+动态点云）
+sparse_feat, vol_dim, valid_coords = self.construct_sparse_tensor(
+    raw_coords=means_all.clone(),
+    feats=anchor_rgb_all,
+    Bbx_max=self.bbx_max,
+    Bbx_min=self.bbx_min,
+    voxel_size=self.voxel_size,
+    device=self.device,
+)
+feat_3d = self.sparse_conv(sparse_feat)
+dense_volume = self.sparse_to_dense_volume(
+    sparse_tensor=feat_3d,
+    coords=valid_coords,
+    vol_dim=vol_dim,
+).unsqueeze(dim=0)
+dense_volume = dense_volume.permute(0, 4, 3, 2, 1)  # [1, C, D, H, W]
+
+# 分别为 bg 和 rigid 点计算 grid_coords 并插值
+grid_coords_bg = self.get_grid_coords(means_bg, self.bbx_min, vol_dim, self.voxel_size)
+feat_3d_crop_bg = self.interpolate_features(grid_coords_bg, dense_volume)
+# rigid 同理，使用 means_rigid_world
 ```
 
 ### 输入数据准备
@@ -1679,9 +1724,13 @@ targets = [
 
 ---
 
-### 4. 评估指标
+### 4. 评估指标 (`models/streetforward/metrics.py`)
+
+**评估流程：** `_evaluate_test_views` 构造 `render_fn = lambda v, h, w: self._render_single_view(render_params, v, h, w)`，调用 `metrics.evaluate_test_views(render_fn, test_views, test_images, device, lpips_model)`，通过回调避免 metrics 依赖 trainer 类型。
 
 #### PSNR (Peak Signal-to-Noise Ratio)
+
+**实现：** `metrics.compute_psnr(pred, gt)`
 
 **计算方法：**
 ```python
@@ -1693,7 +1742,7 @@ psnr = -10 * torch.log10(mse)  # 如果 mse <= 0，返回 inf
 
 #### SSIM (Structural Similarity Index)
 
-**实现：** 使用 `pytorch_msssim` 库
+**实现：** `metrics.compute_ssim(pred, gt)`，使用 `pytorch_msssim` 库
 
 **含义：** 衡量预测图像和真实图像之间的结构相似性，值越高越好（范围：0-1）
 
@@ -1701,38 +1750,7 @@ psnr = -10 * torch.log10(mse)  # 如果 mse <= 0，返回 inf
 
 #### LPIPS (Learned Perceptual Image Patch Similarity)
 
-**实现：** 使用 `lpips` 库，AlexNet 作为特征提取器
-
-**含义：** 基于感知的相似性度量，值越低越好（通常范围：0-1）
-
-**注意：** 如果库不可用，返回 `NaN`
-| `test_metrics` | `Optional[Dict[str, float]]` | 测试视图评估指标（如果进行了评估） |
-
----
-
-### 4. 评估指标
-
-#### PSNR (Peak Signal-to-Noise Ratio)
-
-**计算方法：**
-```python
-mse = torch.mean((pred - gt) ** 2)
-psnr = -10 * torch.log10(mse)  # 如果 mse <= 0，返回 inf
-```
-
-**含义：** 衡量预测图像和真实图像之间的像素级差异，值越高越好（通常范围：20-40 dB）
-
-#### SSIM (Structural Similarity Index)
-
-**实现：** 使用 `pytorch_msssim` 库
-
-**含义：** 衡量预测图像和真实图像之间的结构相似性，值越高越好（范围：0-1）
-
-**注意：** 如果库不可用，返回 `NaN`
-
-#### LPIPS (Learned Perceptual Image Patch Similarity)
-
-**实现：** 使用 `lpips` 库，AlexNet 作为特征提取器
+**实现：** `metrics.compute_lpips(pred, gt, lpips_model, device)`，使用 `lpips` 库，AlexNet 作为特征提取器
 
 **含义：** 基于感知的相似性度量，值越低越好（通常范围：0-1）
 
@@ -1859,6 +1877,17 @@ psnr = -10 * torch.log10(mse)  # 如果 mse <= 0，返回 inf
 - **输入：** `[N, C]` 稀疏特征
 - **输出：** `[D, H, W, C]` 密集体积
 - **错误处理：** 如果函数不可用且未提供自定义 `sparse_to_dense_volume_fn`，会抛出 `ImportError`
+
+### 4.5. 参数合并 (ProxyRenderingMixin)
+
+#### `_merge_all_params`
+- **功能：** 合并 bg、rigid、distant 的完整代理参数（rigid 为完整 `means_rigid_world` 等）
+- **适用：** 无 rigid 或 rigid 无可见点时
+
+#### `_merge_params_with_rigid_subset`
+- **功能：** 合并 bg、rigid 子集、distant，支持只渲染 `idx_tgt_rigid[view_idx]` 指定的可见 rigid 点
+- **输入：** `proxies_bg`, `proxies_distant`, `rigid_subset`（含 means, quats, scales, opacities, colors）
+- **适用：** 有可见 rigid 点时
 
 ### 5. 渲染器 (Renderer)
 
@@ -2016,9 +2045,23 @@ model:
   bbx_max: [20.0, 4.8, 70.0]      # 边界框最大值
   sparseConv_outdim: 32    # 稀疏卷积输出维度
   use_2d_features: False  # 是否启用2D特征融合
+  feat_2d_channels: 16    # 2D CNN 输出通道数（启用 use_2d_features 时生效）
+  feat_2d_downscale: 1    # 2D 特征下采样倍率（启用 use_2d_features 时生效）
+
+  # GRU-style offsets（训练主路径）
+  param_embed_dim: 32              # 参数 embedding 维度（默认等于 fused_in_dim）
+  offset_gru_hidden_dim: 32        # GRU hidden 维度（默认等于 fused_in_dim）
+  offset_gru_use_reset_gate: True  # 是否启用 reset gate（类似标准 GRU）
+
   input_aabb_min: [...]    # 输入AABB最小值（用于背景远景）
   input_aabb_max: [...]    # 输入AABB最大值（用于背景远景）
 ```
+
+### Checkpoint（与流程相关的补充）
+
+- **会保存的额外状态（当前实现）**：
+  - `h_cache_bg / h_cache_rigid / h_cache_distant`：GRU-style offsets 的隐藏状态缓存
+  - `mlp_params_embed / param_embed_norm / gru_update / gru_candidate / gru_reset / gru_to_head`：GRU-style 相关模块（用于从 checkpoint 恢复训练连续性）
 
 ### Optimizer 配置
 
@@ -2044,7 +2087,7 @@ StreetForwardTrainer 通过以下关键机制实现了高效的前馈式 3DGS �
 1. **分离的 NodeState：** 作为稳定的参数缓冲区，避免梯度干扰（支持 Background、Rigid 和 Distant 三种类型）
 2. **3D 特征体积：** 通过稀疏卷积构建空间特征表示
 3. **2D/3D 特征融合：** 可选地从源视图提取2D特征，与3D特征融合以增强表示能力
-4. **偏移量预测：** 使用 MLP 从融合特征预测参数偏移（支持可见性掩码屏蔽不可见动态物体）
+4. **偏移量预测：** 使用 GRU-style hidden fusion（特征 + 参数 embedding）生成 offsets，偏移头仍复用 MLP；并对 rigid 通过 `mask_update_rigid` 做 gate 以保证仅受监督点更新
 5. **代理参数机制：** 实现多视角梯度累积
 6. **单次反向传播：** 每个迭代只进行一次完整的梯度更新
 7. **内存优化：** 密集体积在使用后立即删除，避免内存累积

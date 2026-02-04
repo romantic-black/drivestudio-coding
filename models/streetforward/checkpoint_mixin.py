@@ -172,6 +172,19 @@ class CheckpointMixin:
         }
         if self.image_feature_extractor is not None:
             model_state_dict["image_feature_extractor"] = self.image_feature_extractor.state_dict()
+        # GRU-style modules (may be absent in older checkpoints)
+        if hasattr(self, "mlp_params_embed"):
+            model_state_dict["mlp_params_embed"] = self.mlp_params_embed.state_dict()
+        if hasattr(self, "param_embed_norm"):
+            model_state_dict["param_embed_norm"] = self.param_embed_norm.state_dict()
+        if hasattr(self, "gru_update"):
+            model_state_dict["gru_update"] = self.gru_update.state_dict()
+        if hasattr(self, "gru_candidate"):
+            model_state_dict["gru_candidate"] = self.gru_candidate.state_dict()
+        if hasattr(self, "gru_reset") and self.gru_reset is not None:
+            model_state_dict["gru_reset"] = self.gru_reset.state_dict()
+        if hasattr(self, "gru_to_head") and not isinstance(self.gru_to_head, torch.nn.Identity):
+            model_state_dict["gru_to_head"] = self.gru_to_head.state_dict()
 
         nodes_state_dict = {
             f"scene_{scene}_segment_{segment}": self._node_state_to_dict(state)
@@ -188,6 +201,19 @@ class CheckpointMixin:
             if state is not None
         }
 
+        h_cache_bg = {
+            f"scene_{scene}_segment_{segment}": h.detach().cpu()
+            for (scene, segment), h in getattr(self, "h_cache_bg", {}).items()
+        }
+        h_cache_rigid = {
+            f"scene_{scene}_segment_{segment}": h.detach().cpu()
+            for (scene, segment), h in getattr(self, "h_cache_rigid", {}).items()
+        }
+        h_cache_distant = {
+            f"scene_{scene}_segment_{segment}": h.detach().cpu()
+            for (scene, segment), h in getattr(self, "h_cache_distant", {}).items()
+        }
+
         checkpoint = {
             "step": step_val,
             "global_step": self.global_step,
@@ -196,6 +222,9 @@ class CheckpointMixin:
             "node_states": nodes_state_dict,
             "node_states_rigid": rigid_state_dict,
             "node_states_distant": distant_state_dict,
+            "h_cache_bg": h_cache_bg,
+            "h_cache_rigid": h_cache_rigid,
+            "h_cache_distant": h_cache_distant,
         }
         try:
             checkpoint["config"] = OmegaConf.to_container(self.config, resolve=False)
@@ -233,6 +262,19 @@ class CheckpointMixin:
         self.gaussion_decoder.load_state_dict(model_state["gaussion_decoder"], strict=strict)
         if "image_feature_extractor" in model_state and self.image_feature_extractor is not None:
             self.image_feature_extractor.load_state_dict(model_state["image_feature_extractor"], strict=strict)
+        # Optional GRU-style modules (backward compatible)
+        if "mlp_params_embed" in model_state and hasattr(self, "mlp_params_embed"):
+            self.mlp_params_embed.load_state_dict(model_state["mlp_params_embed"], strict=False)
+        if "param_embed_norm" in model_state and hasattr(self, "param_embed_norm"):
+            self.param_embed_norm.load_state_dict(model_state["param_embed_norm"], strict=False)
+        if "gru_update" in model_state and hasattr(self, "gru_update"):
+            self.gru_update.load_state_dict(model_state["gru_update"], strict=False)
+        if "gru_candidate" in model_state and hasattr(self, "gru_candidate"):
+            self.gru_candidate.load_state_dict(model_state["gru_candidate"], strict=False)
+        if "gru_reset" in model_state and hasattr(self, "gru_reset") and self.gru_reset is not None:
+            self.gru_reset.load_state_dict(model_state["gru_reset"], strict=False)
+        if "gru_to_head" in model_state and hasattr(self, "gru_to_head") and not isinstance(self.gru_to_head, torch.nn.Identity):
+            self.gru_to_head.load_state_dict(model_state["gru_to_head"], strict=False)
 
         if load_optimizer and "optimizer_state_dict" in checkpoint:
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -294,6 +336,32 @@ class CheckpointMixin:
                 restored_distant[(scene_id, segment_id)] = self._node_state_distant_from_dict(state)
             if restored_distant:
                 self.node_states_distant = restored_distant
+
+        # Restore hidden caches if present
+        self.h_cache_bg = {}
+        self.h_cache_rigid = {}
+        self.h_cache_distant = {}
+        for cache_key, cache_attr in [
+            ("h_cache_bg", "h_cache_bg"),
+            ("h_cache_rigid", "h_cache_rigid"),
+            ("h_cache_distant", "h_cache_distant"),
+        ]:
+            cache_dict = checkpoint.get(cache_key, {})
+            restored: Dict[Tuple[int, int], torch.Tensor] = {}
+            for key, tensor in cache_dict.items():
+                scene_id, segment_id = None, None
+                if isinstance(key, str) and key.startswith("scene_") and "_segment_" in key:
+                    try:
+                        scene_id = int(key.split("scene_")[1].split("_segment_")[0])
+                        segment_id = int(key.split("_segment_")[1])
+                    except Exception:
+                        scene_id, segment_id = None, None
+                elif isinstance(key, (tuple, list)) and len(key) == 2:
+                    scene_id, segment_id = int(key[0]), int(key[1])
+                if scene_id is None or segment_id is None:
+                    continue
+                restored[(scene_id, segment_id)] = tensor.to(self.device)
+            setattr(self, cache_attr, restored)
 
         self.global_step = int(checkpoint.get("global_step", checkpoint.get("step", 0)))
         logger.info(f"Checkpoint loaded from {checkpoint_path} (step={self.global_step})")

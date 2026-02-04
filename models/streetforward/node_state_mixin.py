@@ -275,6 +275,13 @@ class NodeStateMixin:
             self.node_states.clear()
             self.node_states_rigid.clear()
             self.node_states_distant.clear()
+            # Clear GRU hidden caches if present
+            if hasattr(self, "h_cache_bg"):
+                self.h_cache_bg.clear()
+            if hasattr(self, "h_cache_rigid"):
+                self.h_cache_rigid.clear()
+            if hasattr(self, "h_cache_distant"):
+                self.h_cache_distant.clear()
             # 强制垃圾回收以释放显存
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -598,7 +605,11 @@ class NodeStateMixin:
                 node_state_distant.sh_rest.copy_(render_params_distant["sh_rest_r"].detach())
 
     def _transform_rigid_to_world(
-        self, node_state_rigid: NodeStateRigid, means_local: torch.Tensor, point_indices: torch.Tensor = None
+        self,
+        node_state_rigid: NodeStateRigid,
+        means_local: torch.Tensor,
+        point_indices: torch.Tensor = None,
+        frame_idx: Optional[int] = None,
     ) -> torch.Tensor:
         """
         将动态物体的局部坐标位置变换到世界坐标。
@@ -619,12 +630,15 @@ class NodeStateMixin:
         - 使用当前帧（cur_frame）的实例位姿进行变换
         - 如果提供了 point_indices，使用对应的 point_ids 子集来索引旋转和平移
         """
-        frame_idx = self._resolve_rigid_frame_idx(node_state_rigid, node_state_rigid.cur_frame)
-        if frame_idx is None:
+        resolved_frame_idx = self._resolve_rigid_frame_idx(
+            node_state_rigid,
+            node_state_rigid.cur_frame if frame_idx is None else frame_idx,
+        )
+        if resolved_frame_idx is None:
             # 如果没有有效的帧索引，返回零向量
             return torch.zeros_like(means_local)
-        quats_cur_frame = node_state_rigid.instances_quats[frame_idx]
-        trans_cur_frame = node_state_rigid.instances_trans[frame_idx]
+        quats_cur_frame = node_state_rigid.instances_quats[resolved_frame_idx]
+        trans_cur_frame = node_state_rigid.instances_trans[resolved_frame_idx]
         rot_cur_frame = _quat_to_rotmat(quats_cur_frame)
         
         # 如果提供了 point_indices，使用对应的 point_ids 子集；否则使用完整的 point_ids
@@ -639,7 +653,11 @@ class NodeStateMixin:
         return means_world
 
     def _transform_rigid_quats_to_world(
-        self, node_state_rigid: NodeStateRigid, quats_local: torch.Tensor, point_indices: torch.Tensor = None
+        self,
+        node_state_rigid: NodeStateRigid,
+        quats_local: torch.Tensor,
+        point_indices: torch.Tensor = None,
+        frame_idx: Optional[int] = None,
     ) -> torch.Tensor:
         """
         将动态物体的局部坐标旋转变换到世界坐标。
@@ -655,11 +673,14 @@ class NodeStateMixin:
         变换公式：quats_world = normalize(quats_instance * quats_local)
         使用四元数乘法组合实例旋转和局部旋转。
         """
-        frame_idx = self._resolve_rigid_frame_idx(node_state_rigid, node_state_rigid.cur_frame)
-        if frame_idx is None:
+        resolved_frame_idx = self._resolve_rigid_frame_idx(
+            node_state_rigid,
+            node_state_rigid.cur_frame if frame_idx is None else frame_idx,
+        )
+        if resolved_frame_idx is None:
             # 如果没有有效的帧索引，返回单位四元数
             return quats_local
-        quats_cur_frame = node_state_rigid.instances_quats[frame_idx]
+        quats_cur_frame = node_state_rigid.instances_quats[resolved_frame_idx]
         
         # 如果提供了 point_indices，使用对应的 point_ids 子集；否则使用完整的 point_ids
         if point_indices is not None:
