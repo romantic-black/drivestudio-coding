@@ -127,14 +127,21 @@ class FeatureVolumeMixin:
             )
         # #endregion
 
-        sparse_feat, vol_dim, valid_coords = self.construct_sparse_tensor(
-            raw_coords=means_all.clone(),
-            feats=anchor_rgb_all,
-            Bbx_max=self.bbx_max,
-            Bbx_min=self.bbx_min,
-            voxel_size=self.voxel_size,
-            device=self.device,
-        )
+        # Sparse path (construct_sparse_tensor, sparse_conv) runs in FP32 when AMP enabled
+        # (numpy/torchsparse may not support FP16)
+        use_amp = getattr(self, "use_amp", False) and torch.cuda.is_available()
+        from contextlib import nullcontext
+        sparse_ctx = torch.cuda.amp.autocast(enabled=False) if use_amp else nullcontext()
+        with sparse_ctx:
+            sparse_feat, vol_dim, valid_coords = self.construct_sparse_tensor(
+                raw_coords=means_all.clone(),
+                feats=anchor_rgb_all,
+                Bbx_max=self.bbx_max,
+                Bbx_min=self.bbx_min,
+                voxel_size=self.voxel_size,
+                device=self.device,
+            )
+            feat_3d = self.sparse_conv(sparse_feat)
         
         # #region agent log
         if torch.cuda.is_available():

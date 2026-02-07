@@ -241,7 +241,11 @@ class ProxyRenderingMixin:
             rgb, acc = self._render_single_view(merged_params, view, height, width)
             loss = self.compute_loss(rgb, gt_img) / view_count
             total_loss_val += float(loss.detach())
-            loss.backward()
+            grad_scaler = getattr(self, "grad_scaler", None)
+            if grad_scaler is not None:
+                grad_scaler.scale(loss).backward()
+            else:
+                loss.backward()
 
             if masks.mask_any_tgt_rigid is not None and proxies_rigid is not None and proxies_rigid["means_p"].grad is not None:
                 grad_means_not_rendered = proxies_rigid["means_p"].grad[~masks.mask_any_tgt_rigid]

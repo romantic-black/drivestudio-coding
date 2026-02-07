@@ -19,6 +19,7 @@ from omegaconf import OmegaConf
 from datasets.multi_scene_dataset import MultiSceneDataset
 from models.trainers.streetforward import StreetForwardTrainer
 from utils.logging import MetricLogger, setup_logging
+from utils.streetforward_baseline import set_deterministic_seed
 
 logger = logging.getLogger(__name__)
 current_time = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
@@ -209,7 +210,12 @@ def main(args):
     cfg = setup(args)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
-    
+
+    # Deterministic reproducibility: set seed before any random sampling
+    seed = cfg.training.get("seed", 42)
+    set_deterministic_seed(seed)
+    logger.info(f"Deterministic seed set to {seed} (cudnn.deterministic=True, benchmark=False)")
+
     # Build MultiSceneDataset
     logger.info("Building MultiSceneDataset...")
     dataset = MultiSceneDataset(
@@ -256,6 +262,11 @@ def main(args):
     eval_freq = cfg.training.get("eval_freq", 5000)
 
     logger.info(f"Starting training for {max_iterations} iterations")
+    logger.info(
+        f"Training setup: use_amp={getattr(trainer, 'use_amp', False)}, "
+        f"grad_clip_max_norm={getattr(trainer, 'grad_clip_max_norm', None)}, "
+        f"scheduler={type(trainer.scheduler).__name__ if getattr(trainer, 'scheduler', None) else None}"
+    )
 
     trainer.train()
 
@@ -269,12 +280,22 @@ def main(args):
             streetforward_batch = convert_batch_to_streetforward_format(batch, device)
             
             # Training step
-            result = trainer.train_iter(streetforward_batch, apply_update=True, update_state=True)
+            try:
+                result = trainer.train_iter(streetforward_batch, apply_update=True, update_state=True)
+            except RuntimeError as e:
+                logger.error(
+                    f"Step {step} failed (RuntimeError): {e}. "
+                    "Check: OOM, AMP compatibility, or invalid tensors."
+                )
+                raise
             step = getattr(trainer, "global_step", step + 1)
             
             # Update metrics
             total_loss = result.get("total_loss", torch.tensor(0.0, device=device))
-            metric_logger.update(loss=total_loss.item() if isinstance(total_loss, torch.Tensor) else total_loss)
+            loss_val = total_loss.item() if isinstance(total_loss, torch.Tensor) else total_loss
+            if not (float("-inf") < loss_val < float("inf")):
+                logger.warning(f"Step {step}: loss is NaN or inf ({loss_val}). Check data and model.")
+            metric_logger.update(loss=loss_val)
             metric_logger.update(step=step)
 
             # Logging
@@ -322,11 +343,16 @@ def main(args):
                     ssim_vals = [m["ssim"] for m in eval_metrics if "ssim" in m]
                     lpips_vals = [m["lpips"] for m in eval_metrics if "lpips" in m]
                     if psnr_vals:
+                        avg_psnr = np.mean(psnr_vals)
                         logger.info(
-                            f"Evaluation PSNR: {np.mean(psnr_vals):.4f}, "
+                            f"Evaluation PSNR: {avg_psnr:.4f}, "
                             f"SSIM: {np.mean(ssim_vals) if ssim_vals else float('nan'):.4f}, "
                             f"LPIPS: {np.mean(lpips_vals) if lpips_vals else float('nan'):.4f}"
                         )
+                        if hasattr(trainer, "step_scheduler_plateau"):
+                            trainer.step_scheduler_plateau(avg_psnr)
+                    elif hasattr(trainer, "step_scheduler_plateau"):
+                        trainer.step_scheduler_plateau(-avg_loss)
                 
                 trainer.train()
         

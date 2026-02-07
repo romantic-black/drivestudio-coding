@@ -220,12 +220,18 @@ class CheckpointMixin:
             "model_state_dict": model_state_dict,
             "optimizer_state_dict": self.optimizer.state_dict(),
             "node_states": nodes_state_dict,
+        }
+        if hasattr(self, "scheduler") and self.scheduler is not None:
+            checkpoint["scheduler_state_dict"] = self.scheduler.state_dict()
+        if hasattr(self, "grad_scaler") and self.grad_scaler is not None:
+            checkpoint["grad_scaler_state_dict"] = self.grad_scaler.state_dict()
+        checkpoint.update({
             "node_states_rigid": rigid_state_dict,
             "node_states_distant": distant_state_dict,
             "h_cache_bg": h_cache_bg,
             "h_cache_rigid": h_cache_rigid,
             "h_cache_distant": h_cache_distant,
-        }
+        })
         try:
             checkpoint["config"] = OmegaConf.to_container(self.config, resolve=False)
         except Exception:
@@ -278,6 +284,18 @@ class CheckpointMixin:
 
         if load_optimizer and "optimizer_state_dict" in checkpoint:
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if load_optimizer and "scheduler_state_dict" in checkpoint and hasattr(self, "scheduler") and self.scheduler is not None:
+            try:
+                self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+                logger.debug("Scheduler state restored from checkpoint")
+            except Exception as e:
+                logger.warning(f"Scheduler state restore failed (non-fatal): {e}")
+        if load_optimizer and "grad_scaler_state_dict" in checkpoint and hasattr(self, "grad_scaler") and self.grad_scaler is not None:
+            try:
+                self.grad_scaler.load_state_dict(checkpoint["grad_scaler_state_dict"])
+                logger.debug("GradScaler state restored from checkpoint")
+            except Exception as e:
+                logger.warning(f"GradScaler state restore failed (non-fatal): {e}")
 
         nodes_state_dict = checkpoint.get("node_states") or checkpoint.get("nodes_state_dict")
         if nodes_state_dict is not None:

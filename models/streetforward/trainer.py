@@ -259,6 +259,47 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
             weight_decay=optim_cfg.get("weight_decay", 0.0),
         )
 
+        # Training infrastructure: AMP, grad clip, LR scheduler
+        training_cfg_init = getattr(config, "training", None)
+        tc_get = training_cfg_init.get if hasattr(training_cfg_init, "get") else lambda k, d=None: d
+        self.use_amp = bool(tc_get("use_amp", False)) and torch.cuda.is_available()
+        self.grad_scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp) if self.use_amp else None
+        grad_clip_val = tc_get("grad_clip_max_norm", None)
+        self.grad_clip_max_norm = float(grad_clip_val) if grad_clip_val is not None and float(grad_clip_val) > 0 else None
+
+        self.scheduler = None
+        sched_cfg = tc_get("lr_scheduler")
+        if sched_cfg is not None and isinstance(sched_cfg, dict):
+            sched_type = sched_cfg.get("type", "none") or "none"
+            max_iter = int(tc_get("max_iterations", 10000))
+            if sched_type == "cosine":
+                T_max = int(sched_cfg.get("T_max", max_iter))
+                eta_min = float(sched_cfg.get("eta_min", 1e-6))
+                self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    self.optimizer, T_max=T_max, eta_min=eta_min
+                )
+                logger.info(f"LR scheduler: CosineAnnealingLR(T_max={T_max}, eta_min={eta_min})")
+            elif sched_type == "step":
+                step_size = int(sched_cfg.get("step_size", 3000))
+                gamma = float(sched_cfg.get("gamma", 0.5))
+                self.scheduler = torch.optim.lr_scheduler.StepLR(
+                    self.optimizer, step_size=step_size, gamma=gamma
+                )
+                logger.info(f"LR scheduler: StepLR(step_size={step_size}, gamma={gamma})")
+            elif sched_type == "plateau":
+                mode = str(sched_cfg.get("mode", "max"))
+                factor = float(sched_cfg.get("factor", 0.5))
+                patience = int(sched_cfg.get("patience", 5))
+                self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                    self.optimizer, mode=mode, factor=factor, patience=patience
+                )
+                logger.info(f"LR scheduler: ReduceLROnPlateau(mode={mode}, factor={factor}, patience={patience})")
+
+        if self.use_amp:
+            logger.info("AMP (mixed precision) enabled")
+        if self.grad_clip_max_norm is not None:
+            logger.info(f"Gradient clipping enabled: max_norm={self.grad_clip_max_norm}")
+
         self.global_step = 0
         self.checkpoint_dir: Optional[str] = None
         self.tb_writer = None
@@ -446,22 +487,42 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
         h_distant = self._get_or_init_hidden(self.h_cache_distant, key, node_state_distant.means.shape[0]) if node_state_distant is not None else None
 
         for _ in range(self.inner_iterations):
-            result = self._train_inner_iteration(
-                batch=batch,
-                targets=targets,
-                node_state_bg=node_state_bg,
-                node_state_rigid=node_state_rigid,
-                node_state_distant=node_state_distant,
-                h_old_bg=h_bg,
-                h_old_rigid=h_rigid,
-                h_old_distant=h_distant,
-            )
+            with torch.cuda.amp.autocast(enabled=getattr(self, "use_amp", False)):
+                result = self._train_inner_iteration(
+                    batch=batch,
+                    targets=targets,
+                    node_state_bg=node_state_bg,
+                    node_state_rigid=node_state_rigid,
+                    node_state_distant=node_state_distant,
+                    h_old_bg=h_bg,
+                    h_old_rigid=h_rigid,
+                    h_old_distant=h_distant,
+                )
             total_loss_val += result["loss_val"]
             outputs.extend(result["outputs"])
 
             if apply_update:
-                self.optimizer.step()
+                grad_scaler = getattr(self, "grad_scaler", None)
+                grad_clip = getattr(self, "grad_clip_max_norm", None)
+                params = [p for g in self.optimizer.param_groups for p in g["params"]]
+                self._last_grad_norm = None
+                if grad_scaler is not None:
+                    grad_scaler.unscale_(self.optimizer)
+                    if grad_clip is not None and grad_clip > 0:
+                        grad_norm = torch.nn.utils.clip_grad_norm_(params, max_norm=grad_clip)
+                        self._last_grad_norm = float(grad_norm.item()) if torch.is_tensor(grad_norm) else float(grad_norm)
+                    grad_scaler.step(self.optimizer)
+                    grad_scaler.update()
+                else:
+                    if grad_clip is not None and grad_clip > 0:
+                        grad_norm = torch.nn.utils.clip_grad_norm_(params, max_norm=grad_clip)
+                        self._last_grad_norm = float(grad_norm.item()) if torch.is_tensor(grad_norm) else float(grad_norm)
+                    self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)
+                if self.scheduler is not None and not isinstance(
+                    self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau
+                ):
+                    self.scheduler.step()
 
             h_bg = result["h_new_bg"]
             h_rigid = result["h_new_rigid"]
@@ -767,6 +828,18 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
         self.train()
         return metrics or {}
 
+    def step_scheduler_plateau(self, metric: float) -> None:
+        """
+        Step ReduceLROnPlateau scheduler (call after eval with validation metric).
+        No-op if scheduler is not ReduceLROnPlateau.
+        """
+        if self.scheduler is not None and isinstance(
+            self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau
+        ):
+            self.scheduler.step(metric)
+            new_lr = self.optimizer.param_groups[0]["lr"]
+            logger.info(f"Plateau scheduler stepped: metric={metric:.4f}, new_lr={new_lr:.2e}")
+
     def _log_to_tensorboard(self, total_loss_val: float, outputs: List[Dict]) -> None:
         """
         在启用时向 TensorBoard 写入标量和图像。
@@ -783,6 +856,9 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
             lr = self.optimizer.param_groups[0]["lr"]
             self.tb_writer.add_scalar("train/total_loss", total_loss_val, step)
             self.tb_writer.add_scalar("train/lr", lr, step)
+            grad_norm = getattr(self, "_last_grad_norm", None)
+            if grad_norm is not None:
+                self.tb_writer.add_scalar("train/grad_norm", grad_norm, step)
 
         if (
             self.log_images
