@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+from typing import Dict, Literal, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -310,7 +310,10 @@ class OffsetsMixin:
         return offsets, h_new
 
     def _render_params_from_offsets(
-        self, node_state: NodeState, offsets: Dict[str, torch.Tensor]
+        self,
+        node_state: NodeState,
+        offsets: Dict[str, torch.Tensor],
+        node_type: Literal["bg", "rigid", "distant"] = "bg",
     ) -> Dict[str, torch.Tensor]:
         """
         从 NodeState 和偏移量计算渲染参数。
@@ -318,6 +321,7 @@ class OffsetsMixin:
         Args:
             node_state: NodeState（Background 或 RigidNodes），所有参数都是分离的
             offsets: 偏移量字典（可微）
+            node_type: 节点类型，控制分节点 eta（默认 "bg"）
             
         Returns:
             渲染参数字典，包含：
@@ -342,14 +346,20 @@ class OffsetsMixin:
         sh_rest_flat = offsets["offset_sh"][:, 3:]
         sh_rest_offset = sh_rest_flat.view(num_points, num_sh - 1, 3)
 
+        eta_means = self._get_eta_for_node(node_type, "means")
+        eta_scales = self._get_eta_for_node(node_type, "scales")
+        eta_opacity = self._get_eta_for_node(node_type, "opacity")
+        eta_sh_dc = self._get_eta_for_node(node_type, "sh_dc")
+        eta_sh_rest = self._get_eta_for_node(node_type, "sh_rest")
+
         # Apply offsets with step size factors (eta)
         # Note: means_r is not clamped here to preserve gradient flow
-        means_r = node_state.means + self.eta_means * offsets["offset_pos"]
-        scales_log_r = node_state.scales_log + self.eta_scales * offsets["offset_scales"]
+        means_r = node_state.means + eta_means * offsets["offset_pos"]
+        scales_log_r = node_state.scales_log + eta_scales * offsets["offset_scales"]
         quats_r = _normalize_quat(_quat_multiply(node_state.quats, offsets["offset_quat"]))
-        opacity_logit_r = node_state.opacity_logit + self.eta_opacity * offsets["offset_opacity"]
-        sh_dc_r = node_state.sh_dc + self.eta_sh_dc * offsets["offset_sh"][:, :3]
-        sh_rest_r = node_state.sh_rest + self.eta_sh_rest * sh_rest_offset
+        opacity_logit_r = node_state.opacity_logit + eta_opacity * offsets["offset_opacity"]
+        sh_dc_r = node_state.sh_dc + eta_sh_dc * offsets["offset_sh"][:, :3]
+        sh_rest_r = node_state.sh_rest + eta_sh_rest * sh_rest_offset
 
         scales_r = torch.exp(scales_log_r)
         opacities_r = torch.sigmoid(opacity_logit_r).squeeze(-1)
@@ -461,6 +471,29 @@ class OffsetsMixin:
 
         return offsets_bg, offsets_rigid_world, offsets_distant
 
+    def _get_eta_for_node(self, node_type: str, key: str) -> float:
+        """
+        Fetch per-node eta with fallback to global defaults.
+        """
+        attr_name = f"eta_{key}"
+        default = getattr(self, attr_name, 1.0)
+        by_node = getattr(self, "eta_by_node", None) or {}
+        node_cfg = by_node.get(node_type, {}) if isinstance(by_node, dict) else {}
+        value = None
+        if hasattr(node_cfg, "get"):
+            value = node_cfg.get(attr_name, None)
+        else:
+            try:
+                value = node_cfg[attr_name]
+            except Exception:
+                value = None
+        if value is None:
+            return default
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
     def _compute_render_params_for_inner_iter(
         self,
         node_state_bg: NodeState,
@@ -474,17 +507,21 @@ class OffsetsMixin:
         """
         训练内一次迭代的渲染参数计算，处理 rigid 世界→局部变换。
         """
-        render_params_bg = self._render_params_from_offsets(node_state_bg, offsets_bg)
+        render_params_bg = self._render_params_from_offsets(node_state_bg, offsets_bg, node_type="bg")
 
         render_params_rigid = None
         if node_state_rigid is not None and offsets_rigid_world is not None:
             offsets_rigid_local = self._transform_offsets_world_to_local(
                 node_state_rigid, offsets_rigid_world, source_frame_idx
             )
-            render_params_rigid = self._render_params_from_offsets(node_state_rigid, offsets_rigid_local)
+            render_params_rigid = self._render_params_from_offsets(
+                node_state_rigid, offsets_rigid_local, node_type="rigid"
+            )
 
         render_params_distant = None
         if node_state_distant is not None and offsets_distant is not None:
-            render_params_distant = self._render_params_from_offsets(node_state_distant, offsets_distant)
+            render_params_distant = self._render_params_from_offsets(
+                node_state_distant, offsets_distant, node_type="distant"
+            )
 
         return render_params_bg, render_params_rigid, render_params_distant

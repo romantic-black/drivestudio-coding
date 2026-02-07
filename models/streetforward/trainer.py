@@ -81,6 +81,14 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
         self.eta_opacity = model_cfg.get("eta_opacity", 1.0)  # 不透明度步长因子
         self.eta_sh_dc = model_cfg.get("eta_sh_dc", 1.0)  # SH DC步长因子
         self.eta_sh_rest = model_cfg.get("eta_sh_rest", 1.0)  # SH rest步长因子
+        eta_by_node_cfg = model_cfg.get("eta_by_node", None)
+        if eta_by_node_cfg is not None:
+            try:
+                eta_by_node_cfg = OmegaConf.to_container(eta_by_node_cfg, resolve=True)
+            except Exception:
+                # OmegaConf may not be present or conversion might fail; keep raw config
+                pass
+        self.eta_by_node = eta_by_node_cfg or {}
         # 其他模型参数
         self.sh_degree = model_cfg.get("sh_degree", 1)  # 球谐函数度数
         self.voxel_size = model_cfg.get("voxel_size", 0.1)  # 体素大小（米）

@@ -89,13 +89,36 @@ model:
   sh_dc_max: 0.1           # SH DC offset upper bound
   sh_rest_max: 0.05         # SH rest offset upper bound (smaller)
   
-  # Step size factors (control offset magnitude, usually fixed)
+  # Step size factors (control offset magnitude)
+  # Global defaults (used when eta_by_node is empty or node not specified)
   eta_means: 1.0           # Position step size factor
   eta_scales: 1.0          # Scale step size factor
   eta_opacity: 1.0         # Opacity step size factor
   eta_sh_dc: 1.0           # SH DC step size factor
   eta_sh_rest: 1.0         # SH rest step size factor
-  
+
+  # Per-node eta (ref: OmniRe Background vs RigidNodes lr ratios)
+  # bg: baseline; rigid: 0.5x (more conservative); distant: 0.8x
+  eta_by_node:
+    bg:
+      eta_means: 1.0
+      eta_scales: 1.2
+      eta_opacity: 1.5
+      eta_sh_dc: 1.1
+      eta_sh_rest: 0.9
+    rigid:
+      eta_means: 0.5
+      eta_scales: 0.6
+      eta_opacity: 0.75
+      eta_sh_dc: 0.55
+      eta_sh_rest: 0.45
+    distant:
+      eta_means: 0.8
+      eta_scales: 0.96
+      eta_opacity: 1.2
+      eta_sh_dc: 0.88
+      eta_sh_rest: 0.72
+
   # Other model parameters
   sh_degree: 1
   voxel_size: 0.4

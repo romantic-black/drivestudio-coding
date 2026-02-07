@@ -174,7 +174,7 @@ scene_dir/ (例如: /path/to/trainval/000)
 │   ├── 1.txt
 │   └── ...
 ├── sky_masks/                 # 天空掩码（可选）
-│   ├── 000_0.png             # 格式: {frame_idx:03d}_{cam_id}.png (0=sky, 255=non-sky)
+│   ├── 000_0.png             # 格式: {frame_idx:03d}_{cam_id}.png (像素0=sky,255=non-sky; 加载后转为0/1 float)
 │   └── ...
 ├── lidar/                     # LiDAR数据（可选，用于AABB计算和点云生成）
 │   ├── 000.bin               # 格式: {frame_idx:03d}.bin
@@ -220,6 +220,8 @@ batch = {
         'frame_indices': Tensor[V_s],             # 帧索引
         'cam_indices': Tensor[V_s],               # 相机索引
         'keyframe_indices': Tensor[num_source_keyframes],  # 关键帧索引
+        'viewdirs': Tensor[V_s, H, W, 3],        # 可选，射线方向
+        'sky_mask': Tensor[V_s, H, W],           # 可选，天空掩码
     },
     
     # Target 数据
@@ -231,6 +233,8 @@ batch = {
         'frame_indices': Tensor[V_t],             # 帧索引
         'cam_indices': Tensor[V_t],               # 相机索引
         'keyframe_indices': Tensor[num_target_keyframes],  # 关键帧索引
+        'viewdirs': Tensor[V_t, H, W, 3],        # 可选，射线方向（用于 Sky 渲染）
+        'sky_mask': Tensor[V_t, H, W],           # 可选，天空掩码（0=天空，1=非天空，float，用于 Sky 监督）
     },
     
     # 测试视图（可选，如果 include_test=True 且段内包含测试帧）
@@ -241,6 +245,8 @@ batch = {
         'depth': Tensor[num_test_images, H, W],
         'frame_indices': Tensor[num_test_images],
         'cam_indices': Tensor[num_test_images],
+        'viewdirs': Tensor[num_test_images, H, W, 3],   # 可选
+        'sky_mask': Tensor[num_test_images, H, W],      # 可选
     },
     
     # 点云数据（可选，如果配置了点云生成器）
@@ -253,6 +259,15 @@ batch = {
     'dynamic_info': Dict[int, Dict],              # 按 frame_idx 索引
 }
 ```
+
+### viewdirs 与 sky_mask（可选）
+
+当底层 `pixel_source` 支持时（如配置 `load_sky_mask: true`），batch 的 `target`、`source`、`test` 中会包含：
+
+- **viewdirs**：射线方向，形状 `[V, H, W, 3]`，用于 Sky 等视角相关渲染
+- **sky_mask**：天空掩码，形状 `[V, H, W]`，来自 `pixel_source` 时为 float 0/1（0=天空，1=非天空），用于 Sky 区域监督
+
+这些字段由 `pixel_source.get_image()` 返回的 `image_infos` 提供；若 `get_image` 未返回对应键，则 batch 中不包含该字段，Trainer 可退化为在内部从 extrinsics/intrinsics 计算 viewdirs。
 
 ### 数据维度说明
 
