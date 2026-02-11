@@ -34,38 +34,65 @@ def set_seeds(seed=31):
 
 def setup(args):
     """Setup configuration and logging."""
+    global logger
     # Load base config
     cfg = OmegaConf.load(args.config_file)
     
     # Parse CLI arguments
     args_from_cli = OmegaConf.from_cli(args.opts)
     
-    # Handle dataset type from CLI (data.dataset or dataset)
+    # Handle dataset preset/type from CLI (data.dataset_preset or data.dataset)
     dataset_type = None
-    if "data" in args_from_cli and "dataset" in args_from_cli.data:
-        dataset_type = args_from_cli.data.dataset
-        del args_from_cli.data.dataset
-    elif "dataset" in args_from_cli:
+    dataset_preset = None
+    if "data" in args_from_cli:
+        if "dataset_preset" in args_from_cli.data:
+            dataset_preset = args_from_cli.data.dataset_preset
+            del args_from_cli.data.dataset_preset
+        if "dataset" in args_from_cli.data:
+            dataset_type = args_from_cli.data.dataset
+            del args_from_cli.data.dataset
+    if dataset_preset is None and "dataset_preset" in args_from_cli:
+        dataset_preset = args_from_cli.pop("dataset_preset")
+    if dataset_type is None and "dataset" in args_from_cli:
         # If dataset is passed as top-level, it should be the dataset type
         dataset_type = args_from_cli.pop("dataset")
     
-    # Get dataset type from config if not in CLI
-    if dataset_type is None:
-        if "data" in cfg and "dataset" in cfg.data:
-            dataset_type = cfg.data.dataset
+    # Get dataset preset/type from config if not in CLI
+    if dataset_preset is None and "data" in cfg and hasattr(cfg.data, "get"):
+        dataset_preset = cfg.data.get("dataset_preset")
+    if dataset_type is None and "data" in cfg and hasattr(cfg.data, "dataset"):
+        dataset_type = cfg.data.dataset
     
-    # Load dataset config if dataset type is specified
-    if dataset_type is not None:
-        dataset_cfg = OmegaConf.load(
-            os.path.join("configs", "datasets", f"{dataset_type}.yaml")
-        )
-        # Merge dataset config
+    dataset_cfg_path = None
+    dataset_cfg_key = dataset_preset or dataset_type
+    if dataset_cfg_key is not None:
+        candidate_path = os.path.join("configs", "datasets", f"{dataset_cfg_key}.yaml")
+        if os.path.exists(candidate_path):
+            dataset_cfg_path = candidate_path
+        else:
+            logger.warning(
+                f"Dataset preset '{dataset_cfg_key}' not found at {candidate_path}; skipping preset merge."
+            )
+    
+    # Load dataset config if available
+    if dataset_cfg_path is not None:
+        dataset_cfg = OmegaConf.load(dataset_cfg_path)
         cfg = OmegaConf.merge(cfg, dataset_cfg)
+        # Persist the preset key for traceability
+        if "data" in cfg:
+            cfg.data["dataset_preset"] = dataset_cfg_key
+    elif dataset_preset is not None and "data" in cfg:
+        # Preserve requested preset even if the preset file is missing
+        cfg.data["dataset_preset"] = dataset_preset
     
     # Merge CLI arguments
     cfg = OmegaConf.merge(cfg, args_from_cli)
     
-    # Ensure required config keys exist
+    # Tiny overfit: 1 scene, default 500 steps (override with training.max_iterations=N in opts)
+    if getattr(args, "tiny_overfit", False):
+        cfg.data.train_scene_ids = [0]
+        if not any("max_iterations" in str(o) for o in (getattr(args, "opts", None) or [])):
+            cfg.training.max_iterations = 500
     if "data" not in cfg:
         raise ValueError("data config is required but not found")
     
@@ -85,8 +112,12 @@ def setup(args):
         os.makedirs(os.path.join(log_dir, folder), exist_ok=True)
     
     # Setup logging
-    global logger
-    setup_logging(output=log_dir, level=logging.INFO, time_string=current_time)
+    log_level_name = None
+    if "training" in cfg and hasattr(cfg.training, "get"):
+        log_level_name = cfg.training.get("log_level", None)
+    log_level = getattr(logging, str(log_level_name).upper(), logging.INFO) if log_level_name is not None else logging.INFO
+
+    setup_logging(output=log_dir, level=log_level, time_string=current_time)
     logger.info("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
     
     # Save config
@@ -235,6 +266,13 @@ def main(args):
     )
     logger.info(f"Dataset initialized with {len(dataset.train_scene_ids)} training scenes")
     
+    # Tiny overfit: use fixed (scene_id=0, segment_id=0) batch every step
+    fixed_batch = None
+    if getattr(args, "tiny_overfit", False):
+        dataset.initialize()
+        fixed_batch = dataset.get_segment_batch(0, 0, include_test=True)
+        logger.info("Tiny overfit: using fixed batch scene_id=0, segment_id=0")
+    
     # Build trainer
     logger.info("Building StreetForwardTrainer...")
     trainer = StreetForwardTrainer(
@@ -273,8 +311,11 @@ def main(args):
     try:
         step = getattr(trainer, "global_step", 0)
         while step < max_iterations:
-            # Sample random batch
-            batch = dataset.sample_random_batch()
+            # Sample random batch or use fixed batch (tiny overfit)
+            if fixed_batch is not None:
+                batch = fixed_batch
+            else:
+                batch = dataset.sample_random_batch()
             
             # Convert batch format
             streetforward_batch = convert_batch_to_streetforward_format(batch, device)
@@ -288,7 +329,20 @@ def main(args):
                     "Check: OOM, AMP compatibility, or invalid tensors."
                 )
                 raise
+            except ValueError as e:
+                logger.error(
+                    f"Step {step} failed (ValueError): {e}. "
+                    "Likely causes: empty targets or invalid/empty pointcloud inputs."
+                )
+                raise
             step = getattr(trainer, "global_step", step + 1)
+            current_lr = None
+            grad_norm = getattr(trainer, "_last_grad_norm", None)
+            if hasattr(trainer, "optimizer"):
+                try:
+                    current_lr = trainer.optimizer.param_groups[0]["lr"]
+                except Exception:
+                    current_lr = None
             
             # Update metrics
             total_loss = result.get("total_loss", torch.tensor(0.0, device=device))
@@ -297,16 +351,20 @@ def main(args):
                 logger.warning(f"Step {step}: loss is NaN or inf ({loss_val}). Check data and model.")
             metric_logger.update(loss=loss_val)
             metric_logger.update(step=step)
+            if current_lr is not None:
+                metric_logger.update(lr=current_lr)
+            if grad_norm is not None:
+                metric_logger.update(grad_norm=grad_norm)
 
-            # Logging
+            # Logging (trainer._log_to_tensorboard already writes lr/grad_norm per tb_log_every)
             if step % log_interval == 0:
                 logger.info(f"Step {step}: {metric_logger}")
 
             if step > 0 and (step % save_checkpoint_freq == 0 or step == max_iterations - 1):
                 trainer.save_checkpoint(step=step, is_final=(step >= max_iterations - 1))
 
-            # Evaluation (可选)
-            if step > 0 and step % eval_freq == 0:
+            # Evaluation (可选；tiny overfit 时跳过以加快运行)
+            if step > 0 and step % eval_freq == 0 and fixed_batch is None:
                 logger.info("Running evaluation...")
                 trainer.eval()
                 
@@ -399,6 +457,11 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="Path to checkpoint to resume from",
+    )
+    parser.add_argument(
+        "--tiny_overfit",
+        action="store_true",
+        help="Tiny overfit: 1 scene (0), 1 segment (0), fixed batch, 500 steps (override with training.max_iterations=N).",
     )
     parser.add_argument(
         "opts",

@@ -5,7 +5,6 @@ from typing import Dict, Literal, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from models.streetforward.logging_utils import _debug_log
 from models.streetforward.math_utils import (
     _axis_angle_to_quat,
     _num_sh_bases,
@@ -79,21 +78,6 @@ class OffsetsMixin:
         
         注意：静态和动态使用相同的 MLP 网络预测偏移量。
         """
-        # #region agent log
-        if torch.cuda.is_available():
-            _debug_log(
-                "streetforward.py:_predict_offsets",
-                "Start predicting offsets",
-                {
-                    "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
-                    "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
-                    "feat_3d_crop_size_mb": feat_3d_crop.numel() * 4 / 1024**2,
-                    "feat_3d_crop_shape": list(feat_3d_crop.shape),
-                },
-                hypothesis_id="H5",
-            )
-        # #endregion
-        
         # Position offset with tanh clamping
         offset_pos = self.offset_max * torch.tanh(self.mlp_offset_pos(feat_3d_crop))
         
@@ -114,31 +98,6 @@ class OffsetsMixin:
         offset_sh_dc = self.sh_dc_max * torch.tanh(sh_dc_raw)
         offset_sh_rest = self.sh_rest_max * torch.tanh(sh_rest_raw)
         offset_sh = torch.cat([offset_sh_dc, offset_sh_rest], dim=-1)
-        
-        # #region agent log
-        if torch.cuda.is_available():
-            total_offset_size = (
-                offset_pos.numel() * 4 + offset_scales.numel() * 4 + offset_quat.numel() * 4 +
-                offset_opacity.numel() * 4 + offset_sh.numel() * 4
-            ) / 1024**2
-            _debug_log(
-                "streetforward.py:_predict_offsets",
-                "After predicting offsets",
-                {
-                    "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
-                    "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
-                    "total_offset_size_mb": total_offset_size,
-                    "offset_shapes": {
-                        "offset_pos": list(offset_pos.shape),
-                        "offset_scales": list(offset_scales.shape),
-                        "offset_quat": list(offset_quat.shape),
-                        "offset_opacity": list(offset_opacity.shape),
-                        "offset_sh": list(offset_sh.shape),
-                    },
-                },
-                hypothesis_id="H5",
-            )
-        # #endregion
         
         return {
             "offset_pos": offset_pos,

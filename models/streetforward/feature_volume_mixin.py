@@ -5,7 +5,6 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from models.streetforward.logging_utils import _debug_log
 from models.streetforward.math_utils import _num_sh_bases, _sh_to_rgb
 from models.streetforward.node_states import NodeState, NodeStateRigid, NodeStateDistant
 
@@ -46,21 +45,6 @@ class FeatureVolumeMixin:
         6. 分别为静态和动态点插值特征
         7. 删除密集体积以释放内存
         """
-        # #region agent log
-        if torch.cuda.is_available():
-            _debug_log(
-                "streetforward.py:_build_3d_feature_volume",
-                "Start building 3D feature volume",
-                {
-                    "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
-                    "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
-                    "num_bg_points": node_state_bg.means.shape[0],
-                    "has_rigid": node_state_rigid is not None,
-                },
-                hypothesis_id="H5",
-            )
-        # #endregion
-        
         rigid_visible_mask = None
         rigid_in_crop_mask = None
         if node_state_rigid is not None:
@@ -99,33 +83,23 @@ class FeatureVolumeMixin:
         means_list = [means_bg]
         rgb_list = [anchor_rgb_bg]
         if node_state_rigid is not None and means_rigid_world_all.numel() > 0:
+            # 默认使用可见且在 crop 内的点；如果传入了 mask_src_rigid 则以其为准
+            effective_mask = None
             if mask_src_rigid is not None and idx_src_rigid is not None and len(idx_src_rigid) > 0:
-                # 使用 mask_src_rigid 和 idx_src_rigid 过滤
                 effective_mask = mask_src_rigid & rigid_in_crop_mask
-                if effective_mask.any():
-                    means_list.append(means_rigid_world_all[effective_mask])
-                    rgb_list.append(anchor_rgb_rigid_all[effective_mask])
             elif rigid_visible_mask is not None:
-                raise ValueError("mask_src_rigid and idx_src_rigid are not provided")
+                effective_mask = rigid_visible_mask
+                if rigid_in_crop_mask is not None:
+                    effective_mask = effective_mask & rigid_in_crop_mask
+            elif rigid_in_crop_mask is not None:
+                effective_mask = rigid_in_crop_mask
+
+            if effective_mask is not None and effective_mask.any():
+                means_list.append(means_rigid_world_all[effective_mask])
+                rgb_list.append(anchor_rgb_rigid_all[effective_mask])
 
         means_all = torch.cat(means_list, dim=0)
         anchor_rgb_all = torch.cat(rgb_list, dim=0)
-
-        # #region agent log
-        if torch.cuda.is_available():
-            _debug_log(
-                "streetforward.py:_build_3d_feature_volume",
-                "Before construct_sparse_tensor",
-                {
-                    "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
-                    "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
-                    "num_total_points": means_all.shape[0],
-                    "means_all_size_mb": means_all.numel() * 4 / 1024**2,
-                    "anchor_rgb_all_size_mb": anchor_rgb_all.numel() * 4 / 1024**2,
-                },
-                hypothesis_id="H5",
-            )
-        # #endregion
 
         # Sparse path (construct_sparse_tensor, sparse_conv) runs in FP32 when AMP enabled
         # (numpy/torchsparse may not support FP16)
@@ -143,152 +117,21 @@ class FeatureVolumeMixin:
             )
             feat_3d = self.sparse_conv(sparse_feat)
         
-        # #region agent log
-        if torch.cuda.is_available():
-            num_voxels = sparse_feat.feats.shape[0] if hasattr(sparse_feat, 'feats') else 0
-            sparse_feat_size = sparse_feat.feats.numel() * 4 / 1024**2 if hasattr(sparse_feat, 'feats') else 0
-            _debug_log(
-                "streetforward.py:_build_3d_feature_volume",
-                "After construct_sparse_tensor, before sparse_conv",
-                {
-                    "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
-                    "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
-                    "num_voxels": num_voxels,
-                    "vol_dim": vol_dim.tolist() if isinstance(vol_dim, torch.Tensor) else vol_dim,
-                    "sparse_feat_size_mb": sparse_feat_size,
-                    "valid_coords_size_mb": valid_coords.numel() * 4 / 1024**2,
-                },
-                hypothesis_id="H5",
-            )
-        # #endregion
-        
-        feat_3d = self.sparse_conv(sparse_feat)
-        
-        # #region agent log
-        if torch.cuda.is_available():
-            # sparse_conv returns torch.Tensor (x.F), not SparseTensor
-            if isinstance(feat_3d, torch.Tensor):
-                feat_3d_size = feat_3d.numel() * 4 / 1024**2
-                feat_3d_shape = list(feat_3d.shape)
-            elif hasattr(feat_3d, 'feats'):
-                feat_3d_size = feat_3d.feats.numel() * 4 / 1024**2
-                feat_3d_shape = list(feat_3d.feats.shape)
-            else:
-                feat_3d_size = 0
-                feat_3d_shape = None
-            
-            # Calculate expected dense volume size
-            vol_dim_list = vol_dim.tolist() if isinstance(vol_dim, torch.Tensor) else vol_dim
-            if isinstance(feat_3d, torch.Tensor):
-                outdim = feat_3d.shape[-1]
-            elif hasattr(feat_3d, 'feats'):
-                outdim = feat_3d.feats.shape[-1]
-            else:
-                outdim = 32  # default
-            expected_dense_size_mb = vol_dim_list[0] * vol_dim_list[1] * vol_dim_list[2] * outdim * 4 / 1024**2
-            
-            _debug_log(
-                "streetforward.py:_build_3d_feature_volume",
-                "After sparse_conv, before sparse_to_dense_volume",
-                {
-                    "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
-                    "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
-                    "feat_3d_size_mb": feat_3d_size,
-                    "feat_3d_shape": feat_3d_shape,
-                    "feat_3d_type": str(type(feat_3d)),
-                    "expected_dense_size_mb": expected_dense_size_mb,
-                    "vol_dim": vol_dim_list,
-                    "outdim": outdim,
-                },
-                hypothesis_id="H5",
-            )
-        # #endregion
-        
-        # 记录调用 sparse_to_dense_volume 前的内存状态作为基线
-        memory_before_dense = None
-        if torch.cuda.is_available():
-            memory_before_dense = torch.cuda.memory_allocated() / 1024**2
-        
-        # #region agent log
-        if torch.cuda.is_available():
-            _debug_log(
-                "streetforward.py:_build_3d_feature_volume",
-                "Right before sparse_to_dense_volume (critical memory point)",
-                {
-                    "allocated_mb": memory_before_dense,
-                    "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
-                    "free_mb": (torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_reserved()) / 1024**2,
-                },
-                hypothesis_id="H5",
-            )
-        # #endregion
-        
-        try:
-            dense_volume = self.sparse_to_dense_volume(
-                sparse_tensor=feat_3d,
-                coords=valid_coords,
-                vol_dim=vol_dim,
-            ).unsqueeze(dim=0)
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
-                # #region agent log
-                if torch.cuda.is_available():
-                    _debug_log(
-                        "streetforward.py:_build_3d_feature_volume",
-                        "OOM ERROR in sparse_to_dense_volume",
-                        {
-                            "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
-                            "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
-                            "error": str(e),
-                            "vol_dim": vol_dim.tolist() if isinstance(vol_dim, torch.Tensor) else vol_dim,
-                        },
-                        hypothesis_id="H5",
-                    )
-                # #endregion
-            raise
-        
-        # #region agent log
-        if torch.cuda.is_available():
-            vol_dim_list = vol_dim.tolist() if isinstance(vol_dim, torch.Tensor) else vol_dim
-            dense_volume_size = dense_volume.numel() * 4 / 1024**2
-            expected_dense_size = vol_dim_list[0] * vol_dim_list[1] * vol_dim_list[2] * dense_volume.shape[-1] * 4 / 1024**2
-            memory_after_dense = torch.cuda.memory_allocated() / 1024**2
-            memory_increase_mb = memory_after_dense - memory_before_dense if memory_before_dense is not None else None
-            _debug_log(
-                "streetforward.py:_build_3d_feature_volume",
-                "After sparse_to_dense_volume, before permute",
-                {
-                    "allocated_mb": memory_after_dense,
-                    "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
-                    "dense_volume_size_mb": dense_volume_size,
-                    "dense_volume_shape": list(dense_volume.shape),
-                    "expected_dense_size_mb": expected_dense_size,
-                    "vol_dim": vol_dim_list,
-                    "memory_increase_mb": memory_increase_mb,  # Compare with before sparse_to_dense_volume
-                },
-                hypothesis_id="H5",
-            )
-        # #endregion
-        
-        dense_volume = dense_volume.permute(0, 4, 3, 2, 1)
+        dense_volume = self.sparse_to_dense_volume(
+            sparse_tensor=feat_3d,
+            coords=valid_coords,
+            vol_dim=vol_dim,
+        ).unsqueeze(dim=0)
+        dense_volume = dense_volume.permute(0, 4, 3, 2, 1)  # [1, C, D, H, W]
+        if hasattr(self, "_record_volume_stats"):
+            try:
+                self._record_volume_stats(vol_dim=vol_dim, feat_dim=dense_volume.shape[1])
+            except Exception:
+                # Stats are best-effort; do not break forward if logging is misconfigured
+                pass
 
         grid_coords_bg = self.get_grid_coords(means_bg, self.bbx_min, vol_dim, self.voxel_size)
         feat_3d_crop_bg = self.interpolate_features(grid_coords_bg, dense_volume)
-
-        # #region agent log
-        if torch.cuda.is_available():
-            _debug_log(
-                "streetforward.py:_build_3d_feature_volume",
-                "After interpolate_features for bg",
-                {
-                    "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
-                    "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
-                    "feat_3d_crop_bg_size_mb": feat_3d_crop_bg.numel() * 4 / 1024**2,
-                    "feat_3d_crop_bg_shape": list(feat_3d_crop_bg.shape),
-                },
-                hypothesis_id="H5",
-            )
-        # #endregion
 
         if node_state_rigid is not None and means_rigid_world_all.shape[0] > 0:
             feat_dim = feat_3d_crop_bg.shape[1]
@@ -311,36 +154,29 @@ class FeatureVolumeMixin:
         else:
             feat_3d_crop_rigid = torch.empty(0, feat_3d_crop_bg.shape[1], device=self.device)
 
-        # #region agent log
-        if torch.cuda.is_available():
-            _debug_log(
-                "streetforward.py:_build_3d_feature_volume",
-                "Before deleting dense_volume",
-                {
-                    "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
-                    "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
-                    "feat_3d_crop_rigid_size_mb": feat_3d_crop_rigid.numel() * 4 / 1024**2 if feat_3d_crop_rigid.numel() > 0 else 0,
-                },
-                hypothesis_id="H5",
-            )
-        # #endregion
-
         del dense_volume
         
-        # #region agent log
-        if torch.cuda.is_available():
-            _debug_log(
-                "streetforward.py:_build_3d_feature_volume",
-                "After deleting dense_volume",
-                {
-                    "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
-                    "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
-                },
-                hypothesis_id="H5",
-            )
-        # #endregion
-        
         return feat_3d_crop_bg, feat_3d_crop_rigid, rigid_visible_mask, rigid_in_crop_mask
+
+    def _record_volume_stats(self, vol_dim: torch.Tensor, feat_dim: int) -> None:
+        """
+        Cache volume statistics for sentinel logging and safety checks.
+        """
+        vol_dim_tensor = torch.as_tensor(vol_dim).detach().cpu().long()
+        self._last_vol_dim = vol_dim_tensor
+        vol_prod = int(vol_dim_tensor.prod().item())
+        self._last_vol_dim_prod = vol_prod
+        dense_elements = vol_prod * int(feat_dim)
+        self._last_dense_elements_est = dense_elements
+
+        max_allowed = getattr(self, "sentinel_max_dense_elements", None)
+        if max_allowed is None:
+            max_allowed = getattr(self, "sentinel_max_vol_elements", None)
+        if max_allowed is not None and dense_elements > max_allowed:
+            raise RuntimeError(
+                f"dense volume elements ({dense_elements}) exceed limit ({max_allowed}); "
+                "consider increasing voxel_size or tightening bounding boxes."
+            )
 
     def _compute_and_fuse_features(
         self,

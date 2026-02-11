@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
+import math
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -15,7 +16,6 @@ from models.feature_extractors import (
     FeatureFusion,
     ImageFeatureExtractor,
 )
-from models.streetforward.logging_utils import _debug_log
 from models.streetforward.math_utils import _num_sh_bases, get_viewmat
 from models.streetforward.node_states import (
     NodeState,
@@ -269,7 +269,7 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
 
         self.scheduler = None
         sched_cfg = tc_get("lr_scheduler")
-        if sched_cfg is not None and isinstance(sched_cfg, dict):
+        if sched_cfg is not None and (isinstance(sched_cfg, dict) or hasattr(sched_cfg, "get")):
             sched_type = sched_cfg.get("type", "none") or "none"
             max_iter = int(tc_get("max_iterations", 10000))
             if sched_type == "cosine":
@@ -312,6 +312,28 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
             if hasattr(training_cfg, "get")
             else None
         )
+        self.strict_proxy_grad = bool(tc_get("strict_proxy_grad", False))
+        self.strict_proxy_grad_steps = int(tc_get("strict_proxy_grad_steps", 0) or 0)
+        self.detect_anomaly_steps = int(tc_get("detect_anomaly_steps", 0) or 0)
+        sentinel_cfg = tc_get("sentinel", {}) if hasattr(training_cfg_init, "get") else {}
+        sget = sentinel_cfg.get if hasattr(sentinel_cfg, "get") else (lambda k, d=None: d)
+        self.sentinel_enabled = bool(sget("enabled", False))
+        self.sentinel_log_every = int(sget("log_every", self.tb_log_every)) if self.tb_log_every else int(sget("log_every", 1) or 1)
+        self.sentinel_alert_on_nan = bool(sget("alert_on_nan", False))
+        self.sentinel_alert_on_grad_zero = bool(sget("alert_on_grad_zero", False))
+        self.proxy_grad_warn_on_none = bool(sget("warn_on_proxy_grad_none", False))
+        max_dense = sget("max_dense_elements", sget("max_vol_elements", None))
+        try:
+            self.sentinel_max_dense_elements = int(max_dense) if max_dense is not None else None
+        except (TypeError, ValueError):
+            self.sentinel_max_dense_elements = None
+        self._strict_proxy_grad_active = False
+        self._strict_checks_active = False
+        self._last_sentinel_metrics: Dict[str, float] = {}
+        self._last_grad_norms_by_module: Dict[str, float] = {}
+        self._last_vol_dim = None
+        self._last_vol_dim_prod = None
+        self._last_dense_elements_est = None
         # allow both legacy top-level flag and training-level override
         self.log_images = bool(config.get("log_images", False))
         if hasattr(training_cfg, "get"):
@@ -326,6 +348,7 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
         self.h_cache_bg: Dict[Tuple[int, int], torch.Tensor] = {}
         self.h_cache_rigid: Dict[Tuple[int, int], torch.Tensor] = {}
         self.h_cache_distant: Dict[Tuple[int, int], torch.Tensor] = {}
+        self._h_cache_signatures: Dict[str, Dict[Tuple[int, int], Tuple[int, ...]]] = {}
         self._lpips_model = None
 
         # Initialize offset heads to output near-zero offsets
@@ -347,15 +370,230 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
         nn.init.zeros_(self.gaussion_decoder[-1].weight)
         nn.init.zeros_(self.gaussion_decoder[-1].bias)
 
-    def _get_or_init_hidden(self, cache: Dict[Tuple[int, int], torch.Tensor], key: Tuple[int, int], num_points: int) -> torch.Tensor:
+    def _update_runtime_flags(self) -> None:
         """
-        Fetch hidden state from cache or initialize zeros. Detach to truncate BPTT across train_iter.
+        Update strict modes (proxy grad, anomaly detection) based on the current global_step.
+        """
+        step = int(getattr(self, "global_step", 0))
+        self._strict_proxy_grad_active = bool(self.strict_proxy_grad) or (
+            self.strict_proxy_grad_steps > 0 and step < self.strict_proxy_grad_steps
+        )
+        self._strict_checks_active = bool(
+            self._strict_proxy_grad_active or (self.detect_anomaly_steps > 0 and step < self.detect_anomaly_steps)
+        )
+        use_anomaly = self.detect_anomaly_steps > 0 and step < self.detect_anomaly_steps
+        if torch.is_anomaly_enabled() != use_anomaly:
+            torch.autograd.set_detect_anomaly(use_anomaly)
+
+    def _reset_sentinel_cache(self) -> None:
+        self._last_sentinel_metrics = {}
+        self._last_grad_norms_by_module = {}
+        self._last_proxy_grad_norms = {}
+
+    def _check_for_nan_inf(self, tensors: Dict[str, Optional[torch.Tensor]]) -> None:
+        if not (self._strict_checks_active or self.sentinel_alert_on_nan):
+            return
+        for name, tensor in tensors.items():
+            if tensor is None:
+                continue
+            if isinstance(tensor, dict):
+                for k, v in tensor.items():
+                    self._check_for_nan_inf({f"{name}.{k}": v})
+                continue
+            if not torch.is_tensor(tensor):
+                continue
+            if not torch.isfinite(tensor).all():
+                raise RuntimeError(f"{name} contains NaN or Inf.")
+
+    def _compute_grad_norms_by_module(self) -> Dict[str, float]:
+        modules = {
+            "sparse_conv": self.sparse_conv,
+            "mlp_offset_pos": self.mlp_offset_pos,
+            "mlp_conv": self.mlp_conv,
+            "mlp_opacity": self.mlp_opacity,
+            "gaussion_decoder": self.gaussion_decoder,
+            "gru_update": self.gru_update,
+            "gru_candidate": self.gru_candidate,
+        }
+        if self.gru_reset is not None:
+            modules["gru_reset"] = self.gru_reset
+        if hasattr(self, "gru_to_head") and not isinstance(self.gru_to_head, nn.Identity):
+            modules["gru_to_head"] = self.gru_to_head
+        if self.image_feature_extractor is not None:
+            modules["image_feature_extractor"] = self.image_feature_extractor
+        if hasattr(self, "feature_fusion") and self.feature_fusion is not None:
+            modules["feature_fusion"] = self.feature_fusion
+
+        norms: Dict[str, float] = {}
+        for name, module in modules.items():
+            total_sq = 0.0
+            has_grad = False
+            for p in module.parameters():
+                if p.grad is None:
+                    continue
+                g = p.grad.detach()
+                if g.numel() == 0:
+                    continue
+                has_grad = True
+                total_sq += float(torch.sum(g * g).item())
+            norms[name] = float(math.sqrt(total_sq)) if has_grad else 0.0
+        return norms
+
+    def _compute_total_grad_norm(self, params: List[torch.nn.Parameter]) -> Optional[float]:
+        grads = [p.grad.detach() for p in params if p.grad is not None]
+        if len(grads) == 0:
+            return None
+        total_sq = 0.0
+        for g in grads:
+            total_sq += float(torch.sum(g * g).item())
+        return float(math.sqrt(total_sq))
+
+    def _collect_sentinel_metrics(
+        self,
+        *,
+        targets: List[Dict],
+        node_state_bg: NodeState,
+        node_state_rigid: Optional[NodeStateRigid],
+        node_state_distant: Optional[NodeStateDistant],
+        masks: RigidMasks,
+        render_params_bg: Dict[str, torch.Tensor],
+        render_params_rigid: Optional[Dict[str, torch.Tensor]],
+        render_params_distant: Optional[Dict[str, torch.Tensor]],
+        offsets_bg: Dict[str, torch.Tensor],
+        offsets_rigid_world: Optional[Dict[str, torch.Tensor]],
+        offsets_distant: Optional[Dict[str, torch.Tensor]],
+    ) -> None:
+        if not (self.sentinel_enabled or self._strict_checks_active or self.sentinel_alert_on_nan or self.sentinel_alert_on_grad_zero):
+            return
+
+        metrics: Dict[str, float] = {}
+        metrics["num_targets"] = float(len(targets))
+        metrics["N_bg"] = float(node_state_bg.means.shape[0])
+        metrics["N_rigid"] = float(node_state_rigid.means.shape[0]) if node_state_rigid is not None else 0.0
+        metrics["N_distant"] = float(node_state_distant.means.shape[0]) if node_state_distant is not None else 0.0
+
+        if masks.mask_update_rigid is not None and masks.mask_update_rigid.numel() > 0:
+            metrics["mask_update_rigid_mean"] = float(masks.mask_update_rigid.float().mean().item())
+        if masks.mask_src_rigid is not None and masks.mask_src_rigid.numel() > 0:
+            metrics["mask_src_rigid_mean"] = float(masks.mask_src_rigid.float().mean().item())
+        if masks.idx_tgt_rigid:
+            lengths = [int(idx.numel()) for idx in masks.idx_tgt_rigid]
+            if len(lengths) > 0:
+                metrics["idx_tgt_rigid_mean"] = float(sum(lengths) / len(lengths))
+                metrics["idx_tgt_rigid_max"] = float(max(lengths))
+
+        if self._last_vol_dim_prod is not None:
+            metrics["vol_dim_prod"] = float(self._last_vol_dim_prod)
+        if self._last_dense_elements_est is not None:
+            metrics["dense_elements_est"] = float(self._last_dense_elements_est)
+
+        def _render_stats(render_params: Optional[Dict[str, torch.Tensor]], prefix: str) -> None:
+            if render_params is None:
+                return
+            opacities = render_params.get("opacities_r")
+            if opacities is not None and opacities.numel() > 0:
+                metrics[f"{prefix}_opacities_min"] = float(opacities.min().detach())
+                metrics[f"{prefix}_opacities_max"] = float(opacities.max().detach())
+            quats = render_params.get("quats_r")
+            if quats is not None and quats.numel() > 0:
+                quat_norm = torch.linalg.norm(quats.detach(), dim=-1)
+                metrics[f"{prefix}_quat_norm_dev"] = float(torch.mean((quat_norm - 1.0).abs()))
+            means_r = render_params.get("means_r")
+            if means_r is not None and means_r.numel() > 0:
+                metrics[f"{prefix}_means_min"] = float(means_r.min().detach())
+                metrics[f"{prefix}_means_max"] = float(means_r.max().detach())
+            scales_log = render_params.get("scales_log_r")
+            if scales_log is not None and scales_log.numel() > 0:
+                metrics[f"{prefix}_scales_log_min"] = float(scales_log.min().detach())
+                metrics[f"{prefix}_scales_log_max"] = float(scales_log.max().detach())
+
+        def _offset_stats(offsets: Optional[Dict[str, torch.Tensor]], prefix: str) -> None:
+            if offsets is None:
+                return
+            metrics[f"{prefix}_offset_pos_max"] = float(offsets["offset_pos"].detach().abs().max())
+            metrics[f"{prefix}_offset_scales_max"] = float(offsets["offset_scales"].detach().abs().max())
+            metrics[f"{prefix}_offset_opacity_max"] = float(offsets["offset_opacity"].detach().abs().max())
+
+        _render_stats(render_params_bg, "bg")
+        _render_stats(render_params_rigid, "rigid")
+        _render_stats(render_params_distant, "distant")
+
+        _offset_stats(offsets_bg, "bg")
+        _offset_stats(offsets_rigid_world, "rigid_world")
+        _offset_stats(offsets_distant, "distant")
+
+        self._last_sentinel_metrics = metrics
+
+    def _augment_sentinel_with_grads(self, total_loss_val: float) -> None:
+        if not (self.sentinel_enabled or self._strict_checks_active or self.sentinel_alert_on_nan or self.sentinel_alert_on_grad_zero):
+            return
+        metrics = dict(getattr(self, "_last_sentinel_metrics", {}))
+        metrics["total_loss"] = float(total_loss_val)
+        if self._last_grad_norm is not None:
+            metrics["grad_norm_total"] = float(self._last_grad_norm)
+        for name, val in self._last_grad_norms_by_module.items():
+            metrics[f"grad_{name}"] = float(val)
+        for name, val in getattr(self, "_last_proxy_grad_norms", {}).items():
+            metrics[f"proxy_grad_{name}"] = float(val)
+        if torch.cuda.is_available():
+            metrics["max_memory_allocated_gb"] = float(torch.cuda.max_memory_allocated() / 1e9)
+        self._last_sentinel_metrics = metrics
+
+    def _maybe_alert_on_sentinel(self) -> None:
+        if not (self.sentinel_enabled or self._strict_checks_active or self.sentinel_alert_on_nan or self.sentinel_alert_on_grad_zero):
+            return
+        metrics = getattr(self, "_last_sentinel_metrics", {})
+        if self._strict_checks_active or self.sentinel_alert_on_nan:
+            for name, val in metrics.items():
+                if isinstance(val, float) and not math.isfinite(val):
+                    raise RuntimeError(f"Sentinel metric {name} is non-finite ({val}).")
+        if self.sentinel_alert_on_grad_zero:
+            zero_keys = [
+                name for name, val in metrics.items()
+                if (name.startswith("grad_") or name.startswith("proxy_grad_")) and val == 0.0
+            ]
+            if zero_keys:
+                logger.warning(f"Gradients are zero for: {', '.join(zero_keys)}")
+    def _cache_signature(self, node_state: NodeState) -> Tuple[int, ...]:
+        """
+        Lightweight signature of a node_state to detect point count/id changes for cache alignment.
+        """
+        num_points = int(node_state.means.shape[0])
+        sig = [num_points]
+        if hasattr(node_state, "point_ids") and getattr(node_state, "point_ids") is not None:
+            point_ids = node_state.point_ids.reshape(-1).to(torch.int64)
+            sig.append(int(point_ids.numel()))
+            sig.append(int(point_ids.sum().item()))
+        return tuple(sig)
+
+    def _get_or_init_hidden(
+        self,
+        cache: Dict[Tuple[int, int], torch.Tensor],
+        key: Tuple[int, int],
+        num_points: int,
+        node_state: Optional[NodeState] = None,
+        node_type: Optional[str] = None,
+    ) -> torch.Tensor:
+        """
+        Fetch hidden state from cache or initialize zeros. Reset cache when size/signature mismatches.
         """
         h = cache.get(key)
-        if h is None:
-            return torch.zeros(num_points, self.offset_gru_hidden_dim, device=self.device)
-        if h.shape[0] != num_points:
-            raise ValueError(f"h_cache shape mismatch for key {key}: cached {h.shape[0]} vs current {num_points}")
+        desired_sig = self._cache_signature(node_state) if node_state is not None else None
+        prev_sig = None
+        if node_type is not None and hasattr(self, "_h_cache_signatures"):
+            prev_sig = self._h_cache_signatures.get(node_type, {}).get(key)
+
+        reset_needed = (
+            h is None
+            or h.shape[0] != num_points
+            or (prev_sig is not None and desired_sig is not None and prev_sig != desired_sig)
+        )
+        if reset_needed:
+            h = torch.zeros(num_points, self.offset_gru_hidden_dim, device=self.device)
+            cache[key] = h
+
+        if node_type is not None and desired_sig is not None:
+            self._h_cache_signatures.setdefault(node_type, {})[key] = desired_sig
         return h.detach()
 
     def _setup_tensorboard(self, training_cfg) -> None:
@@ -452,15 +690,15 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
         """
         key, node_state_bg, node_state_rigid, node_state_distant = self._get_or_init_node_states(batch)
         targets = self._parse_targets(batch)
+        self._update_runtime_flags()
+        self._reset_sentinel_cache()
 
         if len(targets) == 0:
-            return {
-                "total_loss": torch.tensor(0.0, device=self.device),
-                "node_state": node_state_bg,
-                "node_state_rigid": node_state_rigid,
-                "node_state_distant": node_state_distant,
-                "outputs": [],
-            }
+            scene_id, segment_id = key
+            raise ValueError(
+                f"targets is empty: cannot compute loss (scene_id={scene_id}, segment_id={segment_id}). "
+                "Check batch construction or _parse_targets."
+            )
 
         outputs: List[Dict] = []
         total_loss_val = 0.0
@@ -468,23 +706,32 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
 
         self.optimizer.zero_grad(set_to_none=True)
 
-        if torch.cuda.is_available():
-            _debug_log(
-                "streetforward.py:train_iter",
-                "Before inner iterations",
-                {
-                    "num_targets": len(targets),
-                    "inner_iterations": self.inner_iterations,
-                    "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
-                    "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
-                },
-                hypothesis_id="H4",
-            )
-
         # Hidden state seeds (detach to stop grad across train_iter)
-        h_bg = self._get_or_init_hidden(self.h_cache_bg, key, node_state_bg.means.shape[0])
-        h_rigid = self._get_or_init_hidden(self.h_cache_rigid, key, node_state_rigid.means.shape[0]) if node_state_rigid is not None else None
-        h_distant = self._get_or_init_hidden(self.h_cache_distant, key, node_state_distant.means.shape[0]) if node_state_distant is not None else None
+        h_bg = self._get_or_init_hidden(
+            self.h_cache_bg, key, node_state_bg.means.shape[0], node_state=node_state_bg, node_type="bg"
+        )
+        h_rigid = (
+            self._get_or_init_hidden(
+                self.h_cache_rigid,
+                key,
+                node_state_rigid.means.shape[0],
+                node_state=node_state_rigid,
+                node_type="rigid",
+            )
+            if node_state_rigid is not None
+            else None
+        )
+        h_distant = (
+            self._get_or_init_hidden(
+                self.h_cache_distant,
+                key,
+                node_state_distant.means.shape[0],
+                node_state=node_state_distant,
+                node_type="distant",
+            )
+            if node_state_distant is not None
+            else None
+        )
 
         for _ in range(self.inner_iterations):
             with torch.cuda.amp.autocast(enabled=getattr(self, "use_amp", False)):
@@ -508,6 +755,9 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
                 self._last_grad_norm = None
                 if grad_scaler is not None:
                     grad_scaler.unscale_(self.optimizer)
+                if self.sentinel_enabled or self._strict_checks_active:
+                    self._last_grad_norms_by_module = self._compute_grad_norms_by_module()
+                if grad_scaler is not None:
                     if grad_clip is not None and grad_clip > 0:
                         grad_norm = torch.nn.utils.clip_grad_norm_(params, max_norm=grad_clip)
                         self._last_grad_norm = float(grad_norm.item()) if torch.is_tensor(grad_norm) else float(grad_norm)
@@ -517,6 +767,10 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
                     if grad_clip is not None and grad_clip > 0:
                         grad_norm = torch.nn.utils.clip_grad_norm_(params, max_norm=grad_clip)
                         self._last_grad_norm = float(grad_norm.item()) if torch.is_tensor(grad_norm) else float(grad_norm)
+                    elif self._last_grad_norm is None:
+                        maybe_norm = self._compute_total_grad_norm(params)
+                        if maybe_norm is not None:
+                            self._last_grad_norm = maybe_norm
                     self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)
                 if self.scheduler is not None and not isinstance(
@@ -548,6 +802,12 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
                 self.h_cache_rigid[key] = h_rigid.detach()
             if node_state_distant is not None:
                 self.h_cache_distant[key] = h_distant.detach()
+
+        if self._strict_checks_active or self.sentinel_alert_on_nan:
+            if not math.isfinite(total_loss_val):
+                raise RuntimeError("Total loss is NaN or Inf.")
+        self._augment_sentinel_with_grads(total_loss_val)
+        self._maybe_alert_on_sentinel()
 
         if apply_update:
             self.global_step += 1
@@ -731,6 +991,17 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
             source_frame_idx=source_frame_idx,
         )
 
+        self._check_for_nan_inf(
+            {
+                "offsets_bg": offsets_bg,
+                "offsets_rigid": offsets_rigid_world,
+                "offsets_distant": offsets_distant,
+                "render_params_bg": render_params_bg,
+                "render_params_rigid": render_params_rigid,
+                "render_params_distant": render_params_distant,
+            }
+        )
+
         proxies_bg = self._create_proxy_params(render_params_bg)
         proxies_rigid = self._create_proxy_params(render_params_rigid) if render_params_rigid is not None else None
         proxies_distant = self._create_proxy_params(render_params_distant) if render_params_distant is not None else None
@@ -751,6 +1022,20 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
             proxies_bg=proxies_bg,
             proxies_rigid=proxies_rigid,
             proxies_distant=proxies_distant,
+        )
+
+        self._collect_sentinel_metrics(
+            targets=targets,
+            node_state_bg=node_state_bg,
+            node_state_rigid=node_state_rigid,
+            node_state_distant=node_state_distant,
+            masks=masks,
+            render_params_bg=render_params_bg,
+            render_params_rigid=render_params_rigid,
+            render_params_distant=render_params_distant,
+            offsets_bg=offsets_bg,
+            offsets_rigid_world=offsets_rigid_world,
+            offsets_distant=offsets_distant,
         )
 
         return {
@@ -859,6 +1144,12 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
             grad_norm = getattr(self, "_last_grad_norm", None)
             if grad_norm is not None:
                 self.tb_writer.add_scalar("train/grad_norm", grad_norm, step)
+
+        if self.sentinel_enabled and self.sentinel_log_every and step % self.sentinel_log_every == 0:
+            metrics = getattr(self, "_last_sentinel_metrics", {})
+            for name, val in metrics.items():
+                if isinstance(val, float):
+                    self.tb_writer.add_scalar(f"sentinel/{name}", val, step)
 
         if (
             self.log_images

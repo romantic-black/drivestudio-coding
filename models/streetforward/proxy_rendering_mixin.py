@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from models.streetforward.logging_utils import _debug_log
 from models.streetforward.math_utils import _num_sh_bases, _sh_to_rgb, get_viewmat
 from models.streetforward.node_state_mixin import RigidMasks
 
@@ -38,17 +37,6 @@ class ProxyRenderingMixin:
         - 这样可以在多个视角上累积梯度，然后一次性反向传播到渲染参数
         - 所有 target 帧共享同一组代理参数
         """
-        # #region agent log
-        _debug_log(
-            "streetforward.py:_create_proxy_params",
-            "Creating proxy params",
-            {
-                "num_points": render_params["means_r"].shape[0],
-                "requires_grad_before": render_params["means_r"].requires_grad,
-            },
-            hypothesis_id="H1",
-        )
-        # #endregion
         proxies = {
             "means_p": render_params["means_r"].detach().requires_grad_(True),
             "scales_p": render_params["scales_r"].detach().requires_grad_(True),
@@ -56,18 +44,6 @@ class ProxyRenderingMixin:
             "opacities_p": render_params["opacities_r"].detach().requires_grad_(True),
             "colors_p": render_params["colors_r"].detach().requires_grad_(True),
         }
-        # #region agent log
-        _debug_log(
-            "streetforward.py:_create_proxy_params",
-            "Proxy params created",
-            {
-                "requires_grad_after": proxies["means_p"].requires_grad,
-                "is_leaf": proxies["means_p"].is_leaf,
-                "grad_fn": str(proxies["means_p"].grad_fn),
-            },
-            hypothesis_id="H1",
-        )
-        # #endregion
         return proxies
 
     def _merge_all_params(
@@ -295,16 +271,23 @@ class ProxyRenderingMixin:
         """
         grad_report: Dict[str, float] = {}
         grad_warned = getattr(self, "_proxy_grad_warned", set())
+        strict = bool(getattr(self, "_strict_proxy_grad_active", False))
+        warn_on_none = bool(getattr(self, "proxy_grad_warn_on_none", False))
+        alert_on_nan = bool(getattr(self, "sentinel_alert_on_nan", False) or getattr(self, "_strict_checks_active", False))
 
         def _grad_or_zero(proxy_tensor: torch.Tensor, name: str) -> torch.Tensor:
             grad = proxy_tensor.grad
             if grad is None:
-                if name not in grad_warned:
+                if strict:
+                    raise RuntimeError(f"Proxy gradient for {name} is None in strict mode.")
+                if warn_on_none and name not in grad_warned:
                     logger = logging.getLogger(__name__)
                     logger.warning(f"Proxy gradient for {name} is None; using zeros for backward.")
                     grad_warned.add(name)
                 grad_report[name] = 0.0
                 return torch.zeros_like(proxy_tensor)
+            if alert_on_nan and not torch.isfinite(grad).all():
+                raise RuntimeError(f"Proxy gradient for {name} contains NaN/Inf.")
             grad_report[name] = float(grad.norm().detach())
             return grad
 

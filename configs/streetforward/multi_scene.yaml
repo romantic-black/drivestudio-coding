@@ -1,9 +1,11 @@
 # StreetForward training configuration
 # This configuration supports multi-scene training with RGB point cloud initialization
 
+# data 字段直接配置 MultiSceneDataset 的 dataset（参考 docs/dataloader/MultiSceneDataset_Usage.md）
+# 无需 dataset_preset，pixel_source、lidar_source 等在此完整配置
 data:
   data_root: /root/autodl-tmp/nuScenes/  # data root for the dataset
-  dataset: nuscenes  # dataset type (waymo, nuscenes, kitti, etc.)
+  dataset: nuscenes  # dataset name（用于数据加载与 DATASETS_CONFIG）
   start_timestep: 0
   end_timestep: -1
   preload_device: cpu
@@ -147,8 +149,19 @@ training:
   eval_freq: 5000
   log_interval: 100
   log_images: false  # 是否保存渲染图像（节省GPU内存）
+  log_level: info
   grad_clip_max_norm: 1.0  # 梯度裁剪，null 或 0 表示不裁剪
   use_amp: false  # 混合精度 (AMP)，建议先 false 验证流程
+  strict_proxy_grad: false
+  strict_proxy_grad_steps: 50
+  detect_anomaly_steps: 50
+  sentinel:
+    enabled: true
+    log_every: 20
+    alert_on_nan: true
+    alert_on_grad_zero: false
+    warn_on_proxy_grad_none: false
+    max_dense_elements: null  # 不限制；设置整数值可 fail-fast 防 OOM（如 5e9）
   lr_scheduler:
     type: null  # cosine | step | plateau | null
     T_max: 10000  # cosine 用

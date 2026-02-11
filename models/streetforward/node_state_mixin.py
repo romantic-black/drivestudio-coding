@@ -282,6 +282,8 @@ class NodeStateMixin:
                 self.h_cache_rigid.clear()
             if hasattr(self, "h_cache_distant"):
                 self.h_cache_distant.clear()
+            if hasattr(self, "_h_cache_signatures"):
+                self._h_cache_signatures.clear()
             # 强制垃圾回收以释放显存
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -326,6 +328,12 @@ class NodeStateMixin:
         fg_colors = colors[in_crop_mask]
         distant_points = points[~in_crop_mask]
         distant_colors = colors[~in_crop_mask]
+
+        if len(fg_points) == 0:
+            raise ValueError(
+                f"Empty background pointcloud after filtering for scene_id={scene_id}, segment_id={segment_id}. "
+                "Check dataset pointcloud generation and AABB settings."
+            )
 
         node_state_bg = self._init_node_state_from_arrays(fg_points, fg_colors, NodeStateBackground)
         node_state_distant: Optional[NodeStateDistant] = None
