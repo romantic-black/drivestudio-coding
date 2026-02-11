@@ -443,10 +443,12 @@ class NodeStateMixin:
                 for instance_id, instance_pose in instances.items():
                     ins_id = int(instance_id)
                     if ins_id not in instance_id_map:
-                        raise ValueError(
-                            f"Instance ID {ins_id} from dynamic_info not found in existing instance_ids. "
-                            f"Existing instance IDs: {sorted(instance_id_map.keys())}"
+                        # Skip instances that are in dynamic_info but not in pointcloud (e.g. annotated in frame but not in segment pointcloud)
+                        logger.debug(
+                            "Instance ID %s from dynamic_info not in pointcloud instance_ids %s; skipping.",
+                            ins_id, sorted(instance_id_map.keys()),
                         )
+                        continue
                     ins_slot = instance_id_map[ins_id]
                     quat = torch.tensor(instance_pose["quat"], device=device)
                     trans = torch.tensor(instance_pose["trans"], device=device)

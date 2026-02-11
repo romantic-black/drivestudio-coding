@@ -97,6 +97,7 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
         dataset: "MultiSceneDataset",
         scene_id: int,
         segment_id: int,
+        segment_first_pose=None,
     ) -> Dict:
         """
         生成混合RGB点云。
@@ -116,7 +117,7 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
         # 尝试生成LiDAR点云
         try:
             lidar_result = self.lidar_generator.generate_pointcloud(
-                dataset, scene_id, segment_id
+                dataset, scene_id, segment_id, segment_first_pose=segment_first_pose
             )
         except Exception as e:
             lidar_error = e
@@ -127,7 +128,7 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
         # 尝试生成单目点云
         try:
             monocular_result = self.monocular_generator.generate_pointcloud(
-                dataset, scene_id, segment_id
+                dataset, scene_id, segment_id, segment_first_pose=segment_first_pose
             )
         except Exception as e:
             monocular_error = e

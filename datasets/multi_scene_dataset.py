@@ -1405,6 +1405,7 @@ class MultiSceneDataset:
         scene_dataset: DrivingDataset,
         frame_indices: List[int],
         instance_mapping: Optional[Dict[int, int]] = None,
+        world_to_seg0: Optional[Tensor] = None,
     ) -> Optional[Dict]:
         """
         从 scene_dataset 的 instances_pose 构建 dynamic_info。
@@ -1414,6 +1415,7 @@ class MultiSceneDataset:
             frame_indices: 需要构建 dynamic_info 的帧索引列表
             instance_mapping: 可选的实例ID映射，格式为 {original_id: intid}，用于将原始的 instance_id 
                             转换为点云中使用的 intid。如果提供，dynamic_info 中的 instance_id 将使用 intid。
+            world_to_seg0: 可选的世界坐标 -> segment 第一帧坐标的变换矩阵。
             
         Returns:
             dynamic_info: Dict[int, Dict] 格式，{frame_idx: {"instances": {instance_id: {"quat": ..., "trans": ...}}}}
@@ -1467,10 +1469,16 @@ class MultiSceneDataset:
                     visible_instance_ids = torch.nonzero(per_frame_mask[frame_idx], as_tuple=False).view(-1).tolist()
             else:
                 visible_instance_ids = list(range(num_instances))
+            world_to_seg0_local = (
+                world_to_seg0.to(device=instances_pose.device, dtype=instances_pose.dtype)
+                if world_to_seg0 is not None
+                else None
+            )
 
             for instance_id in visible_instance_ids:
-                # 获取实例的位姿矩阵 [4, 4]
                 pose_matrix = instances_pose[frame_idx, instance_id]  # [4, 4]
+                if world_to_seg0_local is not None:
+                    pose_matrix = world_to_seg0_local @ pose_matrix
                 
                 # 提取旋转矩阵 [3, 3] 和平移向量 [3]
                 rot_matrix = pose_matrix[:3, :3]  # [3, 3]
@@ -1545,6 +1553,110 @@ class MultiSceneDataset:
             }
         
         return dynamic_info if len(dynamic_info) > 0 else None
+
+    def _to_4x4_tensor(self, mat) -> Tensor:
+        """
+        Convert various matrix formats to a 4x4 float tensor on self.device.
+        """
+        pose = torch.as_tensor(mat, dtype=torch.float32, device=self.device)
+        if pose.shape == (4, 4):
+            return pose
+        if pose.shape == (3, 4):
+            bottom = torch.tensor([[0, 0, 0, 1]], dtype=torch.float32, device=self.device)
+            return torch.cat([pose, bottom], dim=0)
+        if pose.shape[-2:] == (4, 4) and pose.ndim > 2:
+            return pose[..., :4, :4].to(device=self.device, dtype=torch.float32)
+        raise ValueError(f"Expected pose shape (4,4) or (3,4), got {pose.shape}")
+
+    def _get_pose_from_lidar(self, scene_dataset: DrivingDataset, frame_idx: int) -> Optional[Tensor]:
+        lidar_source = getattr(scene_dataset, "lidar_source", None)
+        if lidar_source is None:
+            return None
+        lidar_to_worlds = getattr(lidar_source, "lidar_to_worlds", None)
+        if lidar_to_worlds is None:
+            return None
+        try:
+            if frame_idx >= len(lidar_to_worlds):
+                return None
+        except TypeError:
+            return None
+        pose = lidar_to_worlds[frame_idx]
+        try:
+            return self._to_4x4_tensor(pose)
+        except Exception:
+            return None
+
+    def _get_pose_from_camera(self, scene_dataset: DrivingDataset, frame_idx: int) -> Optional[Tensor]:
+        pixel_source = getattr(scene_dataset, "pixel_source", None)
+        if pixel_source is None or not getattr(pixel_source, "camera_list", None):
+            return None
+        ref_cam_id = pixel_source.camera_list[0]
+        try:
+            cam_data = pixel_source.camera_data[ref_cam_id]
+        except Exception:
+            return None
+        cam_to_worlds = getattr(cam_data, "cam_to_worlds", None)
+        if cam_to_worlds is None:
+            cam_to_worlds = getattr(cam_data, "camera_to_worlds", None)
+        if cam_to_worlds is None:
+            return None
+        try:
+            if frame_idx >= len(cam_to_worlds):
+                return None
+        except TypeError:
+            return None
+        pose = cam_to_worlds[frame_idx]
+        try:
+            return self._to_4x4_tensor(pose)
+        except Exception:
+            return None
+
+    def _get_segment_first_pose(
+        self,
+        scene_dataset: DrivingDataset,
+        segment: Dict,
+        segment_id: Optional[int] = None,
+    ) -> Tuple[Tensor, int, str]:
+        """
+        Return (pose, frame_idx, source) where pose is segment-first-frame pose in world coords.
+        Priority: lidar_to_worlds -> reference camera cam_to_worlds. Must exist for the segment's first frame.
+        """
+        frame_indices = sorted(set(segment.get("frame_indices", [])))
+        if len(frame_indices) == 0:
+            raise ValueError("Segment has no frame_indices to compute first pose.")
+        first_frame_idx = frame_indices[0]
+        pose = self._get_pose_from_lidar(scene_dataset, first_frame_idx)
+        pose_source = "lidar"
+        if pose is None:
+            pose = self._get_pose_from_camera(scene_dataset, first_frame_idx)
+            pose_source = "camera"
+        if pose is None:
+            seg_label = segment_id if segment_id is not None else segment.get("segment_id", "unknown")
+            raise ValueError(
+                f"Cannot find pose for segment {seg_label} first frame {first_frame_idx}; "
+                "checked lidar_to_worlds and camera poses."
+            )
+        return pose, first_frame_idx, pose_source
+
+    def get_segment_first_pose(
+        self,
+        scene_id: int,
+        segment_id: int,
+    ) -> Tuple[Tensor, int, str]:
+        """
+        Public helper to fetch the segment-first pose for a given scene/segment.
+        Returns (pose, frame_idx, source).
+        """
+        scene_data = self.get_scene(scene_id)
+        if scene_data is None:
+            raise ValueError(f"Scene {scene_id} not found")
+        segment = scene_data["segments"][segment_id]
+        pose, frame_idx, source = self._get_segment_first_pose(
+            scene_dataset=scene_data["dataset"],
+            segment=segment,
+            segment_id=segment_id,
+        )
+        return pose, frame_idx, source
     
     def get_segment_batch(
         self,
@@ -1568,6 +1680,27 @@ class MultiSceneDataset:
         # 2. Get scene and segment information
         segment = scene_data['segments'][segment_id]
         scene_dataset = scene_data['dataset']
+        
+        # 2.1 Get segment first frame pose (world -> segment-0 transform)
+        segment_first_pose, segment_first_frame_idx, segment_pose_source = self._get_segment_first_pose(
+            scene_dataset=scene_dataset,
+            segment=segment,
+            segment_id=segment_id,
+        )
+        segment_first_pose = segment_first_pose.to(device=self.device, dtype=torch.float32)
+        try:
+            world_to_seg0 = torch.linalg.inv(segment_first_pose)
+        except RuntimeError as exc:
+            raise ValueError(
+                f"Segment {segment_id} first pose is non-invertible; cannot build segment coordinate transform."
+            ) from exc
+        
+        def _transform_extrinsics_list(extrinsics_list: List[Tensor]) -> List[Tensor]:
+            transformed: List[Tensor] = []
+            for ext in extrinsics_list:
+                ext_tensor = self._to_4x4_tensor(ext).to(device=self.device, dtype=torch.float32)
+                transformed.append(world_to_seg0 @ ext_tensor)
+            return transformed
         
         # 2. Select source and target keyframes
         source_keyframe_indices, target_keyframe_indices = self._select_source_and_target_keyframes(
@@ -1661,6 +1794,7 @@ class MultiSceneDataset:
                 dataset=self,
                 scene_id=scene_id,
                 segment_id=segment_id,
+                segment_first_pose=segment_first_pose,
             )
         
         # 6.5. Build dynamic_info (if pointcloud contains dynamic objects)
@@ -1685,6 +1819,7 @@ class MultiSceneDataset:
                     scene_dataset=scene_dataset,
                     frame_indices=list(all_frame_indices),
                     instance_mapping=instance_mapping,
+                    world_to_seg0=world_to_seg0,
                 )
 
         # 7. Load test views if requested and available
@@ -1722,6 +1857,12 @@ class MultiSceneDataset:
                         test_frame_idxs.append(frame_idx)
                         test_cam_idxs.append(cam_idx)
         
+        # 7.5 Transform extrinsics to segment-first frame coordinates
+        source_extrinsics = _transform_extrinsics_list(source_extrinsics)
+        target_extrinsics = _transform_extrinsics_list(target_extrinsics)
+        if include_test and len(test_extrinsics) > 0:
+            test_extrinsics = _transform_extrinsics_list(test_extrinsics)
+
         # 8. Assemble batch
         # Get actual scene folder path for debugging
         scene_folder_name = f"{int(scene_id):03d}" if self.data_cfg.get("dataset") not in ["kitti", "nuplan"] else str(scene_id)
@@ -1729,6 +1870,9 @@ class MultiSceneDataset:
             'scene_id': torch.tensor([scene_id], dtype=torch.long),
             'scene_folder_name': scene_folder_name,  # Actual folder name (e.g., "001", "007")
             'segment_id': segment_id,
+            'segment_first_pose': segment_first_pose,  # 4x4 pose of segment first frame in original world
+            'segment_first_frame_idx': segment_first_frame_idx,
+            'segment_first_pose_source': segment_pose_source,
             
             # Keyframe information for debugging/display
             'keyframe_info': {
@@ -2357,11 +2501,12 @@ class MultiSceneDatasetScheduler:
             if self.current_segment_id >= len(self.scene_segment_order):
                 raise ValueError("No current segment available")
             segment_id = self.scene_segment_order[self.current_segment_id]
-        
+        segment_first_pose, _, _ = self.dataset.get_segment_first_pose(scene_id, segment_id)
         return pointcloud_generator.generate_pointcloud(
             dataset=self.dataset,
             scene_id=scene_id,
             segment_id=segment_id,
+            segment_first_pose=segment_first_pose,
         )
     
     def generate_all_segment_pointclouds(
@@ -2395,10 +2540,12 @@ class MultiSceneDatasetScheduler:
         
         for segment_id in range(len(segments)):
             try:
+                segment_first_pose, _, _ = self.dataset.get_segment_first_pose(scene_id, segment_id)
                 pointcloud = pointcloud_generator.generate_pointcloud(
                     dataset=self.dataset,
                     scene_id=scene_id,
                     segment_id=segment_id,
+                    segment_first_pose=segment_first_pose,
                 )
                 pointclouds[segment_id] = pointcloud
                 

@@ -70,6 +70,8 @@ aabb = torch.tensor([
 ])
 ```
 
+StreetForward 方案 A 约定：`crop_aabb` / `input_aabb` 定义在 **segment 第一帧坐标系**。数据侧会将点云（背景/远景的“世界坐标”）及 source/target/test 相机外参统一转换到该坐标系；动态点云保持局部坐标不变。
+
 **示例**：
 ```python
 # 典型的段 AABB 范围
@@ -339,6 +341,7 @@ batch = {
   - `downscale`：下采样因子（默认 2）
   - `crop_aabb`：裁剪AABB `[[x_min, y_min, z_min], [x_max, y_max, z_max]]`
   - `input_aabb`：输入AABB `[[x_min, y_min, z_min], [x_max, y_max, z_max]]`
+  - 坐标系：`crop_aabb` / `input_aabb` 相对于 **segment 第一帧**；点云会在生成时变换到该坐标系再做过滤/裁剪
 
 ---
 
@@ -537,7 +540,7 @@ if dataset.pointcloud_generator is not None:
 
 - **AABB**：使用 x=左右, y=上下（负数为上）, z=后前 坐标系
 - **相机外参**：`camera_to_world` 变换矩阵
-- **点云坐标**：背景点云使用世界坐标系，动态物体点云使用局部坐标系
+- **点云坐标**：背景/远景点云使用 segment 第一帧的世界坐标系，动态物体点云使用局部坐标系；相机外参和 `dynamic_info` 也会对齐到 segment 第一帧
 
 ### 内存管理
 

@@ -48,11 +48,13 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
         dataset: "MultiSceneDataset",
         scene_id: int,
         segment_id: int,
+        segment_first_pose=None,
     ) -> Dict:
         scene_data = dataset.get_scene(scene_id)
         if scene_data is None:
             raise ValueError(f"Scene {scene_id} not found")
 
+        world_to_seg0 = self._compute_world_to_seg0(segment_first_pose)
         segment = scene_data["segments"][segment_id]
         frame_indices = sorted(list(set(segment["frame_indices"])))
         frame_indices = self._apply_sparsity_filter(frame_indices)
@@ -60,7 +62,7 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
             raise ValueError("No frames selected after sparsity filtering")
 
         instance_mapping, instances_by_frame = self._get_instances_for_segment(
-            dataset, scene_id, segment_id, frame_indices
+            dataset, scene_id, segment_id, frame_indices, world_to_seg0
         )
         frame_to_instances = {
             frame_idx: instances_by_frame[i]
@@ -136,6 +138,7 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
 
             points_world = np.concatenate(frame_points_world, axis=0)
             colors = np.concatenate(frame_colors, axis=0)
+            points_world = self._transform_points_np(points_world, world_to_seg0)
 
             if self.use_bbx:
                 crop_min, crop_max = self.get_crop_aabb()
@@ -472,6 +475,7 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
         scene_id: int,
         segment_id: int,
         frame_indices: List[int],
+        world_to_seg0: Optional[np.ndarray] = None,
     ) -> Tuple[Dict[int, int], List[List[Dict]]]:
         scene_data = dataset.get_scene(scene_id)
         if scene_data is None:
@@ -528,6 +532,8 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
                         "size_lwh": instances_size_np[ins_id],
                     }
                 )
-            instances_by_frame.append(frame_instances)
+            instances_by_frame.append(
+                self._transform_instances_to_seg0(frame_instances, world_to_seg0)
+            )
 
         return instance_mapping, instances_by_frame

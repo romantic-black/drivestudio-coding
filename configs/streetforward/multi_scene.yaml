@@ -57,6 +57,7 @@ dataset:
   fixed_segment_aabb: [[-20, -20, -20], [20, 4.8, 70]]  # 用于分割 segment
   
   # Point cloud generator configuration (moved from data.pointcloud)
+  # 坐标系约定：crop_aabb / input_aabb 均相对于 segment 第一帧，点云与外参也会转换到该坐标系
   pointcloud:
     type: hybrid  # 生成器类型：monocular, lidar, 或 hybrid
     # LiDAR生成器参数
@@ -129,6 +130,7 @@ model:
   use_2d_features: true
   feat_2d_channels: 16
   feat_2d_downscale: 4
+  # Model AABB 坐标系：segment 第一帧，需与 dataset.pointcloud 的 crop_aabb/input_aabb 保持一致
   input_aabb: [[-20.0, -20.0, -20.0], [20.0, 4.8, 120.0]]
   bbx_min: [-20.0, -20.0, -20.0]  # 应该与 crop_aabb[0] 一致
   bbx_max: [20.0, 4.8, 70.0]  # 应该与 crop_aabb[1] 一致

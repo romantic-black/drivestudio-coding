@@ -44,6 +44,67 @@ class RGBPointCloudGenerator(ABC):
         self.input_aabb = (
             np.asarray(input_aabb, dtype=np.float32) if input_aabb is not None else None
         )
+    
+    def _convert_pose_to_numpy(self, pose) -> Optional[np.ndarray]:
+        """Convert pose (torch/np/list) to 4x4 numpy array."""
+        if pose is None:
+            return None
+        if isinstance(pose, torch.Tensor):
+            pose_np = pose.detach().cpu().float().numpy()
+        else:
+            pose_np = np.asarray(pose, dtype=np.float32)
+        if pose_np.shape == (3, 4):
+            pose_np = np.vstack([pose_np, np.array([0, 0, 0, 1], dtype=np.float32)])
+        if pose_np.shape != (4, 4):
+            logger.warning(f"Unexpected pose shape {pose_np.shape}; expected (4,4).")
+            return None
+        return pose_np.astype(np.float32)
+
+    def _compute_world_to_seg0(self, segment_first_pose) -> Optional[np.ndarray]:
+        """Compute world->segment0 transform from a segment-first pose."""
+        pose_np = self._convert_pose_to_numpy(segment_first_pose)
+        if pose_np is None:
+            raise ValueError("segment_first_pose is required to compute world->seg0 transform.")
+        try:
+            return np.linalg.inv(pose_np)
+        except np.linalg.LinAlgError:
+            raise ValueError("Failed to invert segment_first_pose; matrix may be singular.")
+
+    def _transform_points_np(
+        self,
+        points: np.ndarray,
+        world_to_seg0: Optional[np.ndarray],
+    ) -> np.ndarray:
+        """Transform points with a 4x4 matrix (world->segment0)."""
+        if world_to_seg0 is None or len(points) == 0:
+            return points
+        points_h = np.concatenate(
+            [points, np.ones((points.shape[0], 1), dtype=np.float32)], axis=1
+        )
+        transformed = (world_to_seg0 @ points_h.T).T[:, :3]
+        return transformed.astype(np.float32)
+
+    def _transform_instances_to_seg0(
+        self,
+        instances: List[Dict],
+        world_to_seg0: Optional[np.ndarray],
+    ) -> List[Dict]:
+        """Deep-copy instance list and transform T_ow into segment-first coords."""
+        if world_to_seg0 is None:
+            return instances
+        transformed: List[Dict] = []
+        for inst in instances:
+            inst_copy = dict(inst)
+            T_ow = np.asarray(inst_copy["T_ow"], dtype=np.float32)
+            if T_ow.shape == (3, 4):
+                T_ow = np.vstack([T_ow, np.array([0, 0, 0, 1], dtype=np.float32)])
+            if T_ow.shape != (4, 4):
+                logger.debug(f"Skip transforming instance with unexpected pose shape {T_ow.shape}")
+                transformed.append(inst_copy)
+                continue
+            inst_copy["T_ow"] = (world_to_seg0 @ T_ow).astype(np.float32)
+            transformed.append(inst_copy)
+        return transformed
 
     @abstractmethod
     def generate_pointcloud(
@@ -51,6 +112,7 @@ class RGBPointCloudGenerator(ABC):
         dataset: "MultiSceneDataset",
         scene_id: int,
         segment_id: int,
+        segment_first_pose=None,
     ) -> Dict:
         """
         Generate RGB point cloud for a segment.
@@ -60,6 +122,12 @@ class RGBPointCloudGenerator(ABC):
             - dynamic: Dict[int, np.ndarray] ({intid: [M, 6]} in local coords)
             - instance_mapping: Dict[int, int] (original id -> intid)
             - metadata: Dict (optional extras)
+        
+        Args:
+            dataset: MultiSceneDataset instance
+            scene_id: Scene identifier
+            segment_id: Segment identifier
+            segment_first_pose: Optional 4x4 pose of the segment's first frame in original world coords.
         """
         raise NotImplementedError
 
