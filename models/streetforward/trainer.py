@@ -428,14 +428,16 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
         for name, module in modules.items():
             total_sq = 0.0
             has_grad = False
-            for p in module.parameters():
-                if p.grad is None:
-                    continue
-                g = p.grad.detach()
-                if g.numel() == 0:
-                    continue
-                has_grad = True
-                total_sq += float(torch.sum(g * g).item())
+            params_fn = getattr(module, "parameters", None)
+            if callable(params_fn):
+                for p in params_fn():
+                    if p.grad is None:
+                        continue
+                    g = p.grad.detach()
+                    if g.numel() == 0:
+                        continue
+                    has_grad = True
+                    total_sq += float(torch.sum(g * g).item())
             norms[name] = float(math.sqrt(total_sq)) if has_grad else 0.0
         return norms
 
