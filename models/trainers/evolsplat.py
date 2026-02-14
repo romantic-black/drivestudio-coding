@@ -69,7 +69,6 @@ from models.evol_splat import (
     construct_sparse_tensor,
     sparse_to_dense_volume,
 )
-from nerfstudio.fields.initial_BgSphere import GaussianBGInitializer
 
 logger = logging.getLogger(__name__)
 
@@ -907,6 +906,7 @@ class EVolsplatTrainer(nn.Module):
         self,
         outputs: Dict[str, torch.Tensor],
         gt_image: torch.Tensor,
+        sky_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Compute loss.
@@ -914,6 +914,7 @@ class EVolsplatTrainer(nn.Module):
         Args:
             outputs: Rendered outputs
             gt_image: Ground truth image [H, W, 3]
+            sky_mask: Optional sky mask [H, W] where 1=valid, 0=sky
             
         Returns:
             loss_dict: Dictionary of losses
@@ -922,15 +923,22 @@ class EVolsplatTrainer(nn.Module):
         accumulation = outputs["accumulation"]
         gt_image = gt_image.to(self.device)
         
-        # L1 loss
-        l1_loss = torch.abs(gt_image - pred_rgb).mean()
-        
-        # SSIM loss
-        ssim_lambda = self.config.loss.get("ssim_lambda", 0.2)
-        ssim_loss = 1 - self.ssim(
-            gt_image.permute(2, 0, 1)[None, ...],
-            pred_rgb.permute(2, 0, 1)[None, ...],
-        )
+        # L1 loss (optionally masked by sky)
+        diff = torch.abs(gt_image - pred_rgb)
+        if sky_mask is not None:
+            mask_2d = sky_mask
+            if mask_2d.dim() == 3:
+                mask_2d = mask_2d.squeeze(-1)
+            mask_2d = mask_2d.to(self.device).float()
+            valid_pixels = mask_2d.sum()
+            if valid_pixels > 0:
+                diff = diff * mask_2d.unsqueeze(-1)
+                l1_loss = diff.sum() / (valid_pixels * diff.shape[-1])
+            else:
+                # All pixels are sky; ignore this view for loss
+                l1_loss = diff.sum() * 0.0
+        else:
+            l1_loss = diff.mean()
         
         # Entropy loss (every 10 steps)
         entropy_loss_weight = self.config.loss.get("entropy_loss", 0.1)
@@ -943,12 +951,11 @@ class EVolsplatTrainer(nn.Module):
             entropy_loss = torch.tensor(0.0, device=self.device)
         
         # Total loss (include entropy loss)
-        main_loss = (1 - ssim_lambda) * l1_loss + ssim_lambda * ssim_loss + entropy_loss
+        main_loss = l1_loss + entropy_loss
         
         loss_dict = {
             "main_loss": main_loss,
             "l1_loss": l1_loss,
-            "ssim_loss": ssim_loss,
             "entropy_loss": entropy_loss,
         }
         
@@ -1010,11 +1017,13 @@ class EVolsplatTrainer(nn.Module):
         target_images = batch["target"]["image"]  # [num_target_keyframes * num_cams, H, W, 3]
         target_extrinsics = batch["target"]["extrinsics"]  # [num_target_keyframes * num_cams, 4, 4]
         target_intrinsics = batch["target"]["intrinsics"]  # [num_target_keyframes * num_cams, 4, 4]
+        target_sky_masks = batch["target"].get("sky_mask")
         
         return {
             "image": target_images[target_idx],
             "extrinsic": target_extrinsics[target_idx],
             "intrinsic": target_intrinsics[target_idx],
+            "sky_mask": target_sky_masks[target_idx] if target_sky_masks is not None else None,
         }
     
     def train_step(self, batch: Dict) -> Dict[str, torch.Tensor]:
@@ -1060,7 +1069,6 @@ class EVolsplatTrainer(nn.Module):
         aggregated_loss_dict = {
             "main_loss": 0.0,
             "l1_loss": 0.0,
-            "ssim_loss": 0.0,
             "entropy_loss": 0.0,
         }
         
@@ -1082,7 +1090,11 @@ class EVolsplatTrainer(nn.Module):
                 outputs = self.render_for_target_view(
                     target_view, reusable_2d_features_detached, node, offset, batch
                 )
-                loss_dict = self.compute_loss(outputs, target_view["image"])
+                loss_dict = self.compute_loss(
+                    outputs,
+                    target_view["image"],
+                    sky_mask=target_view.get("sky_mask"),
+                )
                 loss = loss_dict["main_loss"] / num_target_views
             
             # Backward (no retain_graph needed since 3D features are recomputed for each view)

@@ -1731,6 +1731,8 @@ class MultiSceneDataset:
         source_depths = []
         source_frame_idxs = []
         source_cam_idxs = []
+        source_sky_masks: List[Optional[Tensor]] = []
+        has_source_sky_mask = False
         
         for frame_idx in source_frame_indices:
             for cam_idx in range(num_cams):
@@ -1753,6 +1755,11 @@ class MultiSceneDataset:
                     depth = torch.ones(H, W, dtype=torch.float32, device=self.device) * 10.0
                 source_depths.append(depth)
                 
+                sky_mask = image_infos.get('sky_masks')
+                if sky_mask is not None:
+                    has_source_sky_mask = True
+                source_sky_masks.append(sky_mask)
+                
                 source_frame_idxs.append(frame_idx)
                 source_cam_idxs.append(cam_idx)
         
@@ -1763,6 +1770,8 @@ class MultiSceneDataset:
         target_depths = []
         target_frame_idxs = []
         target_cam_idxs = []
+        target_sky_masks: List[Optional[Tensor]] = []
+        has_target_sky_mask = False
         
         num_target_images = len(target_frame_indices) * num_cams
         for frame_idx in target_frame_indices:
@@ -1783,6 +1792,11 @@ class MultiSceneDataset:
                     H, W = image_infos['pixels'].shape[:2]
                     depth = torch.ones(H, W, dtype=torch.float32, device=self.device) * 10.0
                 target_depths.append(depth)
+                
+                sky_mask = image_infos.get('sky_masks')
+                if sky_mask is not None:
+                    has_target_sky_mask = True
+                target_sky_masks.append(sky_mask)
                 
                 target_frame_idxs.append(frame_idx)
                 target_cam_idxs.append(cam_idx)
@@ -1829,6 +1843,8 @@ class MultiSceneDataset:
         test_depths: List[Tensor] = []
         test_frame_idxs: List[int] = []
         test_cam_idxs: List[int] = []
+        test_sky_masks: List[Optional[Tensor]] = []
+        has_test_sky_mask = False
         
         if include_test:
             segment_test_frames = segment.get('test_frame_indices', [])
@@ -1854,6 +1870,10 @@ class MultiSceneDataset:
                         test_extrinsics.append(frame_data['extrinsic'])
                         test_intrinsics.append(frame_data['intrinsic'])
                         test_depths.append(frame_data['depth'])
+                        sky_mask = frame_data.get('sky_mask')
+                        if sky_mask is not None:
+                            has_test_sky_mask = True
+                        test_sky_masks.append(sky_mask)
                         test_frame_idxs.append(frame_idx)
                         test_cam_idxs.append(cam_idx)
         
@@ -1901,6 +1921,27 @@ class MultiSceneDataset:
                 'keyframe_indices': torch.tensor(target_keyframe_indices, dtype=torch.long),  # [num_target_keyframes]
             }
         }
+
+        # Attach sky masks if available (fill missing masks with ones to keep shapes consistent)
+        if has_source_sky_mask:
+            source_sky_mask_stack = []
+            for mask, img in zip(source_sky_masks, source_images):
+                if mask is None:
+                    H, W = img.shape[:2]
+                    source_sky_mask_stack.append(torch.ones((H, W), dtype=torch.float32, device=self.device))
+                else:
+                    source_sky_mask_stack.append(mask.to(self.device).float())
+            batch['source']['sky_mask'] = torch.stack(source_sky_mask_stack, dim=0)
+
+        if has_target_sky_mask:
+            target_sky_mask_stack = []
+            for mask, img in zip(target_sky_masks, target_images):
+                if mask is None:
+                    H, W = img.shape[:2]
+                    target_sky_mask_stack.append(torch.ones((H, W), dtype=torch.float32, device=self.device))
+                else:
+                    target_sky_mask_stack.append(mask.to(self.device).float())
+            batch['target']['sky_mask'] = torch.stack(target_sky_mask_stack, dim=0)
         
         # Add pointcloud to batch if generated
         if pointcloud is not None:
@@ -1920,6 +1961,15 @@ class MultiSceneDataset:
                 'frame_indices': torch.tensor(test_frame_idxs, dtype=torch.long),
                 'cam_indices': torch.tensor(test_cam_idxs, dtype=torch.long),
             }
+            if has_test_sky_mask:
+                test_sky_mask_stack = []
+                for mask, img in zip(test_sky_masks, test_images):
+                    if mask is None:
+                        H, W = img.shape[:2]
+                        test_sky_mask_stack.append(torch.ones((H, W), dtype=torch.float32, device=self.device))
+                    else:
+                        test_sky_mask_stack.append(mask.to(self.device).float())
+                batch['test']['sky_mask'] = torch.stack(test_sky_mask_stack, dim=0)
         
         return batch
     

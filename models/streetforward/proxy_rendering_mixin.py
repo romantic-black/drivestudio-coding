@@ -123,18 +123,38 @@ class ProxyRenderingMixin:
             torch.cat(colors_list, dim=0),
         )
 
-    def compute_loss(self, pred_rgb: torch.Tensor, gt_image: torch.Tensor) -> torch.Tensor:
+    def compute_loss(
+        self,
+        pred_rgb: torch.Tensor,
+        gt_image: torch.Tensor,
+        sky_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
-        计算 L2 损失（均方误差）。
+        计算 L1 损失，可选天空区域遮挡。
         
         Args:
             pred_rgb: 预测的RGB图像，形状 [H, W, 3]
             gt_image: 真实图像，形状 [H, W, 3]
+            sky_mask: 天空掩码，形状 [H, W] 或 [H, W, 1]，1 表示有效区域，0 表示天空（可选）
             
         Returns:
-            标量损失值：mean((pred_rgb - gt_image)²)
+            标量损失值：mean(|pred_rgb - gt_image|)（若提供 sky_mask，则仅在有效区域计算）
         """
-        return torch.mean((pred_rgb - gt_image) ** 2)
+        diff = torch.abs(pred_rgb - gt_image)
+
+        if sky_mask is not None:
+            mask_2d = sky_mask
+            if mask_2d.dim() == 3:
+                mask_2d = mask_2d.squeeze(-1)
+            mask_2d = mask_2d.to(diff.device).float()
+            valid_pixels = mask_2d.sum()
+            if valid_pixels > 0:
+                diff = diff * mask_2d.unsqueeze(-1)
+                return diff.sum() / (valid_pixels * diff.shape[-1])
+            # All pixels are marked sky; ignore this view for loss
+            return diff.sum() * 0.0
+
+        return diff.mean()
 
     def _render_targets_and_accumulate_loss(
         self,
@@ -215,7 +235,8 @@ class ProxyRenderingMixin:
             }
 
             rgb, acc = self._render_single_view(merged_params, view, height, width)
-            loss = self.compute_loss(rgb, gt_img) / view_count
+            sky_mask = target.get("sky_mask")
+            loss = self.compute_loss(rgb, gt_img, sky_mask=sky_mask) / view_count
             total_loss_val += float(loss.detach())
             grad_scaler = getattr(self, "grad_scaler", None)
             if grad_scaler is not None:

@@ -848,17 +848,28 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
                         "frame_idx": target.get("frame_idx", batch.get("source_frame_idx", 0)),
                         "view": target["view"],
                         "gt_image": target["gt_image"],
+                        "sky_mask": target.get("sky_mask"),
                     }
                 )
         else:
             target_views = batch.get("target_views", [])
             gt_images = batch.get("gt_images", [])
-            for view, gt_img in zip(target_views, gt_images):
+            sky_masks = None
+            if "target_sky_mask" in batch:
+                sky_masks = batch.get("target_sky_mask")
+            elif "target" in batch:
+                sky_masks = batch["target"].get("sky_mask")
+
+            for idx, (view, gt_img) in enumerate(zip(target_views, gt_images)):
+                sky_mask = None
+                if sky_masks is not None and idx < len(sky_masks):
+                    sky_mask = sky_masks[idx]
                 targets.append(
                     {
                         "frame_idx": batch.get("source_frame_idx", 0),
                         "view": view,
                         "gt_image": gt_img,
+                        "sky_mask": sky_mask,
                     }
                 )
         return targets

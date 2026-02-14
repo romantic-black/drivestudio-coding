@@ -174,12 +174,16 @@ def convert_batch_to_streetforward_format(
         # 提取 GT 图像
         gt_image = target_data["image"][i].to(device)  # [H, W, 3]
         gt_images.append(gt_image)
+        sky_mask = None
+        if "sky_mask" in target_data and target_data["sky_mask"] is not None:
+            sky_mask = target_data["sky_mask"][i].to(device)
         frame_indices = target_data.get("frame_indices")
         frame_idx = int(frame_indices[i]) if frame_indices is not None else 0
         targets.append({
             "frame_idx": frame_idx,
             "view": view,
             "gt_image": gt_image,
+            "sky_mask": sky_mask,
         })
     
     # 转换 source 视图（可选，用于未来扩展）

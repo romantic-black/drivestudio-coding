@@ -321,8 +321,36 @@ class LiDARRGBPointCloudGenerator(RGBPointCloudGenerator):
             if not np.any(valid):
                 continue
 
+            # #region agent log
+            _n = z.shape[0]
+            _n_z_le0 = int(np.sum(z <= 0))
+            _n_z_tiny = int(np.sum((z > 0) & (z <= 1e-6)))
+            if _n_z_le0 > 0 or _n_z_tiny > 0:
+                try:
+                    _f = open("/root/drivestudio-coding/.cursor/debug.log", "a")
+                    _f.write('{"id":"lidar_z","timestamp":' + str(int(__import__("time").time() * 1000)) + ',"location":"lidar.py:325","message":"z invalid counts","data":{"n_total":' + str(_n) + ',"n_z_le0":' + str(_n_z_le0) + ',"n_z_tiny":' + str(_n_z_tiny) + '},"hypothesisId":"H1"}\n')
+                    _f.close()
+                except Exception:
+                    pass
+            # #endregion
+
             uv = (intrinsic_np @ points_cam.T).T
-            uv = uv[:, :2] / z[:, None]
+            uv_xy = uv[:, :2]
+
+            # Only perform perspective divide on valid points to avoid divide-by-zero
+            uv = np.zeros_like(uv_xy, dtype=np.float32)
+            uv[valid] = uv_xy[valid] / z[valid, None]
+            # #region agent log
+            _uv_nan = int(np.isnan(uv).any(axis=1).sum())
+            _uv_inf = int(np.isinf(uv).any(axis=1).sum())
+            if _uv_nan > 0 or _uv_inf > 0:
+                try:
+                    _f = open("/root/drivestudio-coding/.cursor/debug.log", "a")
+                    _f.write('{"id":"lidar_uv","timestamp":' + str(int(__import__("time").time() * 1000)) + ',"location":"lidar.py:uv","message":"uv nan/inf after divide","data":{"n_uv_nan":' + str(_uv_nan) + ',"n_uv_inf":' + str(_uv_inf) + '},"hypothesisId":"H2"}\n')
+                    _f.close()
+                except Exception:
+                    pass
+            # #endregion
             u = np.round(uv[:, 0]).astype(int)
             v = np.round(uv[:, 1]).astype(int)
             in_img = valid & (u >= 0) & (u < W) & (v >= 0) & (v < H)
