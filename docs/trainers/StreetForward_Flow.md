@@ -885,14 +885,14 @@ sparse_feat, vol_dim, valid_coords = self.construct_sparse_tensor(
    bbx_max = np.array([X_MAX, Y_MAX, Z_MAX])
    bbx_min = np.array([X_MIN, Y_MIN, Z_MIN])
    vol_dim = (bbx_max - bbx_min) / voxel_size  # 例如: [400, 248, 900]
-   vol_dim = vol_dim.astype(int).tolist()      # [D, H, W] 格式
+   vol_dim = vol_dim.astype(int).tolist()      # [X, Y, Z] 格式
    ```
    **示例计算：**
    ```python
    # 假设 bbx_max = [20, 4.8, 70], bbx_min = [-20, -20, -20], voxel_size = 0.1
    vol_dim = ([20, 4.8, 70] - [-20, -20, -20]) / 0.1
            = [40, 24.8, 90] / 0.1
-           = [400, 248, 900]  # D=400, H=248, W=900
+           = [400, 248, 900]  # X=400, Y=248, Z=900
    ```
 
 4. **将坐标相对于边界框原点**
@@ -980,7 +980,7 @@ sparse_feat, vol_dim, valid_coords = self.construct_sparse_tensor(
 
 **类型：** `List[int]` 或 `torch.Tensor`
 
-**格式：** `[D, H, W]` （深度、高度、宽度）
+**格式：** `[X, Y, Z]` / `[W, H, D]`（permute 后与坐标轴一致）
 
 **计算：**
 ```python
@@ -989,7 +989,7 @@ vol_dim = (bbx_max - bbx_min) / voxel_size
 
 **示例值：**
 ```python
-vol_dim = [400, 248, 900]  # D=400, H=248, W=900
+vol_dim = [400, 248, 900]  # X=400, Y=248, Z=900（即 W×H×D）
 ```
 
 ##### 3. `valid_coords` - 有效坐标
@@ -1082,7 +1082,7 @@ conv11: BasicSparseDeconvolutionBlock(16 → outdim, stride=2)
 dense_volume = self.sparse_to_dense_volume(
     sparse_tensor=feat_3d,      # SparseTensor [M, outdim]
     coords=valid_coords,        # [M, 3]
-    vol_dim=vol_dim,            # [D, H, W]
+    vol_dim=vol_dim,            # [X, Y, Z]
 ).unsqueeze(dim=0)              # [1, D, H, W, C]
 ```
 
@@ -1213,7 +1213,7 @@ PyTorch 的 `grid_sample` 函数（5D版本）期望输入格式为 `[B, C, D, H
 grid_coords = self.get_grid_coords(
     means_s,           # [N, 3] - 原始点坐标（世界坐标系）
     self.bbx_min,      # [3] - 边界框最小值
-    vol_dim,           # [D, H, W] - 体积维度
+    vol_dim,           # [X, Y, Z] - 体积维度
     self.voxel_size,   # float - 体素大小
 )
 ```
@@ -1240,17 +1240,10 @@ def get_grid_coords(
     else:
         vol_dim = vol_dim.to(position_w.device).float()
     
-    # 4. 提取体积维度
-    w_dim, h_dim, d_dim = vol_dim[2], vol_dim[1], vol_dim[0]
-    # vol_dim是[D, H, W]格式，所以：
-    # - vol_dim[0] = D (深度)
-    # - vol_dim[1] = H (高度)
-    # - vol_dim[2] = W (宽度)
-    
-    # 5. 归一化到[-1, 1]范围（grid_sample的要求）
-    x_norm = x_index / (w_dim - 1).clamp(min=1.0) * 2 - 1  # [N]
-    y_norm = y_index / (h_dim - 1).clamp(min=1.0) * 2 - 1  # [N]
-    z_norm = z_index / (d_dim - 1).clamp(min=1.0) * 2 - 1  # [N]
+    # 4. 归一化到[-1, 1]范围（grid_sample的要求）；vol_dim 为 [X, Y, Z]
+    x_norm = x_index / (vol_dim[0] - 1).clamp(min=1.0) * 2 - 1  # [N]
+    y_norm = y_index / (vol_dim[1] - 1).clamp(min=1.0) * 2 - 1  # [N]
+    z_norm = z_index / (vol_dim[2] - 1).clamp(min=1.0) * 2 - 1  # [N]
     
     # 6. 堆叠成坐标张量
     grid_coords = torch.stack([x_norm, y_norm, z_norm], dim=-1)  # [N, 3]
@@ -1277,8 +1270,8 @@ z_index = pts[..., 2] / voxel_size  # D方向
 
 **步骤3：归一化**
 ```python
-x_norm = (x_index / (w_dim - 1)) * 2 - 1
-# 例如: (305 / (900 - 1)) * 2 - 1 = 0.321... (在[-1, 1]范围内)
+x_norm = (x_index / (vol_dim[0] - 1)) * 2 - 1
+# 例如: (305 / (vol_dim[0] - 1)) * 2 - 1，在[-1, 1]范围内
 ```
 
 **归一化公式：**
@@ -1424,7 +1417,7 @@ torch.nn.functional.grid_sample(
 
 步骤1: construct_sparse_tensor
   → sparse_feat: SparseTensor([M, 3], [M, 4]) - 稀疏特征
-  → vol_dim: [D, H, W] - 体积维度
+  → vol_dim: [X, Y, Z] - 体积维度
   → valid_coords: [M, 3] - 有效体素坐标
 
 步骤2: sparse_conv
@@ -1626,7 +1619,7 @@ targets = [
 | `anchor_rgb_rigid` | `[N_rigid, 3]` | 从SH DC分量转换的动态物体RGB |
 | `anchor_rgb_all` | `[N_total, 3]` | 合并后的所有点RGB |
 | `sparse_feat` | `[M, 3]` | 稀疏特征（RGB，M ≤ N_total） |
-| `vol_dim` | `[3]` | 体积维度 `[D, H, W]` |
+| `vol_dim` | `[3]` | 体积维度 `[X, Y, Z]` / `[W, H, D]`（permute 后） |
 | `valid_coords` | `[M, 3]` | 有效体素坐标 |
 | `feat_3d` | `[M, outdim]` | 稀疏卷积后的3D特征 |
 | `dense_volume` | `[1, C, D, H, W]` | 密集化的3D特征体积 |

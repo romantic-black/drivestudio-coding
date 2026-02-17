@@ -11,8 +11,8 @@ data:
   preload_device: cpu
   
   # Training and evaluation scene IDs
-  train_scene_ids: [0, 1, 2, 3, 4, 5]
-  eval_scene_ids: [10, 11, 12, 13]
+  train_scene_ids: [0, 1, 2, 3,]
+  eval_scene_ids: [4, 5]
   
   pixel_source:
     type: datasets.nuscenes.nuscenes_sourceloader.NuScenesPixelSource
