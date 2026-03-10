@@ -1,0 +1,37 @@
+# Minimal StreetForward (Stage 0) — overfit one batch
+# Input: 3D RGB point cloud + single target; no source.
+# Use with: python tools/train_minimal_streetforward.py --config_file configs/minimal_streetforward.yaml overfit_batch_path=./data/overfit_batches/scene0_seg0_batch.pt
+
+# No full data/dataset needed when using overfit_batch_path
+data: {}
+
+model:
+  offset_max: 0.1
+  scale_max: 0.1
+  omega_max: 0.1
+  opacity_max: 0.1
+  sh_dc_max: 0.1
+  sh_rest_max: 0.05
+  eta_means: 1.0
+  eta_scales: 1.0
+  eta_opacity: 1.0
+  eta_sh_dc: 1.0
+  eta_sh_rest: 1.0
+  sh_degree: 1
+  voxel_size: 0.1
+  bbx_min: [-20.0, -20.0, -20.0]
+  bbx_max: [20.0, 4.8, 70.0]
+  sparseConv_outdim: 32
+
+optimizer:
+  lr: 1.0e-3
+  eps: 1.0e-15
+  weight_decay: 0.0
+
+training:
+  max_iterations: 1000
+  log_interval: 50
+  save_checkpoint_freq: 500
+  seed: 42
+
+# Set when running (or via CLI): overfit_batch_path: "./data/overfit_batches/scene0_seg0_batch.pt"

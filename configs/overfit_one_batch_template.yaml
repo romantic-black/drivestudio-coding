@@ -1,0 +1,85 @@
+# configs/overfit_one_batch_template.yaml
+
+# 基础数据配置 (根据底层具体数据集替换，以下为 nuScenes 示例)
+data:
+  data_root: "/root/autodl-tmp/nuScenes/"
+  dataset: "nuscenes"
+  start_timestep: 0
+  end_timestep: -1
+  preload_device: cpu
+  train_scene_ids: [0]  # 指定需要 overfit 的场景
+  eval_scene_ids: []
+  
+  pixel_source:
+    type: datasets.nuscenes.nuscenes_sourceloader.NuScenesPixelSource
+    cameras: [0, 1, 2]
+    downscale_when_loading: [3, 3, 3]
+    downscale: 1
+    undistort: False
+    test_image_stride: 0
+    max_test_images: 4
+    load_sky_mask: true
+    load_dynamic_mask: true
+    load_depth_maps: true
+    load_objects: true
+    load_smpl: false
+    sampler:
+      buffer_downscale: 8
+      buffer_ratio: 0.5
+      start_enhance_weight: 3
+
+  lidar_source:
+    type: datasets.nuscenes.nuscenes_sourceloader.NuScenesLiDARSource
+    load_lidar: true
+    lidar_downsample_factor: 4
+    lidar_percentile: 0.02
+  
+# MultiSceneDataset 核心配置
+dataset:
+  num_source_keyframes: 3
+  num_target_keyframes: 6
+  segment_overlap_ratio: 0.2
+  
+  # 重要：调小场景和段的 keyframes 最小要求，防止截取的短片段被内部策略过滤掉
+  min_keyframes_per_scene: 2    
+  min_keyframes_per_segment: 2  
+  
+  # 【可选】全局固定段AABB，如果希望明确截取某一块空间区域
+  fixed_segment_aabb: 
+    - [-20.0, -20.0, -20.0]  # min
+    - [20.0, 4.8, 70.0]      # max
+    
+  # 点云生成器配置 (为模型提供初始化与深度一致性等特征)
+  pointcloud:
+    type: "hybrid"
+    # LiDAR生成器参数
+    lidar_sparsity: full
+    lidar_use_bbx: true
+    # 单目生成器参数
+    monocular_chosen_cam_ids: [0, 1, 2]
+    monocular_sparsity: full
+    monocular_filter_sky: true
+    monocular_depth_consistency: false
+    monocular_use_bbx: true
+    monocular_downscale: 2
+    # 融合参数
+    max_points: 500000
+    fusion_strategy: merge
+    dynamic_source: lidar_only
+    downsample_dynamic: false
+    count_dynamic_in_max_points: false
+    background_downsample_method: uniform
+    # Crop AABB: 用于裁剪（移除框外的点）
+    crop_aabb:
+      - [-20.0, -20.0, -20.0]
+      - [20.0, 4.8, 70.0]
+    # Input AABB: 用于分割和过滤
+    input_aabb:
+      - [-20.0, -20.0, -20.0]
+      - [20.0, 4.8, 120.0]
+
+# Capture 专属参数（在工具脚本中读取）
+capture:
+  scene_id: 0
+  segment_id: 0
+  save_dir: "./data/overfit_batches"
