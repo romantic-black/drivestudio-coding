@@ -46,7 +46,6 @@ pointcloud_generators/
 | `sparsity` | Literal | "full" | 帧稀疏度：Drop90/Drop80/Drop50/Drop25/full |
 | `filter_sky` | bool | True | 是否过滤天空区域 |
 | `depth_consistency` | bool | True | 是否进行深度一致性检查 |
-| `use_bbx` | bool | True | 是否使用边界框进行分层过滤 |
 | `downscale` | int | 2 | 图像下采样比例 |
 | `crop_aabb` | np.ndarray | None | 裁剪用AABB [min, max] |
 | `input_aabb` | np.ndarray | None | 输入区域AABB [min, max] |
@@ -92,7 +91,6 @@ pointcloud_generators/
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `sparsity` | Literal | "full" | 帧稀疏度 |
-| `use_bbx` | bool | True | 是否使用边界框过滤 |
 | `filter_sky` | - | False | 固定为False（不支持） |
 | `depth_consistency` | - | False | 固定为False（不支持） |
 | `downscale` | - | 1 | 固定为1（不支持） |
@@ -114,7 +112,6 @@ pointcloud_generators/
 | 参数类别 | 参数 | 类型 | 默认值 | 说明 |
 |---------|------|------|--------|------|
 | **LiDAR参数** | `lidar_sparsity` | Literal | "full" | LiDAR帧稀疏度 |
-| | `lidar_use_bbx` | bool | True | LiDAR是否使用边界框 |
 | **单目参数** | `monocular_chosen_cam_ids` | List[int] | [0] | 单目使用的相机ID |
 | | `monocular_sparsity` | Literal | "full" | 单目帧稀疏度 |
 | | `monocular_filter_sky` | bool | True | 单目是否过滤天空 |
@@ -241,7 +238,8 @@ pointcloud_generators/
 
 | 坐标系 | 用途 | 转换关系 |
 |--------|------|----------|
-| **世界坐标系 (world)** | 全局固定参考系，背景点云使用 | 基准坐标系 |
+| **世界坐标系 (world)** | 数据源坐标系（LiDAR/相机/标注实例位姿通常在该系） | 基准坐标系 |
+| **Segment 第一帧坐标系 (seg0)** | 训练/裁剪/渲染使用的局部参考系（以 segment 第一帧为原点） | \(T_{s0w}=\mathrm{inv}(T_{ws0})\)，world→seg0 |
 | **车辆坐标系 (vehicle)** | 相对于车辆位置，LiDAR原始数据 | T_vw: 车辆→世界 |
 | **相机坐标系 (camera)** | 相对于相机位置，用于反投影 | T_cw: 相机→世界 |
 | **对象局部坐标系 (local)** | 相对于动态对象中心，动态点云使用 | T_ow: 对象→世界 |
@@ -249,7 +247,8 @@ pointcloud_generators/
 **关键转换**：
 - 深度图反投影：像素坐标 → 相机坐标 → 世界坐标
 - LiDAR着色：世界坐标 → 相机坐标 → 像素坐标
-- 动态对象分离：世界坐标 → 对象局部坐标
+- **Segment 对齐**：世界坐标 → seg0（用于 background 点云、实例位姿、AABB 裁剪）
+- 动态对象分离：世界坐标/seg0 → 对象局部坐标（动态点云输出为 local）
 
 ### 2. 掩码系统
 
@@ -380,8 +379,16 @@ AABB分割 (input_aabb)
 | `[r, g, b]` | RGB颜色 | float32, [0, 255] |
 
 **坐标系约定**：
-- 背景点云：世界坐标系
+- 背景点云：**segment 第一帧坐标系 (seg0)**（world→seg0 对齐后输出）
 - 动态对象点云：对象局部坐标系
+
+#### segment_first_pose（重要）
+
+生成器在 `generate_pointcloud(..., segment_first_pose=...)` 中会通过 `segment_first_pose` 计算 `world_to_seg0`，以保证：\n
+- `crop_aabb` / `input_aabb` 在 seg0 系下生效；\n
+- 点云 background 与 batch 内相机外参、dynamic_info 使用同一 seg0 坐标系。\n
+\n
+因此在 StreetForward/MultiSceneDataset 路径中，**segment_first_pose 必须由数据集侧传入**；缺失会导致无法构建 `world_to_seg0` 或坐标系不一致。
 
 #### 元数据 (metadata)
 

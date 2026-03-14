@@ -160,7 +160,8 @@ def main(args: argparse.Namespace) -> None:
         min_keyframes_per_segment=cfg.dataset.min_keyframes_per_segment,
         device=device,
         preload_scene_count=cfg.dataset.get("preload_scene_count", 3),
-        fixed_segment_aabb=cfg.dataset.get("fixed_segment_aabb", None),
+        segment_aabb=cfg.dataset.segment_aabb,
+        segment_input_aabb=cfg.dataset.segment_input_aabb,
         pointcloud_config=cfg.dataset.get("pointcloud", None),
     )
 

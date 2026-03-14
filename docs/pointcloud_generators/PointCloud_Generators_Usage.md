@@ -33,7 +33,6 @@ pointcloud_config = {
     'sparsity': 'full',
     'filter_sky': True,
     'depth_consistency': True,
-    'use_bbx': True,
     'downscale': 2,
     'crop_aabb': [[-20, -20, -20], [20, 4.8, 70]],
     'input_aabb': [[-20, -20, -20], [20, 4.8, 120]],
@@ -78,7 +77,6 @@ pointcloud_config = {
     'sparsity': 'full',            # 帧稀疏度：Drop90/Drop80/Drop50/Drop25/full
     'filter_sky': True,            # 是否过滤天空区域
     'depth_consistency': True,     # 是否进行深度一致性检查
-    'use_bbx': True,               # 是否使用边界框进行分层过滤
     'downscale': 2,                # 图像下采样比例
     'crop_aabb': [[-20, -20, -20], [20, 4.8, 70]],  # 裁剪AABB
     'input_aabb': [[-20, -20, -20], [20, 4.8, 120]],  # 输入区域AABB
@@ -100,7 +98,6 @@ pointcloud_config = {
 pointcloud_config = {
     'type': 'lidar',
     'sparsity': 'full',            # 帧稀疏度
-    'use_bbx': True,               # 是否使用边界框过滤
     'crop_aabb': [[-20, -20, -20], [20, 4.8, 70]],
     'input_aabb': [[-20, -20, -20], [20, 4.8, 120]],
 }
@@ -124,13 +121,11 @@ pointcloud_config = {
     'type': 'hybrid',
     # LiDAR生成器参数
     'lidar_sparsity': 'full',
-    'lidar_use_bbx': True,
     # 单目生成器参数
     'monocular_chosen_cam_ids': [0, 1, 2],
     'monocular_sparsity': 'full',
     'monocular_filter_sky': True,
     'monocular_depth_consistency': True,
-    'monocular_use_bbx': True,
     'monocular_downscale': 2,
     # 融合参数
     'max_points': 500000,                    # 背景点云最大点数
@@ -156,7 +151,6 @@ pointcloud_config = {
 | `sparsity` | Literal | "full" | 帧稀疏度：Drop90/Drop80/Drop50/Drop25/full |
 | `filter_sky` | bool | True | 是否过滤天空区域（仅单目生成器） |
 | `depth_consistency` | bool | True | 是否进行深度一致性检查（仅单目生成器） |
-| `use_bbx` | bool | True | 是否使用边界框进行分层过滤 |
 | `downscale` | int | 2 | 图像下采样比例（仅单目生成器） |
 | `crop_aabb` | np.ndarray | None | 裁剪用AABB `[[x_min, y_min, z_min], [x_max, y_max, z_max]]` |
 | `input_aabb` | np.ndarray | None | 输入区域AABB `[[x_min, y_min, z_min], [x_max, y_max, z_max]]` |
@@ -172,12 +166,10 @@ pointcloud_config = {
 | 参数类别 | 参数 | 类型 | 默认值 | 说明 |
 |---------|------|------|--------|------|
 | **LiDAR参数** | `lidar_sparsity` | Literal | "full" | LiDAR帧稀疏度 |
-| | `lidar_use_bbx` | bool | True | LiDAR是否使用边界框 |
 | **单目参数** | `monocular_chosen_cam_ids` | List[int] | [0] | 单目使用的相机ID |
 | | `monocular_sparsity` | Literal | "full" | 单目帧稀疏度 |
 | | `monocular_filter_sky` | bool | True | 单目是否过滤天空 |
 | | `monocular_depth_consistency` | bool | True | 单目是否深度一致性检查 |
-| | `monocular_use_bbx` | bool | True | 单目是否使用边界框 |
 | | `monocular_downscale` | int | 2 | 单目下采样比例 |
 | **融合参数** | `max_points` | int | 500000 | 背景点云最大点数 |
 | | `fusion_strategy` | Literal | "adaptive" | 融合策略：merge/lidar_first/adaptive |
@@ -365,7 +357,6 @@ pointcloud_config = {
     'sparsity': 'Drop50',                   # 使用50%的帧
     'filter_sky': True,
     'depth_consistency': True,
-    'use_bbx': True,
     'downscale': 2,
     'crop_aabb': [[-20, -20, -20], [20, 4.8, 70]],
     'input_aabb': [[-20, -20, -20], [20, 4.8, 120]],
@@ -398,7 +389,6 @@ if 'pointcloud' in batch:
 pointcloud_config = {
     'type': 'lidar',
     'sparsity': 'full',
-    'use_bbx': True,
     'crop_aabb': [[-20, -20, -20], [20, 4.8, 70]],
     'input_aabb': [[-20, -20, -20], [20, 4.8, 120]],
 }
@@ -418,13 +408,11 @@ pointcloud_config = {
     'type': 'hybrid',
     # LiDAR参数
     'lidar_sparsity': 'full',
-    'lidar_use_bbx': True,
     # 单目参数
     'monocular_chosen_cam_ids': [0, 1, 2],
     'monocular_sparsity': 'Drop50',
     'monocular_filter_sky': True,
     'monocular_depth_consistency': True,
-    'monocular_use_bbx': True,
     'monocular_downscale': 2,
     # 融合参数
     'max_points': 500000,
@@ -458,7 +446,6 @@ generator = MonocularRGBPointCloudGenerator(
     sparsity='full',
     filter_sky=True,
     depth_consistency=True,
-    use_bbx=True,
     downscale=2,
     crop_aabb=np.array([[-20, -20, -20], [20, 4.8, 70]]),
     input_aabb=np.array([[-20, -20, -20], [20, 4.8, 120]]),
@@ -529,13 +516,11 @@ data:
     type: hybrid  # monocular, lidar, or hybrid
     # LiDAR参数
     lidar_sparsity: full
-    lidar_use_bbx: true
     # 单目参数
     monocular_chosen_cam_ids: [0, 1, 2]
     monocular_sparsity: Drop50
     monocular_filter_sky: true
     monocular_depth_consistency: true
-    monocular_use_bbx: true
     monocular_downscale: 2
     # 融合参数
     max_points: 500000

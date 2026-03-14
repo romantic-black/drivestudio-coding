@@ -25,7 +25,6 @@ class RGBPointCloudGenerator(ABC):
         sparsity: Literal["Drop90", "Drop80", "Drop50", "Drop25", "full"] = "full",
         filter_sky: bool = True,
         depth_consistency: bool = True,
-        use_bbx: bool = True,
         downscale: int = 2,
         crop_aabb: Optional[np.ndarray] = None,
         input_aabb: Optional[np.ndarray] = None,
@@ -34,7 +33,6 @@ class RGBPointCloudGenerator(ABC):
         self.sparsity = sparsity
         self.filter_sky = filter_sky
         self.depth_consistency = depth_consistency
-        self.use_bbx = use_bbx
         self.downscale = downscale
         self.device = device
 
@@ -189,7 +187,8 @@ class RGBPointCloudGenerator(ABC):
         self,
         points: np.ndarray,
         colors: np.ndarray,
-        use_bbx: bool = True,
+        *,
+        strict: bool,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Filter point cloud (statistical filter and uniform downsampling).
@@ -197,8 +196,8 @@ class RGBPointCloudGenerator(ABC):
         Args:
             points: Point coordinates [N, 3]
             colors: Point colors [N, 3] in range [0, 255]
-            use_bbx: If True, use stricter filtering for inside points (nb_neighbors=35, std_ratio=1.5, every_k=2)
-                    If False, use looser filtering for outside points (nb_neighbors=20, std_ratio=2.0, every_k=5)
+            strict: If True, use stricter filtering for inside points (uniform downsample every_k=2).
+                    If False, use looser filtering for outside points (uniform downsample every_k=4).
         
         Returns:
             Filtered points and colors
@@ -222,7 +221,7 @@ class RGBPointCloudGenerator(ABC):
         pcd.colors = o3d.utility.Vector3dVector(colors_normalized)
 
         # Statistical outlier removal
-        if use_bbx:
+        if strict:
             # Inside points: stricter filtering
             #cl, ind = pcd.remove_statistical_outlier(nb_neighbors=35, std_ratio=1.5)
             #pcd = pcd.select_by_index(ind)

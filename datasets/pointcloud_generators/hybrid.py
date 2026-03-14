@@ -30,13 +30,11 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
         self,
         # LiDAR生成器参数
         lidar_sparsity: Literal["Drop90", "Drop80", "Drop50", "Drop25", "full"] = "full",
-        lidar_use_bbx: bool = True,
         # 单目生成器参数
         monocular_chosen_cam_ids: List[int] = [0],
         monocular_sparsity: Literal["Drop90", "Drop80", "Drop50", "Drop25", "full"] = "full",
         monocular_filter_sky: bool = True,
         monocular_depth_consistency: bool = True,
-        monocular_use_bbx: bool = True,
         monocular_downscale: int = 2,
         # 融合参数
         max_points: int = 500000,
@@ -55,7 +53,6 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
             sparsity="full",  # 基类的sparsity不会被使用
             filter_sky=False,  # 基类的filter_sky不会被使用
             depth_consistency=False,  # 基类的depth_consistency不会被使用
-            use_bbx=True,  # 基类的use_bbx不会被使用
             downscale=1,  # 基类的downscale不会被使用
             crop_aabb=crop_aabb,
             input_aabb=input_aabb,
@@ -65,7 +62,6 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
         # 创建LiDAR生成器
         self.lidar_generator = LiDARRGBPointCloudGenerator(
             sparsity=lidar_sparsity,
-            use_bbx=lidar_use_bbx,
             crop_aabb=crop_aabb,
             input_aabb=input_aabb,
             device=device,
@@ -77,7 +73,6 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
             sparsity=monocular_sparsity,
             filter_sky=monocular_filter_sky,
             depth_consistency=monocular_depth_consistency,
-            use_bbx=monocular_use_bbx,
             downscale=monocular_downscale,
             crop_aabb=crop_aabb,
             input_aabb=input_aabb,

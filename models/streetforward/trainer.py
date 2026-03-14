@@ -97,26 +97,22 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
         self.feat_2d_channels = int(model_cfg.get("feat_2d_channels", 16))
         self.feat_2d_downscale = int(model_cfg.get("feat_2d_downscale", 1))
 
-        bbx_min = model_cfg.get("bbx_min", [-20.0, -20.0, -20.0])
-        bbx_max = model_cfg.get("bbx_max", [20.0, 4.8, 70.0])
+        # Single source of truth: dataset.segment_aabb (seg0 coords)
+        if not hasattr(config, "dataset") or not hasattr(config.dataset, "segment_aabb"):
+            raise ValueError("config.dataset.segment_aabb is required for StreetForwardTrainer.")
+        seg_aabb = config.dataset.segment_aabb
+        if seg_aabb is None or len(seg_aabb) != 2:
+            raise ValueError("config.dataset.segment_aabb must be [[min],[max]] with shape [2,3].")
+        bbx_min = seg_aabb[0]
+        bbx_max = seg_aabb[1]
         self.bbx_min = torch.tensor(bbx_min, dtype=torch.float32, device=device)
         self.bbx_max = torch.tensor(bbx_max, dtype=torch.float32, device=device)
 
-        input_aabb_cfg = model_cfg.get("input_aabb", None)
-        if input_aabb_cfg is None and hasattr(config, "data") and hasattr(config.data, "pointcloud"):
-            pc_cfg = config.data.pointcloud
-            if hasattr(pc_cfg, "get"):
-                input_aabb_cfg = pc_cfg.get("input_aabb")
-            elif hasattr(pc_cfg, "input_aabb"):
-                input_aabb_cfg = pc_cfg.input_aabb
-        if input_aabb_cfg is None and hasattr(config, "dataset") and hasattr(config.dataset, "pointcloud"):
-            pc_cfg = config.dataset.pointcloud
-            if hasattr(pc_cfg, "get"):
-                input_aabb_cfg = pc_cfg.get("input_aabb")
-            elif hasattr(pc_cfg, "input_aabb"):
-                input_aabb_cfg = pc_cfg.input_aabb
-        if input_aabb_cfg is None:
-            input_aabb_cfg = [bbx_min, bbx_max]
+        if not hasattr(config.dataset, "segment_input_aabb"):
+            raise ValueError("config.dataset.segment_input_aabb is required for StreetForwardTrainer.")
+        input_aabb_cfg = config.dataset.segment_input_aabb
+        if input_aabb_cfg is None or len(input_aabb_cfg) != 2:
+            raise ValueError("config.dataset.segment_input_aabb must be [[min],[max]] with shape [2,3].")
         self.input_aabb_min = torch.tensor(input_aabb_cfg[0], dtype=torch.float32, device=device)
         self.input_aabb_max = torch.tensor(input_aabb_cfg[1], dtype=torch.float32, device=device)
 

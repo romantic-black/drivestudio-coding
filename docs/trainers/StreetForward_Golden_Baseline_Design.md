@@ -67,7 +67,7 @@ Golden Baseline 的「基准流程」应包含与第八部分相同的前置条�
 
 | 层级 | 内容 | 说明 |
 |------|------|------|
-| 环境与配置 | Part 1 导入；Part 2 的 `cfg`、`data_cfg`、`dataset_cfg`、`fixed_segment_aabb` 等 | 决定 trainer 与 dataset 的构造参数 |
+| 环境与配置 | Part 1 导入；Part 2 的 `cfg`、`data_cfg`、`dataset_cfg`、`segment_aabb/segment_input_aabb` 等 | 决定 trainer 与 dataset 的构造参数 |
 | 数据源 | Part 3–4：`MultiSceneDataset` 实例、pointcloud 生成方式 | 与 Part 8 使用同一 dataset / 同一配置文件 |
 | Trainer | Part 6：`StreetForwardTrainer(cfg)`，含 model/optimizer 等 | 与 Part 8 使用同一配置与构建方式 |
 | 数据驱动方式 | Part 8：`dataset.create_scheduler(...)` + `scheduler.next_batch()` | 决定「哪些 (scene, segment)」、每个 segment 多少个 batch、是否 shuffle |

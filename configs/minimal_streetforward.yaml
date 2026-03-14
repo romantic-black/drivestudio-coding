@@ -5,6 +5,12 @@
 # No full data/dataset needed when using overfit_batch_path
 data: {}
 
+dataset:
+  # Required (seg0 coords): single source of truth for model AABB
+  segment_aabb: [[-40.0, -20.0, -20.0], [40.0, 4.8, 70.0]]
+  # Kept for consistency with full trainer configs (not used by minimal trainer today)
+  segment_input_aabb: [[-40.0, -20.0, -20.0], [40.0, 4.8, 70.0]]
+
 model:
   offset_max: 0.1
   scale_max: 0.1
@@ -18,9 +24,7 @@ model:
   eta_sh_dc: 1.0
   eta_sh_rest: 1.0
   sh_degree: 1
-  voxel_size: 0.1
-  bbx_min: [-20.0, -20.0, -20.0]
-  bbx_max: [20.0, 4.8, 70.0]
+  voxel_size: 0.2
   sparseConv_outdim: 32
 
 optimizer:
@@ -33,5 +37,16 @@ training:
   log_interval: 50
   save_checkpoint_freq: 500
   seed: 42
+
+eval:
+  enable_psnr: true
+  metric_interval: 10
+  heavy_metric_interval: 50
+  run_test_at_end: true
+
+logging:
+  image_interval: 50
+  enable_jsonl_metrics: true
+  use_tensorboard: true
 
 # Set when running (or via CLI): overfit_batch_path: "./data/overfit_batches/scene0_seg0_batch.pt"

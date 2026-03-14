@@ -25,7 +25,6 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
         sparsity: Literal["Drop90", "Drop80", "Drop50", "Drop25", "full"] = "full",
         filter_sky: bool = True,
         depth_consistency: bool = True,
-        use_bbx: bool = True,
         downscale: int = 2,
         crop_aabb: Optional[np.ndarray] = None,
         input_aabb: Optional[np.ndarray] = None,
@@ -35,7 +34,6 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
             sparsity=sparsity,
             filter_sky=filter_sky,
             depth_consistency=depth_consistency,
-            use_bbx=use_bbx,
             downscale=downscale,
             crop_aabb=crop_aabb,
             input_aabb=input_aabb,
@@ -140,11 +138,10 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
             colors = np.concatenate(frame_colors, axis=0)
             points_world = self._transform_points_np(points_world, world_to_seg0)
 
-            if self.use_bbx:
-                crop_min, crop_max = self.get_crop_aabb()
-                points_world, colors = self.crop_pointcloud(
-                    crop_min, crop_max, points_world, colors
-                )
+            crop_min, crop_max = self.get_crop_aabb()
+            if crop_min is None or crop_max is None:
+                raise ValueError("crop_aabb is required for monocular pointcloud generator.")
+            points_world, colors = self.crop_pointcloud(crop_min, crop_max, points_world, colors)
 
             if len(points_world) == 0:
                 continue
@@ -168,43 +165,26 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
             if len(points_list) > 0
         }
 
-        if self.use_bbx:
-            input_min, input_max = self.get_input_aabb()
-            background_pts, background_colors = (
-                background[:, :3],
-                background[:, 3:],
-            )
-            background_pts, background_colors, outside_pts, outside_colors = (
-                self.split_pointcloud(
-                    input_min, input_max, background_pts, background_colors
-                )
-            )
-            inside_pts, inside_colors = self.filter_pointcloud(
-                background_pts, background_colors, use_bbx=True
-            )
-            outside_pts, outside_colors = self.filter_pointcloud(
-                outside_pts, outside_colors, use_bbx=False
-            )
-            background = np.concatenate(
-                [
-                    np.concatenate([inside_pts, inside_colors], axis=1)
-                    if len(inside_pts) > 0
-                    else np.zeros((0, 6), dtype=np.float32),
-                    np.concatenate([outside_pts, outside_colors], axis=1)
-                    if len(outside_pts) > 0
-                    else np.zeros((0, 6), dtype=np.float32),
-                ],
-                axis=0,
-            )
-        else:
-            if len(background) > 0:
-                pts, cols = background[:, :3], background[:, 3:]
-                pts, cols = self.filter_pointcloud(pts, cols, use_bbx=False)
-                background = (
-                    np.concatenate([pts, cols], axis=1)
-                    if len(pts) > 0
-                    else np.zeros((0, 6), dtype=np.float32)
-                )
+        input_min, input_max = self.get_input_aabb()
+        if input_min is None or input_max is None:
+            raise ValueError("input_aabb is required for monocular pointcloud generator.")
+        background_pts, background_colors = background[:, :3], background[:, 3:]
+        inside_pts, inside_colors, outside_pts, outside_colors = self.split_pointcloud(
+            input_min, input_max, background_pts, background_colors
+        )
+        inside_pts, inside_colors = self.filter_pointcloud(inside_pts, inside_colors, strict=True)
+        outside_pts, outside_colors = self.filter_pointcloud(outside_pts, outside_colors, strict=False)
+        background = np.concatenate(
+            [
+                np.concatenate([inside_pts, inside_colors], axis=1)
+                if len(inside_pts) > 0
+                else np.zeros((0, 6), dtype=np.float32),
+                np.concatenate([outside_pts, outside_colors], axis=1)
+                if len(outside_pts) > 0
+                else np.zeros((0, 6), dtype=np.float32),
+            ],
+            axis=0,
+        )
 
         metadata = {
             "type": "monocular",

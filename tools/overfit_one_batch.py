@@ -4,11 +4,13 @@ import argparse
 import torch
 from omegaconf import OmegaConf
 
-from datasets.multi_scene_dataset import MultiSceneDataset
-
 
 def capture_batch(cfg, scene_id: int, segment_id: int, save_dir: str):
     """提取单个 batch 并持久化到磁盘"""
+    # NOTE: Heavy dataset deps (e.g. pytorch3d) are imported lazily so that
+    # `load_batch()` can be used in lightweight environments.
+    from datasets.multi_scene_dataset import MultiSceneDataset
+
     os.makedirs(save_dir, exist_ok=True)
     
     print(f"Initializing Dataset for scene {scene_id}...")
@@ -25,7 +27,8 @@ def capture_batch(cfg, scene_id: int, segment_id: int, save_dir: str):
         min_keyframes_per_segment=cfg.dataset.get("min_keyframes_per_segment", 2),
         device=torch.device("cpu"),
         preload_scene_count=1,
-        fixed_segment_aabb=cfg.dataset.get("fixed_segment_aabb", None),
+        segment_aabb=cfg.dataset.segment_aabb,
+        segment_input_aabb=cfg.dataset.segment_input_aabb,
         pointcloud_config=cfg.dataset.get("pointcloud", None)
     )
     dataset.initialize()

@@ -123,8 +123,13 @@ class MinimalStreetForward(nn.Module):
 
         self.sh_degree = int(model_cfg.get("sh_degree", 1))
         self.voxel_size = float(model_cfg.get("voxel_size", 0.1))
-        bbx_min = model_cfg.get("bbx_min", [-20.0, -20.0, -20.0])
-        bbx_max = model_cfg.get("bbx_max", [20.0, 4.8, 70.0])
+        if not hasattr(config, "dataset") or not hasattr(config.dataset, "segment_aabb"):
+            raise ValueError("config.dataset.segment_aabb is required for MinimalStreetForwardTrainer.")
+        seg_aabb = config.dataset.segment_aabb
+        if seg_aabb is None or len(seg_aabb) != 2:
+            raise ValueError("config.dataset.segment_aabb must be [[min],[max]] with shape [2,3].")
+        bbx_min = seg_aabb[0]
+        bbx_max = seg_aabb[1]
         self.bbx_min = torch.tensor(bbx_min, dtype=torch.float32, device=device)
         self.bbx_max = torch.tensor(bbx_max, dtype=torch.float32, device=device)
 

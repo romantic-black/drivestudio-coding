@@ -96,7 +96,8 @@ class MultiSceneDataset:
         min_keyframes_per_segment: int = 6,  # 段的最小关键帧数量
         device: torch.device = torch.device("cpu"),
         preload_scene_count: int = 3,  # 预加载场景数量
-        fixed_segment_aabb: Optional[Tensor] = None,  # 全局固定的段AABB（可选）
+        segment_aabb: Tensor,  # 段级 AABB（必需，seg0 系；batch['aabb']/点云裁剪/模型 bbx 的唯一来源）
+        segment_input_aabb: Tensor,  # 输入 AABB（必需，seg0 系；用于点云 inside/outside 分流过滤）
         pointcloud_config: Optional[Dict] = None,  # 点云生成器配置（可选）
     ):
         """
@@ -115,7 +116,8 @@ class MultiSceneDataset:
             min_keyframes_per_segment: 段的最小关键帧数量，不满足则跳过（默认6）
             device: 设备（默认CPU）
             preload_scene_count: 预加载场景数量（默认3），用于控制内存占用
-            fixed_segment_aabb: 可选的全局固定段AABB。如果提供，所有段将使用此固定AABB，
+            segment_aabb: 必需的段级 AABB（seg0 系）。用于 batch['aabb']、点云硬裁剪与模型边界框。\n
+            segment_input_aabb: 必需的输入 AABB（seg0 系）。用于点云 inside/outside 分流过滤。\n
                 而不是从lidar数据计算。形状：[2, 3]，其中 aabb[0] 是 [x_min, y_min, z_min]，
                 aabb[1] 是 [x_max, y_max, z_max]。坐标系：x=左右, y=上下（负数为上）, z=后前
                 （与 _compute_segment_aabb 一致）。如果为 None，则使用从lidar数据计算的AABB。
@@ -126,7 +128,7 @@ class MultiSceneDataset:
                 - sparsity: 点云稀疏度（"full" 等）
                 - filter_sky: 是否过滤天空（默认True）
                 - depth_consistency: 是否使用深度一致性（默认True）
-                - use_bbx: 是否使用边界框（默认True）
+                - （已移除 use_bbx 开关；硬裁剪与分层过滤始终启用）
                 - downscale: 下采样因子（默认2）
                 - crop_aabb: 裁剪AABB [[x_min, y_min, z_min], [x_max, y_max, z_max]]
                 - input_aabb: 输入AABB [[x_min, y_min, z_min], [x_max, y_max, z_max]]
@@ -872,18 +874,15 @@ def _split_segments(
     策略：
     1. 获取场景的 AABB 和轨迹
     2. 计算关键帧的合计距离
-    3. 将关键帧按照距离和 AABB 长度分组为段
-    4. 为每个段计算独立的 AABB（基于段内帧的lidar数据，或使用固定AABB如果配置了）
-    5. 过滤掉关键帧数量不足的段
-    6. 记录每个段内的测试帧（如果提供了测试帧列表）
+    3. 将关键帧按照距离和参考长度分组为段
+    4. 过滤掉关键帧数量不足的段
+    5. 记录每个段内的测试帧（如果提供了测试帧列表）
     
     注意：
     - 段分割不需要那么精确，关键帧的合计距离对比AABB的长度即可
     - 段内设置一个最低关键帧数量限制，不满足则跳过
     - 段与段可以部分重合（overlap_ratio）
-    - **每个段使用独立的AABB**：
-      - 如果配置了 `fixed_segment_aabb`，所有段使用此固定AABB
-      - 否则，基于段内帧的lidar数据计算，而不是使用场景AABB
+    - 段分割不再为每段计算/存储 `segment['aabb']`。段数推断使用 pointcloud 的 **crop_aabb** 尺寸作为参考长度（与训练时裁剪一致，单位为米）。
     - **段内测试帧记录**：如果提供了测试帧列表，会记录每个段范围内包含的测试帧
     
     Args:
@@ -900,7 +899,7 @@ def _split_segments(
             - 'keyframe_indices': List[int] - 该段包含的关键帧索引（全局关键帧索引）
             - 'frame_indices': List[int] - 该段包含的所有帧索引（去重后的帧索引列表）
             - 'test_frame_indices': List[int] - 该段范围内包含的测试帧索引（如果提供了测试帧列表）
-            - 'aabb': Tensor[2, 3] - 段的 AABB 边界（基于段内帧的lidar数据计算）
+            - （不再包含）'aabb'：段分割阶段不存储段 AABB；训练/渲染使用 batch['aabb']（seg0 系）。
     """
     # 1. 获取场景 AABB
     scene_aabb = scene_dataset.get_aabb()  # [2, 3]
@@ -943,17 +942,10 @@ def _split_segments(
             all_frames.extend(kf_seg)
         
         frame_indices = sorted(list(set(all_frames)))
-        # 使用固定AABB（如果配置了），否则计算段的AABB（基于段内帧的lidar数据）
-        if self.fixed_segment_aabb is not None:
-            segment_aabb = self.fixed_segment_aabb
-        else:
-            segment_aabb = self._compute_segment_aabb(scene_dataset, frame_indices)
-        
         segments.append({
             'segment_id': segment_id,
             'keyframe_indices': list(range(len(keyframe_segments))),
             'frame_indices': frame_indices,
-            'aabb': segment_aabb,
         })
     else:
         # 多个段，支持重叠
@@ -991,17 +983,10 @@ def _split_segments(
             # 只添加关键帧数量足够的段
             if len(current_segment_kf_indices) >= self.min_keyframes_per_segment:
                 frame_indices = sorted(list(current_segment_frames))
-                # 使用固定AABB（如果配置了），否则计算段的AABB（基于段内帧的lidar数据）
-                if self.fixed_segment_aabb is not None:
-                    segment_aabb = self.fixed_segment_aabb
-                else:
-                    segment_aabb = self._compute_segment_aabb(scene_dataset, frame_indices)
-                
                 segments.append({
                     'segment_id': segment_id,
                     'keyframe_indices': current_segment_kf_indices,
                     'frame_indices': frame_indices,
-                    'aabb': segment_aabb,
                 })
                 segment_id += 1
     
@@ -1014,9 +999,13 @@ def _split_segments(
     return valid_segments
 ```
 
-### 4.1 段AABB计算
+### 4.1 段 AABB 计算（Legacy / 已不用于段分割）
 
-每个段的AABB是基于段内帧的lidar数据独立计算的，而不是使用场景级别的AABB。这确保了每个段都有反映其实际数据范围的边界框。
+历史版本中会为每个段计算并存储 `segment['aabb']`（通常基于段内 lidar 点的范围）。当前实现中：\n
+- 段分割阶段不再计算/存储 `segment['aabb']`；\n
+- 训练/裁剪/渲染使用 **batch['aabb']**（seg0 系），固定来源为 `dataset.segment_aabb`。\n
+\n
+下面的 `_compute_segment_aabb` 代码片段仅作为遗留参考，不影响当前数据流。
 
 ```python
 def _compute_segment_aabb(
@@ -1155,7 +1144,7 @@ def _create_pointcloud_generator(
     - sparsity: 点云稀疏度（"full" 等）
     - filter_sky: 是否过滤天空（默认True）
     - depth_consistency: 是否使用深度一致性（默认True）
-    - use_bbx: 是否使用边界框（默认True）
+    - （已移除 use_bbx 开关；硬裁剪与分层过滤始终启用）
     - downscale: 下采样因子（默认2）
     - crop_aabb: 裁剪AABB [[x_min, y_min, z_min], [x_max, y_max, z_max]]
     - input_aabb: 输入AABB [[x_min, y_min, z_min], [x_max, y_max, z_max]]
@@ -1178,7 +1167,7 @@ def _create_pointcloud_generator(
             sparsity=pointcloud_config.get("sparsity", "full"),
             filter_sky=pointcloud_config.get("filter_sky", True),
             depth_consistency=pointcloud_config.get("depth_consistency", True),
-            use_bbx=pointcloud_config.get("use_bbx", True),
+            # use_bbx removed: always-on crop & layered filtering
             downscale=pointcloud_config.get("downscale", 2),
             crop_aabb=crop_aabb,
             input_aabb=input_aabb,
@@ -1883,7 +1872,7 @@ def split_trajectory(trajectory, num_splits=0, min_count=1, min_length=0):
 - [ ] **AABB 获取正确**：使用 `scene_dataset.get_aabb()` 获取场景 AABB
 - [ ] **段分割合理**：段的大小和数量合理
 - [ ] **重叠处理正确**：段与段之间的重叠比例正确应用
-- [ ] **固定AABB使用正确**：如果配置了 `fixed_segment_aabb`，所有段使用此固定AABB
+- [ ] **AABB 使用正确**：batch/点云/模型使用同一 `segment_aabb`（seg0 系）
 - [ ] **固定AABB格式正确**：固定AABB的形状为 [2, 3]，min < max
 - [ ] **固定AABB坐标系正确**：固定AABB使用与 `_compute_segment_aabb` 相同的坐标系（x=左右, y=上下（负数为上）, z=后前）
 - [ ] **段AABB边界扩展正确**：段AABB确保包含所有点（使用分位数和实际最小/最大值的组合）
@@ -1983,14 +1972,15 @@ dataset = MultiSceneDataset(
     min_keyframes_per_segment=6,
     device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     preload_scene_count=3,  # 预加载3个场景
-    fixed_segment_aabb=fixed_aabb,  # 使用固定段AABB（可选）
+    segment_aabb=fixed_aabb,  # 段 AABB（必需）
+    segment_input_aabb=fixed_input_aabb,  # 输入 AABB（必需）
     pointcloud_config={  # 点云生成器配置（可选）
         'type': 'monocular',
         'chosen_cam_ids': [0, 1, 2],
         'sparsity': 'full',
         'filter_sky': True,
         'depth_consistency': True,
-        'use_bbx': True,
+        # use_bbx removed
         'downscale': 2,
         'crop_aabb': [[-20, -20, -20], [20, 4.8, 70]],
         'input_aabb': [[-20, -20, -20], [20, 4.8, 120]],

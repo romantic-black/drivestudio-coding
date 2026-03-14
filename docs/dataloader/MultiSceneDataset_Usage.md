@@ -205,6 +205,7 @@ batch = {
     # 场景和段标识
     'scene_id': Tensor[1],           # 场景ID（long类型）
     'segment_id': int,                # 段ID（场景内索引）
+    'aabb': Tensor[2, 3],             # 段 AABB [min, max]，坐标系为 segment 第一帧 (seg0)，与 extrinsics/点云一致
     
     # 关键帧信息（用于调试/显示）
     'keyframe_info': {
@@ -327,21 +328,14 @@ batch = {
 - **min_keyframes_per_segment**：段的最小关键帧数量，不满足则跳过（默认 6）
 - **device**：设备（默认 CPU）
 - **preload_scene_count**：预加载场景数量（默认 3），用于控制内存占用
-- **fixed_segment_aabb**：可选的全局固定段AABB
-  - 形状：`[2, 3]`
-  - 格式：`[[x_min, y_min, z_min], [x_max, y_max, z_max]]`
-  - 坐标系：x=左右, y=上下（负数为上）, z=后前
-- **pointcloud_config**：可选的点云生成器配置
-  - `type`：生成器类型（"monocular" 等，默认 "monocular"）
-  - `chosen_cam_ids`：选择的相机ID列表
-  - `sparsity`：点云稀疏度（"full" 等）
-  - `filter_sky`：是否过滤天空（默认 True）
-  - `depth_consistency`：是否使用深度一致性（默认 True）
-  - `use_bbx`：是否使用边界框（默认 True）
-  - `downscale`：下采样因子（默认 2）
-  - `crop_aabb`：裁剪AABB `[[x_min, y_min, z_min], [x_max, y_max, z_max]]`
-  - `input_aabb`：输入AABB `[[x_min, y_min, z_min], [x_max, y_max, z_max]]`
-  - 坐标系：`crop_aabb` / `input_aabb` 相对于 **segment 第一帧**；点云会在生成时变换到该坐标系再做过滤/裁剪
+- **segment_aabb**：**必需**，段级 AABB（**segment 第一帧坐标系 seg0**）
+  - 形状：`[2, 3]`；格式：`[[x_min, y_min, z_min], [x_max, y_max, z_max]]`
+  - 用途：作为 **batch['aabb']**、点云硬裁剪 `crop_aabb`、以及模型 `bbx_min/bbx_max` 的唯一来源
+- **segment_input_aabb**：**必需**，用于点云 inside/outside 分流与分层过滤（seg0 系）
+  - 形状同上
+- **pointcloud_config**：**必需**，点云生成器配置（不再包含 AABB 与 use_bbx 开关）
+  - `type`：生成器类型（"monocular" / "lidar" / "hybrid"）
+  - 其余参数如 `sparsity/filter_sky/depth_consistency/downscale/...` 仍可配置
 
 ---
 
@@ -452,15 +446,13 @@ finally:
 
 ### 段分割策略
 
-1. **基于 AABB 限制**：根据场景的 AABB 和轨迹距离分割段
-2. **段重叠**：段与段之间可以部分重合（`segment_overlap_ratio`）
-3. **独立 AABB**：每个段使用独立的 AABB（基于段内帧的 lidar 数据计算，或使用固定 AABB）
+1. **基于轨迹距离与参考长度**：段数由关键帧总轨迹距离与「参考 AABB 长度」决定；参考长度来自 pointcloud 的 **crop_aabb**（与训练时点云裁剪一致，seg0 系）。
+2. **段重叠**：段与段之间可以部分重合（`segment_overlap_ratio`）。
+3. **段内无独立 AABB 字段**：每个 segment 不再存储 `aabb`；训练/渲染使用的 AABB 由 **batch['aabb']** 提供（见下文），坐标系为 segment 第一帧 (seg0)。
 
-### 段 AABB 计算
+### Batch 中的 AABB（seg0 系）
 
-- **默认方式**：基于段内帧的 lidar 数据计算
-- **固定 AABB**：如果配置了 `fixed_segment_aabb`，所有段使用此固定 AABB
-- **回退机制**：如果 lidar 数据不可用，回退到场景 AABB
+- **batch['aabb']**：形状 `[2, 3]`，为 **segment 第一帧坐标系 (seg0)** 下的 AABB，与 batch 内外参、点云、dynamic_info 一致。\n+- **取值**：固定等于 `dataset.segment_aabb`（唯一来源）。Trainer 应使用 `batch['aabb']` 作为场景框，保证与当前 batch 同系。
 
 ---
 
@@ -491,14 +483,13 @@ pointcloud_config = {
     'sparsity': 'full',
     'filter_sky': True,
     'depth_consistency': True,
-    'use_bbx': True,
     'downscale': 2,
-    'crop_aabb': [[-20, -20, -20], [20, 4.8, 70]],
-    'input_aabb': [[-20, -20, -20], [20, 4.8, 120]],
 }
 
 dataset = MultiSceneDataset(
     # ... 其他参数
+    segment_aabb=[[-20, -20, -20], [20, 4.8, 70]],
+    segment_input_aabb=[[-20, -20, -20], [20, 4.8, 120]],
     pointcloud_config=pointcloud_config,
 )
 ```
@@ -582,9 +573,9 @@ A: 可以，`num_cams` 是从场景数据中动态获取的。
 
 A: 通过配置 `pixel_source.max_test_images` 限制每个段中使用的测试帧数量。
 
-### Q: 段 AABB 是如何计算的？
+### Q: 段 AABB 是如何计算的？batch 里的 aabb 是什么系？
 
-A: 默认基于段内帧的 lidar 数据计算，如果配置了 `fixed_segment_aabb` 则使用固定 AABB。
+A: 段分割不再为每个段计算/存储 AABB。Batch 中的 **batch['aabb']** 为 **segment 第一帧坐标系 (seg0)**，固定来自 `dataset.segment_aabb`，与 extrinsics、点云一致。
 
 ---
 

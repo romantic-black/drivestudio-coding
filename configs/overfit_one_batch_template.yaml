@@ -44,23 +44,25 @@ dataset:
   min_keyframes_per_scene: 2    
   min_keyframes_per_segment: 2  
   
-  # 【可选】全局固定段AABB，如果希望明确截取某一块空间区域
-  fixed_segment_aabb: 
-    - [-20.0, -20.0, -20.0]  # min
-    - [20.0, 4.8, 70.0]      # max
+  # Segment AABB (required, seg0 coords)
+  segment_aabb:
+    - [-20.0, -20.0, -20.0]
+    - [20.0, 4.8, 70.0]
+  # Segment input AABB (required, seg0 coords)
+  segment_input_aabb:
+    - [-20.0, -20.0, -20.0]
+    - [20.0, 4.8, 120.0]
     
   # 点云生成器配置 (为模型提供初始化与深度一致性等特征)
   pointcloud:
     type: "hybrid"
     # LiDAR生成器参数
     lidar_sparsity: full
-    lidar_use_bbx: true
     # 单目生成器参数
     monocular_chosen_cam_ids: [0, 1, 2]
     monocular_sparsity: full
     monocular_filter_sky: true
     monocular_depth_consistency: false
-    monocular_use_bbx: true
     monocular_downscale: 2
     # 融合参数
     max_points: 500000
@@ -69,14 +71,7 @@ dataset:
     downsample_dynamic: false
     count_dynamic_in_max_points: false
     background_downsample_method: uniform
-    # Crop AABB: 用于裁剪（移除框外的点）
-    crop_aabb:
-      - [-20.0, -20.0, -20.0]
-      - [20.0, 4.8, 70.0]
-    # Input AABB: 用于分割和过滤
-    input_aabb:
-      - [-20.0, -20.0, -20.0]
-      - [20.0, 4.8, 120.0]
+    # NOTE: crop_aabb/input_aabb have been unified into dataset.segment_aabb/segment_input_aabb
 
 # Capture 专属参数（在工具脚本中读取）
 capture:

@@ -13,7 +13,7 @@ import queue
 import random
 import threading
 import time
-from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Dict, List, Optional, Tuple, TYPE_CHECKING, Union
 
 import numpy as np
 import torch
@@ -27,6 +27,164 @@ if TYPE_CHECKING:
     from datasets.pointcloud_generators import RGBPointCloudGenerator
 
 logger = logging.getLogger(__name__)
+
+
+# #region agent log
+_AGENT_DEBUG_LOG_PATH = "/root/drivestudio-coding/.cursor/debug-cebadb.log"
+
+def _agent_write_ndjson(payload: Dict) -> None:
+    try:
+        import json
+        with open(_AGENT_DEBUG_LOG_PATH, "a") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _agent_now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _agent_to_list3(x):
+    try:
+        if isinstance(x, torch.Tensor):
+            x = x.detach().cpu().float().numpy()
+        x = np.asarray(x, dtype=np.float32).reshape(3)
+        return [float(x[0]), float(x[1]), float(x[2])]
+    except Exception:
+        return None
+
+
+def _agent_aabb_to_lists(aabb):
+    try:
+        if isinstance(aabb, torch.Tensor):
+            aabb = aabb.detach().cpu().float().numpy()
+        aabb = np.asarray(aabb, dtype=np.float32).reshape(2, 3)
+        return [_agent_to_list3(aabb[0]), _agent_to_list3(aabb[1])]
+    except Exception:
+        return None
+
+
+def _agent_basis_world_from_seg0_pose(seg0_to_world):
+    try:
+        if isinstance(seg0_to_world, torch.Tensor):
+            T = seg0_to_world.detach().cpu().float().numpy()
+        else:
+            T = np.asarray(seg0_to_world, dtype=np.float32)
+        if T.shape == (3, 4):
+            T = np.vstack([T, np.array([0, 0, 0, 1], dtype=np.float32)])
+        if T.shape != (4, 4):
+            return None
+        o = (T @ np.array([0, 0, 0, 1], dtype=np.float32))[:3]
+        ex = (T @ np.array([1, 0, 0, 1], dtype=np.float32))[:3] - o
+        ey = (T @ np.array([0, 1, 0, 1], dtype=np.float32))[:3] - o
+        ez = (T @ np.array([0, 0, 1, 1], dtype=np.float32))[:3] - o
+        return {
+            "origin_world": _agent_to_list3(o),
+            "seg0_x_in_world": _agent_to_list3(ex),
+            "seg0_y_in_world": _agent_to_list3(ey),
+            "seg0_z_in_world": _agent_to_list3(ez),
+        }
+    except Exception:
+        return None
+
+
+def _agent_minmax_xyz(xyz: np.ndarray):
+    try:
+        if xyz is None:
+            return None, None
+        xyz = np.asarray(xyz, dtype=np.float32)
+        if xyz.ndim != 2 or xyz.shape[1] != 3 or xyz.shape[0] == 0:
+            return None, None
+        return xyz.min(axis=0).tolist(), xyz.max(axis=0).tolist()
+    except Exception:
+        return None, None
+
+
+def _agent_crop_violation_counts(xyz: np.ndarray, crop_min, crop_max):
+    try:
+        if xyz is None or crop_min is None or crop_max is None:
+            return None
+        xyz = np.asarray(xyz, dtype=np.float32)
+        crop_min = np.asarray(crop_min, dtype=np.float32).reshape(3)
+        crop_max = np.asarray(crop_max, dtype=np.float32).reshape(3)
+        if xyz.ndim != 2 or xyz.shape[1] != 3 or xyz.shape[0] == 0:
+            return {"n": int(xyz.shape[0]) if hasattr(xyz, "shape") else 0}
+        below = (xyz < crop_min[None, :]).sum(axis=0).astype(int).tolist()
+        above = (xyz > crop_max[None, :]).sum(axis=0).astype(int).tolist()
+        return {"n": int(xyz.shape[0]), "below_counts_xyz": below, "above_counts_xyz": above}
+    except Exception:
+        return None
+
+
+def _agent_pose_axes_origin(pose) -> Optional[Dict]:
+    """From 4x4 frame_to_world: origin in world, and +x/+y/+z axis directions in world (R columns)."""
+    try:
+        if isinstance(pose, torch.Tensor):
+            T = pose.detach().cpu().float().numpy()
+        else:
+            T = np.asarray(pose, dtype=np.float32)
+        if T.shape == (3, 4):
+            T = np.vstack([T, np.array([0, 0, 0, 1], dtype=np.float32)])
+        if T.shape != (4, 4):
+            return None
+        R = T[:3, :3]
+        return {
+            "origin": _agent_to_list3(T[:3, 3]),
+            "axis_plus_x": _agent_to_list3(R[:, 0]),
+            "axis_plus_y": _agent_to_list3(R[:, 1]),
+            "axis_plus_z": _agent_to_list3(R[:, 2]),
+        }
+    except Exception:
+        return None
+
+
+def _agent_pose_max_diff(pose_a, pose_b) -> Optional[float]:
+    """Max absolute difference between two 4x4 poses; None if either invalid."""
+    try:
+        if isinstance(pose_a, torch.Tensor):
+            A = pose_a.detach().cpu().float().numpy()
+        else:
+            A = np.asarray(pose_a, dtype=np.float32)
+        if isinstance(pose_b, torch.Tensor):
+            B = pose_b.detach().cpu().float().numpy()
+        else:
+            B = np.asarray(pose_b, dtype=np.float32)
+        if A.shape == (3, 4):
+            A = np.vstack([A, np.array([0, 0, 0, 1], dtype=np.float32)])
+        if B.shape == (3, 4):
+            B = np.vstack([B, np.array([0, 0, 0, 1], dtype=np.float32)])
+        if A.shape != (4, 4) or B.shape != (4, 4):
+            return None
+        return float(np.abs(A - B).max())
+    except Exception:
+        return None
+
+
+def _agent_T_cam_to_lidar(cam_to_world, lidar_to_world) -> Optional[Dict]:
+    """T_cam_to_lidar = inv(cam_to_world) @ lidar_to_world; return axes_origin for log."""
+    try:
+        if isinstance(cam_to_world, torch.Tensor):
+            C = cam_to_world.detach().cpu().float().numpy()
+        else:
+            C = np.asarray(cam_to_world, dtype=np.float32)
+        if isinstance(lidar_to_world, torch.Tensor):
+            L = lidar_to_world.detach().cpu().float().numpy()
+        else:
+            L = np.asarray(lidar_to_world, dtype=np.float32)
+        if C.shape == (3, 4):
+            C = np.vstack([C, np.array([0, 0, 0, 1], dtype=np.float32)])
+        if L.shape == (3, 4):
+            L = np.vstack([L, np.array([0, 0, 0, 1], dtype=np.float32)])
+        if C.shape != (4, 4) or L.shape != (4, 4):
+            return None
+        T = np.linalg.inv(C) @ L
+        return _agent_pose_axes_origin(T)
+    except Exception:
+        return None
+
+
+# #endregion
 
 
 def _safe_json_serialize(obj):
@@ -88,7 +246,8 @@ class MultiSceneDataset:
         min_keyframes_per_segment: int = 6,
         device: torch.device = torch.device("cpu"),
         preload_scene_count: int = 3,
-        fixed_segment_aabb: Optional[Tensor] = None,
+        segment_aabb: Optional[Union[Tensor, List, np.ndarray]] = None,
+        segment_input_aabb: Optional[Union[Tensor, List, np.ndarray]] = None,
         pointcloud_config: Optional[Dict] = None,
     ):
         """
@@ -109,10 +268,10 @@ class MultiSceneDataset:
             min_keyframes_per_segment: Minimum keyframes per segment, skip if not met (default 6)
             device: Device (default CPU)
             preload_scene_count: Number of scenes to preload ahead (default 3)
-            fixed_segment_aabb: Optional fixed AABB for all segments. If provided, all segments
-                will use this AABB instead of computing from lidar data. Shape: [2, 3] where
-                aabb[0] is [x_min, y_min, z_min] and aabb[1] is [x_max, y_max, z_max].
-                Coordinate system: x=left-right, y=up-down (negative is up), z=back-front (same as _compute_segment_aabb).
+            segment_aabb: Required segment AABB in segment-first-frame (seg0) coordinates.
+                Shape: [2, 3] where aabb[0] is [x_min, y_min, z_min] and aabb[1] is [x_max, y_max, z_max].
+            segment_input_aabb: Required input AABB in segment-first-frame (seg0) coordinates.
+                Used for inside/outside split and filtering. Same shape as segment_aabb.
         """
         # Store configuration
         self.data_cfg = data_cfg
@@ -143,22 +302,27 @@ class MultiSceneDataset:
         
         # Initialize preload scene count
         self.preload_scene_count = preload_scene_count
-        
-        # Initialize fixed segment AABB (if provided)
-        if fixed_segment_aabb is not None:
-            # Validate shape
-            if not isinstance(fixed_segment_aabb, Tensor):
-                fixed_segment_aabb = torch.tensor(fixed_segment_aabb, dtype=torch.float32)
-            if fixed_segment_aabb.shape != (2, 3):
-                raise ValueError(f"fixed_segment_aabb must have shape [2, 3], got {fixed_segment_aabb.shape}")
-            # Validate min < max
-            if not torch.all(fixed_segment_aabb[0] < fixed_segment_aabb[1]):
-                raise ValueError("fixed_segment_aabb min must be less than max")
-            # Move to device
-            self.fixed_segment_aabb = fixed_segment_aabb.to(device)
-            logger.info(f"Using fixed segment AABB: {self.fixed_segment_aabb}")
-        else:
-            self.fixed_segment_aabb = None
+
+        # Required AABBs (single source of truth; seg0 coords)
+        if segment_aabb is None:
+            raise ValueError("dataset.segment_aabb is required (seg0 coords) and must have shape [2, 3].")
+        if segment_input_aabb is None:
+            raise ValueError("dataset.segment_input_aabb is required (seg0 coords) and must have shape [2, 3].")
+
+        def _as_aabb_tensor(name: str, aabb) -> Tensor:
+            if not isinstance(aabb, Tensor):
+                aabb = torch.tensor(aabb, dtype=torch.float32)
+            aabb = aabb.to(dtype=torch.float32)
+            if aabb.shape != (2, 3):
+                raise ValueError(f"{name} must have shape [2, 3], got {tuple(aabb.shape)}")
+            if not torch.all(aabb[0] < aabb[1]):
+                raise ValueError(f"{name} min must be strictly less than max for all axes")
+            return aabb
+
+        self.segment_aabb = _as_aabb_tensor("dataset.segment_aabb", segment_aabb).to(device)
+        self.segment_input_aabb = _as_aabb_tensor("dataset.segment_input_aabb", segment_input_aabb).to(device)
+        self.segment_aabb_np = self.segment_aabb.detach().cpu().numpy().astype(np.float32)
+        self.segment_input_aabb_np = self.segment_input_aabb.detach().cpu().numpy().astype(np.float32)
         
         # Initialize scene candidate pool (unvalidated scene IDs)
         self.scene_candidate_pool = train_scene_ids.copy()
@@ -188,6 +352,9 @@ class MultiSceneDataset:
                 "pointcloud_config is required for MultiSceneDataset; "
                 "StreetForward training depends on point cloud initialization."
             )
+        # Store for segment splitting reference length and batch['aabb'] construction
+        self.pointcloud_config = pointcloud_config
+
         self.pointcloud_generator = self._create_pointcloud_generator(
             pointcloud_config, data_cfg, device
         )
@@ -221,12 +388,15 @@ class MultiSceneDataset:
             MonocularRGBPointCloudGenerator,
             HybridRGBPointCloudGenerator,
         )
-        
-        # 获取生成器类型（默认为 monocular）
-        generator_type = pointcloud_config.get("type", "monocular")
-        
-        crop_aabb = np.array(pointcloud_config.get("crop_aabb", [[-20, -20, -20], [20, 4.8, 70]]))
-        input_aabb = np.array(pointcloud_config.get("input_aabb", [[-20, -20, -20], [20, 4.8, 120]]))
+
+        # Generator type must be explicit (fail-fast)
+        if "type" not in pointcloud_config:
+            raise ValueError("dataset.pointcloud.type is required (monocular|lidar|hybrid).")
+        generator_type = pointcloud_config["type"]
+
+        # AABB single source of truth: dataset.segment_aabb / dataset.segment_input_aabb
+        crop_aabb = self.segment_aabb_np
+        input_aabb = self.segment_input_aabb_np
         
         if generator_type == "monocular":
             chosen_cam_ids = pointcloud_config.get(
@@ -239,7 +409,6 @@ class MultiSceneDataset:
                 sparsity=pointcloud_config.get("sparsity", "full"),
                 filter_sky=pointcloud_config.get("filter_sky", True),
                 depth_consistency=pointcloud_config.get("depth_consistency", True),
-                use_bbx=pointcloud_config.get("use_bbx", True),
                 downscale=pointcloud_config.get("downscale", 2),
                 crop_aabb=crop_aabb,
                 input_aabb=input_aabb,
@@ -248,7 +417,6 @@ class MultiSceneDataset:
         elif generator_type == "hybrid":
             # LiDAR生成器参数
             lidar_sparsity = pointcloud_config.get("lidar_sparsity", "full")
-            lidar_use_bbx = pointcloud_config.get("lidar_use_bbx", True)
             
             # 单目生成器参数
             monocular_chosen_cam_ids = pointcloud_config.get(
@@ -258,7 +426,6 @@ class MultiSceneDataset:
             monocular_sparsity = pointcloud_config.get("monocular_sparsity", "full")
             monocular_filter_sky = pointcloud_config.get("monocular_filter_sky", True)
             monocular_depth_consistency = pointcloud_config.get("monocular_depth_consistency", True)
-            monocular_use_bbx = pointcloud_config.get("monocular_use_bbx", True)
             monocular_downscale = pointcloud_config.get("monocular_downscale", 2)
             
             # 融合参数
@@ -271,12 +438,10 @@ class MultiSceneDataset:
             
             return HybridRGBPointCloudGenerator(
                 lidar_sparsity=lidar_sparsity,
-                lidar_use_bbx=lidar_use_bbx,
                 monocular_chosen_cam_ids=monocular_chosen_cam_ids,
                 monocular_sparsity=monocular_sparsity,
                 monocular_filter_sky=monocular_filter_sky,
                 monocular_depth_consistency=monocular_depth_consistency,
-                monocular_use_bbx=monocular_use_bbx,
                 monocular_downscale=monocular_downscale,
                 max_points=max_points,
                 fusion_strategy=fusion_strategy,
@@ -1172,10 +1337,10 @@ class MultiSceneDataset:
         test_frame_indices: Optional[List[int]] = None,
     ) -> List[Dict]:
         """
-        Split scene into segments based on AABB constraints.
+        Split scene into segments based on trajectory distance and a reference length.
         
         Strategy:
-        1. Get scene AABB and trajectory
+        1. Get reference AABB length (from pointcloud crop_aabb)
         2. Calculate total keyframe distance
         3. Group keyframes into segments based on distance and AABB length
         4. Filter out segments with insufficient keyframes
@@ -1199,23 +1364,17 @@ class MultiSceneDataset:
                 - 'keyframe_indices': List[int] - Keyframe indices in this segment (global keyframe indices)
                 - 'frame_indices': List[int] - All frame indices in this segment (deduplicated)
                 - 'test_frame_indices': List[int] - Test frames that fall into this segment's frame range
-                - 'aabb': Tensor[2, 3] - Segment AABB bounds (computed from segment frames' lidar data)
         """
-        # 1. Get scene AABB
-        scene_aabb = scene_dataset.get_aabb()  # [2, 3]
-        scene_size = scene_aabb[1] - scene_aabb[0]  # [3]
+        # 1. Reference AABB length from dataset.segment_aabb (seg0-aligned; same as training)
+        aabb_length = float(np.max(self.segment_aabb_np[1].astype(np.float64) - self.segment_aabb_np[0].astype(np.float64)))
         
-        # 2. Calculate scene AABB main direction length (usually x or y, depends on driving direction)
-        # Use largest dimension as main length
-        aabb_length = scene_size.max().item()  # Scalar
-        
-        # 3. Calculate total keyframe distance
+        # 2. Calculate total keyframe distance
         # Each row of keyframe_ranges is [start_distance, end_distance]
         # Calculate length of each keyframe segment
         keyframe_lengths = keyframe_ranges[:, 1] - keyframe_ranges[:, 0]  # [num_keyframes]
         total_keyframe_distance = keyframe_lengths.sum().item()  # Total distance of all keyframe segments
         
-        # 4. Determine number of segments based on distance and AABB length
+        # 3. Determine number of segments based on distance and AABB length
         # If total keyframe distance is much smaller than AABB length, vehicle moved short distance, maybe only 1 segment
         # If total keyframe distance is close to AABB length, can split into multiple segments
         if total_keyframe_distance < aabb_length * 0.3:
@@ -1231,7 +1390,7 @@ class MultiSceneDataset:
             num_segments_by_distance = max(2, int(distance_ratio * 3))  # More segments for longer distances
             num_segments = max(1, min(max_segments, num_segments_by_distance))
         
-        # 5. Group keyframes into segments based on distance with overlap
+        # 4. Group keyframes into segments based on distance with overlap
         segments = []
         segment_id = 0
         
@@ -1242,17 +1401,10 @@ class MultiSceneDataset:
                 all_frames.extend(kf_seg)
             
             frame_indices = sorted(list(set(all_frames)))
-            # Use fixed AABB if configured, otherwise compute from segment frames
-            if self.fixed_segment_aabb is not None:
-                segment_aabb = self.fixed_segment_aabb
-            else:
-                segment_aabb = self._compute_segment_aabb(scene_dataset, frame_indices)
-            
             segments.append({
                 'segment_id': segment_id,
                 'keyframe_indices': list(range(len(keyframe_segments))),
                 'frame_indices': frame_indices,
-                'aabb': segment_aabb,
             })
         else:
             # Multiple segments with overlap
@@ -1290,27 +1442,20 @@ class MultiSceneDataset:
                 # Only add segment if it has enough keyframes
                 if len(current_segment_kf_indices) >= self.min_keyframes_per_segment:
                     frame_indices = sorted(list(current_segment_frames))
-                    # Use fixed AABB if configured, otherwise compute from segment frames
-                    if self.fixed_segment_aabb is not None:
-                        segment_aabb = self.fixed_segment_aabb
-                    else:
-                        segment_aabb = self._compute_segment_aabb(scene_dataset, frame_indices)
-                    
                     segments.append({
                         'segment_id': segment_id,
                         'keyframe_indices': current_segment_kf_indices,
                         'frame_indices': frame_indices,
-                        'aabb': segment_aabb,
                     })
                     segment_id += 1
         
-        # 6. Filter out segments with insufficient keyframes (double check)
+        # 5. Filter out segments with insufficient keyframes (double check)
         valid_segments = [
             seg for seg in segments
             if len(seg['keyframe_indices']) >= self.min_keyframes_per_segment
         ]
 
-        # 7. Record test frames that fall into each segment's frame range
+        # 6. Record test frames that fall into each segment's frame range
         test_frame_indices = test_frame_indices or []
         for seg in valid_segments:
             segment_train_frames = seg.get('frame_indices', [])
@@ -1591,6 +1736,12 @@ class MultiSceneDataset:
         if pixel_source is None or not getattr(pixel_source, "camera_list", None):
             return None
         ref_cam_id = pixel_source.camera_list[0]
+        # Enforce using front camera with id 0 as the only valid seg0 source.
+        if ref_cam_id != 0:
+            raise ValueError(
+                f"MultiSceneDataset expects pixel_source.camera_list[0] == 0, "
+                f"but got {ref_cam_id}. Please ensure front camera has id 0."
+            )
         try:
             cam_data = pixel_source.camera_data[ref_cam_id]
         except Exception:
@@ -1619,23 +1770,45 @@ class MultiSceneDataset:
     ) -> Tuple[Tensor, int, str]:
         """
         Return (pose, frame_idx, source) where pose is segment-first-frame pose in world coords.
-        Priority: lidar_to_worlds -> reference camera cam_to_worlds. Must exist for the segment's first frame.
+        Seg0 is strictly defined from reference camera-0 cam_to_worlds (front camera). Lidar is not allowed.
         """
         frame_indices = sorted(set(segment.get("frame_indices", [])))
         if len(frame_indices) == 0:
             raise ValueError("Segment has no frame_indices to compute first pose.")
         first_frame_idx = frame_indices[0]
-        pose = self._get_pose_from_lidar(scene_dataset, first_frame_idx)
-        pose_source = "lidar"
-        if pose is None:
-            pose = self._get_pose_from_camera(scene_dataset, first_frame_idx)
-            pose_source = "camera"
+        # Only allow camera-0 as seg0 source; fast-fail if unavailable.
+        pose = self._get_pose_from_camera(scene_dataset, first_frame_idx)
+        pose_source = "camera"
         if pose is None:
             seg_label = segment_id if segment_id is not None else segment.get("segment_id", "unknown")
             raise ValueError(
-                f"Cannot find pose for segment {seg_label} first frame {first_frame_idx}; "
-                "checked lidar_to_worlds and camera poses."
+                f"Cannot find camera-0 pose for segment {seg_label} first frame {first_frame_idx}; "
+                "seg0 must come from camera id 0."
             )
+        # #region agent log (H5: frame index and which source available/chosen)
+        try:
+            has_lidar = self._get_pose_from_lidar(scene_dataset, first_frame_idx) is not None
+            has_camera = self._get_pose_from_camera(scene_dataset, first_frame_idx) is not None
+            _agent_write_ndjson(
+                {
+                    "sessionId": "cebadb",
+                    "runId": "run1",
+                    "hypothesisId": "H5",
+                    "location": "multi_scene_dataset.py:_get_segment_first_pose",
+                    "message": "segment first pose: frame index and pose source (lidar/camera)",
+                    "data": {
+                        "segment_id": segment_id,
+                        "first_frame_idx": int(first_frame_idx),
+                        "pose_source": pose_source,
+                        "has_lidar": has_lidar,
+                        "has_camera": has_camera,
+                    },
+                    "timestamp": _agent_now_ms(),
+                }
+            )
+        except Exception:
+            pass
+        # #endregion
         return pose, first_frame_idx, pose_source
 
     def get_segment_first_pose(
@@ -1694,7 +1867,45 @@ class MultiSceneDataset:
             raise ValueError(
                 f"Segment {segment_id} first pose is non-invertible; cannot build segment coordinate transform."
             ) from exc
-        
+
+        # #region agent log (coord debug: H1 seg0==lidar, H2 seg0==camera, H3 T_cam_lidar, H4 seg0 axes, H5 frame/source)
+        try:
+            dataset_name = getattr(self.data_cfg, "dataset", None)
+            if not isinstance(dataset_name, str):
+                dataset_name = str(dataset_name) if dataset_name is not None else None
+            lidar_pose = self._get_pose_from_lidar(scene_dataset, segment_first_frame_idx)
+            camera_pose = self._get_pose_from_camera(scene_dataset, segment_first_frame_idx)
+            seg0_vs_lidar_max_diff = _agent_pose_max_diff(segment_first_pose, lidar_pose) if lidar_pose is not None else None
+            seg0_vs_camera_max_diff = _agent_pose_max_diff(segment_first_pose, camera_pose) if camera_pose is not None else None
+            T_cam_to_lidar = _agent_T_cam_to_lidar(camera_pose, lidar_pose) if (camera_pose is not None and lidar_pose is not None) else None
+            _agent_write_ndjson(
+                {
+                    "sessionId": "cebadb",
+                    "runId": "run1",
+                    "hypothesisId": "H1_H2_H3_H4_H5",
+                    "location": "multi_scene_dataset.py:get_segment_batch:coord_survey",
+                    "message": "coord debug: seg0 vs lidar/camera equality, T_cam_lidar, seg0 axes in world",
+                    "data": {
+                        "dataset": dataset_name,
+                        "scene_id": int(scene_id),
+                        "segment_id": int(segment_id),
+                        "segment_first_frame_idx": int(segment_first_frame_idx),
+                        "segment_first_pose_source": segment_pose_source,
+                        "seg0_vs_lidar_max_diff": seg0_vs_lidar_max_diff,
+                        "seg0_vs_camera_max_diff": seg0_vs_camera_max_diff,
+                        "lidar_to_world_if_available": _agent_pose_axes_origin(lidar_pose) if lidar_pose is not None else None,
+                        "camera_to_world_if_available": _agent_pose_axes_origin(camera_pose) if camera_pose is not None else None,
+                        "segment_first_pose_chosen": _agent_pose_axes_origin(segment_first_pose),
+                        "T_cam_to_lidar": T_cam_to_lidar,
+                        "seg0_basis_in_world": _agent_basis_world_from_seg0_pose(segment_first_pose),
+                    },
+                    "timestamp": _agent_now_ms(),
+                }
+            )
+        except Exception:
+            pass
+        # #endregion
+
         def _transform_extrinsics_list(extrinsics_list: List[Tensor]) -> List[Tensor]:
             transformed: List[Tensor] = []
             for ext in extrinsics_list:
@@ -1804,12 +2015,71 @@ class MultiSceneDataset:
         # 6. Generate point cloud (if point cloud generator exists)
         pointcloud = None
         if self.pointcloud_generator is not None:
+            crop_min, crop_max = self.pointcloud_generator.get_crop_aabb()
+            input_min, input_max = self.pointcloud_generator.get_input_aabb()
+            # #region agent log
+            _agent_write_ndjson(
+                {
+                    "sessionId": "cebadb",
+                    "runId": "run1",
+                    "hypothesisId": "H1_H3_H4",
+                    "location": "multi_scene_dataset.py:get_segment_batch:pre_pointcloud",
+                    "message": "AABB sources + seg0 basis (pre pointcloud)",
+                    "data": {
+                        "scene_id": int(scene_id),
+                        "segment_id": int(segment_id),
+                        "segment_first_frame_idx": int(segment_first_frame_idx),
+                        "segment_first_pose_source": segment_pose_source,
+                        "dataset_segment_aabb": _agent_aabb_to_lists(self.segment_aabb),
+                        "dataset_segment_input_aabb": _agent_aabb_to_lists(self.segment_input_aabb),
+                        "generator_crop_aabb": [_agent_to_list3(crop_min), _agent_to_list3(crop_max)],
+                        "generator_input_aabb": [_agent_to_list3(input_min), _agent_to_list3(input_max)],
+                        "seg0_basis_in_world": _agent_basis_world_from_seg0_pose(segment_first_pose),
+                    },
+                    "timestamp": _agent_now_ms(),
+                }
+            )
+            # #endregion
             pointcloud = self.pointcloud_generator.generate_pointcloud(
                 dataset=self,
                 scene_id=scene_id,
                 segment_id=segment_id,
                 segment_first_pose=segment_first_pose,
             )
+            # #region agent log
+            try:
+                _bg = pointcloud.get("background") if isinstance(pointcloud, dict) else None
+                _bg_xyz = (
+                    _bg[:, :3]
+                    if isinstance(_bg, np.ndarray) and _bg.ndim == 2 and _bg.shape[1] >= 3
+                    else None
+                )
+                crop_min2, crop_max2 = self.pointcloud_generator.get_crop_aabb()
+                _mn, _mx = _agent_minmax_xyz(_bg_xyz)
+                _agent_write_ndjson(
+                    {
+                        "sessionId": "cebadb",
+                        "runId": "run1",
+                        "hypothesisId": "H1_H2_H4",
+                        "location": "multi_scene_dataset.py:get_segment_batch:post_pointcloud",
+                        "message": "pointcloud background seg0 extent vs crop_aabb",
+                        "data": {
+                            "scene_id": int(scene_id),
+                            "segment_id": int(segment_id),
+                            "background_count": int(_bg_xyz.shape[0]) if _bg_xyz is not None else None,
+                            "background_seg0_min": _mn,
+                            "background_seg0_max": _mx,
+                            "generator_crop_min": _agent_to_list3(crop_min2),
+                            "generator_crop_max": _agent_to_list3(crop_max2),
+                            "crop_violation": _agent_crop_violation_counts(_bg_xyz, crop_min2, crop_max2),
+                            "pointcloud_metadata": pointcloud.get("metadata") if isinstance(pointcloud, dict) else None,
+                        },
+                        "timestamp": _agent_now_ms(),
+                    }
+                )
+            except Exception:
+                pass
+            # #endregion
         
         # 6.5. Build dynamic_info (if pointcloud contains dynamic objects)
         dynamic_info = None
@@ -1883,13 +2153,39 @@ class MultiSceneDataset:
         if include_test and len(test_extrinsics) > 0:
             test_extrinsics = _transform_extrinsics_list(test_extrinsics)
 
+        # #region agent log (first camera in seg0: axes and origin in seg0)
+        try:
+            if len(source_extrinsics) > 0:
+                cam_to_seg0 = source_extrinsics[0]
+                _agent_write_ndjson(
+                    {
+                        "sessionId": "cebadb",
+                        "runId": "run1",
+                        "hypothesisId": "H4",
+                        "location": "multi_scene_dataset.py:get_segment_batch:first_camera_in_seg0",
+                        "message": "first source camera pose in seg0: axes and origin (camera_to_seg0)",
+                        "data": {
+                            "scene_id": int(scene_id),
+                            "segment_id": int(segment_id),
+                            "first_camera_to_seg0_axes_origin": _agent_pose_axes_origin(cam_to_seg0),
+                        },
+                        "timestamp": _agent_now_ms(),
+                    }
+                )
+        except Exception:
+            pass
+        # #endregion
+
         # 8. Assemble batch
         # Get actual scene folder path for debugging
         scene_folder_name = f"{int(scene_id):03d}" if self.data_cfg.get("dataset") not in ["kitti", "nuplan"] else str(scene_id)
+        # AABB in segment-first-frame (seg0) coords; single source of truth.
+        batch_aabb = self.segment_aabb.to(device=self.device)
         batch = {
             'scene_id': torch.tensor([scene_id], dtype=torch.long),
             'scene_folder_name': scene_folder_name,  # Actual folder name (e.g., "001", "007")
             'segment_id': segment_id,
+            'aabb': batch_aabb,  # [2, 3] min/max in segment-first-frame (seg0) coords
             'segment_first_pose': segment_first_pose,  # 4x4 pose of segment first frame in original world
             'segment_first_frame_idx': segment_first_frame_idx,
             'segment_first_pose_source': segment_pose_source,
@@ -1921,6 +2217,33 @@ class MultiSceneDataset:
                 'keyframe_indices': torch.tensor(target_keyframe_indices, dtype=torch.long),  # [num_target_keyframes]
             }
         }
+
+        # #region agent log
+        try:
+            crop_min3, crop_max3 = (
+                self.pointcloud_generator.get_crop_aabb()
+                if self.pointcloud_generator is not None
+                else (None, None)
+            )
+            _agent_write_ndjson(
+                {
+                    "sessionId": "cebadb",
+                    "runId": "run1",
+                    "hypothesisId": "H1",
+                    "location": "multi_scene_dataset.py:get_segment_batch:batch_assembled",
+                    "message": "batch['aabb'] vs generator crop_aabb (assembled)",
+                    "data": {
+                        "scene_id": int(scene_id),
+                        "segment_id": int(segment_id),
+                        "batch_aabb": _agent_aabb_to_lists(batch_aabb),
+                        "generator_crop_aabb": [_agent_to_list3(crop_min3), _agent_to_list3(crop_max3)],
+                    },
+                    "timestamp": _agent_now_ms(),
+                }
+            )
+        except Exception:
+            pass
+        # #endregion
 
         # Attach sky masks if available (fill missing masks with ones to keep shapes consistent)
         if has_source_sky_mask:

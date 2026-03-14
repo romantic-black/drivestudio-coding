@@ -127,21 +127,22 @@ def main(args):
         min_keyframes_per_segment=cfg.multi_scene.min_keyframes_per_segment,
         device=device,
         preload_scene_count=cfg.multi_scene.get("preload_scene_count", 3),
-        fixed_segment_aabb=cfg.multi_scene.get("fixed_segment_aabb", None),
+        segment_aabb=cfg.multi_scene.segment_aabb,
+        segment_input_aabb=cfg.multi_scene.segment_input_aabb,
+        pointcloud_config=cfg.multi_scene.pointcloud,
     )
     logger.info(f"Dataset initialized with {len(dataset.train_scene_ids)} training scenes")
     
     # Build RGB point cloud generator
     logger.info("Building RGBPointCloudGenerator...")
-    crop_aabb = np.array(cfg.data.pointcloud.crop_aabb)
-    input_aabb = np.array(cfg.data.pointcloud.input_aabb)
+    crop_aabb = np.array(cfg.multi_scene.segment_aabb, dtype=np.float32)
+    input_aabb = np.array(cfg.multi_scene.segment_input_aabb, dtype=np.float32)
     pointcloud_generator = MonocularRGBPointCloudGenerator(
         chosen_cam_ids=cfg.data.pixel_source.cameras,
-        sparsity=cfg.data.pointcloud.get("sparsity", "full"),
-        filter_sky=cfg.data.pointcloud.get("filter_sky", True),
-        depth_consistency=cfg.data.pointcloud.get("depth_consistency", True),
-        use_bbx=cfg.data.pointcloud.get("use_bbx", True),
-        downscale=cfg.data.pointcloud.get("downscale", 2),
+        sparsity=cfg.multi_scene.pointcloud.get("sparsity", "full"),
+        filter_sky=cfg.multi_scene.pointcloud.get("filter_sky", True),
+        depth_consistency=cfg.multi_scene.pointcloud.get("depth_consistency", True),
+        downscale=cfg.multi_scene.pointcloud.get("downscale", 2),
         crop_aabb=crop_aabb,
         input_aabb=input_aabb,
         device=device,

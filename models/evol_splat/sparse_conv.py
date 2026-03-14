@@ -268,11 +268,16 @@ def construct_sparse_tensor(
             feats_tensor = feats_tensor.clone().detach().requires_grad_(True)
     feats_tensor = feats_tensor.to(device=device, dtype=torch.float32)
 
-    bbx_max = _to_numpy(Bbx_max)
-    bbx_min = _to_numpy(Bbx_min)
+    bbx_max = _to_numpy(Bbx_max).astype(np.float32)
+    bbx_min = _to_numpy(Bbx_min).astype(np.float32)
     vol_dim = ((bbx_max - bbx_min) / voxel_size).astype(int).tolist()
 
-    coords_np = coords_np - bbx_min.astype(np.int64)
+    # IMPORTANT:
+    # Use the same floating bbx_min offset for voxelization as the grid sampling path.
+    # Casting bbx_min to int (truncate-to-zero) silently changes the voxel origin when
+    # bbx_min is non-integer (e.g. -19.7 -> -19), which can misalign the dense volume
+    # coordinates and the later trilinear interpolation grid coords.
+    coords_np = coords_np.astype(np.float32) - bbx_min
     coords_np, indices = sparse_quantize(coords_np, voxel_size, return_index=True)
     coords_th = torch.as_tensor(coords_np, dtype=torch.int32, device=device)
     batch_indices = torch.zeros((coords_th.shape[0], 1), device=device, dtype=torch.int32)

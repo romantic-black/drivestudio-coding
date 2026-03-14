@@ -112,10 +112,14 @@ dataset:
   min_keyframes_per_scene: 2    
   min_keyframes_per_segment: 2  
   
-  # 【可选】全局固定段AABB，如果希望明确截取某一块空间区域
-  fixed_segment_aabb: 
-    - [-20.0, -20.0, -20.0]  # min
-    - [20.0, 4.8, 70.0]      # max
+  # Segment AABB（必需，seg0 系）
+  segment_aabb:
+    - [-20.0, -20.0, -20.0]
+    - [20.0, 4.8, 70.0]
+  # Segment input AABB（必需，seg0 系）
+  segment_input_aabb:
+    - [-20.0, -20.0, -20.0]
+    - [20.0, 4.8, 120.0]
     
   # 点云生成器配置 (为模型提供初始化与深度一致性等特征)
   pointcloud:
@@ -124,14 +128,8 @@ dataset:
     sparsity: "full"
     filter_sky: true
     depth_consistency: true
-    use_bbx: true
     downscale: 2
-    crop_aabb:
-      - [-20.0, -20.0, -20.0]
-      - [20.0, 4.8, 70.0]
-    input_aabb:
-      - [-20.0, -20.0, -20.0]
-      - [20.0, 4.8, 120.0]
+    # NOTE: crop_aabb/input_aabb 已统一到 dataset.segment_aabb/segment_input_aabb
 
 # Capture 专属参数（在工具脚本中读取）
 capture:
