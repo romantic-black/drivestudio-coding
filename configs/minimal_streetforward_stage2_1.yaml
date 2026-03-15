@@ -1,0 +1,55 @@
+# Minimal StreetForward Stage 2.1 — multi-target with proxy params
+# Same num_targets as 2.0 for comparison. Uses proxy + per-view backward + _backward_to_render_params.
+# Use with: python tools/train_minimal_streetforward_stage2_1.py --config_file configs/minimal_streetforward_stage2_1.yaml overfit_batch_path=./data/overfit_batches/scene0_seg0_batch.pt
+
+output_name: minimal_sf_stage2_1
+
+data: {}
+
+dataset:
+  segment_aabb: [[-40.0, -20.0, -20.0], [40.0, 4.8, 70.0]]
+  segment_input_aabb: [[-40.0, -20.0, -20.0], [40.0, 4.8, 70.0]]
+
+model:
+  offset_max: 0.1
+  scale_max: 0.1
+  omega_max: 0.1
+  opacity_max: 0.1
+  sh_dc_max: 0.1
+  sh_rest_max: 0.05
+  eta_means: 1.0
+  eta_scales: 1.0
+  eta_opacity: 1.0
+  eta_sh_dc: 1.0
+  eta_sh_rest: 1.0
+  sh_degree: 1
+  voxel_size: 0.2
+  sparseConv_outdim: 32
+  param_embed_dim: 32
+  offset_gru_hidden_dim: 32
+  offset_gru_use_reset_gate: true
+  update_node_state_interval: 10
+
+optimizer:
+  lr: 1.0e-3
+  eps: 1.0e-15
+  weight_decay: 0.0
+
+training:
+  max_iterations: 1000
+  log_interval: 50
+  save_checkpoint_freq: 500
+  seed: 42
+  # Number of target views per batch (same as 2.0 for comparison; override via opts)
+  num_targets: 18
+
+eval:
+  enable_psnr: true
+  metric_interval: 10
+  heavy_metric_interval: 50
+  run_test_at_end: true
+
+logging:
+  image_interval: 50
+  enable_jsonl_metrics: true
+  use_tensorboard: true

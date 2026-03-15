@@ -111,10 +111,16 @@ Head 负责从**逐点 3D 特征**直接得到 3DGS 渲染所需参数，设计�
    - 仍单 target、无 source。  
    - 验证：与 Stage 0 行为是否一致、能否 overfit。
 
-3. **Stage 2：加多 target（代理参数 + 梯度累积）**  
-   - 同一 batch 内多张 target，引入代理参数与多视角梯度累积（参考 StreetForward_Flow）。  
+2.1. **Stage 1.1：加 GRU-style 偏移量预测**  
+   - 在 Stage 1 基础上，用「特征 + 参数 embedding + GRU → offsets」替代「feat → 直接 offsets」（与 [StreetForward_Flow](StreetForward_Flow.md) §5.1.1 一致）。  
+   - 维护 h_cache_bg，step 间 detach；无 Rigid，无 mask_update_rigid。  
+   - 详见 [Minimal_StreetForward_Next_Steps_Stage1_1_GRU](Minimal_StreetForward_Next_Steps_Stage1_1_GRU.md)。
+
+3. **Stage 2：加多 target（在 Stage 1.1 基础上）**  
+   - **Stage 2.0**：仅多 target（如 3 个），同一套 render_params 多 view 渲染，loss 取均后单次 backward；无代理。  
+   - **Stage 2.1**：多 target + 代理参数与多视角梯度累积（参考 StreetForward_Flow）；与 2.0 同数据对比以保证一致性。  
    - 仍无 source、无 2D 特征。  
-   - 验证：多 target 时 loss/PSNR 是否合理。
+   - 方案讨论见 [Minimal_StreetForward_Next_Steps_Stage2_MultiTarget](Minimal_StreetForward_Next_Steps_Stage2_MultiTarget.md)。
 
 4. **Stage 3：加 source + 2D 特征（可选）**  
    - 加入 source 视图与 2D 特征提取、融合。  
