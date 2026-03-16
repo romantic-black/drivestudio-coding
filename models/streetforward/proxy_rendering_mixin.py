@@ -128,30 +128,44 @@ class ProxyRenderingMixin:
         pred_rgb: torch.Tensor,
         gt_image: torch.Tensor,
         sky_mask: Optional[torch.Tensor] = None,
+        valid_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        计算 L1 损失，可选天空区域遮挡。
-        
+        计算 L1 损失，可选点覆盖掩码与天空区域遮挡。
+
+        最终有效区域 = (valid_mask if provided else 全图) & (sky_mask if provided else 全图)。
+
         Args:
             pred_rgb: 预测的RGB图像，形状 [H, W, 3]
             gt_image: 真实图像，形状 [H, W, 3]
-            sky_mask: 天空掩码，形状 [H, W] 或 [H, W, 1]，1 表示有效区域，0 表示天空（可选）
-            
+            sky_mask: 天空掩码，形状 [H, W] 或 [H, W, 1]，1 表示有效，0 表示天空（可选）
+            valid_mask: 点覆盖掩码，形状 [H, W] 或 [H, W, 1]，1 表示参与损失（可选）
+
         Returns:
-            标量损失值：mean(|pred_rgb - gt_image|)（若提供 sky_mask，则仅在有效区域计算）
+            标量损失值：仅在有效像素上求平均
         """
         diff = torch.abs(pred_rgb - gt_image)
 
-        if sky_mask is not None:
-            mask_2d = sky_mask
+        mask_2d = None
+        if valid_mask is not None:
+            mask_2d = valid_mask.to(diff.device).float()
             if mask_2d.dim() == 3:
                 mask_2d = mask_2d.squeeze(-1)
-            mask_2d = mask_2d.to(diff.device).float()
+        if sky_mask is not None:
+            sky_2d = sky_mask.to(diff.device).float()
+            if sky_2d.dim() == 3:
+                sky_2d = sky_2d.squeeze(-1)
+            if mask_2d is not None:
+                mask_2d = mask_2d * sky_2d
+            else:
+                mask_2d = sky_2d
+
+        if mask_2d is not None:
             valid_pixels = mask_2d.sum()
             if valid_pixels > 0:
                 diff = diff * mask_2d.unsqueeze(-1)
                 return diff.sum() / (valid_pixels * diff.shape[-1])
-            # All pixels are marked sky; ignore this view for loss
+            # No valid pixels (e.g. no point projects to this view): return 0 so this view adds no gradient
             return diff.sum() * 0.0
 
         return diff.mean()
@@ -236,7 +250,15 @@ class ProxyRenderingMixin:
 
             rgb, acc = self._render_single_view(merged_params, view, height, width)
             sky_mask = target.get("sky_mask")
-            loss = self.compute_loss(rgb, gt_img, sky_mask=sky_mask) / view_count
+            point_coverage_mask = target.get("point_coverage_mask")
+            if point_coverage_mask is None:
+                raise ValueError(
+                    "target['point_coverage_mask'] is required for loss. "
+                    "Ensure batch provides point_coverage_mask and _parse_targets passes it."
+                )
+            loss = self.compute_loss(
+                rgb, gt_img, sky_mask=sky_mask, valid_mask=point_coverage_mask
+            ) / view_count
             total_loss_val += float(loss.detach())
             grad_scaler = getattr(self, "grad_scaler", None)
             if grad_scaler is not None:

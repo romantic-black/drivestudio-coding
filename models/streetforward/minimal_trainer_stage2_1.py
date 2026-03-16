@@ -12,9 +12,9 @@ import logging
 from typing import Any, Dict, List, Optional
 
 import torch
-import torch.nn.functional as F
 
 from models.streetforward.math_utils import _sh_to_rgb
+from models.streetforward.metrics import compute_l1_loss_masked
 from models.streetforward.minimal_trainer_stage2_0 import MinimalStreetForwardStage2_0
 
 logger = logging.getLogger(__name__)
@@ -105,6 +105,11 @@ class MinimalStreetForwardStage2_1(MinimalStreetForwardStage2_0):
             gt_images = []
             losses = []
             for target in targets:
+                point_coverage_mask = target.get("point_coverage_mask")
+                if point_coverage_mask is None:
+                    raise ValueError(
+                        "target['point_coverage_mask'] is required. Ensure batch provides point_coverage_mask."
+                    )
                 view = target["view"]
                 gt_image = target["gt_image"]
                 if gt_image.dim() == 4:
@@ -113,7 +118,11 @@ class MinimalStreetForwardStage2_1(MinimalStreetForwardStage2_0):
                 pred_rgb, _ = self._render_single_view(render_params, view, height, width)
                 pred_rgbs.append(pred_rgb)
                 gt_images.append(gt_image)
-                losses.append(F.l1_loss(pred_rgb, gt_image))
+                losses.append(
+                    compute_l1_loss_masked(
+                        pred_rgb, gt_image, point_coverage_mask, sky_mask=target.get("sky_mask")
+                    )
+                )
             loss = torch.stack(losses).mean()
             return {
                 "loss": loss,
@@ -137,13 +146,23 @@ class MinimalStreetForwardStage2_1(MinimalStreetForwardStage2_0):
         total_loss_val = 0.0
 
         for target in targets:
+            point_coverage_mask = target.get("point_coverage_mask")
+            if point_coverage_mask is None:
+                raise ValueError(
+                    "target['point_coverage_mask'] is required. Ensure batch provides point_coverage_mask."
+                )
             view = target["view"]
             gt_image = target["gt_image"]
             if gt_image.dim() == 4:
                 gt_image = gt_image.squeeze(0)
             height, width = gt_image.shape[0], gt_image.shape[1]
             pred_rgb, _ = self._render_single_view(params_for_render, view, height, width)
-            loss_i = F.l1_loss(pred_rgb, gt_image) / n
+            loss_i = (
+                compute_l1_loss_masked(
+                    pred_rgb, gt_image, point_coverage_mask, sky_mask=target.get("sky_mask")
+                )
+                / n
+            )
             total_loss_val += loss_i.detach().item()
             loss_i.backward()
             pred_rgbs.append(pred_rgb.detach())

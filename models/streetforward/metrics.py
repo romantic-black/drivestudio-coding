@@ -10,6 +10,32 @@ _SSIM_UNAVAILABLE = False
 _LPIPS_UNAVAILABLE = False
 
 
+def compute_l1_loss_masked(
+    pred_rgb: torch.Tensor,
+    gt_image: torch.Tensor,
+    valid_mask: torch.Tensor,
+    sky_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    L1 loss only on pixels where valid_mask (and optionally sky_mask) is non-zero.
+    Same logic as ProxyRenderingMixin.compute_loss with required valid_mask.
+    """
+    diff = torch.abs(pred_rgb - gt_image)
+    mask_2d = valid_mask.to(diff.device).float()
+    if mask_2d.dim() == 3:
+        mask_2d = mask_2d.squeeze(-1)
+    if sky_mask is not None:
+        sky_2d = sky_mask.to(diff.device).float()
+        if sky_2d.dim() == 3:
+            sky_2d = sky_2d.squeeze(-1)
+        mask_2d = mask_2d * sky_2d
+    valid_pixels = mask_2d.sum()
+    if valid_pixels > 0:
+        diff = diff * mask_2d.unsqueeze(-1)
+        return diff.sum() / (valid_pixels * diff.shape[-1])
+    return diff.sum() * 0.0
+
+
 def compute_psnr(pred: torch.Tensor, gt: torch.Tensor) -> float:
     """
     计算 PSNR（峰值信噪比）。

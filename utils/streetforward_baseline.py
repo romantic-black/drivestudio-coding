@@ -108,6 +108,11 @@ def convert_batch_to_streetforward_format(batch: Dict, device: torch.device) -> 
     dynamic_info = batch.get("dynamic_info")
 
     target_data = batch["target"]
+    if "point_coverage_mask" not in target_data:
+        raise ValueError(
+            "batch['target']['point_coverage_mask'] is required when pointcloud is in batch. "
+            "Ensure the dataset builds point coverage masks (e.g. MultiSceneDataset with pointcloud)."
+        )
     target_views = []
     gt_images = []
     targets = []
@@ -128,11 +133,19 @@ def convert_batch_to_streetforward_format(batch: Dict, device: torch.device) -> 
         gt_images.append(gt_image)
         frame_indices = target_data.get("frame_indices")
         frame_idx = int(frame_indices[i]) if frame_indices is not None else 0
+        point_coverage_mask = target_data["point_coverage_mask"][i].to(device)
+        sky_mask = (
+            target_data["sky_mask"][i].to(device)
+            if target_data.get("sky_mask") is not None
+            else None
+        )
         targets.append(
             {
                 "frame_idx": frame_idx,
                 "view": view,
                 "gt_image": gt_image,
+                "point_coverage_mask": point_coverage_mask,
+                "sky_mask": sky_mask,
             }
         )
 

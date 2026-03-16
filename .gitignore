@@ -195,3 +195,5 @@ show_dirs/
 checkpoints/
 
 outputs/
+
+data/overfit_batches/

@@ -370,6 +370,10 @@ AABB分割 (input_aabb)
 }
 ```
 
+#### 与 MultiSceneDataset / 损失掩码的衔接
+
+当点云由 **MultiSceneDataset** 在 `get_segment_batch` 中生成并放入 batch 时，数据集会使用该点云（input_aabb 内背景 + 各 target 帧下的动态点）反投影到每个 target 视角，生成 **`batch['target']['point_coverage_mask']`**（形状 `[V_t, H, W]`，1=有投影、0=无）。该掩码为**必需**：用于 StreetForward 等训练器在计算损失时仅在有初始点覆盖的像素上监督，避免拟合远景与天空等无点区域。若掩码构建失败，`get_segment_batch` 会抛出异常。详见 [MultiSceneDataset 使用文档](../dataloader/MultiSceneDataset_Usage.md) 中的 `point_coverage_mask` 说明。
+
 #### 点云数据格式
 
 | 维度 | 说明 | 范围/类型 |

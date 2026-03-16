@@ -21,6 +21,7 @@ from omegaconf import OmegaConf
 from torch import Tensor
 
 from datasets.driving_dataset import DrivingDataset
+from datasets.point_coverage_utils import build_point_coverage_masks
 from datasets.tools.trajectory_utils import split_trajectory
 
 if TYPE_CHECKING:
@@ -2273,7 +2274,28 @@ class MultiSceneDataset:
         # Add dynamic_info to batch if available
         if dynamic_info is not None:
             batch['dynamic_info'] = dynamic_info
-        
+
+        # Point coverage masks for loss: required when pointcloud is present; raise on failure
+        if pointcloud is not None and len(target_images) > 0:
+            input_min = self.segment_input_aabb_np[0]
+            input_max = self.segment_input_aabb_np[1]
+            ext_np = torch.stack(target_extrinsics, dim=0).cpu().numpy()
+            intr_np = torch.stack(target_intrinsics, dim=0).cpu().numpy()
+            shapes = [(target_images[i].shape[0], target_images[i].shape[1]) for i in range(len(target_images))]
+            mask_list = build_point_coverage_masks(
+                pointcloud=pointcloud,
+                dynamic_info=dynamic_info,
+                input_aabb_min=input_min,
+                input_aabb_max=input_max,
+                target_frame_idxs=target_frame_idxs,
+                target_extrinsics=ext_np,
+                target_intrinsics=intr_np,
+                target_shapes=shapes,
+            )
+            batch['target']['point_coverage_mask'] = torch.from_numpy(
+                np.stack(mask_list, axis=0).astype(np.float32)
+            ).to(device=self.device)
+
         # Add test views if available
         if include_test and len(test_images) > 0:
             batch['test'] = {

@@ -10,9 +10,9 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 import torch
-import torch.nn.functional as F
 
 from models.streetforward.math_utils import _sh_to_rgb
+from models.streetforward.metrics import compute_l1_loss_masked
 from models.streetforward.minimal_trainer_stage1_1 import MinimalStreetForwardStage1_1
 
 
@@ -51,13 +51,20 @@ class MinimalStreetForwardStage2_0(MinimalStreetForwardStage1_1):
         losses: List[torch.Tensor] = []
 
         for target in targets:
+            point_coverage_mask = target.get("point_coverage_mask")
+            if point_coverage_mask is None:
+                raise ValueError(
+                    "target['point_coverage_mask'] is required. Ensure batch provides point_coverage_mask."
+                )
             view = target["view"]
             gt_image = target["gt_image"]
             if gt_image.dim() == 4:
                 gt_image = gt_image.squeeze(0)
             height, width = gt_image.shape[0], gt_image.shape[1]
             pred_rgb, _ = self._render_single_view(render_params, view, height, width)
-            loss_i = F.l1_loss(pred_rgb, gt_image)
+            loss_i = compute_l1_loss_masked(
+                pred_rgb, gt_image, point_coverage_mask, sky_mask=target.get("sky_mask")
+            )
             pred_rgbs.append(pred_rgb)
             gt_images.append(gt_image)
             losses.append(loss_i)

@@ -2,7 +2,56 @@ import os
 import json
 import argparse
 import torch
+import numpy as np
 from omegaconf import OmegaConf
+
+
+def _save_mask_images(batch: dict, save_dir: str) -> None:
+    """Save each point_coverage_mask as a grayscale PNG for inspection."""
+    target = batch.get("target")
+    if target is None:
+        return
+    masks = target.get("point_coverage_mask")
+    if masks is None:
+        return
+    masks_dir = os.path.join(save_dir, "point_coverage_masks")
+    os.makedirs(masks_dir, exist_ok=True)
+    for i in range(masks.shape[0]):
+        m = masks[i]
+        if torch.is_tensor(m):
+            m = m.cpu().numpy()
+        m = (np.clip(m, 0.0, 1.0) * 255).astype(np.uint8)
+        path = os.path.join(masks_dir, f"view_{i:03d}.png")
+        try:
+            from PIL import Image
+            Image.fromarray(m, mode="L").save(path)
+        except ImportError:
+            np.save(path.replace(".png", ".npy"), m)
+    print(f"Saved {masks.shape[0]} point_coverage_mask images to {masks_dir}")
+
+
+def _save_target_images(batch: dict, save_dir: str) -> None:
+    """Save each target image as RGB PNG for comparison with point_coverage_masks."""
+    target = batch.get("target")
+    if target is None:
+        return
+    images = target.get("image")
+    if images is None:
+        return
+    images_dir = os.path.join(save_dir, "target_images")
+    os.makedirs(images_dir, exist_ok=True)
+    for i in range(images.shape[0]):
+        img = images[i]
+        if torch.is_tensor(img):
+            img = img.cpu().numpy()
+        img = (np.clip(img, 0.0, 1.0) * 255).astype(np.uint8)
+        path = os.path.join(images_dir, f"view_{i:03d}.png")
+        try:
+            from PIL import Image
+            Image.fromarray(img, mode="RGB").save(path)
+        except ImportError:
+            np.save(path.replace(".png", ".npy"), img)
+    print(f"Saved {images.shape[0]} target images to {images_dir}")
 
 
 def capture_batch(cfg, scene_id: int, segment_id: int, save_dir: str):
@@ -51,7 +100,12 @@ def capture_batch(cfg, scene_id: int, segment_id: int, save_dir: str):
     }
     with open(os.path.join(save_dir, "meta.json"), "w") as f:
         json.dump(meta_info, f, indent=4)
-        
+
+    # 5. 若有 point_coverage_mask，额外保存为图像便于查看
+    _save_mask_images(batch, save_dir)
+    # 6. 保存所有 target 图像便于与 mask 对比
+    _save_target_images(batch, save_dir)
+
     print(f"Batch successfully saved to {batch_path}")
     print(f"Metadata saved to {os.path.join(save_dir, 'meta.json')}")
     return batch_path

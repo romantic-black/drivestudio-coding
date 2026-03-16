@@ -19,6 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from omegaconf import OmegaConf
 
+from models.streetforward.metrics import compute_l1_loss_masked
 from models.streetforward.math_utils import (
     _axis_angle_to_quat,
     _num_sh_bases,
@@ -466,6 +467,11 @@ class MinimalStreetForwardStage1(nn.Module):
         if not targets:
             raise ValueError("MinimalStreetForwardStage1 requires at least one target.")
         target = targets[0]
+        point_coverage_mask = target.get("point_coverage_mask")
+        if point_coverage_mask is None:
+            raise ValueError(
+                "target['point_coverage_mask'] is required. Ensure batch provides point_coverage_mask."
+            )
         view = target["view"]
         gt_image = target["gt_image"]
         if gt_image.dim() == 4:
@@ -480,7 +486,9 @@ class MinimalStreetForwardStage1(nn.Module):
         offsets = self._predict_offsets(feat_3d_crop)
         render_params = self._render_params_from_offsets(node_state_bg, offsets)
         pred_rgb, _ = self._render_single_view(render_params, view, height, width)
-        loss = F.l1_loss(pred_rgb, gt_image)
+        loss = compute_l1_loss_masked(
+            pred_rgb, gt_image, point_coverage_mask, sky_mask=target.get("sky_mask")
+        )
 
         return {
             "loss": loss,

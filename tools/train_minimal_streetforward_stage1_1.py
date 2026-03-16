@@ -166,11 +166,20 @@ def convert_batch_to_minimal_format(
             target_views.append(view)
             gt_images.append(target_data["image"][i].to(device))
         frame_indices = target_data.get("frame_indices")
+        pcm = target_data.get("point_coverage_mask")
+        if pcm is None:
+            raise ValueError(
+                "batch['target']['point_coverage_mask'] is required. "
+                "Re-capture overfit batch with tools/overfit_one_batch.py using a dataset that provides it."
+            )
+        sky_mask = target_data.get("sky_mask")
         targets = [
             {
                 "frame_idx": int(frame_indices[i]) if frame_indices is not None else 0,
                 "view": target_views[i],
                 "gt_image": gt_images[i],
+                "point_coverage_mask": pcm[i].to(device),
+                **({"sky_mask": sky_mask[i].to(device)} if sky_mask is not None else {}),
             }
             for i in range(num_target)
         ]

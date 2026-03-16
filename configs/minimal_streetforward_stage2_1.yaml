@@ -50,6 +50,6 @@ eval:
   run_test_at_end: true
 
 logging:
-  image_interval: 50
+  image_interval: 100
   enable_jsonl_metrics: true
   use_tensorboard: true

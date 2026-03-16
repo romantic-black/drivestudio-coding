@@ -41,7 +41,7 @@ training:
   save_checkpoint_freq: 500
   seed: 42
   # Number of target views per batch (take up to this many from overfit batch; default 3)
-  num_targets: 6
+  num_targets: 18
 
 eval:
   enable_psnr: true
@@ -50,6 +50,6 @@ eval:
   run_test_at_end: true
 
 logging:
-  image_interval: 50
+  image_interval: 100
   enable_jsonl_metrics: true
   use_tensorboard: true
