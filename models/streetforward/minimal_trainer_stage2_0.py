@@ -106,6 +106,8 @@ class MinimalStreetForwardStage2_0(MinimalStreetForwardStage1_1):
             "gt_images": [g.detach() for g in out["gt_images"]],
             "pred_rgb": out["pred_rgb"].detach(),
             "gt_image": out["gt_image"].detach(),
+            "num_gaussians_bg": int(out["_node_state_bg"].means.shape[0]),
+            "num_targets": len(batch.get("targets", [])),
         }
 
 

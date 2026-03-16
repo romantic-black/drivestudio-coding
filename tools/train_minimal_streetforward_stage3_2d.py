@@ -1,12 +1,12 @@
 """
-Training script for Minimal StreetForward Stage 2.1 (multi-target with proxy).
+Training script for Minimal StreetForward Stage 3 (2D branch + bg + distant).
 
-- Same multi-target as 2.0; uses proxy params and per-view loss.backward() then
-  _backward_to_render_params. Compare with 2.0 for consistency.
-- Logs per-view and mean PSNR/SSIM/LPIPS; saves per-view pred/gt/error images.
+- Requires source_views/source_images (from first target via include_source_for_2d=True).
+- Uses 2D feature extraction and fusion; pointcloud split into bg + distant.
+- Same logging, metrics, and test-at-end as Stage 2.1.
 
 Use with overfit batch (with multiple targets):
-  python tools/train_minimal_streetforward_stage2_1.py --config_file configs/minimal_streetforward_stage2_1.yaml \\
+  python tools/train_minimal_streetforward_stage3_2d.py --config_file configs/minimal_streetforward_stage3_2d.yaml \\
     overfit_batch_path=./data/overfit_batches/scene0_seg0_batch.pt
 """
 
@@ -26,7 +26,7 @@ from pytorch_msssim import SSIM
 from torchmetrics.image import PeakSignalNoiseRatio
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
-from models.streetforward.minimal_trainer_stage2_1 import MinimalStreetForwardStage2_1
+from models.streetforward.minimal_trainer_stage3_2d import MinimalStreetForwardStage3_2d
 from utils.logging import setup_logging
 from utils.streetforward_baseline import set_deterministic_seed
 from tools.upload_to_vika import upload_experiment_summary
@@ -48,17 +48,17 @@ except ImportError:
 logger = logging.getLogger(__name__)
 current_time = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
 
-CKPT_PREFIX = "minimal_sf_stage2_1"
+CKPT_PREFIX = "minimal_sf_stage3_2d"
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train Minimal StreetForward Stage 2.1 (multi-target with proxy)"
+        description="Train Minimal StreetForward Stage 3 (2D + bg + distant)"
     )
     parser.add_argument(
         "--config_file",
         type=str,
-        default="configs/minimal_streetforward_stage2_1.yaml",
+        default="configs/minimal_streetforward_stage3_2d.yaml",
         help="Path to config YAML",
     )
     parser.add_argument("--output_root", type=str, default="outputs")
@@ -93,11 +93,17 @@ def main():
 
     raw_batch = load_batch(overfit_path)
     num_targets = cfg.training.get("num_targets", 3)
-    minimal_batch = convert_batch_to_minimal_format(raw_batch, device, num_targets=num_targets)
-    logger.info("Using num_targets=%d (batch has %d targets)", num_targets, len(minimal_batch["targets"]))
+    minimal_batch = convert_batch_to_minimal_format(
+        raw_batch, device, num_targets=num_targets, include_source_for_2d=True
+    )
+    logger.info(
+        "Using num_targets=%d (batch has %d targets), source for 2d included",
+        num_targets,
+        len(minimal_batch["targets"]),
+    )
 
-    logger.info("Building MinimalStreetForwardStage2_1...")
-    model = MinimalStreetForwardStage2_1(config=cfg, device=device)
+    logger.info("Building MinimalStreetForwardStage3_2d...")
+    model = MinimalStreetForwardStage3_2d(config=cfg, device=device)
     model.train()
 
     psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
@@ -122,7 +128,9 @@ def main():
     # Aggregated GS stats
     total_steps = 0
     sum_num_gaussians_bg = 0.0
+    sum_num_gaussians_distant = 0.0
     sum_num_targets = 0.0
+    sum_num_source_views = 0.0
     try:
         metrics_fh = _open_metrics_history(cfg.log_dir, enable_jsonl_metrics)
 
@@ -146,12 +154,15 @@ def main():
             gt_images = result["gt_images"]
             num_views = len(pred_rgbs)
 
-            # accumulate GS stats
             num_gaussians_bg = int(result.get("num_gaussians_bg", 0))
-            num_targets = int(result.get("num_targets", num_views))
+            num_gaussians_distant = int(result.get("num_gaussians_distant", 0))
+            num_targets_step = int(result.get("num_targets", num_views))
+            num_source_views_step = int(result.get("num_source_views", len(minimal_batch.get("source_views", []))))
             total_steps += 1
             sum_num_gaussians_bg += num_gaussians_bg
-            sum_num_targets += num_targets
+            sum_num_gaussians_distant += num_gaussians_distant
+            sum_num_targets += num_targets_step
+            sum_num_source_views += num_source_views_step
 
             if step % log_interval == 0:
                 logger.info("Step %s: loss=%.6f (num_views=%d)", step, loss_val, num_views)
@@ -273,7 +284,24 @@ def main():
             model.eval()
             with torch.no_grad():
                 out = model.forward(minimal_batch)
-                render_params = out["render_params"]
+                render_params_bg = out["render_params"]
+                render_params_distant = out.get("_render_params_distant")
+                if render_params_distant is not None:
+                    merged_params = {
+                        "means_r": torch.cat([render_params_bg["means_r"], render_params_distant["means_r"]]),
+                        "scales_r": torch.cat([render_params_bg["scales_r"], render_params_distant["scales_r"]]),
+                        "quats_r": torch.cat([render_params_bg["quats_r"], render_params_distant["quats_r"]]),
+                        "opacities_r": torch.cat([render_params_bg["opacities_r"], render_params_distant["opacities_r"]]),
+                        "colors_r": torch.cat([render_params_bg["colors_r"], render_params_distant["colors_r"]]),
+                    }
+                else:
+                    merged_params = {
+                        "means_r": render_params_bg["means_r"],
+                        "scales_r": render_params_bg["scales_r"],
+                        "quats_r": render_params_bg["quats_r"],
+                        "opacities_r": render_params_bg["opacities_r"],
+                        "colors_r": render_params_bg["colors_r"],
+                    }
 
                 psnr_list: List[float] = []
                 ssim_list: List[float] = []
@@ -283,7 +311,7 @@ def main():
                 test_images = minimal_batch.get("test_images", [])
                 for view, gt in zip(test_views, test_images):
                     h, w = int(gt.shape[0]), int(gt.shape[1])
-                    pred, _ = model._render_single_view(render_params, view, h, w)
+                    pred, _ = model._render_single_view(merged_params, view, h, w)
                     vals = _compute_metrics(
                         pred_rgb=pred,
                         gt_rgb=gt,
@@ -316,29 +344,32 @@ def main():
                         writer.add_scalar("test/ssim", test_metrics["ssim"], max_iterations - 1)
                         writer.add_scalar("test/lpips", test_metrics["lpips"], max_iterations - 1)
 
-                    avg_num_gaussians_bg = (
-                        sum_num_gaussians_bg / max(total_steps, 1) if total_steps > 0 else 0.0
-                    )
-                    avg_num_targets = (
-                        sum_num_targets / max(total_steps, 1) if total_steps > 0 else 0.0
-                    )
+                    metrics_final_path = os.path.join(cfg.log_dir, "metrics_final.json")
+                    denom = max(total_steps, 1)
+                    avg_num_gaussians_bg = sum_num_gaussians_bg / denom
+                    avg_num_gaussians_distant = sum_num_gaussians_distant / denom
+                    avg_num_targets = sum_num_targets / denom
+                    avg_num_source_views = sum_num_source_views / denom
                     summary = {
                         "final_step": int(max_iterations - 1),
                         "train": {"loss_l1": float(result["loss"])},
                         "test": test_metrics,
                         "gs_stats": {
                             "avg_num_gaussians_bg": avg_num_gaussians_bg,
+                            "avg_num_gaussians_distant": avg_num_gaussians_distant,
                             "avg_num_targets_per_batch": avg_num_targets,
+                            "avg_num_source_views": avg_num_source_views,
                         },
                     }
-                    metrics_final_path = os.path.join(cfg.log_dir, "metrics_final.json")
                     with open(metrics_final_path, "w", encoding="utf-8") as f:
                         json.dump(summary, f, indent=2)
                     logger.info(
-                        "Saved metrics_final.json to %s (avg_num_gaussians_bg=%.1f, avg_num_targets=%.2f)",
+                        "Saved metrics_final.json to %s (avg_bg=%.1f, avg_distant=%.1f, avg_targets=%.2f, avg_source_views=%.2f)",
                         metrics_final_path,
                         avg_num_gaussians_bg,
+                        avg_num_gaussians_distant,
                         avg_num_targets,
+                        avg_num_source_views,
                     )
                     try:
                         upload_experiment_summary(cfg.log_dir, summary)

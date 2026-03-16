@@ -124,7 +124,8 @@ Head 负责从**逐点 3D 特征**直接得到 3DGS 渲染所需参数，设计�
 
 4. **Stage 3：加 source + 2D 特征（可选）**  
    - 加入 source 视图与 2D 特征提取、融合。  
-   - 验证：与现有 StreetForward 的 2D 分支差异。
+   - 验证：与现有 StreetForward 的 2D 分支差异。  
+   - 方案讨论见 [Minimal_StreetForward_Next_Steps_Stage3_2D_Branch](Minimal_StreetForward_Next_Steps_Stage3_2D_Branch.md)。
 
 5. **Stage 4：加动态物体（Rigid/Distant）**  
    - 恢复 pointcloud 的 dynamic/distant、RigidMasks、GRU-style 等。  

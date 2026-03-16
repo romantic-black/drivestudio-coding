@@ -1,0 +1,19 @@
+vika:
+  # Whether to enable Vika upload in training scripts.
+  enabled: true
+
+  # API token configuration.
+  # Prefer reading from environment variable to avoid committing secrets.
+  token_env: "uskOAMAgxIGBcxtXQaEDJtm"
+
+  # Target datasheet id or URL for Minimal StreetForward experiments.
+  # Example: "dstt3KGCKtp11fgK0t" or "https://vika.cn/space/.../dstt3KGCKtp11fgK0t/..."
+  datasheet_id: "dstc3gehGYpDmlNrCg"
+
+  # Optional: view id to use when writing records (usually not needed for basic usage).
+  view_id: null
+
+  # Optional field mapping from local summary keys to Vika column names.
+  # If empty, keys from the summary dict are used as-is.
+  field_mapping: {}
+

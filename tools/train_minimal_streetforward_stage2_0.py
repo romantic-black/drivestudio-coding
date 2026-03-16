@@ -28,6 +28,7 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from models.streetforward.minimal_trainer_stage2_0 import MinimalStreetForwardStage2_0
 from utils.logging import setup_logging
 from utils.streetforward_baseline import set_deterministic_seed
+from tools.upload_to_vika import upload_experiment_summary
 
 from tools.train_minimal_streetforward_stage1_1 import (
     _compute_metrics,
@@ -116,6 +117,11 @@ def main():
     metrics_fh: Optional[TextIO] = None
     writer: Optional["SummaryWriter"] = None
     result: Dict[str, Any] = {}
+
+    # Aggregated GS stats
+    total_steps = 0
+    sum_num_gaussians_bg = 0.0
+    sum_num_targets = 0.0
     try:
         metrics_fh = _open_metrics_history(cfg.log_dir, enable_jsonl_metrics)
 
@@ -138,6 +144,13 @@ def main():
             pred_rgbs = result["pred_rgbs"]
             gt_images = result["gt_images"]
             num_views = len(pred_rgbs)
+
+            # accumulate GS stats
+            num_gaussians_bg = int(result.get("num_gaussians_bg", 0))
+            num_targets = int(result.get("num_targets", num_views))
+            total_steps += 1
+            sum_num_gaussians_bg += num_gaussians_bg
+            sum_num_targets += num_targets
 
             if step % log_interval == 0:
                 logger.info("Step %s: loss=%.6f (num_views=%d)", step, loss_val, num_views)
@@ -302,18 +315,34 @@ def main():
                         writer.add_scalar("test/ssim", test_metrics["ssim"], max_iterations - 1)
                         writer.add_scalar("test/lpips", test_metrics["lpips"], max_iterations - 1)
 
+                    avg_num_gaussians_bg = (
+                        sum_num_gaussians_bg / max(total_steps, 1) if total_steps > 0 else 0.0
+                    )
+                    avg_num_targets = (
+                        sum_num_targets / max(total_steps, 1) if total_steps > 0 else 0.0
+                    )
+                    summary = {
+                        "final_step": int(max_iterations - 1),
+                        "train": {"loss_l1": float(result["loss"])},
+                        "test": test_metrics,
+                        "gs_stats": {
+                            "avg_num_gaussians_bg": avg_num_gaussians_bg,
+                            "avg_num_targets_per_batch": avg_num_targets,
+                        },
+                    }
                     metrics_final_path = os.path.join(cfg.log_dir, "metrics_final.json")
                     with open(metrics_final_path, "w", encoding="utf-8") as f:
-                        json.dump(
-                            {
-                                "final_step": int(max_iterations - 1),
-                                "train": {"loss_l1": float(result["loss"])},
-                                "test": test_metrics,
-                            },
-                            f,
-                            indent=2,
-                        )
-                    logger.info("Saved metrics_final.json to %s", metrics_final_path)
+                        json.dump(summary, f, indent=2)
+                    logger.info(
+                        "Saved metrics_final.json to %s (avg_num_gaussians_bg=%.1f, avg_num_targets=%.2f)",
+                        metrics_final_path,
+                        avg_num_gaussians_bg,
+                        avg_num_targets,
+                    )
+                    try:
+                        upload_experiment_summary(cfg.log_dir, summary)
+                    except Exception:
+                        logger.exception("Vika upload failed for log_dir=%s", cfg.log_dir)
 
             if prev_mode:
                 model.train()

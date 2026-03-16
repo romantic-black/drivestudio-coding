@@ -1,12 +1,12 @@
 """
-Training script for Minimal StreetForward Stage 2.1 (multi-target with proxy).
+Training script for Minimal StreetForward Stage 2.2 (multi-target, batched multi-view render).
 
-- Same multi-target as 2.0; uses proxy params and per-view loss.backward() then
-  _backward_to_render_params. Compare with 2.0 for consistency.
+- Same as Stage 2.0 but when all targets share the same resolution, uses one gsplat
+  rasterization call for all views. loss = mean(loss_i), single backward.
 - Logs per-view and mean PSNR/SSIM/LPIPS; saves per-view pred/gt/error images.
 
 Use with overfit batch (with multiple targets):
-  python tools/train_minimal_streetforward_stage2_1.py --config_file configs/minimal_streetforward_stage2_1.yaml \\
+  python tools/train_minimal_streetforward_stage2_2.py --config_file configs/minimal_streetforward_stage2_2.yaml \\
     overfit_batch_path=./data/overfit_batches/scene0_seg0_batch.pt
 """
 
@@ -26,7 +26,7 @@ from pytorch_msssim import SSIM
 from torchmetrics.image import PeakSignalNoiseRatio
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
-from models.streetforward.minimal_trainer_stage2_1 import MinimalStreetForwardStage2_1
+from models.streetforward.minimal_trainer_stage2_2 import MinimalStreetForwardStage2_2
 from utils.logging import setup_logging
 from utils.streetforward_baseline import set_deterministic_seed
 from tools.upload_to_vika import upload_experiment_summary
@@ -48,17 +48,17 @@ except ImportError:
 logger = logging.getLogger(__name__)
 current_time = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
 
-CKPT_PREFIX = "minimal_sf_stage2_1"
+CKPT_PREFIX = "minimal_sf_stage2_2"
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train Minimal StreetForward Stage 2.1 (multi-target with proxy)"
+        description="Train Minimal StreetForward Stage 2.2 (multi-target, batched multi-view render)"
     )
     parser.add_argument(
         "--config_file",
         type=str,
-        default="configs/minimal_streetforward_stage2_1.yaml",
+        default="configs/minimal_streetforward_stage2_2.yaml",
         help="Path to config YAML",
     )
     parser.add_argument("--output_root", type=str, default="outputs")
@@ -96,8 +96,8 @@ def main():
     minimal_batch = convert_batch_to_minimal_format(raw_batch, device, num_targets=num_targets)
     logger.info("Using num_targets=%d (batch has %d targets)", num_targets, len(minimal_batch["targets"]))
 
-    logger.info("Building MinimalStreetForwardStage2_1...")
-    model = MinimalStreetForwardStage2_1(config=cfg, device=device)
+    logger.info("Building MinimalStreetForwardStage2_2...")
+    model = MinimalStreetForwardStage2_2(config=cfg, device=device)
     model.train()
 
     psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
@@ -146,7 +146,6 @@ def main():
             gt_images = result["gt_images"]
             num_views = len(pred_rgbs)
 
-            # accumulate GS stats
             num_gaussians_bg = int(result.get("num_gaussians_bg", 0))
             num_targets = int(result.get("num_targets", num_views))
             total_steps += 1

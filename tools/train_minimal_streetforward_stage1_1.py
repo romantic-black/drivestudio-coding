@@ -28,6 +28,7 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from models.streetforward.minimal_trainer_stage1_1 import MinimalStreetForwardStage1_1
 from utils.logging import setup_logging
 from utils.streetforward_baseline import set_deterministic_seed
+from tools.upload_to_vika import upload_experiment_summary
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -128,11 +129,13 @@ def convert_batch_to_minimal_format(
     batch: Dict,
     device: torch.device,
     num_targets: Optional[int] = None,
+    include_source_for_2d: bool = False,
 ) -> Dict:
     """Convert raw overfit/dataset batch to minimal format.
 
     When num_targets is None, keeps single target (targets_minimal = [targets[0]]) for Stage 1.1.
     When num_targets is set (e.g. 3), targets_minimal = targets[:num_targets]; uses all if fewer available.
+    When include_source_for_2d is True, adds source_views, source_images, source_frame_idx from the first target.
     """
     scene_id = batch.get("scene_id")
     segment_id = batch.get("segment_id")
@@ -210,7 +213,7 @@ def convert_batch_to_minimal_format(
             test_views.append(view)
             test_images.append(test_data["image"][i].to(device))
 
-    return {
+    result: Dict = {
         "scene_id": scene_id,
         "segment_id": segment_id,
         "pointcloud": pointcloud_minimal,
@@ -218,6 +221,14 @@ def convert_batch_to_minimal_format(
         "test_views": test_views,
         "test_images": test_images,
     }
+    if include_source_for_2d:
+        first = targets_minimal[0]
+        result["source_views"] = [first["view"]]
+        result["source_images"] = [
+            first["gt_image"].to(device) if first["gt_image"].device != device else first["gt_image"]
+        ]
+        result["source_frame_idx"] = int(first.get("frame_idx", 0))
+    return result
 
 
 def setup(args: argparse.Namespace):
@@ -335,6 +346,12 @@ def main():
     metrics_fh: Optional[TextIO] = None
     writer: Optional["SummaryWriter"] = None
     result: Dict[str, Any] = {}
+
+    # Step-level profiling accumulators
+    total_steps = 0
+    sum_step_time_ms = 0.0
+    peak_mem_bytes = 0
+    peak_mem_reserved_bytes = 0
     try:
         metrics_fh = _open_metrics_history(cfg.log_dir, enable_jsonl_metrics)
 
@@ -352,13 +369,34 @@ def main():
         )
 
         for step in range(max_iterations):
+            step_start_wall = time.time()
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+
             result = model.train_step(minimal_batch, step=step)
+
+            step_end_wall = time.time()
+            step_wall_time_ms = (step_end_wall - step_start_wall) * 1000.0
+            total_steps += 1
+            sum_step_time_ms += step_wall_time_ms
+            if torch.cuda.is_available():
+                step_mem = torch.cuda.max_memory_allocated()
+                step_mem_reserved = torch.cuda.max_memory_reserved()
+                if step_mem > peak_mem_bytes:
+                    peak_mem_bytes = int(step_mem)
+                if step_mem_reserved > peak_mem_reserved_bytes:
+                    peak_mem_reserved_bytes = int(step_mem_reserved)
             loss_val = float(result["loss"])
             pred_rgb = result["pred_rgb"]
             gt_image = result["gt_image"]
 
             if step % log_interval == 0:
-                logger.info("Step %s: loss=%.6f", step, loss_val)
+                logger.info(
+                    "Step %s: loss=%.6f step_time_ms=%.2f",
+                    step,
+                    loss_val,
+                    step_wall_time_ms,
+                )
 
             want_psnr = enable_psnr and (step % metric_interval == 0)
             want_heavy = heavy_metric_interval > 0 and (step % heavy_metric_interval == 0)
@@ -486,18 +524,33 @@ def main():
                         writer.add_scalar("test/ssim", test_metrics["ssim"], max_iterations - 1)
                         writer.add_scalar("test/lpips", test_metrics["lpips"], max_iterations - 1)
 
+                    avg_step_time_ms = (
+                        sum_step_time_ms / max(total_steps, 1) if total_steps > 0 else 0.0
+                    )
+                    summary = {
+                        "final_step": int(max_iterations - 1),
+                        "train": {"loss_l1": float(result["loss"])},
+                        "test": test_metrics,
+                        "profiling": {
+                            "avg_step_time_ms": avg_step_time_ms,
+                            "peak_mem_bytes": peak_mem_bytes,
+                            "peak_mem_reserved_bytes": peak_mem_reserved_bytes,
+                        },
+                    }
                     metrics_final_path = os.path.join(cfg.log_dir, "metrics_final.json")
                     with open(metrics_final_path, "w", encoding="utf-8") as f:
-                        json.dump(
-                            {
-                                "final_step": int(max_iterations - 1),
-                                "train": {"loss_l1": float(result["loss"])},
-                                "test": test_metrics,
-                            },
-                            f,
-                            indent=2,
-                        )
-                    logger.info("Saved metrics_final.json to %s", metrics_final_path)
+                        json.dump(summary, f, indent=2)
+                    logger.info(
+                        "Saved metrics_final.json to %s (avg_step_time_ms=%.2f, peak_mem_bytes=%d)",
+                        metrics_final_path,
+                        avg_step_time_ms,
+                        peak_mem_bytes,
+                    )
+                    # Try uploading summary to Vika (no-op if env or vika.py missing)
+                    try:
+                        upload_experiment_summary(cfg.log_dir, summary)
+                    except Exception:
+                        logger.exception("Vika upload failed for log_dir=%s", cfg.log_dir)
 
             if prev_mode:
                 model.train()
