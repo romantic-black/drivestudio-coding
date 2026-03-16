@@ -43,27 +43,20 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
         downsample_dynamic: bool = False,
         count_dynamic_in_max_points: bool = False,
         background_downsample_method: Literal["uniform", "density", "distance"] = "uniform",
-        # 通用参数
-        crop_aabb: Optional[np.ndarray] = None,
-        input_aabb: Optional[np.ndarray] = None,
         device: torch.device = torch.device("cpu"),
     ):
-        # 使用通用参数初始化基类
+        # 使用通用参数初始化基类（不再持有 crop_aabb/input_aabb，AABB 由上层控制）
         super().__init__(
             sparsity="full",  # 基类的sparsity不会被使用
             filter_sky=False,  # 基类的filter_sky不会被使用
             depth_consistency=False,  # 基类的depth_consistency不会被使用
             downscale=1,  # 基类的downscale不会被使用
-            crop_aabb=crop_aabb,
-            input_aabb=input_aabb,
             device=device,
         )
 
-        # 创建LiDAR生成器
+        # 创建LiDAR生成器（不再传递 crop_aabb/input_aabb；由上层使用 segment_aabb 划分近/远景）
         self.lidar_generator = LiDARRGBPointCloudGenerator(
             sparsity=lidar_sparsity,
-            crop_aabb=crop_aabb,
-            input_aabb=input_aabb,
             device=device,
         )
 
@@ -74,8 +67,6 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
             filter_sky=monocular_filter_sky,
             depth_consistency=monocular_depth_consistency,
             downscale=monocular_downscale,
-            crop_aabb=crop_aabb,
-            input_aabb=input_aabb,
             device=device,
         )
 

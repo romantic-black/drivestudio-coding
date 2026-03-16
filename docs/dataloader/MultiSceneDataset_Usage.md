@@ -238,7 +238,6 @@ batch = {
         'keyframe_indices': Tensor[num_target_keyframes],  # 关键帧索引
         'viewdirs': Tensor[V_t, H, W, 3],        # 可选，射线方向（用于 Sky 渲染）
         'sky_mask': Tensor[V_t, H, W],           # 可选，天空掩码（0=天空，1=非天空，float，用于 Sky 监督）
-        'point_coverage_mask': Tensor[V_t, H, W], # 必需（见下方），点覆盖掩码（1=有初始点投影，0=无），用于损失过滤
     },
     
     # 测试视图（可选，如果 include_test=True 且段内包含测试帧）
@@ -264,9 +263,6 @@ batch = {
 }
 ```
 
-### point_coverage_mask（必需）
-
-当 batch 中包含 `pointcloud` 时（即配置了点云生成器且生成成功），**`batch['target']['point_coverage_mask']` 必须存在**。数据集在 `get_segment_batch` 中会用初始点云（input_aabb 内背景 + 各 target 帧下的动态点）反投影到每个 target 视角，生成二值掩码 `[V_t, H, W]`（1 表示该像素有至少一个点投影，0 表示无）。用于 StreetForward 等训练器在计算损失时仅在有覆盖的像素上监督；若掩码构建失败，`get_segment_batch` 会抛出异常（不做静默回退）。
 
 ### viewdirs 与 sky_mask（可选）
 

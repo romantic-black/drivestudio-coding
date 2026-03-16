@@ -8,7 +8,6 @@ data: {}
 
 dataset:
   segment_aabb: [[-40.0, -20.0, -20.0], [40.0, 4.8, 70.0]]
-  segment_input_aabb: [[-40.0, -20.0, -20.0], [40.0, 4.8, 70.0]]
 
 model:
   offset_max: 0.1

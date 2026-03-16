@@ -24,8 +24,6 @@ class LiDARRGBPointCloudGenerator(RGBPointCloudGenerator):
     def __init__(
         self,
         sparsity: Literal["Drop90", "Drop80", "Drop50", "Drop25", "full"] = "full",
-        crop_aabb: Optional[np.ndarray] = None,
-        input_aabb: Optional[np.ndarray] = None,
         device: torch.device = torch.device("cpu"),
     ):
         super().__init__(
@@ -33,8 +31,6 @@ class LiDARRGBPointCloudGenerator(RGBPointCloudGenerator):
             filter_sky=False,
             depth_consistency=False,
             downscale=1,
-            crop_aabb=crop_aabb,
-            input_aabb=input_aabb,
             device=device,
         )
 
@@ -86,32 +82,6 @@ class LiDARRGBPointCloudGenerator(RGBPointCloudGenerator):
             colors_frame = points_world_rgb[:, 3:]
             points_world_frame = self._transform_points_np(points_world_frame, world_to_seg0)
 
-            crop_min, crop_max = self.get_crop_aabb()
-            if crop_min is None or crop_max is None:
-                raise ValueError("crop_aabb is required for lidar pointcloud generator.")
-            n_before_crop = len(points_world_frame)
-            seg0_min_before_crop = points_world_frame.min(axis=0).tolist() if n_before_crop > 0 else None
-            seg0_max_before_crop = points_world_frame.max(axis=0).tolist() if n_before_crop > 0 else None
-            points_world_frame, colors_frame = self.crop_pointcloud(
-                crop_min, crop_max, points_world_frame, colors_frame
-            )
-            n_after_crop = len(points_world_frame)
-            if not _agent_first_frame_logged:
-                _agent_first_frame_logged = True
-                # #region agent log
-                try:
-                    import json
-                    _pts = points_world_rgb[:, :3]
-                    _log = {"sessionId": "9dda96", "runId": "run1", "hypothesisId": "H1_H3_H4", "location": "lidar.py:generate_pointcloud", "message": "first frame: world vs seg0 vs crop", "data": {"frame_idx": int(frame_idx), "world_min": _pts.min(axis=0).tolist(), "world_max": _pts.max(axis=0).tolist(), "seg0_min_before_crop": seg0_min_before_crop, "seg0_max_before_crop": seg0_max_before_crop, "crop_min": list(crop_min), "crop_max": list(crop_max), "n_before_crop": n_before_crop, "n_after_crop": n_after_crop}, "timestamp": __import__("time").time() * 1000}
-                    with open("/root/drivestudio-coding/.cursor/debug-9dda96.log", "a") as _f:
-                        _f.write(json.dumps(_log, ensure_ascii=False) + "\n")
-                except Exception:
-                    pass
-                # #endregion
-
-            if len(points_world_frame) == 0:
-                continue
-
             frame_instances = frame_to_instances.get(frame_idx, [])
             background_frame, dynamic_frame = self._separate_static_dynamic(
                 points_world_frame, colors_frame, frame_instances
@@ -141,26 +111,17 @@ class LiDARRGBPointCloudGenerator(RGBPointCloudGenerator):
             if len(points_list) > 0
         }
 
-        input_min, input_max = self.get_input_aabb()
-        if input_min is None or input_max is None:
-            raise ValueError("input_aabb is required for lidar pointcloud generator.")
-        background_pts, background_colors = background[:, :3], background[:, 3:]
-        inside_pts, inside_colors, outside_pts, outside_colors = self.split_pointcloud(
-            input_min, input_max, background_pts, background_colors
-        )
-        inside_pts, inside_colors = self.filter_pointcloud(inside_pts, inside_colors, strict=True)
-        outside_pts, outside_colors = self.filter_pointcloud(outside_pts, outside_colors, strict=False)
-        background = np.concatenate(
-            [
-                np.concatenate([inside_pts, inside_colors], axis=1)
-                if len(inside_pts) > 0
-                else np.zeros((0, 6), dtype=np.float32),
-                np.concatenate([outside_pts, outside_colors], axis=1)
-                if len(outside_pts) > 0
-                else np.zeros((0, 6), dtype=np.float32),
-            ],
-            axis=0,
-        )
+        # Single-stage filtering; distant/near 划分交给上层根据 segment_aabb 完成
+        if len(background) > 0:
+            background_pts, background_colors = background[:, :3], background[:, 3:]
+            background_pts, background_colors = self.filter_pointcloud(
+                background_pts, background_colors, strict=True
+            )
+            background = (
+                np.concatenate([background_pts, background_colors], axis=1)
+                if len(background_pts) > 0
+                else np.zeros((0, 6), dtype=np.float32)
+            )
 
         metadata = {
             "type": "lidar",
@@ -396,7 +357,7 @@ class LiDARRGBPointCloudGenerator(RGBPointCloudGenerator):
         frame_indices: List[int],
         world_to_seg0: Optional[np.ndarray] = None,
     ) -> Tuple[Dict[int, int], List[List[Dict]]]:
-        # Reuse monocular logic to stay in sync
+        # Reuse monocular logic to stay in sync（不再传递 crop_aabb/input_aabb；AABB 由上层基于 segment_aabb 控制）
         from .monocular import MonocularRGBPointCloudGenerator
 
         helper = MonocularRGBPointCloudGenerator(
@@ -405,8 +366,6 @@ class LiDARRGBPointCloudGenerator(RGBPointCloudGenerator):
             filter_sky=False,
             depth_consistency=False,
             downscale=1,
-            crop_aabb=self.crop_aabb,
-            input_aabb=self.input_aabb,
             device=self.device,
         )
         return helper._get_instances_for_segment(

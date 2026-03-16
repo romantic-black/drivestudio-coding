@@ -26,8 +26,6 @@ class RGBPointCloudGenerator(ABC):
         filter_sky: bool = True,
         depth_consistency: bool = True,
         downscale: int = 2,
-        crop_aabb: Optional[np.ndarray] = None,
-        input_aabb: Optional[np.ndarray] = None,
         device: torch.device = torch.device("cpu"),
     ):
         self.sparsity = sparsity
@@ -35,13 +33,6 @@ class RGBPointCloudGenerator(ABC):
         self.depth_consistency = depth_consistency
         self.downscale = downscale
         self.device = device
-
-        self.crop_aabb = (
-            np.asarray(crop_aabb, dtype=np.float32) if crop_aabb is not None else None
-        )
-        self.input_aabb = (
-            np.asarray(input_aabb, dtype=np.float32) if input_aabb is not None else None
-        )
     
     def _convert_pose_to_numpy(self, pose) -> Optional[np.ndarray]:
         """Convert pose (torch/np/list) to 4x4 numpy array."""
@@ -128,16 +119,6 @@ class RGBPointCloudGenerator(ABC):
             segment_first_pose: Optional 4x4 pose of the segment's first frame in original world coords.
         """
         raise NotImplementedError
-
-    def get_crop_aabb(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        if self.crop_aabb is None:
-            return None, None
-        return self.crop_aabb[0].copy(), self.crop_aabb[1].copy()
-
-    def get_input_aabb(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        if self.input_aabb is None:
-            return None, None
-        return self.input_aabb[0].copy(), self.input_aabb[1].copy()
 
     def crop_pointcloud(
         self,

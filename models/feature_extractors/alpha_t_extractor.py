@@ -218,35 +218,58 @@ class AlphaTWeightExtractor:
         """
         First render pass: collect RGB only and release meta immediately.
         """
+        if not cameras:
+            return []
+
+        # Batched multi-view render when possible (one gsplat call, packed=False).
         rendered_rgbs: List[torch.Tensor] = []
         with torch.no_grad():
-            for cam in cameras:
+            cam0 = cameras[0]
+            cam0_ctw = cam0.camtoworlds if hasattr(cam0, "camtoworlds") else cam0["camtoworlds"]
+            viewmat0 = _get_viewmat(cam0_ctw)
+            k_mat0 = self._resolve_intrinsics(cam0)
+
+            viewmats_list = [viewmat0]
+            Ks_list = [k_mat0]
+            for cam in cameras[1:]:
                 cam_ctw = cam.camtoworlds if hasattr(cam, "camtoworlds") else cam["camtoworlds"]
                 viewmat = _get_viewmat(cam_ctw)
                 k_mat = self._resolve_intrinsics(cam)
-                render_colors, _, meta = self.renderer(
-                    means=gaussians["means"],
-                    quats=gaussians["quats"],
-                    scales=gaussians["scales"],
-                    opacities=gaussians["opacities"],
-                    colors=gaussians["colors"],
-                    viewmats=viewmat,
-                    Ks=k_mat,
-                    width=width,
-                    height=height,
-                    tile_size=self.tile_size,
-                    packed=True,
-                    near_plane=0.01,
-                    far_plane=1e10,
-                    render_mode="RGB",
-                    sh_degree=self.sh_degree,
-                    sparse_grad=False,
-                    absgrad=True,
-                    rasterize_mode="classic",
-                )
-                rgb = self._extract_rgb(render_colors)
+                viewmats_list.append(viewmat)
+                Ks_list.append(k_mat)
+
+            viewmats = torch.cat(viewmats_list, dim=0)
+            Ks = torch.cat(Ks_list, dim=0)
+
+            render_colors, _, _ = self.renderer(
+                means=gaussians["means"],
+                quats=gaussians["quats"],
+                scales=gaussians["scales"],
+                opacities=gaussians["opacities"],
+                colors=gaussians["colors"],
+                viewmats=viewmats,
+                Ks=Ks,
+                width=width,
+                height=height,
+                tile_size=self.tile_size,
+                packed=False,
+                near_plane=0.01,
+                far_plane=1e10,
+                render_mode="RGB",
+                sh_degree=self.sh_degree,
+                sparse_grad=False,
+                absgrad=True,
+                rasterize_mode="classic",
+            )
+
+            # render_colors shape: [C, H, W, 3] or [1, C, H, W, 3]
+            if render_colors.dim() == 5:
+                render_colors = render_colors.squeeze(0)
+            for c in range(render_colors.shape[0]):
+                rgb = render_colors[c]
+                rgb = torch.clamp(rgb, 0.0, 1.0).detach()
                 rendered_rgbs.append(rgb)
-                del meta, render_colors
+
         return rendered_rgbs
 
     def extract_single_weight(

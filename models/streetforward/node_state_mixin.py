@@ -318,16 +318,36 @@ class NodeStateMixin:
             points = points[inside_mask]
             colors = colors[inside_mask]
 
+        # Split background into near (inside segment_aabb) and distant (outside) by bbx_min/bbx_max (seg0 coords).
         crop_min = self.bbx_min.cpu().numpy()
         crop_max = self.bbx_max.cpu().numpy()
-        in_crop_mask = (
-            (points >= crop_min)
-            & (points <= crop_max)
-        ).all(axis=1)
+        in_crop_mask = ((points >= crop_min) & (points <= crop_max)).all(axis=1)
         fg_points = points[in_crop_mask]
         fg_colors = colors[in_crop_mask]
         distant_points = points[~in_crop_mask]
         distant_colors = colors[~in_crop_mask]
+
+        # Optional per-region point limits (near / distant), configured via dataset.pointcloud.
+        def _limit_region(
+            pts: np.ndarray,
+            cols: np.ndarray,
+            max_points: Optional[int],
+        ) -> Tuple[np.ndarray, np.ndarray]:
+            if max_points is None or max_points <= 0 or len(pts) <= max_points:
+                return pts, cols
+            # Fast, reproducible subsampling: stride-based selection.
+            step = max(1, len(pts) // max_points)
+            idx = np.arange(0, len(pts), step, dtype=int)
+            if len(idx) > max_points:
+                idx = idx[:max_points]
+            return pts[idx], cols[idx]
+
+        fg_points, fg_colors = _limit_region(
+            fg_points, fg_colors, getattr(self, "near_max_points", None)
+        )
+        distant_points, distant_colors = _limit_region(
+            distant_points, distant_colors, getattr(self, "distant_max_points", None)
+        )
 
         if len(fg_points) == 0:
             raise ValueError(

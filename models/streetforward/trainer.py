@@ -108,13 +108,28 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
         self.bbx_min = torch.tensor(bbx_min, dtype=torch.float32, device=device)
         self.bbx_max = torch.tensor(bbx_max, dtype=torch.float32, device=device)
 
-        if not hasattr(config.dataset, "segment_input_aabb"):
-            raise ValueError("config.dataset.segment_input_aabb is required for StreetForwardTrainer.")
-        input_aabb_cfg = config.dataset.segment_input_aabb
-        if input_aabb_cfg is None or len(input_aabb_cfg) != 2:
-            raise ValueError("config.dataset.segment_input_aabb must be [[min],[max]] with shape [2,3].")
-        self.input_aabb_min = torch.tensor(input_aabb_cfg[0], dtype=torch.float32, device=device)
-        self.input_aabb_max = torch.tensor(input_aabb_cfg[1], dtype=torch.float32, device=device)
+        # Optional per-region background point limits, read from dataset.pointcloud if present.
+        pc_cfg = getattr(config.dataset, "pointcloud", None)
+        self.near_max_points: Optional[int] = None
+        self.distant_max_points: Optional[int] = None
+        if pc_cfg is not None:
+            try:
+                # Use getattr to support both dict-like and OmegaConf nodes.
+                near_val = pc_cfg.get("near_max_points") if hasattr(pc_cfg, "get") else getattr(
+                    pc_cfg, "near_max_points", None
+                )
+            except Exception:
+                near_val = None
+            try:
+                distant_val = pc_cfg.get("distant_max_points") if hasattr(pc_cfg, "get") else getattr(
+                    pc_cfg, "distant_max_points", None
+                )
+            except Exception:
+                distant_val = None
+            if near_val is not None:
+                self.near_max_points = int(near_val)
+            if distant_val is not None:
+                self.distant_max_points = int(distant_val)
 
         # Renderer and sparse conv dependencies
         self.renderer = renderer or _gsplat_rasterization

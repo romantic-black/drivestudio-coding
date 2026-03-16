@@ -266,7 +266,6 @@ def main(args):
         device=device,
         preload_scene_count=cfg.dataset.get("preload_scene_count", 3),
         segment_aabb=cfg.dataset.segment_aabb,
-        segment_input_aabb=cfg.dataset.segment_input_aabb,
         pointcloud_config=cfg.dataset.get("pointcloud", None),  # 传递点云配置
     )
     logger.info(f"Dataset initialized with {len(dataset.train_scene_ids)} training scenes")

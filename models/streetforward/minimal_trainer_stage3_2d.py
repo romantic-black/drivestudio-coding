@@ -98,11 +98,6 @@ class MinimalStreetForwardStage3_2d(MinimalStreetForwardStage2_1):
     ):
         super().__init__(config, device, **kwargs)
         model_cfg = config.model
-        if not hasattr(config, "dataset") or not hasattr(config.dataset, "segment_input_aabb"):
-            raise ValueError("config.dataset.segment_input_aabb is required for Stage 3 (distant).")
-        seg_input = config.dataset.segment_input_aabb
-        self.input_aabb_min = torch.tensor(seg_input[0], dtype=torch.float32, device=device)
-        self.input_aabb_max = torch.tensor(seg_input[1], dtype=torch.float32, device=device)
 
         feat_2d_channels = int(model_cfg.get("feat_2d_channels", 16))
         feat_2d_downscale = int(model_cfg.get("feat_2d_downscale", 1))
@@ -178,6 +173,28 @@ class MinimalStreetForwardStage3_2d(MinimalStreetForwardStage2_1):
         self.node_states_distant: Dict[Tuple[int, int], Optional[NodeStateDistant]] = {}
         self.h_cache_distant: Dict[Tuple[int, int], torch.Tensor] = {}
 
+        # Optional per-region background point limits for minimal trainer (read from dataset.pointcloud if present).
+        pc_cfg = getattr(config.dataset, "pointcloud", None)
+        self.near_max_points: Optional[int] = None
+        self.distant_max_points: Optional[int] = None
+        if pc_cfg is not None:
+            try:
+                near_val = pc_cfg.get("near_max_points") if hasattr(pc_cfg, "get") else getattr(
+                    pc_cfg, "near_max_points", None
+                )
+            except Exception:
+                near_val = None
+            try:
+                distant_val = pc_cfg.get("distant_max_points") if hasattr(pc_cfg, "get") else getattr(
+                    pc_cfg, "distant_max_points", None
+                )
+            except Exception:
+                distant_val = None
+            if near_val is not None:
+                self.near_max_points = int(near_val)
+            if distant_val is not None:
+                self.distant_max_points = int(distant_val)
+
         self.optimizer = torch.optim.Adam(
             list(self.parameters()),
             lr=float(config.optimizer.get("lr", 1e-3)),
@@ -252,11 +269,6 @@ class MinimalStreetForwardStage3_2d(MinimalStreetForwardStage2_1):
             raise ValueError(
                 f"Empty point cloud for scene_id={scene_id}, segment_id={segment_id}."
             )
-        input_min = self.input_aabb_min.cpu().numpy()
-        input_max = self.input_aabb_max.cpu().numpy()
-        inside = ((points >= input_min) & (points <= input_max)).all(axis=1)
-        points = points[inside]
-        colors = colors[inside]
         crop_min = self.bbx_min.cpu().numpy()
         crop_max = self.bbx_max.cpu().numpy()
         in_crop = ((points >= crop_min) & (points <= crop_max)).all(axis=1)
@@ -264,6 +276,26 @@ class MinimalStreetForwardStage3_2d(MinimalStreetForwardStage2_1):
         fg_colors = colors[in_crop]
         distant_points = points[~in_crop]
         distant_colors = colors[~in_crop]
+
+        def _limit_region(
+            pts: np.ndarray,
+            cols: np.ndarray,
+            max_points: Optional[int],
+        ) -> Tuple[np.ndarray, np.ndarray]:
+            if max_points is None or max_points <= 0 or len(pts) <= max_points:
+                return pts, cols
+            step = max(1, len(pts) // max_points)
+            idx = np.arange(0, len(pts), dtype=int)[::step]
+            if len(idx) > max_points:
+                idx = idx[:max_points]
+            return pts[idx], cols[idx]
+
+        fg_points, fg_colors = _limit_region(
+            fg_points, fg_colors, self.near_max_points
+        )
+        distant_points, distant_colors = _limit_region(
+            distant_points, distant_colors, self.distant_max_points
+        )
         if len(fg_points) == 0:
             raise ValueError(
                 f"No points inside segment_aabb for scene_id={scene_id}, segment_id={segment_id}."
@@ -381,17 +413,84 @@ class MinimalStreetForwardStage3_2d(MinimalStreetForwardStage2_1):
         render_params: Dict[str, torch.Tensor],
     ) -> None:
         with torch.no_grad():
-            means_clamped = torch.clamp(
-                render_params["means_r"].detach(),
-                min=self.input_aabb_min,
-                max=self.input_aabb_max,
-            )
-            node_state_distant.means.copy_(means_clamped)
+            node_state_distant.means.copy_(render_params["means_r"].detach())
             node_state_distant.scales_log.copy_(render_params["scales_log_r"].detach())
             node_state_distant.quats.copy_(render_params["quats_r"].detach())
             node_state_distant.opacity_logit.copy_(render_params["opacity_logit_r"].detach())
             node_state_distant.sh_dc.copy_(render_params["sh_dc_r"].detach())
             node_state_distant.sh_rest.copy_(render_params["sh_rest_r"].detach())
+
+    def _render_multi_view(
+        self,
+        render_params: Dict[str, torch.Tensor],
+        targets: List[Dict],
+    ) -> Optional[List[Tuple[torch.Tensor, torch.Tensor]]]:
+        """
+        Batched multi-view render, following Stage 2.2: render all views in one gsplat call
+        when they share the same (H, W); otherwise return None to signal fallback.
+        """
+        if not targets:
+            return None
+        viewmats_list: List[torch.Tensor] = []
+        Ks_list: List[torch.Tensor] = []
+        heights: List[int] = []
+        widths: List[int] = []
+        for target in targets:
+            view = target["view"]
+            gt_image = target["gt_image"]
+            if gt_image.dim() == 4:
+                gt_image = gt_image.squeeze(0)
+            h, w = int(gt_image.shape[0]), int(gt_image.shape[1])
+            heights.append(h)
+            widths.append(w)
+            c2w = view.camtoworlds if hasattr(view, "camtoworlds") else view["camtoworlds"]
+            if c2w.dim() == 2:
+                c2w = c2w.unsqueeze(0)
+            viewmat = torch.linalg.inv(c2w)
+            if viewmat.dim() == 2:
+                viewmat = viewmat.unsqueeze(0)
+            viewmats_list.append(viewmat)
+            if hasattr(view, "Ks"):
+                k_mat = view.Ks[0:1]
+            elif hasattr(view, "K"):
+                k_mat = view.K
+            else:
+                k_mat = torch.eye(3, device=self.device).unsqueeze(0)
+            if k_mat.dim() == 2:
+                k_mat = k_mat.unsqueeze(0)
+            Ks_list.append(k_mat)
+        h0, w0 = heights[0], widths[0]
+        if any(h != h0 or w != w0 for h, w in zip(heights, widths)):
+            return None
+        viewmats = torch.cat(viewmats_list, dim=0)
+        Ks = torch.cat(Ks_list, dim=0)
+        render, alpha, _ = self.renderer(
+            means=render_params["means_r"],
+            quats=render_params["quats_r"],
+            scales=render_params["scales_r"],
+            opacities=render_params["opacities_r"],
+            colors=render_params["colors_r"],
+            viewmats=viewmats,
+            Ks=Ks,
+            width=w0,
+            height=h0,
+            tile_size=16,
+            packed=False,
+            near_plane=0.01,
+            far_plane=1e10,
+            render_mode="RGB",
+            sh_degree=self.sh_degree,
+            sparse_grad=False,
+            absgrad=True,
+            rasterize_mode="classic",
+        )
+        C = viewmats.shape[0]
+        result: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        for c in range(C):
+            rgb = render[c, ..., :3]
+            acc = alpha[c, ..., 0]
+            result.append((rgb, acc))
+        return result
 
     def forward(self, batch: Dict) -> Dict[str, Any]:
         if "pointcloud" not in batch:
@@ -476,17 +575,31 @@ class MinimalStreetForwardStage3_2d(MinimalStreetForwardStage2_1):
                     "opacities_r": render_params_bg["opacities_r"],
                     "colors_r": render_params_bg["colors_r"],
                 }
-            pred_rgbs = []
-            gt_images = []
-            for target in targets:
-                view = target["view"]
-                gt_image = target["gt_image"]
-                if gt_image.dim() == 4:
-                    gt_image = gt_image.squeeze(0)
-                h, w = gt_image.shape[0], gt_image.shape[1]
-                pred_rgb, _ = self._render_single_view(merged, view, h, w)
-                pred_rgbs.append(pred_rgb)
-                gt_images.append(gt_image)
+
+            pred_rgbs: List[torch.Tensor] = []
+            gt_images: List[torch.Tensor] = []
+
+            # Eval path: try batched multi-view render first, fallback to per-view.
+            multi_result = self._render_multi_view(merged, targets)
+            if multi_result is not None:
+                for i, target in enumerate(targets):
+                    gt_image = target["gt_image"]
+                    if gt_image.dim() == 4:
+                        gt_image = gt_image.squeeze(0)
+                    pred_rgb = multi_result[i][0]
+                    pred_rgbs.append(pred_rgb)
+                    gt_images.append(gt_image)
+            else:
+                for target in targets:
+                    view = target["view"]
+                    gt_image = target["gt_image"]
+                    if gt_image.dim() == 4:
+                        gt_image = gt_image.squeeze(0)
+                    h, w = gt_image.shape[0], gt_image.shape[1]
+                    pred_rgb, _ = self._render_single_view(merged, view, h, w)
+                    pred_rgbs.append(pred_rgb)
+                    gt_images.append(gt_image)
+
             loss = torch.tensor(0.0, device=self.device)
             return {
                 "loss": loss,
@@ -508,33 +621,48 @@ class MinimalStreetForwardStage3_2d(MinimalStreetForwardStage2_1):
         proxies_distant = _create_proxy_params(render_params_distant) if render_params_distant is not None else None
         merged_for_render = _merge_params_bg_distant(proxies_bg, proxies_distant)
 
-        pred_rgbs = []
-        gt_images = []
-        n = len(targets)
-        total_loss_val = 0.0
-        for target in targets:
-            point_coverage_mask = target.get("point_coverage_mask")
-            if point_coverage_mask is None:
-                raise ValueError("target['point_coverage_mask'] is required.")
-            view = target["view"]
-            gt_image = target["gt_image"]
-            if gt_image.dim() == 4:
-                gt_image = gt_image.squeeze(0)
-            height, width = gt_image.shape[0], gt_image.shape[1]
-            pred_rgb, _ = self._render_single_view(merged_for_render, view, height, width)
-            loss_i = (
-                compute_l1_loss_masked(
+        pred_rgbs: List[torch.Tensor] = []
+        gt_images: List[torch.Tensor] = []
+        losses: List[torch.Tensor] = []
+
+        # Training: try batched multi-view render (like Stage 2.2), fallback to per-view.
+        multi_result = self._render_multi_view(merged_for_render, targets)
+
+        if multi_result is not None:
+            for i, target in enumerate(targets):
+                point_coverage_mask = target.get("point_coverage_mask")
+                if point_coverage_mask is None:
+                    raise ValueError("target['point_coverage_mask'] is required.")
+                gt_image = target["gt_image"]
+                if gt_image.dim() == 4:
+                    gt_image = gt_image.squeeze(0)
+                pred_rgb = multi_result[i][0]
+                loss_i = compute_l1_loss_masked(
                     pred_rgb, gt_image, point_coverage_mask, sky_mask=target.get("sky_mask")
                 )
-                / n
-            )
-            total_loss_val += loss_i.detach().item()
-            loss_i.backward()
-            pred_rgbs.append(pred_rgb.detach())
-            gt_images.append(gt_image)
+                pred_rgbs.append(pred_rgb)
+                gt_images.append(gt_image)
+                losses.append(loss_i)
+        else:
+            for target in targets:
+                point_coverage_mask = target.get("point_coverage_mask")
+                if point_coverage_mask is None:
+                    raise ValueError("target['point_coverage_mask'] is required.")
+                view = target["view"]
+                gt_image = target["gt_image"]
+                if gt_image.dim() == 4:
+                    gt_image = gt_image.squeeze(0)
+                height, width = gt_image.shape[0], gt_image.shape[1]
+                pred_rgb, _ = self._render_single_view(merged_for_render, view, height, width)
+                loss_i = compute_l1_loss_masked(
+                    pred_rgb, gt_image, point_coverage_mask, sky_mask=target.get("sky_mask")
+                )
+                pred_rgbs.append(pred_rgb)
+                gt_images.append(gt_image)
+                losses.append(loss_i)
 
-        loss = torch.tensor(
-            total_loss_val, device=render_params_bg["means_r"].device, dtype=render_params_bg["means_r"].dtype
+        loss = torch.stack(losses).mean() if losses else torch.tensor(
+            0.0, device=render_params_bg["means_r"].device, dtype=render_params_bg["means_r"].dtype
         )
         return {
             "loss": loss,
@@ -557,6 +685,9 @@ class MinimalStreetForwardStage3_2d(MinimalStreetForwardStage2_1):
         self.train()
         self.optimizer.zero_grad()
         out = self.forward(batch)
+        # First backprop from scalar loss to proxy params (and other learnable params).
+        if torch.is_tensor(out.get("loss")):
+            out["loss"].backward()
         if out.get("proxies") is not None:
             _backward_to_render_params_bg(out["render_params"], out["proxies"])
         if out.get("_proxies_distant") is not None and out.get("_render_params_distant") is not None:

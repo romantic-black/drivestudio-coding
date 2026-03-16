@@ -117,7 +117,9 @@ pointcloud_generators/
 | | `monocular_filter_sky` | bool | True | 单目是否过滤天空 |
 | | `monocular_depth_consistency` | bool | True | 单目是否深度一致性检查 |
 | | `monocular_downscale` | int | 2 | 单目下采样比例 |
-| **融合参数** | `max_points` | int | 500000 | 背景点云最大点数 |
+| **融合参数** | `max_points` | int | 2000000 | 背景点云总点数预算（近景+远景），用于生成阶段的全局限制 |
+| | `near_max_points` | Optional[int] | - | 近景背景点数上限（segment_aabb 内，仅 StreetForward/MultiScene 路径使用） |
+| | `distant_max_points` | Optional[int] | - | 远景背景点数上限（segment_aabb 外，仅 StreetForward/MultiScene 路径使用） |
 | | `fusion_strategy` | Literal | "adaptive" | 融合策略：merge/lidar_first/adaptive |
 | | `dynamic_source` | Literal | "lidar_only" | 动态点来源：lidar_only/fuse |
 | | `background_downsample_method` | Literal | "uniform" | 下采样方法：uniform/density/distance |
@@ -370,9 +372,13 @@ AABB分割 (input_aabb)
 }
 ```
 
-#### 与 MultiSceneDataset / 损失掩码的衔接
+#### 与 MultiSceneDataset 的衔接
 
-当点云由 **MultiSceneDataset** 在 `get_segment_batch` 中生成并放入 batch 时，数据集会使用该点云（input_aabb 内背景 + 各 target 帧下的动态点）反投影到每个 target 视角，生成 **`batch['target']['point_coverage_mask']`**（形状 `[V_t, H, W]`，1=有投影、0=无）。该掩码为**必需**：用于 StreetForward 等训练器在计算损失时仅在有初始点覆盖的像素上监督，避免拟合远景与天空等无点区域。若掩码构建失败，`get_segment_batch` 会抛出异常。详见 [MultiSceneDataset 使用文档](../dataloader/MultiSceneDataset_Usage.md) 中的 `point_coverage_mask` 说明。
+当点云由 **MultiSceneDataset** 在 `get_segment_batch` 中生成并放入 batch 时，训练 batch 中会包含：
+
+- `batch['pointcloud']['background']`：seg0 系下的背景点云；
+- 可选的 `batch['pointcloud']['dynamic']` 与 `batch['dynamic_info']`：动态物体点云及其时序姿态信息。
+
 
 #### 点云数据格式
 

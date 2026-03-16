@@ -21,7 +21,6 @@ from omegaconf import OmegaConf
 from torch import Tensor
 
 from datasets.driving_dataset import DrivingDataset
-from datasets.point_coverage_utils import build_point_coverage_masks
 from datasets.tools.trajectory_utils import split_trajectory
 
 if TYPE_CHECKING:
@@ -248,7 +247,6 @@ class MultiSceneDataset:
         device: torch.device = torch.device("cpu"),
         preload_scene_count: int = 3,
         segment_aabb: Optional[Union[Tensor, List, np.ndarray]] = None,
-        segment_input_aabb: Optional[Union[Tensor, List, np.ndarray]] = None,
         pointcloud_config: Optional[Dict] = None,
     ):
         """
@@ -271,8 +269,6 @@ class MultiSceneDataset:
             preload_scene_count: Number of scenes to preload ahead (default 3)
             segment_aabb: Required segment AABB in segment-first-frame (seg0) coordinates.
                 Shape: [2, 3] where aabb[0] is [x_min, y_min, z_min] and aabb[1] is [x_max, y_max, z_max].
-            segment_input_aabb: Required input AABB in segment-first-frame (seg0) coordinates.
-                Used for inside/outside split and filtering. Same shape as segment_aabb.
         """
         # Store configuration
         self.data_cfg = data_cfg
@@ -304,11 +300,9 @@ class MultiSceneDataset:
         # Initialize preload scene count
         self.preload_scene_count = preload_scene_count
 
-        # Required AABBs (single source of truth; seg0 coords)
+        # Required AABB (single source of truth; seg0 coords)
         if segment_aabb is None:
             raise ValueError("dataset.segment_aabb is required (seg0 coords) and must have shape [2, 3].")
-        if segment_input_aabb is None:
-            raise ValueError("dataset.segment_input_aabb is required (seg0 coords) and must have shape [2, 3].")
 
         def _as_aabb_tensor(name: str, aabb) -> Tensor:
             if not isinstance(aabb, Tensor):
@@ -321,9 +315,7 @@ class MultiSceneDataset:
             return aabb
 
         self.segment_aabb = _as_aabb_tensor("dataset.segment_aabb", segment_aabb).to(device)
-        self.segment_input_aabb = _as_aabb_tensor("dataset.segment_input_aabb", segment_input_aabb).to(device)
         self.segment_aabb_np = self.segment_aabb.detach().cpu().numpy().astype(np.float32)
-        self.segment_input_aabb_np = self.segment_input_aabb.detach().cpu().numpy().astype(np.float32)
         
         # Initialize scene candidate pool (unvalidated scene IDs)
         self.scene_candidate_pool = train_scene_ids.copy()
@@ -395,10 +387,6 @@ class MultiSceneDataset:
             raise ValueError("dataset.pointcloud.type is required (monocular|lidar|hybrid).")
         generator_type = pointcloud_config["type"]
 
-        # AABB single source of truth: dataset.segment_aabb / dataset.segment_input_aabb
-        crop_aabb = self.segment_aabb_np
-        input_aabb = self.segment_input_aabb_np
-        
         if generator_type == "monocular":
             chosen_cam_ids = pointcloud_config.get(
                 "chosen_cam_ids",
@@ -411,8 +399,6 @@ class MultiSceneDataset:
                 filter_sky=pointcloud_config.get("filter_sky", True),
                 depth_consistency=pointcloud_config.get("depth_consistency", True),
                 downscale=pointcloud_config.get("downscale", 2),
-                crop_aabb=crop_aabb,
-                input_aabb=input_aabb,
                 device=device,
             )
         elif generator_type == "hybrid":
@@ -450,8 +436,6 @@ class MultiSceneDataset:
                 downsample_dynamic=downsample_dynamic,
                 count_dynamic_in_max_points=count_dynamic_in_max_points,
                 background_downsample_method=background_downsample_method,
-                crop_aabb=crop_aabb,
-                input_aabb=input_aabb,
                 device=device,
             )
         else:
@@ -2016,71 +2000,12 @@ class MultiSceneDataset:
         # 6. Generate point cloud (if point cloud generator exists)
         pointcloud = None
         if self.pointcloud_generator is not None:
-            crop_min, crop_max = self.pointcloud_generator.get_crop_aabb()
-            input_min, input_max = self.pointcloud_generator.get_input_aabb()
-            # #region agent log
-            _agent_write_ndjson(
-                {
-                    "sessionId": "cebadb",
-                    "runId": "run1",
-                    "hypothesisId": "H1_H3_H4",
-                    "location": "multi_scene_dataset.py:get_segment_batch:pre_pointcloud",
-                    "message": "AABB sources + seg0 basis (pre pointcloud)",
-                    "data": {
-                        "scene_id": int(scene_id),
-                        "segment_id": int(segment_id),
-                        "segment_first_frame_idx": int(segment_first_frame_idx),
-                        "segment_first_pose_source": segment_pose_source,
-                        "dataset_segment_aabb": _agent_aabb_to_lists(self.segment_aabb),
-                        "dataset_segment_input_aabb": _agent_aabb_to_lists(self.segment_input_aabb),
-                        "generator_crop_aabb": [_agent_to_list3(crop_min), _agent_to_list3(crop_max)],
-                        "generator_input_aabb": [_agent_to_list3(input_min), _agent_to_list3(input_max)],
-                        "seg0_basis_in_world": _agent_basis_world_from_seg0_pose(segment_first_pose),
-                    },
-                    "timestamp": _agent_now_ms(),
-                }
-            )
-            # #endregion
             pointcloud = self.pointcloud_generator.generate_pointcloud(
                 dataset=self,
                 scene_id=scene_id,
                 segment_id=segment_id,
                 segment_first_pose=segment_first_pose,
             )
-            # #region agent log
-            try:
-                _bg = pointcloud.get("background") if isinstance(pointcloud, dict) else None
-                _bg_xyz = (
-                    _bg[:, :3]
-                    if isinstance(_bg, np.ndarray) and _bg.ndim == 2 and _bg.shape[1] >= 3
-                    else None
-                )
-                crop_min2, crop_max2 = self.pointcloud_generator.get_crop_aabb()
-                _mn, _mx = _agent_minmax_xyz(_bg_xyz)
-                _agent_write_ndjson(
-                    {
-                        "sessionId": "cebadb",
-                        "runId": "run1",
-                        "hypothesisId": "H1_H2_H4",
-                        "location": "multi_scene_dataset.py:get_segment_batch:post_pointcloud",
-                        "message": "pointcloud background seg0 extent vs crop_aabb",
-                        "data": {
-                            "scene_id": int(scene_id),
-                            "segment_id": int(segment_id),
-                            "background_count": int(_bg_xyz.shape[0]) if _bg_xyz is not None else None,
-                            "background_seg0_min": _mn,
-                            "background_seg0_max": _mx,
-                            "generator_crop_min": _agent_to_list3(crop_min2),
-                            "generator_crop_max": _agent_to_list3(crop_max2),
-                            "crop_violation": _agent_crop_violation_counts(_bg_xyz, crop_min2, crop_max2),
-                            "pointcloud_metadata": pointcloud.get("metadata") if isinstance(pointcloud, dict) else None,
-                        },
-                        "timestamp": _agent_now_ms(),
-                    }
-                )
-            except Exception:
-                pass
-            # #endregion
         
         # 6.5. Build dynamic_info (if pointcloud contains dynamic objects)
         dynamic_info = None
@@ -2274,27 +2199,6 @@ class MultiSceneDataset:
         # Add dynamic_info to batch if available
         if dynamic_info is not None:
             batch['dynamic_info'] = dynamic_info
-
-        # Point coverage masks for loss: required when pointcloud is present; raise on failure
-        if pointcloud is not None and len(target_images) > 0:
-            input_min = self.segment_input_aabb_np[0]
-            input_max = self.segment_input_aabb_np[1]
-            ext_np = torch.stack(target_extrinsics, dim=0).cpu().numpy()
-            intr_np = torch.stack(target_intrinsics, dim=0).cpu().numpy()
-            shapes = [(target_images[i].shape[0], target_images[i].shape[1]) for i in range(len(target_images))]
-            mask_list = build_point_coverage_masks(
-                pointcloud=pointcloud,
-                dynamic_info=dynamic_info,
-                input_aabb_min=input_min,
-                input_aabb_max=input_max,
-                target_frame_idxs=target_frame_idxs,
-                target_extrinsics=ext_np,
-                target_intrinsics=intr_np,
-                target_shapes=shapes,
-            )
-            batch['target']['point_coverage_mask'] = torch.from_numpy(
-                np.stack(mask_list, axis=0).astype(np.float32)
-            ).to(device=self.device)
 
         # Add test views if available
         if include_test and len(test_images) > 0:

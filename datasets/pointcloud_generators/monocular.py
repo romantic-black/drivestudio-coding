@@ -26,8 +26,6 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
         filter_sky: bool = True,
         depth_consistency: bool = True,
         downscale: int = 2,
-        crop_aabb: Optional[np.ndarray] = None,
-        input_aabb: Optional[np.ndarray] = None,
         device: torch.device = torch.device("cpu"),
     ):
         super().__init__(
@@ -35,8 +33,6 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
             filter_sky=filter_sky,
             depth_consistency=depth_consistency,
             downscale=downscale,
-            crop_aabb=crop_aabb,
-            input_aabb=input_aabb,
             device=device,
         )
         self.chosen_cam_ids = chosen_cam_ids
@@ -138,11 +134,6 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
             colors = np.concatenate(frame_colors, axis=0)
             points_world = self._transform_points_np(points_world, world_to_seg0)
 
-            crop_min, crop_max = self.get_crop_aabb()
-            if crop_min is None or crop_max is None:
-                raise ValueError("crop_aabb is required for monocular pointcloud generator.")
-            points_world, colors = self.crop_pointcloud(crop_min, crop_max, points_world, colors)
-
             if len(points_world) == 0:
                 continue
 
@@ -164,27 +155,17 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
             for intid, points_list in all_dynamic_objects.items()
             if len(points_list) > 0
         }
-
-        input_min, input_max = self.get_input_aabb()
-        if input_min is None or input_max is None:
-            raise ValueError("input_aabb is required for monocular pointcloud generator.")
-        background_pts, background_colors = background[:, :3], background[:, 3:]
-        inside_pts, inside_colors, outside_pts, outside_colors = self.split_pointcloud(
-            input_min, input_max, background_pts, background_colors
-        )
-        inside_pts, inside_colors = self.filter_pointcloud(inside_pts, inside_colors, strict=True)
-        outside_pts, outside_colors = self.filter_pointcloud(outside_pts, outside_colors, strict=False)
-        background = np.concatenate(
-            [
-                np.concatenate([inside_pts, inside_colors], axis=1)
-                if len(inside_pts) > 0
-                else np.zeros((0, 6), dtype=np.float32),
-                np.concatenate([outside_pts, outside_colors], axis=1)
-                if len(outside_pts) > 0
-                else np.zeros((0, 6), dtype=np.float32),
-            ],
-            axis=0,
-        )
+        # Single-stage filtering without inside/outside split; distant/near划分交给上层根据 segment_aabb 完成
+        if len(background) > 0:
+            background_pts, background_colors = background[:, :3], background[:, 3:]
+            background_pts, background_colors = self.filter_pointcloud(
+                background_pts, background_colors, strict=True
+            )
+            background = (
+                np.concatenate([background_pts, background_colors], axis=1)
+                if len(background_pts) > 0
+                else np.zeros((0, 6), dtype=np.float32)
+            )
 
         metadata = {
             "type": "monocular",

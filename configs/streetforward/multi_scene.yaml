@@ -55,11 +55,8 @@ dataset:
   
   # Segment AABB (required, seg0 coords): single source of truth for
   # - batch['aabb']
-  # - pointcloud generator crop_aabb
   # - model bbx_min/bbx_max
   segment_aabb: [[-20, -20, -20], [20, 4.8, 70]]
-  # Segment input AABB (required, seg0 coords): used for inside/outside split & filtering
-  segment_input_aabb: [[-20, -20, -20], [20, 4.8, 120]]
   
   # Point cloud generator configuration (moved from data.pointcloud)
   # 坐标系约定：crop_aabb / input_aabb 均相对于 segment 第一帧，点云与外参也会转换到该坐标系
@@ -74,7 +71,10 @@ dataset:
     monocular_depth_consistency: false  # 单目是否使用深度一致性检查
     monocular_downscale: 2  # 单目下采样比例
     # 融合参数
-    max_points: 500000  # 静态背景点云最大点数（默认500K）
+    max_points: 500000  # 静态背景点云总点数预算（默认500K）
+    # 可选：基于 segment_aabb 内/外的近景/远景点数上限（仅 StreetForward/MultiScene 路径使用）
+    # near_max_points: 400000   # 近景（segment_aabb 内）背景点数上限
+    # distant_max_points: 100000  # 远景（segment_aabb 外）背景点数上限
     fusion_strategy: merge  # 融合策略：merge, lidar_first, adaptive
     dynamic_source: lidar_only  # 动态点云来源：lidar_only（推荐）或 fuse
     downsample_dynamic: false  # 动态点云是否下采样（默认False，推荐保持False）

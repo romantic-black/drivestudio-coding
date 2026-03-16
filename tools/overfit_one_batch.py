@@ -77,7 +77,6 @@ def capture_batch(cfg, scene_id: int, segment_id: int, save_dir: str):
         device=torch.device("cpu"),
         preload_scene_count=1,
         segment_aabb=cfg.dataset.segment_aabb,
-        segment_input_aabb=cfg.dataset.segment_input_aabb,
         pointcloud_config=cfg.dataset.get("pointcloud", None)
     )
     dataset.initialize()
