@@ -17,6 +17,7 @@
 4. [数据结构详解](#数据结构详解)
 5. [关键组件说明](#关键组件说明)
 6. [梯度反向传播机制](#梯度反向传播机制)
+7. [天空分支（Stage 3.1）](#天空分支stage-31)
 
 ---
 
@@ -2086,3 +2087,57 @@ StreetForwardTrainer 通过以下关键机制实现了高效的前馈式 3DGS �
 7. **内存优化：** 密集体积在使用后立即删除，避免内存累积
 
 这种设计既保证了训练效率，又实现了多视角监督的有效利用，同时支持静态背景、动态物体和背景远景的联合训练。
+
+---
+
+## 天空分支（Stage 3.1）
+
+本节将 [StreetForward_Sky_Model_Design.md](StreetForward_Sky_Model_Design.md) 的核心要点并入本文档，用于说明 **Stage 3.1（天空）** 如何与 StreetForward 的渲染与训练流程对接。
+
+### 1. 输入与数据契约（viewdirs / sky_mask）
+
+- **viewdirs**：
+  - 来源：`datasets/base/pixel_source.py:get_rays()`（MultiSceneDataset 在组 batch 时从 `image_infos['viewdirs']` 收集）。
+  - 形状：每张图像提供 `[H, W, 3]`（batch 中常为 `[V, H, W, 3]`）。
+  - 语义：世界坐标系（seg0），单位向量。
+  - **强约束**：viewdirs 必须与对应 `gt_image`/渲染分辨率一致；若分辨率不一致，应在数据侧/转换阶段用 `get_rays` 重算，而不是在 trainer 内插值 resize。
+
+- **sky_mask（可选）**：
+  - 形状：`[H, W]`（batch `[V, H, W]`）。
+  - 约定：`0=天空, 1=非天空`（float 0/1）。
+  - 用途：可用于 loss 加权（例如仅天空区域更强监督 sky）。
+
+### 2. 天空模型接口与坐标系约定
+
+- **接口**：
+  - 输入：`image_infos = {'viewdirs': viewdirs}`，其中 `viewdirs` shape 可为 `(H,W,3)` 或 batched `(B,H,W,3)`。
+  - 输出：`rgb_sky`，shape 与 viewdirs 前缀一致，RGB 建议值域 `[0,1]`（例如 sigmoid）。
+
+- **坐标系**（与 `get_rays` / MultiSceneDataset 对齐）：
+  - 世界系：`+X=右，-Y=上，+Z=前`；viewdirs 为该系单位向量。
+  - 若使用 cubemap + nvdiffrast `dr.texture`：需按 OpenGL cubemap convention 采样方向。
+    - 常用变换：`to_opengl: (x,y,z) -> (x, z, -y)`（与 EnvLight 一致），再进行 cubemap 采样。
+
+### 3. 合成公式与训练（单次 backward）
+
+Stage 3.1 的核心是把天空作为“未被高斯遮挡区域”的补全项：
+
+- 高斯渲染得到：`rgb_gaussians` 与 `opacity`（累积不透明度）
+- 天空渲染得到：`rgb_sky`（仅依赖 viewdirs）
+- 合成：
+  - `rgb_composite = rgb_gaussians + rgb_sky * (1 - opacity)`
+
+训练时对 `rgb_composite` 与 `gt_image` 计算 loss（如 L1/L2），并执行一次 `loss.backward()`，梯度同时更新：
+
+- 高斯分支（proxy → render_params → offsets → 网络参数）
+- 天空分支（sky_model 参数）
+
+### 4. 多视角（multi-view）实现建议
+
+当一次迭代包含多个 target views 时，建议将 sky 采样 **batch 化**：
+
+- stack target viewdirs 为 `(T, H, W, 3)`
+- 一次 sky forward 得到 `(T, H, W, 3)`
+- 与 `(T, H, W, 3)` 的 `pred_rgbs` / `(T, H, W)` 的 `opacity` 一次性合成
+
+这样可减少重复的 `dr.texture` launch 与 Python 循环开销。

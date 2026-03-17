@@ -1929,7 +1929,9 @@ class MultiSceneDataset:
         source_cam_idxs = []
         source_sky_masks: List[Optional[Tensor]] = []
         has_source_sky_mask = False
-        
+        source_viewdirs_list: List[Optional[Tensor]] = []
+        has_source_viewdirs = False
+
         for frame_idx in source_frame_indices:
             for cam_idx in range(num_cams):
                 img_idx = frame_idx * num_cams + cam_idx
@@ -1956,6 +1958,11 @@ class MultiSceneDataset:
                     has_source_sky_mask = True
                 source_sky_masks.append(sky_mask)
                 
+                viewdirs = image_infos.get('viewdirs')
+                if viewdirs is not None:
+                    has_source_viewdirs = True
+                source_viewdirs_list.append(viewdirs)
+                
                 source_frame_idxs.append(frame_idx)
                 source_cam_idxs.append(cam_idx)
         
@@ -1968,7 +1975,9 @@ class MultiSceneDataset:
         target_cam_idxs = []
         target_sky_masks: List[Optional[Tensor]] = []
         has_target_sky_mask = False
-        
+        target_viewdirs_list: List[Optional[Tensor]] = []
+        has_target_viewdirs = False
+
         num_target_images = len(target_frame_indices) * num_cams
         for frame_idx in target_frame_indices:
             for cam_idx in range(num_cams):
@@ -1993,6 +2002,11 @@ class MultiSceneDataset:
                 if sky_mask is not None:
                     has_target_sky_mask = True
                 target_sky_masks.append(sky_mask)
+                
+                viewdirs = image_infos.get('viewdirs')
+                if viewdirs is not None:
+                    has_target_viewdirs = True
+                target_viewdirs_list.append(viewdirs)
                 
                 target_frame_idxs.append(frame_idx)
                 target_cam_idxs.append(cam_idx)
@@ -2182,6 +2196,16 @@ class MultiSceneDataset:
                     source_sky_mask_stack.append(mask.to(self.device).float())
             batch['source']['sky_mask'] = torch.stack(source_sky_mask_stack, dim=0)
 
+        if has_source_viewdirs:
+            source_viewdirs_stack = []
+            for vd, img in zip(source_viewdirs_list, source_images):
+                if vd is None:
+                    H, W = img.shape[:2]
+                    source_viewdirs_stack.append(torch.zeros((H, W, 3), dtype=torch.float32, device=self.device))
+                else:
+                    source_viewdirs_stack.append(vd.to(self.device).float())
+            batch['source']['viewdirs'] = torch.stack(source_viewdirs_stack, dim=0)
+
         if has_target_sky_mask:
             target_sky_mask_stack = []
             for mask, img in zip(target_sky_masks, target_images):
@@ -2191,6 +2215,17 @@ class MultiSceneDataset:
                 else:
                     target_sky_mask_stack.append(mask.to(self.device).float())
             batch['target']['sky_mask'] = torch.stack(target_sky_mask_stack, dim=0)
+
+        # Target viewdirs (for sky / Stage 3.1): from pixel_source.get_image() image_infos['viewdirs']
+        if has_target_viewdirs:
+            target_viewdirs_stack = []
+            for vd, img in zip(target_viewdirs_list, target_images):
+                if vd is None:
+                    H, W = img.shape[:2]
+                    target_viewdirs_stack.append(torch.zeros((H, W, 3), dtype=torch.float32, device=self.device))
+                else:
+                    target_viewdirs_stack.append(vd.to(self.device).float())
+            batch['target']['viewdirs'] = torch.stack(target_viewdirs_stack, dim=0)
         
         # Add pointcloud to batch if generated
         if pointcloud is not None:

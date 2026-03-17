@@ -250,14 +250,8 @@ class ProxyRenderingMixin:
 
             rgb, acc = self._render_single_view(merged_params, view, height, width)
             sky_mask = target.get("sky_mask")
-            point_coverage_mask = target.get("point_coverage_mask")
-            if point_coverage_mask is None:
-                raise ValueError(
-                    "target['point_coverage_mask'] is required for loss. "
-                    "Ensure batch provides point_coverage_mask and _parse_targets passes it."
-                )
             loss = self.compute_loss(
-                rgb, gt_img, sky_mask=sky_mask, valid_mask=point_coverage_mask
+                rgb, gt_img, sky_mask=sky_mask, valid_mask=None
             ) / view_count
             total_loss_val += float(loss.detach())
             grad_scaler = getattr(self, "grad_scaler", None)

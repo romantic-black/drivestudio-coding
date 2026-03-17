@@ -158,9 +158,13 @@ def convert_batch_to_minimal_format(
         raise ValueError("batch must contain 'target' or 'targets'")
 
     if isinstance(target_data, dict):
+        from datasets.base.pixel_source import get_rays
+
         num_target = target_data["image"].shape[0]
         target_views = []
         gt_images = []
+        viewdirs_list: List[Optional[torch.Tensor]] = [None] * num_target
+        target_viewdirs = target_data.get("viewdirs")
         for i in range(num_target):
             view = type("View", (), {
                 "camtoworlds": target_data["extrinsics"][i].to(device),
@@ -168,21 +172,34 @@ def convert_batch_to_minimal_format(
             })()
             target_views.append(view)
             gt_images.append(target_data["image"][i].to(device))
+            if target_viewdirs is not None:
+                viewdirs_list[i] = target_viewdirs[i].to(device)
+            else:
+                gt = target_data["image"][i]
+                h, w = int(gt.shape[0]), int(gt.shape[1])
+                c2w = target_data["extrinsics"][i]
+                intrinsic = target_data["intrinsics"][i][:3, :3]
+                if c2w.dim() == 2:
+                    c2w = c2w.unsqueeze(0)
+                if intrinsic.dim() == 2:
+                    intrinsic = intrinsic.unsqueeze(0)
+                y_coords = torch.arange(h, device=device, dtype=torch.float32)
+                x_coords = torch.arange(w, device=device, dtype=torch.float32)
+                x_grid, y_grid = torch.meshgrid(x_coords, y_coords, indexing="xy")
+                _, viewdirs, _ = get_rays(
+                    x_grid.flatten(), y_grid.flatten(),
+                    c2w.to(device), intrinsic.to(device),
+                )
+                viewdirs_list[i] = viewdirs.reshape(h, w, 3)
         frame_indices = target_data.get("frame_indices")
-        pcm = target_data.get("point_coverage_mask")
-        if pcm is None:
-            raise ValueError(
-                "batch['target']['point_coverage_mask'] is required. "
-                "Re-capture overfit batch with tools/overfit_one_batch.py using a dataset that provides it."
-            )
         sky_mask = target_data.get("sky_mask")
         targets = [
             {
                 "frame_idx": int(frame_indices[i]) if frame_indices is not None else 0,
                 "view": target_views[i],
                 "gt_image": gt_images[i],
-                "point_coverage_mask": pcm[i].to(device),
                 **({"sky_mask": sky_mask[i].to(device)} if sky_mask is not None else {}),
+                **({"viewdirs": viewdirs_list[i]} if viewdirs_list[i] is not None else {}),
             }
             for i in range(num_target)
         ]

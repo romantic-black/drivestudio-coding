@@ -266,12 +266,18 @@ batch = {
 
 ### viewdirs 与 sky_mask（可选）
 
-当底层 `pixel_source` 支持时（如配置 `load_sky_mask: true`），batch 的 `target`、`source`、`test` 中会包含：
+当底层 `pixel_source.get_image()` 返回的 `image_infos` 中包含对应键时，MultiSceneDataset 会在组装 batch 时收集并填入：
 
-- **viewdirs**：射线方向，形状 `[V, H, W, 3]`，用于 Sky 等视角相关渲染
-- **sky_mask**：天空掩码，形状 `[V, H, W]`，来自 `pixel_source` 时为 float 0/1（0=天空，1=非天空），用于 Sky 区域监督
+- **viewdirs**：射线方向，形状 `[V, H, W, 3]`，来自 `image_infos['viewdirs']`（与 `get_rays` 约定一致，世界系单位向量）。用于 Sky 渲染等。**Stage 3.1（天空）要求 target 提供 viewdirs**，需使用会返回 `viewdirs` 的 pixel_source（如 `datasets/base/pixel_source.py` 中实现）。
+- **sky_mask**：天空掩码，形状 `[V, H, W]`，来自 `image_infos['sky_masks']`，float 0/1（0=天空，1=非天空），用于 Sky 区域监督。
 
-这些字段由 `pixel_source.get_image()` 返回的 `image_infos` 提供；若 `get_image` 未返回对应键，则 batch 中不包含该字段，Trainer 可退化为在内部从 extrinsics/intrinsics 计算 viewdirs。
+若某张图像的 `get_image()` 未返回 `viewdirs` 或 `sky_masks`，该视角在 stack 时以占位（viewdirs 为零向量、sky_mask 为 1）保持形状一致。使用 Stage 3.1 时请确保 pixel_source 为所有 target 图像提供 viewdirs。
+
+**Stage 3.1 contract（强约束）**：
+
+- `target['viewdirs']` 必须与 `target['image']` / `target['gt_image']` **同分辨率**（相同的 H/W）。
+- `viewdirs[...,3]` 必须是 **单位向量**（与 `get_rays()` 一致）。
+- `MinimalStreetForwardStage3_1` 在 trainer 侧会对分辨率不一致 **直接报错**（不再在 trainer 内插值 resize viewdirs）。如需兼容旧缓存 batch，应在 batch 转换阶段用 `get_rays()` 在目标分辨率重算并写入。
 
 ### 数据维度说明
 

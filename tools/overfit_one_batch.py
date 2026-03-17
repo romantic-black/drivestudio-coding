@@ -7,31 +7,13 @@ from omegaconf import OmegaConf
 
 
 def _save_mask_images(batch: dict, save_dir: str) -> None:
-    """Save each point_coverage_mask as a grayscale PNG for inspection."""
-    target = batch.get("target")
-    if target is None:
-        return
-    masks = target.get("point_coverage_mask")
-    if masks is None:
-        return
-    masks_dir = os.path.join(save_dir, "point_coverage_masks")
-    os.makedirs(masks_dir, exist_ok=True)
-    for i in range(masks.shape[0]):
-        m = masks[i]
-        if torch.is_tensor(m):
-            m = m.cpu().numpy()
-        m = (np.clip(m, 0.0, 1.0) * 255).astype(np.uint8)
-        path = os.path.join(masks_dir, f"view_{i:03d}.png")
-        try:
-            from PIL import Image
-            Image.fromarray(m, mode="L").save(path)
-        except ImportError:
-            np.save(path.replace(".png", ".npy"), m)
-    print(f"Saved {masks.shape[0]} point_coverage_mask images to {masks_dir}")
+    raise RuntimeError(
+        "Point-coverage mask has been removed from the codebase; mask dumping is no longer supported."
+    )
 
 
 def _save_target_images(batch: dict, save_dir: str) -> None:
-    """Save each target image as RGB PNG for comparison with point_coverage_masks."""
+    """Save each target image as RGB PNG for inspection."""
     target = batch.get("target")
     if target is None:
         return
@@ -100,9 +82,7 @@ def capture_batch(cfg, scene_id: int, segment_id: int, save_dir: str):
     with open(os.path.join(save_dir, "meta.json"), "w") as f:
         json.dump(meta_info, f, indent=4)
 
-    # 5. 若有 point_coverage_mask，额外保存为图像便于查看
-    _save_mask_images(batch, save_dir)
-    # 6. 保存所有 target 图像便于与 mask 对比
+    # 5. 保存所有 target 图像便于查看
     _save_target_images(batch, save_dir)
 
     print(f"Batch successfully saved to {batch_path}")

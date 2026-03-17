@@ -849,26 +849,19 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
 
     def _parse_targets(self, batch: Dict) -> List[Dict]:
         """
-        统一解析 target 视角。当 batch 含 pointcloud 时，每个 target 必须提供 point_coverage_mask。
+        统一解析 target 视角。
         """
         targets: List[Dict] = []
         has_pointcloud = "pointcloud" in batch and batch["pointcloud"] is not None
 
         if "targets" in batch:
             for target in batch["targets"]:
-                pm = target.get("point_coverage_mask")
-                if has_pointcloud and pm is None:
-                    raise ValueError(
-                        "point_coverage_mask is required on each target when batch contains pointcloud. "
-                        "Ensure the dataset provides batch['target']['point_coverage_mask'] and the adapter passes it."
-                    )
                 targets.append(
                     {
                         "frame_idx": target.get("frame_idx", batch.get("source_frame_idx", 0)),
                         "view": target["view"],
                         "gt_image": target["gt_image"],
                         "sky_mask": target.get("sky_mask"),
-                        "point_coverage_mask": pm,
                     }
                 )
         else:
@@ -880,13 +873,7 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
             elif "target" in batch:
                 sky_masks = batch["target"].get("sky_mask")
             target_data = batch.get("target")
-            point_coverage_masks = target_data.get("point_coverage_mask") if target_data else None
             target_frame_indices = target_data.get("frame_indices") if target_data else None
-            if has_pointcloud and (point_coverage_masks is None or len(point_coverage_masks) == 0):
-                raise ValueError(
-                    "batch['target']['point_coverage_mask'] is required when batch contains pointcloud. "
-                    "Ensure the dataset builds point coverage masks."
-                )
 
             for idx, (view, gt_img) in enumerate(zip(target_views, gt_images)):
                 sky_mask = None
@@ -895,18 +882,12 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
                 frame_idx = batch.get("source_frame_idx", 0)
                 if target_frame_indices is not None and idx < len(target_frame_indices):
                     frame_idx = int(target_frame_indices[idx])
-                point_coverage_mask = point_coverage_masks[idx] if idx < len(point_coverage_masks) else None
-                if has_pointcloud and point_coverage_mask is None:
-                    raise ValueError(
-                        f"point_coverage_mask is missing for target index {idx} (batch has pointcloud)."
-                    )
                 targets.append(
                     {
                         "frame_idx": frame_idx,
                         "view": view,
                         "gt_image": gt_img,
                         "sky_mask": sky_mask,
-                        "point_coverage_mask": point_coverage_mask,
                     }
                 )
         return targets

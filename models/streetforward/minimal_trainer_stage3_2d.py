@@ -10,6 +10,8 @@ See docs/trainers/Minimal_StreetForward_Next_Steps_Stage3_2D_Branch.md and the p
 from __future__ import annotations
 
 import logging
+import json
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -61,7 +63,7 @@ def _backward_to_render_params_distant(
     render_params_distant: Dict[str, torch.Tensor],
     proxies_distant: Dict[str, torch.Tensor],
 ) -> None:
-    """Push proxy gradients to render_params_distant."""
+    """Push proxy gradients to render_params_distant (kept for API compatibility)."""
 
     def _grad_or_zero(t: torch.Tensor) -> torch.Tensor:
         g = t.grad
@@ -81,6 +83,56 @@ def _backward_to_render_params_distant(
         _grad_or_zero(proxies_distant["opacities_p"]),
         _grad_or_zero(proxies_distant["colors_p"]),
     ]
+    torch.autograd.backward(tensors=render_tensors, grad_tensors=grad_tensors)
+
+
+def _backward_to_render_params_bg_distant(
+    render_params_bg: Dict[str, torch.Tensor],
+    proxies_bg: Dict[str, torch.Tensor],
+    render_params_distant: Optional[Dict[str, torch.Tensor]],
+    proxies_distant: Optional[Dict[str, torch.Tensor]],
+) -> None:
+    """Single autograd.backward from proxies (bg + distant) to corresponding render params."""
+
+    def _grad_or_zero(t: torch.Tensor) -> torch.Tensor:
+        g = t.grad
+        return g if g is not None else torch.zeros_like(t)
+
+    render_tensors = [
+        render_params_bg["means_r"],
+        render_params_bg["scales_r"],
+        render_params_bg["quats_r"],
+        render_params_bg["opacities_r"],
+        render_params_bg["colors_r"],
+    ]
+    grad_tensors = [
+        _grad_or_zero(proxies_bg["means_p"]),
+        _grad_or_zero(proxies_bg["scales_p"]),
+        _grad_or_zero(proxies_bg["quats_p"]),
+        _grad_or_zero(proxies_bg["opacities_p"]),
+        _grad_or_zero(proxies_bg["colors_p"]),
+    ]
+
+    if render_params_distant is not None and proxies_distant is not None:
+        render_tensors.extend(
+            [
+                render_params_distant["means_r"],
+                render_params_distant["scales_r"],
+                render_params_distant["quats_r"],
+                render_params_distant["opacities_r"],
+                render_params_distant["colors_r"],
+            ]
+        )
+        grad_tensors.extend(
+            [
+                _grad_or_zero(proxies_distant["means_p"]),
+                _grad_or_zero(proxies_distant["scales_p"]),
+                _grad_or_zero(proxies_distant["quats_p"]),
+                _grad_or_zero(proxies_distant["opacities_p"]),
+                _grad_or_zero(proxies_distant["colors_p"]),
+            ]
+        )
+
     torch.autograd.backward(tensors=render_tensors, grad_tensors=grad_tensors)
 
 
@@ -630,24 +682,18 @@ class MinimalStreetForwardStage3_2d(MinimalStreetForwardStage2_1):
 
         if multi_result is not None:
             for i, target in enumerate(targets):
-                point_coverage_mask = target.get("point_coverage_mask")
-                if point_coverage_mask is None:
-                    raise ValueError("target['point_coverage_mask'] is required.")
                 gt_image = target["gt_image"]
                 if gt_image.dim() == 4:
                     gt_image = gt_image.squeeze(0)
                 pred_rgb = multi_result[i][0]
                 loss_i = compute_l1_loss_masked(
-                    pred_rgb, gt_image, point_coverage_mask, sky_mask=target.get("sky_mask")
+                    pred_rgb, gt_image, None, sky_mask=target.get("sky_mask")
                 )
                 pred_rgbs.append(pred_rgb)
                 gt_images.append(gt_image)
                 losses.append(loss_i)
         else:
             for target in targets:
-                point_coverage_mask = target.get("point_coverage_mask")
-                if point_coverage_mask is None:
-                    raise ValueError("target['point_coverage_mask'] is required.")
                 view = target["view"]
                 gt_image = target["gt_image"]
                 if gt_image.dim() == 4:
@@ -655,7 +701,7 @@ class MinimalStreetForwardStage3_2d(MinimalStreetForwardStage2_1):
                 height, width = gt_image.shape[0], gt_image.shape[1]
                 pred_rgb, _ = self._render_single_view(merged_for_render, view, height, width)
                 loss_i = compute_l1_loss_masked(
-                    pred_rgb, gt_image, point_coverage_mask, sky_mask=target.get("sky_mask")
+                    pred_rgb, gt_image, None, sky_mask=target.get("sky_mask")
                 )
                 pred_rgbs.append(pred_rgb)
                 gt_images.append(gt_image)
@@ -685,13 +731,59 @@ class MinimalStreetForwardStage3_2d(MinimalStreetForwardStage2_1):
         self.train()
         self.optimizer.zero_grad()
         out = self.forward(batch)
+        # region agent log
+        try:
+            log_payload = {
+                "sessionId": "45949f",
+                "runId": "pre-fix",
+                "hypothesisId": "H1",
+                "location": "minimal_trainer_stage3_2d.py:680",
+                "message": "train_step forward output summary",
+                "data": {
+                    "has_loss": bool(torch.is_tensor(out.get("loss"))),
+                    "has_proxies_bg": out.get("proxies") is not None,
+                    "has_render_params_bg": out.get("render_params") is not None,
+                    "has_proxies_distant": out.get("_proxies_distant") is not None,
+                    "has_render_params_distant": out.get("_render_params_distant") is not None,
+                },
+                "timestamp": int(time.time() * 1000),
+            }
+            with open("/root/drivestudio-coding/.cursor/debug-45949f.log", "a") as _f:
+                _f.write(json.dumps(log_payload) + "\n")
+        except Exception:
+            pass
+        # endregion agent log
         # First backprop from scalar loss to proxy params (and other learnable params).
         if torch.is_tensor(out.get("loss")):
             out["loss"].backward()
+        # region agent log
+        try:
+            log_payload = {
+                "sessionId": "45949f",
+                "runId": "pre-fix",
+                "hypothesisId": "H1",
+                "location": "minimal_trainer_stage3_2d.py:685",
+                "message": "before proxy backward calls",
+                "data": {
+                    "has_proxies_bg": out.get("proxies") is not None,
+                    "has_render_params_bg": out.get("render_params") is not None,
+                    "has_proxies_distant": out.get("_proxies_distant") is not None,
+                    "has_render_params_distant": out.get("_render_params_distant") is not None,
+                },
+                "timestamp": int(time.time() * 1000),
+            }
+            with open("/root/drivestudio-coding/.cursor/debug-45949f.log", "a") as _f:
+                _f.write(json.dumps(log_payload) + "\n")
+        except Exception:
+            pass
+        # endregion agent log
         if out.get("proxies") is not None:
-            _backward_to_render_params_bg(out["render_params"], out["proxies"])
-        if out.get("_proxies_distant") is not None and out.get("_render_params_distant") is not None:
-            _backward_to_render_params_distant(out["_render_params_distant"], out["_proxies_distant"])
+            _backward_to_render_params_bg_distant(
+                out["render_params"],
+                out["proxies"],
+                out.get("_render_params_distant"),
+                out.get("_proxies_distant"),
+            )
         self.optimizer.step()
         if "_h_new_bg" in out and "_cache_key" in out:
             self.h_cache_bg[out["_cache_key"]] = out["_h_new_bg"].detach()

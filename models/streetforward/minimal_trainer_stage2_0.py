@@ -51,11 +51,6 @@ class MinimalStreetForwardStage2_0(MinimalStreetForwardStage1_1):
         losses: List[torch.Tensor] = []
 
         for target in targets:
-            point_coverage_mask = target.get("point_coverage_mask")
-            if point_coverage_mask is None:
-                raise ValueError(
-                    "target['point_coverage_mask'] is required. Ensure batch provides point_coverage_mask."
-                )
             view = target["view"]
             gt_image = target["gt_image"]
             if gt_image.dim() == 4:
@@ -63,7 +58,7 @@ class MinimalStreetForwardStage2_0(MinimalStreetForwardStage1_1):
             height, width = gt_image.shape[0], gt_image.shape[1]
             pred_rgb, _ = self._render_single_view(render_params, view, height, width)
             loss_i = compute_l1_loss_masked(
-                pred_rgb, gt_image, point_coverage_mask, sky_mask=target.get("sky_mask")
+                pred_rgb, gt_image, None, sky_mask=target.get("sky_mask")
             )
             pred_rgbs.append(pred_rgb)
             gt_images.append(gt_image)

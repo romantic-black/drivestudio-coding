@@ -13,26 +13,42 @@ _LPIPS_UNAVAILABLE = False
 def compute_l1_loss_masked(
     pred_rgb: torch.Tensor,
     gt_image: torch.Tensor,
-    valid_mask: torch.Tensor,
+    valid_mask: Optional[torch.Tensor] = None,
     sky_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
-    L1 loss only on pixels where valid_mask (and optionally sky_mask) is non-zero.
-    Same logic as ProxyRenderingMixin.compute_loss with required valid_mask.
+    L1 损失，支持可选的 valid_mask 和 sky_mask。
+
+    - 若 valid_mask 和 sky_mask 均为 None，则在全图上计算 mean L1。
+    - 若只提供 valid_mask，则只在 valid_mask>0 的像素上计算。
+    - 若只提供 sky_mask，则只在 sky_mask>0 的像素上计算。
+    - 若二者都提供，则在二者相乘后的区域上计算。
     """
     diff = torch.abs(pred_rgb - gt_image)
-    mask_2d = valid_mask.to(diff.device).float()
-    if mask_2d.dim() == 3:
-        mask_2d = mask_2d.squeeze(-1)
+
+    mask_2d = None
+    if valid_mask is not None:
+        mask_2d = valid_mask.to(diff.device).float()
+        if mask_2d.dim() == 3:
+            mask_2d = mask_2d.squeeze(-1)
     if sky_mask is not None:
         sky_2d = sky_mask.to(diff.device).float()
         if sky_2d.dim() == 3:
             sky_2d = sky_2d.squeeze(-1)
-        mask_2d = mask_2d * sky_2d
+        if mask_2d is not None:
+            mask_2d = mask_2d * sky_2d
+        else:
+            mask_2d = sky_2d
+
+    if mask_2d is None:
+        # 无任何掩码，退化为全图 L1
+        return diff.mean()
+
     valid_pixels = mask_2d.sum()
     if valid_pixels > 0:
         diff = diff * mask_2d.unsqueeze(-1)
         return diff.sum() / (valid_pixels * diff.shape[-1])
+    # 没有有效像素（例如无点投影到该视角），返回 0，避免破坏整体梯度
     return diff.sum() * 0.0
 
 

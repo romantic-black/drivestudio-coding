@@ -626,11 +626,6 @@ class MinimalStreetForwardStage1_1(nn.Module):
         if not targets:
             raise ValueError("MinimalStreetForwardStage1_1 requires at least one target.")
         target = targets[0]
-        point_coverage_mask = target.get("point_coverage_mask")
-        if point_coverage_mask is None:
-            raise ValueError(
-                "target['point_coverage_mask'] is required. Ensure batch provides point_coverage_mask."
-            )
         view = target["view"]
         gt_image = target["gt_image"]
         if gt_image.dim() == 4:
@@ -651,7 +646,7 @@ class MinimalStreetForwardStage1_1(nn.Module):
         render_params = self._render_params_from_offsets(node_state_bg, offsets)
         pred_rgb, _ = self._render_single_view(render_params, view, height, width)
         loss = compute_l1_loss_masked(
-            pred_rgb, gt_image, point_coverage_mask, sky_mask=target.get("sky_mask")
+            pred_rgb, gt_image, None, sky_mask=target.get("sky_mask")
         )
 
         return {
