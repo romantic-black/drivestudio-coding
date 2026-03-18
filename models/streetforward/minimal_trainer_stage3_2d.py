@@ -332,14 +332,14 @@ class MinimalStreetForwardStage3_2d(MinimalStreetForwardStage2_1):
         def _limit_region(
             pts: np.ndarray,
             cols: np.ndarray,
-            max_points: Optional[int],
+            max_count: Optional[int],
         ) -> Tuple[np.ndarray, np.ndarray]:
-            if max_points is None or max_points <= 0 or len(pts) <= max_points:
+            if max_count is None or max_count <= 0 or len(pts) <= max_count:
                 return pts, cols
-            step = max(1, len(pts) // max_points)
+            step = max(1, len(pts) // max_count)
             idx = np.arange(0, len(pts), dtype=int)[::step]
-            if len(idx) > max_points:
-                idx = idx[:max_points]
+            if len(idx) > max_count:
+                idx = idx[:max_count]
             return pts[idx], cols[idx]
 
         fg_points, fg_colors = _limit_region(
@@ -798,6 +798,12 @@ class MinimalStreetForwardStage3_2d(MinimalStreetForwardStage2_1):
                 self._update_node_state_bg(out["_node_state_bg"], out["render_params"])
             if out.get("_node_state_distant") is not None and out.get("_render_params_distant") is not None:
                 self._update_node_state_distant(out["_node_state_distant"], out["_render_params_distant"])
+            if (
+                self.reset_node_state_interval > 0
+                and step is not None
+                and step % self.reset_node_state_interval == 0
+            ):
+                self.reset_node_state()
         num_gaussians_bg = int(out["_node_state_bg"].means.shape[0])
         node_state_distant = out.get("_node_state_distant")
         num_gaussians_distant = (

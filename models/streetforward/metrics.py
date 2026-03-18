@@ -10,6 +10,67 @@ _SSIM_UNAVAILABLE = False
 _LPIPS_UNAVAILABLE = False
 
 
+def compute_ssim_loss_masked(
+    pred_rgb: torch.Tensor,
+    gt_image: torch.Tensor,
+    valid_mask: Optional[torch.Tensor] = None,
+    sky_mask: Optional[torch.Tensor] = None,
+    *,
+    data_range: float = 1.0,
+) -> torch.Tensor:
+    """
+    SSIM loss (1 - SSIM)，支持可选的 valid_mask 和 sky_mask。
+
+    注意：SSIM 是局部窗口指标，严格的“只在 mask 区域计算”实现较复杂。
+    这里采用一种稳定、可微且简单的做法：对 mask 外像素，将 pred 替换为 gt，
+    使得无效区域对 SSIM 的贡献趋近于“完美匹配”（不惩罚、不引入梯度噪声）。
+    """
+    try:
+        from pytorch_msssim import ssim
+    except ImportError as e:
+        # 训练用 loss，缺依赖应直接失败（fast-fail）。
+        raise ImportError(
+            "pytorch_msssim is required for SSIM loss. Please install it in the training environment."
+        ) from e
+
+    if pred_rgb.dim() != 3 or gt_image.dim() != 3 or pred_rgb.shape[-1] != 3 or gt_image.shape[-1] != 3:
+        raise ValueError(
+            f"pred_rgb/gt_image must have shape [H, W, 3], got pred={tuple(pred_rgb.shape)} gt={tuple(gt_image.shape)}"
+        )
+    if pred_rgb.shape[0] != gt_image.shape[0] or pred_rgb.shape[1] != gt_image.shape[1]:
+        raise ValueError(
+            f"pred_rgb/gt_image spatial shapes must match, got pred={tuple(pred_rgb.shape)} gt={tuple(gt_image.shape)}"
+        )
+
+    mask_2d: Optional[torch.Tensor] = None
+    if valid_mask is not None:
+        mask_2d = valid_mask.to(pred_rgb.device).float()
+        if mask_2d.dim() == 3:
+            mask_2d = mask_2d.squeeze(-1)
+    if sky_mask is not None:
+        sky_2d = sky_mask.to(pred_rgb.device).float()
+        if sky_2d.dim() == 3:
+            sky_2d = sky_2d.squeeze(-1)
+        mask_2d = (mask_2d * sky_2d) if mask_2d is not None else sky_2d
+
+    pred_in = pred_rgb
+    gt_in = gt_image
+    if mask_2d is not None:
+        if mask_2d.dim() != 2:
+            raise ValueError(f"mask must have shape [H, W] (or [H, W, 1]), got {tuple(mask_2d.shape)}")
+        if mask_2d.shape[0] != pred_rgb.shape[0] or mask_2d.shape[1] != pred_rgb.shape[1]:
+            raise ValueError(
+                f"mask spatial shape must match image, got mask={tuple(mask_2d.shape)} image={tuple(pred_rgb.shape)}"
+            )
+        m = mask_2d.clamp(0.0, 1.0).unsqueeze(-1)
+        pred_in = pred_rgb * m + gt_image * (1.0 - m)
+
+    pred_4d = pred_in.permute(2, 0, 1).unsqueeze(0)
+    gt_4d = gt_in.permute(2, 0, 1).unsqueeze(0)
+    ssim_val = ssim(pred_4d, gt_4d, data_range=float(data_range), size_average=True)
+    return (1.0 - ssim_val)
+
+
 def compute_l1_loss_masked(
     pred_rgb: torch.Tensor,
     gt_image: torch.Tensor,

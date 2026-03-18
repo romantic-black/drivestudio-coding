@@ -127,6 +127,9 @@ class MinimalStreetForwardStage1(nn.Module):
 
         # Update NodeState every N steps; 0 = never, 1 = every step
         self.update_node_state_interval = int(model_cfg.get("update_node_state_interval", 0))
+        # Reset cached NodeState every N steps (executed together with update_node_state_interval gate).
+        # Default: 10 (useful for controlled experiments / fast-fail).
+        self.reset_node_state_interval = int(model_cfg.get("reset_node_state_interval", 10))
 
         self.sh_degree = int(model_cfg.get("sh_degree", 1))
         self.voxel_size = float(model_cfg.get("voxel_size", 0.1))
@@ -508,6 +511,12 @@ class MinimalStreetForwardStage1(nn.Module):
             and "_node_state_bg" in out
         ):
             self._update_node_state_bg(out["_node_state_bg"], out["render_params"])
+            if (
+                self.reset_node_state_interval > 0
+                and step is not None
+                and step % self.reset_node_state_interval == 0
+            ):
+                self.reset_node_state()
         return {
             "loss": loss.item(),
             "pred_rgb": out["pred_rgb"].detach(),

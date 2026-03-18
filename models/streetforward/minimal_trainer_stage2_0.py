@@ -95,6 +95,12 @@ class MinimalStreetForwardStage2_0(MinimalStreetForwardStage1_1):
             and "_node_state_bg" in out
         ):
             self._update_node_state_bg(out["_node_state_bg"], out["render_params"])
+            if (
+                self.reset_node_state_interval > 0
+                and step is not None
+                and step % self.reset_node_state_interval == 0
+            ):
+                self.reset_node_state()
         return {
             "loss": loss.item(),
             "pred_rgbs": [p.detach() for p in out["pred_rgbs"]],

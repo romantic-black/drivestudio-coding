@@ -31,7 +31,7 @@ pointcloud_generators/
 | **统计过滤** | ✅ | ✅ | ✅ | ✅ |
 | **动态对象分离** | ✅ | ✅ | ✅ | ✅ |
 | **融合策略** | - | - | - | merge/lidar_first/adaptive |
-| **点数限制** | - | - | - | ✅ (max_points) |
+| **点数限制** | - | - | - | ❌ |
 
 ## 核心类详解
 
@@ -117,8 +117,7 @@ pointcloud_generators/
 | | `monocular_filter_sky` | bool | True | 单目是否过滤天空 |
 | | `monocular_depth_consistency` | bool | True | 单目是否深度一致性检查 |
 | | `monocular_downscale` | int | 2 | 单目下采样比例 |
-| **融合参数** | `max_points` | int | 2000000 | 背景点云总点数预算（近景+远景），用于生成阶段的全局限制 |
-| | `near_max_points` | Optional[int] | - | 近景背景点数上限（segment_aabb 内，仅 StreetForward/MultiScene 路径使用） |
+| **融合参数** | `near_max_points` | Optional[int] | - | 近景背景点数上限（segment_aabb 内，仅 StreetForward/MultiScene 路径使用） |
 | | `distant_max_points` | Optional[int] | - | 远景背景点数上限（segment_aabb 外，仅 StreetForward/MultiScene 路径使用） |
 | | `fusion_strategy` | Literal | "adaptive" | 融合策略：merge/lidar_first/adaptive |
 | | `dynamic_source` | Literal | "lidar_only" | 动态点来源：lidar_only/fuse |
@@ -130,8 +129,6 @@ pointcloud_generators/
 |------|------|
 | `_fuse_background_points` | 融合背景点云（按策略） |
 | `_fuse_dynamic_objects` | 融合动态对象点云 |
-| `_limit_point_count` | 限制点云数量（多种下采样方法） |
-| `_select_complementary_points` | 选择补充点（用于adaptive策略） |
 
 ## 生成流程
 
@@ -223,7 +220,7 @@ pointcloud_generators/
    │  ├─ merge: 简单合并
    │  ├─ lidar_first: 优先保留所有LiDAR点
    │  └─ adaptive: LiDAR优先，单目补充稀疏区域
-   └─ 应用点数限制（下采样到max_points）
+   └─ 返回全量背景点云（不在生成阶段做点数截断）
    ↓
 4. 融合动态对象点云
    ├─ dynamic_source="lidar_only": 仅使用LiDAR
@@ -413,7 +410,6 @@ AABB分割 (input_aabb)
 | `fused_background_count` | int | 融合后背景点数（仅hybrid） |
 | `dynamic_count` | int | 动态点总数（仅hybrid） |
 | `fusion_strategy` | str | 融合策略（仅hybrid） |
-| `max_points` | int | 最大点数（仅hybrid） |
 
 ### 中间数据
 
@@ -476,8 +472,7 @@ AABB分割 (input_aabb)
 
 - **LiDAR优先**：LiDAR点云更稳定，优先保留
 - **单目补充**：单目点云补充细节和稀疏区域
-- **点数控制**：通过max_points限制背景点云大小，避免内存问题
-- **动态点独立**：动态点默认不计入max_points，保持对象完整性
+- **点数控制**：在训练初始化阶段通过 `near_max_points` / `distant_max_points` 控制近/远景点数
 
 ## 依赖项
 
@@ -513,9 +508,7 @@ AABB分割 (input_aabb)
    - 内部点使用严格过滤，外部点使用宽松过滤
 
 6. **内存管理**：
-   - 混合生成器通过max_points限制背景点云大小
-   - 动态点默认不计入max_points限制
-   - 大量帧时注意内存使用
+   - 背景点云不在生成阶段截断；大量帧/多相机时注意内存使用
 
 7. **错误处理**：
    - 混合生成器在单个生成器失败时会fallback到另一个

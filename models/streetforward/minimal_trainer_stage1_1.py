@@ -131,6 +131,7 @@ class MinimalStreetForwardStage1_1(nn.Module):
         self.eta_sh_rest = float(model_cfg.get("eta_sh_rest", 1.0))
 
         self.update_node_state_interval = int(model_cfg.get("update_node_state_interval", 0))
+        self.reset_node_state_interval = int(model_cfg.get("reset_node_state_interval", 10))
 
         self.sh_degree = int(model_cfg.get("sh_degree", 1))
         self.voxel_size = float(model_cfg.get("voxel_size", 0.1))
@@ -676,6 +677,12 @@ class MinimalStreetForwardStage1_1(nn.Module):
             and "_node_state_bg" in out
         ):
             self._update_node_state_bg(out["_node_state_bg"], out["render_params"])
+            if (
+                self.reset_node_state_interval > 0
+                and step is not None
+                and step % self.reset_node_state_interval == 0
+            ):
+                self.reset_node_state()
         return {
             "loss": loss.item(),
             "pred_rgb": out["pred_rgb"].detach(),

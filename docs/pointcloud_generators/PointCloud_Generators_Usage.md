@@ -112,7 +112,7 @@ pointcloud_config = {
 **适用场景**：
 - 同时有LiDAR和深度图数据
 - 需要平衡点云密度和质量
-- 需要控制点云大小（通过 `max_points`）
+- 需要在训练侧控制近/远景初始化点数（通过 `near_max_points` / `distant_max_points`）
 
 **配置示例**：
 
@@ -128,11 +128,9 @@ pointcloud_config = {
     'monocular_depth_consistency': True,
     'monocular_downscale': 2,
     # 融合参数
-    'max_points': 500000,                    # 背景点云最大点数
     'fusion_strategy': 'adaptive',           # 融合策略：merge/lidar_first/adaptive
     'dynamic_source': 'lidar_only',          # 动态点来源：lidar_only/fuse
     'downsample_dynamic': False,             # 是否对动态点云下采样
-    'count_dynamic_in_max_points': False,    # 动态点是否计入max_points
     'background_downsample_method': 'uniform',  # 下采样方法：uniform/density/distance
     # 通用参数
     'crop_aabb': [[-20, -20, -20], [20, 4.8, 70]],
@@ -171,11 +169,9 @@ pointcloud_config = {
 | | `monocular_filter_sky` | bool | True | 单目是否过滤天空 |
 | | `monocular_depth_consistency` | bool | True | 单目是否深度一致性检查 |
 | | `monocular_downscale` | int | 2 | 单目下采样比例 |
-| **融合参数** | `max_points` | int | 500000 | 背景点云最大点数 |
-| | `fusion_strategy` | Literal | "adaptive" | 融合策略：merge/lidar_first/adaptive |
+| **融合参数** | `fusion_strategy` | Literal | "adaptive" | 融合策略：merge/lidar_first/adaptive |
 | | `dynamic_source` | Literal | "lidar_only" | 动态点来源：lidar_only/fuse |
 | | `downsample_dynamic` | bool | False | 是否对动态点云下采样 |
-| | `count_dynamic_in_max_points` | bool | False | 动态点是否计入max_points |
 | | `background_downsample_method` | Literal | "uniform" | 下采样方法：uniform/density/distance |
 
 ---
@@ -201,7 +197,6 @@ pointcloud_config = {
 **特点**：
 - 保留所有LiDAR点和单目点
 - 点云密度最大
-- 可能超过 `max_points` 限制
 
 **适用场景**：需要最大点云密度
 
@@ -210,9 +205,8 @@ pointcloud_config = {
 优先保留所有LiDAR点，剩余配额分配给单目点。
 
 **特点**：
-- 优先保留所有LiDAR点（如果不超过预算）
-- 剩余配额分配给单目点
-- 确保不超过 `max_points` 限制
+- 优先保留所有LiDAR点
+- 单目点补充细节
 
 **适用场景**：LiDAR质量高，单目补充细节
 
@@ -327,7 +321,6 @@ metadata = {
     "fused_background_count": int,             # 融合后背景点数
     "dynamic_count": int,                        # 动态点总数
     "fusion_strategy": str,                     # 融合策略
-    "max_points": int,                          # 最大点数
 }
 ```
 
@@ -415,11 +408,9 @@ pointcloud_config = {
     'monocular_depth_consistency': True,
     'monocular_downscale': 2,
     # 融合参数
-    'max_points': 500000,
     'fusion_strategy': 'adaptive',
     'dynamic_source': 'lidar_only',
     'downsample_dynamic': False,
-    'count_dynamic_in_max_points': False,
     'background_downsample_method': 'uniform',
     # 通用参数
     'crop_aabb': [[-20, -20, -20], [20, 4.8, 70]],
@@ -523,11 +514,9 @@ data:
     monocular_depth_consistency: true
     monocular_downscale: 2
     # 融合参数
-    max_points: 500000
     fusion_strategy: adaptive
     dynamic_source: lidar_only
     downsample_dynamic: false
-    count_dynamic_in_max_points: false
     background_downsample_method: uniform
     # AABB配置
     crop_aabb: [[-20, -20, -20], [20, 4.8, 70]]
@@ -603,9 +592,8 @@ data:
 
 ### 6. 内存管理
 
-- 混合生成器通过 `max_points` 限制背景点云大小
-- 动态点默认不计入 `max_points` 限制
-- 大量帧时注意内存使用
+- 背景点云规模由数据本身决定；训练侧可通过 `near_max_points` / `distant_max_points` 控制初始化点数
+- 大量帧/多相机时注意内存使用
 
 ### 7. 错误处理
 
@@ -632,15 +620,9 @@ A:
 ### Q: 如何控制点云大小？
 
 A: 
-- 使用混合生成器的 `max_points` 参数
+- 使用 `near_max_points` / `distant_max_points` 控制近/远景初始化点数
 - 调整 `sparsity` 参数减少使用的帧数
 - 调整 `downscale` 参数（单目生成器）
-
-### Q: 动态点云是否计入 max_points？
-
-A: 
-- 默认不计入（`count_dynamic_in_max_points=False`）
-- 如果需要计入，设置 `count_dynamic_in_max_points=True`
 
 ### Q: 如何选择融合策略？
 

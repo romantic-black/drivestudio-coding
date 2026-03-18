@@ -331,15 +331,15 @@ class NodeStateMixin:
         def _limit_region(
             pts: np.ndarray,
             cols: np.ndarray,
-            max_points: Optional[int],
+            max_count: Optional[int],
         ) -> Tuple[np.ndarray, np.ndarray]:
-            if max_points is None or max_points <= 0 or len(pts) <= max_points:
+            if max_count is None or max_count <= 0 or len(pts) <= max_count:
                 return pts, cols
             # Fast, reproducible subsampling: stride-based selection.
-            step = max(1, len(pts) // max_points)
+            step = max(1, len(pts) // max_count)
             idx = np.arange(0, len(pts), step, dtype=int)
-            if len(idx) > max_points:
-                idx = idx[:max_points]
+            if len(idx) > max_count:
+                idx = idx[:max_count]
             return pts[idx], cols[idx]
 
         fg_points, fg_colors = _limit_region(

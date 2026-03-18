@@ -71,14 +71,12 @@ dataset:
     monocular_depth_consistency: false  # 单目是否使用深度一致性检查
     monocular_downscale: 2  # 单目下采样比例
     # 融合参数
-    max_points: 500000  # 静态背景点云总点数预算（默认500K）
     # 可选：基于 segment_aabb 内/外的近景/远景点数上限（仅 StreetForward/MultiScene 路径使用）
     # near_max_points: 400000   # 近景（segment_aabb 内）背景点数上限
     # distant_max_points: 100000  # 远景（segment_aabb 外）背景点数上限
     fusion_strategy: merge  # 融合策略：merge, lidar_first, adaptive
     dynamic_source: lidar_only  # 动态点云来源：lidar_only（推荐）或 fuse
     downsample_dynamic: false  # 动态点云是否下采样（默认False，推荐保持False）
-    count_dynamic_in_max_points: false  # 动态点是否计入max_points（默认False）
     background_downsample_method: uniform  # 背景点云下采样方法：uniform, density, distance
     # NOTE: crop_aabb/input_aabb have been unified into dataset.segment_aabb/segment_input_aabb
     # and are no longer configured here.

@@ -96,15 +96,15 @@
             90
         ],
         "source_keyframes": [
-            76
+            70
         ],
         "target_keyframes": [
-            76,
-            5,
-            25,
-            74,
-            49,
-            20
+            70,
+            61,
+            32,
+            47,
+            80,
+            34
         ]
     },
     "has_pointcloud": true,

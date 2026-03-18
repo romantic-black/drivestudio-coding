@@ -192,6 +192,12 @@ class MinimalStreetForwardStage2_1(MinimalStreetForwardStage2_0):
             and "_node_state_bg" in out
         ):
             self._update_node_state_bg(out["_node_state_bg"], out["render_params"])
+            if (
+                self.reset_node_state_interval > 0
+                and step is not None
+                and step % self.reset_node_state_interval == 0
+            ):
+                self.reset_node_state()
         return {
             "loss": out["loss"].item() if torch.is_tensor(out["loss"]) else out["loss"],
             "pred_rgbs": out["pred_rgbs"],

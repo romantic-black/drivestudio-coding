@@ -1,14 +1,12 @@
-# Minimal StreetForward Stage 2.2 — multi-target, batched multi-view render
-# Same as Stage 2.0; when all targets share same resolution, one gsplat call for all views.
-# Use with: python tools/train_minimal_streetforward_stage2_2.py --config_file configs/minimal_streetforward_stage2_2.yaml overfit_batch_path=./data/overfit_batches/scene0_seg0_batch.pt
+# Minimal StreetForward Stage 3.2: Stage 3.1 + SSIM loss
+# Use with: python tools/train_minimal_streetforward_stage3_2.py --config_file configs/minimal_streetforward_stage3_2.yaml overfit_batch_path=./data/overfit_batches/scene0_seg0_batch.pt
 
-output_name: minimal_sf_stage2_2
+output_name: minimal_sf_stage3_2
 
 data: {}
 
 dataset:
   segment_aabb: [[-40.0, -20.0, -20.0], [40.0, 4.8, 70.0]]
-  segment_input_aabb: [[-40.0, -20.0, -20.0], [40.0, 4.8, 70.0]]
 
 model:
   offset_max: 0.1
@@ -25,11 +23,27 @@ model:
   sh_degree: 1
   voxel_size: 0.2
   sparseConv_outdim: 32
-  param_embed_dim: 32
-  offset_gru_hidden_dim: 32
+  feat_2d_channels: 32
+  feat_2d_downscale: 1
+  param_embed_dim: 48
+  offset_gru_hidden_dim: 48
   offset_gru_use_reset_gate: true
   update_node_state_interval: 1
   reset_node_state_interval: 10
+  sky:
+    resolution: 1024
+    init_value: 0.5
+
+losses:
+  rgb:
+    w: 0.8
+  ssim:
+    w: 0.2
+  mask:
+    w: 0.05
+    opacity_loss_type: bce  # choose from [bce, safe_bce]
+  opacity_entropy:
+    w: 0.0
 
 optimizer:
   lr: 1.0e-3
@@ -37,12 +51,11 @@ optimizer:
   weight_decay: 0.0
 
 training:
-  max_iterations: 1000
+  max_iterations: 4000
   log_interval: 50
   save_checkpoint_freq: 500
   seed: 42
-  # Number of target views per batch (take up to this many from overfit batch; default 3)
-  num_targets: 18
+  num_targets: 6
 
 eval:
   enable_psnr: true
@@ -51,6 +64,7 @@ eval:
   run_test_at_end: true
 
 logging:
-  image_interval: 100
+  image_interval: 500
   enable_jsonl_metrics: true
   use_tensorboard: true
+

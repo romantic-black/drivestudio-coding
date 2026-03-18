@@ -225,6 +225,7 @@ batch = {
         'keyframe_indices': Tensor[num_source_keyframes],  # 关键帧索引
         'viewdirs': Tensor[V_s, H, W, 3],        # 可选，射线方向
         'sky_mask': Tensor[V_s, H, W],           # 可选，天空掩码
+        'egocar_mask': Tensor[V_s, H, W],        # 可选，自车mask（1=需要忽略的自车区域，0=有效区域）
     },
     
     # Target 数据
@@ -238,6 +239,7 @@ batch = {
         'keyframe_indices': Tensor[num_target_keyframes],  # 关键帧索引
         'viewdirs': Tensor[V_t, H, W, 3],        # 可选，射线方向（用于 Sky 渲染）
         'sky_mask': Tensor[V_t, H, W],           # 可选，天空掩码（0=天空，1=非天空，float，用于 Sky 监督）
+        'egocar_mask': Tensor[V_t, H, W],        # 可选，自车mask（1=需要忽略的自车区域，0=有效区域）
     },
     
     # 测试视图（可选，如果 include_test=True 且段内包含测试帧）
@@ -250,6 +252,7 @@ batch = {
         'cam_indices': Tensor[num_test_images],
         'viewdirs': Tensor[num_test_images, H, W, 3],   # 可选
         'sky_mask': Tensor[num_test_images, H, W],      # 可选
+        'egocar_mask': Tensor[num_test_images, H, W],   # 可选
     },
     
     # 点云数据（配置了点云生成器时必有）

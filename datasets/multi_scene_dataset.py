@@ -416,12 +416,9 @@ class MultiSceneDataset:
             monocular_downscale = pointcloud_config.get("monocular_downscale", 2)
             
             # 融合参数
-            max_points = pointcloud_config.get("max_points", 500000)
             fusion_strategy = pointcloud_config.get("fusion_strategy", "adaptive")
             dynamic_source = pointcloud_config.get("dynamic_source", "lidar_only")
             downsample_dynamic = pointcloud_config.get("downsample_dynamic", False)
-            count_dynamic_in_max_points = pointcloud_config.get("count_dynamic_in_max_points", False)
-            background_downsample_method = pointcloud_config.get("background_downsample_method", "uniform")
             
             return HybridRGBPointCloudGenerator(
                 lidar_sparsity=lidar_sparsity,
@@ -430,12 +427,9 @@ class MultiSceneDataset:
                 monocular_filter_sky=monocular_filter_sky,
                 monocular_depth_consistency=monocular_depth_consistency,
                 monocular_downscale=monocular_downscale,
-                max_points=max_points,
                 fusion_strategy=fusion_strategy,
                 dynamic_source=dynamic_source,
                 downsample_dynamic=downsample_dynamic,
-                count_dynamic_in_max_points=count_dynamic_in_max_points,
-                background_downsample_method=background_downsample_method,
                 device=device,
             )
         else:
@@ -1931,6 +1925,8 @@ class MultiSceneDataset:
         has_source_sky_mask = False
         source_viewdirs_list: List[Optional[Tensor]] = []
         has_source_viewdirs = False
+        source_egocar_masks: List[Optional[Tensor]] = []
+        has_source_egocar_mask = False
 
         for frame_idx in source_frame_indices:
             for cam_idx in range(num_cams):
@@ -1962,6 +1958,11 @@ class MultiSceneDataset:
                 if viewdirs is not None:
                     has_source_viewdirs = True
                 source_viewdirs_list.append(viewdirs)
+
+                egocar_mask = image_infos.get("egocar_masks")
+                if egocar_mask is not None:
+                    has_source_egocar_mask = True
+                source_egocar_masks.append(egocar_mask)
                 
                 source_frame_idxs.append(frame_idx)
                 source_cam_idxs.append(cam_idx)
@@ -1977,6 +1978,8 @@ class MultiSceneDataset:
         has_target_sky_mask = False
         target_viewdirs_list: List[Optional[Tensor]] = []
         has_target_viewdirs = False
+        target_egocar_masks: List[Optional[Tensor]] = []
+        has_target_egocar_mask = False
 
         num_target_images = len(target_frame_indices) * num_cams
         for frame_idx in target_frame_indices:
@@ -2007,6 +2010,11 @@ class MultiSceneDataset:
                 if viewdirs is not None:
                     has_target_viewdirs = True
                 target_viewdirs_list.append(viewdirs)
+
+                egocar_mask = image_infos.get("egocar_masks")
+                if egocar_mask is not None:
+                    has_target_egocar_mask = True
+                target_egocar_masks.append(egocar_mask)
                 
                 target_frame_idxs.append(frame_idx)
                 target_cam_idxs.append(cam_idx)
@@ -2055,6 +2063,8 @@ class MultiSceneDataset:
         test_cam_idxs: List[int] = []
         test_sky_masks: List[Optional[Tensor]] = []
         has_test_sky_mask = False
+        test_egocar_masks: List[Optional[Tensor]] = []
+        has_test_egocar_mask = False
         
         if include_test:
             segment_test_frames = segment.get('test_frame_indices', [])
@@ -2084,6 +2094,10 @@ class MultiSceneDataset:
                         if sky_mask is not None:
                             has_test_sky_mask = True
                         test_sky_masks.append(sky_mask)
+                        egocar_mask = frame_data.get("egocar_mask")
+                        if egocar_mask is not None:
+                            has_test_egocar_mask = True
+                        test_egocar_masks.append(egocar_mask)
                         test_frame_idxs.append(frame_idx)
                         test_cam_idxs.append(cam_idx)
         
@@ -2206,6 +2220,16 @@ class MultiSceneDataset:
                     source_viewdirs_stack.append(vd.to(self.device).float())
             batch['source']['viewdirs'] = torch.stack(source_viewdirs_stack, dim=0)
 
+        if has_source_egocar_mask:
+            source_egocar_mask_stack = []
+            for mask, img in zip(source_egocar_masks, source_images):
+                if mask is None:
+                    H, W = img.shape[:2]
+                    source_egocar_mask_stack.append(torch.zeros((H, W), dtype=torch.float32, device=self.device))
+                else:
+                    source_egocar_mask_stack.append(mask.to(self.device).float())
+            batch["source"]["egocar_mask"] = torch.stack(source_egocar_mask_stack, dim=0)
+
         if has_target_sky_mask:
             target_sky_mask_stack = []
             for mask, img in zip(target_sky_masks, target_images):
@@ -2226,6 +2250,16 @@ class MultiSceneDataset:
                 else:
                     target_viewdirs_stack.append(vd.to(self.device).float())
             batch['target']['viewdirs'] = torch.stack(target_viewdirs_stack, dim=0)
+
+        if has_target_egocar_mask:
+            target_egocar_mask_stack = []
+            for mask, img in zip(target_egocar_masks, target_images):
+                if mask is None:
+                    H, W = img.shape[:2]
+                    target_egocar_mask_stack.append(torch.zeros((H, W), dtype=torch.float32, device=self.device))
+                else:
+                    target_egocar_mask_stack.append(mask.to(self.device).float())
+            batch["target"]["egocar_mask"] = torch.stack(target_egocar_mask_stack, dim=0)
         
         # Add pointcloud to batch if generated
         if pointcloud is not None:
@@ -2254,6 +2288,15 @@ class MultiSceneDataset:
                     else:
                         test_sky_mask_stack.append(mask.to(self.device).float())
                 batch['test']['sky_mask'] = torch.stack(test_sky_mask_stack, dim=0)
+            if has_test_egocar_mask:
+                test_egocar_mask_stack = []
+                for mask, img in zip(test_egocar_masks, test_images):
+                    if mask is None:
+                        H, W = img.shape[:2]
+                        test_egocar_mask_stack.append(torch.zeros((H, W), dtype=torch.float32, device=self.device))
+                    else:
+                        test_egocar_mask_stack.append(mask.to(self.device).float())
+                batch["test"]["egocar_mask"] = torch.stack(test_egocar_mask_stack, dim=0)
         
         return batch
     

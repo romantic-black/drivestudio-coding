@@ -29,7 +29,8 @@ model:
   param_embed_dim: 48
   offset_gru_hidden_dim: 48
   offset_gru_use_reset_gate: true
-  update_node_state_interval: 10
+  update_node_state_interval: 1
+  reset_node_state_interval: 10
 
 optimizer:
   lr: 1.0e-3
