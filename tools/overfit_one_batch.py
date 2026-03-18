@@ -35,6 +35,63 @@ def _save_target_images(batch: dict, save_dir: str) -> None:
             np.save(path.replace(".png", ".npy"), img)
     print(f"Saved {images.shape[0]} target images to {images_dir}")
 
+def _print_pointcloud_stats(
+    batch: dict,
+    *,
+    near_max_points: int | None = None,
+    distant_max_points: int | None = None,
+) -> None:
+    pc = batch.get("pointcloud")
+    if pc is None:
+        print("[batch] pointcloud: <missing>")
+        return
+
+    if not isinstance(pc, dict):
+        pts = getattr(pc, "points", None)
+        n = int(pts.shape[0]) if pts is not None and hasattr(pts, "shape") else -1
+        print(f"[batch] pointcloud: non-dict type={type(pc)} points={n}")
+        return
+
+    bg = pc.get("background", None)
+    bg_n = int(bg.shape[0]) if bg is not None and hasattr(bg, "shape") else 0
+    dyn = pc.get("dynamic", {}) or {}
+    dyn_instances = len(dyn) if isinstance(dyn, dict) else 0
+    dyn_points = 0
+    if isinstance(dyn, dict):
+        for _, arr in dyn.items():
+            if arr is not None and hasattr(arr, "shape"):
+                dyn_points += int(arr.shape[0])
+
+    print(f"[batch] pointcloud.background: N={bg_n}")
+    print(f"[batch] pointcloud.dynamic: instances={dyn_instances} total_points={dyn_points}")
+
+    # StreetForward/MultiScene split logic: segment_aabb (near) vs outside (distant), in seg0 coords.
+    seg_aabb = batch.get("aabb", None)
+    if bg is None or not hasattr(bg, "shape") or bg_n == 0 or seg_aabb is None:
+        return
+
+    try:
+        aabb_np = seg_aabb.detach().cpu().numpy() if torch.is_tensor(seg_aabb) else np.asarray(seg_aabb)
+        crop_min = aabb_np[0].astype(np.float32)
+        crop_max = aabb_np[1].astype(np.float32)
+        bg_np = bg.detach().cpu().numpy() if torch.is_tensor(bg) else np.asarray(bg)
+        xyz = bg_np[:, :3].astype(np.float32)
+        in_crop = ((xyz >= crop_min) & (xyz <= crop_max)).all(axis=1)
+        near_n = int(in_crop.sum())
+        distant_n = int((~in_crop).sum())
+        print(f"[batch] pointcloud split by segment_aabb: near={near_n} distant={distant_n}")
+    except Exception as e:
+        print(f"[batch] pointcloud split failed: {e}")
+        return
+
+    if near_max_points is not None or distant_max_points is not None:
+        near_after = min(near_n, int(near_max_points)) if near_max_points is not None else near_n
+        distant_after = min(distant_n, int(distant_max_points)) if distant_max_points is not None else distant_n
+        print(
+            f"[batch] caps: near_max_points={near_max_points} distant_max_points={distant_max_points} "
+            f"=> expected_after_cap near={near_after} distant={distant_after}"
+        )
+
 
 def capture_batch(cfg, scene_id: int, segment_id: int, save_dir: str):
     """提取单个 batch 并持久化到磁盘"""
@@ -66,6 +123,10 @@ def capture_batch(cfg, scene_id: int, segment_id: int, save_dir: str):
     # 2. 获取 Batch
     print(f"Capturing batch for scene {scene_id}, segment {segment_id}...")
     batch = dataset.get_segment_batch(scene_id=scene_id, segment_id=segment_id, include_test=True)
+    pc_cfg = cfg.dataset.get("pointcloud", {}) if hasattr(cfg, "dataset") else {}
+    near_cap = pc_cfg.get("near_max_points", None) if hasattr(pc_cfg, "get") else None
+    distant_cap = pc_cfg.get("distant_max_points", None) if hasattr(pc_cfg, "get") else None
+    _print_pointcloud_stats(batch, near_max_points=near_cap, distant_max_points=distant_cap)
     
     # 3. 核心数据持久化
     batch_path = os.path.join(save_dir, f"scene{scene_id}_seg{segment_id}_batch.pt")

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
 from pathlib import Path
 import math
+import time
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -38,6 +40,38 @@ from models.evol_splat import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _dbg_profile_enabled() -> bool:
+    return os.environ.get("DRIVESTUDIO_PROFILE_STEPS", "0") == "1"
+
+
+def _dbg_run_id() -> str:
+    return os.environ.get("DRIVESTUDIO_PROFILE_RUN_ID", "pre-fix")
+
+
+def _dbg_write_ndjson(payload: Dict) -> None:
+    # region agent log
+    try:
+        with open("/root/drivestudio-coding/.cursor/debug-cf43bc.log", "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    # endregion
+
+
+def _dbg_cuda_mem(device: torch.device) -> Dict[str, Optional[int]]:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return {
+            "allocated": None,
+            "reserved": None,
+            "max_allocated": None,
+        }
+    return {
+        "allocated": int(torch.cuda.memory_allocated(device)),
+        "reserved": int(torch.cuda.memory_reserved(device)),
+        "max_allocated": int(torch.cuda.max_memory_allocated(device)),
+    }
 
 
 

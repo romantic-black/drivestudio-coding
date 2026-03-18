@@ -416,6 +416,8 @@ class MultiSceneDataset:
             monocular_downscale = pointcloud_config.get("monocular_downscale", 2)
             
             # 融合参数
+            near_max_points = pointcloud_config.get("near_max_points", None)
+            distant_max_points = pointcloud_config.get("distant_max_points", None)
             fusion_strategy = pointcloud_config.get("fusion_strategy", "adaptive")
             dynamic_source = pointcloud_config.get("dynamic_source", "lidar_only")
             downsample_dynamic = pointcloud_config.get("downsample_dynamic", False)
@@ -427,6 +429,8 @@ class MultiSceneDataset:
                 monocular_filter_sky=monocular_filter_sky,
                 monocular_depth_consistency=monocular_depth_consistency,
                 monocular_downscale=monocular_downscale,
+                near_max_points=near_max_points,
+                distant_max_points=distant_max_points,
                 fusion_strategy=fusion_strategy,
                 dynamic_source=dynamic_source,
                 downsample_dynamic=downsample_dynamic,

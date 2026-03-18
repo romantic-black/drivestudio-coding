@@ -37,6 +37,8 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
         monocular_depth_consistency: bool = True,
         monocular_downscale: int = 2,
         # 融合参数
+        near_max_points: Optional[int] = None,
+        distant_max_points: Optional[int] = None,
         fusion_strategy: Literal["merge", "lidar_first", "adaptive"] = "adaptive",
         dynamic_source: Literal["lidar_only", "fuse"] = "lidar_only",
         downsample_dynamic: bool = False,
@@ -68,9 +70,67 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
         )
 
         # 存储融合参数
+        self.near_max_points = int(near_max_points) if near_max_points is not None else None
+        self.distant_max_points = int(distant_max_points) if distant_max_points is not None else None
         self.fusion_strategy = fusion_strategy
         self.dynamic_source = dynamic_source
         self.downsample_dynamic = downsample_dynamic
+
+    def _stride_downsample(self, pts6: np.ndarray, max_count: Optional[int]) -> np.ndarray:
+        if max_count is None or max_count <= 0:
+            return pts6
+        n = int(pts6.shape[0])
+        if n <= max_count:
+            return pts6
+        step = max(1, n // int(max_count))
+        idx = np.arange(0, n, step, dtype=np.int64)
+        if idx.shape[0] > max_count:
+            idx = idx[: int(max_count)]
+        return pts6[idx]
+
+    def _apply_segment_aabb_caps(self, dataset: "MultiSceneDataset", background: np.ndarray) -> Tuple[np.ndarray, Dict]:
+        """
+        Apply near/distant caps by splitting with dataset.segment_aabb (seg0 coords).
+        Returns (background_after, stats_dict).
+        """
+        if background is None or background.shape[0] == 0:
+            return background, {"background_n": 0}
+        if self.near_max_points is None and self.distant_max_points is None:
+            return background, {"background_n": int(background.shape[0]), "caps_disabled": True}
+
+        seg_aabb = getattr(dataset, "segment_aabb_np", None)
+        if seg_aabb is None:
+            seg_aabb_t = getattr(dataset, "segment_aabb", None)
+            if seg_aabb_t is not None:
+                seg_aabb = seg_aabb_t.detach().cpu().numpy() if torch.is_tensor(seg_aabb_t) else np.asarray(seg_aabb_t)
+        if seg_aabb is None:
+            return background, {"background_n": int(background.shape[0]), "caps_disabled": True, "reason": "missing segment_aabb"}
+
+        seg_aabb = np.asarray(seg_aabb, dtype=np.float32).reshape(2, 3)
+        crop_min = seg_aabb[0]
+        crop_max = seg_aabb[1]
+        xyz = background[:, :3].astype(np.float32, copy=False)
+        in_crop = ((xyz >= crop_min[None, :]) & (xyz <= crop_max[None, :])).all(axis=1)
+        near = background[in_crop]
+        distant = background[~in_crop]
+
+        near_before = int(near.shape[0])
+        distant_before = int(distant.shape[0])
+        near_after_arr = self._stride_downsample(near, self.near_max_points)
+        distant_after_arr = self._stride_downsample(distant, self.distant_max_points)
+        out = np.concatenate([near_after_arr, distant_after_arr], axis=0).astype(np.float32, copy=False)
+
+        stats = {
+            "background_before": int(background.shape[0]),
+            "near_before": near_before,
+            "distant_before": distant_before,
+            "near_cap": self.near_max_points,
+            "distant_cap": self.distant_max_points,
+            "near_after": int(near_after_arr.shape[0]),
+            "distant_after": int(distant_after_arr.shape[0]),
+            "background_after": int(out.shape[0]),
+        }
+        return out, stats
 
     def generate_pointcloud(
         self,
@@ -165,6 +225,7 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
         fused_background = self._fuse_background_points(
             lidar_background, monocular_background, lidar_dynamic
         )
+        fused_background, cap_stats = self._apply_segment_aabb_caps(dataset, fused_background)
 
         # 融合动态对象点云
         fused_dynamic = self._fuse_dynamic_objects(lidar_dynamic, monocular_dynamic)
