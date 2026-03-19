@@ -731,52 +731,9 @@ class MinimalStreetForwardStage3_2d(MinimalStreetForwardStage2_1):
         self.train()
         self.optimizer.zero_grad()
         out = self.forward(batch)
-        # region agent log
-        try:
-            log_payload = {
-                "sessionId": "45949f",
-                "runId": "pre-fix",
-                "hypothesisId": "H1",
-                "location": "minimal_trainer_stage3_2d.py:680",
-                "message": "train_step forward output summary",
-                "data": {
-                    "has_loss": bool(torch.is_tensor(out.get("loss"))),
-                    "has_proxies_bg": out.get("proxies") is not None,
-                    "has_render_params_bg": out.get("render_params") is not None,
-                    "has_proxies_distant": out.get("_proxies_distant") is not None,
-                    "has_render_params_distant": out.get("_render_params_distant") is not None,
-                },
-                "timestamp": int(time.time() * 1000),
-            }
-            with open("/root/drivestudio-coding/.cursor/debug-45949f.log", "a") as _f:
-                _f.write(json.dumps(log_payload) + "\n")
-        except Exception:
-            pass
-        # endregion agent log
         # First backprop from scalar loss to proxy params (and other learnable params).
         if torch.is_tensor(out.get("loss")):
             out["loss"].backward()
-        # region agent log
-        try:
-            log_payload = {
-                "sessionId": "45949f",
-                "runId": "pre-fix",
-                "hypothesisId": "H1",
-                "location": "minimal_trainer_stage3_2d.py:685",
-                "message": "before proxy backward calls",
-                "data": {
-                    "has_proxies_bg": out.get("proxies") is not None,
-                    "has_render_params_bg": out.get("render_params") is not None,
-                    "has_proxies_distant": out.get("_proxies_distant") is not None,
-                    "has_render_params_distant": out.get("_render_params_distant") is not None,
-                },
-                "timestamp": int(time.time() * 1000),
-            }
-            with open("/root/drivestudio-coding/.cursor/debug-45949f.log", "a") as _f:
-                _f.write(json.dumps(log_payload) + "\n")
-        except Exception:
-            pass
-        # endregion agent log
         if out.get("proxies") is not None:
             _backward_to_render_params_bg_distant(
                 out["render_params"],

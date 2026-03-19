@@ -108,6 +108,7 @@ class MinimalStreetForwardStage3_2(MinimalStreetForwardStage3_1):
         node_state_bg, node_state_distant = self._get_or_init_node_states_bg_distant(batch)
         key = self._batch_key(batch)
         means_bg = node_state_bg.means
+
         from models.streetforward.math_utils import _sh_to_rgb
 
         anchor_rgb_bg = _sh_to_rgb(node_state_bg.sh_dc)
@@ -116,10 +117,13 @@ class MinimalStreetForwardStage3_2(MinimalStreetForwardStage3_1):
         sample_img = source_images[0]
         height = int(sample_img.shape[0] if sample_img.dim() == 3 else sample_img.shape[1])
         width = int(sample_img.shape[1] if sample_img.dim() == 3 else sample_img.shape[2])
+
         gaussians_all, num_bg, num_distant = self._prepare_gaussians_bg_distant(node_state_bg, node_state_distant)
+
         feat_2d_bg, feat_2d_distant = self._compute_2d_features_bg_distant(
             gaussians_all, num_bg, num_distant, source_views, source_images, height, width
         )
+
         vis_bg = torch.ones(num_bg, device=self.device)
         feat_bg_input = self._fuse_features(feat_3d_crop_bg, feat_2d_bg, vis_bg)
         feat_distant_input = None
@@ -129,8 +133,12 @@ class MinimalStreetForwardStage3_2(MinimalStreetForwardStage3_1):
             feat_distant_input = self._fuse_features(zeros_3d, feat_2d_distant, vis_d)
 
         params_bg = self._build_params_for_embed(node_state_bg, coord_space="world")
-        h_old_bg = self._get_or_init_hidden(self.h_cache_bg, key, node_state_bg.means.shape[0], node_state_bg, "bg")
-        offsets_bg, h_new_bg = self._predict_offsets_gru(feat_bg_input, params_bg, h_old_bg, mask_update_rigid=None)
+        h_old_bg = self._get_or_init_hidden(
+            self.h_cache_bg, key, node_state_bg.means.shape[0], node_state_bg, "bg"
+        )
+        offsets_bg, h_new_bg = self._predict_offsets_gru(
+            feat_bg_input, params_bg, h_old_bg, mask_update_rigid=None
+        )
         render_params_bg = self._render_params_from_offsets(node_state_bg, offsets_bg)
 
         render_params_distant = None
@@ -138,12 +146,18 @@ class MinimalStreetForwardStage3_2(MinimalStreetForwardStage3_1):
         if node_state_distant is not None and feat_distant_input is not None and feat_distant_input.numel() > 0:
             params_distant = self._build_params_for_embed(node_state_distant, coord_space="world")
             h_old_distant = self._get_or_init_hidden(
-                self.h_cache_distant, key, node_state_distant.means.shape[0], node_state_distant, "distant"
+                self.h_cache_distant,
+                key,
+                node_state_distant.means.shape[0],
+                node_state_distant,
+                "distant",
             )
             offsets_distant, h_new_distant = self._predict_offsets_gru(
                 feat_distant_input, params_distant, h_old_distant, mask_update_rigid=None
             )
-            render_params_distant = self._render_params_from_offsets_distant(node_state_distant, offsets_distant)
+            render_params_distant = self._render_params_from_offsets_distant(
+                node_state_distant, offsets_distant
+            )
 
         if not self.training:
             # Keep eval behavior identical to Stage 3.1.
@@ -269,7 +283,9 @@ class MinimalStreetForwardStage3_2(MinimalStreetForwardStage3_1):
 
             # RGB reconstruction (L1 + SSIM) with egocar valid_loss_mask only.
             l1_i = compute_l1_loss_masked(pred_rgb, gt_image, valid_mask=valid_loss_mask, sky_mask=None)
-            ssim_i = compute_ssim_loss_masked(pred_rgb, gt_image, valid_mask=valid_loss_mask, sky_mask=None, data_range=1.0)
+            ssim_i = compute_ssim_loss_masked(
+                pred_rgb, gt_image, valid_mask=valid_loss_mask, sky_mask=None, data_range=1.0
+            )
             rgb_i = self.loss_w_l1 * l1_i + self.loss_w_ssim * ssim_i
 
             # P0: opacity mask supervision using sky_mask (1=non-sky, 0=sky) => gt_occupied = sky_mask

@@ -1,6 +1,7 @@
 import os
 import json
 import argparse
+from typing import Optional
 import torch
 import numpy as np
 from omegaconf import OmegaConf
@@ -38,8 +39,8 @@ def _save_target_images(batch: dict, save_dir: str) -> None:
 def _print_pointcloud_stats(
     batch: dict,
     *,
-    near_max_points: int | None = None,
-    distant_max_points: int | None = None,
+    near_max_points: Optional[int] = None,
+    distant_max_points: Optional[int] = None,
 ) -> None:
     pc = batch.get("pointcloud")
     if pc is None:
