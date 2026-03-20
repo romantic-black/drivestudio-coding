@@ -20,7 +20,6 @@ from models.streetforward.metrics import compute_l1_loss_masked
 from models.streetforward.math_utils import (
     _axis_angle_to_quat,
     _num_sh_bases,
-    _pairwise_neighbor_distances,
     _quat_multiply,
     _quat_to_rotmat,
     _normalize_quat,
@@ -122,6 +121,20 @@ class MinimalStreetForwardStage1_1(nn.Module):
         self.scale_max = float(model_cfg.get("scale_max", 0.1))
         self.omega_max = float(model_cfg.get("omega_max", 0.1))
         self.opacity_max = float(model_cfg.get("opacity_max", 0.1))
+        # Initial opacity for NodeState (detached buffers).
+        # Used only at initialization; network offsets can still increase/decrease opacity.
+        # Default initial opacity is intentionally small; otherwise alpha saturates too
+        # early and the rendered RGB becomes a near-grey mixture.
+        self.opacity_init_value = float(model_cfg.get("opacity_init_value", 0.02))
+        scale_init_value = model_cfg.get("scale_init_value", None)
+        if scale_init_value is None:
+            raise ValueError(
+                "MinimalStreetForward requires config.model.scale_init_value (linear scale in world units). "
+                "This replaces kNN-based scale init."
+            )
+        self.scale_init_value = float(scale_init_value)
+        if not (self.scale_init_value > 0.0):
+            raise ValueError(f"model.scale_init_value must be > 0, got {self.scale_init_value}")
         self.sh_dc_max = float(model_cfg.get("sh_dc_max", 0.1))
         self.sh_rest_max = float(model_cfg.get("sh_rest_max", 0.05))
         self.eta_means = float(model_cfg.get("eta_means", 1.0))
@@ -374,10 +387,17 @@ class MinimalStreetForwardStage1_1(nn.Module):
         return offsets, h_new
 
     def _compute_initial_scales(self, means: torch.Tensor) -> torch.Tensor:
-        """K-NN based initial scales_log [N, 3]."""
-        distances = _pairwise_neighbor_distances(means, k=3)
-        avg_dist = distances.mean(dim=-1, keepdim=True)
-        return torch.log(torch.clamp(avg_dist, min=1e-3).repeat(1, 3))
+        """Constant initial scales_log [N, 3] from model.scale_init_value."""
+        N = int(means.shape[0])
+        v = torch.full(
+            (N, 1),
+            float(self.scale_init_value),
+            device=means.device,
+            dtype=means.dtype,
+        )
+        scales_log = torch.log(torch.clamp(v, min=1e-6)).repeat(1, 3)
+
+        return scales_log
 
     def _init_node_state_bg_from_pointcloud(
         self,
@@ -433,7 +453,7 @@ class MinimalStreetForwardStage1_1(nn.Module):
             colors_rgb = colors_rgb[:, :3]
         scales_log = self._compute_initial_scales(means)
         quats = _random_quat_tensor(means.shape[0], device=self.device)
-        opacity_logit = torch.logit(torch.full((means.shape[0], 1), 0.1, device=self.device))
+        opacity_logit = torch.logit(torch.full((means.shape[0], 1), self.opacity_init_value, device=self.device))
         num_sh = _num_sh_bases(self.sh_degree)
         sh_dc = _rgb_to_sh(colors_rgb)
         sh_rest = torch.zeros((means.shape[0], num_sh - 1, 3), device=self.device)
@@ -531,6 +551,7 @@ class MinimalStreetForwardStage1_1(nn.Module):
         scales_r = torch.exp(scales_log_r)
         opacities_r = torch.sigmoid(opacity_logit_r).squeeze(-1)
         colors_r = torch.cat([sh_dc_r[:, None, :], sh_rest_r], dim=1)
+
         return {
             "means_r": means_r,
             "scales_log_r": scales_log_r,

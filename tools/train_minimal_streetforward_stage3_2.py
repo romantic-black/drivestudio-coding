@@ -24,6 +24,7 @@ from torchmetrics.image import PeakSignalNoiseRatio
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 from models.streetforward.minimal_trainer_stage3_2 import MinimalStreetForwardStage3_2
+from utils.minimal_batch_view_selection import parse_view_selection
 from utils.streetforward_baseline import set_deterministic_seed
 from tools.upload_to_vika import upload_experiment_summary
 
@@ -88,15 +89,28 @@ def main():
     from tools.overfit_one_batch import load_batch
 
     raw_batch = load_batch(overfit_path)
-    num_targets = cfg.training.get("num_targets", 3)
+    view_sel = cfg.training.get("view_selection")
+    explicit = parse_view_selection(view_sel)
+    num_targets = None if explicit is not None else cfg.training.get("num_targets", 3)
     minimal_batch = convert_batch_to_minimal_format(
-        raw_batch, device, num_targets=num_targets, include_source_for_2d=True
+        raw_batch,
+        device,
+        num_targets=num_targets,
+        include_source_for_2d=True,
+        view_selection=view_sel,
     )
-    logger.info(
-        "Using num_targets=%d (batch has %d targets), source for 2d included",
-        num_targets,
-        len(minimal_batch["targets"]),
-    )
+    if explicit is not None:
+        logger.info(
+            "Using explicit view_selection (explicit targets=%d, source views=%d)",
+            len(minimal_batch["targets"]),
+            len(minimal_batch.get("source_views", [])),
+        )
+    else:
+        logger.info(
+            "Using num_targets=%d (batch has %d targets), source for 2d included",
+            num_targets,
+            len(minimal_batch["targets"]),
+        )
 
     logger.info("Building MinimalStreetForwardStage3_2...")
     model = MinimalStreetForwardStage3_2(config=cfg, device=device)

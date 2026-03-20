@@ -12,6 +12,7 @@ dataset:
 model:
   offset_max: 0.1
   scale_max: 0.1
+  scale_init_value: 0.1
   omega_max: 0.1
   opacity_max: 0.1
   sh_dc_max: 0.1

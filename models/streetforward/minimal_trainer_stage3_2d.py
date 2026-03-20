@@ -275,10 +275,11 @@ class MinimalStreetForwardStage3_2d(MinimalStreetForwardStage2_1):
 
         scales_log = self._compute_initial_scales(means)
         quats = _random_quat_tensor(means.shape[0], device=self.device)
-        opacity_logit = torch.logit(torch.full((means.shape[0], 1), 0.1, device=self.device))
+        opacity_logit = torch.logit(torch.full((means.shape[0], 1), self.opacity_init_value, device=self.device))
         num_sh = _num_sh_bases(self.sh_degree)
         sh_dc = _rgb_to_sh(colors_tensor)
         sh_rest = torch.zeros((means.shape[0], num_sh - 1, 3), device=self.device)
+
         return state_cls(
             means=means.detach().clone(),
             scales_log=scales_log.detach().clone(),

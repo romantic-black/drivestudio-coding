@@ -27,6 +27,11 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 from models.streetforward.minimal_trainer_stage1_1 import MinimalStreetForwardStage1_1
 from utils.logging import setup_logging
+from utils.minimal_batch_view_selection import (
+    build_explicit_minimal_batch_parts,
+    build_explicit_targets_only,
+    parse_view_selection,
+)
 from utils.streetforward_baseline import set_deterministic_seed
 from tools.upload_to_vika import upload_experiment_summary
 
@@ -130,12 +135,16 @@ def convert_batch_to_minimal_format(
     device: torch.device,
     num_targets: Optional[int] = None,
     include_source_for_2d: bool = False,
+    view_selection: Optional[Any] = None,
 ) -> Dict:
     """Convert raw overfit/dataset batch to minimal format.
 
     When num_targets is None, keeps single target (targets_minimal = [targets[0]]) for Stage 1.1.
     When num_targets is set (e.g. 3), targets_minimal = targets[:num_targets]; uses all if fewer available.
     When include_source_for_2d is True, adds source_views, source_images, source_frame_idx from the first target.
+
+    When training.view_selection.mode == explicit (pass view_selection), selects rows by (frame_idx, cam_id)
+    from batch['source'] / batch['target']; num_targets must be None; include_source_for_2d must be True.
     """
     scene_id = batch.get("scene_id")
     segment_id = batch.get("segment_id")
@@ -152,6 +161,54 @@ def convert_batch_to_minimal_format(
         pointcloud_minimal = {"background": background}
     else:
         pointcloud_minimal = pointcloud
+
+    explicit = parse_view_selection(view_selection)
+    if explicit is not None:
+        if num_targets is not None:
+            raise ValueError(
+                "training.num_targets conflicts with training.view_selection.mode=explicit; "
+                "remove num_targets from config when using explicit observation lists."
+            )
+        test_views: List[Any] = []
+        test_images: List[torch.Tensor] = []
+        test_data = batch.get("test")
+        if isinstance(test_data, dict) and "image" in test_data and test_data["image"].numel() > 0:
+            num_test = int(test_data["image"].shape[0])
+            for i in range(num_test):
+                view = type(
+                    "View",
+                    (),
+                    {
+                        "camtoworlds": test_data["extrinsics"][i].to(device),
+                        "Ks": test_data["intrinsics"][i][:3, :3].unsqueeze(0).to(device),
+                    },
+                )()
+                test_views.append(view)
+                test_images.append(test_data["image"][i].to(device))
+        if include_source_for_2d:
+            targets_minimal, source_views, source_images, source_frame_idx = build_explicit_minimal_batch_parts(
+                batch, device, explicit
+            )
+            return {
+                "scene_id": scene_id,
+                "segment_id": segment_id,
+                "pointcloud": pointcloud_minimal,
+                "targets": targets_minimal,
+                "test_views": test_views,
+                "test_images": test_images,
+                "source_views": source_views,
+                "source_images": source_images,
+                "source_frame_idx": int(source_frame_idx),
+            }
+        targets_minimal = build_explicit_targets_only(batch, device, explicit)
+        return {
+            "scene_id": scene_id,
+            "segment_id": segment_id,
+            "pointcloud": pointcloud_minimal,
+            "targets": targets_minimal,
+            "test_views": test_views,
+            "test_images": test_images,
+        }
 
     target_data = batch.get("target", batch.get("targets"))
     if target_data is None:
@@ -339,8 +396,16 @@ def main():
     logger.info("Loading overfit batch from %s", overfit_path)
     from tools.overfit_one_batch import load_batch
     raw_batch = load_batch(overfit_path)
-    num_targets = cfg.training.get("num_targets")
-    minimal_batch = convert_batch_to_minimal_format(raw_batch, device, num_targets=num_targets)
+    view_sel = cfg.training.get("view_selection")
+    explicit = parse_view_selection(view_sel)
+    num_targets = None if explicit is not None else cfg.training.get("num_targets")
+    minimal_batch = convert_batch_to_minimal_format(
+        raw_batch,
+        device,
+        num_targets=num_targets,
+        include_source_for_2d=False,
+        view_selection=view_sel,
+    )
 
     logger.info("Building MinimalStreetForwardStage1_1...")
     model = MinimalStreetForwardStage1_1(config=cfg, device=device)

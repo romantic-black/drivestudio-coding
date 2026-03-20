@@ -91,6 +91,7 @@ class MinimalStreetForwardStage3_1(MinimalStreetForwardStage3_2d):
         if opacity.dim() == 3 and opacity.shape[-1] == 1:
             opacity = opacity.squeeze(-1)
         one_minus_opacity = (1.0 - opacity.clamp(0.0, 1.0)).unsqueeze(-1)
+
         return pred_rgb + rgb_sky * one_minus_opacity
 
     def _composite_sky_batched(
@@ -130,6 +131,7 @@ class MinimalStreetForwardStage3_1(MinimalStreetForwardStage3_2d):
         if opacities.dim() != 3:
             raise ValueError(f"opacities must have shape (T,H,W) or (T,H,W,1), got {tuple(opacities.shape)}")
         one_minus_opacity = (1.0 - opacities.clamp(0.0, 1.0)).unsqueeze(-1)
+
         return pred_rgbs + rgb_sky * one_minus_opacity
 
     def forward(self, batch: Dict) -> Dict[str, Any]:

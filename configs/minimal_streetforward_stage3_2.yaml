@@ -11,6 +11,7 @@ dataset:
 model:
   offset_max: 0.1
   scale_max: 0.1
+  scale_init_value: 0.1
   omega_max: 0.1
   opacity_max: 0.1
   sh_dc_max: 0.1
@@ -55,8 +56,22 @@ training:
   log_interval: 50
   save_checkpoint_freq: 500
   seed: 42
-  num_targets: 6
-
+  # Explicit refs must match batch['source']/['target'] rows (scene-global frame_idx, not 0..N-1).
+  # For ./data/overfit_batches/scene0_seg0_batch.pt: source has 3 rows (one frame 101, cams 0–2);
+  # target has 18 rows (frames 101,68,94,23,45,12 × 3 cams). Adjust if you re-capture.
+  view_selection:
+    mode: explicit
+    source:
+      - { frame_idx: 101, cam_id: 0 }
+      - { frame_idx: 101, cam_id: 1 }
+      - { frame_idx: 101, cam_id: 2 }
+    target:
+      - { frame_idx: 101, cam_id: 0 }
+      - { frame_idx: 101, cam_id: 1 }
+      - { frame_idx: 101, cam_id: 2 }
+      - { frame_idx: 68, cam_id: 0 }
+      - { frame_idx: 68, cam_id: 1 }
+      - { frame_idx: 68, cam_id: 2 }
 eval:
   enable_psnr: true
   metric_interval: 10

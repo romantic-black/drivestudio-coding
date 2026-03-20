@@ -1,7 +1,7 @@
 # Minimal StreetForward Stage 3.1: Stage 3.2d + learnable sky cubemap
 # Use with: python tools/train_minimal_streetforward_stage3_1.py --config_file configs/minimal_streetforward_stage3_1.yaml overfit_batch_path=./data/overfit_batches/scene0_seg0_batch.pt
 
-output_name: minimal_sf_stage3_1_5000_40
+output_name: minimal_sf_stage3_1
 
 data: {}
 
@@ -11,6 +11,7 @@ dataset:
 model:
   offset_max: 0.1
   scale_max: 0.1
+  scale_init_value: 0.1
   omega_max: 0.1
   opacity_max: 0.1
   sh_dc_max: 0.1
@@ -44,7 +45,19 @@ training:
   log_interval: 50
   save_checkpoint_freq: 500
   seed: 42
-  num_targets: 6
+  view_selection:
+    mode: explicit
+    source:
+      - { frame_idx: 101, cam_id: 0 }
+      - { frame_idx: 101, cam_id: 1 }
+      - { frame_idx: 101, cam_id: 2 }
+    target:
+      - { frame_idx: 101, cam_id: 0 }
+      - { frame_idx: 101, cam_id: 1 }
+      - { frame_idx: 101, cam_id: 2 }
+      - { frame_idx: 68, cam_id: 0 }
+      - { frame_idx: 68, cam_id: 1 }
+      - { frame_idx: 68, cam_id: 2 }
 
 eval:
   enable_psnr: true
