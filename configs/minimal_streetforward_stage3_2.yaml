@@ -62,16 +62,16 @@ training:
   view_selection:
     mode: explicit
     source:
-      - { frame_idx: 101, cam_id: 0 }
-      - { frame_idx: 101, cam_id: 1 }
-      - { frame_idx: 101, cam_id: 2 }
+      - { frame_idx: 72, cam_id: 0 }
+      - { frame_idx: 72, cam_id: 1 }
+      - { frame_idx: 72, cam_id: 2 }
     target:
-      - { frame_idx: 101, cam_id: 0 }
-      - { frame_idx: 101, cam_id: 1 }
-      - { frame_idx: 101, cam_id: 2 }
-      - { frame_idx: 68, cam_id: 0 }
-      - { frame_idx: 68, cam_id: 1 }
-      - { frame_idx: 68, cam_id: 2 }
+      - { frame_idx: 72, cam_id: 0 }
+      - { frame_idx: 72, cam_id: 1 }
+      - { frame_idx: 72, cam_id: 2 }
+      - { frame_idx: 55, cam_id: 0 }
+      - { frame_idx: 55, cam_id: 1 }
+      - { frame_idx: 55, cam_id: 2 }
 eval:
   enable_psnr: true
   metric_interval: 10

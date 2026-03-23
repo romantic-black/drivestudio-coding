@@ -85,7 +85,6 @@ def build_dataset(cfg: OmegaConf, device: torch.device):
         device=device,
         preload_scene_count=ds_cfg.get("preload_scene_count", 3),
         segment_aabb=ds_cfg.segment_aabb,
-        segment_input_aabb=ds_cfg.segment_input_aabb,
         pointcloud_config=ds_cfg.get("pointcloud", None),
     )
 

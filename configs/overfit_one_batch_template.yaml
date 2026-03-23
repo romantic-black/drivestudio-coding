@@ -7,6 +7,7 @@ data:
   start_timestep: 0
   end_timestep: -1
   preload_device: cpu
+  sky_mask_semantics: one_is_non_sky
   train_scene_ids: [0]  # 指定需要 overfit 的场景
   eval_scene_ids: []
   
@@ -46,12 +47,8 @@ dataset:
   
   # Segment AABB (required, seg0 coords)
   segment_aabb:
-    - [-20.0, -20.0, -20.0]
-    - [20.0, 4.8, 70.0]
-  # Segment input AABB (required, seg0 coords)
-  segment_input_aabb:
-    - [-20.0, -20.0, -20.0]
-    - [20.0, 4.8, 120.0]
+    - [-40.0, -20.0, -20.0]
+    - [40.0, 4.8, 70.0]
     
   # 点云生成器配置 (为模型提供初始化与深度一致性等特征)
   pointcloud:
@@ -65,13 +62,13 @@ dataset:
     monocular_depth_consistency: false
     monocular_downscale: 2
     # 融合参数
-    max_points: 500000
+    # 仅 StreetForward/MultiScene 路径使用的近/远景点数上限（按 segment_aabb 内外划分）
+    near_max_points: 400000     # 近景（segment_aabb 内）背景点数上限
+    distant_max_points: 400000  # 远景（segment_aabb 外）背景点数上限
     fusion_strategy: merge
     dynamic_source: lidar_only
     downsample_dynamic: false
-    count_dynamic_in_max_points: false
     background_downsample_method: uniform
-    # NOTE: crop_aabb/input_aabb have been unified into dataset.segment_aabb/segment_input_aabb
 
 # Capture 专属参数（在工具脚本中读取）
 capture:

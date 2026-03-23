@@ -99,11 +99,14 @@ def capture_batch(cfg, scene_id: int, segment_id: int, save_dir: str):
     # NOTE: Heavy dataset deps (e.g. pytorch3d) are imported lazily so that
     # `load_batch()` can be used in lightweight environments.
     from datasets.multi_scene_dataset import MultiSceneDataset
+    from datasets.sky_mask_semantics import parse_sky_mask_semantics_from_data_cfg
 
     os.makedirs(save_dir, exist_ok=True)
     
     print(f"Initializing Dataset for scene {scene_id}...")
     # 1. 最小化初始化 Dataset
+    # fast-fail: when load_sky_mask is enabled, semantics must be explicit.
+    parse_sky_mask_semantics_from_data_cfg(cfg.data)
     dataset = MultiSceneDataset(
         data_cfg=cfg.data,
         train_scene_ids=[scene_id],
@@ -134,12 +137,33 @@ def capture_batch(cfg, scene_id: int, segment_id: int, save_dir: str):
     torch.save(batch, batch_path)
     
     # 4. 保存易读的元数据 (Meta Info)
+    source_sky = None
+    target_sky = None
+    if isinstance(batch.get("source"), dict):
+        source_sky = batch["source"].get("sky_mask")
+    if isinstance(batch.get("target"), dict):
+        target_sky = batch["target"].get("sky_mask")
+
+    def _sky_ratio(x):
+        if x is None:
+            return None
+        if torch.is_tensor(x):
+            t = x.float()
+        else:
+            t = torch.tensor(x, dtype=torch.float32)
+        if t.numel() == 0:
+            return None
+        return float((t > 0.5).float().mean().item())
+
     meta_info = {
         "scene_id": int(batch['scene_id'].item() if torch.is_tensor(batch['scene_id']) else batch['scene_id']),
         "segment_id": batch['segment_id'],
         "keyframe_info": batch.get('keyframe_info', {}),
         "has_pointcloud": 'pointcloud' in batch,
-        "has_test_views": 'test' in batch
+        "has_test_views": 'test' in batch,
+        "sky_mask_semantics": str(cfg.data.get("sky_mask_semantics", "unknown")),
+        "source_sky_ratio_1_is_sky": _sky_ratio(source_sky),
+        "target_sky_ratio_1_is_sky": _sky_ratio(target_sky),
     }
     with open(os.path.join(save_dir, "meta.json"), "w") as f:
         json.dump(meta_info, f, indent=4)
