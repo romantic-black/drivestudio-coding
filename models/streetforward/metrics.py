@@ -1,13 +1,25 @@
 from __future__ import annotations
 
 import logging
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import torch
 
 _SSIM_UNAVAILABLE = False
 _LPIPS_UNAVAILABLE = False
+
+MaskRegion = Literal["non_sky", "sky"]
+
+
+def _loss_weight_from_sky_mask(sky_2d: torch.Tensor, mask_region: MaskRegion) -> torch.Tensor:
+    """``sky_mask`` is canonical **1=sky**; build per-pixel weights for the chosen region."""
+    s = sky_2d.clamp(0.0, 1.0)
+    if mask_region == "non_sky":
+        return 1.0 - s
+    if mask_region == "sky":
+        return s
+    raise ValueError(f"mask_region must be non_sky|sky, got {mask_region!r}")
 
 
 def compute_ssim_loss_masked(
@@ -16,10 +28,14 @@ def compute_ssim_loss_masked(
     valid_mask: Optional[torch.Tensor] = None,
     sky_mask: Optional[torch.Tensor] = None,
     *,
+    mask_region: MaskRegion = "non_sky",
     data_range: float = 1.0,
 ) -> torch.Tensor:
     """
     SSIM loss (1 - SSIM)，支持可选的 valid_mask 和 sky_mask。
+
+    ``sky_mask``（若提供）：**1=sky，0=non-sky**。默认 ``mask_region=non_sky`` 仅在非天空区域计算
+    （内部用 ``1 - sky_mask`` 作权重）。``mask_region=sky`` 时仅在天空区域计算。
 
     注意：SSIM 是局部窗口指标，严格的“只在 mask 区域计算”实现较复杂。
     这里采用一种稳定、可微且简单的做法：对 mask 外像素，将 pred 替换为 gt，
@@ -51,7 +67,8 @@ def compute_ssim_loss_masked(
         sky_2d = sky_mask.to(pred_rgb.device).float()
         if sky_2d.dim() == 3:
             sky_2d = sky_2d.squeeze(-1)
-        mask_2d = (mask_2d * sky_2d) if mask_2d is not None else sky_2d
+        w2d = _loss_weight_from_sky_mask(sky_2d, mask_region)
+        mask_2d = (mask_2d * w2d) if mask_2d is not None else w2d
 
     pred_in = pred_rgb
     gt_in = gt_image
@@ -76,13 +93,18 @@ def compute_l1_loss_masked(
     gt_image: torch.Tensor,
     valid_mask: Optional[torch.Tensor] = None,
     sky_mask: Optional[torch.Tensor] = None,
+    *,
+    mask_region: MaskRegion = "non_sky",
 ) -> torch.Tensor:
     """
     L1 损失，支持可选的 valid_mask 和 sky_mask。
 
+    ``sky_mask``（若提供）：**1=sky，0=non-sky**。默认 ``mask_region=non_sky`` 仅在非天空像素上计算
+    （权重 ``1 - sky_mask``）。``mask_region=sky`` 时仅在天空像素上计算。
+
     - 若 valid_mask 和 sky_mask 均为 None，则在全图上计算 mean L1。
     - 若只提供 valid_mask，则只在 valid_mask>0 的像素上计算。
-    - 若只提供 sky_mask，则只在 sky_mask>0 的像素上计算。
+    - 若只提供 sky_mask，则按 ``mask_region`` 在对应区域上计算。
     - 若二者都提供，则在二者相乘后的区域上计算。
     """
     diff = torch.abs(pred_rgb - gt_image)
@@ -96,10 +118,11 @@ def compute_l1_loss_masked(
         sky_2d = sky_mask.to(diff.device).float()
         if sky_2d.dim() == 3:
             sky_2d = sky_2d.squeeze(-1)
+        w2d = _loss_weight_from_sky_mask(sky_2d, mask_region)
         if mask_2d is not None:
-            mask_2d = mask_2d * sky_2d
+            mask_2d = mask_2d * w2d
         else:
-            mask_2d = sky_2d
+            mask_2d = w2d
 
     if mask_2d is None:
         # 无任何掩码，退化为全图 L1

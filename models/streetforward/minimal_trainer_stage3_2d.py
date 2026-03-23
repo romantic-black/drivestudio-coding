@@ -688,7 +688,11 @@ class MinimalStreetForwardStage3_2d(MinimalStreetForwardStage2_1):
                     gt_image = gt_image.squeeze(0)
                 pred_rgb = multi_result[i][0]
                 loss_i = compute_l1_loss_masked(
-                    pred_rgb, gt_image, None, sky_mask=target.get("sky_mask")
+                    pred_rgb,
+                    gt_image,
+                    None,
+                    sky_mask=target.get("sky_mask"),
+                    mask_region="non_sky",
                 )
                 pred_rgbs.append(pred_rgb)
                 gt_images.append(gt_image)
@@ -702,7 +706,11 @@ class MinimalStreetForwardStage3_2d(MinimalStreetForwardStage2_1):
                 height, width = gt_image.shape[0], gt_image.shape[1]
                 pred_rgb, _ = self._render_single_view(merged_for_render, view, height, width)
                 loss_i = compute_l1_loss_masked(
-                    pred_rgb, gt_image, None, sky_mask=target.get("sky_mask")
+                    pred_rgb,
+                    gt_image,
+                    None,
+                    sky_mask=target.get("sky_mask"),
+                    mask_region="non_sky",
                 )
                 pred_rgbs.append(pred_rgb)
                 gt_images.append(gt_image)

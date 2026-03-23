@@ -369,24 +369,25 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
 
         H, W = depth_np.shape
 
+        # sky_mask from MultiSceneDataset is canonical **1=sky, 0=non-sky** (float).
         if sky_mask is not None:
             if isinstance(sky_mask, torch.Tensor):
                 sky_mask = sky_mask.cpu().numpy()
-            sky_mask = sky_mask.astype(bool)
+            is_sky = sky_mask > 0.5
             if self.filter_sky:
-                sky_mask = ~sky_mask  # True means keep
+                keep_mask = ~is_sky
             else:
-                sky_mask = np.ones((H, W), dtype=bool)
+                keep_mask = np.ones((H, W), dtype=bool)
         else:
-            sky_mask = np.ones((H, W), dtype=bool)
+            keep_mask = np.ones((H, W), dtype=bool)
 
         if consistency_mask is None:
             consistency_mask = np.ones((H, W), dtype=bool)
 
         if downscale_mask is not None:
-            final_mask = consistency_mask & sky_mask & downscale_mask
+            final_mask = consistency_mask & keep_mask & downscale_mask
         else:
-            final_mask = consistency_mask & sky_mask
+            final_mask = consistency_mask & keep_mask
 
         kept = np.argwhere(final_mask)
         if len(kept) == 0:

@@ -668,7 +668,11 @@ class MinimalStreetForwardStage1_1(nn.Module):
         render_params = self._render_params_from_offsets(node_state_bg, offsets)
         pred_rgb, _ = self._render_single_view(render_params, view, height, width)
         loss = compute_l1_loss_masked(
-            pred_rgb, gt_image, None, sky_mask=target.get("sky_mask")
+            pred_rgb,
+            gt_image,
+            None,
+            sky_mask=target.get("sky_mask"),
+            mask_region="non_sky",
         )
 
         return {

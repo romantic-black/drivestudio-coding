@@ -224,7 +224,7 @@ batch = {
         'cam_indices': Tensor[V_s],               # 相机索引
         'keyframe_indices': Tensor[num_source_keyframes],  # 关键帧索引
         'viewdirs': Tensor[V_s, H, W, 3],        # 可选，射线方向
-        'sky_mask': Tensor[V_s, H, W],           # 可选，天空掩码
+        'sky_mask': Tensor[V_s, H, W],           # 可选，**1=天空，0=非天空**（float）
         'egocar_mask': Tensor[V_s, H, W],        # 可选，自车mask（1=需要忽略的自车区域，0=有效区域）
     },
     
@@ -238,7 +238,7 @@ batch = {
         'cam_indices': Tensor[V_t],               # 相机索引
         'keyframe_indices': Tensor[num_target_keyframes],  # 关键帧索引
         'viewdirs': Tensor[V_t, H, W, 3],        # 可选，射线方向（用于 Sky 渲染）
-        'sky_mask': Tensor[V_t, H, W],           # 可选，天空掩码（0=天空，1=非天空，float，用于 Sky 监督）
+        'sky_mask': Tensor[V_t, H, W],           # 可选，**1=天空，0=非天空**（float），见下「sky_mask」
         'egocar_mask': Tensor[V_t, H, W],        # 可选，自车mask（1=需要忽略的自车区域，0=有效区域）
     },
     
@@ -272,9 +272,10 @@ batch = {
 当底层 `pixel_source.get_image()` 返回的 `image_infos` 中包含对应键时，MultiSceneDataset 会在组装 batch 时收集并填入：
 
 - **viewdirs**：射线方向，形状 `[V, H, W, 3]`，来自 `image_infos['viewdirs']`（与 `get_rays` 约定一致，世界系单位向量）。用于 Sky 渲染等。**Stage 3.1（天空）要求 target 提供 viewdirs**，需使用会返回 `viewdirs` 的 pixel_source（如 `datasets/base/pixel_source.py` 中实现）。
-- **sky_mask**：天空掩码，形状 `[V, H, W]`，来自 `image_infos['sky_masks']`，float 0/1（0=天空，1=非天空），用于 Sky 区域监督。
+- **sky_mask**：天空掩码，形状 `[V, H, W]`，来自 `image_infos['sky_masks']`，在 **batch 内**统一为 float 0/1，语义为 **1=天空，0=非天空**（与名称一致）。  
+  - 在 `data` 配置中设置 **`sky_mask_semantics`**（当 `pixel_source.load_sky_mask: true` 时必填）：`one_is_non_sky` 表示 loader 中「1=非天空」（常见 PNG：0=天空、255=非天空 经 `>0` 后），数据集在组装时做 `1-x` 归一化；`one_is_sky` 表示 loader 中已为「1=天空」，不再取反。详见 [Sky_Mask_Semantics_One_Is_Sky_Refactor.md](Sky_Mask_Semantics_One_Is_Sky_Refactor.md)。
 
-若某张图像的 `get_image()` 未返回 `viewdirs` 或 `sky_masks`，该视角在 stack 时以占位（viewdirs 为零向量、sky_mask 为 1）保持形状一致。使用 Stage 3.1 时请确保 pixel_source 为所有 target 图像提供 viewdirs。
+若某张图像的 `get_image()` 未返回 `viewdirs` 或 `sky_masks`，该视角在 stack 时以占位（viewdirs 为零向量、**sky_mask 为 0 表示全图非天空**）保持形状一致。使用 Stage 3.1 时请确保 pixel_source 为所有 target 图像提供 viewdirs。
 
 **Stage 3.1 contract（强约束）**：
 

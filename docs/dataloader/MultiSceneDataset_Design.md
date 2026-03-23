@@ -217,7 +217,7 @@ class MultiSceneDataset:
                 - 'extrinsic': Tensor [4, 4] - 外参（cam_to_world）
                 - 'intrinsic': Tensor [4, 4] - 内参（4x4矩阵）
                 - 'depth': Tensor [H, W] - 深度图（如果可用）
-                - 'sky_mask': Tensor [H, W] 或 None - 天空掩码（如果可用）
+                - 'sky_mask': Tensor [H, W] 或 None - 天空掩码（如果可用）；**1=天空，0=非天空**（与 MultiSceneDataset batch 一致）
         """
         pass
     

@@ -147,7 +147,7 @@ pointcloud_config = {
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `sparsity` | Literal | "full" | 帧稀疏度：Drop90/Drop80/Drop50/Drop25/full |
-| `filter_sky` | bool | True | 是否过滤天空区域（仅单目生成器） |
+| `filter_sky` | bool | True | 是否过滤天空区域（仅单目生成器）；`frame_data['sky_mask']` 为 **1=天空**（与 MultiSceneDataset 一致） |
 | `depth_consistency` | bool | True | 是否进行深度一致性检查（仅单目生成器） |
 | `downscale` | int | 2 | 图像下采样比例（仅单目生成器） |
 | `crop_aabb` | np.ndarray | None | 裁剪用AABB `[[x_min, y_min, z_min], [x_max, y_max, z_max]]` |

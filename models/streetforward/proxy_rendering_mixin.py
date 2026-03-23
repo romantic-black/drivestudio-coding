@@ -133,12 +133,12 @@ class ProxyRenderingMixin:
         """
         计算 L1 损失，可选点覆盖掩码与天空区域遮挡。
 
-        最终有效区域 = (valid_mask if provided else 全图) & (sky_mask if provided else 全图)。
+        最终有效区域 = (valid_mask if provided else 全图) & (non_sky weight if sky_mask else 全图)。
 
         Args:
             pred_rgb: 预测的RGB图像，形状 [H, W, 3]
             gt_image: 真实图像，形状 [H, W, 3]
-            sky_mask: 天空掩码，形状 [H, W] 或 [H, W, 1]，1 表示有效，0 表示天空（可选）
+            sky_mask: **1=sky，0=non-sky**；用于 photometric 时在 **non-sky** 上计损失（内部用 ``1-sky_mask`` 作权重）（可选）
             valid_mask: 点覆盖掩码，形状 [H, W] 或 [H, W, 1]，1 表示参与损失（可选）
 
         Returns:
@@ -155,10 +155,11 @@ class ProxyRenderingMixin:
             sky_2d = sky_mask.to(diff.device).float()
             if sky_2d.dim() == 3:
                 sky_2d = sky_2d.squeeze(-1)
+            non_sky_2d = 1.0 - sky_2d.clamp(0.0, 1.0)
             if mask_2d is not None:
-                mask_2d = mask_2d * sky_2d
+                mask_2d = mask_2d * non_sky_2d
             else:
-                mask_2d = sky_2d
+                mask_2d = non_sky_2d
 
         if mask_2d is not None:
             valid_pixels = mask_2d.sum()

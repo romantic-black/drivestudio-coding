@@ -115,7 +115,11 @@ class MinimalStreetForwardStage2_1(MinimalStreetForwardStage2_0):
                 gt_images.append(gt_image)
                 losses.append(
                     compute_l1_loss_masked(
-                        pred_rgb, gt_image, None, sky_mask=target.get("sky_mask")
+                        pred_rgb,
+                        gt_image,
+                        None,
+                        sky_mask=target.get("sky_mask"),
+                        mask_region="non_sky",
                     )
                 )
             loss = torch.stack(losses).mean()
@@ -149,7 +153,11 @@ class MinimalStreetForwardStage2_1(MinimalStreetForwardStage2_0):
             pred_rgb, _ = self._render_single_view(params_for_render, view, height, width)
             loss_i = (
                 compute_l1_loss_masked(
-                    pred_rgb, gt_image, None, sky_mask=target.get("sky_mask")
+                    pred_rgb,
+                    gt_image,
+                    None,
+                    sky_mask=target.get("sky_mask"),
+                    mask_region="non_sky",
                 )
                 / n
             )

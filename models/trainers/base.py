@@ -533,6 +533,7 @@ class BasicTrainer(nn.Module):
         gt_rgb = image_infos["pixels"] * valid_loss_mask[..., None]
         predicted_rgb = outputs["rgb"] * valid_loss_mask[..., None]
         
+        # sky_masks: **1=sky, 0=non-sky** (canonical; align MultiSceneDataset + data.sky_mask_semantics)
         gt_occupied_mask = (1.0 - image_infos["sky_masks"]).float() * valid_loss_mask
         pred_occupied_mask = outputs["opacity"].squeeze() * valid_loss_mask
         

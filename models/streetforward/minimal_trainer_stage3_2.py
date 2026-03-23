@@ -288,10 +288,10 @@ class MinimalStreetForwardStage3_2(MinimalStreetForwardStage3_1):
             )
             rgb_i = self.loss_w_l1 * l1_i + self.loss_w_ssim * ssim_i
 
-            # P0: opacity mask supervision using sky_mask (1=non-sky, 0=sky) => gt_occupied = sky_mask
+            # P0: opacity mask supervision; sky_mask is **1=sky, 0=non-sky** => gt_occupied = non-sky
             sky_mask = target.get("sky_mask")
             if sky_mask is None:
-                raise ValueError("Stage 3.2 P0 requires target['sky_mask'] (1=non-sky, 0=sky).")
+                raise ValueError("Stage 3.2 P0 requires target['sky_mask'] (1=sky, 0=non-sky).")
             sm = sky_mask.to(self.device).float()
             if sm.dim() == 3:
                 sm = sm.squeeze(-1)
@@ -299,7 +299,7 @@ class MinimalStreetForwardStage3_2(MinimalStreetForwardStage3_1):
                 raise ValueError(
                     f"target['sky_mask'] must match image shape [H,W], got {tuple(sm.shape)} vs H,W=({H},{W})"
                 )
-            gt_occupied = sm * valid_loss_mask
+            gt_occupied = (1.0 - sm) * valid_loss_mask
             pred_occupied = opacity.clamp(0.0, 1.0) * valid_loss_mask
             mask_i = self.loss_w_mask * self._mask_bce(pred_occupied, gt_occupied, valid_loss_mask)
 

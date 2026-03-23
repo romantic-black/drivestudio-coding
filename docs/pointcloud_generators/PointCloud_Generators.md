@@ -421,7 +421,7 @@ AABB分割 (input_aabb)
 | `depth` | Tensor/Array | 深度图 [H, W] |
 | `extrinsic` | Tensor/Array | 相机到世界变换 [4, 4] |
 | `intrinsic` | Tensor/Array | 相机内参 [3, 3] 或 [4, 4] |
-| `sky_mask` | Tensor/Array | 天空掩码 [H, W] (可选) |
+| `sky_mask` | Tensor/Array | 天空掩码 [H, W] (可选)，**1=天空，0=非天空**（与 MultiSceneDataset 一致） |
 
 #### 一致性掩码 - 单目生成器
 

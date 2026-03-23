@@ -192,6 +192,7 @@ def build_minimal_target_entry_from_row(
         "view": view,
         "gt_image": gt_image,
     }
+    # sky_mask: **1=sky, 0=non-sky** (MultiSceneDataset / overfit batch)
     if sky_mask is not None:
         out["sky_mask"] = sky_mask[row].to(device)
     if egocar_mask is not None:

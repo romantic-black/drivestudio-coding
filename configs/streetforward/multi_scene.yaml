@@ -9,7 +9,9 @@ data:
   start_timestep: 0
   end_timestep: -1
   preload_device: cpu
-  
+  # MultiSceneDataset: loader float 语义见 pixel_source；此处声明如何归一化为 batch 内 **1=sky**
+  sky_mask_semantics: one_is_non_sky
+
   # Training and evaluation scene IDs
   train_scene_ids: [0]
   eval_scene_ids: [0]

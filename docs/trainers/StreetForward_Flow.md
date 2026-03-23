@@ -2104,8 +2104,8 @@ StreetForwardTrainer 通过以下关键机制实现了高效的前馈式 3DGS �
 
 - **sky_mask（可选）**：
   - 形状：`[H, W]`（batch `[V, H, W]`）。
-  - 约定：`0=天空, 1=非天空`（float 0/1）。
-  - 用途：可用于 loss 加权（例如仅天空区域更强监督 sky）。
+  - 约定：**`1=天空`，`0=非天空`**（float 0/1）；由 `MultiSceneDataset` 根据 `data.sky_mask_semantics` 从 loader 归一化。
+  - 用途：可用于 loss 加权（例如仅天空区域更强监督 sky）；non-sky 区域权重为 `1 - sky_mask`。
 
 ### 2. 天空模型接口与坐标系约定
 
