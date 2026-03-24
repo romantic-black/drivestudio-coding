@@ -30,6 +30,7 @@ from utils.logging import setup_logging
 from utils.minimal_batch_view_selection import (
     build_explicit_minimal_batch_parts,
     build_explicit_targets_only,
+    find_row,
     parse_view_selection,
 )
 from utils.streetforward_baseline import set_deterministic_seed
@@ -157,8 +158,11 @@ def convert_batch_to_minimal_format(
     if pointcloud is None:
         raise ValueError("batch must contain 'pointcloud'")
     if isinstance(pointcloud, dict):
-        background = pointcloud.get("background", np.zeros((0, 6), dtype=np.float32))
-        pointcloud_minimal = {"background": background}
+        # Keep all available branches (background/dynamic/...) so downstream
+        # trainers (e.g. stage4 rigid) can access dynamic pointclouds.
+        pointcloud_minimal = dict(pointcloud)
+        if "background" not in pointcloud_minimal:
+            pointcloud_minimal["background"] = np.zeros((0, 6), dtype=np.float32)
     else:
         pointcloud_minimal = pointcloud
 
@@ -189,6 +193,27 @@ def convert_batch_to_minimal_format(
             targets_minimal, source_views, source_images, source_frame_idx = build_explicit_minimal_batch_parts(
                 batch, device, explicit
             )
+            source_sky_masks: List[torch.Tensor] = []
+            source_viewdirs: List[torch.Tensor] = []
+            source_egocar_masks: List[torch.Tensor] = []
+            source_data = batch.get("source")
+            if not isinstance(source_data, dict):
+                raise ValueError("explicit view_selection requires batch['source'] dict for source-only Stage4 contract.")
+            sfi = source_data.get("frame_indices")
+            sci = source_data.get("cam_indices")
+            if sfi is None or sci is None:
+                raise ValueError("batch['source'] must contain frame_indices and cam_indices.")
+            for frame_idx, cam_id in explicit.source_refs:
+                row = find_row(sfi, sci, frame_idx, cam_id, role="batch['source']")
+                src_sky = source_data.get("sky_mask")
+                src_vd = source_data.get("viewdirs")
+                src_ego = source_data.get("egocar_mask")
+                if src_sky is not None:
+                    source_sky_masks.append(src_sky[row].to(device))
+                if src_vd is not None:
+                    source_viewdirs.append(src_vd[row].to(device))
+                if src_ego is not None:
+                    source_egocar_masks.append(src_ego[row].to(device))
             return {
                 "scene_id": scene_id,
                 "segment_id": segment_id,
@@ -199,6 +224,10 @@ def convert_batch_to_minimal_format(
                 "source_views": source_views,
                 "source_images": source_images,
                 "source_frame_idx": int(source_frame_idx),
+                **({"dynamic_info": batch.get("dynamic_info")} if batch.get("dynamic_info") is not None else {}),
+                **({"source_sky_mask": source_sky_masks} if source_sky_masks else {}),
+                **({"source_viewdirs": source_viewdirs} if source_viewdirs else {}),
+                **({"source_egocar_mask": source_egocar_masks} if source_egocar_masks else {}),
             }
         targets_minimal = build_explicit_targets_only(batch, device, explicit)
         return {
@@ -208,6 +237,7 @@ def convert_batch_to_minimal_format(
             "targets": targets_minimal,
             "test_views": test_views,
             "test_images": test_images,
+            **({"dynamic_info": batch.get("dynamic_info")} if batch.get("dynamic_info") is not None else {}),
         }
 
     target_data = batch.get("target", batch.get("targets"))
@@ -297,6 +327,8 @@ def convert_batch_to_minimal_format(
         "test_views": test_views,
         "test_images": test_images,
     }
+    if "dynamic_info" in batch and batch.get("dynamic_info") is not None:
+        result["dynamic_info"] = batch["dynamic_info"]
     if include_source_for_2d:
         first = targets_minimal[0]
         result["source_views"] = [first["view"]]
@@ -304,6 +336,17 @@ def convert_batch_to_minimal_format(
             first["gt_image"].to(device) if first["gt_image"].device != device else first["gt_image"]
         ]
         result["source_frame_idx"] = int(first.get("frame_idx", 0))
+        source_data = batch.get("source")
+        if isinstance(source_data, dict):
+            src_sky = source_data.get("sky_mask")
+            src_vd = source_data.get("viewdirs")
+            src_ego = source_data.get("egocar_mask")
+            if src_sky is not None and src_sky.shape[0] > 0:
+                result["source_sky_mask"] = [src_sky[0].to(device)]
+            if src_vd is not None and src_vd.shape[0] > 0:
+                result["source_viewdirs"] = [src_vd[0].to(device)]
+            if src_ego is not None and src_ego.shape[0] > 0:
+                result["source_egocar_mask"] = [src_ego[0].to(device)]
     return result
 
 

@@ -8,7 +8,7 @@ data:
   end_timestep: -1
   preload_device: cpu
   sky_mask_semantics: one_is_non_sky
-  train_scene_ids: [0]  # 指定需要 overfit 的场景
+  train_scene_ids: [2]  # 指定需要 overfit 的场景
   eval_scene_ids: []
   
   pixel_source:
@@ -72,6 +72,6 @@ dataset:
 
 # Capture 专属参数（在工具脚本中读取）
 capture:
-  scene_id: 0
+  scene_id: 1
   segment_id: 0
   save_dir: "./data/overfit_batches"

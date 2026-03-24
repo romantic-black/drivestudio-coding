@@ -21,6 +21,7 @@ __all__ = [
     "MinimalStreetForwardStage3_1",
     "MinimalStreetForwardStage3_2",
     "MinimalStreetForwardStage3_3",
+    "MinimalStreetForwardStage4_0",
     "NodeState",
     "NodeStateBackground",
     "NodeStateRigid",
@@ -73,6 +74,10 @@ def __getattr__(name: str) -> Any:  # pragma: no cover
         from models.streetforward.minimal_trainer_stage3_3 import MinimalStreetForwardStage3_3
 
         return MinimalStreetForwardStage3_3
+    if name == "MinimalStreetForwardStage4_0":
+        from models.streetforward.minimal_trainer_stage4_0 import MinimalStreetForwardStage4_0
+
+        return MinimalStreetForwardStage4_0
     if name in {"NodeState", "NodeStateBackground", "NodeStateRigid", "NodeStateDistant"}:
         from models.streetforward import node_states as _ns
 
