@@ -1,0 +1,130 @@
+# Minimal StreetForward Stage 3.3: branch-decoupled bg/distant + distant no-3d-feat
+
+output_name: minimal_sf_stage3_3
+
+data: {}
+
+dataset:
+  segment_aabb: [[-40.0, -20.0, -20.0], [40.0, 4.8, 70.0]]
+
+model:
+  # Shared backbone settings
+  # Required by inherited Stage1_1 constructor; Stage3_3 branch init overrides practical usage.
+  scale_init_value: 0.1
+  sh_degree: 1
+  voxel_size: 0.2
+  sparseConv_outdim: 32
+  feat_2d_channels: 32
+  feat_2d_downscale: 1
+  param_embed_dim: 48
+  offset_gru_hidden_dim: 48
+  offset_gru_use_reset_gate: true
+  update_node_state_interval: 1
+  reset_node_state_interval: 10
+  sky:
+    resolution: 1024
+    init_value: 0.5
+
+  branches:
+    bg:
+      freeze_means: false
+      init:
+        scale_init:
+          mode: isotropic
+          isotropic_log_value: -2.30
+          knn_k: 3
+          knn_log_scale_bias: 0.0
+        opacity_init: 0.1
+      limits:
+        offset_max: 0.1
+        scale_max: 0.1
+        omega_max: 0.1
+        opacity_max: 0.1
+        sh_dc_max: 0.1
+        sh_rest_max: 0.05
+      eta:
+        means: 1.0
+        scales: 1.0
+        opacity: 1.0
+        sh_dc: 1.0
+        sh_rest: 1.0
+      mlp:
+        hidden_dim: 64
+        use_3d_feat: true
+        use_2d_feat: true
+        freeze_quat: false
+
+    distant:
+      freeze_means: true
+      init:
+        scale_init:
+          mode: isotropic
+          isotropic_log_value: -1.90
+          knn_k: 3
+          knn_log_scale_bias: 0.0
+        opacity_init: 0.05
+      limits:
+        offset_max: 0.02
+        scale_max: 0.08
+        omega_max: 0.01
+        opacity_max: 0.05
+        sh_dc_max: 0.08
+        sh_rest_max: 0.015
+      eta:
+        means: 0.2
+        scales: 0.7
+        opacity: 0.5
+        sh_dc: 0.8
+        sh_rest: 0.4
+      mlp:
+        hidden_dim: 64
+        use_3d_feat: false
+        use_2d_feat: true
+        freeze_quat: true
+
+losses:
+  rgb:
+    w: 0.8
+  ssim:
+    w: 0.2
+  mask:
+    w: 0.05
+    opacity_loss_type: bce
+  opacity_entropy:
+    w: 0.0
+
+optimizer:
+  lr: 1.0e-3
+  eps: 1.0e-15
+  weight_decay: 0.0
+
+training:
+  max_iterations: 4000
+  log_interval: 50
+  save_checkpoint_freq: 500
+  seed: 42
+  view_selection:
+    mode: explicit
+    source:
+      - { frame_idx: 72, cam_id: 0 }
+      - { frame_idx: 72, cam_id: 1 }
+      - { frame_idx: 72, cam_id: 2 }
+    target:
+      - { frame_idx: 72, cam_id: 0 }
+      - { frame_idx: 72, cam_id: 1 }
+      - { frame_idx: 72, cam_id: 2 }
+      - { frame_idx: 55, cam_id: 0 }
+      - { frame_idx: 55, cam_id: 1 }
+      - { frame_idx: 55, cam_id: 2 }
+
+eval:
+  enable_psnr: true
+  metric_interval: 10
+  heavy_metric_interval: 50
+  run_test_at_end: true
+
+logging:
+  image_interval: 500
+  enable_jsonl_metrics: true
+  use_tensorboard: true
+

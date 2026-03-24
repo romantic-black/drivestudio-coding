@@ -9,6 +9,8 @@
 > - `offsets_mixin.py`：`_predict_offsets`、`_predict_offsets_gru`、`_compute_render_params_for_inner_iter`、`_render_params_from_offsets`
 > - `proxy_rendering_mixin.py`：`_create_proxy_params`、`_render_targets_and_accumulate_loss`、`_backward_to_render_params`、`_merge_params_with_rigid_subset`
 > - `metrics.py`：`compute_psnr`、`compute_ssim`、`compute_lpips`、`evaluate_test_views`
+>
+> **Minimal Stage 3.3（旁路实验管线）**：在 `MinimalStreetForwardStage3_2` 之上实现 bg / distant 配置与网络解耦，入口为 `tools/train_minimal_streetforward_stage3_3.py`，实现见 `models/streetforward/minimal_trainer_stage3_3.py`；设计背景见 [StreetForward_Stage3_3_Design.md](StreetForward_Stage3_3_Design.md)。包导出在 `models/streetforward/__init__.py` 中通过 lazy import 暴露 `MinimalStreetForwardStage3_3`。
 
 ## 目录
 1. [整体架构](#整体架构)
@@ -18,6 +20,7 @@
 5. [关键组件说明](#关键组件说明)
 6. [梯度反向传播机制](#梯度反向传播机制)
 7. [天空分支（Stage 3.1）](#天空分支stage-31)
+8. [Minimal Stage 3.3（bg/distant 解耦）](#minimal-stage-3-3-bg-distant)
 
 ---
 
@@ -2086,6 +2089,8 @@ StreetForwardTrainer 通过以下关键机制实现了高效的前馈式 3DGS �
 6. **单次反向传播：** 每个迭代只进行一次完整的梯度更新
 7. **内存优化：** 密集体积在使用后立即删除，避免内存累积
 
+**Minimal Stage 3.3** 在精简 bg+distant 管线上将分支配置（`model.branches`）、distant 的 2D-only 特征与独立偏移头、以及依赖 `sky_mask` 的复合损失单独成节说明；见上文 [Minimal Stage 3.3（bg/distant 解耦）](#minimal-stage-3-3-bg-distant)。
+
 这种设计既保证了训练效率，又实现了多视角监督的有效利用，同时支持静态背景、动态物体和背景远景的联合训练。
 
 ---
@@ -2141,3 +2146,100 @@ Stage 3.1 的核心是把天空作为“未被高斯遮挡区域”的补全项�
 - 与 `(T, H, W, 3)` 的 `pred_rgbs` / `(T, H, W)` 的 `opacity` 一次性合成
 
 这样可减少重复的 `dr.texture` launch 与 Python 循环开销。
+
+---
+
+<a id="minimal-stage-3-3-bg-distant"></a>
+
+## Minimal Stage 3.3（bg/distant 解耦）
+
+本节说明 **Minimal** 管线中与主 `StreetForwardTrainer` 不同的 Stage 3.3 机制：在 Stage 3.2 的 GRU-style 偏移、proxy 多视角渲染与天空合成之上，对 **背景（bg）** 与 **远景（distant）** 做配置与预测头分离；更完整的设计动机与分阶段计划见 [StreetForward_Stage3_3_Design.md](StreetForward_Stage3_3_Design.md)。
+
+### 1. 与主文档的关系
+
+- **主文档上文**：描述完整 `StreetForwardTrainer`（含 rigid、inner_iteration、双阶段 backward 等）。
+- **Stage 3.3 Minimal**：仅含 **bg + distant**（无 rigid 分支），`forward` 路径继承 `MinimalStreetForwardStage3_2`（含 `train_step`、天空 `_composite_sky*` 等），在特征与 offsets 上对 distant 单独处理。
+- **配置**：示例见仓库内 `configs/minimal_streetforward_stage3_3.yaml`。
+
+### 2. 配置：`model.branches.{bg,distant}`（fast-fail）
+
+初始化时 **必须** 同时存在 `model.branches.bg` 与 `model.branches.distant`，且每个分支必须包含子键 `init`、`limits`、`eta`、`mlp`、`freeze_means`；缺失直接报错，不做静默默认补齐。
+
+每个分支结构要点：
+
+| 块 | 含义 |
+|----|------|
+| `freeze_means` | 若为 true，渲染位置上功能冻结：`means_r = means + eta * offset_pos` 中的 offset 项乘零，仍保留计算图连接以便 proxy 反传。 |
+| `init` | `opacity_init`；`scale_init.mode` 为 `isotropic`（`isotropic_log_value` 填 `scales_log`）或 `knn`（`knn_k`、`knn_log_scale_bias`）；**bg/distant 的 quat 均固定为单位四元数**，无配置项。 |
+| `limits` | 对应各偏移的 `tanh` 上限（原单的 `offset_max`、`scale_max`、`omega_max` 等），按分支分别读取。 |
+| `eta` | 各 Gaussian 参数相对 NodeState 的步长（`means` / `scales` / `opacity` / `sh_dc` / `sh_rest`）。 |
+| `mlp` | `hidden_dim`、`use_3d_feat`、`use_2d_feat`、`freeze_quat`（distant 常为 true：旋转偏移在实现上等效为轴角乘零再转四元数）。 |
+
+**与继承代码的衔接**：Stage 3.3 将 **bg** 的 `limits` / `eta` 写回 `self.offset_max`、`self.eta_means` 等属性，供父类里仍按「单套标量」工作的共享逻辑默认使用 bg 分支数值。
+
+### 3. NodeState 初始化与分割
+
+- 方法：`_get_or_init_node_states_bg_distant(batch)`。
+- 点云来自 `batch["pointcloud"]`（字典时取 `background` 的 `xyz + rgb`）。
+- 用 **`segment_aabb`（与 trainer 内 `bbx_min` / `bbx_max` 一致）** 划分：
+  - **框内** → `NodeStateBackground`（`branches.bg.init` 初始化尺度与 opacity）。
+  - **框外** → 若有剩余点则 `NodeStateDistant`（`branches.distant.init`）；否则 distant 为 `None`。
+- 框内无点则直接报错（fast-fail）。
+
+### 4. 特征与 offsets 前向（bg vs distant）
+
+**背景（bg）**
+
+1. `_build_3d_features(means_bg, anchor_rgb_bg)` 得到 3D 点特征。
+2. `_prepare_gaussians_bg_distant` + `_compute_2d_features_bg_distant` 得到 `feat_2d_bg`（及 distant 的 2D）。
+3. `feat_bg_input = _fuse_features(feat_3d_crop_bg, feat_2d_bg, vis_bg)`（与 Stage 3.2 一致的 3D+2D 融合）。
+4. `_predict_offsets_gru(feat_bg_input, params_bg, h_old_bg, mask_update_rigid=None)` → **共用** Stage 3.2 的偏移 MLP 头。
+5. `_render_params_from_offsets_bg(node_state_bg, offsets)`，**eta 全部来自 `branches.bg.eta`**。
+
+**远景（distant）**
+
+- 设计前提：distant 不在可靠 3D 体积支撑内，**不走 3D 特征拼接**；仅当 `num_distant > 0` 且 `feat_2d_distant` 有效时参与更新。
+- `feat_2d_distant` 经 **`distant_feat_proj`**（`Linear`: 2D 通道维 → `fused_in_dim`）与 GRU 输入维对齐。
+- `_predict_offsets_gru_distant(feat_distant_input, params_distant, h_old_distant)`：
+  - **GRU 子模块**（`mlp_params_embed`、`param_embed_norm`、`gru_*`、`gru_to_head`）与 bg **共用参数**；
+  - **偏移头独立**：`mlp_offset_pos_distant`、`mlp_conv_distant`、`mlp_opacity_distant`、`gaussion_decoder_distant`，`tanh` 上限来自 **`branches.distant.limits`**。
+- `_render_params_from_offsets_distant` 使用 **`branches.distant.eta`**。
+
+空特征时 distant 返回零位移类 offset、`offset_quat` 为 identity，`h_new = h_old`（与主 trainer 空特征约定一致）。
+
+### 5. 渲染、proxy 与损失
+
+- 训练时：`proxies_bg`、可选 `proxies_distant` 经 `_merge_params_bg_distant` 合并后多视角渲染；天空合成逻辑继承 Stage 3.2。
+- **损失（训练态）**：每个 target **必须** 提供 `sky_mask`（`1`=天空，`0`=非天空）；否则报错。在有效像素掩码上计算：
+  - RGB：`loss_w_l1 * L1 + loss_w_ssim * SSIM`（masked）；
+  - Mask：将累积不透明度与 `(1 - sky_mask)` 在有效区域上做 BCE 类监督（权重 `loss_w_mask`）；
+  - 可选：`loss_w_opacity_entropy *` 不透明度熵（masked）。
+- 返回字典除 `loss` 外包含 `loss_l1`、`loss_ssim`、`loss_rgb`、`loss_mask`、`loss_opacity_entropy` 等分项，便于日志与消融。
+
+### 6. 训练脚本与 checkpoint
+
+- **脚本**：`tools/train_minimal_streetforward_stage3_3.py` — 默认配置 `configs/minimal_streetforward_stage3_3.yaml`，依赖 overfit batch（`--overfit_batch_path` 或 config），`convert_batch_to_minimal_format(..., include_source_for_2d=True)`，视图选择逻辑与 Stage 3.2 脚本一致。
+- **Checkpoint**：`__init__` 在注册 distant 头与 `distant_feat_proj` 后 **重建 Adam**，状态 dict 含新增键；与 Stage 3.2 旧权重 **不保证 strict 兼容**，需按设计文档做部分 warm-start 或重训。
+
+### 7. 配置示例（缩略）
+
+完整字段以 `configs/minimal_streetforward_stage3_3.yaml` 为准；结构形如：
+
+```yaml
+model:
+  branches:
+    bg:
+      freeze_means: false
+      init:
+        scale_init: { mode: isotropic, isotropic_log_value: -2.30, knn_k: 3, knn_log_scale_bias: 0.0 }
+        opacity_init: 0.1
+      limits: { offset_max: 0.1, scale_max: 0.1, omega_max: 0.1, opacity_max: 0.1, sh_dc_max: 0.1, sh_rest_max: 0.05 }
+      eta: { means: 1.0, scales: 1.0, opacity: 1.0, sh_dc: 1.0, sh_rest: 1.0 }
+      mlp: { hidden_dim: 64, use_3d_feat: true, use_2d_feat: true, freeze_quat: false }
+    distant:
+      freeze_means: true
+      init: { ... }
+      limits: { ... }
+      eta: { ... }
+      mlp: { hidden_dim: 64, use_3d_feat: false, use_2d_feat: true, freeze_quat: true }
+```
