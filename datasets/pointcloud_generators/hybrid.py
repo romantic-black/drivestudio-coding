@@ -36,6 +36,8 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
         monocular_filter_sky: bool = True,
         monocular_depth_consistency: bool = True,
         monocular_downscale: int = 2,
+        monocular_dynamic_filter: bool = True,
+        monocular_dynamic_mask_key: Literal["dynamic_masks", "human_masks", "vehicle_masks"] = "dynamic_masks",
         # 融合参数
         near_max_points: Optional[int] = None,
         distant_max_points: Optional[int] = None,
@@ -66,6 +68,8 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
             filter_sky=monocular_filter_sky,
             depth_consistency=monocular_depth_consistency,
             downscale=monocular_downscale,
+            dynamic_filter=monocular_dynamic_filter,
+            dynamic_mask_key=monocular_dynamic_mask_key,
             device=device,
         )
 
@@ -75,6 +79,13 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
         self.fusion_strategy = fusion_strategy
         self.dynamic_source = dynamic_source
         self.downsample_dynamic = downsample_dynamic
+
+        if self.dynamic_source == "fuse":
+            # Monocular generator no longer outputs per-instance dynamic pointclouds.
+            raise ValueError(
+                "Hybrid pointcloud dynamic_source='fuse' is unsupported when monocular dynamic "
+                "points are disabled. Use dynamic_source='lidar_only'."
+            )
 
     def _stride_downsample(self, pts6: np.ndarray, max_count: Optional[int]) -> np.ndarray:
         if max_count is None or max_count <= 0:

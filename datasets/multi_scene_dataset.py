@@ -404,39 +404,87 @@ class MultiSceneDataset:
         generator_type = pointcloud_config["type"]
 
         if generator_type == "monocular":
-            chosen_cam_ids = pointcloud_config.get(
-                "chosen_cam_ids",
-                data_cfg.pixel_source.get("cameras", [0])
-            )
-            
+            if "chosen_cam_ids" not in pointcloud_config:
+                raise ValueError("dataset.pointcloud.chosen_cam_ids is required for monocular generator.")
+            chosen_cam_ids = pointcloud_config["chosen_cam_ids"]
+            if "dynamic_filter" not in pointcloud_config:
+                raise ValueError("dataset.pointcloud.dynamic_filter is required for monocular generator.")
+            if "dynamic_mask_key" not in pointcloud_config:
+                raise ValueError("dataset.pointcloud.dynamic_mask_key is required for monocular generator.")
+            if not bool(pointcloud_config["dynamic_filter"]):
+                raise ValueError(
+                    "Monocular pointcloud requires dynamic_filter=true (no bbox fallback)."
+                )
+
+            # Require pixel_source to load dynamic masks (fast-fail)
+            if (
+                getattr(data_cfg, "pixel_source", None) is None
+                or not bool(data_cfg.pixel_source.get("load_dynamic_mask", False))
+            ):
+                raise ValueError(
+                    "Monocular pointcloud requires data.pixel_source.load_dynamic_mask: true."
+                )
+
             return MonocularRGBPointCloudGenerator(
                 chosen_cam_ids=chosen_cam_ids,
-                sparsity=pointcloud_config.get("sparsity", "full"),
-                filter_sky=pointcloud_config.get("filter_sky", True),
-                depth_consistency=pointcloud_config.get("depth_consistency", True),
-                downscale=pointcloud_config.get("downscale", 2),
+                sparsity=pointcloud_config["sparsity"],
+                filter_sky=pointcloud_config["filter_sky"],
+                depth_consistency=pointcloud_config["depth_consistency"],
+                downscale=pointcloud_config["downscale"],
+                dynamic_filter=pointcloud_config["dynamic_filter"],
+                dynamic_mask_key=pointcloud_config["dynamic_mask_key"],
                 device=device,
             )
         elif generator_type == "hybrid":
             # LiDAR生成器参数
-            lidar_sparsity = pointcloud_config.get("lidar_sparsity", "full")
+            if "lidar_sparsity" not in pointcloud_config:
+                raise ValueError("dataset.pointcloud.lidar_sparsity is required for hybrid generator.")
+            lidar_sparsity = pointcloud_config["lidar_sparsity"]
             
             # 单目生成器参数
-            monocular_chosen_cam_ids = pointcloud_config.get(
+            required_mono = [
                 "monocular_chosen_cam_ids",
-                data_cfg.pixel_source.get("cameras", [0])
-            )
-            monocular_sparsity = pointcloud_config.get("monocular_sparsity", "full")
-            monocular_filter_sky = pointcloud_config.get("monocular_filter_sky", True)
-            monocular_depth_consistency = pointcloud_config.get("monocular_depth_consistency", True)
-            monocular_downscale = pointcloud_config.get("monocular_downscale", 2)
+                "monocular_sparsity",
+                "monocular_filter_sky",
+                "monocular_depth_consistency",
+                "monocular_downscale",
+                "monocular_dynamic_filter",
+                "monocular_dynamic_mask_key",
+            ]
+            missing = [k for k in required_mono if k not in pointcloud_config]
+            if missing:
+                raise ValueError(
+                    f"Hybrid pointcloud missing required monocular config keys: {missing}"
+                )
+            monocular_chosen_cam_ids = pointcloud_config["monocular_chosen_cam_ids"]
+            monocular_sparsity = pointcloud_config["monocular_sparsity"]
+            monocular_filter_sky = pointcloud_config["monocular_filter_sky"]
+            monocular_depth_consistency = pointcloud_config["monocular_depth_consistency"]
+            monocular_downscale = pointcloud_config["monocular_downscale"]
+
+            if not bool(pointcloud_config["monocular_dynamic_filter"]):
+                raise ValueError(
+                    "Hybrid pointcloud requires monocular_dynamic_filter=true (no bbox fallback)."
+                )
+            if (
+                getattr(data_cfg, "pixel_source", None) is None
+                or not bool(data_cfg.pixel_source.get("load_dynamic_mask", False))
+            ):
+                raise ValueError(
+                    "Hybrid pointcloud requires data.pixel_source.load_dynamic_mask: true "
+                    "(monocular dynamic filtering)."
+                )
             
             # 融合参数
+            required_fusion = ["fusion_strategy", "dynamic_source", "downsample_dynamic"]
+            missing_fusion = [k for k in required_fusion if k not in pointcloud_config]
+            if missing_fusion:
+                raise ValueError(f"Hybrid pointcloud missing required fusion keys: {missing_fusion}")
             near_max_points = pointcloud_config.get("near_max_points", None)
             distant_max_points = pointcloud_config.get("distant_max_points", None)
-            fusion_strategy = pointcloud_config.get("fusion_strategy", "adaptive")
-            dynamic_source = pointcloud_config.get("dynamic_source", "lidar_only")
-            downsample_dynamic = pointcloud_config.get("downsample_dynamic", False)
+            fusion_strategy = pointcloud_config["fusion_strategy"]
+            dynamic_source = pointcloud_config["dynamic_source"]
+            downsample_dynamic = pointcloud_config["downsample_dynamic"]
             
             return HybridRGBPointCloudGenerator(
                 lidar_sparsity=lidar_sparsity,
@@ -445,6 +493,8 @@ class MultiSceneDataset:
                 monocular_filter_sky=monocular_filter_sky,
                 monocular_depth_consistency=monocular_depth_consistency,
                 monocular_downscale=monocular_downscale,
+                monocular_dynamic_filter=pointcloud_config["monocular_dynamic_filter"],
+                monocular_dynamic_mask_key=pointcloud_config["monocular_dynamic_mask_key"],
                 near_max_points=near_max_points,
                 distant_max_points=distant_max_points,
                 fusion_strategy=fusion_strategy,

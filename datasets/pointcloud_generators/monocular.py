@@ -1,5 +1,4 @@
 import logging
-from collections import defaultdict
 from typing import Dict, List, Literal, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
@@ -16,7 +15,11 @@ logger = logging.getLogger(__name__)
 class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
     """
     RGB point cloud generator that back-projects monocular depth from MultiSceneDataset.
-    Splits points into static background (world coords) and dynamic objects (local coords).
+    Generates static background points by back-projecting monocular depth.
+
+    Important (fast-fail, no backward compatibility):
+    - Dynamic objects are removed in the pixel domain using dynamic masks (e.g. image_infos['dynamic_masks']).
+    - This generator no longer produces per-instance dynamic pointclouds (returns empty dict).
     """
 
     def __init__(
@@ -26,6 +29,8 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
         filter_sky: bool = True,
         depth_consistency: bool = True,
         downscale: int = 2,
+        dynamic_filter: bool = True,
+        dynamic_mask_key: Literal["dynamic_masks", "human_masks", "vehicle_masks"] = "dynamic_masks",
         device: torch.device = torch.device("cpu"),
     ):
         super().__init__(
@@ -36,6 +41,8 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
             device=device,
         )
         self.chosen_cam_ids = chosen_cam_ids
+        self.dynamic_filter = bool(dynamic_filter)
+        self.dynamic_mask_key = str(dynamic_mask_key)
 
     def generate_pointcloud(
         self,
@@ -54,14 +61,6 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
         frame_indices = self._apply_sparsity_filter(frame_indices)
         if len(frame_indices) == 0:
             raise ValueError("No frames selected after sparsity filtering")
-
-        instance_mapping, instances_by_frame = self._get_instances_for_segment(
-            dataset, scene_id, segment_id, frame_indices, world_to_seg0
-        )
-        frame_to_instances = {
-            frame_idx: instances_by_frame[i]
-            for i, frame_idx in enumerate(frame_indices)
-        }
 
         frame_data_by_camera: Dict[int, List[Tuple[int, Dict]]] = {
             cam_id: [] for cam_id in self.chosen_cam_ids
@@ -106,7 +105,6 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
                 ]
 
         all_backgrounds: List[np.ndarray] = []
-        all_dynamic_objects: Dict[int, List[np.ndarray]] = defaultdict(list)
 
         for frame_idx in frame_indices:
             frame_points_world: List[np.ndarray] = []
@@ -136,25 +134,18 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
 
             if len(points_world) == 0:
                 continue
-
-            frame_instances = frame_to_instances.get(frame_idx, [])
-            background_frame, dynamic_frame = self._separate_static_dynamic(
-                points_world, colors, frame_instances
+            background_frame = (
+                np.concatenate([points_world, colors], axis=1).astype(np.float32, copy=False)
+                if len(points_world) > 0
+                else np.zeros((0, 6), dtype=np.float32)
             )
             all_backgrounds.append(background_frame)
-            for intid, pts in dynamic_frame.items():
-                all_dynamic_objects[intid].append(pts)
 
         background = (
             np.concatenate(all_backgrounds, axis=0)
             if len(all_backgrounds) > 0
             else np.zeros((0, 6), dtype=np.float32)
         )
-        dynamic_objects = {
-            intid: np.concatenate(points_list, axis=0)
-            for intid, points_list in all_dynamic_objects.items()
-            if len(points_list) > 0
-        }
         # Single-stage filtering without inside/outside split; distant/near划分交给上层根据 segment_aabb 完成
         if len(background) > 0:
             background_pts, background_colors = background[:, :3], background[:, 3:]
@@ -172,12 +163,14 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
             "frame_indices": frame_indices,
             "frames_used": len(all_backgrounds),
             "sparsity": self.sparsity,
+            "dynamic_filter": self.dynamic_filter,
+            "dynamic_mask_key": self.dynamic_mask_key,
         }
 
         return {
             "background": background,
-            "dynamic": dynamic_objects,
-            "instance_mapping": instance_mapping,
+            "dynamic": {},
+            "instance_mapping": {},
             "metadata": metadata,
         }
 
@@ -253,7 +246,18 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
         if depth is None:
             return None
 
-        sky_mask = image_infos.get("sky_mask")
+        sky_mask = image_infos.get("sky_masks")
+        if self.filter_sky and sky_mask is None:
+            raise ValueError(
+                "Monocular pointcloud requires image_infos['sky_masks'] when filter_sky is enabled."
+            )
+
+        dynamic_mask = image_infos.get(self.dynamic_mask_key)
+        if self.dynamic_filter and dynamic_mask is None:
+            raise ValueError(
+                f"Monocular pointcloud requires image_infos['{self.dynamic_mask_key}'] "
+                f"when dynamic_filter is enabled."
+            )
 
         return {
             "image": image_infos["pixels"],
@@ -261,6 +265,7 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
             "extrinsic": cam_infos["camera_to_world"],
             "intrinsic": cam_infos["intrinsics"],
             "sky_mask": sky_mask,
+            "dynamic_mask": dynamic_mask,
         }
 
     def _depth_consistency_check(
@@ -359,6 +364,7 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
         extrinsic = frame_data["extrinsic"]
         intrinsic = frame_data["intrinsic"]
         sky_mask = frame_data.get("sky_mask")
+        dynamic_mask = frame_data.get("dynamic_mask")
 
         rgb_np = rgb.cpu().numpy() if isinstance(rgb, torch.Tensor) else rgb
         depth_np = depth.cpu().numpy() if isinstance(depth, torch.Tensor) else depth
@@ -381,13 +387,26 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
         else:
             keep_mask = np.ones((H, W), dtype=bool)
 
+        # dynamic_mask is canonical **1=dynamic(ignore), 0=static(keep)** (float/bool).
+        if self.dynamic_filter:
+            if dynamic_mask is None:
+                raise ValueError(
+                    "dynamic_filter is enabled but dynamic_mask is missing in frame_data."
+                )
+            if isinstance(dynamic_mask, torch.Tensor):
+                dynamic_mask = dynamic_mask.cpu().numpy()
+            is_dynamic = dynamic_mask > 0.5
+            keep_dynamic_mask = ~is_dynamic
+        else:
+            keep_dynamic_mask = np.ones((H, W), dtype=bool)
+
         if consistency_mask is None:
             consistency_mask = np.ones((H, W), dtype=bool)
 
         if downscale_mask is not None:
-            final_mask = consistency_mask & keep_mask & downscale_mask
+            final_mask = consistency_mask & keep_mask & keep_dynamic_mask & downscale_mask
         else:
-            final_mask = consistency_mask & keep_mask
+            final_mask = consistency_mask & keep_mask & keep_dynamic_mask
 
         kept = np.argwhere(final_mask)
         if len(kept) == 0:

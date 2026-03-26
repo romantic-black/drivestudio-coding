@@ -16,7 +16,7 @@ data:
   start_timestep: 0 # which timestep to start from
   end_timestep: -1 # which timestep to end at, -1 means the last timestep
   preload_device: cpu # choose from ["cpu", "cuda"], cache the data on this device
-  sky_mask_semantics: one_is_non_sky
+  sky_mask_semantics: one_is_sky
   pixel_source: # image source and object annotations
     type: datasets.argoverse.argoverse_sourceloader.ArgoVersePixelSource
     cameras: [0, 1, 2, 3, 4, 5, 6] # which cameras to use

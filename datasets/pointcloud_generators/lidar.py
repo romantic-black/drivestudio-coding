@@ -366,6 +366,7 @@ class LiDARRGBPointCloudGenerator(RGBPointCloudGenerator):
             filter_sky=False,
             depth_consistency=False,
             downscale=1,
+            dynamic_filter=False,
             device=self.device,
         )
         return helper._get_instances_for_segment(
