@@ -65,6 +65,7 @@ def _backward_to_render_params_bg_rigid_distant(
     proxies_rigid_world: Optional[Dict[str, torch.Tensor]],
     render_params_distant: Optional[Dict[str, torch.Tensor]],
     proxies_distant: Optional[Dict[str, torch.Tensor]],
+    rigid_world_proxy_pairs: Optional[List[Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]]] = None,
 ) -> None:
     def _grad_or_zero(t: torch.Tensor) -> torch.Tensor:
         return t.grad if t.grad is not None else torch.zeros_like(t)
@@ -83,7 +84,29 @@ def _backward_to_render_params_bg_rigid_distant(
         _grad_or_zero(proxies_bg["opacities_p"]),
         _grad_or_zero(proxies_bg["colors_p"]),
     ]
-    if render_params_rigid_world is not None and proxies_rigid_world is not None:
+    if rigid_world_proxy_pairs is not None:
+        if render_params_rigid_world is not None or proxies_rigid_world is not None:
+            raise ValueError("Use either rigid_world_proxy_pairs or single rigid world/proxy pair, not both.")
+        for rp_w, px_w in rigid_world_proxy_pairs:
+            render_tensors.extend(
+                [
+                    rp_w["means_r"],
+                    rp_w["scales_r"],
+                    rp_w["quats_r"],
+                    rp_w["opacities_r"],
+                    rp_w["colors_r"],
+                ]
+            )
+            grad_tensors.extend(
+                [
+                    _grad_or_zero(px_w["means_p"]),
+                    _grad_or_zero(px_w["scales_p"]),
+                    _grad_or_zero(px_w["quats_p"]),
+                    _grad_or_zero(px_w["opacities_p"]),
+                    _grad_or_zero(px_w["colors_p"]),
+                ]
+            )
+    elif render_params_rigid_world is not None and proxies_rigid_world is not None:
         render_tensors.extend(
             [
                 render_params_rigid_world["means_r"],
@@ -443,6 +466,8 @@ class MinimalStreetForwardStage4_0(MinimalStreetForwardStage3_3):
         source_images: List[torch.Tensor],
         height: int,
         width: int,
+        return_accumulated_weights: bool = False,
+        backprojector_override=None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         num_gaussians = int(gaussians["means"].shape[0])
         if num_gaussians == 0:
@@ -464,16 +489,20 @@ class MinimalStreetForwardStage4_0(MinimalStreetForwardStage3_3):
             ).permute(0, 2, 3, 1)
         multi = torch.cat([image_batch, rendered_batch], dim=-1)
         features_2d = self.image_feature_extractor(multi)
-        feat_2d_all = self.alpha_t_extractor.render_and_backproject_streaming(
+        back_out = self.alpha_t_extractor.render_and_backproject_streaming(
             gaussians=gaussians,
             cameras=source_views,
             features_2d=features_2d,
             height=height,
             width=width,
             num_gaussians=num_gaussians,
-            backprojector=self.feature_backprojector,
+            backprojector=backprojector_override if backprojector_override is not None else self.feature_backprojector,
+            return_accumulated_weights=return_accumulated_weights,
         )
-        return feat_2d_all, None
+        if return_accumulated_weights:
+            feat_2d_all, acc_w = back_out
+            return feat_2d_all, acc_w
+        return back_out, None
 
     def _render_params_from_offsets_rigid_local(
         self, node_state_rigid: NodeStateRigid, offsets: Dict[str, torch.Tensor]
@@ -875,6 +904,7 @@ class MinimalStreetForwardStage4_0(MinimalStreetForwardStage3_3):
                 out.get("_proxies_rigid_world"),
                 out.get("_render_params_distant"),
                 out.get("_proxies_distant"),
+                rigid_world_proxy_pairs=out.get("_rigid_world_proxy_pairs"),
             )
         self.optimizer.step()
         if "_cache_key" in out:
@@ -892,9 +922,9 @@ class MinimalStreetForwardStage4_0(MinimalStreetForwardStage3_3):
             if out.get("_node_state_distant") is not None and out.get("_render_params_distant") is not None:
                 self._update_node_state_distant(out["_node_state_distant"], out["_render_params_distant"])
             if out.get("_node_state_rigid") is not None and out.get("_render_params_rigid_local") is not None:
-                valid_idx = out.get("_rigid_valid_idx")
+                valid_idx = out.get("_rigid_writeback_idx", out.get("_rigid_valid_idx"))
                 if valid_idx is None:
-                    raise ValueError("Internal error: missing _rigid_valid_idx for rigid node update.")
+                    raise ValueError("Internal error: missing _rigid_writeback_idx/_rigid_valid_idx for rigid node update.")
                 self._update_node_state_rigid_local(out["_node_state_rigid"], out["_render_params_rigid_local"], valid_idx)
             if self.reset_node_state_interval > 0 and step % self.reset_node_state_interval == 0:
                 self.reset_node_state()

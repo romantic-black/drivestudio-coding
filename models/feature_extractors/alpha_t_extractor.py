@@ -8,7 +8,7 @@ Weights are detached by design to avoid coupling gradients through the rasterize
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -331,16 +331,26 @@ class AlphaTWeightExtractor:
         width: int,
         num_gaussians: int,
         backprojector: "FeatureBackprojector",
-    ) -> torch.Tensor:
+        return_accumulated_weights: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Second render pass: stream per-view weights and accumulate backprojection.
+
+        When return_accumulated_weights is True, also returns per-Gaussian **support**
+        accumulated weights over views, shape [N]. Support weights are defined as the
+        *unfiltered* sum of (T * alpha) over gaussian-pixel pairs, and therefore do NOT
+        depend on FeatureBackprojector.weight_threshold (which may be used as a feature
+        aggregation optimization).
         """
         device = features_2d.device
         channels = features_2d.shape[-1]
         eps = getattr(backprojector, "eps", 1e-8)
 
         accumulated_feat = torch.zeros(num_gaussians, channels, device=device)
-        accumulated_weight = torch.zeros(num_gaussians, device=device)
+        accumulated_weight_feature = torch.zeros(num_gaussians, device=device)
+        accumulated_weight_support = (
+            torch.zeros(num_gaussians, device=device) if return_accumulated_weights else None
+        )
 
         for i, cam in enumerate(cameras):
             cam_ctw = cam.camtoworlds if hasattr(cam, "camtoworlds") else cam["camtoworlds"]
@@ -371,17 +381,37 @@ class AlphaTWeightExtractor:
                 weight_info = self.extract_single_weight(meta, height, width)
                 del meta
 
-            feat_sum, weight_sum = backprojector.backproject_single_view(
-                features_2d[i],
-                weight_info,
-                height,
-                width,
-                num_gaussians,
-            )
+            if return_accumulated_weights:
+                feat_sum, weight_sum_feature, weight_sum_support = backprojector.backproject_single_view(
+                    features_2d[i],
+                    weight_info,
+                    height,
+                    width,
+                    num_gaussians,
+                    return_support_weight=True,
+                )
+            else:
+                feat_sum, weight_sum_feature = backprojector.backproject_single_view(
+                    features_2d[i],
+                    weight_info,
+                    height,
+                    width,
+                    num_gaussians,
+                )
             del weight_info
 
             accumulated_feat += feat_sum
-            accumulated_weight += weight_sum
-            del feat_sum, weight_sum
+            accumulated_weight_feature += weight_sum_feature
+            if return_accumulated_weights:
+                if accumulated_weight_support is None:
+                    raise RuntimeError("Internal error: accumulated_weight_support is None.")
+                accumulated_weight_support += weight_sum_support
+                del weight_sum_support
+            del feat_sum, weight_sum_feature
 
-        return accumulated_feat / (accumulated_weight.unsqueeze(-1) + eps)
+        feat_out = accumulated_feat / (accumulated_weight_feature.unsqueeze(-1) + eps)
+        if return_accumulated_weights:
+            if accumulated_weight_support is None:
+                raise RuntimeError("Internal error: accumulated_weight_support is None.")
+            return feat_out, accumulated_weight_support
+        return feat_out

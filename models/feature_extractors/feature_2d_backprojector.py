@@ -4,7 +4,7 @@ Backproject 2D features to Gaussians using alpha-T weights.
 
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -123,34 +123,54 @@ class FeatureBackprojector:
         height: int,
         width: int,
         num_gaussians: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return_support_weight: bool = False,
+    ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
-        Backproject a single view: return weighted feature sums and weight sums.
+        Backproject a single view.
+
+        Returns:
+            - feat_sum: [N, C] weighted feature sum (after optional threshold filtering)
+            - weight_sum_feature: [N] sum of weights used for feature aggregation (after filtering)
+            - weight_sum_support (optional): [N] sum of *unfiltered* weights (support strength)
+
+        Notes:
+            `weight_threshold` is treated as a feature-aggregation optimization only. Support
+            (weight_sum_support) must not depend on this threshold, otherwise downstream
+            masks (e.g., `mask_src_feat_valid`) become sensitive to an approximation knob.
         """
-        gaussian_ids = weight_info["gaussian_ids"].long()
-        pixel_ids = weight_info["pixel_ids"].long()
-        weights = weight_info["weights"].detach()
+        gaussian_ids_all = weight_info["gaussian_ids"].long()
+        pixel_ids_all = weight_info["pixel_ids"].long()
+        weights_all = weight_info["weights"].detach()
 
         device = feat_2d.device
         channels = feat_2d.shape[-1]
 
-        if gaussian_ids.numel() == 0:
-            return (
-                torch.zeros(num_gaussians, channels, device=device, dtype=feat_2d.dtype),
-                torch.zeros(num_gaussians, device=device, dtype=feat_2d.dtype),
-            )
+        zeros_feat = torch.zeros(num_gaussians, channels, device=device, dtype=feat_2d.dtype)
+        zeros_w = torch.zeros(num_gaussians, device=device, dtype=feat_2d.dtype)
 
+        if gaussian_ids_all.numel() == 0:
+            if return_support_weight:
+                return zeros_feat, zeros_w, zeros_w
+            return zeros_feat, zeros_w
+
+        weight_sum_support = zeros_w
+        if return_support_weight:
+            weight_sum_support = torch.zeros(num_gaussians, device=device, dtype=feat_2d.dtype)
+            weight_sum_support.scatter_add_(0, gaussian_ids_all, weights_all)
+
+        gaussian_ids = gaussian_ids_all
+        pixel_ids = pixel_ids_all
+        weights = weights_all
         if self.weight_threshold > 0.0:
-            mask = weights >= self.weight_threshold
-            gaussian_ids = gaussian_ids[mask]
-            pixel_ids = pixel_ids[mask]
-            weights = weights[mask]
+            mask = weights_all >= self.weight_threshold
+            gaussian_ids = gaussian_ids_all[mask]
+            pixel_ids = pixel_ids_all[mask]
+            weights = weights_all[mask]
 
         if gaussian_ids.numel() == 0:
-            return (
-                torch.zeros(num_gaussians, channels, device=device, dtype=feat_2d.dtype),
-                torch.zeros(num_gaussians, device=device, dtype=feat_2d.dtype),
-            )
+            if return_support_weight:
+                return zeros_feat, zeros_w, weight_sum_support
+            return zeros_feat, zeros_w
 
         sampled = self._sample_features_single_view(feat_2d, pixel_ids, height, width)
         weighted_feat = sampled * weights.unsqueeze(-1)
@@ -158,9 +178,11 @@ class FeatureBackprojector:
         feat_sum = torch.zeros(num_gaussians, channels, device=device, dtype=feat_2d.dtype)
         feat_sum.scatter_add_(0, gaussian_ids.unsqueeze(-1).expand(-1, channels), weighted_feat)
 
-        weight_sum = torch.zeros(num_gaussians, device=device, dtype=feat_2d.dtype)
-        weight_sum.scatter_add_(0, gaussian_ids, weights)
-        return feat_sum, weight_sum
+        weight_sum_feature = torch.zeros(num_gaussians, device=device, dtype=feat_2d.dtype)
+        weight_sum_feature.scatter_add_(0, gaussian_ids, weights)
+        if return_support_weight:
+            return feat_sum, weight_sum_feature, weight_sum_support
+        return feat_sum, weight_sum_feature
 
     def backproject(
         self,

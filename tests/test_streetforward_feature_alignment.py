@@ -112,9 +112,15 @@ class _DummyAlphaT:
     def render_rgb_only(self, gaussians, cameras, height: int, width: int):
         return [torch.zeros(height, width, 3, device=gaussians["means"].device) for _ in cameras]
 
-    def render_and_backproject_streaming(self, gaussians, cameras, features_2d, height, width, num_gaussians, backprojector):
+    def render_and_backproject_streaming(
+        self, gaussians, cameras, features_2d, height, width, num_gaussians, backprojector, return_accumulated_weights=False, **kwargs
+    ):
         vals = torch.arange(num_gaussians, device=gaussians["means"].device, dtype=torch.float32).unsqueeze(1)
-        return vals.repeat(1, self.feat_dim)
+        feat = vals.repeat(1, self.feat_dim)
+        if return_accumulated_weights:
+            acc = torch.ones(num_gaussians, device=gaussians["means"].device, dtype=torch.float32)
+            return feat, acc
+        return feat
 
 
 def _make_config(use_2d: bool = False):
