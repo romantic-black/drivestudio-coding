@@ -6,6 +6,7 @@ mask_src_feat_valid from alpha-T backprojection accumulated weights (not feature
 from __future__ import annotations
 
 import logging
+import time
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -155,6 +156,66 @@ class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
             out = {k: torch.cat([out[k], render_params_distant[k]], dim=0) for k in keys}
         return out
 
+    @staticmethod
+    def _stat_tensor(t: Optional[torch.Tensor]) -> Dict[str, float]:
+        if t is None or t.numel() == 0:
+            return {"mean": 0.0, "std": 0.0, "max": 0.0}
+        x = t.detach().float()
+        return {
+            "mean": float(x.mean().item()),
+            "std": float(x.std(unbiased=False).item()),
+            "max": float(x.abs().max().item()),
+        }
+
+    def _collect_offset_stats(
+        self,
+        offsets_bg: Optional[Dict[str, torch.Tensor]],
+        offsets_rigid: Optional[Dict[str, torch.Tensor]],
+    ) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        for branch, offsets in (("bg", offsets_bg), ("rigid", offsets_rigid)):
+            for key in ("offset_pos", "offset_scales", "offset_opacity"):
+                stats = self._stat_tensor(None if offsets is None else offsets.get(key))
+                out[f"{branch}_{key}_mean"] = stats["mean"]
+                out[f"{branch}_{key}_std"] = stats["std"]
+                out[f"{branch}_{key}_max"] = stats["max"]
+        return out
+
+    def _collect_hidden_norms(
+        self,
+        h_new_bg: Optional[torch.Tensor],
+        h_new_distant: Optional[torch.Tensor],
+        h_new_rigid: Optional[torch.Tensor],
+    ) -> Dict[str, float]:
+        def _mean_norm(t: Optional[torch.Tensor]) -> float:
+            if t is None or t.numel() == 0:
+                return 0.0
+            return float(torch.norm(t.detach().float(), dim=-1).mean().item())
+
+        return {
+            "hidden_norm_bg_mean": _mean_norm(h_new_bg),
+            "hidden_norm_distant_mean": _mean_norm(h_new_distant),
+            "hidden_norm_rigid_mean": _mean_norm(h_new_rigid),
+        }
+
+    def _compute_branch_grad_norms(self) -> Dict[str, float]:
+        sq_sum = {"bg": 0.0, "distant": 0.0, "rigid": 0.0}
+        for name, param in self.named_parameters():
+            if param.grad is None:
+                continue
+            g2 = float(param.grad.detach().float().pow(2).sum().item())
+            if "distant" in name:
+                sq_sum["distant"] += g2
+            elif "rigid" in name:
+                sq_sum["rigid"] += g2
+            else:
+                sq_sum["bg"] += g2
+        return {
+            "grad_norm_bg": float(sq_sum["bg"] ** 0.5),
+            "grad_norm_distant": float(sq_sum["distant"] ** 0.5),
+            "grad_norm_rigid": float(sq_sum["rigid"] ** 0.5),
+        }
+
     def forward(self, batch: Dict) -> Dict[str, Any]:
         targets = batch["targets"]
         if not targets:
@@ -191,6 +252,9 @@ class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
             mask_src_rigid = self._rigid_point_valid_mask(node_state_rigid, source_frame_idx)
             for F in unique_target_frames:
                 mask_tgt_by_frame[F] = self._rigid_point_valid_mask(node_state_rigid, F)
+        else:
+            for F in unique_target_frames:
+                mask_tgt_by_frame[F] = torch.zeros(N_rigid, dtype=torch.bool, device=self.device)
 
         mask_any_tgt = torch.zeros(N_rigid, dtype=torch.bool, device=self.device)
         for m in mask_tgt_by_frame.values():
@@ -252,6 +316,7 @@ class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
         render_params_rigid_local: Optional[Dict[str, torch.Tensor]] = None
         render_params_rigid_world_example: Optional[Dict[str, torch.Tensor]] = None
         h_new_rigid: Optional[torch.Tensor] = None
+        offsets_rigid: Optional[Dict[str, torch.Tensor]] = None
         if (
             node_state_rigid is not None
             and U.numel() > 0
@@ -355,8 +420,20 @@ class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
                     )
                 prox_r: Optional[Dict[str, torch.Tensor]] = None
                 if rw is not None and training:
-                    prox_r = _create_proxy_params(rw)
-                    rigid_pairs_l.append((rw, prox_r))
+                    # If this frame has no trainable rigid points, rw is frozen-only and detached.
+                    # Keep rigid in render merge, but skip proxy/backward pair to avoid autograd
+                    # calling backward on tensors that do not require grad.
+                    if idx_tr.numel() > 0:
+                        prox_r = _create_proxy_params(rw)
+                        rigid_pairs_l.append((rw, prox_r))
+                    else:
+                        prox_r = {
+                            "means_p": rw["means_r"],
+                            "scales_p": rw["scales_r"],
+                            "quats_p": rw["quats_r"],
+                            "opacities_p": rw["opacities_r"],
+                            "colors_p": rw["colors_r"],
+                        }
                 if training:
                     merged_f = _merge_params_bg_rigid_distant(proxies_bg_l, prox_r, proxies_dist_l)
                 else:
@@ -449,6 +526,7 @@ class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
         loss_total_list: List[torch.Tensor] = []
 
         frame_losses: List[torch.Tensor] = []
+        frame_loss_map: Dict[int, float] = {}
         eff_frames = 0
         for F in sorted_frames:
             group = by_frame[F]
@@ -483,7 +561,9 @@ class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
                 loss_total_list.append(total_i)
                 view_losses.append(total_i)
             if view_losses:
-                frame_losses.append(torch.stack(view_losses).mean())
+                frame_loss = torch.stack(view_losses).mean()
+                frame_losses.append(frame_loss)
+                frame_loss_map[int(F)] = float(frame_loss.detach().item())
                 eff_frames += 1
 
         if frame_losses:
@@ -496,6 +576,12 @@ class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
         ssim_mean = torch.stack(loss_ssim_list).mean() if loss_ssim_list else loss * 0.0
         mask_mean = torch.stack(loss_mask_list).mean() if loss_mask_list else loss * 0.0
         entropy_mean = torch.stack(loss_entropy_list).mean() if loss_entropy_list else loss * 0.0
+        offset_stats = self._collect_offset_stats(offsets_bg, offsets_rigid)
+        hidden_stats = self._collect_hidden_norms(h_new_bg, h_new_distant, h_new_rigid)
+        rigid_src_feat_valid = int(mask_src_feat_valid.sum().item())
+        rigid_update_count = int(U.numel())
+        rigid_update_ratio = float(rigid_update_count / max(int(N_rigid), 1))
+        rigid_update_among_feat_valid = float(rigid_update_count / max(rigid_src_feat_valid, 1))
 
         return {
             "loss": loss,
@@ -525,6 +611,11 @@ class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
             "_num_target_frames": len(sorted_frames),
             "_loss_effective_frames": eff_frames,
             "_num_rigid_total": N_rigid,
+            "_frame_loss_map": frame_loss_map,
+            "_offset_stats": offset_stats,
+            "_hidden_stats": hidden_stats,
+            "_rigid_update_ratio": rigid_update_ratio,
+            "_rigid_update_among_feat_valid": rigid_update_among_feat_valid,
             "_cache_key": key,
             "pred_rgbs": pred_rgbs_t,
             "gt_images": gt_images_t,
@@ -532,10 +623,27 @@ class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
             "gt_image": gt_images_t[0],
         }
 
-    def train_step(self, batch: Dict, step: Optional[int] = None) -> Dict[str, Any]:
+    def train_step(
+        self,
+        batch: Dict,
+        step: Optional[int] = None,
+        profile_phase_timing: bool = False,
+        sync_cuda_timing: bool = False,
+    ) -> Dict[str, Any]:
         self.train()
+        timing_ms: Dict[str, float] = {
+            "forward_ms": 0.0,
+            "backward_ms": 0.0,
+            "optimizer_ms": 0.0,
+        }
+        t0 = time.perf_counter()
         self.optimizer.zero_grad()
         out = self.forward(batch)
+        t1 = time.perf_counter()
+        if profile_phase_timing:
+            if sync_cuda_timing and torch.cuda.is_available():
+                torch.cuda.synchronize()
+            timing_ms["forward_ms"] = float((t1 - t0) * 1000.0)
         if torch.is_tensor(out.get("loss")):
             out["loss"].backward()
         if out.get("proxies") is not None:
@@ -548,7 +656,18 @@ class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
                 out.get("_proxies_distant"),
                 rigid_world_proxy_pairs=out.get("_rigid_world_proxy_pairs"),
             )
+        grad_norms = self._compute_branch_grad_norms()
+        t2 = time.perf_counter()
+        if profile_phase_timing:
+            if sync_cuda_timing and torch.cuda.is_available():
+                torch.cuda.synchronize()
+            timing_ms["backward_ms"] = float((t2 - t1) * 1000.0)
         self.optimizer.step()
+        t3 = time.perf_counter()
+        if profile_phase_timing:
+            if sync_cuda_timing and torch.cuda.is_available():
+                torch.cuda.synchronize()
+            timing_ms["optimizer_ms"] = float((t3 - t2) * 1000.0)
         if "_cache_key" in out:
             key = out["_cache_key"]
             if out.get("_h_new_bg") is not None:
@@ -581,8 +700,20 @@ class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
         num_gaussians_rigid = int(node_state_rigid.means.shape[0]) if node_state_rigid is not None else 0
         num_rigid_valid_src = int(out.get("_num_rigid_valid_src", 0))
         num_rigid_total = int(out.get("_num_rigid_total", num_gaussians_rigid))
+        writeback_idx = out.get("_rigid_writeback_idx")
+        writeback_count = int(writeback_idx.numel()) if writeback_idx is not None else 0
+        writeback_rigid_ratio = float(writeback_count / max(num_rigid_total, 1))
+        hidden_stats = out.get("_hidden_stats", {})
+        offset_stats = out.get("_offset_stats", {})
+        frame_loss_map = out.get("_frame_loss_map", {})
         return {
             "loss": out["loss"].item() if torch.is_tensor(out["loss"]) else out["loss"],
+            "loss_l1": out["loss_l1"].item() if torch.is_tensor(out.get("loss_l1")) else float(out.get("loss_l1", 0.0)),
+            "loss_ssim": out["loss_ssim"].item() if torch.is_tensor(out.get("loss_ssim")) else float(out.get("loss_ssim", 0.0)),
+            "loss_mask": out["loss_mask"].item() if torch.is_tensor(out.get("loss_mask")) else float(out.get("loss_mask", 0.0)),
+            "loss_opacity_entropy": out["loss_opacity_entropy"].item()
+            if torch.is_tensor(out.get("loss_opacity_entropy"))
+            else float(out.get("loss_opacity_entropy", 0.0)),
             "pred_rgbs": out["pred_rgbs"],
             "gt_images": out["gt_images"],
             "pred_rgb": out["pred_rgb"],
@@ -595,10 +726,20 @@ class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
             "rigid_valid_ratio": float(num_rigid_valid_src / max(num_rigid_total, 1)),
             "num_rigid_src_feat_valid": int(out.get("_num_rigid_src_feat_valid", 0)),
             "num_rigid_update": int(out.get("_num_rigid_update", 0)),
+            "rigid_update_ratio": float(out.get("_rigid_update_ratio", 0.0)),
+            "rigid_update_among_feat_valid": float(out.get("_rigid_update_among_feat_valid", 0.0)),
+            "writeback_rigid_ratio": writeback_rigid_ratio,
             "num_target_frames": int(out.get("_num_target_frames", 0)),
             "loss_effective_frames": int(out.get("_loss_effective_frames", 0)),
             "num_targets": len(batch.get("targets", [])),
             "num_source_views": len(batch.get("source_views", [])),
+            "frame_loss_map": frame_loss_map,
+            "hidden_norm_bg_mean": float(hidden_stats.get("hidden_norm_bg_mean", 0.0)),
+            "hidden_norm_distant_mean": float(hidden_stats.get("hidden_norm_distant_mean", 0.0)),
+            "hidden_norm_rigid_mean": float(hidden_stats.get("hidden_norm_rigid_mean", 0.0)),
+            **{k: float(v) for k, v in offset_stats.items()},
+            **grad_norms,
+            **timing_ms,
         }
 
 

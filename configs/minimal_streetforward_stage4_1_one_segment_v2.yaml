@@ -1,11 +1,87 @@
-# Minimal StreetForward Stage 4.1: multi target-frame rigid, mask_src_feat_valid from alpha-T backproject weight sum
+# Minimal StreetForward Stage 4.1 — 单段在线训练（Scheduler v2 + MultiSceneDatasetV2）
+#
+# 用法（示例）:
+#   conda run -n drivestudio-new env PYTHONPATH=/root/drivestudio-coding \
+#   python tools/train_minimal_streetforward_stage4_1_one_segment.py \
+#     --config_file configs/minimal_streetforward_stage4_1_one_segment_v2.yaml
 
-output_name: minimal_sf_stage4_1
+output_name: minimal_sf_stage4_1_one_segment_v2
 
-data: {}
+data:
+  data_root: "/root/autodl-tmp/nuScenes/"
+  dataset: "nuscenes"
+  start_timestep: 0
+  end_timestep: -1
+  preload_device: cpu
+  sky_mask_semantics: one_is_sky
+  train_scene_ids: [1]
+  eval_scene_ids: []
+
+  pixel_source:
+    type: datasets.nuscenes.nuscenes_sourceloader.NuScenesPixelSource
+    cameras: [0, 1, 2]
+    downscale_when_loading: [3, 3, 3]
+    downscale: 1
+    undistort: False
+    test_image_stride: 0
+    max_test_images: 4
+    load_sky_mask: true
+    load_dynamic_mask: true
+    load_depth_maps: true
+    load_objects: true
+    load_smpl: false
+    sampler:
+      buffer_downscale: 8
+      buffer_ratio: 0.5
+      start_enhance_weight: 3
+
+  lidar_source:
+    type: datasets.nuscenes.nuscenes_sourceloader.NuScenesLiDARSource
+    load_lidar: true
+    lidar_downsample_factor: 4
+    lidar_percentile: 0.02
 
 dataset:
-  segment_aabb: [[-40.0, -20.0, -20.0], [40.0, 4.8, 70.0]]
+  num_source_keyframes: 1
+  num_target_keyframes: 6
+  segment_overlap_ratio: 0.2
+  min_keyframes_per_scene: 2
+  min_keyframes_per_segment: 2
+  preload_scene_count: 3
+
+  segment_aabb:
+    - [-40.0, -20.0, -20.0]
+    - [40.0, 4.8, 70.0]
+
+  pointcloud:
+    type: "hybrid"
+    lidar_sparsity: full
+    monocular_chosen_cam_ids: [0, 1, 2]
+    monocular_sparsity: full
+    monocular_filter_sky: true
+    monocular_depth_consistency: false
+    monocular_downscale: 2
+    monocular_dynamic_filter: true
+    monocular_dynamic_mask_key: dynamic_masks
+    near_max_points: 400000
+    distant_max_points: 400000
+    fusion_strategy: merge
+    dynamic_source: lidar_only
+    downsample_dynamic: false
+    background_downsample_method: uniform
+
+one_segment:
+  scene_id: 1
+  segment_id: 0
+  include_test: true
+
+scheduler_v2:
+  alpha_steps_per_keyframe: 4
+  min_steps_per_segment: 12
+  max_steps_per_segment: 48
+  source_hold_steps: 4
+  num_target_frames_total: 6
+  target_include_source: true
 
 model:
   scale_init_value: 0.1
@@ -81,7 +157,6 @@ model:
         freeze_quat: true
 
     rigid:
-      # Per-Gaussian sum of alpha-T weights over source views; feature validity must NOT use ||feat||.
       src_backproject_support_min: 1.0e-6
       freeze_means: false
       init:
@@ -131,19 +206,6 @@ training:
   log_interval: 50
   save_checkpoint_freq: 500
   seed: 42
-  view_selection:
-    mode: explicit
-    source:
-      - { frame_idx: 111, cam_id: 0 }
-      - { frame_idx: 111, cam_id: 1 }
-      - { frame_idx: 111, cam_id: 2 }
-    target:
-      - { frame_idx: 111, cam_id: 0 }
-      - { frame_idx: 111, cam_id: 1 }
-      - { frame_idx: 111, cam_id: 2 }
-      - { frame_idx: 50, cam_id: 0 }
-      - { frame_idx: 50, cam_id: 1 }
-      - { frame_idx: 50, cam_id: 2 }
 
 eval:
   enable_psnr: true

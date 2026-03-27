@@ -131,6 +131,60 @@ def _compute_metrics(
     return out
 
 
+def _build_minimal_source_stack_from_dataset_source(
+    source_data: Dict,
+    device: torch.device,
+) -> Dict[str, Any]:
+    """Build source_views / source_images (and optional per-view masks) from batch['source'] (MultiSceneDataset)."""
+    images = source_data["image"]
+    n = int(images.shape[0])
+    extrinsics = source_data["extrinsics"]
+    intrinsics = source_data["intrinsics"]
+    frame_indices = source_data.get("frame_indices")
+    source_views: List[Any] = []
+    source_images: List[torch.Tensor] = []
+    for i in range(n):
+        view = type(
+            "View",
+            (),
+            {
+                "camtoworlds": extrinsics[i].to(device),
+                "Ks": intrinsics[i][:3, :3].unsqueeze(0).to(device),
+            },
+        )()
+        source_views.append(view)
+        source_images.append(images[i].to(device))
+    sfi = 0
+    if frame_indices is not None and int(frame_indices.shape[0]) > 0:
+        sfi = int(frame_indices[0].item())
+    out: Dict[str, Any] = {
+        "source_views": source_views,
+        "source_images": source_images,
+        "source_frame_idx": sfi,
+    }
+    src_sky = source_data.get("sky_mask")
+    src_vd = source_data.get("viewdirs")
+    src_ego = source_data.get("egocar_mask")
+    if src_sky is not None and src_sky.shape[0] >= n:
+        out["source_sky_mask"] = [src_sky[i].to(device) for i in range(n)]
+    if src_vd is not None and src_vd.shape[0] >= n:
+        out["source_viewdirs"] = [src_vd[i].to(device) for i in range(n)]
+    if src_ego is not None and src_ego.shape[0] >= n:
+        out["source_egocar_mask"] = [src_ego[i].to(device) for i in range(n)]
+    return out
+
+
+def _finalize_test_frame_indices_for_minimal(
+    test_frame_indices: List[int],
+    targets_minimal: List[Dict],
+) -> List[int]:
+    """Replace sentinel -1 with first training target frame when batch['test'] omits frame_indices."""
+    if not test_frame_indices:
+        return test_frame_indices
+    fb = int(targets_minimal[0]["frame_idx"]) if targets_minimal else 0
+    return [fb if x < 0 else x for x in test_frame_indices]
+
+
 def convert_batch_to_minimal_format(
     batch: Dict,
     device: torch.device,
@@ -175,9 +229,11 @@ def convert_batch_to_minimal_format(
             )
         test_views: List[Any] = []
         test_images: List[torch.Tensor] = []
+        test_frame_indices: List[int] = []
         test_data = batch.get("test")
         if isinstance(test_data, dict) and "image" in test_data and test_data["image"].numel() > 0:
             num_test = int(test_data["image"].shape[0])
+            fi = test_data.get("frame_indices")
             for i in range(num_test):
                 view = type(
                     "View",
@@ -189,6 +245,10 @@ def convert_batch_to_minimal_format(
                 )()
                 test_views.append(view)
                 test_images.append(test_data["image"][i].to(device))
+                if fi is not None and hasattr(fi, "shape") and int(fi.shape[0]) > i:
+                    test_frame_indices.append(int(fi[i].item()))
+                else:
+                    test_frame_indices.append(-1)
         if include_source_for_2d:
             targets_minimal, source_views, source_images, source_frame_idx = build_explicit_minimal_batch_parts(
                 batch, device, explicit
@@ -214,6 +274,8 @@ def convert_batch_to_minimal_format(
                     source_viewdirs.append(src_vd[row].to(device))
                 if src_ego is not None:
                     source_egocar_masks.append(src_ego[row].to(device))
+            if test_frame_indices:
+                test_frame_indices = _finalize_test_frame_indices_for_minimal(test_frame_indices, targets_minimal)
             return {
                 "scene_id": scene_id,
                 "segment_id": segment_id,
@@ -221,6 +283,7 @@ def convert_batch_to_minimal_format(
                 "targets": targets_minimal,
                 "test_views": test_views,
                 "test_images": test_images,
+                **({"test_frame_indices": test_frame_indices} if test_frame_indices else {}),
                 "source_views": source_views,
                 "source_images": source_images,
                 "source_frame_idx": int(source_frame_idx),
@@ -230,6 +293,8 @@ def convert_batch_to_minimal_format(
                 **({"source_egocar_mask": source_egocar_masks} if source_egocar_masks else {}),
             }
         targets_minimal = build_explicit_targets_only(batch, device, explicit)
+        if test_frame_indices:
+            test_frame_indices = _finalize_test_frame_indices_for_minimal(test_frame_indices, targets_minimal)
         return {
             "scene_id": scene_id,
             "segment_id": segment_id,
@@ -237,6 +302,7 @@ def convert_batch_to_minimal_format(
             "targets": targets_minimal,
             "test_views": test_views,
             "test_images": test_images,
+            **({"test_frame_indices": test_frame_indices} if test_frame_indices else {}),
             **({"dynamic_info": batch.get("dynamic_info")} if batch.get("dynamic_info") is not None else {}),
         }
 
@@ -304,9 +370,11 @@ def convert_batch_to_minimal_format(
 
     test_views: List[Any] = []
     test_images: List[torch.Tensor] = []
+    test_frame_indices: List[int] = []
     test_data = batch.get("test")
     if isinstance(test_data, dict) and "image" in test_data and test_data["image"].numel() > 0:
         num_test = int(test_data["image"].shape[0])
+        fi = test_data.get("frame_indices")
         for i in range(num_test):
             view = type(
                 "View",
@@ -318,6 +386,12 @@ def convert_batch_to_minimal_format(
             )()
             test_views.append(view)
             test_images.append(test_data["image"][i].to(device))
+            if fi is not None and hasattr(fi, "shape") and int(fi.shape[0]) > i:
+                test_frame_indices.append(int(fi[i].item()))
+            else:
+                test_frame_indices.append(-1)
+    if test_frame_indices:
+        test_frame_indices = _finalize_test_frame_indices_for_minimal(test_frame_indices, targets_minimal)
 
     result: Dict = {
         "scene_id": scene_id,
@@ -326,27 +400,40 @@ def convert_batch_to_minimal_format(
         "targets": targets_minimal,
         "test_views": test_views,
         "test_images": test_images,
+        **({"test_frame_indices": test_frame_indices} if test_frame_indices else {}),
     }
     if "dynamic_info" in batch and batch.get("dynamic_info") is not None:
         result["dynamic_info"] = batch["dynamic_info"]
     if include_source_for_2d:
-        first = targets_minimal[0]
-        result["source_views"] = [first["view"]]
-        result["source_images"] = [
-            first["gt_image"].to(device) if first["gt_image"].device != device else first["gt_image"]
-        ]
-        result["source_frame_idx"] = int(first.get("frame_idx", 0))
         source_data = batch.get("source")
-        if isinstance(source_data, dict):
-            src_sky = source_data.get("sky_mask")
-            src_vd = source_data.get("viewdirs")
-            src_ego = source_data.get("egocar_mask")
-            if src_sky is not None and src_sky.shape[0] > 0:
-                result["source_sky_mask"] = [src_sky[0].to(device)]
-            if src_vd is not None and src_vd.shape[0] > 0:
-                result["source_viewdirs"] = [src_vd[0].to(device)]
-            if src_ego is not None and src_ego.shape[0] > 0:
-                result["source_egocar_mask"] = [src_ego[0].to(device)]
+        if isinstance(source_data, dict) and source_data.get("image") is not None:
+            n_src = int(source_data["image"].shape[0])
+            if n_src > 0:
+                result.update(_build_minimal_source_stack_from_dataset_source(source_data, device))
+            else:
+                first = targets_minimal[0]
+                result["source_views"] = [first["view"]]
+                result["source_images"] = [
+                    first["gt_image"].to(device) if first["gt_image"].device != device else first["gt_image"]
+                ]
+                result["source_frame_idx"] = int(first.get("frame_idx", 0))
+        else:
+            first = targets_minimal[0]
+            result["source_views"] = [first["view"]]
+            result["source_images"] = [
+                first["gt_image"].to(device) if first["gt_image"].device != device else first["gt_image"]
+            ]
+            result["source_frame_idx"] = int(first.get("frame_idx", 0))
+            if isinstance(source_data, dict):
+                src_sky = source_data.get("sky_mask")
+                src_vd = source_data.get("viewdirs")
+                src_ego = source_data.get("egocar_mask")
+                if src_sky is not None and src_sky.shape[0] > 0:
+                    result["source_sky_mask"] = [src_sky[0].to(device)]
+                if src_vd is not None and src_vd.shape[0] > 0:
+                    result["source_viewdirs"] = [src_vd[0].to(device)]
+                if src_ego is not None and src_ego.shape[0] > 0:
+                    result["source_egocar_mask"] = [src_ego[0].to(device)]
     return result
 
 

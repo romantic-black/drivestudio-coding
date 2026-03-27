@@ -1,7 +1,11 @@
 """
-Training script for Minimal StreetForward Stage 4.1.
+Minimal StreetForward Stage 4.1 — 单段训练：Scheduler v2 + MultiSceneDatasetV2。
 
-Multi target-frame rigid, mask_src_feat_valid from alpha-T backproject weight sum; extends 4.0 logging.
+不使用 overfit .pt；配置见 configs/minimal_streetforward_stage4_1_one_segment_v2.yaml。
+
+  conda run -n drivestudio-new env PYTHONPATH=/root/drivestudio-coding \\
+    python tools/train_minimal_streetforward_stage4_1_one_segment.py \\
+      --config_file configs/minimal_streetforward_stage4_1_one_segment_v2.yaml
 """
 
 from __future__ import annotations
@@ -14,9 +18,8 @@ import time
 from collections import deque
 from typing import Any, Dict, List, Optional, TextIO
 
-
+# Match stage4_1 OMP normalization
 def _normalize_omp_num_threads(*, fallback: int = 8) -> None:
-    """Normalize OMP_NUM_THREADS to a valid positive integer for OpenMP runtime."""
     raw = os.environ.get("OMP_NUM_THREADS")
     if raw is None:
         return
@@ -25,29 +28,23 @@ def _normalize_omp_num_threads(*, fallback: int = 8) -> None:
         value = int(raw_str)
     except (TypeError, ValueError):
         os.environ["OMP_NUM_THREADS"] = str(fallback)
-        logging.getLogger(__name__).warning(
-            "Invalid OMP_NUM_THREADS=%r; fallback to %d.",
-            raw_str,
-            fallback,
-        )
+        logging.getLogger(__name__).warning("Invalid OMP_NUM_THREADS=%r; fallback to %d.", raw_str, fallback)
         return
     if value <= 0:
         os.environ["OMP_NUM_THREADS"] = str(fallback)
-        logging.getLogger(__name__).warning(
-            "Non-positive OMP_NUM_THREADS=%d; fallback to %d.",
-            value,
-            fallback,
-        )
+        logging.getLogger(__name__).warning("Non-positive OMP_NUM_THREADS=%d; fallback to %d.", value, fallback)
 
 
 _normalize_omp_num_threads()
 
 import numpy as np
 import torch
+from omegaconf import OmegaConf
 from pytorch_msssim import SSIM
 from torchmetrics.image import PeakSignalNoiseRatio
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
+from datasets.multi_scene_dataset_v2 import MultiSceneDatasetV2, TrainSchedulerV2
 from models.streetforward.minimal_trainer_stage4_1 import MinimalStreetForwardStage4_1
 from tools.train_minimal_streetforward_stage1_1 import (
     _compute_metrics,
@@ -56,6 +53,15 @@ from tools.train_minimal_streetforward_stage1_1 import (
     _write_metrics_history,
     convert_batch_to_minimal_format,
     setup,
+)
+from tools.train_minimal_streetforward_stage4_1 import (
+    _diagnose_step,
+    _merge_bg_distant_rigid_for_eval,
+    _parse_diagnostics_cfg,
+    _parse_perf_cfg,
+    _percentile,
+    _save_diagnostic_renders,
+    _save_single_gray_image,
 )
 from tools.upload_to_vika import upload_experiment_summary
 from utils.minimal_batch_view_selection import parse_view_selection
@@ -68,287 +74,110 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 current_time = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
-CKPT_PREFIX = "minimal_sf_stage4_1"
+CKPT_PREFIX = "minimal_sf_stage4_1_one_segment"
 
 
-def _require_keys(obj: Dict[str, Any], keys: List[str], ctx: str) -> None:
-    missing = [k for k in keys if k not in obj]
-    if missing:
-        raise ValueError(f"{ctx} missing required keys: {missing}")
-
-
-def _parse_diagnostics_cfg(cfg) -> Dict[str, Any]:
-    diag_cfg = cfg.logging.get("diagnostics")
-    if diag_cfg is None:
-        return {"enable": False, "interval": 0, "window_size": 0, "save_branch_renders": False}
-    enable = bool(diag_cfg.get("enable", False))
-    if not enable:
-        return {"enable": False, "interval": 0, "window_size": 0, "save_branch_renders": False}
-    _require_keys(diag_cfg, ["interval", "window_size", "save_branch_renders"], "logging.diagnostics")
-    return {
-        "enable": True,
-        "interval": int(diag_cfg["interval"]),
-        "window_size": int(diag_cfg["window_size"]),
-        "save_branch_renders": bool(diag_cfg["save_branch_renders"]),
-    }
-
-
-def _parse_perf_cfg(cfg) -> Dict[str, Any]:
-    perf_cfg = cfg.logging.get("performance")
-    if perf_cfg is None:
-        return {"enable": False, "phase_timing": False, "cuda_memory": False}
-    enable = bool(perf_cfg.get("enable", False))
-    if not enable:
-        return {"enable": False, "phase_timing": False, "cuda_memory": False}
-    _require_keys(perf_cfg, ["phase_timing", "cuda_memory"], "logging.performance")
-    return {
-        "enable": True,
-        "phase_timing": bool(perf_cfg["phase_timing"]),
-        "cuda_memory": bool(perf_cfg["cuda_memory"]),
-    }
-
-
-def _percentile(values: List[float], q: float) -> float:
-    if not values:
-        return 0.0
-    return float(np.percentile(np.asarray(values, dtype=np.float64), q))
-
-
-def _diagnose_step(window: List[Dict[str, float]]) -> Dict[str, Any]:
-    if not window:
-        return {"diag_tags": [], "diag_scores": {}, "diag_reason": "insufficient_history"}
-    tags: List[str] = []
-    scores: Dict[str, float] = {}
-    reasons: List[str] = []
-
-    avg_grad_rigid = float(np.mean([x.get("grad_norm_rigid", 0.0) for x in window]))
-    avg_update_ratio = float(np.mean([x.get("rigid_update_ratio", 0.0) for x in window]))
-    avg_feat_valid = float(np.mean([x.get("num_rigid_src_feat_valid", 0.0) for x in window]))
-    avg_valid_src = float(np.mean([x.get("num_rigid_valid_src", 0.0) for x in window]))
-    avg_mask_ratio = float(np.mean([x.get("loss_mask_ratio", 0.0) for x in window]))
-    avg_writeback = float(np.mean([x.get("writeback_rigid_ratio", 0.0) for x in window]))
-    avg_offset_rigid_max = float(np.mean([x.get("rigid_offset_pos_max", 0.0) for x in window]))
-
-    if avg_valid_src > 10 and avg_update_ratio < 0.02 and avg_grad_rigid < 1e-5:
-        score = min(1.0, (0.02 - avg_update_ratio) / 0.02 + (1e-5 - avg_grad_rigid) / 1e-5)
-        tags.append("rigid_not_learning")
-        scores["rigid_not_learning"] = max(0.0, float(score))
-        reasons.append("rigid grad/update are both near zero under valid supervision")
-
-    if avg_offset_rigid_max > 0.08 and avg_writeback > 0.5:
-        score = min(1.0, (avg_offset_rigid_max / 0.08) * 0.5 + (avg_writeback / 0.5) * 0.5)
-        tags.append("rigid_update_too_aggressive")
-        scores["rigid_update_too_aggressive"] = max(0.0, float(score))
-        reasons.append("rigid offset max and writeback ratio are both high")
-
-    feat_cov = float(avg_feat_valid / max(avg_valid_src, 1.0))
-    if avg_valid_src > 0 and feat_cov < 0.2:
-        score = min(1.0, (0.2 - feat_cov) / 0.2)
-        tags.append("source_feature_coverage_insufficient")
-        scores["source_feature_coverage_insufficient"] = max(0.0, float(score))
-        reasons.append("rigid source feature valid ratio is persistently low")
-
-    if avg_mask_ratio > 0.7:
-        score = min(1.0, avg_mask_ratio)
-        tags.append("mask_constraint_too_strong")
-        scores["mask_constraint_too_strong"] = max(0.0, float(score))
-        reasons.append("mask loss dominates total loss for recent window")
-
-    if not tags:
-        return {"diag_tags": [], "diag_scores": {}, "diag_reason": "no_strong_signal"}
-    return {"diag_tags": tags, "diag_scores": scores, "diag_reason": "; ".join(reasons)}
-
-
-def _save_single_gray_image(img: torch.Tensor, path: str) -> None:
-    arr = torch.clamp(img.detach().cpu(), 0.0, 1.0).numpy()
-    arr_u8 = (arr * 255.0).clip(0, 255).astype(np.uint8)
-    try:
-        from PIL import Image
-    except ImportError:
-        np.save(path.replace(".png", ".npy"), arr_u8)
-        return
-    Image.fromarray(arr_u8).save(path)
-
-
-def _rigid_world_from_forward_or_rebuild(
-    model: MinimalStreetForwardStage4_1,
-    out: Dict[str, Any],
-    frame_idx: int,
-) -> Optional[Dict[str, torch.Tensor]]:
-    """Use forward's _render_params_rigid_world if set; else rebuild from rigid state (same as diagnostics)."""
-    rp_rigid_world = out.get("_render_params_rigid_world")
-    if rp_rigid_world is not None:
-        return rp_rigid_world
-    node_state_rigid = out.get("_node_state_rigid")
-    if node_state_rigid is None:
-        return None
-    n_rigid = int(node_state_rigid.means.shape[0])
-    if n_rigid <= 0:
-        return None
-    device = node_state_rigid.means.device
-    valid_tgt = model._rigid_point_valid_mask(node_state_rigid, frame_idx)
-    idx_tgt = torch.nonzero(valid_tgt, as_tuple=False).squeeze(1)
-    idx_writeback = out.get("_rigid_writeback_idx")
-    if idx_writeback is None:
-        idx_writeback = torch.zeros(0, dtype=torch.long, device=device)
-    if idx_writeback.numel() > 0:
-        mask_writeback = torch.zeros(n_rigid, dtype=torch.bool, device=device)
-        mask_writeback[idx_writeback] = True
-        idx_tr = idx_tgt[mask_writeback[idx_tgt]]
-        idx_fr = idx_tgt[~mask_writeback[idx_tgt]]
-    else:
-        idx_tr = torch.zeros(0, dtype=torch.long, device=device)
-        idx_fr = idx_tgt
-    rp_rigid_local = out.get("_render_params_rigid_local")
-    if idx_tr.numel() > 0 and rp_rigid_local is None:
-        raise ValueError(
-            "Rigid eval requires _render_params_rigid_local when trainable rigid indices exist "
-            f"(frame_idx={frame_idx})."
-        )
-    return model._build_rigid_world_for_frame(
-        node_state_rigid=node_state_rigid,
-        frame_idx=frame_idx,
-        idx_train=idx_tr,
-        idx_frozen=idx_fr,
-        render_params_rigid_local=rp_rigid_local,
-        U=idx_writeback,
+def _build_multi_scene_dataset(cfg: Any, device: torch.device) -> MultiSceneDatasetV2:
+    ds_cfg = cfg.dataset
+    data_cfg = cfg.data
+    pc = OmegaConf.to_container(ds_cfg.pointcloud, resolve=True)
+    kfc = ds_cfg.get("keyframe_split_config")
+    if kfc is not None:
+        kfc = OmegaConf.to_container(kfc, resolve=True)
+    return MultiSceneDatasetV2(
+        data_cfg=data_cfg,
+        train_scene_ids=list(data_cfg.train_scene_ids),
+        eval_scene_ids=list(data_cfg.get("eval_scene_ids", [])),
+        num_source_keyframes=int(ds_cfg.num_source_keyframes),
+        num_target_keyframes=int(ds_cfg.num_target_keyframes),
+        segment_overlap_ratio=float(ds_cfg.segment_overlap_ratio),
+        keyframe_split_config=kfc,
+        min_keyframes_per_scene=int(ds_cfg.min_keyframes_per_scene),
+        min_keyframes_per_segment=int(ds_cfg.min_keyframes_per_segment),
+        device=device,
+        preload_scene_count=int(ds_cfg.preload_scene_count),
+        segment_aabb=ds_cfg.segment_aabb,
+        pointcloud_config=pc,
     )
 
 
-def _merge_bg_distant_rigid_for_eval(
-    model: MinimalStreetForwardStage4_1,
-    out: Dict[str, Any],
-    frame_idx: int,
-) -> Dict[str, torch.Tensor]:
-    """bg + rigid (world) + distant in the same order as training merge."""
-    bg = out["render_params"]
-    merged: Dict[str, torch.Tensor] = {
-        "means_r": bg["means_r"],
-        "scales_r": bg["scales_r"],
-        "quats_r": bg["quats_r"],
-        "opacities_r": bg["opacities_r"],
-        "colors_r": bg["colors_r"],
-    }
-    rp_r = _rigid_world_from_forward_or_rebuild(model, out, frame_idx)
-    if rp_r is not None:
-        merged = {
-            "means_r": torch.cat([merged["means_r"], rp_r["means_r"]], dim=0),
-            "scales_r": torch.cat([merged["scales_r"], rp_r["scales_r"]], dim=0),
-            "quats_r": torch.cat([merged["quats_r"], rp_r["quats_r"]], dim=0),
-            "opacities_r": torch.cat([merged["opacities_r"], rp_r["opacities_r"]], dim=0),
-            "colors_r": torch.cat([merged["colors_r"], rp_r["colors_r"]], dim=0),
-        }
-    rp_d = out.get("_render_params_distant")
-    if rp_d is not None:
-        merged = {
-            "means_r": torch.cat([merged["means_r"], rp_d["means_r"]], dim=0),
-            "scales_r": torch.cat([merged["scales_r"], rp_d["scales_r"]], dim=0),
-            "quats_r": torch.cat([merged["quats_r"], rp_d["quats_r"]], dim=0),
-            "opacities_r": torch.cat([merged["opacities_r"], rp_d["opacities_r"]], dim=0),
-            "colors_r": torch.cat([merged["colors_r"], rp_d["colors_r"]], dim=0),
-        }
-    return merged
+def _parse_one_segment_cfg(cfg: Any) -> tuple[int, int, bool]:
+    os_cfg = cfg.get("one_segment")
+    if os_cfg is None:
+        raise ValueError("config must define one_segment with scene_id and segment_id")
+    if os_cfg.get("scene_id") is None or os_cfg.get("segment_id") is None:
+        raise ValueError("one_segment.scene_id and one_segment.segment_id are required")
+    return int(os_cfg.scene_id), int(os_cfg.segment_id), bool(os_cfg.get("include_test", True))
 
 
-def _save_diagnostic_renders(
-    model: MinimalStreetForwardStage4_1,
-    batch: Dict[str, Any],
-    step: int,
-    log_dir: str,
-) -> None:
-    targets = batch.get("targets", [])
-    if not targets:
-        return
-    prev_mode = model.training
-    model.eval()
-    with torch.no_grad():
-        out = model.forward(batch)
-        target0 = targets[0]
-        gt0 = target0["gt_image"]
-        if gt0.dim() == 4:
-            gt0 = gt0.squeeze(0)
-        h, w = int(gt0.shape[0]), int(gt0.shape[1])
-        view = target0["view"]
-
-        bg = out["render_params"]
-        rgb_bg, acc_bg = model._render_single_view(bg, view, h, w)
-        rgb_bg = model._composite_sky(rgb_bg, acc_bg, target0)
-
-        merged = _merge_bg_distant_rigid_for_eval(model, out, int(target0["frame_idx"]))
-        rgb_full, acc_full = model._render_single_view(merged, view, h, w)
-        rgb_full = model._composite_sky(rgb_full, acc_full, target0)
-        opacity = acc_full.squeeze(-1) if acc_full.dim() == 3 else acc_full
-
-        out_dir = os.path.join(log_dir, "images", "diagnostics", f"step{step:06d}")
-        os.makedirs(out_dir, exist_ok=True)
-        _save_image_triplet(step, rgb_full, gt0, out_dir)
-        _save_image_triplet(step, rgb_bg, gt0, out_dir, view_suffix="bg_only")
-        _save_single_gray_image(opacity, os.path.join(out_dir, "opacity.png"))
-    if prev_mode:
-        model.train()
+def _build_train_scheduler_v2(
+    cfg: Any,
+    dataset: MultiSceneDatasetV2,
+    scene_id: int,
+    segment_id: int,
+    include_test: bool,
+) -> TrainSchedulerV2:
+    scheduler_cfg = cfg.get("scheduler_v2")
+    if scheduler_cfg is None:
+        raise ValueError("config must define scheduler_v2 for one-segment v2 training")
+    if scheduler_cfg.get("target_include_source") is not True:
+        raise ValueError("scheduler_v2.target_include_source must be true")
+    return dataset.create_train_scheduler_v2(
+        alpha_steps_per_keyframe=float(scheduler_cfg.alpha_steps_per_keyframe),
+        min_steps_per_segment=int(scheduler_cfg.min_steps_per_segment),
+        max_steps_per_segment=int(scheduler_cfg.max_steps_per_segment),
+        source_hold_steps=int(scheduler_cfg.source_hold_steps),
+        num_target_frames_total=int(scheduler_cfg.num_target_frames_total),
+        target_include_source=bool(scheduler_cfg.target_include_source),
+        include_test=bool(include_test),
+        fixed_scene_id=int(scene_id),
+        fixed_segment_id=int(segment_id),
+    )
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Train Minimal StreetForward Stage 4.1")
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Train Minimal StreetForward Stage 4.1 (one segment, dataloader)")
     parser.add_argument(
         "--config_file",
         type=str,
-        default="configs/minimal_streetforward_stage4_1.yaml",
+        default="configs/minimal_streetforward_stage4_1_one_segment_v2.yaml",
         help="Path to config YAML",
     )
     parser.add_argument("--output_root", type=str, default="outputs")
     parser.add_argument("--project", type=str, default="minimal_sf")
-    parser.add_argument("--run_name", type=str, default="overfit")
-    parser.add_argument("--overfit_batch_path", type=str, default=None, help="Path to .pt overfit batch")
+    parser.add_argument("--run_name", type=str, default="one_segment")
     parser.add_argument("--max_steps", type=int, default=None, help="Override training.max_iterations")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("opts", nargs="*", help="Override config, e.g. overfit_batch_path=path/to/batch.pt")
+    parser.add_argument("opts", nargs="*", help="Override config")
     args = parser.parse_args()
 
     cfg = setup(args)
-    diag_cfg = _parse_diagnostics_cfg(cfg)
-    perf_cfg = _parse_perf_cfg(cfg)
+    if parse_view_selection(cfg.training.get("view_selection")) is not None:
+        raise ValueError(
+            "one_segment script does not support training.view_selection.mode=explicit; "
+            "remove view_selection from the config (dataset already samples keyframes per batch)."
+        )
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("RUN start time=%s device=%s", current_time, device)
 
     set_deterministic_seed(args.seed)
     logger.info("Seed: %s", args.seed)
 
-    overfit_path = getattr(args, "overfit_batch_path", None) or cfg.get("overfit_batch_path")
-    if not overfit_path or not os.path.isfile(overfit_path):
-        raise FileNotFoundError("Overfit batch required. Set --overfit_batch_path or config overfit_batch_path.")
-    logger.info("RUN config_path=%s log_dir=%s overfit_batch_path=%s", args.config_file, cfg.log_dir, overfit_path)
-    from tools.overfit_one_batch import load_batch
+    scene_id, segment_id, include_test = _parse_one_segment_cfg(cfg)
+    train_ids = list(cfg.data.train_scene_ids)
+    if scene_id not in train_ids:
+        raise ValueError(f"one_segment.scene_id={scene_id} must appear in data.train_scene_ids={train_ids}")
 
-    raw_batch = load_batch(overfit_path)
-    view_sel = cfg.training.get("view_selection")
-    explicit = parse_view_selection(view_sel)
-    num_targets = None if explicit is not None else cfg.training.get("num_targets", 1)
-    minimal_batch = convert_batch_to_minimal_format(
-        raw_batch,
-        device,
-        num_targets=num_targets,
-        include_source_for_2d=True,
-        view_selection=view_sel,
+    logger.info(
+        "Building MultiSceneDatasetV2; training one segment scene_id=%s segment_id=%s include_test=%s",
+        scene_id,
+        segment_id,
+        include_test,
     )
-    if explicit is not None:
-        logger.info(
-            "Using explicit view_selection (explicit targets=%d, source views=%d)",
-            len(minimal_batch["targets"]),
-            len(minimal_batch.get("source_views", [])),
-        )
-    else:
-        logger.info(
-            "Using num_targets=%d (batch has %d targets), source for 2d included",
-            num_targets,
-            len(minimal_batch["targets"]),
-        )
-    model = MinimalStreetForwardStage4_1(config=cfg, device=device)
-    model.train()
-
-    psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
-    ssim_metric = SSIM(data_range=1.0, size_average=True, channel=3).to(device)
-    lpips_metric = LearnedPerceptualImagePatchSimilarity(normalize=True).to(device)
+    dataset = _build_multi_scene_dataset(cfg, device)
+    dataset.initialize()
+    scheduler = _build_train_scheduler_v2(cfg, dataset, scene_id, segment_id, include_test)
 
     max_iterations = args.max_steps or cfg.training.get("max_iterations", 1000)
     log_interval = cfg.training.get("log_interval", 50)
@@ -360,9 +189,18 @@ def main():
     enable_jsonl_metrics = bool(cfg.logging.get("enable_jsonl_metrics", True))
     image_interval = int(cfg.logging.get("image_interval", 50))
     use_tensorboard = bool(cfg.logging.get("use_tensorboard", False))
+    diag_cfg = _parse_diagnostics_cfg(cfg)
+    perf_cfg = _parse_perf_cfg(cfg)
+
+    model = MinimalStreetForwardStage4_1(config=cfg, device=device)
+    model.train()
+
+    psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
+    ssim_metric = SSIM(data_range=1.0, size_average=True, channel=3).to(device)
+    lpips_metric = LearnedPerceptualImagePatchSimilarity(normalize=True).to(device)
 
     metrics_fh: Optional[TextIO] = None
-    writer: Optional["SummaryWriter"] = None
+    writer: Optional[Any] = None
     result: Dict[str, Any] = {}
     total_steps = 0
     sum_num_gaussians_bg = 0.0
@@ -373,12 +211,28 @@ def main():
     peak_mem_bytes = 0
     peak_mem_reserved_bytes = 0
     diag_window: deque = deque(maxlen=max(diag_cfg.get("window_size", 0), 1))
+    minimal_batch: Dict[str, Any] = {}
+
     try:
         metrics_fh = _open_metrics_history(cfg.log_dir, enable_jsonl_metrics)
         if use_tensorboard and SummaryWriter is not None:
             writer = SummaryWriter(log_dir=os.path.join(cfg.log_dir, "tb"))
 
         for step in range(max_iterations):
+            raw_batch = scheduler.next_batch()
+            scheduler_info = scheduler.get_current_info()
+            tgt = raw_batch.get("target")
+            if not isinstance(tgt, dict) or tgt.get("image") is None:
+                raise ValueError("dataset batch must contain target.image")
+            num_target_views = int(tgt["image"].shape[0])
+            minimal_batch = convert_batch_to_minimal_format(
+                raw_batch,
+                device,
+                num_targets=num_target_views,
+                include_source_for_2d=True,
+                view_selection=None,
+            )
+
             step_t0 = time.perf_counter()
             if perf_cfg["enable"] and perf_cfg["cuda_memory"] and torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats()
@@ -431,6 +285,12 @@ def main():
                 "split": "train",
                 "scene_id": int(minimal_batch.get("scene_id", -1)),
                 "segment_id": int(minimal_batch.get("segment_id", -1)),
+                "epoch_idx": int(scheduler_info.get("epoch_idx", -1)),
+                "global_step": int(scheduler_info.get("global_step", -1)),
+                "segment_local_step": int(scheduler_info.get("segment_local_step", -1)),
+                "segment_step_budget": int(scheduler_info.get("segment_step_budget", -1)),
+                "source_frame_idx": int(scheduler_info.get("source_frame_idx", -1)),
+                "source_block_step": int(scheduler_info.get("source_block_step", -1)),
                 "loss": loss_val,
                 "loss_l1": float(result.get("loss_l1", 0.0)),
                 "loss_ssim": float(result.get("loss_ssim", 0.0)),
@@ -471,7 +331,11 @@ def main():
 
             if want_psnr or want_heavy:
                 mse_vals = [
-                    float(torch.mean((torch.clamp(pred_rgbs[v], 0.0, 1.0) - torch.clamp(gt_images[v], 0.0, 1.0)) ** 2).item())
+                    float(
+                        torch.mean(
+                            (torch.clamp(pred_rgbs[v], 0.0, 1.0) - torch.clamp(gt_images[v], 0.0, 1.0)) ** 2
+                        ).item()
+                    )
                     for v in range(num_views)
                 ]
                 mse_val = float(np.mean(mse_vals))
@@ -563,7 +427,10 @@ def main():
 
             if save_every and step > 0 and step % save_every == 0:
                 ckpt_path = os.path.join(cfg.log_dir, "checkpoints", f"{CKPT_PREFIX}_step{step}.pt")
-                torch.save({"step": step, "model_state_dict": model.state_dict(), "optimizer_state_dict": model.optimizer.state_dict()}, ckpt_path)
+                torch.save(
+                    {"step": step, "model_state_dict": model.state_dict(), "optimizer_state_dict": model.optimizer.state_dict()},
+                    ckpt_path,
+                )
                 logger.info("Saved checkpoint to %s", ckpt_path)
 
         if run_test_at_end and minimal_batch.get("test_views"):
@@ -627,7 +494,10 @@ def main():
             writer.close()
 
     final_ckpt = os.path.join(cfg.log_dir, "checkpoints", f"{CKPT_PREFIX}_final.pt")
-    torch.save({"step": max_iterations - 1, "model_state_dict": model.state_dict(), "optimizer_state_dict": model.optimizer.state_dict()}, final_ckpt)
+    torch.save(
+        {"step": max_iterations - 1, "model_state_dict": model.state_dict(), "optimizer_state_dict": model.optimizer.state_dict()},
+        final_ckpt,
+    )
     logger.info("Saved final checkpoint to %s", final_ckpt)
 
 

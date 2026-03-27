@@ -400,6 +400,8 @@ frame_data = dataset.get_frame_data(scene_id=0, frame_idx=0, cam_idx=0)
 
 ### 使用调度器（推荐）
 
+> Scheduler v2（`MultiSceneDatasetV2`）请参考：`docs/dataloader/MultiSceneDataset_V2_Usage.md` 与 `docs/trainers/StreetForward_Scheduler_V2_Usage.md`。本节示例是 legacy `create_scheduler()`。
+
 ```python
 # 创建调度器
 scheduler = dataset.create_scheduler(
@@ -529,6 +531,13 @@ if dataset.pointcloud_generator is not None:
     )
 ```
 
+### Segment 级点云缓存（性能关键）
+
+- `pointcloud` 是 **segment 级静态对象**（对同一 `(scene_id, segment_id)` 不随 batch 内 source/target 采样变化）。
+- `MultiSceneDataset` 会按 `(scene_id, segment_id)` 缓存点云；同一段后续 `get_segment_batch()` 默认复用缓存，不再重复调用生成器。
+- 场景从缓存卸载（`_unload_scene`）时，会同步清理该场景对应的 segment 点云缓存以释放内存。
+- 因此 one-segment 训练中，首个 batch 可能较慢（首次建云），后续 batch 不应再承担重复建云开销。
+
 ---
 
 ## 注意事项
@@ -547,6 +556,7 @@ if dataset.pointcloud_generator is not None:
 ### 内存管理
 
 - **场景缓存**：最多同时缓存 `preload_scene_count + 1` 个训练场景
+- **点云缓存**：按 `(scene_id, segment_id)` 维护，随场景卸载同步清理
 - **场景切换**：使用 `mark_scene_completed()` 及时释放已完成场景的内存
 - **评估场景**：评估场景可以保留所有，不会自动卸载
 

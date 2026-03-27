@@ -2,9 +2,36 @@ import os
 import json
 import argparse
 from typing import Optional
+from omegaconf import OmegaConf
+
+
+def _normalize_omp_num_threads(*, fallback: int = 8) -> None:
+    """Normalize OMP_NUM_THREADS to a valid positive integer for OpenMP runtime."""
+    raw = os.environ.get("OMP_NUM_THREADS")
+    if raw is None:
+        return
+    raw_str = str(raw).strip()
+    try:
+        value = int(raw_str)
+    except (TypeError, ValueError):
+        os.environ["OMP_NUM_THREADS"] = str(fallback)
+        print(
+            f"[env] Invalid OMP_NUM_THREADS={raw_str!r}; "
+            f"fallback to {fallback}."
+        )
+        return
+    if value <= 0:
+        os.environ["OMP_NUM_THREADS"] = str(fallback)
+        print(
+            f"[env] Non-positive OMP_NUM_THREADS={value}; "
+            f"fallback to {fallback}."
+        )
+
+
+_normalize_omp_num_threads()
+
 import torch
 import numpy as np
-from omegaconf import OmegaConf
 
 
 def _save_mask_images(batch: dict, save_dir: str) -> None:

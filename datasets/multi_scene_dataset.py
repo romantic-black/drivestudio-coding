@@ -361,6 +361,9 @@ class MultiSceneDataset:
                 "Failed to create pointcloud generator from pointcloud_config; "
                 "please check the configuration."
             )
+        # Segment-level pointcloud cache: {(scene_id, segment_id): pointcloud_dict}
+        # Pointclouds are static for a segment and should not be rebuilt per step.
+        self._segment_pointcloud_cache: Dict[Tuple[int, int], Dict] = {}
         
         # Track if initialized
         self._initialized = False
@@ -817,6 +820,10 @@ class MultiSceneDataset:
             
             # Remove from cache
             del self.train_scenes_cache[scene_id]
+            # Drop segment-level pointcloud cache for this scene to free memory.
+            stale_keys = [k for k in self._segment_pointcloud_cache.keys() if k[0] == scene_id]
+            for k in stale_keys:
+                del self._segment_pointcloud_cache[k]
             logger.info(f"Scene {scene_id} unloaded from cache")
     
     def _switch_to_next_scene(self):
@@ -2089,15 +2096,19 @@ class MultiSceneDataset:
                 target_frame_idxs.append(frame_idx)
                 target_cam_idxs.append(cam_idx)
         
-        # 6. Generate point cloud (if point cloud generator exists)
+        # 6. Get segment-level point cloud (cached by scene_id + segment_id)
         pointcloud = None
         if self.pointcloud_generator is not None:
-            pointcloud = self.pointcloud_generator.generate_pointcloud(
-                dataset=self,
-                scene_id=scene_id,
-                segment_id=segment_id,
-                segment_first_pose=segment_first_pose,
-            )
+            pc_key = (int(scene_id), int(segment_id))
+            pointcloud = self._segment_pointcloud_cache.get(pc_key)
+            if pointcloud is None:
+                pointcloud = self.pointcloud_generator.generate_pointcloud(
+                    dataset=self,
+                    scene_id=scene_id,
+                    segment_id=segment_id,
+                    segment_first_pose=segment_first_pose,
+                )
+                self._segment_pointcloud_cache[pc_key] = pointcloud
         
         # 6.5. Build dynamic_info (if pointcloud contains dynamic objects)
         dynamic_info = None

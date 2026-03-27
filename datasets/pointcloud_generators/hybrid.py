@@ -226,11 +226,11 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
 
         # 统一实例映射（使用LiDAR的映射，因为它是更稳定的来源）
         instance_mapping = lidar_instance_mapping
-        if lidar_instance_mapping != monocular_instance_mapping:
-            logger.warning(
-                f"Instance mappings differ between LiDAR and monocular generators. "
-                f"Using LiDAR mapping."
-            )
+        # if lidar_instance_mapping != monocular_instance_mapping:
+        #     logger.warning(
+        #         f"Instance mappings differ between LiDAR and monocular generators. "
+        #         f"Using LiDAR mapping."
+        #     )
 
         # 融合背景点云
         fused_background = self._fuse_background_points(
