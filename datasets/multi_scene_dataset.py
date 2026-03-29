@@ -13,7 +13,7 @@ import queue
 import random
 import threading
 import time
-from typing import Dict, List, Optional, Tuple, TYPE_CHECKING, Union
+from typing import Dict, List, Optional, Set, Tuple, TYPE_CHECKING, Union
 
 import numpy as np
 import torch
@@ -31,6 +31,30 @@ if TYPE_CHECKING:
     from datasets.pointcloud_generators import RGBPointCloudGenerator
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_static_instance_motion_cfg(pointcloud_config: Dict) -> Tuple[bool, Optional[float]]:
+    """
+    Parse dataset.pointcloud.static_instance_motion for LiDAR / hybrid generators.
+
+    Returns:
+        (enable, traj_length_thresh_m). When enable is False, thresh is None.
+    """
+    block = pointcloud_config.get("static_instance_motion")
+    if block is None:
+        return False, None
+    if "enable" not in block:
+        raise ValueError(
+            "dataset.pointcloud.static_instance_motion.enable is required when static_instance_motion is set."
+        )
+    enable = bool(block["enable"])
+    if enable:
+        if "traj_length_thresh_m" not in block:
+            raise ValueError(
+                "dataset.pointcloud.static_instance_motion.traj_length_thresh_m is required when enable=true."
+            )
+        return True, float(block["traj_length_thresh_m"])
+    return False, None
 
 
 # #region agent log
@@ -399,6 +423,7 @@ class MultiSceneDataset:
         from datasets.pointcloud_generators import (
             MonocularRGBPointCloudGenerator,
             HybridRGBPointCloudGenerator,
+            LiDARRGBPointCloudGenerator,
         )
 
         # Generator type must be explicit (fail-fast)
@@ -437,6 +462,17 @@ class MultiSceneDataset:
                 dynamic_filter=pointcloud_config["dynamic_filter"],
                 dynamic_mask_key=pointcloud_config["dynamic_mask_key"],
                 device=device,
+            )
+        elif generator_type == "lidar":
+            if "lidar_sparsity" not in pointcloud_config:
+                raise ValueError("dataset.pointcloud.lidar_sparsity is required for lidar generator.")
+            lidar_sparsity = pointcloud_config["lidar_sparsity"]
+            sim_enable, sim_thresh = _parse_static_instance_motion_cfg(pointcloud_config)
+            return LiDARRGBPointCloudGenerator(
+                sparsity=lidar_sparsity,
+                device=device,
+                static_instance_motion_enable=sim_enable,
+                static_instance_motion_traj_length_thresh_m=sim_thresh,
             )
         elif generator_type == "hybrid":
             # LiDAR生成器参数
@@ -488,7 +524,8 @@ class MultiSceneDataset:
             fusion_strategy = pointcloud_config["fusion_strategy"]
             dynamic_source = pointcloud_config["dynamic_source"]
             downsample_dynamic = pointcloud_config["downsample_dynamic"]
-            
+            sim_enable, sim_thresh = _parse_static_instance_motion_cfg(pointcloud_config)
+
             return HybridRGBPointCloudGenerator(
                 lidar_sparsity=lidar_sparsity,
                 monocular_chosen_cam_ids=monocular_chosen_cam_ids,
@@ -503,11 +540,14 @@ class MultiSceneDataset:
                 fusion_strategy=fusion_strategy,
                 dynamic_source=dynamic_source,
                 downsample_dynamic=downsample_dynamic,
+                static_instance_motion_enable=sim_enable,
+                static_instance_motion_traj_length_thresh_m=sim_thresh,
                 device=device,
             )
         else:
-            logger.warning(f"Unknown pointcloud generator type: {generator_type}")
-            return None
+            raise ValueError(
+                f"Unknown dataset.pointcloud.type: {generator_type!r} (expected monocular|lidar|hybrid)."
+            )
     
     def initialize(self):
         """
@@ -1607,6 +1647,7 @@ class MultiSceneDataset:
         frame_indices: List[int],
         instance_mapping: Optional[Dict[int, int]] = None,
         world_to_seg0: Optional[Tensor] = None,
+        exclude_instance_intids: Optional[Set[int]] = None,
     ) -> Optional[Dict]:
         """
         从 scene_dataset 的 instances_pose 构建 dynamic_info。
@@ -1617,6 +1658,7 @@ class MultiSceneDataset:
             instance_mapping: 可选的实例ID映射，格式为 {original_id: intid}，用于将原始的 instance_id 
                             转换为点云中使用的 intid。如果提供，dynamic_info 中的 instance_id 将使用 intid。
             world_to_seg0: 可选的世界坐标 -> segment 第一帧坐标的变换矩阵。
+            exclude_instance_intids: 若设置，这些 intid 不写入 dynamic_info（与静止实例留在 background 一致）。
             
         Returns:
             dynamic_info: Dict[int, Dict] 格式，{frame_idx: {"instances": {instance_id: {"quat": ..., "trans": ...}}}}
@@ -1744,6 +1786,9 @@ class MultiSceneDataset:
                     # 这与点云中的 dynamic 字典的 key 一致
                     final_instance_id = int(instance_id)
                 
+                if exclude_instance_intids is not None and final_instance_id in exclude_instance_intids:
+                    continue
+
                 frame_instances[final_instance_id] = {
                     "quat": quat,
                     "trans": trans,
@@ -1753,7 +1798,14 @@ class MultiSceneDataset:
                 "instances": frame_instances,
             }
         
-        return dynamic_info if len(dynamic_info) > 0 else None
+        if not dynamic_info:
+            return None
+        nonempty = any(
+            len(finfo.get("instances", {})) > 0 for finfo in dynamic_info.values()
+        )
+        if not nonempty:
+            return None
+        return dynamic_info
 
     def _to_4x4_tensor(self, mat) -> Tensor:
         """
@@ -2128,11 +2180,18 @@ class MultiSceneDataset:
             if scene_dataset.pixel_source is not None and scene_dataset.pixel_source.instances_pose is not None:
                 # 获取点云的 instance_mapping（如果存在），用于确保 dynamic_info 中的 instance_id 与点云中的一致
                 instance_mapping = pointcloud.get("instance_mapping")
+                exclude_instance_intids: Optional[Set[int]] = None
+                meta = pointcloud.get("metadata") if isinstance(pointcloud, dict) else None
+                if meta:
+                    raw = meta.get("static_instance_intids")
+                    if raw:
+                        exclude_instance_intids = {int(x) for x in raw}
                 dynamic_info = self._build_dynamic_info(
                     scene_dataset=scene_dataset,
                     frame_indices=list(all_frame_indices),
                     instance_mapping=instance_mapping,
                     world_to_seg0=world_to_seg0,
+                    exclude_instance_intids=exclude_instance_intids,
                 )
 
         # 7. Load test views if requested and available

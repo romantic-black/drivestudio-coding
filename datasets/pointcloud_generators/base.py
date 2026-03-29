@@ -1,6 +1,6 @@
 import logging
 from abc import ABC, abstractmethod
-from typing import Dict, List, Literal, Optional, Tuple, TYPE_CHECKING
+from typing import Dict, List, Literal, Optional, Set, Tuple, TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -229,10 +229,14 @@ class RGBPointCloudGenerator(ABC):
         points_world: np.ndarray,
         colors: np.ndarray,
         instances: List[Dict],
+        skip_instance_intids: Optional[Set[int]] = None,
     ) -> Tuple[np.ndarray, Dict[int, np.ndarray]]:
         """
         Split a single-frame point cloud into static background and dynamic objects.
         Dynamic points are converted to local coordinates.
+
+        If skip_instance_intids is set, those instance intids are not assigned to dynamic;
+        their box interior points remain in the background (world coordinates).
         """
         if len(points_world) == 0:
             return (
@@ -246,8 +250,12 @@ class RGBPointCloudGenerator(ABC):
         any_obj_mask = np.zeros(N, dtype=bool)
         dynamic_points_dict: Dict[int, np.ndarray] = {}
 
+        skip = skip_instance_intids if skip_instance_intids is not None else set()
+
         for instance in instances:
             intid = int(instance["intid"])
+            if intid in skip:
+                continue
             T_ow = np.asarray(instance["T_ow"], dtype=np.float32)
             size_lwh = np.asarray(instance["size_lwh"], dtype=np.float32)
 

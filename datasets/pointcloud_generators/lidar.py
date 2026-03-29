@@ -1,11 +1,12 @@
 import logging
 from collections import defaultdict
-from typing import Dict, List, Literal, Optional, Tuple, TYPE_CHECKING
+from typing import Dict, List, Literal, Optional, Set, Tuple, TYPE_CHECKING
 
 import numpy as np
 import torch
 
 from .base import RGBPointCloudGenerator
+from .motion_utils import compute_static_instance_intids
 
 if TYPE_CHECKING:
     from datasets.multi_scene_dataset import MultiSceneDataset
@@ -25,6 +26,8 @@ class LiDARRGBPointCloudGenerator(RGBPointCloudGenerator):
         self,
         sparsity: Literal["Drop90", "Drop80", "Drop50", "Drop25", "full"] = "full",
         device: torch.device = torch.device("cpu"),
+        static_instance_motion_enable: bool = False,
+        static_instance_motion_traj_length_thresh_m: Optional[float] = None,
     ):
         super().__init__(
             sparsity=sparsity,
@@ -33,6 +36,13 @@ class LiDARRGBPointCloudGenerator(RGBPointCloudGenerator):
             downscale=1,
             device=device,
         )
+        self.static_instance_motion_enable = bool(static_instance_motion_enable)
+        self.static_instance_motion_traj_length_thresh_m = static_instance_motion_traj_length_thresh_m
+        if self.static_instance_motion_enable and self.static_instance_motion_traj_length_thresh_m is None:
+            raise ValueError(
+                "LiDARRGBPointCloudGenerator: static_instance_motion_enable=true requires "
+                "static_instance_motion_traj_length_thresh_m."
+            )
 
     def generate_pointcloud(
         self,
@@ -60,9 +70,18 @@ class LiDARRGBPointCloudGenerator(RGBPointCloudGenerator):
             for i, frame_idx in enumerate(frame_indices)
         }
 
+        scene_dataset = scene_data["dataset"]
+        pixel_source = getattr(scene_dataset, "pixel_source", None)
+        skip_instance_intids: Optional[Set[int]] = None
+        if self.static_instance_motion_enable:
+            skip_instance_intids = compute_static_instance_intids(
+                pixel_source,
+                frame_indices,
+                float(self.static_instance_motion_traj_length_thresh_m),
+            )
+
         all_backgrounds: List[np.ndarray] = []
         all_dynamic_objects: Dict[int, List[np.ndarray]] = defaultdict(list)
-        _agent_first_frame_logged = False
 
         for frame_idx in frame_indices:
             points_world, points_vehicle = self._load_lidar_points(
@@ -84,7 +103,10 @@ class LiDARRGBPointCloudGenerator(RGBPointCloudGenerator):
 
             frame_instances = frame_to_instances.get(frame_idx, [])
             background_frame, dynamic_frame = self._separate_static_dynamic(
-                points_world_frame, colors_frame, frame_instances
+                points_world_frame,
+                colors_frame,
+                frame_instances,
+                skip_instance_intids=skip_instance_intids,
             )
             all_backgrounds.append(background_frame)
             for intid, pts in dynamic_frame.items():
@@ -95,16 +117,6 @@ class LiDARRGBPointCloudGenerator(RGBPointCloudGenerator):
             if len(all_backgrounds) > 0
             else np.zeros((0, 6), dtype=np.float32)
         )
-        # #region agent log
-        try:
-            import json
-            _bg = background[:, :3]
-            _log = {"sessionId": "9dda96", "runId": "run1", "hypothesisId": "H1_H3", "location": "lidar.py:generate_pointcloud", "message": "final background extent", "data": {"background_count": int(len(background)), "background_seg0_min": _bg.min(axis=0).tolist() if len(_bg) > 0 else None, "background_seg0_max": _bg.max(axis=0).tolist() if len(_bg) > 0 else None}, "timestamp": __import__("time").time() * 1000}
-            with open("/root/drivestudio-coding/.cursor/debug-9dda96.log", "a") as _f:
-                _f.write(json.dumps(_log, ensure_ascii=False) + "\n")
-        except Exception:
-            pass
-        # #endregion
         dynamic_objects = {
             intid: np.concatenate(points_list, axis=0)
             for intid, points_list in all_dynamic_objects.items()
@@ -123,11 +135,18 @@ class LiDARRGBPointCloudGenerator(RGBPointCloudGenerator):
                 else np.zeros((0, 6), dtype=np.float32)
             )
 
+        static_list = (
+            sorted(int(x) for x in skip_instance_intids)
+            if skip_instance_intids is not None
+            else []
+        )
         metadata = {
             "type": "lidar",
             "frame_indices": frame_indices,
             "frames_used": len(all_backgrounds),
             "sparsity": self.sparsity,
+            "static_instance_motion_enable": self.static_instance_motion_enable,
+            "static_instance_intids": static_list,
         }
 
         return {
@@ -291,36 +310,12 @@ class LiDARRGBPointCloudGenerator(RGBPointCloudGenerator):
             if not np.any(valid):
                 continue
 
-            # #region agent log
-            _n = z.shape[0]
-            _n_z_le0 = int(np.sum(z <= 0))
-            _n_z_tiny = int(np.sum((z > 0) & (z <= 1e-6)))
-            if _n_z_le0 > 0 or _n_z_tiny > 0:
-                try:
-                    _f = open("/root/drivestudio-coding/.cursor/debug.log", "a")
-                    _f.write('{"id":"lidar_z","timestamp":' + str(int(__import__("time").time() * 1000)) + ',"location":"lidar.py:325","message":"z invalid counts","data":{"n_total":' + str(_n) + ',"n_z_le0":' + str(_n_z_le0) + ',"n_z_tiny":' + str(_n_z_tiny) + '},"hypothesisId":"H1"}\n')
-                    _f.close()
-                except Exception:
-                    pass
-            # #endregion
-
             uv = (intrinsic_np @ points_cam.T).T
             uv_xy = uv[:, :2]
 
             # Only perform perspective divide on valid points to avoid divide-by-zero
             uv = np.zeros_like(uv_xy, dtype=np.float32)
             uv[valid] = uv_xy[valid] / z[valid, None]
-            # #region agent log
-            _uv_nan = int(np.isnan(uv).any(axis=1).sum())
-            _uv_inf = int(np.isinf(uv).any(axis=1).sum())
-            if _uv_nan > 0 or _uv_inf > 0:
-                try:
-                    _f = open("/root/drivestudio-coding/.cursor/debug.log", "a")
-                    _f.write('{"id":"lidar_uv","timestamp":' + str(int(__import__("time").time() * 1000)) + ',"location":"lidar.py:uv","message":"uv nan/inf after divide","data":{"n_uv_nan":' + str(_uv_nan) + ',"n_uv_inf":' + str(_uv_inf) + '},"hypothesisId":"H2"}\n')
-                    _f.close()
-                except Exception:
-                    pass
-            # #endregion
             u = np.round(uv[:, 0]).astype(int)
             v = np.round(uv[:, 1]).astype(int)
             in_img = valid & (u >= 0) & (u < W) & (v >= 0) & (v < H)

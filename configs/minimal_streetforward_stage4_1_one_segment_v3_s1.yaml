@@ -1,0 +1,434 @@
+# 实验名；用于日志目录命名与配置落盘。
+output_name: minimal_sf_stage4_1_one_segment
+
+# 数据源与加载总配置。
+data:
+  # nuScenes 数据根目录。
+  data_root: "/root/autodl-tmp/nuScenes/"
+  # 数据集类型（对应 DataParser/SourceLoader 路径）。
+  dataset: "nuscenes"
+  # 起始时间步（含）。
+  start_timestep: 0
+  # 结束时间步（含）；-1 表示直到末尾。
+  end_timestep: -1
+  # 预加载设备；cpu 更稳，显存压力更小。
+  preload_device: cpu
+  # sky mask 语义约定：1 表示天空。
+  sky_mask_semantics: one_is_sky
+  # 训练场景 ID 列表。
+  train_scene_ids: [1]
+  # 评估场景 ID 列表；空表示不做独立 eval 场景。
+  eval_scene_ids: []
+
+  # 像素数据源（图像/掩码/深度）。
+  pixel_source:
+    # 像素数据源实现类。
+    type: datasets.nuscenes.nuscenes_sourceloader.NuScenesPixelSource
+    # 使用的相机 ID。
+    cameras: [0, 1, 2, 3, 4, 5]
+    # 各相机加载时缩放比例（先缩放再进入训练流）。
+    downscale_when_loading: [3, 3, 3, 3, 3, 3]
+    # 训练阶段额外缩放比例（1 表示不再缩放）。
+    downscale: 1
+    # 是否去畸变。
+    undistort: False
+    # 测试帧抽样步长；0 表示不按步长拆分 test。
+    test_image_stride: 0
+    # 每个 segment 最多保留的 test 图像数。
+    max_test_images: 4
+    # 是否加载天空掩码。
+    load_sky_mask: true
+    # 是否加载动态掩码。
+    load_dynamic_mask: true
+    # 是否加载深度图。
+    load_depth_maps: true
+    # 是否加载目标检测/实例对象信息。
+    load_objects: true
+    # 是否加载 SMPL 人体参数。
+    load_smpl: false
+    # 像素采样器配置。
+    sampler:
+      # 采样缓冲区下采样倍率。
+      buffer_downscale: 8
+      # 采样缓冲区占比。
+      buffer_ratio: 0.5
+      # 训练初期的难例增强权重。
+      start_enhance_weight: 3
+
+  # LiDAR 数据源配置。
+  lidar_source:
+    # LiDAR 数据源实现类。
+    type: datasets.nuscenes.nuscenes_sourceloader.NuScenesLiDARSource
+    # 是否加载 LiDAR 点云。
+    load_lidar: true
+    # LiDAR 下采样因子。
+    lidar_downsample_factor: 4
+    # 距离截断分位数（去除离群点）。
+    lidar_percentile: 0.02
+
+# MultiSceneDataset 分段与点云构建配置。
+dataset:
+  # source keyframe 数（v3 脚本中主要由 scheduler 控制 frame 级采样）。
+  num_source_keyframes: 1
+  # target keyframe 数（同上，保留为 dataset 兼容字段）。
+  num_target_keyframes: 1
+  # 相邻 segment 重叠比例。
+  segment_overlap_ratio: 0.2
+  # 场景最少 keyframe 数（低于阈值则跳过）。
+  min_keyframes_per_scene: 2
+  # 每个 segment 最少 keyframe 数。
+  min_keyframes_per_segment: 2
+  # 启动时预加载场景数。
+  preload_scene_count: 2
+
+  # segment AABB（在 segment 第一帧坐标系下）。
+  segment_aabb:
+    # [x_min, y_min, z_min]
+    - [-40.0, -20.0, -20.0]
+    # [x_max, y_max, z_max]
+    - [40.0, 4.8, 70.0]
+
+  # 点云融合配置（背景/远景/动态）。
+  pointcloud:
+    # 融合模式：hybrid = lidar + monocular 深度融合。
+    type: "hybrid"
+    # LiDAR 采样密度策略。
+    lidar_sparsity: full
+    # 单目深度使用的相机 ID。
+    monocular_chosen_cam_ids: [0, 1, 2, 3, 4, 5]
+    # 单目点云采样密度策略。
+    monocular_sparsity: full
+    # 是否过滤天空区域单目点。
+    monocular_filter_sky: true
+    # 是否启用单目深度一致性筛选。
+    monocular_depth_consistency: false
+    # 单目深度图下采样倍率。
+    monocular_downscale: 2
+    # 是否启用动态区域单目过滤。
+    monocular_dynamic_filter: true
+    # 动态掩码字段名。
+    monocular_dynamic_mask_key: dynamic_masks
+    # 近景点云最大点数。
+    near_max_points: 400000
+    # 远景点云最大点数。
+    distant_max_points: 400000
+    # 融合策略：merge。
+    fusion_strategy: merge
+    # 动态点来源：仅 LiDAR。
+    dynamic_source: lidar_only
+    # 是否对动态点额外下采样。
+    downsample_dynamic: false
+    # 背景点下采样方法。
+    background_downsample_method: uniform
+
+# 单段训练固定入口（one-segment overfit）。
+one_segment:
+  # 固定训练 scene id。
+  scene_id: 1
+  # 固定训练 segment id。
+  segment_id: 0
+  # batch 中是否包含 test 视角字段。
+  include_test: true
+
+# Scheduler v3 配置（本次改动核心）。
+scheduler_v3:
+  # 是否启用 scheduler v3。
+  enable: true
+
+  # 时间基准层：所有 raw-step 时间尺度由 U 映射。
+  time_base:
+    # U: 每 U 个 raw steps 视作 1 个 update tick。
+    state_write_interval_steps: 4   # U
+    # 是否启用 update-units 语义（文档开关）。
+    use_update_units: true
+
+  # segment 预算配置（单位：update ticks）。
+  segment_budget:
+    # 每个 keyframe 分配的 update ticks（alpha_u）。
+    alpha_updates_per_keyframe: 12
+    # 每 segment 最小 update ticks。
+    min_updates_per_segment: 24
+    # 每 segment 最大 update ticks。
+    max_updates_per_segment: 128
+    # 是否把预算对齐到完整 source blocks。
+    align_budget_to_full_blocks: true
+
+  # source block 配置（单位：update ticks）。
+  source_block:
+    # 目标每 segment 的 source block 数（用于反推 K_u）。
+    target_source_blocks_per_segment: 2
+    # 每 block 最小 update ticks。
+    min_updates_per_source_block: 8
+    # 每 block 最大 update ticks。
+    max_updates_per_source_block: 24
+    # source keyframe 采样策略。
+    source_keyframe_policy: shuffled_cycle
+    # source frame 采样策略。
+    source_frame_policy: uniform_in_keyframe
+
+  # target 采样与刷新节奏配置。
+  target_sampling:
+    # target 是否强制包含 source frame（必须 true）。
+    include_source: true
+    # 总 target frame 数（包含 source）。
+    total_target_frames: 1
+    # 是否在整个 source block 内固定同一组 target（true 时 block 内不刷新）。
+    freeze_target_within_block: true
+    # 是否允许有效 target 数在短段下降。
+    allow_effective_target_drop: true
+    # target 保持周期（单位：update ticks，T_u）。
+    target_hold_updates: 1
+    # extra target 的 keyframe 采样策略。
+    extra_target_keyframe_policy: uniform_without_replacement
+    # extra target 的 frame 采样策略。
+    extra_target_frame_policy: uniform_in_keyframe
+
+  # reset 策略配置。
+  reset:
+    # reset policy：默认与 source block 对齐。
+    policy: align_with_source_block
+    # 每个 reset episode 覆盖多少个 source blocks。
+    reset_blocks_per_episode: 1
+    # 进入 segment 时是否 reset。
+    reset_at_segment_start: true
+    # 退出 segment 时是否 reset。
+    reset_at_segment_end: false
+
+  # scene/segment 遍历顺序配置。
+  ordering:
+    # 每个 epoch 是否打乱 scene 顺序。
+    shuffle_scenes_each_epoch: true
+    # 每个 epoch 是否打乱 segment 顺序。
+    shuffle_segments_each_epoch: true
+
+  # scheduler 事件日志开关（由训练脚本消费并落盘）。
+  logging:
+    # 控制台日志开关。
+    console: true
+    # JSONL 结构化日志开关。
+    jsonl: true
+    # TensorBoard 日志开关。
+    tensorboard: true
+    # 是否记录 segment_begin。
+    log_segment_begin: true
+    # 是否记录 block_begin。
+    log_block_begin: true
+    # 是否记录 block_end。
+    log_block_end: true
+    # 是否记录 reset_event。
+    log_reset_events: true
+
+  # MinimalStreetForward NodeState：与 v3 时间基准对齐（由 one-segment v3 训练脚本消费）。
+  # sync_with_scheduler=true：每 U 个 raw step（segment_local_step % U == 0）写回 NodeState；每个 source block 最后一步（block_end 对应 batch）之后 reset_node_state。
+  # 为 true 时忽略下方 model.update_node_state_interval / reset_node_state_interval。
+  model_node_state:
+    sync_with_scheduler: true
+
+# 模型结构与分支超参数。
+model:
+  # 初始化高斯尺度值（全局）。
+  scale_init_value: 0.1
+  # 球谐阶数。
+  sh_degree: 1
+  # 体素大小（稀疏体素编码分辨率）。
+  voxel_size: 0.2
+  # SparseConv 输出通道。
+  sparseConv_outdim: 32
+  # 2D 特征通道数。
+  feat_2d_channels: 32
+  # 2D 特征下采样倍率。
+  feat_2d_downscale: 1
+  # 参数嵌入维度。
+  param_embed_dim: 48
+  # offset GRU 隐状态维度。
+  offset_gru_hidden_dim: 48
+  # offset GRU 是否使用 reset gate。
+  offset_gru_use_reset_gate: true
+  # Node state 写回间隔（模型内部语义）。
+  # 仅当 scheduler_v3.model_node_state.sync_with_scheduler 为 false 或未设置时生效。
+  update_node_state_interval: 1
+  # 仅当 scheduler_v3.model_node_state.sync_with_scheduler 为 false 或未设置时生效。
+  reset_node_state_interval: 10
+  # 天空分支配置。
+  sky:
+    # 天空贴图分辨率。
+    resolution: 1024
+    # 天空初始值。
+    init_value: 0.5
+  # 三分支（bg/distant/rigid）参数配置。
+  branches:
+    # 背景分支。
+    bg:
+      # 是否冻结高斯中心。
+      freeze_means: false
+      # 初始化配置。
+      init:
+        # 尺度初始化配置。
+        scale_init:
+          # 尺度初始化模式。
+          mode: isotropic
+          # 各向同性 log-scale 初始值。
+          isotropic_log_value: -2.30
+          # KNN 邻居数（用于初始化估计）。
+          knn_k: 3
+          # KNN log-scale 偏置。
+          knn_log_scale_bias: 0.0
+        # 不透明度初值。
+        opacity_init: 0.1
+      # 每步 offset/参数变化上限（稳定训练）。
+      limits:
+        offset_max: 0.1
+        scale_max: 0.1
+        omega_max: 0.1
+        opacity_max: 0.1
+        sh_dc_max: 0.1
+        sh_rest_max: 0.05
+      # 各参数分量的学习率缩放系数。
+      eta:
+        means: 1.0
+        scales: 1.0
+        opacity: 1.0
+        sh_dc: 1.0
+        sh_rest: 1.0
+      # 分支 MLP 配置。
+      mlp:
+        hidden_dim: 64
+        use_3d_feat: true
+        use_2d_feat: true
+        freeze_quat: false
+
+    # 远景分支。
+    distant:
+      freeze_means: true
+      init:
+        scale_init:
+          mode: isotropic
+          isotropic_log_value: -1.90
+          knn_k: 3
+          knn_log_scale_bias: 0.0
+        opacity_init: 0.05
+      limits:
+        offset_max: 0.02
+        scale_max: 0.08
+        omega_max: 0.01
+        opacity_max: 0.05
+        sh_dc_max: 0.08
+        sh_rest_max: 0.015
+      eta:
+        means: 0.2
+        scales: 0.7
+        opacity: 0.5
+        sh_dc: 0.8
+        sh_rest: 0.4
+      mlp:
+        hidden_dim: 64
+        use_3d_feat: false
+        use_2d_feat: true
+        freeze_quat: true
+
+    # 刚体动态分支。
+    rigid:
+      # 源视角反投影有效阈值（防止数值问题）。
+      src_backproject_support_min: 1.0e-6
+      freeze_means: false
+      init:
+        scale_init:
+          mode: isotropic
+          isotropic_log_value: -2.10
+          knn_k: 3
+          knn_log_scale_bias: 0.0
+        opacity_init: 0.10
+      limits:
+        offset_max: 0.05
+        scale_max: 0.08
+        omega_max: 0.05
+        opacity_max: 0.08
+        sh_dc_max: 0.08
+        sh_rest_max: 0.03
+      eta:
+        means: 0.5
+        scales: 0.8
+        opacity: 0.8
+        sh_dc: 0.8
+        sh_rest: 0.5
+      mlp:
+        hidden_dim: 64
+        use_3d_feat: false
+        use_2d_feat: true
+        freeze_quat: false
+
+# 损失项配置。
+losses:
+  # RGB 重建损失。
+  rgb:
+    # RGB 损失权重。
+    w: 1.0
+  # SSIM 损失。
+  ssim:
+    # SSIM 损失权重。
+    w: 0.05
+  # mask 监督损失。
+  mask:
+    # mask 损失权重。
+    w: 0.02
+    # mask 中 opacity 的损失类型。
+    opacity_loss_type: bce
+  # opacity 熵正则。
+  opacity_entropy:
+    # 熵损失权重（0 表示关闭）。
+    w: 0.0
+
+# 优化器配置。
+optimizer:
+  # 学习率。
+  lr: 1.0e-4
+  # Adam epsilon。
+  eps: 1.0e-15
+  # 权重衰减。
+  weight_decay: 0.0
+
+# 训练过程控制。
+training:
+  # 最大训练步数。
+  max_iterations: 100010
+  # 常规训练日志间隔（step 级）。
+  log_interval: 100
+  # checkpoint 保存间隔。
+  save_checkpoint_freq: 20000
+  # 训练随机种子。
+  seed: 42
+
+# 评估开关（v3 中指标触发由 block_end 事件驱动，而非 metric_interval）。
+eval:
+  # 是否计算 PSNR/SSIM/LPIPS。
+  enable_psnr: true
+  # 训练结束后是否运行 test views 评估。
+  run_test_at_end: true
+
+# 日志与诊断配置。
+logging:
+  # 图像可视化保存间隔。
+  image_interval: 10000
+  # 是否写 metrics_history.jsonl。
+  enable_jsonl_metrics: true
+  # 是否启用 TensorBoard。
+  use_tensorboard: true
+  # 诊断系统配置。
+  diagnostics:
+    # 是否启用诊断标签/评分。
+    enable: false
+    # 诊断计算间隔。
+    interval: 500
+    # 诊断滑窗长度。
+    window_size: 50
+    # 是否保存分支级诊断渲染图。
+    save_branch_renders: true
+  # 性能统计配置。
+  performance:
+    # 是否启用性能统计。
+    enable: false
+    # 是否统计 phase timing（forward/backward/optimizer）。
+    phase_timing: true
+    # 是否统计 CUDA 显存峰值。
+    cuda_memory: true
+

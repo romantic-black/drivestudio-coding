@@ -44,6 +44,8 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
         fusion_strategy: Literal["merge", "lidar_first", "adaptive"] = "adaptive",
         dynamic_source: Literal["lidar_only", "fuse"] = "lidar_only",
         downsample_dynamic: bool = False,
+        static_instance_motion_enable: bool = False,
+        static_instance_motion_traj_length_thresh_m: Optional[float] = None,
         device: torch.device = torch.device("cpu"),
     ):
         # 使用通用参数初始化基类（不再持有 crop_aabb/input_aabb，AABB 由上层控制）
@@ -59,6 +61,8 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
         self.lidar_generator = LiDARRGBPointCloudGenerator(
             sparsity=lidar_sparsity,
             device=device,
+            static_instance_motion_enable=static_instance_motion_enable,
+            static_instance_motion_traj_length_thresh_m=static_instance_motion_traj_length_thresh_m,
         )
 
         # 创建单目生成器
@@ -205,6 +209,8 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
             )
             result = monocular_result.copy()
             result["metadata"]["type"] = "hybrid_monocular_fallback"
+            result["metadata"]["static_instance_motion_enable"] = False
+            result["metadata"]["static_instance_intids"] = []
             return result
 
         if monocular_result is None:
@@ -243,6 +249,7 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
 
         # 构建元数据
         dynamic_count = sum(len(points) for points in fused_dynamic.values())
+        lidar_meta = lidar_result.get("metadata") or {}
         metadata = {
             "type": "hybrid",
             "lidar_count": len(lidar_background),
@@ -251,8 +258,12 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
             "dynamic_count": dynamic_count,
             "fusion_strategy": self.fusion_strategy,
             "dynamic_source": self.dynamic_source,
-            "lidar_frames_used": lidar_result["metadata"].get("frames_used", 0),
+            "lidar_frames_used": lidar_meta.get("frames_used", 0),
             "monocular_frames_used": monocular_result["metadata"].get("frames_used", 0),
+            "static_instance_motion_enable": lidar_meta.get(
+                "static_instance_motion_enable", False
+            ),
+            "static_instance_intids": list(lidar_meta.get("static_instance_intids", [])),
         }
 
         return {
