@@ -10,6 +10,38 @@ import torch
 import torch.nn.functional as F
 
 
+def pixel_ids_to_grid_sample_coords_align_corners(
+    pixel_ids: torch.Tensor,
+    height: int,
+    width: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Row-major pixel_id -> grid_sample normalized coords for align_corners=True.
+
+    `pixel_ids` come from gsplat rasterization (row-major: id = i * width + j).
+    PyTorch maps grid g in [-1, 1] to input index ((g + 1) / 2) * (size - 1), so
+    integer pixel index k maps to g = 2*k/(size-1) - 1 (not 2*k/size - 1).
+
+    `height`/`width` must be the rasterization image size used to form `pixel_ids`.
+    The feature map may have a different spatial shape; the same (gx, gy) still
+    denotes the same normalized image position when the feature tensor is an
+    align_corners-style resample of that image.
+    """
+    j = (pixel_ids % width).to(dtype=dtype)
+    i = (pixel_ids // width).to(dtype=dtype)
+    if width > 1:
+        gx = 2.0 * j / float(width - 1) - 1.0
+    else:
+        gx = torch.zeros_like(j)
+    if height > 1:
+        gy = 2.0 * i / float(height - 1) - 1.0
+    else:
+        gy = torch.zeros_like(i)
+    return torch.stack([gx, gy], dim=-1)
+
+
 class FeatureBackprojector:
     """
     Aggregate per-pixel CNN features into per-Gaussian descriptors.
@@ -41,10 +73,9 @@ class FeatureBackprojector:
             raise ValueError(f"features_2d must be [V, H, W, C], got {features_2d.shape}")
         device = features_2d.device
         V, _, _, C2 = features_2d.shape
-        coords = torch.zeros(len(pixel_ids), 2, device=device, dtype=features_2d.dtype)
-        coords[:, 0] = (pixel_ids % width).float() / float(width)
-        coords[:, 1] = (pixel_ids // width).float() / float(height)
-        coords = coords * 2.0 - 1.0  # [-1, 1]
+        coords = pixel_ids_to_grid_sample_coords_align_corners(
+            pixel_ids, height, width, features_2d.dtype, device
+        )
 
         sampled = torch.zeros(len(pixel_ids), C2, device=device, dtype=features_2d.dtype)
         for v in range(V):
@@ -99,10 +130,9 @@ class FeatureBackprojector:
         Bilinearly sample a single-view feature map at the specified pixel ids.
         """
         device = feat_2d.device
-        coords = torch.zeros(len(pixel_ids), 2, device=device, dtype=feat_2d.dtype)
-        coords[:, 0] = (pixel_ids % width).float() / float(width)
-        coords[:, 1] = (pixel_ids // width).float() / float(height)
-        coords = coords * 2.0 - 1.0  # [-1, 1]
+        coords = pixel_ids_to_grid_sample_coords_align_corners(
+            pixel_ids, height, width, feat_2d.dtype, device
+        )
 
         feat_2d_chw = feat_2d.permute(2, 0, 1).unsqueeze(0)  # [1, C, H, W]
         coords_grid = coords.view(1, 1, -1, 2)  # [1, 1, M, 2]

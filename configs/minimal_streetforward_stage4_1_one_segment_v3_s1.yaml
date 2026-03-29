@@ -118,8 +118,10 @@ dataset:
     dynamic_source: lidar_only
     # 是否对动态点额外下采样。
     downsample_dynamic: false
-    # 背景点下采样方法。
-    background_downsample_method: uniform
+    # 段内轨迹长度低于阈值的实例视为静止：LiDAR 框内点保留在 background，并排除 dynamic_info。
+    static_instance_motion:
+      enable: true
+      traj_length_thresh_m: 0.5
 
 # 单段训练固定入口（one-segment overfit）。
 one_segment:
