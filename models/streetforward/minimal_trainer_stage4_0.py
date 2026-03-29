@@ -421,6 +421,7 @@ class MinimalStreetForwardStage4_0(MinimalStreetForwardStage3_3):
         feat: torch.Tensor,
         params_for_embed: Dict[str, torch.Tensor],
         h_old: torch.Tensor,
+        head_rms_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
         if feat is None or feat.numel() == 0:
             num_points = params_for_embed["means"].shape[0]
@@ -448,6 +449,7 @@ class MinimalStreetForwardStage4_0(MinimalStreetForwardStage3_3):
             h_cand = torch.tanh(self.gru_candidate(hx))
         h_new = (1.0 - z) * h_old + z * h_cand
         head_input = self.gru_to_head(h_new)
+        head_input = self._apply_gru_head_rms(head_input, head_rms_mask)
         offsets = self._predict_offsets_with_heads(
             head_input,
             limits=self.rigid_cfg["limits"],
@@ -682,7 +684,15 @@ class MinimalStreetForwardStage4_0(MinimalStreetForwardStage3_3):
                 self.h_cache_rigid, key, node_state_rigid.means.shape[0], node_state_rigid, "rigid"
             )
             h_old_rigid_valid = h_old_rigid[rigid_valid_idx]
-            offsets_rigid, h_new_rigid_valid = self._predict_offsets_gru_rigid(feat_rigid_input, params_rigid, h_old_rigid_valid)
+            rigid_head_rms_mask = rigid_valid_mask[rigid_valid_idx].to(
+                dtype=feat_rigid_input.dtype, device=feat_rigid_input.device
+            )
+            offsets_rigid, h_new_rigid_valid = self._predict_offsets_gru_rigid(
+                feat_rigid_input,
+                params_rigid,
+                h_old_rigid_valid,
+                head_rms_mask=rigid_head_rms_mask,
+            )
             render_params_rigid_local = self._render_params_from_offsets_rigid_local(
                 NodeStateRigid(
                     means=node_state_rigid.means[rigid_valid_idx],

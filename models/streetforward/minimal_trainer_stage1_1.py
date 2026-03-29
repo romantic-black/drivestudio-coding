@@ -28,6 +28,7 @@ from models.streetforward.math_utils import (
     _sh_to_rgb,
 )
 from models.streetforward.node_states import NodeStateBackground
+from models.streetforward.rms_norm import RMSNorm
 
 logger = logging.getLogger(__name__)
 
@@ -190,7 +191,7 @@ class MinimalStreetForwardStage1_1(nn.Module):
             nn.ReLU(),
             nn.Linear(self.param_embed_dim, self.param_embed_dim),
         ).to(device)
-        self.param_embed_norm = nn.LayerNorm(self.param_embed_dim).to(device)
+        self.param_embed_norm = RMSNorm(self.param_embed_dim).to(device)
 
         gru_in_dim = outdim + self.param_embed_dim
         self.gru_update = nn.Linear(
@@ -208,6 +209,8 @@ class MinimalStreetForwardStage1_1(nn.Module):
             self.gru_to_head = nn.Linear(self.offset_gru_hidden_dim, outdim).to(device)
         else:
             self.gru_to_head = nn.Identity()
+
+        self.gru_head_rms = RMSNorm(outdim).to(device)
 
         self.h_cache_bg: Dict[Tuple[int, int], torch.Tensor] = {}
         self._h_cache_signatures: Dict[str, Dict[Tuple[int, int], Tuple[int, ...]]] = {}
@@ -262,6 +265,7 @@ class MinimalStreetForwardStage1_1(nn.Module):
             params += list(self.gru_reset.parameters())
         if not isinstance(self.gru_to_head, nn.Identity):
             params += list(self.gru_to_head.parameters())
+        params += list(self.gru_head_rms.parameters())
         params += (
             list(self.mlp_offset_pos.parameters())
             + list(self.mlp_conv.parameters())
@@ -334,6 +338,18 @@ class MinimalStreetForwardStage1_1(nn.Module):
         )
         return param_vec
 
+    def _apply_gru_head_rms(
+        self,
+        head_input: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Apply RMSNorm on GRU hidden->head tensor; optional mask blends normed vs raw (rigid gating)."""
+        normed = self.gru_head_rms(head_input)
+        if mask is None:
+            return normed
+        m = mask.to(device=head_input.device, dtype=head_input.dtype).unsqueeze(-1)
+        return m * normed + (1.0 - m) * head_input
+
     def _build_params_for_embed(
         self, node_state_bg: NodeStateBackground, coord_space: str = "world"
     ) -> Dict[str, torch.Tensor]:
@@ -383,6 +399,7 @@ class MinimalStreetForwardStage1_1(nn.Module):
             h_cand = torch.tanh(self.gru_candidate(hx))
         h_new = (1.0 - z) * h_old + z * h_cand
         head_input = self.gru_to_head(h_new)
+        head_input = self._apply_gru_head_rms(head_input, mask_update_rigid)
         offsets = self._predict_offsets(head_input)
         return offsets, h_new
 

@@ -544,6 +544,8 @@ class FeatureVolumeMixin:
         if visibility is None:
             visibility = torch.ones(feat_3d.shape[0], device=feat_3d.device)
         fused = self.feature_fusion.fuse(feat_3d, feat_2d, visibility)
+        if hasattr(self, "feat_fused_rms") and self.feat_fused_rms is not None:
+            fused = self.feat_fused_rms(fused)
         return fused
 
     def get_grid_coords(

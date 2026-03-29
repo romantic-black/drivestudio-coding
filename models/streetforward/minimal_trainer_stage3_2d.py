@@ -34,6 +34,7 @@ from models.streetforward.minimal_trainer_stage2_1 import (
 )
 from models.streetforward.minimal_trainer_stage2_1 import MinimalStreetForwardStage2_1
 from models.streetforward.node_states import NodeStateBackground, NodeStateDistant
+from models.streetforward.rms_norm import RMSNorm
 
 logger = logging.getLogger(__name__)
 
@@ -173,6 +174,7 @@ class MinimalStreetForwardStage3_2d(MinimalStreetForwardStage2_1):
         )
         self.feature_backprojector = FeatureBackprojector()
         self.feature_fusion = FeatureFusion(use_visibility=False)
+        self.feat_fused_rms = RMSNorm(self.fused_in_dim).to(device)
 
         self.gru_update = nn.Linear(
             gru_in_dim + self.offset_gru_hidden_dim, self.offset_gru_hidden_dim
@@ -184,6 +186,7 @@ class MinimalStreetForwardStage3_2d(MinimalStreetForwardStage2_1):
             gru_in_dim + self.offset_gru_hidden_dim, self.offset_gru_hidden_dim
         ).to(device)
         self.gru_to_head = nn.Identity()
+        self.gru_head_rms = RMSNorm(self.fused_in_dim).to(device)
 
         from models.streetforward.math_utils import _num_sh_bases
         num_sh = _num_sh_bases(self.sh_degree)
@@ -453,7 +456,8 @@ class MinimalStreetForwardStage3_2d(MinimalStreetForwardStage2_1):
             return feat_3d
         if visibility is None:
             visibility = torch.ones(feat_3d.shape[0], device=feat_3d.device)
-        return self.feature_fusion.fuse(feat_3d, feat_2d, visibility)
+        fused = self.feature_fusion.fuse(feat_3d, feat_2d, visibility)
+        return self.feat_fused_rms(fused)
 
     def _render_params_from_offsets_distant(
         self, node_state_distant: NodeStateDistant, offsets: Dict[str, torch.Tensor]

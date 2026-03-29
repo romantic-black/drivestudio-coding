@@ -252,6 +252,46 @@ class MultiSceneDatasetV2(MultiSceneDataset):
             fixed_segment_id=fixed_segment_id,
         )
 
+    def create_train_scheduler_v3(
+        self,
+        *,
+        state_write_interval_steps: int,
+        alpha_updates_per_keyframe: float,
+        min_updates_per_segment: int,
+        max_updates_per_segment: int,
+        target_source_blocks_per_segment: int,
+        min_updates_per_source_block: int,
+        max_updates_per_source_block: int,
+        reset_policy: str,
+        reset_blocks_per_episode: int,
+        target_hold_updates: int,
+        freeze_target_within_block: bool,
+        num_target_frames_total: int,
+        target_include_source: bool,
+        include_test: bool,
+        fixed_scene_id: Optional[int] = None,
+        fixed_segment_id: Optional[int] = None,
+    ) -> "TrainSchedulerV3":
+        return TrainSchedulerV3(
+            dataset=self,
+            state_write_interval_steps=state_write_interval_steps,
+            alpha_updates_per_keyframe=alpha_updates_per_keyframe,
+            min_updates_per_segment=min_updates_per_segment,
+            max_updates_per_segment=max_updates_per_segment,
+            target_source_blocks_per_segment=target_source_blocks_per_segment,
+            min_updates_per_source_block=min_updates_per_source_block,
+            max_updates_per_source_block=max_updates_per_source_block,
+            reset_policy=reset_policy,
+            reset_blocks_per_episode=reset_blocks_per_episode,
+            target_hold_updates=target_hold_updates,
+            freeze_target_within_block=freeze_target_within_block,
+            num_target_frames_total=num_target_frames_total,
+            target_include_source=target_include_source,
+            include_test=include_test,
+            fixed_scene_id=fixed_scene_id,
+            fixed_segment_id=fixed_segment_id,
+        )
+
     def build_eval_manifest_v2(
         self,
         scene_ids: Sequence[int],
@@ -585,4 +625,461 @@ class EvalSchedulerV2:
             include_test=self.include_test,
             test_frame_indices=[int(x) for x in item.get("test_frame_indices", [])] if self.include_test else None,
         )
+
+
+class TrainSchedulerV3:
+    """
+    Scheduler v3: block-based deterministic macro schedule (derived S/K/R) with event hooks.
+
+    Notes:
+    - This scheduler only decides sampling/time boundaries and emits events.
+    - Training loop owns actual logging sinks (jsonl / console / tensorboard), but must
+      trigger metrics on block_end events (instead of step%metric_interval).
+    """
+
+    def __init__(
+        self,
+        *,
+        dataset: MultiSceneDatasetV2,
+        state_write_interval_steps: int,
+        alpha_updates_per_keyframe: float,
+        min_updates_per_segment: int,
+        max_updates_per_segment: int,
+        target_source_blocks_per_segment: int,
+        min_updates_per_source_block: int,
+        max_updates_per_source_block: int,
+        reset_policy: str,
+        reset_blocks_per_episode: int,
+        target_hold_updates: int,
+        freeze_target_within_block: bool,
+        num_target_frames_total: int,
+        target_include_source: bool,
+        include_test: bool,
+        fixed_scene_id: Optional[int],
+        fixed_segment_id: Optional[int],
+    ) -> None:
+        if state_write_interval_steps < 1:
+            raise ValueError("state_write_interval_steps must be >= 1")
+        if alpha_updates_per_keyframe <= 0:
+            raise ValueError("alpha_updates_per_keyframe must be > 0")
+        if min_updates_per_segment < 1:
+            raise ValueError("min_updates_per_segment must be >= 1")
+        if max_updates_per_segment < min_updates_per_segment:
+            raise ValueError("max_updates_per_segment must be >= min_updates_per_segment")
+        if target_source_blocks_per_segment < 1:
+            raise ValueError("target_source_blocks_per_segment must be >= 1")
+        if min_updates_per_source_block < 1:
+            raise ValueError("min_updates_per_source_block must be >= 1")
+        if max_updates_per_source_block < min_updates_per_source_block:
+            raise ValueError("max_updates_per_source_block must be >= min_updates_per_source_block")
+        if reset_blocks_per_episode < 1:
+            raise ValueError("reset_blocks_per_episode must be >= 1")
+        if target_hold_updates < 1:
+            raise ValueError("target_hold_updates must be >= 1")
+        if num_target_frames_total < 1:
+            raise ValueError("num_target_frames_total must be >= 1")
+        if not target_include_source:
+            raise ValueError("target_include_source must be true in scheduler v3")
+        if reset_policy not in {"align_with_source_block", "every_n_source_blocks", "segment_only"}:
+            raise ValueError(f"Unknown reset_policy={reset_policy!r}")
+
+        self.dataset = dataset
+        self.U = int(state_write_interval_steps)
+        self.alpha_updates_per_keyframe = float(alpha_updates_per_keyframe)
+        self.min_updates_per_segment = int(min_updates_per_segment)
+        self.max_updates_per_segment = int(max_updates_per_segment)
+        self.target_source_blocks_per_segment = int(target_source_blocks_per_segment)
+        self.min_updates_per_source_block = int(min_updates_per_source_block)
+        self.max_updates_per_source_block = int(max_updates_per_source_block)
+        self.reset_policy = str(reset_policy)
+        self.reset_blocks_per_episode = int(reset_blocks_per_episode)
+        self.target_hold_updates = int(target_hold_updates)
+        self.freeze_target_within_block = bool(freeze_target_within_block)
+        self.num_target_frames_total = int(num_target_frames_total)
+        self.include_test = bool(include_test)
+        self.fixed_scene_id = int(fixed_scene_id) if fixed_scene_id is not None else None
+        self.fixed_segment_id = int(fixed_segment_id) if fixed_segment_id is not None else None
+
+        self.epoch_idx = 0
+        self.global_step = 0  # raw steps
+        self.epoch_plan: List[Dict[str, int]] = []
+        self.plan_cursor = 0
+        self.current_segment_state: Optional[Dict[str, int]] = None
+        self._pending_events: List[Dict[str, Any]] = []
+
+        self._block_idx_global = 0
+        self._reset_episode_idx = 0
+
+        if not self.dataset._initialized:
+            self.dataset.initialize()
+        self.start_new_epoch()
+
+    def pop_events(self) -> List[Dict[str, Any]]:
+        events = list(self._pending_events)
+        self._pending_events.clear()
+        return events
+
+    def _emit(self, event: Dict[str, Any]) -> None:
+        self._pending_events.append(event)
+
+    def _sample_source_from_keyframe(self, scene_id: int, segment_id: int, keyframe_idx: int) -> int:
+        scene_data = self.dataset.get_scene(scene_id)
+        if scene_data is None:
+            raise ValueError(f"Scene {scene_id} cannot be loaded")
+        frame_candidates = scene_data["keyframe_segments"][int(keyframe_idx)]
+        if len(frame_candidates) == 0:
+            raise ValueError(f"scene={scene_id} segment={segment_id} keyframe={keyframe_idx} has no frames")
+        return int(random.choice(frame_candidates))
+
+    def _build_source_keyframe_cycle(self, scene_id: int, segment_id: int) -> List[int]:
+        scene_data = self.dataset.get_scene(scene_id)
+        if scene_data is None:
+            raise ValueError(f"Scene {scene_id} cannot be loaded")
+        segment = scene_data["segments"][segment_id]
+        keyframes = [int(kf) for kf in segment["keyframe_indices"]]
+        if len(keyframes) == 0:
+            raise ValueError(f"scene={scene_id} segment={segment_id} has no keyframes")
+        random.shuffle(keyframes)
+        return keyframes
+
+    def _sample_target_frames(self, scene_id: int, segment_id: int, source_kf: int, source_frame: int) -> List[int]:
+        scene_data = self.dataset.get_scene(scene_id)
+        if scene_data is None:
+            raise ValueError(f"Scene {scene_id} cannot be loaded")
+        segment = scene_data["segments"][segment_id]
+        extra_needed = self.num_target_frames_total - 1
+        if extra_needed <= 0:
+            return [int(source_frame)]
+
+        candidate_kfs = [int(kf) for kf in segment["keyframe_indices"] if int(kf) != int(source_kf)]
+        if len(candidate_kfs) == 0:
+            raise ValueError(
+                "No non-source keyframes available for extra target sampling; "
+                f"scene={scene_id} segment={segment_id} source_kf={source_kf}"
+            )
+        picked_kfs = candidate_kfs[:] if len(candidate_kfs) < extra_needed else random.sample(candidate_kfs, extra_needed)
+        while len(picked_kfs) < extra_needed:
+            picked_kfs.append(int(random.choice(candidate_kfs)))
+
+        extra_frames: List[int] = []
+        for kf in picked_kfs:
+            frames = scene_data["keyframe_segments"][int(kf)]
+            if len(frames) == 0:
+                raise ValueError(f"scene={scene_id} segment={segment_id} keyframe={kf} has no frames")
+            extra_frames.append(int(random.choice(frames)))
+        return [int(source_frame)] + extra_frames
+
+    def build_epoch_plan(self) -> None:
+        if self.fixed_scene_id is not None:
+            train_scene_ids = [self.fixed_scene_id]
+        else:
+            if len(getattr(self.dataset, "scene_training_queue", [])) == 0:
+                self.dataset._initialize_training_queue()
+            train_scene_ids = list(getattr(self.dataset, "scene_training_queue", []))
+            if len(train_scene_ids) == 0:
+                raise ValueError("No valid scenes in dataset.scene_training_queue")
+            random.shuffle(train_scene_ids)
+
+        plan: List[Dict[str, int]] = []
+        for scene_id in train_scene_ids:
+            scene_data = self.dataset.get_scene(scene_id)
+            if scene_data is None:
+                raise ValueError(f"Scene {scene_id} cannot be loaded")
+            all_segment_ids = list(range(len(scene_data["segments"])))
+            if self.fixed_segment_id is not None:
+                if self.fixed_segment_id not in all_segment_ids:
+                    raise ValueError(f"fixed_segment_id={self.fixed_segment_id} out of range in scene={scene_id}")
+                segment_ids = [self.fixed_segment_id]
+            else:
+                segment_ids = all_segment_ids
+                random.shuffle(segment_ids)
+
+            for segment_id in segment_ids:
+                segment = scene_data["segments"][segment_id]
+                num_keyframes = len(segment["keyframe_indices"])
+                S_u_raw = _clamp_int(
+                    int(round(self.alpha_updates_per_keyframe * num_keyframes)),
+                    self.min_updates_per_segment,
+                    self.max_updates_per_segment,
+                )
+                K_u_raw = int(round(S_u_raw / float(self.target_source_blocks_per_segment)))
+                K_u = _clamp_int(K_u_raw, self.min_updates_per_source_block, self.max_updates_per_source_block)
+                B_seg = max(1, int(math.ceil(S_u_raw / float(K_u))))
+                S_u_final = int(B_seg * K_u)
+                K_steps = int(K_u * self.U)
+                T_steps = int(K_u * self.U) if self.freeze_target_within_block else int(self.target_hold_updates * self.U)
+                R_u = int(K_u) if self.reset_policy == "align_with_source_block" else int(self.reset_blocks_per_episode * K_u)
+                if self.reset_policy == "segment_only":
+                    R_u = int(S_u_final)
+                R_steps = int(R_u * self.U)
+                plan.append(
+                    {
+                        "scene_id": int(scene_id),
+                        "segment_id": int(segment_id),
+                        "num_keyframes": int(num_keyframes),
+                        "S_u_raw": int(S_u_raw),
+                        "S_u_final": int(S_u_final),
+                        "K_u": int(K_u),
+                        "B_seg": int(B_seg),
+                        "R_u": int(R_u),
+                        "T_u": int(K_u) if self.freeze_target_within_block else int(self.target_hold_updates),
+                        "U": int(self.U),
+                        "K_steps": int(K_steps),
+                        "R_steps": int(R_steps),
+                        "T_steps": int(T_steps),
+                        "segment_step_budget": int(S_u_final * self.U),
+                        "freeze_target_within_block": int(1 if self.freeze_target_within_block else 0),
+                    }
+                )
+        if len(plan) == 0:
+            raise ValueError("Epoch plan is empty")
+        self.epoch_plan = plan
+        self.plan_cursor = 0
+
+    def start_new_epoch(self) -> None:
+        self.epoch_idx += 1
+        self.build_epoch_plan()
+        self.current_segment_state = None
+
+    def _enter_segment(self) -> None:
+        item = self.epoch_plan[self.plan_cursor]
+        cycle = self._build_source_keyframe_cycle(item["scene_id"], item["segment_id"])
+        self.current_segment_state = {
+            "scene_id": int(item["scene_id"]),
+            "segment_id": int(item["segment_id"]),
+            "segment_local_step": 0,
+            "segment_step_budget": int(item["segment_step_budget"]),
+            "block_idx_in_segment": 0,
+            "block_step_in_block": 0,
+            "target_hold_step": 0,
+            "source_cycle_pos": 0,
+        }
+        self._emit(
+            {
+                "type": "segment_begin",
+                "epoch_idx": int(self.epoch_idx),
+                "global_step": int(self.global_step),
+                **{k: int(item[k]) for k in item.keys() if k != "segment_step_budget"},
+                "segment_step_budget": int(item["segment_step_budget"]),
+                "reset_policy": str(self.reset_policy),
+            }
+        )
+        # Segment-enter reset (if policy says so, always true for align/every_n; also for segment_only)
+        self._reset_episode_idx += 1
+        self._emit(
+            {
+                "type": "reset_event",
+                "epoch_idx": int(self.epoch_idx),
+                "global_step": int(self.global_step),
+                "scene_id": int(item["scene_id"]),
+                "segment_id": int(item["segment_id"]),
+                "reset_episode_idx": int(self._reset_episode_idx),
+                "reason": "segment_enter",
+            }
+        )
+        self._enter_block()
+
+    def _enter_block(self) -> None:
+        state = self.current_segment_state
+        if state is None:
+            raise ValueError("Internal scheduler state is not initialized")
+        item = self.epoch_plan[self.plan_cursor]
+        scene_id = int(item["scene_id"])
+        segment_id = int(item["segment_id"])
+        cycle = self._build_source_keyframe_cycle(scene_id, segment_id)
+        # Keep a lightweight shuffled-cycle without storing full list across calls:
+        # choose by advancing a cursor modulo len(keyframes); reshuffle when wraps.
+        # For determinism across block boundaries within an epoch, we store cycle in state.
+        if "source_keyframe_cycle" not in state:
+            state["source_keyframe_cycle"] = 1  # sentinel; actual list stored separately
+            state["_cycle_list"] = cycle
+        cycle_list = state.get("_cycle_list", cycle)
+        pos = int(state["source_cycle_pos"])
+        if pos >= len(cycle_list):
+            random.shuffle(cycle_list)
+            pos = 0
+        source_kf = int(cycle_list[pos])
+        state["source_cycle_pos"] = int(pos + 1)
+        source_frame = self._sample_source_from_keyframe(scene_id, segment_id, source_kf)
+
+        # Reset semantics (event-only)
+        state_reset_this_block = False
+        if self.reset_policy == "align_with_source_block":
+            state_reset_this_block = True
+        elif self.reset_policy == "every_n_source_blocks":
+            if (int(state["block_idx_in_segment"]) % int(self.reset_blocks_per_episode)) == 0:
+                state_reset_this_block = True
+        elif self.reset_policy == "segment_only":
+            state_reset_this_block = False
+        if state_reset_this_block:
+            self._reset_episode_idx += 1
+            self._emit(
+                {
+                    "type": "reset_event",
+                    "epoch_idx": int(self.epoch_idx),
+                    "global_step": int(self.global_step),
+                    "scene_id": int(scene_id),
+                    "segment_id": int(segment_id),
+                    "reset_episode_idx": int(self._reset_episode_idx),
+                    "reason": "source_block_boundary",
+                }
+            )
+
+        state["source_keyframe_idx"] = int(source_kf)
+        state["source_frame_idx"] = int(source_frame)
+        state["block_step_in_block"] = 0
+        state["target_hold_step"] = 0
+
+        self._block_idx_global += 1
+        state["block_idx_global"] = int(self._block_idx_global)
+
+        self._emit(
+            {
+                "type": "block_begin",
+                "epoch_idx": int(self.epoch_idx),
+                "global_step": int(self.global_step),
+                "scene_id": int(scene_id),
+                "segment_id": int(segment_id),
+                "block_idx_in_segment": int(state["block_idx_in_segment"]),
+                "block_idx_global": int(state["block_idx_global"]),
+                "reset_episode_idx": int(self._reset_episode_idx),
+                "state_reset_this_block": bool(state_reset_this_block),
+                "source_keyframe_idx": int(source_kf),
+                "source_frame_idx": int(source_frame),
+                "U": int(item["U"]),
+                "K_u": int(item["K_u"]),
+                "K_steps": int(item["K_steps"]),
+                "R_u": int(item["R_u"]),
+                "R_steps": int(item["R_steps"]),
+                "T_u": int(item["T_u"]),
+                "T_steps": int(item["T_steps"]),
+            }
+        )
+
+        # Initial target sample for the block
+        target_frames = self._sample_target_frames(scene_id, segment_id, source_kf, source_frame)
+        state["target_frame_indices"] = target_frames
+
+    def next_batch(self) -> Dict[str, Any]:
+        if self.plan_cursor >= len(self.epoch_plan):
+            self.start_new_epoch()
+        if self.current_segment_state is None:
+            self._enter_segment()
+        state = self.current_segment_state
+        if state is None:
+            raise ValueError("Internal scheduler state is not initialized")
+        item = self.epoch_plan[self.plan_cursor]
+
+        scene_id = int(state["scene_id"])
+        segment_id = int(state["segment_id"])
+        source_frame = int(state["source_frame_idx"])
+        source_kf = int(state["source_keyframe_idx"])
+
+        # Target refresh inside block
+        T_steps = int(item["T_steps"])
+        if T_steps > 0 and int(state["target_hold_step"]) >= T_steps:
+            state["target_frame_indices"] = self._sample_target_frames(scene_id, segment_id, source_kf, source_frame)
+            state["target_hold_step"] = 0
+
+        batch = self.dataset.get_segment_batch_from_frames(
+            scene_id=scene_id,
+            segment_id=segment_id,
+            source_frame_idx=source_frame,
+            target_frame_indices=list(state.get("target_frame_indices", [source_frame])),
+            include_test=self.include_test,
+        )
+
+        # Advance counters (raw-step domain)
+        state["segment_local_step"] += 1
+        state["block_step_in_block"] += 1
+        state["target_hold_step"] += 1
+        self.global_step += 1
+
+        # Block end check
+        K_steps = int(item["K_steps"])
+        if int(state["block_step_in_block"]) >= K_steps:
+            self._emit(
+                {
+                    "type": "block_end",
+                    "epoch_idx": int(self.epoch_idx),
+                    "global_step": int(self.global_step),
+                    "scene_id": int(scene_id),
+                    "segment_id": int(segment_id),
+                    "block_idx_in_segment": int(state["block_idx_in_segment"]),
+                    "block_idx_global": int(state["block_idx_global"]),
+                    "source_keyframe_idx": int(source_kf),
+                    "source_frame_idx": int(source_frame),
+                    "U": int(item["U"]),
+                    "K_u": int(item["K_u"]),
+                    "K_steps": int(item["K_steps"]),
+                    "R_u": int(item["R_u"]),
+                    "R_steps": int(item["R_steps"]),
+                    "T_u": int(item["T_u"]),
+                    "T_steps": int(item["T_steps"]),
+                }
+            )
+            state["block_idx_in_segment"] += 1
+            self._enter_block()
+
+        # Segment end check
+        if int(state["segment_local_step"]) >= int(state["segment_step_budget"]):
+            self.plan_cursor += 1
+            self.current_segment_state = None
+
+        return batch
+
+    def get_current_info(self) -> Dict[str, Any]:
+        state = self.current_segment_state
+        if state is None and self.plan_cursor < len(self.epoch_plan):
+            item = self.epoch_plan[self.plan_cursor]
+            return {
+                "epoch_idx": int(self.epoch_idx),
+                "global_step": int(self.global_step),
+                "scene_id": int(item["scene_id"]),
+                "segment_id": int(item["segment_id"]),
+                "segment_local_step": 0,
+                "segment_step_budget": int(item["segment_step_budget"]),
+                "block_idx_in_segment": 0,
+                "block_idx_global": int(self._block_idx_global),
+                "source_frame_idx": -1,
+                "source_keyframe_idx": -1,
+                "U": int(item["U"]),
+                "K_steps": int(item["K_steps"]),
+                "R_steps": int(item["R_steps"]),
+                "T_steps": int(item["T_steps"]),
+            }
+        if state is None:
+            return {
+                "epoch_idx": int(self.epoch_idx),
+                "global_step": int(self.global_step),
+                "scene_id": -1,
+                "segment_id": -1,
+                "segment_local_step": 0,
+                "segment_step_budget": 0,
+                "block_idx_in_segment": 0,
+                "block_idx_global": int(self._block_idx_global),
+                "source_frame_idx": -1,
+                "source_keyframe_idx": -1,
+                "U": int(self.U),
+                "K_steps": 0,
+                "R_steps": 0,
+                "T_steps": 0,
+            }
+        item = self.epoch_plan[self.plan_cursor]
+        return {
+            "epoch_idx": int(self.epoch_idx),
+            "global_step": int(self.global_step),
+            "scene_id": int(state["scene_id"]),
+            "segment_id": int(state["segment_id"]),
+            "segment_local_step": int(state["segment_local_step"]),
+            "segment_step_budget": int(state["segment_step_budget"]),
+            "block_idx_in_segment": int(state["block_idx_in_segment"]),
+            "block_idx_global": int(state.get("block_idx_global", self._block_idx_global)),
+            "source_frame_idx": int(state.get("source_frame_idx", -1)),
+            "source_keyframe_idx": int(state.get("source_keyframe_idx", -1)),
+            "U": int(item["U"]),
+            "K_steps": int(item["K_steps"]),
+            "R_steps": int(item["R_steps"]),
+            "T_steps": int(item["T_steps"]),
+        }
 

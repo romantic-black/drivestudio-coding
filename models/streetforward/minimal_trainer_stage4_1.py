@@ -51,6 +51,35 @@ class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
             )
         source_frame_idx = int(batch.get("source_frame_idx", targets[0].get("frame_idx", 0)))
         target_frames = {int(t["frame_idx"]) for t in targets}
+        # Fast-fail source/target alignment guard:
+        # For each source view, there must be a target on source_frame_idx with matching camera pose.
+        # This catches silent batch corruption where source frame/camera drifts from target metadata.
+        src_frame_targets = [t for t in targets if int(t.get("frame_idx", source_frame_idx)) == source_frame_idx]
+        if len(src_frame_targets) == 0:
+            raise ValueError(
+                "Stage4.1 requires at least one target on source_frame_idx for source/target alignment checks. "
+                f"source_frame_idx={source_frame_idx}, target_frames={sorted(target_frames)}"
+            )
+        used_target_idx = set()
+        for i, src_view in enumerate(source_views):
+            src_c2w = src_view.camtoworlds if hasattr(src_view, "camtoworlds") else src_view["camtoworlds"]
+            src_c2w = src_c2w if src_c2w.dim() == 2 else src_c2w[0]
+            matched = False
+            for j, t in enumerate(src_frame_targets):
+                if j in used_target_idx:
+                    continue
+                tgt_view = t["view"]
+                tgt_c2w = tgt_view.camtoworlds if hasattr(tgt_view, "camtoworlds") else tgt_view["camtoworlds"]
+                tgt_c2w = tgt_c2w if tgt_c2w.dim() == 2 else tgt_c2w[0]
+                if torch.allclose(src_c2w.to(self.device), tgt_c2w.to(self.device), atol=1e-4, rtol=1e-4):
+                    used_target_idx.add(j)
+                    matched = True
+                    break
+            if not matched:
+                raise ValueError(
+                    "Stage4.1 source/target camera-frame mismatch: no target view on source_frame_idx matches "
+                    f"source_views[{i}] (source_frame_idx={source_frame_idx})."
+                )
         if node_state_rigid is not None:
             for fid in {source_frame_idx, *target_frames}:
                 if self._resolve_rigid_frame_idx(node_state_rigid, fid) is None:
@@ -350,7 +379,10 @@ class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
                 self.h_cache_rigid, key, node_state_rigid.means.shape[0], node_state_rigid, "rigid"
             )
             h_old_rigid_U = h_old_rigid[U]
-            offsets_rigid, h_new_rigid_U = self._predict_offsets_gru_rigid(feat_U, params_rigid, h_old_rigid_U)
+            rigid_head_rms_mask = mask_src_feat_valid[U].to(dtype=feat_U.dtype, device=feat_U.device)
+            offsets_rigid, h_new_rigid_U = self._predict_offsets_gru_rigid(
+                feat_U, params_rigid, h_old_rigid_U, head_rms_mask=rigid_head_rms_mask
+            )
             render_params_rigid_local = self._render_params_from_offsets_rigid_local(
                 NodeStateRigid(
                     means=node_state_rigid.means[U],
@@ -623,14 +655,32 @@ class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
             "gt_image": gt_images_t[0],
         }
 
+    def _writeback_node_states_from_out(self, out: Dict[str, Any]) -> None:
+        """Persist render params into NodeState tensors (bg / distant / rigid)."""
+        if "_node_state_bg" in out:
+            self._update_node_state_bg(out["_node_state_bg"], out["render_params"])
+        if out.get("_node_state_distant") is not None and out.get("_render_params_distant") is not None:
+            self._update_node_state_distant(out["_node_state_distant"], out["_render_params_distant"])
+        if out.get("_node_state_rigid") is not None and out.get("_render_params_rigid_local") is not None:
+            valid_idx = out.get("_rigid_writeback_idx", out.get("_rigid_valid_idx"))
+            if valid_idx is None:
+                raise ValueError("Internal error: missing rigid writeback idx.")
+            if valid_idx.numel() > 0:
+                self._update_node_state_rigid_local(
+                    out["_node_state_rigid"], out["_render_params_rigid_local"], valid_idx
+                )
+
     def train_step(
         self,
         batch: Dict,
         step: Optional[int] = None,
         profile_phase_timing: bool = False,
         sync_cuda_timing: bool = False,
+        scheduler_node_sync: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         self.train()
+        node_state_sync_update = False
+        node_state_sync_reset = False
         timing_ms: Dict[str, float] = {
             "forward_ms": 0.0,
             "backward_ms": 0.0,
@@ -677,19 +727,22 @@ class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
             if out.get("_h_new_rigid") is not None:
                 self.h_cache_rigid[key] = out["_h_new_rigid"].detach()
 
-        if self.update_node_state_interval > 0 and step is not None and step % self.update_node_state_interval == 0:
-            if "_node_state_bg" in out:
-                self._update_node_state_bg(out["_node_state_bg"], out["render_params"])
-            if out.get("_node_state_distant") is not None and out.get("_render_params_distant") is not None:
-                self._update_node_state_distant(out["_node_state_distant"], out["_render_params_distant"])
-            if out.get("_node_state_rigid") is not None and out.get("_render_params_rigid_local") is not None:
-                valid_idx = out.get("_rigid_writeback_idx", out.get("_rigid_valid_idx"))
-                if valid_idx is None:
-                    raise ValueError("Internal error: missing rigid writeback idx.")
-                if valid_idx.numel() > 0:
-                    self._update_node_state_rigid_local(
-                        out["_node_state_rigid"], out["_render_params_rigid_local"], valid_idx
-                    )
+        if scheduler_node_sync is not None:
+            U = int(scheduler_node_sync["U"])
+            seg = int(scheduler_node_sync["segment_local_step"])
+            reset_after_block = bool(scheduler_node_sync.get("reset_after_block", False))
+            if U < 1:
+                raise ValueError(
+                    "scheduler_node_sync requires U >= 1 (scheduler time_base.state_write_interval_steps)."
+                )
+            if seg > 0 and seg % U == 0:
+                self._writeback_node_states_from_out(out)
+                node_state_sync_update = True
+            if reset_after_block:
+                self.reset_node_state()
+                node_state_sync_reset = True
+        elif self.update_node_state_interval > 0 and step is not None and step % self.update_node_state_interval == 0:
+            self._writeback_node_states_from_out(out)
             if self.reset_node_state_interval > 0 and step % self.reset_node_state_interval == 0:
                 self.reset_node_state()
 
@@ -740,6 +793,8 @@ class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
             **{k: float(v) for k, v in offset_stats.items()},
             **grad_norms,
             **timing_ms,
+            "node_state_sync_update": node_state_sync_update,
+            "node_state_sync_reset": node_state_sync_reset,
         }
 
 

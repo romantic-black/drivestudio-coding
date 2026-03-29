@@ -24,6 +24,19 @@ def _quat_to_rot6d(quats: torch.Tensor) -> torch.Tensor:
 
 
 class OffsetsMixin:
+    def _apply_gru_head_rms(
+        self,
+        head_input: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if not hasattr(self, "gru_head_rms") or self.gru_head_rms is None:
+            return head_input
+        normed = self.gru_head_rms(head_input)
+        if mask is None:
+            return normed
+        m = mask.to(device=head_input.device, dtype=head_input.dtype).unsqueeze(-1)
+        return m * normed + (1.0 - m) * head_input
+
     def _mask_rigid_offsets(
         self, offsets: Dict[str, torch.Tensor], visible_mask: Optional[torch.Tensor]
     ) -> Dict[str, torch.Tensor]:
@@ -251,6 +264,7 @@ class OffsetsMixin:
 
         # Project to offset head input dim if needed
         head_input = self.gru_to_head(h_new)
+        head_input = self._apply_gru_head_rms(head_input, mask_update_rigid)
         offsets = self._predict_offsets(head_input)
 
         if mask_update_rigid is not None:

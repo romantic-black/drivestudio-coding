@@ -343,6 +343,7 @@ class MinimalStreetForwardStage3_3(MinimalStreetForwardStage3_2):
             h_cand = torch.tanh(self.gru_candidate(hx))
         h_new = (1.0 - z) * h_old + z * h_cand
         head_input = self.gru_to_head(h_new)
+        head_input = self._apply_gru_head_rms(head_input, None)
         offsets = self._predict_offsets_with_heads(
             head_input,
             limits=self.distant_cfg["limits"],

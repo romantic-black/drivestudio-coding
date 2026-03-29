@@ -17,6 +17,7 @@ from models.feature_extractors import (
     ImageFeatureExtractor,
 )
 from models.streetforward.math_utils import _num_sh_bases, get_viewmat
+from models.streetforward.rms_norm import RMSNorm
 from models.streetforward.node_states import (
     NodeState,
     NodeStateBackground,
@@ -170,11 +171,13 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
             # 不再使用可见性通道，保持 3D+2D 融合
             self.feature_fusion = FeatureFusion(use_visibility=False)
             fused_in_dim = outdim + self.feat_2d_channels
+            self.feat_fused_rms = RMSNorm(fused_in_dim).to(device)
         else:
             self.image_feature_extractor = None
             self.alpha_t_extractor = None
             self.feature_backprojector = None
             self.feature_fusion = None
+            self.feat_fused_rms = None
 
         # GRU-style hidden fusion settings
         self.param_embed_input_dim = 17  # means(3) + rot6d(6) + scales(3) + opacity(1) + sh_dc(3) + sh_rest_energy(1)
@@ -188,7 +191,7 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
             nn.ReLU(),
             nn.Linear(self.param_embed_dim, self.param_embed_dim),
         ).to(device)
-        self.param_embed_norm = nn.LayerNorm(self.param_embed_dim).to(device)
+        self.param_embed_norm = RMSNorm(self.param_embed_dim).to(device)
 
         # GRU-style fusion layers
         gru_in_dim = fused_in_dim + self.param_embed_dim
@@ -205,6 +208,7 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
             self.gru_to_head = nn.Linear(self.offset_gru_hidden_dim, fused_in_dim).to(device)
         else:
             self.gru_to_head = nn.Identity()
+        self.gru_head_rms = RMSNorm(fused_in_dim).to(device)
 
         # MLP 偏移量预测头（支持 2D+3D 融合特征）
         # 位置偏移预测网络：fused_in_dim → 64 → 32 → 3
@@ -255,6 +259,9 @@ class StreetForwardTrainer(CheckpointMixin, ProxyRenderingMixin, OffsetsMixin, F
             params += list(self.gru_reset.parameters())
         if not isinstance(self.gru_to_head, nn.Identity):
             params += list(self.gru_to_head.parameters())
+        params += list(self.gru_head_rms.parameters())
+        if self.feat_fused_rms is not None:
+            params += list(self.feat_fused_rms.parameters())
         params += list(self.mlp_offset_pos.parameters())
         params += list(self.mlp_conv.parameters())
         params += list(self.mlp_opacity.parameters())
