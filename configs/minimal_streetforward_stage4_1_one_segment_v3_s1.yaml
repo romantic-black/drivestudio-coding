@@ -1,5 +1,5 @@
 # 实验名；用于日志目录命名与配置落盘。
-output_name: minimal_sf_stage4_1_one_segment
+output_name: minimal_sf_stage4_1_one_segment_1cam
 
 # 数据源与加载总配置。
 data:
@@ -25,9 +25,9 @@ data:
     # 像素数据源实现类。
     type: datasets.nuscenes.nuscenes_sourceloader.NuScenesPixelSource
     # 使用的相机 ID。
-    cameras: [0, 1, 2, 3, 4, 5]
+    cameras: [0]
     # 各相机加载时缩放比例（先缩放再进入训练流）。
-    downscale_when_loading: [3, 3, 3, 3, 3, 3]
+    downscale_when_loading: [3]
     # 训练阶段额外缩放比例（1 表示不再缩放）。
     downscale: 1
     # 是否去畸变。
@@ -95,7 +95,7 @@ dataset:
     # LiDAR 采样密度策略。
     lidar_sparsity: full
     # 单目深度使用的相机 ID。
-    monocular_chosen_cam_ids: [0, 1, 2, 3, 4, 5]
+    monocular_chosen_cam_ids: [0]
     # 单目点云采样密度策略。
     monocular_sparsity: full
     # 是否过滤天空区域单目点。
@@ -104,20 +104,16 @@ dataset:
     monocular_depth_consistency: false
     # 单目深度图下采样倍率。
     monocular_downscale: 2
-    # 是否启用动态区域单目过滤。
-    monocular_dynamic_filter: true
     # 动态掩码字段名。
-    monocular_dynamic_mask_key: dynamic_masks
+    monocular_dynamic_mask_key: fine_dynamic_mask
+    # 单目动态点回收：3D bbox 扩张（米）。
+    monocular_dynamic_recovery_bbox_expand_xyz_m: [0.5, 0.2, 0.5]
+    # 单实例动态点数上限。
+    monocular_dynamic_recovery_max_points_per_instance: 20000
     # 近景点云最大点数。
-    near_max_points: 400000
+    near_max_points: 1000000
     # 远景点云最大点数。
-    distant_max_points: 400000
-    # 融合策略：merge。
-    fusion_strategy: merge
-    # 动态点来源：仅 LiDAR。
-    dynamic_source: lidar_only
-    # 是否对动态点额外下采样。
-    downsample_dynamic: false
+    distant_max_points: 2000000
     # 段内轨迹长度低于阈值的实例视为静止：LiDAR 框内点保留在 background，并排除 dynamic_info。
     static_instance_motion:
       enable: true
@@ -331,7 +327,7 @@ model:
     # 刚体动态分支。
     rigid:
       # 源视角反投影有效阈值（防止数值问题）。
-      src_backproject_support_min: 1.0e-6
+      src_backproject_support_min: 0
       freeze_means: false
       init:
         scale_init:
@@ -392,7 +388,7 @@ optimizer:
 # 训练过程控制。
 training:
   # 最大训练步数。
-  max_iterations: 100010
+  max_iterations: 200010
   # 常规训练日志间隔（step 级）。
   log_interval: 100
   # checkpoint 保存间隔。

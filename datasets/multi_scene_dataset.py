@@ -57,6 +57,66 @@ def _parse_static_instance_motion_cfg(pointcloud_config: Dict) -> Tuple[bool, Op
     return False, None
 
 
+def _parse_monocular_dynamic_recovery_cfg(
+    pointcloud_config: Dict,
+) -> Tuple[bool, Optional[List[float]], Optional[int], str]:
+    """
+    Parse monocular dynamic recovery config.
+
+    Returns:
+        (
+            enable,
+            bbox_expand_xyz_m,
+            max_points_per_instance,
+            assignment,
+        )
+    """
+    block = pointcloud_config.get("dynamic_recovery")
+    if block is None:
+        return False, None, None, "first_hit"
+    if "enable" not in block:
+        raise ValueError(
+            "dataset.pointcloud.dynamic_recovery.enable is required when dynamic_recovery is set."
+        )
+    enable = bool(block["enable"])
+    if not enable:
+        return False, None, None, str(block.get("assignment", "first_hit"))
+
+    if "bbox_expand_xyz_m" not in block:
+        raise ValueError(
+            "dataset.pointcloud.dynamic_recovery.bbox_expand_xyz_m is required when enable=true."
+        )
+    if "max_points_per_instance" not in block:
+        raise ValueError(
+            "dataset.pointcloud.dynamic_recovery.max_points_per_instance is required when enable=true."
+        )
+
+    bbox_expand = list(block["bbox_expand_xyz_m"])
+    if len(bbox_expand) != 3:
+        raise ValueError(
+            "dataset.pointcloud.dynamic_recovery.bbox_expand_xyz_m must have 3 values [dx, dy, dz]."
+        )
+    bbox_expand = [float(x) for x in bbox_expand]
+    if any(x < 0.0 for x in bbox_expand):
+        raise ValueError(
+            "dataset.pointcloud.dynamic_recovery.bbox_expand_xyz_m must be non-negative."
+        )
+
+    max_points = int(block["max_points_per_instance"])
+    if max_points <= 0:
+        raise ValueError(
+            "dataset.pointcloud.dynamic_recovery.max_points_per_instance must be > 0."
+        )
+
+    assignment = str(block.get("assignment", "first_hit"))
+    if assignment not in ("first_hit", "nearest_center"):
+        raise ValueError(
+            "dataset.pointcloud.dynamic_recovery.assignment must be one of ['first_hit', 'nearest_center']."
+        )
+
+    return True, bbox_expand, max_points, assignment
+
+
 # #region agent log
 _AGENT_DEBUG_LOG_PATH = "/root/drivestudio-coding/.cursor/debug-cebadb.log"
 
@@ -437,12 +497,13 @@ class MultiSceneDataset:
             chosen_cam_ids = pointcloud_config["chosen_cam_ids"]
             if "dynamic_filter" not in pointcloud_config:
                 raise ValueError("dataset.pointcloud.dynamic_filter is required for monocular generator.")
-            if "dynamic_mask_key" not in pointcloud_config:
-                raise ValueError("dataset.pointcloud.dynamic_mask_key is required for monocular generator.")
             if not bool(pointcloud_config["dynamic_filter"]):
                 raise ValueError(
                     "Monocular pointcloud requires dynamic_filter=true (no bbox fallback)."
                 )
+            dyn_rec_enable, dyn_rec_bbox_expand, dyn_rec_max_pts, dyn_rec_assignment = (
+                _parse_monocular_dynamic_recovery_cfg(pointcloud_config)
+            )
 
             # Require pixel_source to load dynamic masks (fast-fail)
             if (
@@ -460,7 +521,10 @@ class MultiSceneDataset:
                 depth_consistency=pointcloud_config["depth_consistency"],
                 downscale=pointcloud_config["downscale"],
                 dynamic_filter=pointcloud_config["dynamic_filter"],
-                dynamic_mask_key=pointcloud_config["dynamic_mask_key"],
+                dynamic_recovery_enable=dyn_rec_enable,
+                dynamic_recovery_bbox_expand_xyz_m=dyn_rec_bbox_expand,
+                dynamic_recovery_max_points_per_instance=dyn_rec_max_pts,
+                dynamic_recovery_assignment=dyn_rec_assignment,
                 device=device,
             )
         elif generator_type == "lidar":
@@ -480,15 +544,15 @@ class MultiSceneDataset:
                 raise ValueError("dataset.pointcloud.lidar_sparsity is required for hybrid generator.")
             lidar_sparsity = pointcloud_config["lidar_sparsity"]
             
-            # 单目生成器参数
+            # 单目生成器参数（最小必需集合）
             required_mono = [
                 "monocular_chosen_cam_ids",
                 "monocular_sparsity",
                 "monocular_filter_sky",
                 "monocular_depth_consistency",
                 "monocular_downscale",
-                "monocular_dynamic_filter",
-                "monocular_dynamic_mask_key",
+                "monocular_dynamic_recovery_bbox_expand_xyz_m",
+                "monocular_dynamic_recovery_max_points_per_instance",
             ]
             missing = [k for k in required_mono if k not in pointcloud_config]
             if missing:
@@ -500,11 +564,6 @@ class MultiSceneDataset:
             monocular_filter_sky = pointcloud_config["monocular_filter_sky"]
             monocular_depth_consistency = pointcloud_config["monocular_depth_consistency"]
             monocular_downscale = pointcloud_config["monocular_downscale"]
-
-            if not bool(pointcloud_config["monocular_dynamic_filter"]):
-                raise ValueError(
-                    "Hybrid pointcloud requires monocular_dynamic_filter=true (no bbox fallback)."
-                )
             if (
                 getattr(data_cfg, "pixel_source", None) is None
                 or not bool(data_cfg.pixel_source.get("load_dynamic_mask", False))
@@ -513,18 +572,56 @@ class MultiSceneDataset:
                     "Hybrid pointcloud requires data.pixel_source.load_dynamic_mask: true "
                     "(monocular dynamic filtering)."
                 )
-            
-            # 融合参数
-            required_fusion = ["fusion_strategy", "dynamic_source", "downsample_dynamic"]
-            missing_fusion = [k for k in required_fusion if k not in pointcloud_config]
-            if missing_fusion:
-                raise ValueError(f"Hybrid pointcloud missing required fusion keys: {missing_fusion}")
+
             near_max_points = pointcloud_config.get("near_max_points", None)
             distant_max_points = pointcloud_config.get("distant_max_points", None)
-            fusion_strategy = pointcloud_config["fusion_strategy"]
-            dynamic_source = pointcloud_config["dynamic_source"]
-            downsample_dynamic = pointcloud_config["downsample_dynamic"]
             sim_enable, sim_thresh = _parse_static_instance_motion_cfg(pointcloud_config)
+            mono_rec_bbox_expand = pointcloud_config["monocular_dynamic_recovery_bbox_expand_xyz_m"]
+            mono_rec_max_pts = pointcloud_config["monocular_dynamic_recovery_max_points_per_instance"]
+
+            mono_rec_bbox_expand = list(mono_rec_bbox_expand)
+            if len(mono_rec_bbox_expand) != 3:
+                raise ValueError(
+                    "dataset.pointcloud.monocular_dynamic_recovery_bbox_expand_xyz_m must have "
+                    "3 values [dx, dy, dz]."
+                )
+            mono_rec_bbox_expand = [float(x) for x in mono_rec_bbox_expand]
+            if any(x < 0.0 for x in mono_rec_bbox_expand):
+                raise ValueError(
+                    "dataset.pointcloud.monocular_dynamic_recovery_bbox_expand_xyz_m must be non-negative."
+                )
+            mono_rec_max_pts = int(mono_rec_max_pts)
+            if mono_rec_max_pts <= 0:
+                raise ValueError(
+                    "dataset.pointcloud.monocular_dynamic_recovery_max_points_per_instance must be > 0."
+                )
+            if "monocular_dynamic_recovery_enable" in pointcloud_config:
+                raise ValueError(
+                    "dataset.pointcloud.monocular_dynamic_recovery_enable is removed; "
+                    "hybrid now always enables monocular dynamic recovery."
+                )
+            if "monocular_dynamic_recovery_assignment" in pointcloud_config:
+                raise ValueError(
+                    "dataset.pointcloud.monocular_dynamic_recovery_assignment is removed; "
+                    "hybrid now uses first_hit."
+                )
+            if "monocular_dynamic_filter" in pointcloud_config:
+                raise ValueError(
+                    "dataset.pointcloud.monocular_dynamic_filter is removed; "
+                    "hybrid always enables monocular dynamic filtering."
+                )
+            if "fusion_strategy" in pointcloud_config:
+                raise ValueError(
+                    "dataset.pointcloud.fusion_strategy is removed; hybrid always uses merge."
+                )
+            if "dynamic_source" in pointcloud_config:
+                raise ValueError(
+                    "dataset.pointcloud.dynamic_source is removed; hybrid always uses fused dynamic points."
+                )
+            if "downsample_dynamic" in pointcloud_config:
+                raise ValueError(
+                    "dataset.pointcloud.downsample_dynamic is removed; hybrid no longer supports this config."
+                )
 
             return HybridRGBPointCloudGenerator(
                 lidar_sparsity=lidar_sparsity,
@@ -533,13 +630,10 @@ class MultiSceneDataset:
                 monocular_filter_sky=monocular_filter_sky,
                 monocular_depth_consistency=monocular_depth_consistency,
                 monocular_downscale=monocular_downscale,
-                monocular_dynamic_filter=pointcloud_config["monocular_dynamic_filter"],
-                monocular_dynamic_mask_key=pointcloud_config["monocular_dynamic_mask_key"],
+                monocular_dynamic_recovery_bbox_expand_xyz_m=mono_rec_bbox_expand,
+                monocular_dynamic_recovery_max_points_per_instance=mono_rec_max_pts,
                 near_max_points=near_max_points,
                 distant_max_points=distant_max_points,
-                fusion_strategy=fusion_strategy,
-                dynamic_source=dynamic_source,
-                downsample_dynamic=downsample_dynamic,
                 static_instance_motion_enable=sim_enable,
                 static_instance_motion_traj_length_thresh_m=sim_thresh,
                 device=device,

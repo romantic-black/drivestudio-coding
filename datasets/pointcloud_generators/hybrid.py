@@ -36,14 +36,11 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
         monocular_filter_sky: bool = True,
         monocular_depth_consistency: bool = True,
         monocular_downscale: int = 2,
-        monocular_dynamic_filter: bool = True,
-        monocular_dynamic_mask_key: Literal["dynamic_masks", "human_masks", "vehicle_masks"] = "dynamic_masks",
+        monocular_dynamic_recovery_bbox_expand_xyz_m: Optional[List[float]] = None,
+        monocular_dynamic_recovery_max_points_per_instance: Optional[int] = None,
         # 融合参数
         near_max_points: Optional[int] = None,
         distant_max_points: Optional[int] = None,
-        fusion_strategy: Literal["merge", "lidar_first", "adaptive"] = "adaptive",
-        dynamic_source: Literal["lidar_only", "fuse"] = "lidar_only",
-        downsample_dynamic: bool = False,
         static_instance_motion_enable: bool = False,
         static_instance_motion_traj_length_thresh_m: Optional[float] = None,
         device: torch.device = torch.device("cpu"),
@@ -72,24 +69,24 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
             filter_sky=monocular_filter_sky,
             depth_consistency=monocular_depth_consistency,
             downscale=monocular_downscale,
-            dynamic_filter=monocular_dynamic_filter,
-            dynamic_mask_key=monocular_dynamic_mask_key,
+            dynamic_filter=True,
+            dynamic_recovery_enable=True,
+            dynamic_recovery_bbox_expand_xyz_m=monocular_dynamic_recovery_bbox_expand_xyz_m,
+            dynamic_recovery_max_points_per_instance=monocular_dynamic_recovery_max_points_per_instance,
+            dynamic_recovery_assignment="first_hit",
             device=device,
         )
 
         # 存储融合参数
         self.near_max_points = int(near_max_points) if near_max_points is not None else None
         self.distant_max_points = int(distant_max_points) if distant_max_points is not None else None
-        self.fusion_strategy = fusion_strategy
-        self.dynamic_source = dynamic_source
-        self.downsample_dynamic = downsample_dynamic
-
-        if self.dynamic_source == "fuse":
-            # Monocular generator no longer outputs per-instance dynamic pointclouds.
-            raise ValueError(
-                "Hybrid pointcloud dynamic_source='fuse' is unsupported when monocular dynamic "
-                "points are disabled. Use dynamic_source='lidar_only'."
-            )
+        # Fast-fail simplification: hybrid uses deterministic behavior
+        # - background fusion: merge
+        # - dynamic fusion: fuse (lidar + monocular)
+        # - no extra dynamic downsample here
+        self.fusion_strategy: Literal["merge"] = "merge"
+        self.dynamic_source: Literal["fuse"] = "fuse"
+        self.downsample_dynamic = False
 
     def _stride_downsample(self, pts6: np.ndarray, max_count: Optional[int]) -> np.ndarray:
         if max_count is None or max_count <= 0:
@@ -239,9 +236,7 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
         #     )
 
         # 融合背景点云
-        fused_background = self._fuse_background_points(
-            lidar_background, monocular_background, lidar_dynamic
-        )
+        fused_background = self._fuse_background_points(lidar_background, monocular_background)
         fused_background, cap_stats = self._apply_segment_aabb_caps(dataset, fused_background)
 
         # 融合动态对象点云
@@ -277,14 +272,11 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
         self,
         lidar_background: np.ndarray,
         monocular_background: np.ndarray,
-        lidar_dynamic: Dict[int, np.ndarray],
     ) -> np.ndarray:
         """
         融合背景点云。
         
-        策略：
-        - 先按fusion_strategy融合（merge / lidar_first / adaptive）
-        - adaptive 策略在“没有点数预算”时退化为 merge（即返回全量点云）
+        策略：固定 merge（直接拼接 LiDAR + monocular）。
         """
         # 处理空点云情况
         if len(lidar_background) == 0 and len(monocular_background) == 0:
@@ -298,21 +290,7 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
             # 只有LiDAR点云
             return lidar_background
 
-        # 根据融合策略融合点云
-        if self.fusion_strategy == "merge":
-            # 简单合并
-            return np.concatenate([lidar_background, monocular_background], axis=0)
-
-        elif self.fusion_strategy == "lidar_first":
-            # “lidar_first” 在没有点数预算的前提下等价于 merge（保留全量LiDAR和单目点）
-            return np.concatenate([lidar_background, monocular_background], axis=0)
-
-        elif self.fusion_strategy == "adaptive":
-            # 没有点数预算时，自适应策略没有意义，退化为 merge
-            return np.concatenate([lidar_background, monocular_background], axis=0)
-
-        else:
-            raise ValueError(f"Unknown fusion strategy: {self.fusion_strategy}")
+        return np.concatenate([lidar_background, monocular_background], axis=0)
 
     def _fuse_dynamic_objects(
         self,
@@ -320,61 +298,14 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
         monocular_dynamic: Dict[int, np.ndarray],
     ) -> Dict[int, np.ndarray]:
         """
-        动态对象点云融合策略。
-        
-        - dynamic_source="lidar_only": 直接返回lidar_dynamic
-        - dynamic_source="fuse": 按实例ID合并lidar_dynamic与monocular_dynamic（实验性）
+        动态对象点云融合策略：固定 fuse（按实例ID合并 lidar + monocular）。
         """
-        if self.dynamic_source == "lidar_only":
-            result = lidar_dynamic.copy()
-        elif self.dynamic_source == "fuse":
-            # 按实例ID合并
-            result = lidar_dynamic.copy()
-            for intid, monocular_points in monocular_dynamic.items():
-                if intid in result:
-                    # 合并同一实例的点云
-                    result[intid] = np.concatenate([result[intid], monocular_points], axis=0)
-                else:
-                    # 添加新实例
-                    result[intid] = monocular_points
-        else:
-            raise ValueError(f"Unknown dynamic_source: {self.dynamic_source}")
-
-        # 如果启用下采样，对动态点云进行下采样
-        if self.downsample_dynamic:
-            for intid in result:
-                # 对每个动态对象进行下采样（保持点数比例）
-                # 这里使用简单的均匀下采样
-                points = result[intid]
-                if len(points) > 1000:  # 只对较大的点云下采样
-                    pcd = o3d.geometry.PointCloud()
-                    pcd.points = o3d.utility.Vector3dVector(points[:, :3])
-                    # 修复：更准确地判断颜色范围，避免错误的归一化/反归一化
-                    # 如果最大值 > 1.0 + 1e-3，说明是 [0, 255] 范围，需要归一化到 [0, 1] 供 Open3D 使用
-                    # 如果最大值 <= 1.0 + 1e-3，说明已经是 [0, 1] 范围，不需要归一化
-                    points_colors = points[:, 3:]
-                    if points_colors.max() > 1.0 + 1e-3:
-                        # 已经是 [0, 255] 范围，归一化到 [0, 1]
-                        colors_normalized = points_colors / 255.0
-                    else:
-                        # 已经是 [0, 1] 范围，不需要归一化
-                        colors_normalized = points_colors
-                    pcd.colors = o3d.utility.Vector3dVector(colors_normalized)
-                    # 下采样到原来的50%
-                    every_k = max(1, len(points) // (len(points) // 2))
-                    pcd = pcd.uniform_down_sample(every_k_points=every_k)
-                    filtered_points = np.asarray(pcd.points).astype(np.float32)
-                    filtered_colors = np.asarray(pcd.colors).astype(np.float32)
-                    # 修复：确保颜色值转换回 [0, 255] 范围
-                    # Open3D 返回的颜色值应该在 [0, 1] 范围内
-                    # 如果最大值 <= 1.0 + 1e-3，说明是 [0, 1] 范围，需要乘以 255 转换到 [0, 255]
-                    # 如果最大值 > 1.0 + 1e-3，说明已经是 [0, 255] 范围（不应该发生，但为了安全起见处理）
-                    if filtered_colors.max() <= 1.0 + 1e-3:
-                        filtered_colors = filtered_colors * 255.0
-                    else:
-                        # 如果已经是 [0, 255] 范围，确保值在有效范围内
-                        filtered_colors = np.clip(filtered_colors, 0.0, 255.0)
-                    result[intid] = np.concatenate([filtered_points, filtered_colors], axis=1)
+        result = lidar_dynamic.copy()
+        for intid, monocular_points in monocular_dynamic.items():
+            if intid in result:
+                result[intid] = np.concatenate([result[intid], monocular_points], axis=0)
+            else:
+                result[intid] = monocular_points
 
         return result
 

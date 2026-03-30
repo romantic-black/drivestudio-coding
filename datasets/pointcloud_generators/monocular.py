@@ -1,4 +1,5 @@
 import logging
+from collections import defaultdict
 from typing import Dict, List, Literal, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
@@ -17,9 +18,10 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
     RGB point cloud generator that back-projects monocular depth from MultiSceneDataset.
     Generates static background points by back-projecting monocular depth.
 
-    Important (fast-fail, no backward compatibility):
-    - Dynamic objects are removed in the pixel domain using dynamic masks (e.g. image_infos['dynamic_masks']).
-    - This generator no longer produces per-instance dynamic pointclouds (returns empty dict).
+    Dynamic handling (fast-fail):
+    - Pixel-domain dynamic filtering is still used to keep background clean.
+    - Optional dynamic recovery extracts per-instance points by 3D bbox from
+      monocular back-projected points.
     """
 
     def __init__(
@@ -30,7 +32,10 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
         depth_consistency: bool = True,
         downscale: int = 2,
         dynamic_filter: bool = True,
-        dynamic_mask_key: Literal["dynamic_masks", "human_masks", "vehicle_masks"] = "dynamic_masks",
+        dynamic_recovery_enable: bool = False,
+        dynamic_recovery_bbox_expand_xyz_m: Optional[List[float]] = None,
+        dynamic_recovery_max_points_per_instance: Optional[int] = None,
+        dynamic_recovery_assignment: Literal["first_hit", "nearest_center"] = "first_hit",
         device: torch.device = torch.device("cpu"),
     ):
         super().__init__(
@@ -42,7 +47,37 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
         )
         self.chosen_cam_ids = chosen_cam_ids
         self.dynamic_filter = bool(dynamic_filter)
-        self.dynamic_mask_key = str(dynamic_mask_key)
+        # Dynamic mask is fixed to coarse dynamic masks to simplify configuration.
+        self.dynamic_mask_key = "dynamic_masks"
+        self.dynamic_recovery_enable = bool(dynamic_recovery_enable)
+        self.dynamic_recovery_assignment = str(dynamic_recovery_assignment)
+        if self.dynamic_recovery_assignment not in ("first_hit", "nearest_center"):
+            raise ValueError(
+                "dynamic_recovery_assignment must be one of ['first_hit', 'nearest_center']."
+            )
+        if self.dynamic_recovery_enable:
+            if dynamic_recovery_bbox_expand_xyz_m is None:
+                raise ValueError(
+                    "dynamic_recovery_enable=true requires dynamic_recovery_bbox_expand_xyz_m."
+                )
+            bbox_expand = np.asarray(dynamic_recovery_bbox_expand_xyz_m, dtype=np.float32).reshape(-1)
+            if bbox_expand.shape[0] != 3:
+                raise ValueError(
+                    "dynamic_recovery_bbox_expand_xyz_m must contain 3 values: [dx, dy, dz]."
+                )
+            if np.any(bbox_expand < 0):
+                raise ValueError("dynamic_recovery_bbox_expand_xyz_m must be non-negative.")
+            if dynamic_recovery_max_points_per_instance is None:
+                raise ValueError(
+                    "dynamic_recovery_enable=true requires dynamic_recovery_max_points_per_instance."
+                )
+            self.dynamic_recovery_max_points_per_instance = int(dynamic_recovery_max_points_per_instance)
+            if self.dynamic_recovery_max_points_per_instance <= 0:
+                raise ValueError("dynamic_recovery_max_points_per_instance must be > 0.")
+            self.dynamic_recovery_bbox_expand_xyz_m = bbox_expand
+        else:
+            self.dynamic_recovery_bbox_expand_xyz_m = np.zeros((3,), dtype=np.float32)
+            self.dynamic_recovery_max_points_per_instance = None
 
     def generate_pointcloud(
         self,
@@ -105,10 +140,26 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
                 ]
 
         all_backgrounds: List[np.ndarray] = []
+        all_dynamic_objects: Dict[int, List[np.ndarray]] = defaultdict(list)
+        dynamic_recovery_frame_count = 0
+        dynamic_recovered_points_before_cap = 0
+
+        if self.dynamic_recovery_enable:
+            instance_mapping, instances_by_frame = self._get_instances_for_segment(
+                dataset, scene_id, segment_id, frame_indices, world_to_seg0
+            )
+            frame_to_instances = {
+                frame_idx: instances_by_frame[i] for i, frame_idx in enumerate(frame_indices)
+            }
+        else:
+            instance_mapping = {}
+            frame_to_instances = {}
 
         for frame_idx in frame_indices:
             frame_points_world: List[np.ndarray] = []
             frame_colors: List[np.ndarray] = []
+            frame_points_world_for_dynamic: List[np.ndarray] = []
+            frame_colors_for_dynamic: List[np.ndarray] = []
 
             for cam_id, frames_sorted in sorted_frame_data_by_camera.items():
                 if not frames_sorted:
@@ -119,11 +170,24 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
                         continue
                     consistency_mask = masks[order] if order < len(masks) else None
                     points_w, colors = self._generate_points_from_frame_data(
-                        frame_data, consistency_mask, downscale_mask
+                        frame_data,
+                        consistency_mask,
+                        downscale_mask,
+                        apply_dynamic_filter=True,
                     )
                     if points_w is not None and len(points_w) > 0:
                         frame_points_world.append(points_w)
                         frame_colors.append(colors)
+                    if self.dynamic_recovery_enable:
+                        points_w_dyn, colors_dyn = self._generate_points_from_frame_data(
+                            frame_data,
+                            consistency_mask,
+                            downscale_mask,
+                            apply_dynamic_filter=False,
+                        )
+                        if points_w_dyn is not None and len(points_w_dyn) > 0:
+                            frame_points_world_for_dynamic.append(points_w_dyn)
+                            frame_colors_for_dynamic.append(colors_dyn)
 
             if len(frame_points_world) == 0:
                 continue
@@ -141,11 +205,28 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
             )
             all_backgrounds.append(background_frame)
 
+            if self.dynamic_recovery_enable and len(frame_points_world_for_dynamic) > 0:
+                dynamic_points_world = np.concatenate(frame_points_world_for_dynamic, axis=0)
+                dynamic_colors = np.concatenate(frame_colors_for_dynamic, axis=0)
+                dynamic_points_world = self._transform_points_np(dynamic_points_world, world_to_seg0)
+                frame_instances = frame_to_instances.get(frame_idx, [])
+                dynamic_frame, frame_recovered_before_cap = self._recover_dynamic_points_by_3d_bbox(
+                    dynamic_points_world,
+                    dynamic_colors,
+                    frame_instances,
+                )
+                if len(dynamic_frame) > 0:
+                    dynamic_recovery_frame_count += 1
+                dynamic_recovered_points_before_cap += frame_recovered_before_cap
+                for intid, points_local_rgb in dynamic_frame.items():
+                    all_dynamic_objects[intid].append(points_local_rgb)
+
         background = (
             np.concatenate(all_backgrounds, axis=0)
             if len(all_backgrounds) > 0
             else np.zeros((0, 6), dtype=np.float32)
         )
+        dynamic_objects = self._finalize_dynamic_objects_with_cap(all_dynamic_objects)
         # Single-stage filtering without inside/outside split; distant/near划分交给上层根据 segment_aabb 完成
         if len(background) > 0:
             background_pts, background_colors = background[:, :3], background[:, 3:]
@@ -165,12 +246,22 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
             "sparsity": self.sparsity,
             "dynamic_filter": self.dynamic_filter,
             "dynamic_mask_key": self.dynamic_mask_key,
+            "dynamic_recovery_enable": self.dynamic_recovery_enable,
+            "dynamic_recovery_assignment": self.dynamic_recovery_assignment,
+            "dynamic_recovery_bbox_expand_xyz_m": self.dynamic_recovery_bbox_expand_xyz_m.tolist(),
+            "dynamic_recovery_max_points_per_instance": self.dynamic_recovery_max_points_per_instance,
+            "dynamic_recovery_frames_with_points": dynamic_recovery_frame_count,
+            "dynamic_recovered_instances": len(dynamic_objects),
+            "dynamic_recovered_points_before_cap": int(dynamic_recovered_points_before_cap),
+            "dynamic_recovered_points_total": int(
+                sum(int(points.shape[0]) for points in dynamic_objects.values())
+            ),
         }
 
         return {
             "background": background,
-            "dynamic": {},
-            "instance_mapping": {},
+            "dynamic": dynamic_objects,
+            "instance_mapping": instance_mapping,
             "metadata": metadata,
         }
 
@@ -358,6 +449,8 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
         frame_data: Dict,
         consistency_mask: Optional[np.ndarray],
         downscale_mask: Optional[np.ndarray],
+        *,
+        apply_dynamic_filter: bool,
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         rgb = frame_data["image"]
         depth = frame_data["depth"]
@@ -388,7 +481,7 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
             keep_mask = np.ones((H, W), dtype=bool)
 
         # dynamic_mask is canonical **1=dynamic(ignore), 0=static(keep)** (float/bool).
-        if self.dynamic_filter:
+        if self.dynamic_filter and apply_dynamic_filter:
             if dynamic_mask is None:
                 raise ValueError(
                     "dynamic_filter is enabled but dynamic_mask is missing in frame_data."
@@ -449,6 +542,148 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
         rgb_values = rgb_values.astype(np.float32)
 
         return worlds.astype(np.float32), rgb_values
+
+    def _stride_limit_points6(self, points6: np.ndarray, max_count: Optional[int]) -> np.ndarray:
+        if max_count is None:
+            return points6
+        n = int(points6.shape[0])
+        if n <= int(max_count):
+            return points6
+        step = max(1, n // int(max_count))
+        idx = np.arange(0, n, step, dtype=np.int64)
+        if idx.shape[0] > int(max_count):
+            idx = idx[: int(max_count)]
+        return points6[idx]
+
+    def _recover_dynamic_points_by_3d_bbox(
+        self,
+        points_world: np.ndarray,
+        colors: np.ndarray,
+        instances: List[Dict],
+    ) -> Tuple[Dict[int, np.ndarray], int]:
+        if len(points_world) == 0 or len(instances) == 0:
+            return {}, 0
+
+        points_world = points_world.astype(np.float32, copy=False)
+        colors = colors.astype(np.float32, copy=False)
+        n = int(points_world.shape[0])
+        points_h = np.concatenate(
+            [points_world, np.ones((n, 1), dtype=np.float32)],
+            axis=1,
+        )
+
+        dynamic_dict: Dict[int, np.ndarray] = {}
+        recovered_before_cap = 0
+
+        if self.dynamic_recovery_assignment == "nearest_center":
+            best_intid = np.full((n,), -1, dtype=np.int64)
+            best_dist = np.full((n,), np.inf, dtype=np.float32)
+            best_local = np.zeros((n, 3), dtype=np.float32)
+
+            for instance in instances:
+                intid = int(instance["intid"])
+                T_ow = np.asarray(instance["T_ow"], dtype=np.float32)
+                size_lwh = np.asarray(instance["size_lwh"], dtype=np.float32)
+                if T_ow.shape == (3, 4):
+                    T_ow = np.vstack([T_ow, np.array([0, 0, 0, 1], dtype=np.float32)])
+                if T_ow.shape != (4, 4):
+                    continue
+                if size_lwh.shape != (3,):
+                    size_lwh = size_lwh.reshape(3)
+                try:
+                    T_wo = np.linalg.inv(T_ow)
+                except np.linalg.LinAlgError:
+                    continue
+
+                local_all = (T_wo @ points_h.T).T[:, :3]
+                half = 0.5 * size_lwh + self.dynamic_recovery_bbox_expand_xyz_m
+                inside = (np.abs(local_all) <= (half[None, :] + 1e-6)).all(axis=1)
+                if not np.any(inside):
+                    continue
+                dist = np.linalg.norm(local_all, axis=1).astype(np.float32)
+                better = inside & (dist < best_dist)
+                if not np.any(better):
+                    continue
+                best_dist[better] = dist[better]
+                best_intid[better] = intid
+                best_local[better] = local_all[better].astype(np.float32, copy=False)
+
+            valid = best_intid >= 0
+            if not np.any(valid):
+                return {}, 0
+            recovered_before_cap = int(valid.sum())
+            unique_intids = np.unique(best_intid[valid]).tolist()
+            for intid in unique_intids:
+                mask = best_intid == intid
+                local_points = best_local[mask]
+                selected_colors = colors[mask].astype(np.float32, copy=False)
+                points6 = np.concatenate([local_points, selected_colors], axis=1)
+                points6 = self._stride_limit_points6(points6, self.dynamic_recovery_max_points_per_instance)
+                if points6.shape[0] > 0:
+                    dynamic_dict[int(intid)] = points6.astype(np.float32, copy=False)
+            return dynamic_dict, recovered_before_cap
+
+        assigned = np.zeros(n, dtype=bool)
+        for instance in instances:
+            intid = int(instance["intid"])
+            T_ow = np.asarray(instance["T_ow"], dtype=np.float32)
+            size_lwh = np.asarray(instance["size_lwh"], dtype=np.float32)
+            if T_ow.shape == (3, 4):
+                T_ow = np.vstack([T_ow, np.array([0, 0, 0, 1], dtype=np.float32)])
+            if T_ow.shape != (4, 4):
+                continue
+            if size_lwh.shape != (3,):
+                size_lwh = size_lwh.reshape(3)
+
+            try:
+                T_wo = np.linalg.inv(T_ow)
+            except np.linalg.LinAlgError:
+                continue
+
+            if self.dynamic_recovery_assignment == "first_hit":
+                candidate_idx = np.where(~assigned)[0]
+            else:
+                candidate_idx = np.arange(n, dtype=np.int64)
+            if candidate_idx.shape[0] == 0:
+                continue
+
+            local_all = (T_wo @ points_h[candidate_idx].T).T[:, :3]
+            half = 0.5 * size_lwh + self.dynamic_recovery_bbox_expand_xyz_m
+            inside = (np.abs(local_all) <= (half[None, :] + 1e-6)).all(axis=1)
+            if not np.any(inside):
+                continue
+
+            local_points = local_all[inside].astype(np.float32, copy=False)
+            selected_idx = candidate_idx[inside]
+            selected_colors = colors[selected_idx].astype(np.float32, copy=False)
+            points6 = np.concatenate([local_points, selected_colors], axis=1)
+            recovered_before_cap += int(points6.shape[0])
+            points6 = self._stride_limit_points6(points6, self.dynamic_recovery_max_points_per_instance)
+            if points6.shape[0] > 0:
+                dynamic_dict[intid] = points6.astype(np.float32, copy=False)
+                if self.dynamic_recovery_assignment == "first_hit":
+                    assigned[selected_idx] = True
+
+        return dynamic_dict, recovered_before_cap
+
+    def _finalize_dynamic_objects_with_cap(
+        self,
+        all_dynamic_objects: Dict[int, List[np.ndarray]],
+    ) -> Dict[int, np.ndarray]:
+        if len(all_dynamic_objects) == 0:
+            return {}
+
+        finalized: Dict[int, np.ndarray] = {}
+        for intid, points_list in all_dynamic_objects.items():
+            if len(points_list) == 0:
+                continue
+            merged = np.concatenate(points_list, axis=0).astype(np.float32, copy=False)
+            merged = self._stride_limit_points6(
+                merged,
+                self.dynamic_recovery_max_points_per_instance,
+            )
+            finalized[intid] = merged
+        return finalized
 
     def _get_instances_for_segment(
         self,

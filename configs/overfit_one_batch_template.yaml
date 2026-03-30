@@ -61,9 +61,6 @@ dataset:
     monocular_filter_sky: true
     monocular_depth_consistency: false
     monocular_downscale: 2
-    # 单目动态物体过滤（fast-fail；不再使用 3D bbox 移除动态）
-    monocular_dynamic_filter: true
-    monocular_dynamic_mask_key: dynamic_masks  # dynamic_masks | human_masks | vehicle_masks
     # 融合参数
     # 仅 StreetForward/MultiScene 路径使用的近/远景点数上限（按 segment_aabb 内外划分）
     near_max_points: 400000     # 近景（segment_aabb 内）背景点数上限

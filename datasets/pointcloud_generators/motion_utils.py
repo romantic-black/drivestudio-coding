@@ -39,7 +39,10 @@ def compute_static_instance_intids(
     instances_pose = pixel_source.instances_pose
     per_frame_mask = getattr(pixel_source, "per_frame_instance_mask", None)
     if per_frame_mask is None:
-        return set()
+        raise ValueError(
+            "Static instance motion filtering requires pixel_source.per_frame_instance_mask; "
+            "ensure loader provides per-frame instance visibility or disable static_instance_motion."
+        )
 
     if not isinstance(instances_pose, torch.Tensor):
         instances_pose = torch.as_tensor(instances_pose)

@@ -47,3 +47,18 @@ def test_single_visible_frame_is_static():
     ps = _FakePixelSource(pose, mask)
     static_ids = compute_static_instance_intids(ps, [0, 1], 0.5)
     assert static_ids == {0}
+
+
+def test_missing_per_frame_mask_raises():
+    pose = torch.eye(4).unsqueeze(0).unsqueeze(0).repeat(2, 1, 1, 1)
+
+    class _PixelSourceNoMask:
+        def __init__(self, instances_pose):
+            self.instances_pose = instances_pose
+
+    ps = _PixelSourceNoMask(pose)
+    try:
+        compute_static_instance_intids(ps, [0, 1], 0.5)
+    except ValueError:
+        return
+    assert False, "Expected ValueError when per_frame_instance_mask is missing"
