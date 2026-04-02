@@ -1,5 +1,5 @@
 # 实验名；用于日志目录命名与配置落盘。
-output_name: minimal_sf_stage4_1_one_segment_1cam
+output_name: minimal_sf_stage4_2_one_segment_1cam
 
 # 数据源与加载总配置。
 data:
@@ -84,9 +84,9 @@ dataset:
   # segment AABB（在 segment 第一帧坐标系下）。
   segment_aabb:
     # [x_min, y_min, z_min]
-    - [-40.0, -20.0, -20.0]
+    - [-40.0, -20.0, -30.0]
     # [x_max, y_max, z_max]
-    - [40.0, 4.8, 70.0]
+    - [40.0, 14.8, 90.0]
 
   # 点云融合配置（背景/远景/动态）。
   pointcloud:
@@ -107,11 +107,11 @@ dataset:
     # 单目动态点回收：3D bbox 扩张（米）。
     monocular_dynamic_recovery_bbox_expand_xyz_m: [0.5, 0.2, 0.5]
     # 单实例动态点数上限。
-    monocular_dynamic_recovery_max_points_per_instance: 20000
+    monocular_dynamic_recovery_max_points_per_instance: 10000
     # 近景点云最大点数。
-    near_max_points: 1000000
+    near_max_points: 400000
     # 远景点云最大点数。
-    distant_max_points: 2000000
+    distant_max_points: 400000
     # 段内轨迹长度低于阈值的实例视为静止：LiDAR 框内点保留在 background，并排除 dynamic_info。
     static_instance_motion:
       enable: true
@@ -255,6 +255,10 @@ model:
   branches:
     # 背景分支。
     bg:
+      # Stage4.2：源视角 backproject 有效阈值（与 acc_w 比较）。
+      src_backproject_support_min: 0
+      # Stage4.2：是否启用选择性 target 更新（当前实现为兼容占位，静态分支为全 1 mask）。
+      enable_selective_update: false
       # 是否冻结高斯中心。
       freeze_means: false
       # 初始化配置。
@@ -295,6 +299,8 @@ model:
 
     # 远景分支。
     distant:
+      src_backproject_support_min: 0
+      enable_selective_update: false
       freeze_means: true
       init:
         scale_init:
@@ -386,7 +392,7 @@ optimizer:
 # 训练过程控制。
 training:
   # 最大训练步数。
-  max_iterations: 200010
+  max_iterations: 5010
   # 常规训练日志间隔（step 级）。
   log_interval: 100
   # checkpoint 保存间隔。
@@ -404,7 +410,7 @@ eval:
 # 日志与诊断配置。
 logging:
   # 图像可视化保存间隔。
-  image_interval: 10000
+  image_interval: 96
   # 是否写 metrics_history.jsonl。
   enable_jsonl_metrics: true
   # 是否启用 TensorBoard。
@@ -422,7 +428,7 @@ logging:
   # 性能统计配置。
   performance:
     # 是否启用性能统计。
-    enable: false
+    enable: true
     # 是否统计 phase timing（forward/backward/optimizer）。
     phase_timing: true
     # 是否统计 CUDA 显存峰值。

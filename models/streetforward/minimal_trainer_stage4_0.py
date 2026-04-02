@@ -215,6 +215,7 @@ class MinimalStreetForwardStage4_0(MinimalStreetForwardStage3_3):
             eps=float(config.optimizer.get("eps")),
             weight_decay=float(config.optimizer.get("weight_decay")),
         )
+        self._perf_acc: Dict[str, float] = {}
 
     def _assert_src_target_consistent(self, batch: Dict, targets: List[Dict]) -> None:
         source_views = batch.get("source_views")
@@ -474,10 +475,19 @@ class MinimalStreetForwardStage4_0(MinimalStreetForwardStage3_3):
         num_gaussians = int(gaussians["means"].shape[0])
         if num_gaussians == 0:
             return None, None
+        stats: Dict[str, float] = {}
+        if torch.cuda.is_available():
+            stats["cuda_mem_alloc_before"] = float(torch.cuda.memory_allocated())
+            stats["cuda_mem_reserved_before"] = float(torch.cuda.memory_reserved())
         with torch.no_grad():
-            rendered_rgbs = self.alpha_t_extractor.render_rgb_only(
-                gaussians, source_views, height, width
+            render_rgb_out = self.alpha_t_extractor.render_rgb_only(
+                gaussians, source_views, height, width, return_debug_stats=True
             )
+        if isinstance(render_rgb_out, tuple):
+            rendered_rgbs, rgb_stats = render_rgb_out
+            stats.update({f"2d_rgb_{k}": float(v) for k, v in rgb_stats.items()})
+        else:
+            rendered_rgbs = render_rgb_out
         image_batch = torch.stack([img.to(self.device) for img in source_images], dim=0)
         if image_batch.dim() == 4 and image_batch.shape[1] == 3:
             image_batch = image_batch.permute(0, 2, 3, 1)
@@ -500,11 +510,35 @@ class MinimalStreetForwardStage4_0(MinimalStreetForwardStage3_3):
             num_gaussians=num_gaussians,
             backprojector=backprojector_override if backprojector_override is not None else self.feature_backprojector,
             return_accumulated_weights=return_accumulated_weights,
+            return_debug_stats=True,
         )
         if return_accumulated_weights:
-            feat_2d_all, acc_w = back_out
+            feat_2d_all, acc_w, bp_stats = back_out
+            stats.update({f"2d_bp_{k}": float(v) for k, v in bp_stats.items()})
+            if torch.cuda.is_available():
+                stats["cuda_mem_alloc_after"] = float(torch.cuda.memory_allocated())
+                stats["cuda_mem_reserved_after"] = float(torch.cuda.memory_reserved())
+                stats["cuda_mem_alloc_delta"] = float(stats["cuda_mem_alloc_after"] - stats["cuda_mem_alloc_before"])
+                stats["cuda_mem_reserved_delta"] = float(
+                    stats["cuda_mem_reserved_after"] - stats["cuda_mem_reserved_before"]
+                )
+            for k, v in stats.items():
+                self._perf_acc[k] = float(self._perf_acc.get(k, 0.0) + float(v))
+            self._perf_acc["2d_call_count"] = float(self._perf_acc.get("2d_call_count", 0.0) + 1.0)
             return feat_2d_all, acc_w
-        return back_out, None
+        feat_2d_all, bp_stats = back_out
+        stats.update({f"2d_bp_{k}": float(v) for k, v in bp_stats.items()})
+        if torch.cuda.is_available():
+            stats["cuda_mem_alloc_after"] = float(torch.cuda.memory_allocated())
+            stats["cuda_mem_reserved_after"] = float(torch.cuda.memory_reserved())
+            stats["cuda_mem_alloc_delta"] = float(stats["cuda_mem_alloc_after"] - stats["cuda_mem_alloc_before"])
+            stats["cuda_mem_reserved_delta"] = float(
+                stats["cuda_mem_reserved_after"] - stats["cuda_mem_reserved_before"]
+            )
+        for k, v in stats.items():
+            self._perf_acc[k] = float(self._perf_acc.get(k, 0.0) + float(v))
+        self._perf_acc["2d_call_count"] = float(self._perf_acc.get("2d_call_count", 0.0) + 1.0)
+        return feat_2d_all, None
 
     def _render_params_from_offsets_rigid_local(
         self, node_state_rigid: NodeStateRigid, offsets: Dict[str, torch.Tensor]

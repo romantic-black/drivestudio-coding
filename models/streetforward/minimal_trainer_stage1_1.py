@@ -16,6 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from omegaconf import OmegaConf
 
+from models.feature_extractors.alpha_t_extractor import _get_viewmat
 from models.streetforward.metrics import compute_l1_loss_masked
 from models.streetforward.math_utils import (
     _axis_angle_to_quat,
@@ -158,6 +159,14 @@ class MinimalStreetForwardStage1_1(nn.Module):
         bbx_max = seg_aabb[1]
         self.bbx_min = torch.tensor(bbx_min, dtype=torch.float32, device=device)
         self.bbx_max = torch.tensor(bbx_max, dtype=torch.float32, device=device)
+        # input_aabb is used to clamp distant branch writes; fall back to segment_aabb if absent.
+        seg_input_aabb = getattr(config.dataset, "segment_input_aabb", None)
+        if seg_input_aabb is None:
+            seg_input_aabb = seg_aabb
+        if seg_input_aabb is None or len(seg_input_aabb) != 2:
+            raise ValueError("config.dataset.segment_input_aabb must be [[min],[max]] with shape [2,3] when provided.")
+        self.input_aabb_min = torch.tensor(seg_input_aabb[0], dtype=torch.float32, device=device)
+        self.input_aabb_max = torch.tensor(seg_input_aabb[1], dtype=torch.float32, device=device)
 
         self.renderer = renderer or _gsplat_rasterization
         if self.renderer is None:
@@ -609,9 +618,7 @@ class MinimalStreetForwardStage1_1(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Render one view; returns (rgb [H,W,3], alpha [H,W])."""
         c2w = view.camtoworlds if hasattr(view, "camtoworlds") else view["camtoworlds"]
-        if c2w.dim() == 2:
-            c2w = c2w.unsqueeze(0)
-        viewmat = torch.linalg.inv(c2w)
+        viewmat = _get_viewmat(c2w)
         if hasattr(view, "Ks"):
             k_mat = view.Ks[0:1]
         elif hasattr(view, "K"):

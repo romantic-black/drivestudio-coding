@@ -19,6 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from omegaconf import OmegaConf
 
+from models.feature_extractors.alpha_t_extractor import _get_viewmat
 from models.streetforward.metrics import compute_l1_loss_masked
 from models.streetforward.math_utils import (
     _axis_angle_to_quat,
@@ -423,9 +424,7 @@ class MinimalStreetForwardStage1(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Render one view; returns (rgb [H,W,3], alpha [H,W])."""
         c2w = view.camtoworlds if hasattr(view, "camtoworlds") else view["camtoworlds"]
-        if c2w.dim() == 2:
-            c2w = c2w.unsqueeze(0)
-        viewmat = torch.linalg.inv(c2w)
+        viewmat = _get_viewmat(c2w)
         if hasattr(view, "Ks"):
             k_mat = view.Ks[0:1]
         elif hasattr(view, "K"):

@@ -43,7 +43,7 @@ data:
 
 dataset:
   num_source_keyframes: 1
-  num_target_keyframes: 6
+  num_target_keyframes: 1
   segment_overlap_ratio: 0.2
   min_keyframes_per_scene: 2
   min_keyframes_per_segment: 2
@@ -61,8 +61,6 @@ dataset:
     monocular_filter_sky: true
     monocular_depth_consistency: false
     monocular_downscale: 2
-    monocular_dynamic_filter: true
-    monocular_dynamic_mask_key: dynamic_masks
     near_max_points: 400000
     distant_max_points: 400000
     fusion_strategy: merge
@@ -80,7 +78,7 @@ scheduler_v2:
   min_steps_per_segment: 12
   max_steps_per_segment: 48
   source_hold_steps: 4
-  num_target_frames_total: 6
+  num_target_frames_total: 1
   target_include_source: true
 
 model:

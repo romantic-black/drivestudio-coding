@@ -1,30 +1,159 @@
 # StreetForward Trainer 流程图与数据结构说明
 
-本文档详细梳理了 `StreetForwardTrainer` 的训练流程、数据结构和关键组件。
+**Canonical 行为以 `models/streetforward/minimal_trainer_stage4_2.py` 的 `MinimalStreetForwardStage4_2` 为准。** 下文先给出 **Minimal Stage 4.2 主线**（单步 `forward` / `train_step`）；`StreetForwardTrainer`（`train_iter`、`inner_iterations`、`RigidMasks`、bg+rigid 合并 3D 体积等）移至 **[附录 A](#附录-astreetforwardtrainer-与历史实现对照)**，避免与当前 Minimal 实现混读。
 
-> **模块结构（Phase 2 重构后）**：训练逻辑分布在 `models/streetforward/` 下：
-> - `trainer.py`：主编排、`train_iter`、`_train_inner_iteration`、`_parse_targets`、`_get_source_frame_idx`
-> - `node_state_mixin.py`：`_get_or_init_node_states`、`_precompute_rigid_masks`、`_update_node_states`、Rigid 变换
-> - `feature_volume_mixin.py`：`_build_3d_feature_volume`、`_compute_and_fuse_features`
-> - `offsets_mixin.py`：`_predict_offsets`、`_predict_offsets_gru`、`_compute_render_params_for_inner_iter`、`_render_params_from_offsets`
-> - `proxy_rendering_mixin.py`：`_create_proxy_params`、`_render_targets_and_accumulate_loss`、`_backward_to_render_params`、`_merge_params_with_rigid_subset`
-> - `metrics.py`：`compute_psnr`、`compute_ssim`、`compute_lpips`、`evaluate_test_views`
->
-> **Minimal Stage 3.3（旁路实验管线）**：在 `MinimalStreetForwardStage3_2` 之上实现 bg / distant 配置与网络解耦，入口为 `tools/train_minimal_streetforward_stage3_3.py`，实现见 `models/streetforward/minimal_trainer_stage3_3.py`；设计背景见 [StreetForward_Stage3_3_Design.md](StreetForward_Stage3_3_Design.md)。包导出在 `models/streetforward/__init__.py` 中通过 lazy import 暴露 `MinimalStreetForwardStage3_3`。
+> **类与入口**：`MinimalStreetForwardStage4_2`；继承链 `4_2→4_1→4_0→3_3→3_2d→…→1_1`；脚本 `tools/train_minimal_streetforward_stage4_2.py`，配置示例 `configs/minimal_streetforward_stage4_2.yaml`。
 
-## 目录
-1. [整体架构](#整体架构)
-2. [训练流程](#训练流程)
-3. [3D特征体积构建详细流程](#3d特征体积构建详细流程) ⭐
-4. [数据结构详解](#数据结构详解)
-5. [关键组件说明](#关键组件说明)
-6. [梯度反向传播机制](#梯度反向传播机制)
-7. [天空分支（Stage 3.1）](#天空分支stage-31)
-8. [Minimal Stage 3.3（bg/distant 解耦）](#minimal-stage-3-3-bg-distant)
+## 目录（Canonical 优先）
+
+**Minimal Stage 4.2（主线）**
+
+1. [标准实现：Minimal Stage 4.2](#标准实现minimal-stage-42)
+   - [输入契约（Stage 4.1/4.2 fast-fail）](#输入契约stage-41--42-fast-fail)
+   - [三分支更新语义（不对称）](#三分支更新语义不对称)
+   - [`enable_selective_update` 与 static target 可见性](#enable_selective_update-与-static-target-可见性)
+   - [bg 的 mask 仅为 head RMS 路径，非 full gate](#bg-的-mask-仅为-head-rms-路径非-full-gate)
+   - [损失聚合（非简单 L2）](#损失聚合非简单-l2)
+   - [2D 反投影硬不变量](#2d-反投影硬不变量)
+   - [NodeState 初始化（trainer 内语义）](#nodestate-初始化trainer-内语义)
+   - [四元数初始化](#四元数初始化)
+2. [附录 A：StreetForwardTrainer 与历史实现对照](#附录-astreetforwardtrainer-与历史实现对照)
+
+**附录中的子目录（非 canonical 主线）**
+
+3. [整体架构（主编排器示意图）](#整体架构主编排器示意图)
+4. [训练流程（train_iter / inner_iterations）](#训练流程train_iter--inner_iterations)
+5. [3D 特征体积（双路径说明）](#3d特征体积双路径说明)
+6. [数据结构详解](#数据结构详解)
+7. [关键组件说明](#关键组件说明)
+8. [梯度反向传播机制](#梯度反向传播机制)
+9. [天空分支（Stage 3.1）](#天空分支stage-31)
+10. [Minimal Stage 3.3（bg/distant 解耦）](#minimal-stage-3-3-bg-distant)
 
 ---
 
-## 整体架构
+<a id="标准实现minimal-stage-42"></a>
+
+## 标准实现：Minimal Stage 4.2
+
+本节与 `MinimalStreetForwardStage4_2` 及父类 `MinimalStreetForwardStage4_1` / `MinimalStreetForwardStage4_0` 对齐。**主线**：单次 `forward(batch)` + `train_step(batch)`，无 `train_iter` / `inner_iterations` / `RigidMasks`。
+
+### 1. Stage 4.2 相对 4.1 的增量（one-pass 2D + 静态掩码占位）
+
+| 项 | 行为 |
+|----|------|
+| **统一源视图 2D 反投影** | `_compute_2d_features_all_branches_once`：`gaussians_all = cat(bg, distant, rigid@S)`，**一次** `_compute_2d_features_for_gaussians`；`FeatureBackprojector(..., weight_threshold=0.0)`；按 `num_bg` / `num_distant` / `num_rigid_S` **切分** `feat_2d_*` 与 `acc_w_*`；`src_backproject_pass_count = 1`。 |
+| **支持度阈值** | `branches.{bg,distant,rigid}.src_backproject_support_min` 各自独立；`mask_src_feat_valid_* = acc_w > threshold`（无 acc 的分支跳过）。 |
+| **distant GRU** | `_predict_offsets_gru_distant_masked`：**完整** masked GRU（offsets + quat identity + `h` 混合）。 |
+| **写回** | bg subset：`means` **clamp 到 `segment_aabb`**。distant subset：**故意不 clamp `means`**（Stage 4.2 语义变更，非疏漏）。rigid：仅 `U` 子集局部参数写回。 |
+
+### 2. 前向概要（训练 / 评估）
+
+- **3D**：仅 **bg** — `feat_3d_crop_bg = _build_3d_features(means_bg, anchor_rgb_bg)`。
+- **2D**：**distant / rigid 均为 2D-only**（rigid 配置 `use_3d_feat=false`）；one-pass 只统一 **2D** 反投影，不统一 3D volume。
+- **索引**：`S` = source 帧 rigid 合法点；`mask_src_feat_valid_rigid` 来自 `acc_w`；`U ⊆` 全局 rigid 下标，`mask_update_rigid = mask_src_feat_valid_rigid & mask_any_tgt_rigid`；one-pass 张量中 rigid 行与 **全局 `S` 顺序一致**，再通过 `lookup_s[U]` 取 `feat_2d_rigid_S` 行。
+- **渲染**：按 `frame_idx` 分组；rigid 每帧 `idx_tr` / `idx_fr` 与 `_build_rigid_world_for_frame`；训练路径 `_merge_params_bg_rigid_distant` + proxy；`_composite_sky`。
+- **`train_step`**：`zero_grad` → `forward` → `loss.backward()` → `_backward_to_render_params_bg_rigid_distant` → `step` → 更新 `h_cache_*`；写回由 `scheduler_node_sync` 或 `update_node_state_interval` 触发。
+
+<a id="输入契约stage-41--42-fast-fail"></a>
+
+### 输入契约（Stage 4.1 / 4.2 fast-fail）
+
+`_validate_stage4_1_batch` **硬约束**（不满足即抛错，不是建议）：
+
+- `batch["targets"]` 非空；`source_views` 与 `source_images` **必须存在**且 `len` 一致。
+- 至少存在一个 `targets[*]` 的 `frame_idx == source_frame_idx`（用于 source/target 对齐检查）。
+- **每个** `source_views[i]` 必须在上述 source-frame targets 中找到 **同 `camtoworlds`（atol=1e-4, rtol=1e-4）** 的一条 target view。
+- 每个 target **必须**含 `sky_mask`、`viewdirs`；`gt_image` 与二者 **HW 一致**（`viewdirs` 为 `[H,W,3]`）。
+- 若存在 rigid：`dynamic_info` 中须含 `source_frame_idx` 与各 target 的 `frame_idx`（`_resolve_rigid_frame_idx` 非空）。
+
+<a id="三分支更新语义不对称"></a>
+
+### 三分支更新语义（不对称）
+
+勿把三分支写成完全同构：
+
+| 分支 | 预测域 | 掩码 / 选择性 |
+|------|--------|----------------|
+| **bg** | 全量 `N_bg` 点跑 GRU + offsets；`mask_update_bg` **仅** 控制 `_apply_gru_head_rms` 的 normed vs raw **head 路径** | **持久化选择性**主要靠 **`_bg_writeback_idx`（子集写回）**；不是 distant 那种对 offsets/`h` 的 full gate |
+| **distant** | 全量渲染参与；`_predict_offsets_gru_distant_masked` 对无支持点 **full gate**（offsets、quat、`h`） | 子集写回 `_distant_writeback_idx` |
+| **rigid** | **真·子集训练**：仅 **`U`** 点构建 `render_params_rigid_local` 与 2D 特征行；每 target 帧再拆 **`idx_tr` / `idx_fr`**（可训 / 冻结）并经 `_build_rigid_world_for_frame` | 与 bg/distant 的「全量前向 + 掩码写回」**不同级** |
+
+<a id="enable_selective_update-与-static-target-可见性"></a>
+
+### `enable_selective_update` 与 static target 可见性
+
+- 配置项 `model.branches.{bg,distant}.enable_selective_update` 当前为 **预留开关**。
+- `_build_any_target_mask_static()` 在 Stage 4.2 中 **无论 true/false 均返回全 1**；注释写明：静态分支 **尚无** per-point target visibility 预计算。
+- **因此现阶段**：`mask_any_tgt_bg`、`mask_any_tgt_distant` 恒为真 → **`mask_update_bg` 实际上等于 `mask_src_feat_valid_bg`**，`mask_update_distant` 实际上等于 `mask_src_feat_valid_distant`**。  
+- **按 target 可见性筛静态点** 的 selective update **尚未实现**；打开 `enable_selective_update` **不会**启用该逻辑。
+
+<a id="bg-的-mask-仅为-head-rms-路径非-full-gate"></a>
+
+### bg 的 mask 仅为 head RMS 路径，非 full gate
+
+- 调用：`_predict_offsets_gru(feat_bg_input, params_bg, h_old_bg, mask_update_rigid=mask_update_bg)`（形参名来自基类，**传入的是 bg 掩码**）。
+- `minimal_trainer_stage1_1._predict_offsets_gru` 中该张量 **只**传给 `_apply_gru_head_rms`：mask 为真用 RMSNorm 后的 head，为假用 raw `head_input`。
+- **不会**：对 bg 的 `offset_*` 乘 gate、对 quat 填 identity、或对 `h_new` 做 `(1-gate)*h_old+gate*h_new`（那是 **distant masked** 路径）。
+- **含义**：bg 仍对 **全部** bg 点算出一套 `render_params_bg` 用于渲染；**哪些点写回 NodeState** 由 **`_bg_writeback_idx`**（与 `mask_update_bg` 一致索引）表达。
+
+<a id="损失聚合非简单-l2"></a>
+
+### 损失聚合（非简单 L2）
+
+Stage 4.1 / 4.2 **不是** `mean((pred-gt)^2)` 作为主损失。
+
+对每个 **view**（在 `valid_loss_mask` 内）：`total_i = loss_w_l1 * L1 + loss_w_ssim * SSIM + loss_w_mask * mask_bce + loss_w_opacity_entropy * entropy`。
+
+- **帧内**：该帧上各 view 的 `total_i` 取 **mean** → `frame_loss`。
+- **step**：对各 `frame_loss` 再 **mean**；若无有效像素则 warning 且 loss 为 0。
+
+`sky_mask` / `viewdirs` 为 **硬输入**（校验见上）。mask 项用累积不透明度 vs `(1-sky_mask)` 等在有效区域内的占用监督。
+
+<a id="2d-反投影硬不变量"></a>
+
+### 2D 反投影硬不变量
+
+与 `models/feature_extractors/feature_2d_backprojector.py`、`alpha_t_extractor.py` 及 Stage 4.x 的 `FeatureBackprojector(weight_threshold=0.0)` 用法一致：
+
+1. **`weight_threshold` 与 support**  
+   `weight_threshold` 仅影响 **特征聚合**时是否过滤高斯–像素对（省显存）。**累积支持权重**（用于 `mask_src_feat_valid`）必须在 **未过滤** 的权重上统计；否则 support 会被近似超参污染。Stage 4.1/4.2 在 rigid 掩码与 4.2 one-pass 中显式使用 **`weight_threshold=0.0`** 的 `FeatureBackprojector`。
+
+2. **像素格点与 `grid_sample`（`align_corners=True`）**  
+   行主序 `pixel_id → (i,j)` 后，归一化坐标须为 **`g = 2*k/(S-1) - 1`**（`k` 为像素索引，`S` 为 H 或 W），**不是** `2*k/S - 1`。实现：`pixel_ids_to_grid_sample_coords_align_corners`。
+
+3. **Packed 渲染的 local → global 高斯 id**  
+   `AlphaTWeightExtractor` 在 packed 路径用 `meta["gaussian_ids"]` 将 rasterizer 返回的 **local id** 映射回 **全局 id**（含 range/device/dtype 检查）。反投影聚合必须与全局索引一致，否则会表现为 support=0、索引错位等。
+
+<a id="nodestate-初始化trainer-内语义"></a>
+
+### NodeState 初始化（trainer 内语义）
+
+Minimal Stage 3.3 / 4.x 的 `_get_or_init_node_states_bg_distant`（及 4.x 扩展的 rigid）在 **trainer 内**：
+
+- 从 **`pointcloud["background"]`** 读入点（**不是**单独 `pointcloud["distant"]` 一条支路）。
+- 用 **`segment_aabb`（`bbx_min` / `bbx_max`）** 划分：**框内 → `NodeStateBackground`**，**框外 → `NodeStateDistant`**（有点则建，否则 `None`）。
+- **不在此函数内**再做一层 `input_aabb` 过滤；若上游 dataset / pointcloud builder 做了裁剪，那是 **上游语义**，不是 Stage 4.2 trainer 内两步「input_aabb → segment」流程。
+
+动态 rigid：来自 `pointcloud["dynamic"]` 等（见 `_get_or_init_node_states_bg_rigid_distant` 实现）。
+
+<a id="四元数初始化"></a>
+
+### 四元数初始化
+
+当前 Minimal 线（bg / distant / rigid）初始化 **`quats = [1,0,0,0]`（identity）**，**不是**随机单位四元数。若文档其它处仍写「随机四元数」，视为 **主编排器附录或历史表述**，非 Stage 4.2 canonical。
+
+---
+
+<a id="附录-astreetforwardtrainer-与历史实现对照"></a>
+
+## 附录 A：StreetForwardTrainer 与历史实现对照
+
+以下章节描述 **`trainer.py` + mixins** 的 `train_iter`、`inner_iterations`、`_build_3d_feature_volume`（常合并 bg+rigid）、`RigidMasks`、`NodeStateMixin` 写回（含 **distant `means` clamp 到 input_aabb** 等）——用于与旧代码/论文式总览对照。**Minimal Stage 4.2 不以该路径为主叙述**；冲突时 **以正文 Minimal Stage 4.2 为准**（尤其：distant 写回不 clamp、三分支 head 分离、one-pass 2D、损失形式）。
+
+<a id="整体架构主编排器示意图"></a>
+
+## 整体架构（主编排器示意图）
 
 StreetForwardTrainer 实现了基于代理（Proxy）的多视角梯度累积的前馈式 3D Gaussian Splatting 训练器，支持静态背景、动态物体和背景远景的联合训练。
 
@@ -34,13 +163,15 @@ StreetForwardTrainer 实现了基于代理（Proxy）的多视角梯度累积的
   - `NodeStateBackground`：存储静态背景的高斯参数（世界坐标系）
   - `NodeStateRigid`：存储动态物体的高斯参数（局部坐标系）
   - `NodeStateDistant`：存储背景远景的高斯参数（世界坐标系，可选）
-- **前馈预测**：通过 3D 特征体积（可选融合 2D 特征）预测偏移量（offsets），静态和动态物体共享相同的 MLP 网络
-- **GRU-style Hidden Fusion（当前实现）**：训练时将「点的融合特征」与「NodeState 参数 embedding」通过 GRU 风格更新得到 `h_new`，再用 `h_new` 作为偏移头输入预测 offsets；并在 `train_iter` 级别缓存 `h_cache_{bg,rigid,distant}`，实现跨 iter 的状态记忆（每次 `train_iter` 起始处对 `h_old` 做 `detach()` 截断跨 iter 梯度）
+- **前馈预测（主编排器叙述）**：通过 3D 特征体积（可选融合 2D 特征）预测 offsets。**注意**：Minimal Stage 4.2 中 **distant/rigid 有独立 offset 头**，且 rigid 为 2D-only；勿与本条「共享头」混读。
+- **GRU-style Hidden Fusion**：`train_iter` 级别缓存 `h_cache_*`（Minimal 则为 `train_step` 末写入 cache）。
 - **2D/3D 特征融合**：可选地从源视图提取 2D 图像特征，与 3D 特征融合以增强表示能力
 - **代理参数渲染**：使用代理参数进行渲染，实现多视角梯度累积
 - **单次反向传播**：每个迭代只进行一次反向传播
 - **帧变换机制**：动态物体在不同帧间通过 RigidNodes 变换，支持时间一致性
 - **可见性掩码**：动态物体使用可见性掩码屏蔽不可见点的偏移量
+
+**Minimal Stage 4.2 补充（与上图不完全同构）：** 无 `train_iter`/`inner_iterations`；2D 反投影对 bg+distant+rigid(`S`) **单次拼接**；rigid 为 2D-only 分支；bg 的 3D 体积仅含背景点；详见 [标准实现：Minimal Stage 4.2](#标准实现minimal-stage-42)。
 
 ### 架构图
 
@@ -111,7 +242,11 @@ StreetForwardTrainer 实现了基于代理（Proxy）的多视角梯度累积的
 
 ---
 
-## 训练流程
+<a id="训练流程train_iter--inner_iterations"></a>
+
+## 训练流程（train_iter / inner_iterations）
+
+> **附录**：本节对应 `StreetForwardTrainer`，**不是** Minimal Stage 4.2 主路径（4.2 为单次 `forward` + `train_step`）。
 
 ### 主训练循环流程图
 
@@ -155,6 +290,8 @@ graph TD
 7. `_render_targets_and_accumulate_loss`（含 `_merge_params_with_rigid_subset` 支持 rigid 子集）
 8. `_backward_to_render_params`
 
+**Minimal Stage 4.2：** 无 `inner_iterations`；单次 `forward` 内完成特征、offsets、按帧渲染与 loss；proxy 反传为 `_backward_to_render_params_bg_rigid_distant`。掩码在 `forward` 内直接计算，不使用 `RigidMasks` / `_precompute_rigid_masks`。
+
 ### 详细步骤说明
 
 #### 1. 初始化阶段 (`_get_or_init_node_states`)
@@ -165,18 +302,19 @@ graph TD
 - `batch["pointcloud"]`: 点云数据（字典格式，包含 `background` 和可选的 `dynamic`）
 - `batch["dynamic_info"]`: 动态物体信息（可选，如果点云包含动态物体）
 
-**处理流程：**
+**处理流程（主编排器 / 历史对照语义）：**
 ```
-点云数据 → 先按 input_aabb 过滤 → 再按 bbx(crop) 切分前景/远景 →
-  前景(在bbx内): 提取坐标和颜色 → 计算初始尺度 → 生成随机四元数 → 创建NodeStateBackground
-  动态: 提取坐标和颜色 → 计算初始尺度 → 生成随机四元数 → 创建NodeStateRigid（局部坐标）
-  远景(在bbx外但仍在input_aabb内): 提取坐标和颜色 → 计算初始尺度 → 生成随机四元数 → 创建NodeStateDistant（世界坐标，可选）
+pointcloud["background"] → 按 segment_aabb(bbx_min/max) 划分 →
+  框内 → NodeStateBackground（尺度/opacity 等按 branches.bg）
+  框外 → NodeStateDistant（若有点；否则 None；按 branches.distant）
+动态 rigid：pointcloud["dynamic"] + dynamic_info → NodeStateRigid（局部坐标；quats 初始 identity）
 ```
+上游可对点云做 `input_aabb` 等过滤，**不属于** trainer 内第二步「distant 键」分支。
 
 **关键操作：**
-- **静态背景**：使用 k-NN 计算邻居距离，初始化尺度；将 RGB 颜色转换为球谐函数（SH）的 DC 分量；所有参数初始化为分离（detached）状态
-- **动态物体**：从 `pointcloud["dynamic"]` 获取各实例的点云（局部坐标）；从 `dynamic_info` 初始化 `instances_quats` 和 `instances_trans`；记录 `point_ids` 以关联每个点到实例；初始化 `instances_fv` 记录可见性
-- **背景远景**：从 `pointcloud["distant"]` 获取远景点云（世界坐标，可选）；使用与静态背景相同的初始化方法
+- **静态背景 / 远景**：见 `_get_or_init_node_states_bg_distant`；**非** `pointcloud["distant"]` 单独读取（除非其它实验脚本另行组 batch）。
+- **动态物体**：从 `pointcloud["dynamic"]` 获取；`dynamic_info`、 `point_ids`、`instances_fv` 等见实现。
+- **四元数**：Minimal 当前为 **identity**，见正文 [四元数初始化](#四元数初始化)。
 
 #### 2. 预计算 Rigid 掩码 (`_precompute_rigid_masks`)
 
@@ -196,6 +334,8 @@ graph TD
 #### 3. 3D 特征体积构建 (`_build_3d_feature_volume`)
 
 **归属：** FeatureVolumeMixin
+
+**说明：** 下文为 **StreetForwardTrainer** 将 bg+rigid 合并建体积的路径（历史/对照）。
 
 **步骤：**
 ```
@@ -325,7 +465,7 @@ interpolate_features()
 - `feat_distant_input`: `[N_distant, C_input]` - 背景远景点的融合特征（如果存在）
 
 **处理：**
-- 静态、动态和远景使用**相同的 MLP 网络**预测偏移量
+- **`StreetForwardTrainer` 历史表述**：静态、动态和远景曾描述为共用一套 MLP；**Minimal 标准实现（Stage 4.2）** 中 **distant 与 rigid 有独立 offset 头**（`mlp_offset_pos_distant` / `mlp_offset_pos_rigid` 等），bg 使用与 Stage 3.2 一致的共享头路径；具体以 `minimal_trainer_stage4_2.py` 及 `model.branches` 为准。
 - 在 source 帧下，静态和动态都是确定的，偏移量是共同预测的，不区别对待
 - 如果启用了2D特征，输入特征维度可能大于3D特征维度（`C_input > outdim`）
 
@@ -373,8 +513,8 @@ offsets_rigid_world["offset_sh"] *= gate
 - `feat`: `[N, C_fused]`（3D 或 3D+2D 融合特征）
 - `params_for_embed`: 来自 `_build_params_for_embed()`，包含 `means/quats/scales_log/opacity_logit/sh_dc/sh_rest`
   - 对 rigid：会先将 `means/quats` 变换到 source 帧世界坐标对齐（便于跨类型统一归一化）
-- `h_old`: `[N, H]`（来自 `h_cache_*`，在 `train_iter` 起始处 `detach()` 截断跨 iter 梯度）
-- `mask_update_rigid`（仅 rigid 传入）：`[N_rigid]` bool
+- `h_old`: `[N, H]`（来自 `h_cache_*`；**StreetForwardTrainer** 在 `train_iter` 起始 `detach()`；**Minimal `train_step`** 在 step 末把 `_h_new_*` 写入 cache，语义同为跨 step 截断）
+- `mask_update_rigid`：`[N]` bool — 在 **`StreetForwardTrainer` / `offsets_mixin`** 中主要用于 rigid 的 offset/hidden gate；在 **Minimal `minimal_trainer_stage1_1._predict_offsets_gru`** 中该参数仅传入 `_apply_gru_head_rms`。**Stage 4.2 的 bg 路径**把 **bg 的 `mask_update_bg`** 经第四个参数传入（参数名仍为 `mask_update_rigid`），**不是**对 offsets 做逐通道乘 gate；distant 使用 `_predict_offsets_gru_distant_masked`；rigid 子集使用 `_predict_offsets_gru_rigid`（head RMS mask，见 Stage 4.0）。
 
 **参数 embedding（固定 17 维 param_vec）**：
 - `means_norm(3)`: 以 `bbx_min/bbx_max` 归一化到 `[-1, 1]`
@@ -604,9 +744,8 @@ for view_idx, target in enumerate(targets):
     loss.backward()
 ```
 
-**损失函数：**
-- `L2 Loss`: `mean((pred_rgb - gt_image) ** 2)`
-- 每个 target 帧的损失除以 target 帧数量，实现平均
+**损失函数（主编排器伪代码）：**
+- 实现可能是 L1/L2/组合；Stage 4.2 请见正文 [损失聚合（非简单 L2）](#损失聚合非简单-l2)。
 
 **关键设计点：**
 - **Rigid 子集渲染**：仅渲染 `idx_tgt_rigid[view_idx]` 指定的可见点，使用 `_merge_params_with_rigid_subset` 合并
@@ -680,42 +819,29 @@ torch.autograd.backward(tensors=render_tensors, grad_tensors=grad_tensors)
 **第二步：** 从渲染参数到网络参数（自动）
 - 通过 `offset_*` 参数链
 - 最终更新所有 MLP、sparse_conv 和 feature_fusion 的参数
-- **注意**：静态、动态和远景使用相同的 MLP 网络，梯度会自动合并
+- **注意**：本节是主编排器对照叙述；Stage 4.2 细节见正文。
 
 **grad_warned 状态**：`_grad_or_zero` 使用 `self._proxy_grad_warned` 避免重复打印 "Proxy gradient is None" 的 warning。
 
 #### 10. 状态更新 (`_update_node_states`)
 
-**归属：** NodeStateMixin
+**归属：** NodeStateMixin（**主编排器**；非 Minimal Stage 4.2 写回路径）
 
 **条件：** `update_state == True`
 
-**操作：**
+**操作（节选）：** 静态 bg 写回常 clamp 到 `bbx_*`；**此处 distant 示例为 clamp 到 `input_aabb_*`**。
+
+> Stage 4.2 写回语义请见正文；附录仅用于主编排器/历史对照。
+
 ```python
 with torch.no_grad():
-    # 更新静态背景 NodeState
     means_clamped = torch.clamp(
         render_params_bg["means_r"].detach(),
         min=self.bbx_min,
         max=self.bbx_max
     )
     node_state_bg.means.copy_(means_clamped)
-    node_state_bg.scales_log.copy_(render_params_bg["scales_log_r"].detach())
-    node_state_bg.quats.copy_(render_params_bg["quats_r"].detach())
-    node_state_bg.opacity_logit.copy_(render_params_bg["opacity_logit_r"].detach())
-    node_state_bg.sh_dc.copy_(render_params_bg["sh_dc_r"].detach())
-    node_state_bg.sh_rest.copy_(render_params_bg["sh_rest_r"].detach())
-    
-    # 更新动态物体 NodeState（局部坐标）
-    if node_state_rigid is not None and render_params_rigid is not None:
-        node_state_rigid.means.copy_(render_params_rigid["means_r"].detach())
-        node_state_rigid.scales_log.copy_(render_params_rigid["scales_log_r"].detach())
-        node_state_rigid.quats.copy_(render_params_rigid["quats_r"].detach())
-        node_state_rigid.opacity_logit.copy_(render_params_rigid["opacity_logit_r"].detach())
-        node_state_rigid.sh_dc.copy_(render_params_rigid["sh_dc_r"].detach())
-        node_state_rigid.sh_rest.copy_(render_params_rigid["sh_rest_r"].detach())
-    
-    # 更新背景远景 NodeState（如果存在）
+    # ... scales_log, quats, opacity, sh ...
     if node_state_distant is not None and render_params_distant is not None:
         means_distant = torch.clamp(
             render_params_distant["means_r"].detach(),
@@ -723,24 +849,31 @@ with torch.no_grad():
             max=self.input_aabb_max,
         )
         node_state_distant.means.copy_(means_distant)
-        node_state_distant.scales_log.copy_(render_params_distant["scales_log_r"].detach())
-        node_state_distant.quats.copy_(render_params_distant["quats_r"].detach())
-        node_state_distant.opacity_logit.copy_(render_params_distant["opacity_logit_r"].detach())
-        node_state_distant.sh_dc.copy_(render_params_distant["sh_dc_r"].detach())
-        node_state_distant.sh_rest.copy_(render_params_distant["sh_rest_r"].detach())
+        # ...
 ```
 
-**注意：** 
-- 所有更新都是分离的（detached），保持 NodeState 作为缓冲区
-- 静态背景的 `means` 在写回时进行 clamp，限制在边界框范围内（`bbx_min` 到 `bbx_max`），但在反向传播时保持不限制以保持梯度流
-- 动态物体的 `means` 是局部坐标，不需要 clamp（边界框限制在变换到世界坐标时处理）
-- 背景远景的 `means` 在写回时进行 clamp，限制在输入AABB范围内（`input_aabb_min` 到 `input_aabb_max`）
+**注意：** detached 写回；具体 Trainer 语义以对应章节为准。
 
 ---
 
-## 3D特征体积构建详细流程
+<a id="3d特征体积双路径说明"></a>
 
-本节深入讲解 3D 特征体积构建的详细实现，这是整个训练流程中的核心部分。
+## 3D 特征体积（双路径说明）
+
+### Canonical：Minimal Stage 4.2
+
+- **仅 bg** 构建稀疏 3D 体积并插值：`_build_3d_features`。
+- **rigid**：**不参与** 3D volume；**2D-only**（`use_3d_feat=false`）。
+- **distant**：**2D-only** → `distant_feat_proj` → distant 头。
+- **2D**：bg+distant+rigid(`S`) **one-pass** 反投影（见正文）。
+
+### 附录：主编排器路径（`feature_volume_mixin._build_3d_feature_volume`）
+
+以下小节深入 **合并 bg+rigid** 等 **主编排器** 实现；**不是** Stage 4.2 的 3D 路径。
+
+#### 代码归属与片段预览
+
+本节深入讲解 3D 特征体积构建的详细实现（**StreetForwardTrainer / FeatureVolumeMixin**）。
 
 ### 代码片段
 
@@ -1087,7 +1220,7 @@ dense_volume = self.sparse_to_dense_volume(
     sparse_tensor=feat_3d,      # SparseTensor [M, outdim]
     coords=valid_coords,        # [M, 3]
     vol_dim=vol_dim,            # [X, Y, Z]
-).unsqueeze(dim=0)              # [1, D, H, W, C]
+).unsqueeze(dim=0)              # [1, X, Y, Z, C]
 ```
 
 #### 函数实现（nerfstudio 版本）
@@ -1174,12 +1307,12 @@ dense_volume = dense.unsqueeze(dim=0)  # [X, Y, Z, C] → [1, X, Y, Z, C]
 
 ```python
 dense_volume = dense_volume.permute(0, 4, 3, 2, 1)
-# [1, D, H, W, C] → [1, C, Z, Y, X] = [1, C, D, H, W]
+# [1, X, Y, Z, C] → [1, C, Z, Y, X] = [1, C, D, H, W]
 ```
 
 #### 维度变换详解
 
-**原始维度：** `[1, D, H, W, C]`
+**原始维度：** `[1, X, Y, Z, C]`
 - `0`: batch维度 (1)
 - `1`: D (深度，对应Z轴)
 - `2`: H (高度，对应Y轴)
@@ -1205,7 +1338,7 @@ PyTorch 的 `grid_sample` 函数（5D版本）期望输入格式为 `[B, C, D, H
 - `H` 是高度维度（Y轴）
 - `W` 是宽度维度（X轴）
 
-`sparse_to_dense_volume` 返回的格式是 `[D, H, W, C]`，经过 `unsqueeze(0)` 后变成 `[1, D, H, W, C]`。通过 `permute(0, 4, 3, 2, 1)` 变换，我们将特征通道移到第二个维度，并确保维度顺序与 `grid_sample` 的要求匹配：`[1, C, D, H, W]`。
+`sparse_to_dense_volume` 返回的格式是 `[X, Y, Z, C]`，经过 `unsqueeze(0)` 后变成 `[1, X, Y, Z, C]`。通过 `permute(0, 4, 3, 2, 1)` 变换，我们将特征通道移到第二个维度，并确保维度顺序与 `grid_sample` 的要求匹配：`[1, C, D, H, W] = [1, C, Z, Y, X]`。
 
 ---
 
@@ -1312,7 +1445,7 @@ normalized = (index / (dim - 1)) * 2 - 1
 ```python
 feat_3d_crop = self.interpolate_features(grid_coords, dense_volume)
 # grid_coords: [N, 3]
-# dense_volume: [1, C, W, D, H] (经过permute后)
+# dense_volume: [1, C, D, H, W] = [1, C, Z, Y, X] (经过permute后)
 # 输出: [N, C]
 ```
 
@@ -1328,7 +1461,7 @@ def interpolate_features(
     
     # 2. 使用三线性插值从体积中提取特征
     feature = torch.nn.functional.grid_sample(
-        feature_volume,           # [1, C, W, D, H] - 输入体积
+        feature_volume,           # [1, C, D, H, W] - 输入体积
         grid_coords_expanded,     # [1, 1, 1, N, 3] - 采样坐标
         mode="bilinear",          # 双线性插值（3D中实际是三线性插值）
         align_corners=True,       # 对齐角点（与归一化坐标对应）
@@ -1356,7 +1489,7 @@ torch.nn.functional.grid_sample(
 ```
 
 **在我们的代码中：**
-- `input`: `[1, C, W, D, H]` - 特征体积
+- `input`: `[1, C, D, H, W]` - 特征体积（即 `[1, C, Z, Y, X]`）
 - `grid`: `[1, 1, 1, N, 3]` - 采样坐标（每个点一个坐标）
 
 **插值模式：**
@@ -1456,6 +1589,8 @@ torch.nn.functional.grid_sample(
 
 ## 数据结构详解
 
+> **Stage 4.2**：以下「初始化」条目若写「随机四元数」，Minimal 当前为 **identity**，见正文 [四元数初始化](#四元数初始化)。
+
 ### 1. NodeStateBackground
 
 **定义：**
@@ -1473,12 +1608,12 @@ class NodeStateBackground:
 **特性：**
 - 所有张量都是分离的（detached），不参与梯度计算
 - 每个 `(scene_id, segment_id)` 对应一个 NodeStateBackground
-- 存储在 `self.node_states: Dict[Tuple[int, int], NodeStateBackground]` 中（兼容旧代码，实际是 Background）
+- Minimal 当前存储在 `self.node_states_bg: Dict[Tuple[int, int], NodeStateBackground]`（`self.node_states` 属历史命名）
 
 **初始化：**
 - `means`: 从静态背景点云坐标初始化（世界坐标）
 - `scales_log`: 基于 k-NN 距离计算（`log(clamp(avg_dist, min=1e-3))`）
-- `quats`: 随机生成单位四元数
+- `quats`: Minimal 当前为 **identity** `[1,0,0,0]`（非随机）
 - `opacity_logit`: 初始化为 `logit(0.1)`
 - `sh_dc`: 从点云颜色转换（`(rgb - 0.5) / c0`）
 - `sh_rest`: 初始化为零
@@ -1513,7 +1648,7 @@ class NodeStateRigid:
 **初始化：**
 - `means`: 从动态物体点云坐标初始化（局部坐标）
 - `scales_log`: 基于 k-NN 距离计算
-- `quats`: 随机生成单位四元数（局部旋转）
+- `quats`: Minimal 当前为 **identity**（非随机）
 - `opacity_logit`: 初始化为 `logit(0.1)`
 - `sh_dc`: 从点云颜色转换
 - `sh_rest`: 初始化为零
@@ -1546,7 +1681,7 @@ class NodeStateDistant:
 **初始化：**
 - `means`: 从背景远景点云坐标初始化（世界坐标）
 - `scales_log`: 基于 k-NN 距离计算
-- `quats`: 随机生成单位四元数
+- `quats`: Minimal 当前为 **identity**（非随机）
 - `opacity_logit`: 初始化为 `logit(0.1)`
 - `sh_dc`: 从点云颜色转换
 - `sh_rest`: 初始化为零
@@ -1759,7 +1894,15 @@ psnr = -10 * torch.log10(mse)  # 如果 mse <= 0，返回 inf
 
 ### 1. 偏移量预测网络 (Offset Prediction Networks)
 
-**作用：** 从3D特征预测Gaussian参数的偏移量
+**作用：** 从融合特征（3D 或 2D-only）预测 Gaussian 参数偏移量。
+
+**Stage 4.2 canonical 结构：**
+- **共用主干**：`mlp_params_embed`、`param_embed_norm`、`gru_update/gru_reset/gru_candidate`、`gru_to_head`（参数 embedding + GRU 主干）。
+- **分支独立 heads**：
+  - bg：`mlp_offset_pos` / `mlp_conv` / `mlp_opacity` / `gaussion_decoder`
+  - distant：`mlp_offset_pos_distant` / `mlp_conv_distant` / `mlp_opacity_distant` / `gaussion_decoder_distant`
+  - rigid：`mlp_offset_pos_rigid` / `mlp_conv_rigid` / `mlp_opacity_rigid` / `gaussion_decoder_rigid`
+- **特征路径差异**：bg 走 3D+2D 融合；distant/rigid 为 2D-only（经各自投影层对齐维度）。
 
 **网络结构：**
 
@@ -1793,7 +1936,7 @@ psnr = -10 * torch.log10(mse)  # 如果 mse <= 0，返回 inf
   - `offset_sh = concat([offset_sh_dc, offset_sh_rest])`
 - **初始化：** 最后一层初始化为零（输出接近零偏移）
 
-**共同特性：**
+**共同特性（同一分支内）：**
 - 所有网络使用 `ReLU` 激活函数（中间层）
 - 所有网络的最后一层**无激活函数**（直接输出原始值）
 - 所有偏移量通过 `tanh` 函数限制在指定范围内
@@ -1908,7 +2051,7 @@ psnr = -10 * torch.log10(mse)  # 如果 mse <= 0，返回 inf
 ### 6. 辅助函数
 
 #### 四元数操作
-- `_random_quat_tensor()`: 生成随机单位四元数（wxyz格式）
+- `_random_quat_tensor()`: 工具函数（**Minimal Stage 4.2 初始化 quats 为 identity**，见正文；随机初始化若存在则见于其它/历史路径）
 - `_quat_multiply()`: 四元数乘法（用于组合旋转）
 - `_normalize_quat()`: 四元数归一化（确保单位四元数）
 - `_axis_angle_to_quat()`: 轴角到四元数转换（使用无分支sinc结构，提供平滑梯度）
@@ -1965,7 +2108,7 @@ psnr = -10 * torch.log10(mse)  # 如果 mse <= 0，返回 inf
 ```
 gt_image
   ↓
-loss (L2)
+loss（主编排器示意；Stage 4.2 见正文损失节）
   ↓
 rgb (renderer输出)
   ↓
@@ -2015,44 +2158,62 @@ sparse_feat
 
 ## 配置参数
 
-### Model 配置
+### Stage 4.2 canonical 配置（推荐阅读顺序）
 
-```python
+> 以 `configs/minimal_streetforward_stage4_2.yaml` + `MinimalStreetForwardStage4_2` 解析逻辑为准。  
+> `limits/eta/init` 为 **branch-style**：`model.branches.{bg,distant,rigid}.*`，不是单套顶层 canonical 字段。
+
+```yaml
+dataset:
+  segment_aabb: [[x_min, y_min, z_min], [x_max, y_max, z_max]]
+  # 可选：segment_input_aabb；若缺省，基类回退到 segment_aabb
+
 model:
-  # 偏移量的物理上限（通常固定）
-  offset_max: 0.1          # 位置偏移上限（米）
-  scale_max: 0.1           # 尺度偏移上限（对数域）
-  omega_max: 0.1           # 旋转偏移上限（弧度，约5.7°）
-  opacity_max: 0.1         # 不透明度偏移上限（logit域）
-  sh_dc_max: 0.1           # SH DC偏移上限
-  sh_rest_max: 0.05        # SH rest偏移上限（通常更小）
-  
-  # 步长因子（控制偏移量幅度，通常固定）
-  eta_means: 1.0           # 位置步长因子
-  eta_scales: 1.0          # 尺度步长因子
-  eta_opacity: 1.0         # 不透明度步长因子
-  eta_sh_dc: 1.0           # SH DC步长因子
-  eta_sh_rest: 1.0         # SH rest步长因子
-  
-  # 其他模型参数
-  sh_degree: 1             # 球谐函数度数
-  voxel_size: 0.1          # 体素大小
-  max_iterations: 1        # 内部迭代次数
-  bbx_min: [-20.0, -20.0, -20.0]  # 边界框最小值
-  bbx_max: [20.0, 4.8, 70.0]      # 边界框最大值
-  sparseConv_outdim: 32    # 稀疏卷积输出维度
-  use_2d_features: False  # 是否启用2D特征融合
-  feat_2d_channels: 16    # 2D CNN 输出通道数（启用 use_2d_features 时生效）
-  feat_2d_downscale: 1    # 2D 特征下采样倍率（启用 use_2d_features 时生效）
+  sh_degree: 1
+  voxel_size: 0.1
+  sparseConv_outdim: 32
+  scale_init_value: 0.1
+  feat_2d_channels: 16
+  feat_2d_downscale: 1
+  param_embed_dim: 32
+  offset_gru_hidden_dim: 32
+  offset_gru_use_reset_gate: true
 
-  # GRU-style offsets（训练主路径）
-  param_embed_dim: 32              # 参数 embedding 维度（默认等于 fused_in_dim）
-  offset_gru_hidden_dim: 32        # GRU hidden 维度（默认等于 fused_in_dim）
-  offset_gru_use_reset_gate: True  # 是否启用 reset gate（类似标准 GRU）
-
-  input_aabb_min: [...]    # 输入AABB最小值（用于背景远景）
-  input_aabb_max: [...]    # 输入AABB最大值（用于背景远景）
+  branches:
+    bg:
+      init: { ... }
+      limits: { ... }
+      eta: { ... }
+      mlp: { use_3d_feat: true, use_2d_feat: true, ... }
+      freeze_means: false
+      src_backproject_support_min: ...
+      enable_selective_update: true/false   # 当前实现为占位，static 仍无 per-target visibility gating
+    distant:
+      init: { ... }
+      limits: { ... }
+      eta: { ... }
+      mlp: { use_3d_feat: false, use_2d_feat: true, ... }
+      freeze_means: ...
+      src_backproject_support_min: ...
+      enable_selective_update: true/false   # 同上，占位
+    rigid:
+      init: { ... }
+      limits: { ... }
+      eta: { ... }
+      mlp: { use_3d_feat: false, use_2d_feat: true, ... } # Stage 4.x 强约束
+      freeze_means: ...
+      src_backproject_support_min: ...
 ```
+
+**关键语义：**
+- `bbx_min/bbx_max` 在 trainer 内来自 `dataset.segment_aabb`（非 `model.bbx_*` 顶层 canonical）。
+- `input_aabb_*` 在基类通过 `dataset.segment_input_aabb` 读取；未配置时回退到 `segment_aabb`。
+- rigid 从 Stage 4.0 起要求 `use_3d_feat=false` 且 `use_2d_feat=true`。
+
+### 继承基类的兼容字段（非 Stage 4.2 主配置）
+
+以下字段可能在早期 stage 或父类中仍存在默认路径：`offset_max/scale_max/...`、`eta_means/...`、`use_2d_features`、`model.bbx_*`、`input_aabb_*` 等。  
+**在 Stage 4.2 推荐配置中，不应把它们当作主入口；优先使用 branch-style + dataset AABB 配置。**
 
 ### Checkpoint（与流程相关的补充）
 
@@ -2079,19 +2240,19 @@ log_images: False                # 是否保存渲染图像（节省GPU内存）
 
 ## 总结
 
-StreetForwardTrainer 通过以下关键机制实现了高效的前馈式 3DGS 训练：
+**标准实现（`MinimalStreetForwardStage4_2`）** 通过以下机制实现前馈式 3DGS 训练（与上文 [标准实现：Minimal Stage 4.2](#标准实现minimal-stage-42) 一致）：
 
-1. **分离的 NodeState：** 作为稳定的参数缓冲区，避免梯度干扰（支持 Background、Rigid 和 Distant 三种类型）
-2. **3D 特征体积：** 通过稀疏卷积构建空间特征表示
-3. **2D/3D 特征融合：** 可选地从源视图提取2D特征，与3D特征融合以增强表示能力
-4. **偏移量预测：** 使用 GRU-style hidden fusion（特征 + 参数 embedding）生成 offsets，偏移头仍复用 MLP；并对 rigid 通过 `mask_update_rigid` 做 gate 以保证仅受监督点更新
-5. **代理参数机制：** 实现多视角梯度累积
-6. **单次反向传播：** 每个迭代只进行一次完整的梯度更新
-7. **内存优化：** 密集体积在使用后立即删除，避免内存累积
+1. **分离的 NodeState：** Background、Rigid（局部坐标 + 实例位姿）、Distant（世界坐标，可选）
+2. **bg 的 3D 特征：** `_build_3d_features` — 仅 bg；rigid/distant **无** 3D 体积路径
+3. **2D：** one-pass 反投影；`weight_threshold=0.0` 用于 support；不变量见 [2D 反投影硬不变量](#2d-反投影硬不变量)
+4. **GRU / 头：** 共用 embedding+GRU 主干；**distant/rigid 独立 offset 头**；bg 的 `mask_update_bg` **仅** head RMS 路径；distant **full gate**；rigid **子集 U** + 每帧 train/frozen；`enable_selective_update` **尚未**接 per-target static 可见性
+5. **Proxy：** `_create_proxy_params` + `_merge_params_bg_rigid_distant` / `_backward_to_render_params_bg_rigid_distant`
+6. **损失：** 每 target 的 L1/SSIM/mask/entropy，按帧聚合；依赖 `sky_mask`、`viewdirs`
+7. **写回：** 按配置间隔写回 NodeState；distant **不**对 `means` 做 segment AABB clamp
 
-**Minimal Stage 3.3** 在精简 bg+distant 管线上将分支配置（`model.branches`）、distant 的 2D-only 特征与独立偏移头、以及依赖 `sky_mask` 的复合损失单独成节说明；见上文 [Minimal Stage 3.3（bg/distant 解耦）](#minimal-stage-3-3-bg-distant)。
+**`StreetForwardTrainer`** 另具 `train_iter`、`_build_3d_feature_volume` 命名、`RigidMasks` 预计算与 inner iteration 等差异，作对照时勿与 Stage 4.2 混为一谈。
 
-这种设计既保证了训练效率，又实现了多视角监督的有效利用，同时支持静态背景、动态物体和背景远景的联合训练。
+**Minimal Stage 3.3** 是 bg+distant 解耦的较早阶段；完整 Minimal 管线以 **Stage 4.2** 为终点，详见 [Minimal Stage 3.3（bg/distant 解耦）](#minimal-stage-3-3-bg-distant) 与 [标准实现：Minimal Stage 4.2](#标准实现minimal-stage-42)。
 
 ---
 
@@ -2153,12 +2314,15 @@ Stage 3.1 的核心是把天空作为“未被高斯遮挡区域”的补全项�
 
 ## Minimal Stage 3.3（bg/distant 解耦）
 
+> **与当前标准的关系**：Stage 3.3 是 **bg + distant** 解耦的基线；后续 **Stage 4.0** 增加 rigid，**Stage 4.1** 增加多 target 与基于反投影累积权重的 rigid 掩码，**Stage 4.2** 将 bg/distant/rigid 源视图反投影合并为单次并增加 bg/distant 支持度门控。**最终行为以 [标准实现：Minimal Stage 4.2](#标准实现minimal-stage-42) 为准**；本节保留 3.3 专用说明便于读配置与历史。
+
 本节说明 **Minimal** 管线中与主 `StreetForwardTrainer` 不同的 Stage 3.3 机制：在 Stage 3.2 的 GRU-style 偏移、proxy 多视角渲染与天空合成之上，对 **背景（bg）** 与 **远景（distant）** 做配置与预测头分离；更完整的设计动机与分阶段计划见 [StreetForward_Stage3_3_Design.md](StreetForward_Stage3_3_Design.md)。
 
 ### 1. 与主文档的关系
 
 - **主文档上文**：描述完整 `StreetForwardTrainer`（含 rigid、inner_iteration、双阶段 backward 等）。
 - **Stage 3.3 Minimal**：仅含 **bg + distant**（无 rigid 分支），`forward` 路径继承 `MinimalStreetForwardStage3_2`（含 `train_step`、天空 `_composite_sky*` 等），在特征与 offsets 上对 distant 单独处理。
+- **Stage 4.2**：在 3.3 栈上扩展，见 [标准实现：Minimal Stage 4.2](#标准实现minimal-stage-42)。
 - **配置**：示例见仓库内 `configs/minimal_streetforward_stage3_3.yaml`。
 
 ### 2. 配置：`model.branches.{bg,distant}`（fast-fail）

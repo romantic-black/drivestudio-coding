@@ -8,7 +8,8 @@ Weights are detached by design to avoid coupling gradients through the rasterize
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple, Union
+import time
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -17,22 +18,19 @@ try:
 except Exception:  # pragma: no cover - fall back when gsplat is not available
     rasterize_to_indices_in_range = None
 
+if TYPE_CHECKING:
+    from models.feature_extractors.feature_2d_backprojector import FeatureBackprojector
+
 
 def _get_viewmat(camera_to_world: torch.Tensor) -> torch.Tensor:
     """
-    Convert camera-to-world to gsplat-style view matrix.
+    Convert camera-to-world to gsplat-style view matrix (no axis flip).
     """
     if camera_to_world.dim() == 2:
         camera_to_world = camera_to_world.unsqueeze(0)
-    r = camera_to_world[:, :3, :3]
-    t = camera_to_world[:, :3, 3:4]
-    r = r * torch.tensor([[[1, -1, -1]]], device=r.device, dtype=r.dtype)
-    r_inv = r.transpose(1, 2)
-    t_inv = -torch.bmm(r_inv, t)
-    viewmat = torch.zeros(r.shape[0], 4, 4, device=r.device, dtype=r.dtype)
-    viewmat[:, 3, 3] = 1.0
-    viewmat[:, :3, :3] = r_inv
-    viewmat[:, :3, 3:4] = t_inv
+    viewmat = torch.linalg.inv(camera_to_world)
+    if viewmat.dim() == 2:
+        viewmat = viewmat.unsqueeze(0)
     return viewmat
 
 
@@ -110,7 +108,7 @@ class AlphaTWeightExtractor:
                     rasterize_mode="classic",
                 )
                 meta_list.append(meta)
-                
+
                 if return_rgb:
                     # render_colors shape: [..., C, H, W, 3] for packed mode
                     # Extract RGB image: [H, W, 3]
@@ -172,7 +170,7 @@ class AlphaTWeightExtractor:
                     else:
                         break  # Only squeeze dimensions of size 1
             isect_offsets_fixed = isect_offsets_raw
-            gaussian_ids, pixel_ids, _, weights = rasterize_to_indices_in_range(
+            gaussian_ids_local, pixel_ids, _, weights = rasterize_to_indices_in_range(
                 range_start=0,
                 range_end=int(1e9),
                 transmittances=transmittances,
@@ -186,6 +184,21 @@ class AlphaTWeightExtractor:
                 flatten_ids=meta["flatten_ids"],
                 return_weights=True,
             )
+            if "gaussian_ids" not in meta:
+                raise ValueError("Packed render meta missing gaussian_ids; cannot remap local ids to global ids.")
+            packed_to_global = meta["gaussian_ids"]
+            if packed_to_global is None:
+                raise ValueError("Packed render meta gaussian_ids is None; cannot remap local ids to global ids.")
+            if gaussian_ids_local.numel() > 0:
+                local_min = int(gaussian_ids_local.min().item())
+                local_max = int(gaussian_ids_local.max().item())
+                if local_min < 0 or local_max >= int(packed_to_global.numel()):
+                    raise ValueError(
+                        f"Local gaussian id out of range: [{local_min}, {local_max}] vs mapping size {packed_to_global.numel()}."
+                    )
+                gaussian_ids = packed_to_global[gaussian_ids_local.long()].long()
+            else:
+                gaussian_ids = gaussian_ids_local.long()
 
             weight_info.append(
                 {
@@ -214,7 +227,8 @@ class AlphaTWeightExtractor:
         cameras: List,
         height: int,
         width: int,
-    ) -> List[torch.Tensor]:
+        return_debug_stats: bool = False,
+    ) -> Union[List[torch.Tensor], Tuple[List[torch.Tensor], Dict[str, float]]]:
         """
         First render pass: collect RGB only and release meta immediately.
         """
@@ -222,6 +236,7 @@ class AlphaTWeightExtractor:
             return []
 
         # Batched multi-view render when possible (one gsplat call, packed=False).
+        t_start = time.perf_counter()
         rendered_rgbs: List[torch.Tensor] = []
         with torch.no_grad():
             cam0 = cameras[0]
@@ -270,6 +285,13 @@ class AlphaTWeightExtractor:
                 rgb = torch.clamp(rgb, 0.0, 1.0).detach()
                 rendered_rgbs.append(rgb)
 
+        if return_debug_stats:
+            stats = {
+                "render_rgb_only_ms": float((time.perf_counter() - t_start) * 1000.0),
+                "num_views": int(len(cameras)),
+                "num_gaussians": int(gaussians["means"].shape[0]),
+            }
+            return rendered_rgbs, stats
         return rendered_rgbs
 
     def extract_single_weight(
@@ -301,7 +323,7 @@ class AlphaTWeightExtractor:
                 else:
                     break
 
-        gaussian_ids, pixel_ids, _, weights = rasterize_to_indices_in_range(
+        gaussian_ids_local, pixel_ids, _, weights = rasterize_to_indices_in_range(
             range_start=0,
             range_end=int(1e9),
             transmittances=transmittances,
@@ -315,6 +337,36 @@ class AlphaTWeightExtractor:
             flatten_ids=meta["flatten_ids"],
             return_weights=True,
         )
+        if "gaussian_ids" not in meta:
+            raise ValueError("Packed render meta missing gaussian_ids; cannot remap local ids to global ids.")
+        packed_to_global = meta["gaussian_ids"]
+        if packed_to_global is None:
+            raise ValueError("Packed render meta gaussian_ids is None; cannot remap local ids to global ids.")
+        if not torch.is_tensor(packed_to_global):
+            raise TypeError("Packed render meta gaussian_ids must be a tensor.")
+        if packed_to_global.dtype not in (
+            torch.int16,
+            torch.int32,
+            torch.int64,
+            torch.uint8,
+            torch.int8,
+        ):
+            raise TypeError(f"Packed render meta gaussian_ids must be integer tensor, got {packed_to_global.dtype}.")
+        if packed_to_global.device != gaussian_ids_local.device:
+            raise ValueError("Packed gaussian_ids device mismatch with rasterized local ids.")
+        if gaussian_ids_local.numel() > 0:
+            local_min = int(gaussian_ids_local.min().item())
+            local_max = int(gaussian_ids_local.max().item())
+            if local_min < 0 or local_max >= int(packed_to_global.numel()):
+                raise ValueError(
+                    f"Local gaussian id out of range: [{local_min}, {local_max}] vs mapping size {packed_to_global.numel()}."
+                )
+            gaussian_ids = packed_to_global[gaussian_ids_local.long()].long()
+            global_min = int(gaussian_ids.min().item())
+            if global_min < 0:
+                raise ValueError(f"Remapped global gaussian id is negative: min={global_min}.")
+        else:
+            gaussian_ids = gaussian_ids_local.long()
 
         return {
             "gaussian_ids": gaussian_ids.to(device),
@@ -332,7 +384,8 @@ class AlphaTWeightExtractor:
         num_gaussians: int,
         backprojector: "FeatureBackprojector",
         return_accumulated_weights: bool = False,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        return_debug_stats: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, Dict[str, float]], Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]]:
         """
         Second render pass: stream per-view weights and accumulate backprojection.
 
@@ -342,6 +395,7 @@ class AlphaTWeightExtractor:
         depend on FeatureBackprojector.weight_threshold (which may be used as a feature
         aggregation optimization).
         """
+        t_total_start = time.perf_counter()
         device = features_2d.device
         channels = features_2d.shape[-1]
         eps = getattr(backprojector, "eps", 1e-8)
@@ -352,10 +406,20 @@ class AlphaTWeightExtractor:
             torch.zeros(num_gaussians, device=device) if return_accumulated_weights else None
         )
 
+        stats = {
+            "render_packed_total_ms": 0.0,
+            "extract_weight_total_ms": 0.0,
+            "backproject_total_ms": 0.0,
+            "pairs_total": 0,
+            "pairs_after_threshold": 0,
+            "num_views": int(len(cameras)),
+            "num_gaussians": int(num_gaussians),
+        }
         for i, cam in enumerate(cameras):
             cam_ctw = cam.camtoworlds if hasattr(cam, "camtoworlds") else cam["camtoworlds"]
             viewmat = _get_viewmat(cam_ctw)
             k_mat = self._resolve_intrinsics(cam)
+            t_render = time.perf_counter()
             with torch.no_grad():
                 _, _, meta = self.renderer(
                     means=gaussians["means"],
@@ -377,27 +441,36 @@ class AlphaTWeightExtractor:
                     absgrad=True,
                     rasterize_mode="classic",
                 )
+            stats["render_packed_total_ms"] += float((time.perf_counter() - t_render) * 1000.0)
 
-                weight_info = self.extract_single_weight(meta, height, width)
-                del meta
+            t_extract = time.perf_counter()
+            weight_info = self.extract_single_weight(meta, height, width)
+            stats["extract_weight_total_ms"] += float((time.perf_counter() - t_extract) * 1000.0)
+            stats["pairs_total"] += int(weight_info["gaussian_ids"].numel())
+            del meta
 
+            t_bp = time.perf_counter()
             if return_accumulated_weights:
-                feat_sum, weight_sum_feature, weight_sum_support = backprojector.backproject_single_view(
+                feat_sum, weight_sum_feature, weight_sum_support, bp_stats = backprojector.backproject_single_view(
                     features_2d[i],
                     weight_info,
                     height,
                     width,
                     num_gaussians,
                     return_support_weight=True,
+                    return_debug_stats=True,
                 )
             else:
-                feat_sum, weight_sum_feature = backprojector.backproject_single_view(
+                feat_sum, weight_sum_feature, bp_stats = backprojector.backproject_single_view(
                     features_2d[i],
                     weight_info,
                     height,
                     width,
                     num_gaussians,
+                    return_debug_stats=True,
                 )
+            stats["backproject_total_ms"] += float((time.perf_counter() - t_bp) * 1000.0)
+            stats["pairs_after_threshold"] += int(bp_stats.get("pairs_after_threshold", 0))
             del weight_info
 
             accumulated_feat += feat_sum
@@ -410,8 +483,13 @@ class AlphaTWeightExtractor:
             del feat_sum, weight_sum_feature
 
         feat_out = accumulated_feat / (accumulated_weight_feature.unsqueeze(-1) + eps)
+        stats["streaming_total_ms"] = float((time.perf_counter() - t_total_start) * 1000.0)
         if return_accumulated_weights:
             if accumulated_weight_support is None:
                 raise RuntimeError("Internal error: accumulated_weight_support is None.")
+            if return_debug_stats:
+                return feat_out, accumulated_weight_support, stats
             return feat_out, accumulated_weight_support
+        if return_debug_stats:
+            return feat_out, stats
         return feat_out

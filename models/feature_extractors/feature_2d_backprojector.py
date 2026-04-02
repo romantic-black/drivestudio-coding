@@ -4,6 +4,7 @@ Backproject 2D features to Gaussians using alpha-T weights.
 
 from __future__ import annotations
 
+import time
 from typing import Dict, List, Tuple, Union
 
 import torch
@@ -154,6 +155,7 @@ class FeatureBackprojector:
         width: int,
         num_gaussians: int,
         return_support_weight: bool = False,
+        return_debug_stats: bool = False,
     ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
         Backproject a single view.
@@ -168,6 +170,7 @@ class FeatureBackprojector:
             (weight_sum_support) must not depend on this threshold, otherwise downstream
             masks (e.g., `mask_src_feat_valid`) become sensitive to an approximation knob.
         """
+        t_start = time.perf_counter()
         gaussian_ids_all = weight_info["gaussian_ids"].long()
         pixel_ids_all = weight_info["pixel_ids"].long()
         weights_all = weight_info["weights"].detach()
@@ -179,8 +182,18 @@ class FeatureBackprojector:
         zeros_w = torch.zeros(num_gaussians, device=device, dtype=feat_2d.dtype)
 
         if gaussian_ids_all.numel() == 0:
+            debug = {
+                "backproject_single_view_ms": float((time.perf_counter() - t_start) * 1000.0),
+                "pairs_total": 0,
+                "pairs_after_threshold": 0,
+                "num_gaussians": int(num_gaussians),
+            }
             if return_support_weight:
+                if return_debug_stats:
+                    return zeros_feat, zeros_w, zeros_w, debug
                 return zeros_feat, zeros_w, zeros_w
+            if return_debug_stats:
+                return zeros_feat, zeros_w, debug
             return zeros_feat, zeros_w
 
         weight_sum_support = zeros_w
@@ -191,15 +204,27 @@ class FeatureBackprojector:
         gaussian_ids = gaussian_ids_all
         pixel_ids = pixel_ids_all
         weights = weights_all
+        pairs_total = int(gaussian_ids_all.numel())
         if self.weight_threshold > 0.0:
             mask = weights_all >= self.weight_threshold
             gaussian_ids = gaussian_ids_all[mask]
             pixel_ids = pixel_ids_all[mask]
             weights = weights_all[mask]
 
+        pairs_after_threshold = int(gaussian_ids.numel())
         if gaussian_ids.numel() == 0:
+            debug = {
+                "backproject_single_view_ms": float((time.perf_counter() - t_start) * 1000.0),
+                "pairs_total": pairs_total,
+                "pairs_after_threshold": pairs_after_threshold,
+                "num_gaussians": int(num_gaussians),
+            }
             if return_support_weight:
+                if return_debug_stats:
+                    return zeros_feat, zeros_w, weight_sum_support, debug
                 return zeros_feat, zeros_w, weight_sum_support
+            if return_debug_stats:
+                return zeros_feat, zeros_w, debug
             return zeros_feat, zeros_w
 
         sampled = self._sample_features_single_view(feat_2d, pixel_ids, height, width)
@@ -210,8 +235,18 @@ class FeatureBackprojector:
 
         weight_sum_feature = torch.zeros(num_gaussians, device=device, dtype=feat_2d.dtype)
         weight_sum_feature.scatter_add_(0, gaussian_ids, weights)
+        debug = {
+            "backproject_single_view_ms": float((time.perf_counter() - t_start) * 1000.0),
+            "pairs_total": pairs_total,
+            "pairs_after_threshold": pairs_after_threshold,
+            "num_gaussians": int(num_gaussians),
+        }
         if return_support_weight:
+            if return_debug_stats:
+                return feat_sum, weight_sum_feature, weight_sum_support, debug
             return feat_sum, weight_sum_feature, weight_sum_support
+        if return_debug_stats:
+            return feat_sum, weight_sum_feature, debug
         return feat_sum, weight_sum_feature
 
     def backproject(

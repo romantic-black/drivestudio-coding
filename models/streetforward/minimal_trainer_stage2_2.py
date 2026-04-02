@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
+from models.feature_extractors.alpha_t_extractor import _get_viewmat
 from models.streetforward.math_utils import _sh_to_rgb
 from models.streetforward.metrics import compute_l1_loss_masked
 from models.streetforward.minimal_trainer_stage2_0 import MinimalStreetForwardStage2_0
@@ -48,11 +49,7 @@ class MinimalStreetForwardStage2_2(MinimalStreetForwardStage2_0):
             heights.append(h)
             widths.append(w)
             c2w = view.camtoworlds if hasattr(view, "camtoworlds") else view["camtoworlds"]
-            if c2w.dim() == 2:
-                c2w = c2w.unsqueeze(0)
-            viewmat = torch.linalg.inv(c2w)
-            if viewmat.dim() == 2:
-                viewmat = viewmat.unsqueeze(0)
+            viewmat = _get_viewmat(c2w)
             viewmats_list.append(viewmat)
             if hasattr(view, "Ks"):
                 k_mat = view.Ks[0:1]

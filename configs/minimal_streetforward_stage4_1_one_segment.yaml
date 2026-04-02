@@ -67,8 +67,6 @@ dataset:
     monocular_filter_sky: true
     monocular_depth_consistency: false
     monocular_downscale: 2
-    monocular_dynamic_filter: true
-    monocular_dynamic_mask_key: dynamic_masks  # dynamic_masks | human_masks | vehicle_masks
     near_max_points: 400000
     distant_max_points: 400000
     fusion_strategy: merge

@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from models.feature_extractors.alpha_t_extractor import _get_viewmat
 from models.feature_extractors import (
     AlphaTWeightExtractor,
     FeatureBackprojector,
@@ -501,11 +502,7 @@ class MinimalStreetForwardStage3_2d(MinimalStreetForwardStage2_1):
             heights.append(h)
             widths.append(w)
             c2w = view.camtoworlds if hasattr(view, "camtoworlds") else view["camtoworlds"]
-            if c2w.dim() == 2:
-                c2w = c2w.unsqueeze(0)
-            viewmat = torch.linalg.inv(c2w)
-            if viewmat.dim() == 2:
-                viewmat = viewmat.unsqueeze(0)
+            viewmat = _get_viewmat(c2w)
             viewmats_list.append(viewmat)
             if hasattr(view, "Ks"):
                 k_mat = view.Ks[0:1]

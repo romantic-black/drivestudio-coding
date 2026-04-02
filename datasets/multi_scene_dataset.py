@@ -13,7 +13,7 @@ import queue
 import random
 import threading
 import time
-from typing import Dict, List, Optional, Set, Tuple, TYPE_CHECKING, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING, Union
 
 import numpy as np
 import torch
@@ -115,164 +115,6 @@ def _parse_monocular_dynamic_recovery_cfg(
         )
 
     return True, bbox_expand, max_points, assignment
-
-
-# #region agent log
-_AGENT_DEBUG_LOG_PATH = "/root/drivestudio-coding/.cursor/debug-cebadb.log"
-
-def _agent_write_ndjson(payload: Dict) -> None:
-    try:
-        import json
-        with open(_AGENT_DEBUG_LOG_PATH, "a") as f:
-            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
-
-
-def _agent_now_ms() -> int:
-    return int(time.time() * 1000)
-
-
-def _agent_to_list3(x):
-    try:
-        if isinstance(x, torch.Tensor):
-            x = x.detach().cpu().float().numpy()
-        x = np.asarray(x, dtype=np.float32).reshape(3)
-        return [float(x[0]), float(x[1]), float(x[2])]
-    except Exception:
-        return None
-
-
-def _agent_aabb_to_lists(aabb):
-    try:
-        if isinstance(aabb, torch.Tensor):
-            aabb = aabb.detach().cpu().float().numpy()
-        aabb = np.asarray(aabb, dtype=np.float32).reshape(2, 3)
-        return [_agent_to_list3(aabb[0]), _agent_to_list3(aabb[1])]
-    except Exception:
-        return None
-
-
-def _agent_basis_world_from_seg0_pose(seg0_to_world):
-    try:
-        if isinstance(seg0_to_world, torch.Tensor):
-            T = seg0_to_world.detach().cpu().float().numpy()
-        else:
-            T = np.asarray(seg0_to_world, dtype=np.float32)
-        if T.shape == (3, 4):
-            T = np.vstack([T, np.array([0, 0, 0, 1], dtype=np.float32)])
-        if T.shape != (4, 4):
-            return None
-        o = (T @ np.array([0, 0, 0, 1], dtype=np.float32))[:3]
-        ex = (T @ np.array([1, 0, 0, 1], dtype=np.float32))[:3] - o
-        ey = (T @ np.array([0, 1, 0, 1], dtype=np.float32))[:3] - o
-        ez = (T @ np.array([0, 0, 1, 1], dtype=np.float32))[:3] - o
-        return {
-            "origin_world": _agent_to_list3(o),
-            "seg0_x_in_world": _agent_to_list3(ex),
-            "seg0_y_in_world": _agent_to_list3(ey),
-            "seg0_z_in_world": _agent_to_list3(ez),
-        }
-    except Exception:
-        return None
-
-
-def _agent_minmax_xyz(xyz: np.ndarray):
-    try:
-        if xyz is None:
-            return None, None
-        xyz = np.asarray(xyz, dtype=np.float32)
-        if xyz.ndim != 2 or xyz.shape[1] != 3 or xyz.shape[0] == 0:
-            return None, None
-        return xyz.min(axis=0).tolist(), xyz.max(axis=0).tolist()
-    except Exception:
-        return None, None
-
-
-def _agent_crop_violation_counts(xyz: np.ndarray, crop_min, crop_max):
-    try:
-        if xyz is None or crop_min is None or crop_max is None:
-            return None
-        xyz = np.asarray(xyz, dtype=np.float32)
-        crop_min = np.asarray(crop_min, dtype=np.float32).reshape(3)
-        crop_max = np.asarray(crop_max, dtype=np.float32).reshape(3)
-        if xyz.ndim != 2 or xyz.shape[1] != 3 or xyz.shape[0] == 0:
-            return {"n": int(xyz.shape[0]) if hasattr(xyz, "shape") else 0}
-        below = (xyz < crop_min[None, :]).sum(axis=0).astype(int).tolist()
-        above = (xyz > crop_max[None, :]).sum(axis=0).astype(int).tolist()
-        return {"n": int(xyz.shape[0]), "below_counts_xyz": below, "above_counts_xyz": above}
-    except Exception:
-        return None
-
-
-def _agent_pose_axes_origin(pose) -> Optional[Dict]:
-    """From 4x4 frame_to_world: origin in world, and +x/+y/+z axis directions in world (R columns)."""
-    try:
-        if isinstance(pose, torch.Tensor):
-            T = pose.detach().cpu().float().numpy()
-        else:
-            T = np.asarray(pose, dtype=np.float32)
-        if T.shape == (3, 4):
-            T = np.vstack([T, np.array([0, 0, 0, 1], dtype=np.float32)])
-        if T.shape != (4, 4):
-            return None
-        R = T[:3, :3]
-        return {
-            "origin": _agent_to_list3(T[:3, 3]),
-            "axis_plus_x": _agent_to_list3(R[:, 0]),
-            "axis_plus_y": _agent_to_list3(R[:, 1]),
-            "axis_plus_z": _agent_to_list3(R[:, 2]),
-        }
-    except Exception:
-        return None
-
-
-def _agent_pose_max_diff(pose_a, pose_b) -> Optional[float]:
-    """Max absolute difference between two 4x4 poses; None if either invalid."""
-    try:
-        if isinstance(pose_a, torch.Tensor):
-            A = pose_a.detach().cpu().float().numpy()
-        else:
-            A = np.asarray(pose_a, dtype=np.float32)
-        if isinstance(pose_b, torch.Tensor):
-            B = pose_b.detach().cpu().float().numpy()
-        else:
-            B = np.asarray(pose_b, dtype=np.float32)
-        if A.shape == (3, 4):
-            A = np.vstack([A, np.array([0, 0, 0, 1], dtype=np.float32)])
-        if B.shape == (3, 4):
-            B = np.vstack([B, np.array([0, 0, 0, 1], dtype=np.float32)])
-        if A.shape != (4, 4) or B.shape != (4, 4):
-            return None
-        return float(np.abs(A - B).max())
-    except Exception:
-        return None
-
-
-def _agent_T_cam_to_lidar(cam_to_world, lidar_to_world) -> Optional[Dict]:
-    """T_cam_to_lidar = inv(cam_to_world) @ lidar_to_world; return axes_origin for log."""
-    try:
-        if isinstance(cam_to_world, torch.Tensor):
-            C = cam_to_world.detach().cpu().float().numpy()
-        else:
-            C = np.asarray(cam_to_world, dtype=np.float32)
-        if isinstance(lidar_to_world, torch.Tensor):
-            L = lidar_to_world.detach().cpu().float().numpy()
-        else:
-            L = np.asarray(lidar_to_world, dtype=np.float32)
-        if C.shape == (3, 4):
-            C = np.vstack([C, np.array([0, 0, 0, 1], dtype=np.float32)])
-        if L.shape == (3, 4):
-            L = np.vstack([L, np.array([0, 0, 0, 1], dtype=np.float32)])
-        if C.shape != (4, 4) or L.shape != (4, 4):
-            return None
-        T = np.linalg.inv(C) @ L
-        return _agent_pose_axes_origin(T)
-    except Exception:
-        return None
-
-
-# #endregion
 
 
 def _safe_json_serialize(obj):
@@ -1987,30 +1829,6 @@ class MultiSceneDataset:
                 f"Cannot find camera-0 pose for segment {seg_label} first frame {first_frame_idx}; "
                 "seg0 must come from camera id 0."
             )
-        # #region agent log (H5: frame index and which source available/chosen)
-        try:
-            has_lidar = self._get_pose_from_lidar(scene_dataset, first_frame_idx) is not None
-            has_camera = self._get_pose_from_camera(scene_dataset, first_frame_idx) is not None
-            _agent_write_ndjson(
-                {
-                    "sessionId": "cebadb",
-                    "runId": "run1",
-                    "hypothesisId": "H5",
-                    "location": "multi_scene_dataset.py:_get_segment_first_pose",
-                    "message": "segment first pose: frame index and pose source (lidar/camera)",
-                    "data": {
-                        "segment_id": segment_id,
-                        "first_frame_idx": int(first_frame_idx),
-                        "pose_source": pose_source,
-                        "has_lidar": has_lidar,
-                        "has_camera": has_camera,
-                    },
-                    "timestamp": _agent_now_ms(),
-                }
-            )
-        except Exception:
-            pass
-        # #endregion
         return pose, first_frame_idx, pose_source
 
     def get_segment_first_pose(
@@ -2070,44 +1888,6 @@ class MultiSceneDataset:
                 f"Segment {segment_id} first pose is non-invertible; cannot build segment coordinate transform."
             ) from exc
 
-        # #region agent log (coord debug: H1 seg0==lidar, H2 seg0==camera, H3 T_cam_lidar, H4 seg0 axes, H5 frame/source)
-        try:
-            dataset_name = getattr(self.data_cfg, "dataset", None)
-            if not isinstance(dataset_name, str):
-                dataset_name = str(dataset_name) if dataset_name is not None else None
-            lidar_pose = self._get_pose_from_lidar(scene_dataset, segment_first_frame_idx)
-            camera_pose = self._get_pose_from_camera(scene_dataset, segment_first_frame_idx)
-            seg0_vs_lidar_max_diff = _agent_pose_max_diff(segment_first_pose, lidar_pose) if lidar_pose is not None else None
-            seg0_vs_camera_max_diff = _agent_pose_max_diff(segment_first_pose, camera_pose) if camera_pose is not None else None
-            T_cam_to_lidar = _agent_T_cam_to_lidar(camera_pose, lidar_pose) if (camera_pose is not None and lidar_pose is not None) else None
-            _agent_write_ndjson(
-                {
-                    "sessionId": "cebadb",
-                    "runId": "run1",
-                    "hypothesisId": "H1_H2_H3_H4_H5",
-                    "location": "multi_scene_dataset.py:get_segment_batch:coord_survey",
-                    "message": "coord debug: seg0 vs lidar/camera equality, T_cam_lidar, seg0 axes in world",
-                    "data": {
-                        "dataset": dataset_name,
-                        "scene_id": int(scene_id),
-                        "segment_id": int(segment_id),
-                        "segment_first_frame_idx": int(segment_first_frame_idx),
-                        "segment_first_pose_source": segment_pose_source,
-                        "seg0_vs_lidar_max_diff": seg0_vs_lidar_max_diff,
-                        "seg0_vs_camera_max_diff": seg0_vs_camera_max_diff,
-                        "lidar_to_world_if_available": _agent_pose_axes_origin(lidar_pose) if lidar_pose is not None else None,
-                        "camera_to_world_if_available": _agent_pose_axes_origin(camera_pose) if camera_pose is not None else None,
-                        "segment_first_pose_chosen": _agent_pose_axes_origin(segment_first_pose),
-                        "T_cam_to_lidar": T_cam_to_lidar,
-                        "seg0_basis_in_world": _agent_basis_world_from_seg0_pose(segment_first_pose),
-                    },
-                    "timestamp": _agent_now_ms(),
-                }
-            )
-        except Exception:
-            pass
-        # #endregion
-
         def _transform_extrinsics_list(extrinsics_list: List[Tensor]) -> List[Tensor]:
             transformed: List[Tensor] = []
             for ext in extrinsics_list:
@@ -2121,7 +1901,7 @@ class MultiSceneDataset:
             num_source_keyframes=self.num_source_keyframes,
             num_target_keyframes=self.num_target_keyframes,
         )
-        
+
         # 3. Select one frame from each keyframe
         source_frame_indices = []
         for kf_idx in source_keyframe_indices:
@@ -2341,29 +2121,6 @@ class MultiSceneDataset:
         if include_test and len(test_extrinsics) > 0:
             test_extrinsics = _transform_extrinsics_list(test_extrinsics)
 
-        # #region agent log (first camera in seg0: axes and origin in seg0)
-        try:
-            if len(source_extrinsics) > 0:
-                cam_to_seg0 = source_extrinsics[0]
-                _agent_write_ndjson(
-                    {
-                        "sessionId": "cebadb",
-                        "runId": "run1",
-                        "hypothesisId": "H4",
-                        "location": "multi_scene_dataset.py:get_segment_batch:first_camera_in_seg0",
-                        "message": "first source camera pose in seg0: axes and origin (camera_to_seg0)",
-                        "data": {
-                            "scene_id": int(scene_id),
-                            "segment_id": int(segment_id),
-                            "first_camera_to_seg0_axes_origin": _agent_pose_axes_origin(cam_to_seg0),
-                        },
-                        "timestamp": _agent_now_ms(),
-                    }
-                )
-        except Exception:
-            pass
-        # #endregion
-
         # 8. Assemble batch
         # Get actual scene folder path for debugging
         scene_folder_name = f"{int(scene_id):03d}" if self.data_cfg.get("dataset") not in ["kitti", "nuplan"] else str(scene_id)
@@ -2405,33 +2162,6 @@ class MultiSceneDataset:
                 'keyframe_indices': torch.tensor(target_keyframe_indices, dtype=torch.long),  # [num_target_keyframes]
             }
         }
-
-        # #region agent log
-        try:
-            crop_min3, crop_max3 = (
-                self.pointcloud_generator.get_crop_aabb()
-                if self.pointcloud_generator is not None
-                else (None, None)
-            )
-            _agent_write_ndjson(
-                {
-                    "sessionId": "cebadb",
-                    "runId": "run1",
-                    "hypothesisId": "H1",
-                    "location": "multi_scene_dataset.py:get_segment_batch:batch_assembled",
-                    "message": "batch['aabb'] vs generator crop_aabb (assembled)",
-                    "data": {
-                        "scene_id": int(scene_id),
-                        "segment_id": int(segment_id),
-                        "batch_aabb": _agent_aabb_to_lists(batch_aabb),
-                        "generator_crop_aabb": [_agent_to_list3(crop_min3), _agent_to_list3(crop_max3)],
-                    },
-                    "timestamp": _agent_now_ms(),
-                }
-            )
-        except Exception:
-            pass
-        # #endregion
 
         # Attach sky masks if available (canonical 1=sky; missing -> zeros = all non-sky)
         if has_source_sky_mask:

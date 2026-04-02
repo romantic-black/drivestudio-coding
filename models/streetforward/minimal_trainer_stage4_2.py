@@ -1,6 +1,6 @@
 """
-Minimal StreetForward Stage 4.1: multi target-frame rigid with train/frozen split and
-mask_src_feat_valid from alpha-T backprojection accumulated weights (not feature norm).
+Minimal StreetForward Stage 4.2: unify source 2D backprojection across bg/distant/rigid
+and add support-based update masks for bg/distant (plus rigid).
 """
 
 from __future__ import annotations
@@ -11,244 +11,272 @@ from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 
-from models.streetforward.math_utils import _sh_to_rgb
+from models.feature_extractors import FeatureBackprojector
+from models.streetforward.math_utils import _num_sh_bases, _sh_to_rgb
+from models.streetforward.metrics import compute_ssim_loss_masked
 from models.streetforward.minimal_trainer_stage3_2d import _create_proxy_params
 from models.streetforward.minimal_trainer_stage4_0 import (
-    MinimalStreetForwardStage4_0,
     _backward_to_render_params_bg_rigid_distant,
     _merge_params_bg_rigid_distant,
 )
-from models.streetforward.node_states import NodeStateRigid
-from models.streetforward.metrics import compute_ssim_loss_masked
-from models.feature_extractors import FeatureBackprojector
+from models.streetforward.minimal_trainer_stage4_1 import MinimalStreetForwardStage4_1
+from models.streetforward.node_states import NodeStateBackground, NodeStateDistant, NodeStateRigid
 
 logger = logging.getLogger(__name__)
 
 
-class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
-    """Stage 4.0 + multi target frames, feat-valid mask from backproject support, train/frozen rigid."""
+class MinimalStreetForwardStage4_2(MinimalStreetForwardStage4_1):
+    """Stage4.1 + unified source backprojection + bg/distant update mask gating."""
 
     def __init__(self, config, device: torch.device, **kwargs):
         super().__init__(config, device, **kwargs)
         branches = self._require_key(config.model, "branches", "model")
-        rigid_yaml = self._require_key(branches, "rigid", "model.branches")
-        self.src_backproject_support_min = float(
-            self._require_key(rigid_yaml, "src_backproject_support_min", "model.branches.rigid")
+        bg_yaml = self._require_key(branches, "bg", "model.branches")
+        distant_yaml = self._require_key(branches, "distant", "model.branches")
+
+        self.bg_src_backproject_support_min = float(
+            self._require_key(bg_yaml, "src_backproject_support_min", "model.branches.bg")
         )
-        if self.src_backproject_support_min < 0:
-            raise ValueError("model.branches.rigid.src_backproject_support_min must be non-negative.")
+        self.distant_src_backproject_support_min = float(
+            self._require_key(distant_yaml, "src_backproject_support_min", "model.branches.distant")
+        )
+        self.bg_enable_selective_update = bool(
+            self._require_key(bg_yaml, "enable_selective_update", "model.branches.bg")
+        )
+        self.distant_enable_selective_update = bool(
+            self._require_key(distant_yaml, "enable_selective_update", "model.branches.distant")
+        )
 
-    def _validate_stage4_1_batch(self, batch: Dict, targets: List[Dict], node_state_rigid: Optional[NodeStateRigid]) -> int:
-        source_views = batch.get("source_views")
-        source_images = batch.get("source_images")
-        if not source_views or not source_images:
-            raise ValueError("Stage4.1 requires source_views/source_images.")
-        if len(source_views) != len(source_images):
-            raise ValueError(
-                f"Stage4.1 len(source_views)={len(source_views)} != len(source_images)={len(source_images)}."
+    @staticmethod
+    def _identity_quat(num_points: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        q = torch.zeros(num_points, 4, device=device, dtype=dtype)
+        q[:, 0] = 1.0
+        return q
+
+    def _predict_offsets_gru_distant_masked(
+        self,
+        feat: torch.Tensor,
+        params_for_embed: Dict[str, torch.Tensor],
+        h_old: torch.Tensor,
+        mask_update_distant: Optional[torch.Tensor],
+    ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
+        """Distant-specific heads + optional mask gate (hidden/head/offset)."""
+        if feat is None or feat.numel() == 0:
+            num_points = params_for_embed["means"].shape[0]
+            device = params_for_embed["means"].device
+            dtype = params_for_embed["means"].dtype
+            num_sh = _num_sh_bases(self.sh_degree)
+            offsets = {
+                "offset_pos": torch.zeros_like(params_for_embed["means"]),
+                "offset_scales": torch.zeros_like(params_for_embed["scales_log"]),
+                "offset_quat": self._identity_quat(num_points, device, dtype),
+                "offset_opacity": torch.zeros_like(params_for_embed["opacity_logit"]),
+                "offset_sh": torch.zeros(num_points, 3 * num_sh, device=device, dtype=dtype),
+            }
+            h_new = h_old
+            if mask_update_distant is not None:
+                gate = mask_update_distant.to(dtype=dtype, device=device).unsqueeze(-1).detach()
+                identity = self._identity_quat(num_points, device, dtype)
+                offsets["offset_pos"] = offsets["offset_pos"] * gate
+                offsets["offset_scales"] = offsets["offset_scales"] * gate
+                offsets["offset_quat"] = torch.where(gate.expand_as(offsets["offset_quat"]).bool(), offsets["offset_quat"], identity)
+                offsets["offset_opacity"] = offsets["offset_opacity"] * gate
+                offsets["offset_sh"] = offsets["offset_sh"] * gate
+                h_new = h_old * (1.0 - gate) + h_new * gate
+            return offsets, h_new
+
+        param_vec = self._normalize_params_for_embed(params_for_embed)
+        param_embed = self.param_embed_norm(self.mlp_params_embed(param_vec))
+        x = torch.cat([feat, param_embed], dim=-1)
+        hx = torch.cat([h_old, x], dim=-1)
+        z = torch.sigmoid(self.gru_update(hx))
+        if self.gru_reset is not None:
+            r = torch.sigmoid(self.gru_reset(hx))
+            h_cand = torch.tanh(self.gru_candidate(torch.cat([r * h_old, x], dim=-1)))
+        else:
+            h_cand = torch.tanh(self.gru_candidate(hx))
+        h_new = (1.0 - z) * h_old + z * h_cand
+        head_input = self.gru_to_head(h_new)
+        head_input = self._apply_gru_head_rms(head_input, mask_update_distant)
+        offsets = self._predict_offsets_with_heads(
+            head_input,
+            limits=self.distant_cfg["limits"],
+            mlp_offset_pos=self.mlp_offset_pos_distant,
+            mlp_conv=self.mlp_conv_distant,
+            mlp_opacity=self.mlp_opacity_distant,
+            gaussion_decoder=self.gaussion_decoder_distant,
+            freeze_quat=self.distant_freeze_quat,
+        )
+
+        if mask_update_distant is not None:
+            gate = mask_update_distant.to(dtype=offsets["offset_pos"].dtype, device=offsets["offset_pos"].device).unsqueeze(-1).detach()
+            identity = self._identity_quat(offsets["offset_quat"].shape[0], offsets["offset_quat"].device, offsets["offset_quat"].dtype)
+            offsets["offset_pos"] = offsets["offset_pos"] * gate
+            offsets["offset_scales"] = offsets["offset_scales"] * gate
+            offsets["offset_quat"] = torch.where(gate.expand_as(offsets["offset_quat"]).bool(), offsets["offset_quat"], identity)
+            offsets["offset_opacity"] = offsets["offset_opacity"] * gate
+            offsets["offset_sh"] = offsets["offset_sh"] * gate
+            h_new = h_old * (1.0 - gate) + h_new * gate
+        return offsets, h_new
+
+    def _compute_2d_features_all_branches_once(
+        self,
+        node_state_bg: NodeStateBackground,
+        node_state_distant: Optional[NodeStateDistant],
+        node_state_rigid: Optional[NodeStateRigid],
+        source_frame_idx: int,
+        rigid_idx_S: torch.Tensor,
+        source_views: List[Any],
+        source_images: List[torch.Tensor],
+        height: int,
+        width: int,
+    ) -> Dict[str, Optional[torch.Tensor]]:
+        """
+        One-pass source backprojection for [bg, distant, rigid_S], then split by ranges.
+        """
+        gaussians_bg_distant, num_bg, num_distant = self._prepare_gaussians_bg_distant(node_state_bg, node_state_distant)
+        num_rigid_S = int(rigid_idx_S.numel())
+
+        parts_means = [gaussians_bg_distant["means"]]
+        parts_scales = [gaussians_bg_distant["scales"]]
+        parts_quats = [gaussians_bg_distant["quats"]]
+        parts_opacities = [gaussians_bg_distant["opacities"]]
+        parts_colors = [gaussians_bg_distant["colors"]]
+
+        if node_state_rigid is not None and num_rigid_S > 0:
+            rigid_point_ids_subset = node_state_rigid.point_ids[rigid_idx_S, 0]
+            means_local_S = node_state_rigid.means[rigid_idx_S]
+            quats_local_S = node_state_rigid.quats[rigid_idx_S]
+            rigid_means_world = self._transform_rigid_to_world(
+                node_state_rigid, means_local_S, source_frame_idx, point_ids_subset=rigid_point_ids_subset
             )
-        source_frame_idx = int(batch.get("source_frame_idx", targets[0].get("frame_idx", 0)))
-        target_frames = {int(t["frame_idx"]) for t in targets}
-        # Fast-fail source/target alignment guard:
-        # For each source view, there must be a target on source_frame_idx with matching camera pose.
-        # This catches silent batch corruption where source frame/camera drifts from target metadata.
-        src_frame_targets = [t for t in targets if int(t.get("frame_idx", source_frame_idx)) == source_frame_idx]
-        if len(src_frame_targets) == 0:
-            raise ValueError(
-                "Stage4.1 requires at least one target on source_frame_idx for source/target alignment checks. "
-                f"source_frame_idx={source_frame_idx}, target_frames={sorted(target_frames)}"
+            parts_means.append(
+                rigid_means_world
             )
-        used_target_idx = set()
-        for i, src_view in enumerate(source_views):
-            src_c2w = src_view.camtoworlds if hasattr(src_view, "camtoworlds") else src_view["camtoworlds"]
-            src_c2w = src_c2w if src_c2w.dim() == 2 else src_c2w[0]
-            matched = False
-            for j, t in enumerate(src_frame_targets):
-                if j in used_target_idx:
-                    continue
-                tgt_view = t["view"]
-                tgt_c2w = tgt_view.camtoworlds if hasattr(tgt_view, "camtoworlds") else tgt_view["camtoworlds"]
-                tgt_c2w = tgt_c2w if tgt_c2w.dim() == 2 else tgt_c2w[0]
-                if torch.allclose(src_c2w.to(self.device), tgt_c2w.to(self.device), atol=1e-4, rtol=1e-4):
-                    used_target_idx.add(j)
-                    matched = True
-                    break
-            if not matched:
-                raise ValueError(
-                    "Stage4.1 source/target camera-frame mismatch: no target view on source_frame_idx matches "
-                    f"source_views[{i}] (source_frame_idx={source_frame_idx})."
+            parts_quats.append(
+                self._transform_rigid_quats_to_world(
+                    node_state_rigid, quats_local_S, source_frame_idx, point_ids_subset=rigid_point_ids_subset
                 )
-        if node_state_rigid is not None:
-            for fid in {source_frame_idx, *target_frames}:
-                if self._resolve_rigid_frame_idx(node_state_rigid, fid) is None:
-                    raise ValueError(
-                        f"Rigid frame_idx={fid} missing in dynamic_info frame_ids={node_state_rigid.frame_ids}"
-                    )
-        for i, target in enumerate(targets):
-            if "sky_mask" not in target or target["sky_mask"] is None:
-                raise ValueError(f"Stage4.1 requires targets[{i}].sky_mask.")
-            if "viewdirs" not in target or target["viewdirs"] is None:
-                raise ValueError(f"Stage4.1 requires targets[{i}].viewdirs.")
-            gt_image = target["gt_image"]
-            if gt_image.dim() == 4:
-                gt_image = gt_image.squeeze(0)
-            h, w = int(gt_image.shape[0]), int(gt_image.shape[1])
-            sm = target["sky_mask"]
-            if sm.dim() == 3:
-                sm = sm.squeeze(-1)
-            if int(sm.shape[0]) != h or int(sm.shape[1]) != w:
-                raise ValueError(f"targets[{i}] sky_mask HW mismatch vs gt_image.")
-            vd = target["viewdirs"]
-            if vd.dim() == 4:
-                vd = vd.squeeze(0)
-            if int(vd.shape[0]) != h or int(vd.shape[1]) != w or int(vd.shape[2]) != 3:
-                raise ValueError(f"targets[{i}] viewdirs shape mismatch vs gt_image.")
-        return source_frame_idx
+            )
+            parts_scales.append(torch.exp(node_state_rigid.scales_log[rigid_idx_S]))
+            parts_opacities.append(torch.sigmoid(node_state_rigid.opacity_logit[rigid_idx_S]).squeeze(-1))
+            parts_colors.append(torch.cat([node_state_rigid.sh_dc[rigid_idx_S, None, :], node_state_rigid.sh_rest[rigid_idx_S]], dim=1))
+        else:
+            rigid_means_world = None
 
-    @staticmethod
-    def _global_to_subset_rows(global_idx: torch.Tensor, subset_U: torch.Tensor, n_rigid: int, device: torch.device) -> torch.Tensor:
-        """Map global point indices (subset of U) to rows in arrays aligned with U."""
-        lookup = torch.full((n_rigid,), -1, dtype=torch.long, device=device)
-        lookup[subset_U] = torch.arange(subset_U.numel(), device=device, dtype=torch.long)
-        rows = lookup[global_idx]
-        if bool((rows < 0).any().item()):
-            raise ValueError("Internal error: global_idx not contained in subset_U.")
-        return rows
-
-    def _build_rigid_world_for_frame(
-        self,
-        node_state_rigid: NodeStateRigid,
-        frame_idx: int,
-        idx_train: torch.Tensor,
-        idx_frozen: torch.Tensor,
-        render_params_rigid_local: Dict[str, torch.Tensor],
-        U: torch.Tensor,
-    ) -> Optional[Dict[str, torch.Tensor]]:
-        chunks_means: List[torch.Tensor] = []
-        chunks_quats: List[torch.Tensor] = []
-        chunks_scales: List[torch.Tensor] = []
-        chunks_opacities: List[torch.Tensor] = []
-        chunks_colors: List[torch.Tensor] = []
-        if idx_train.numel() > 0:
-            if render_params_rigid_local is None or U.numel() == 0:
-                raise ValueError("Internal error: trainable rigid indices need render_params_rigid_local and U.")
-            rows = self._global_to_subset_rows(idx_train, U, int(node_state_rigid.means.shape[0]), self.device)
-            point_ids_t = node_state_rigid.point_ids[idx_train, 0]
-            means_l = render_params_rigid_local["means_r"][rows]
-            quats_l = render_params_rigid_local["quats_r"][rows]
-            means_w = self._transform_rigid_to_world(node_state_rigid, means_l, frame_idx, point_ids_subset=point_ids_t)
-            quats_w = self._transform_rigid_quats_to_world(node_state_rigid, quats_l, frame_idx, point_ids_subset=point_ids_t)
-            chunks_means.append(means_w)
-            chunks_quats.append(quats_w)
-            chunks_scales.append(render_params_rigid_local["scales_r"][rows])
-            chunks_opacities.append(render_params_rigid_local["opacities_r"][rows])
-            chunks_colors.append(render_params_rigid_local["colors_r"][rows])
-        if idx_frozen.numel() > 0:
-            point_ids_f = node_state_rigid.point_ids[idx_frozen, 0]
-            means_l = node_state_rigid.means[idx_frozen].detach()
-            quats_l = node_state_rigid.quats[idx_frozen].detach()
-            means_w = self._transform_rigid_to_world(node_state_rigid, means_l, frame_idx, point_ids_subset=point_ids_f)
-            quats_w = self._transform_rigid_quats_to_world(node_state_rigid, quats_l, frame_idx, point_ids_subset=point_ids_f)
-            scales = torch.exp(node_state_rigid.scales_log[idx_frozen].detach())
-            opacities = torch.sigmoid(node_state_rigid.opacity_logit[idx_frozen].detach()).squeeze(-1)
-            sh_dc = node_state_rigid.sh_dc[idx_frozen].detach()
-            sh_rest = node_state_rigid.sh_rest[idx_frozen].detach()
-            colors = torch.cat([sh_dc[:, None, :], sh_rest], dim=1)
-            chunks_means.append(means_w)
-            chunks_quats.append(quats_w)
-            chunks_scales.append(scales)
-            chunks_opacities.append(opacities)
-            chunks_colors.append(colors)
-        if not chunks_means:
-            return None
-        return {
-            "means_r": torch.cat(chunks_means, dim=0),
-            "scales_r": torch.cat(chunks_scales, dim=0),
-            "quats_r": torch.cat(chunks_quats, dim=0),
-            "opacities_r": torch.cat(chunks_opacities, dim=0),
-            "colors_r": torch.cat(chunks_colors, dim=0),
+        gaussians_all = {
+            "means": torch.cat(parts_means, dim=0),
+            "scales": torch.cat(parts_scales, dim=0),
+            "quats": torch.cat(parts_quats, dim=0),
+            "opacities": torch.cat(parts_opacities, dim=0),
+            "colors": torch.cat(parts_colors, dim=0),
         }
 
-    def _tensor_merge_bg_rigid_distant_world(
-        self,
-        render_params_bg: Dict[str, torch.Tensor],
-        rigid_world: Optional[Dict[str, torch.Tensor]],
-        render_params_distant: Optional[Dict[str, torch.Tensor]],
-    ) -> Dict[str, torch.Tensor]:
-        keys = ("means_r", "scales_r", "quats_r", "opacities_r", "colors_r")
-        out = {k: render_params_bg[k] for k in keys}
-        if rigid_world is not None:
-            out = {k: torch.cat([out[k], rigid_world[k]], dim=0) for k in keys}
-        if render_params_distant is not None:
-            out = {k: torch.cat([out[k], render_params_distant[k]], dim=0) for k in keys}
-        return out
+        bp_unfiltered = FeatureBackprojector(
+            eps=getattr(self.feature_backprojector, "eps", 1e-8),
+            weight_threshold=0.0,
+        )
+        pass_count = 0
+        pass_count += 1
+        feat_2d_all, acc_w_all = self._compute_2d_features_for_gaussians(
+            gaussians=gaussians_all,
+            source_views=source_views,
+            source_images=source_images,
+            height=height,
+            width=width,
+            return_accumulated_weights=True,
+            backprojector_override=bp_unfiltered,
+        )
+        if feat_2d_all is None or acc_w_all is None:
+            raise ValueError("Stage4.2 one-pass backprojection returned None unexpectedly.")
 
-    @staticmethod
-    def _stat_tensor(t: Optional[torch.Tensor]) -> Dict[str, float]:
-        if t is None or t.numel() == 0:
-            return {"mean": 0.0, "std": 0.0, "max": 0.0}
-        x = t.detach().float()
-        return {
-            "mean": float(x.mean().item()),
-            "std": float(x.std(unbiased=False).item()),
-            "max": float(x.abs().max().item()),
-        }
+        idx0 = 0
+        idx1 = idx0 + num_bg
+        idx2 = idx1 + num_distant
+        idx3 = idx2 + num_rigid_S
+        if idx3 != int(feat_2d_all.shape[0]):
+            raise ValueError("Stage4.2 split size mismatch for one-pass backprojection.")
 
-    def _collect_offset_stats(
-        self,
-        offsets_bg: Optional[Dict[str, torch.Tensor]],
-        offsets_rigid: Optional[Dict[str, torch.Tensor]],
-    ) -> Dict[str, float]:
-        out: Dict[str, float] = {}
-        for branch, offsets in (("bg", offsets_bg), ("rigid", offsets_rigid)):
-            for key in ("offset_pos", "offset_scales", "offset_opacity"):
-                stats = self._stat_tensor(None if offsets is None else offsets.get(key))
-                out[f"{branch}_{key}_mean"] = stats["mean"]
-                out[f"{branch}_{key}_std"] = stats["std"]
-                out[f"{branch}_{key}_max"] = stats["max"]
-        return out
-
-    def _collect_hidden_norms(
-        self,
-        h_new_bg: Optional[torch.Tensor],
-        h_new_distant: Optional[torch.Tensor],
-        h_new_rigid: Optional[torch.Tensor],
-    ) -> Dict[str, float]:
-        def _mean_norm(t: Optional[torch.Tensor]) -> float:
-            if t is None or t.numel() == 0:
-                return 0.0
-            return float(torch.norm(t.detach().float(), dim=-1).mean().item())
+        feat_2d_bg = feat_2d_all[idx0:idx1]
+        acc_w_bg = acc_w_all[idx0:idx1]
+        feat_2d_distant = feat_2d_all[idx1:idx2] if num_distant > 0 else None
+        acc_w_distant = acc_w_all[idx1:idx2] if num_distant > 0 else None
+        feat_2d_rigid_S = feat_2d_all[idx2:idx3] if num_rigid_S > 0 else None
+        acc_w_rigid_S = acc_w_all[idx2:idx3] if num_rigid_S > 0 else None
 
         return {
-            "hidden_norm_bg_mean": _mean_norm(h_new_bg),
-            "hidden_norm_distant_mean": _mean_norm(h_new_distant),
-            "hidden_norm_rigid_mean": _mean_norm(h_new_rigid),
+            "num_bg": num_bg,
+            "num_distant": num_distant,
+            "feat_2d_bg": feat_2d_bg,
+            "acc_w_bg": acc_w_bg,
+            "feat_2d_distant": feat_2d_distant,
+            "acc_w_distant": acc_w_distant,
+            "feat_2d_rigid_S": feat_2d_rigid_S,
+            "acc_w_rigid_S": acc_w_rigid_S,
+            "src_backproject_pass_count": pass_count,
         }
 
-    def _compute_branch_grad_norms(self) -> Dict[str, float]:
-        sq_sum = {"bg": 0.0, "distant": 0.0, "rigid": 0.0}
-        for name, param in self.named_parameters():
-            if param.grad is None:
-                continue
-            g2 = float(param.grad.detach().float().pow(2).sum().item())
-            if "distant" in name:
-                sq_sum["distant"] += g2
-            elif "rigid" in name:
-                sq_sum["rigid"] += g2
-            else:
-                sq_sum["bg"] += g2
-        return {
-            "grad_norm_bg": float(sq_sum["bg"] ** 0.5),
-            "grad_norm_distant": float(sq_sum["distant"] ** 0.5),
-            "grad_norm_rigid": float(sq_sum["rigid"] ** 0.5),
-        }
+    def _build_any_target_mask_static(
+        self,
+        num_points: int,
+        enable_selective: bool,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """
+        Stage4_2 static branches currently do not have per-point target visibility precomputation.
+        Selective toggle is kept for compatibility; mask remains all-ones when enabled.
+        """
+        if num_points <= 0:
+            return torch.zeros(0, dtype=torch.bool, device=device)
+        if not enable_selective:
+            return torch.ones(num_points, dtype=torch.bool, device=device)
+        return torch.ones(num_points, dtype=torch.bool, device=device)
+
+    def _update_node_state_bg_subset(
+        self,
+        node_state_bg: NodeStateBackground,
+        render_params: Dict[str, torch.Tensor],
+        valid_idx: torch.Tensor,
+    ) -> None:
+        with torch.no_grad():
+            if valid_idx.numel() == 0:
+                return
+            means_clamped = torch.clamp(
+                render_params["means_r"][valid_idx].detach(),
+                min=self.bbx_min,
+                max=self.bbx_max,
+            )
+            node_state_bg.means[valid_idx] = means_clamped
+            node_state_bg.scales_log[valid_idx] = render_params["scales_log_r"][valid_idx].detach()
+            node_state_bg.quats[valid_idx] = render_params["quats_r"][valid_idx].detach()
+            node_state_bg.opacity_logit[valid_idx] = render_params["opacity_logit_r"][valid_idx].detach()
+            node_state_bg.sh_dc[valid_idx] = render_params["sh_dc_r"][valid_idx].detach()
+            node_state_bg.sh_rest[valid_idx] = render_params["sh_rest_r"][valid_idx].detach()
+
+    def _update_node_state_distant_subset(
+        self,
+        node_state_distant: NodeStateDistant,
+        render_params: Dict[str, torch.Tensor],
+        valid_idx: torch.Tensor,
+    ) -> None:
+        with torch.no_grad():
+            if valid_idx.numel() == 0:
+                return
+            # Distant Gaussians are far-field / segment-exterior by design; do not clamp means to
+            # dataset.segment_aabb (input_aabb_*). Clamping collapsed visible distant points onto the
+            # AABB shell and destroyed frustum overlap after the first scheduler writeback.
+            node_state_distant.means[valid_idx] = render_params["means_r"][valid_idx].detach()
+            node_state_distant.scales_log[valid_idx] = render_params["scales_log_r"][valid_idx].detach()
+            node_state_distant.quats[valid_idx] = render_params["quats_r"][valid_idx].detach()
+            node_state_distant.opacity_logit[valid_idx] = render_params["opacity_logit_r"][valid_idx].detach()
+            node_state_distant.sh_dc[valid_idx] = render_params["sh_dc_r"][valid_idx].detach()
+            node_state_distant.sh_rest[valid_idx] = render_params["sh_rest_r"][valid_idx].detach()
 
     def forward(self, batch: Dict) -> Dict[str, Any]:
         targets = batch["targets"]
         if not targets:
-            raise ValueError("Stage4.1 requires non-empty batch['targets'].")
+            raise ValueError("Stage4.2 requires non-empty batch['targets'].")
 
         node_state_bg, node_state_rigid, node_state_distant = self._get_or_init_node_states_bg_rigid_distant(batch)
         source_frame_idx = self._validate_stage4_1_batch(batch, targets, node_state_rigid)
@@ -264,98 +292,93 @@ class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
         anchor_rgb_bg = _sh_to_rgb(node_state_bg.sh_dc)
         feat_3d_crop_bg = self._build_3d_features(means_bg, anchor_rgb_bg)
 
-        gaussians_all, num_bg, num_distant = self._prepare_gaussians_bg_distant(node_state_bg, node_state_distant)
-        feat_2d_bg, feat_2d_distant = self._compute_2d_features_bg_distant(
-            gaussians_all, num_bg, num_distant, source_views, source_images, height, width
+        N_rigid = int(node_state_rigid.means.shape[0]) if node_state_rigid is not None else 0
+        mask_src_rigid = torch.zeros(N_rigid, dtype=torch.bool, device=self.device)
+        mask_src_feat_valid_rigid = torch.zeros(N_rigid, dtype=torch.bool, device=self.device)
+        mask_tgt_by_frame: Dict[int, torch.Tensor] = {}
+        unique_target_frames = sorted({int(t["frame_idx"]) for t in targets})
+        if node_state_rigid is not None:
+            mask_src_rigid = self._rigid_point_valid_mask(node_state_rigid, source_frame_idx)
+            for frame_idx in unique_target_frames:
+                mask_tgt_by_frame[frame_idx] = self._rigid_point_valid_mask(node_state_rigid, frame_idx)
+        else:
+            for frame_idx in unique_target_frames:
+                mask_tgt_by_frame[frame_idx] = torch.zeros(N_rigid, dtype=torch.bool, device=self.device)
+        mask_any_tgt_rigid = torch.zeros(N_rigid, dtype=torch.bool, device=self.device)
+        for m in mask_tgt_by_frame.values():
+            mask_any_tgt_rigid = mask_any_tgt_rigid | m
+
+        S = torch.nonzero(mask_src_rigid, as_tuple=False).squeeze(1)
+        one_pass = self._compute_2d_features_all_branches_once(
+            node_state_bg=node_state_bg,
+            node_state_distant=node_state_distant,
+            node_state_rigid=node_state_rigid,
+            source_frame_idx=source_frame_idx,
+            rigid_idx_S=S,
+            source_views=source_views,
+            source_images=source_images,
+            height=height,
+            width=width,
         )
+        num_bg = int(one_pass["num_bg"])
+        num_distant = int(one_pass["num_distant"])
+        feat_2d_bg = one_pass["feat_2d_bg"]
+        feat_2d_distant = one_pass["feat_2d_distant"]
+        feat_2d_rigid_S = one_pass["feat_2d_rigid_S"]
+        acc_w_bg = one_pass["acc_w_bg"]
+        acc_w_distant = one_pass["acc_w_distant"]
+        acc_w_rigid_S = one_pass["acc_w_rigid_S"]
+        src_backproject_pass_count = int(one_pass.get("src_backproject_pass_count", 0))
+
+        mask_src_feat_valid_bg = acc_w_bg > self.bg_src_backproject_support_min
+        mask_any_tgt_bg = self._build_any_target_mask_static(
+            num_points=num_bg,
+            enable_selective=self.bg_enable_selective_update,
+            device=self.device,
+        )
+        mask_update_bg = mask_src_feat_valid_bg & mask_any_tgt_bg
         vis_bg = torch.ones(num_bg, device=self.device)
         feat_bg_input = self._fuse_features(feat_3d_crop_bg, feat_2d_bg, vis_bg)
 
-        N_rigid = int(node_state_rigid.means.shape[0]) if node_state_rigid is not None else 0
-        mask_src_rigid = torch.zeros(N_rigid, dtype=torch.bool, device=self.device)
-        mask_src_feat_valid = torch.zeros(N_rigid, dtype=torch.bool, device=self.device)
-        mask_tgt_by_frame: Dict[int, torch.Tensor] = {}
-        unique_target_frames = sorted({int(t["frame_idx"]) for t in targets})
-
-        if node_state_rigid is not None:
-            mask_src_rigid = self._rigid_point_valid_mask(node_state_rigid, source_frame_idx)
-            for F in unique_target_frames:
-                mask_tgt_by_frame[F] = self._rigid_point_valid_mask(node_state_rigid, F)
+        mask_src_feat_valid_distant = (
+            (acc_w_distant > self.distant_src_backproject_support_min) if acc_w_distant is not None else None
+        )
+        if num_distant > 0:
+            mask_any_tgt_distant = self._build_any_target_mask_static(
+                num_points=num_distant,
+                enable_selective=self.distant_enable_selective_update,
+                device=self.device,
+            )
+            mask_update_distant = mask_src_feat_valid_distant & mask_any_tgt_distant
         else:
-            for F in unique_target_frames:
-                mask_tgt_by_frame[F] = torch.zeros(N_rigid, dtype=torch.bool, device=self.device)
+            mask_any_tgt_distant = None
+            mask_update_distant = None
 
-        mask_any_tgt = torch.zeros(N_rigid, dtype=torch.bool, device=self.device)
-        for m in mask_tgt_by_frame.values():
-            mask_any_tgt = mask_any_tgt | m
-
-        S = torch.nonzero(mask_src_rigid, as_tuple=False).squeeze(1)
-        feat_S: Optional[torch.Tensor] = None
-        acc_w: Optional[torch.Tensor] = None
         if node_state_rigid is not None and S.numel() > 0:
-            # For rigid support/mask, disable FeatureBackprojector weight filtering.
-            # This keeps the mask definition strictly based on alpha-T accumulated weights
-            # (support strength), not feature norm.
-            bp_unfiltered = FeatureBackprojector(
-                eps=getattr(self.feature_backprojector, "eps", 1e-8),
-                weight_threshold=0.0,
-            )
-            rigid_point_ids_subset = node_state_rigid.point_ids[S, 0]
-            means_local_S = node_state_rigid.means[S]
-            quats_local_S = node_state_rigid.quats[S]
-            gaussians_rigid = {
-                "means": self._transform_rigid_to_world(
-                    node_state_rigid, means_local_S, source_frame_idx, point_ids_subset=rigid_point_ids_subset
-                ),
-                "quats": self._transform_rigid_quats_to_world(
-                    node_state_rigid, quats_local_S, source_frame_idx, point_ids_subset=rigid_point_ids_subset
-                ),
-                "scales": torch.exp(node_state_rigid.scales_log[S]),
-                "opacities": torch.sigmoid(node_state_rigid.opacity_logit[S]).squeeze(-1),
-                "colors": torch.cat([node_state_rigid.sh_dc[S, None, :], node_state_rigid.sh_rest[S]], dim=1),
-            }
-            feat_S, acc_w = self._compute_2d_features_for_gaussians(
-                gaussians=gaussians_rigid,
-                source_views=source_views,
-                source_images=source_images,
-                height=height,
-                width=width,
-                return_accumulated_weights=True,
-                backprojector_override=bp_unfiltered,
-            )
-            if feat_S is None or acc_w is None:
-                raise ValueError("Stage4.1 rigid backprojection returned None despite non-empty S.")
-            mask_src_feat_valid[S] = acc_w > self.src_backproject_support_min
-            bad = mask_src_feat_valid & ~mask_src_rigid
+            if acc_w_rigid_S is None:
+                raise ValueError("Stage4.2 rigid S non-empty but acc_w_rigid_S is None.")
+            mask_src_feat_valid_rigid[S] = acc_w_rigid_S > self.src_backproject_support_min
+            bad = mask_src_feat_valid_rigid & ~mask_src_rigid
             if bool(bad.any().item()):
-                raise ValueError("mask_src_feat_valid True outside mask_src_rigid; check backprojection indexing.")
-
-        mask_update = mask_src_feat_valid & mask_any_tgt
-        U = torch.nonzero(mask_update, as_tuple=False).squeeze(1)
-
-        feat_distant_input = None
-        if num_distant > 0 and feat_2d_distant is not None:
-            feat_distant_input = self.distant_feat_proj(feat_2d_distant)
+                raise ValueError("mask_src_feat_valid_rigid True outside mask_src_rigid.")
+        mask_update_rigid = mask_src_feat_valid_rigid & mask_any_tgt_rigid
+        U = torch.nonzero(mask_update_rigid, as_tuple=False).squeeze(1)
 
         params_bg = self._build_params_for_embed(node_state_bg, coord_space="world")
         h_old_bg = self._get_or_init_hidden(self.h_cache_bg, key, node_state_bg.means.shape[0], node_state_bg, "bg")
-        offsets_bg, h_new_bg = self._predict_offsets_gru(feat_bg_input, params_bg, h_old_bg, mask_update_rigid=None)
+        offsets_bg, h_new_bg = self._predict_offsets_gru(
+            feat_bg_input, params_bg, h_old_bg, mask_update_rigid=mask_update_bg
+        )
         render_params_bg = self._render_params_from_offsets_bg(node_state_bg, offsets_bg)
 
         render_params_rigid_local: Optional[Dict[str, torch.Tensor]] = None
-        render_params_rigid_world_example: Optional[Dict[str, torch.Tensor]] = None
         h_new_rigid: Optional[torch.Tensor] = None
         offsets_rigid: Optional[Dict[str, torch.Tensor]] = None
-        if (
-            node_state_rigid is not None
-            and U.numel() > 0
-            and feat_S is not None
-            and S.numel() > 0
-        ):
+        if node_state_rigid is not None and U.numel() > 0 and feat_2d_rigid_S is not None and S.numel() > 0:
             lookup_s = torch.full((N_rigid,), -1, dtype=torch.long, device=self.device)
             lookup_s[S] = torch.arange(S.numel(), device=self.device, dtype=torch.long)
             idx_in_S = lookup_s[U]
-            feat_U = feat_S[idx_in_S]
+            feat_U = feat_2d_rigid_S[idx_in_S]
             if int(feat_U.shape[-1]) != int(self.rigid_feat_in_dim):
                 raise ValueError(f"Rigid 2D feature dim mismatch: got {feat_U.shape[-1]}, expected {self.rigid_feat_in_dim}")
             feat_U = self.rigid_feat_proj(feat_U)
@@ -375,11 +398,9 @@ class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
             rigid_embed_state.sh_dc = node_state_rigid.sh_dc[U]
             rigid_embed_state.sh_rest = node_state_rigid.sh_rest[U]
             params_rigid = self._build_params_for_embed(rigid_embed_state, coord_space="world")
-            h_old_rigid = self._get_or_init_hidden(
-                self.h_cache_rigid, key, node_state_rigid.means.shape[0], node_state_rigid, "rigid"
-            )
+            h_old_rigid = self._get_or_init_hidden(self.h_cache_rigid, key, node_state_rigid.means.shape[0], node_state_rigid, "rigid")
             h_old_rigid_U = h_old_rigid[U]
-            rigid_head_rms_mask = mask_src_feat_valid[U].to(dtype=feat_U.dtype, device=feat_U.device)
+            rigid_head_rms_mask = mask_src_feat_valid_rigid[U].to(dtype=feat_U.dtype, device=feat_U.device)
             offsets_rigid, h_new_rigid_U = self._predict_offsets_gru_rigid(
                 feat_U, params_rigid, h_old_rigid_U, head_rms_mask=rigid_head_rms_mask
             )
@@ -403,21 +424,17 @@ class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
             )
             h_new_rigid = h_old_rigid.clone()
             h_new_rigid[U] = h_new_rigid_U
-
         if node_state_rigid is not None and h_new_rigid is None:
-            h_new_rigid = self._get_or_init_hidden(
-                self.h_cache_rigid, key, node_state_rigid.means.shape[0], node_state_rigid, "rigid"
-            ).clone()
+            h_new_rigid = self._get_or_init_hidden(self.h_cache_rigid, key, node_state_rigid.means.shape[0], node_state_rigid, "rigid").clone()
 
         render_params_distant = None
         h_new_distant = None
-        if node_state_distant is not None and feat_distant_input is not None and feat_distant_input.numel() > 0:
+        if node_state_distant is not None and feat_2d_distant is not None and feat_2d_distant.numel() > 0:
+            feat_distant_input = self.distant_feat_proj(feat_2d_distant)
             params_distant = self._build_params_for_embed(node_state_distant, coord_space="world")
-            h_old_distant = self._get_or_init_hidden(
-                self.h_cache_distant, key, node_state_distant.means.shape[0], node_state_distant, "distant"
-            )
-            offsets_distant, h_new_distant = self._predict_offsets_gru_distant(
-                feat_distant_input, params_distant, h_old_distant
+            h_old_distant = self._get_or_init_hidden(self.h_cache_distant, key, node_state_distant.means.shape[0], node_state_distant, "distant")
+            offsets_distant, h_new_distant = self._predict_offsets_gru_distant_masked(
+                feat_distant_input, params_distant, h_old_distant, mask_update_distant
             )
             render_params_distant = self._render_params_from_offsets_distant(node_state_distant, offsets_distant)
 
@@ -432,29 +449,19 @@ class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
             proxies_dist_l: Optional[Dict[str, torch.Tensor]],
             rigid_local_opt: Optional[Dict[str, torch.Tensor]],
             U_tensor: torch.Tensor,
-        ) -> Tuple[
-            Dict[int, Tuple[torch.Tensor, torch.Tensor]],
-            List[Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]],
-        ]:
+        ):
             pred_by_idx: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
             rigid_pairs_l: List[Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]] = []
             for F in sorted_frames:
                 group = by_frame[F]
                 targets_F = [t for _, t in group]
-                idx_tr = torch.nonzero(mask_update & mask_tgt_by_frame[F], as_tuple=False).squeeze(1)
-                idx_fr = torch.nonzero((~mask_update) & mask_tgt_by_frame[F], as_tuple=False).squeeze(1)
+                idx_tr = torch.nonzero(mask_update_rigid & mask_tgt_by_frame[F], as_tuple=False).squeeze(1)
+                idx_fr = torch.nonzero((~mask_update_rigid) & mask_tgt_by_frame[F], as_tuple=False).squeeze(1)
                 rw: Optional[Dict[str, torch.Tensor]] = None
                 if node_state_rigid is not None and (idx_tr.numel() > 0 or idx_fr.numel() > 0):
-                    if idx_tr.numel() > 0 and (rigid_local_opt is None or U_tensor.numel() == 0):
-                        raise ValueError("Trainable rigid points require render_params_rigid_local and non-empty U.")
-                    rw = self._build_rigid_world_for_frame(
-                        node_state_rigid, F, idx_tr, idx_fr, rigid_local_opt, U_tensor
-                    )
+                    rw = self._build_rigid_world_for_frame(node_state_rigid, F, idx_tr, idx_fr, rigid_local_opt, U_tensor)
                 prox_r: Optional[Dict[str, torch.Tensor]] = None
                 if rw is not None and training:
-                    # If this frame has no trainable rigid points, rw is frozen-only and detached.
-                    # Keep rigid in render merge, but skip proxy/backward pair to avoid autograd
-                    # calling backward on tensors that do not require grad.
                     if idx_tr.numel() > 0:
                         prox_r = _create_proxy_params(rw)
                         rigid_pairs_l.append((rw, prox_r))
@@ -470,6 +477,7 @@ class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
                     merged_f = _merge_params_bg_rigid_distant(proxies_bg_l, prox_r, proxies_dist_l)
                 else:
                     merged_f = self._tensor_merge_bg_rigid_distant_world(render_params_bg, rw, render_params_distant)
+
                 heights = []
                 widths = []
                 for t in targets_F:
@@ -486,7 +494,7 @@ class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
                             rgb_j, acc_j = multi_result[j]
                             pred_by_idx[orig_i] = (rgb_j, acc_j.squeeze(-1) if acc_j.dim() == 3 else acc_j)
                         continue
-                for j, (orig_i, t) in enumerate(group):
+                for orig_i, t in group:
                     view = t["view"]
                     g = t["gt_image"]
                     if g.dim() == 4:
@@ -502,8 +510,7 @@ class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
             gt_images: List[torch.Tensor] = []
             for i in range(len(targets)):
                 pr, acc = pred_by_idx[i]
-                pred_rgb = self._composite_sky(pr, acc, targets[i])
-                pred_rgbs.append(pred_rgb)
+                pred_rgbs.append(self._composite_sky(pr, acc, targets[i]))
                 gt = targets[i]["gt_image"]
                 if gt.dim() == 4:
                     gt = gt.squeeze(0)
@@ -524,27 +531,28 @@ class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
                 "_h_new_bg": h_new_bg,
                 "_h_new_distant": h_new_distant,
                 "_h_new_rigid": h_new_rigid,
-                "_rigid_valid_idx": S,
+                "_bg_writeback_idx": torch.nonzero(mask_update_bg, as_tuple=False).squeeze(1),
+                "_distant_writeback_idx": (
+                    torch.nonzero(mask_update_distant, as_tuple=False).squeeze(1) if mask_update_distant is not None else None
+                ),
                 "_rigid_writeback_idx": U,
+                "_rigid_valid_idx": S,
                 "_num_rigid_valid_src": int(S.numel()),
                 "_num_rigid_total": N_rigid,
                 "_cache_key": key,
+                "_src_backproject_pass_count": src_backproject_pass_count,
             }
 
         proxies_bg = _create_proxy_params(render_params_bg)
         proxies_distant = _create_proxy_params(render_params_distant) if render_params_distant is not None else None
-
-        pred_by_idx, rigid_world_proxy_pairs = _run_frame_renders(
-            True, proxies_bg, proxies_distant, render_params_rigid_local, U
-        )
+        pred_by_idx, rigid_world_proxy_pairs = _run_frame_renders(True, proxies_bg, proxies_distant, render_params_rigid_local, U)
 
         pred_rgbs_t: List[torch.Tensor] = []
         gt_images_t: List[torch.Tensor] = []
         opacities_t: List[torch.Tensor] = []
         for i in range(len(targets)):
             pr, acc = pred_by_idx[i]
-            pred_rgb_sky = self._composite_sky(pr, acc, targets[i])
-            pred_rgbs_t.append(pred_rgb_sky)
+            pred_rgbs_t.append(self._composite_sky(pr, acc, targets[i]))
             gt = targets[i]["gt_image"]
             if gt.dim() == 4:
                 gt = gt.squeeze(0)
@@ -555,8 +563,6 @@ class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
         loss_ssim_list: List[torch.Tensor] = []
         loss_mask_list: List[torch.Tensor] = []
         loss_entropy_list: List[torch.Tensor] = []
-        loss_total_list: List[torch.Tensor] = []
-
         frame_losses: List[torch.Tensor] = []
         frame_loss_map: Dict[int, float] = {}
         eff_frames = 0
@@ -590,19 +596,17 @@ class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
                 loss_ssim_list.append(ssim_i)
                 loss_mask_list.append(mask_i)
                 loss_entropy_list.append(entropy_i)
-                loss_total_list.append(total_i)
                 view_losses.append(total_i)
             if view_losses:
                 frame_loss = torch.stack(view_losses).mean()
                 frame_losses.append(frame_loss)
                 frame_loss_map[int(F)] = float(frame_loss.detach().item())
                 eff_frames += 1
-
         if frame_losses:
             loss = torch.stack(frame_losses).mean()
         else:
             loss = render_params_bg["means_r"].sum() * 0.0
-            logger.warning("Stage4.1: no valid supervision in this step; using zero loss.")
+            logger.warning("Stage4.2: no valid supervision in this step; using zero loss.")
 
         l1_mean = torch.stack(loss_l1_list).mean() if loss_l1_list else loss * 0.0
         ssim_mean = torch.stack(loss_ssim_list).mean() if loss_ssim_list else loss * 0.0
@@ -610,7 +614,12 @@ class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
         entropy_mean = torch.stack(loss_entropy_list).mean() if loss_entropy_list else loss * 0.0
         offset_stats = self._collect_offset_stats(offsets_bg, offsets_rigid)
         hidden_stats = self._collect_hidden_norms(h_new_bg, h_new_distant, h_new_rigid)
-        rigid_src_feat_valid = int(mask_src_feat_valid.sum().item())
+
+        bg_writeback_idx = torch.nonzero(mask_update_bg, as_tuple=False).squeeze(1)
+        distant_writeback_idx = (
+            torch.nonzero(mask_update_distant, as_tuple=False).squeeze(1) if mask_update_distant is not None else None
+        )
+        rigid_src_feat_valid = int(mask_src_feat_valid_rigid.sum().item())
         rigid_update_count = int(U.numel())
         rigid_update_ratio = float(rigid_update_count / max(int(N_rigid), 1))
         rigid_update_among_feat_valid = float(rigid_update_count / max(rigid_src_feat_valid, 1))
@@ -635,10 +644,12 @@ class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
             "_h_new_bg": h_new_bg,
             "_h_new_distant": h_new_distant,
             "_h_new_rigid": h_new_rigid,
+            "_bg_writeback_idx": bg_writeback_idx,
+            "_distant_writeback_idx": distant_writeback_idx,
             "_rigid_valid_idx": S,
             "_rigid_writeback_idx": U,
             "_num_rigid_valid_src": int(S.numel()),
-            "_num_rigid_src_feat_valid": int(mask_src_feat_valid.sum().item()),
+            "_num_rigid_src_feat_valid": int(mask_src_feat_valid_rigid.sum().item()),
             "_num_rigid_update": int(U.numel()),
             "_num_target_frames": len(sorted_frames),
             "_loss_effective_frames": eff_frames,
@@ -648,6 +659,11 @@ class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
             "_hidden_stats": hidden_stats,
             "_rigid_update_ratio": rigid_update_ratio,
             "_rigid_update_among_feat_valid": rigid_update_among_feat_valid,
+            "_num_bg_src_feat_valid": int(mask_src_feat_valid_bg.sum().item()),
+            "_num_bg_update": int(bg_writeback_idx.numel()),
+            "_num_distant_src_feat_valid": int(mask_src_feat_valid_distant.sum().item()) if mask_src_feat_valid_distant is not None else 0,
+            "_num_distant_update": int(distant_writeback_idx.numel()) if distant_writeback_idx is not None else 0,
+            "_src_backproject_pass_count": src_backproject_pass_count,
             "_cache_key": key,
             "pred_rgbs": pred_rgbs_t,
             "gt_images": gt_images_t,
@@ -656,19 +672,24 @@ class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
         }
 
     def _writeback_node_states_from_out(self, out: Dict[str, Any]) -> None:
-        """Persist render params into NodeState tensors (bg / distant / rigid)."""
         if "_node_state_bg" in out:
-            self._update_node_state_bg(out["_node_state_bg"], out["render_params"])
+            bg_idx = out.get("_bg_writeback_idx")
+            if bg_idx is None:
+                self._update_node_state_bg(out["_node_state_bg"], out["render_params"])
+            else:
+                self._update_node_state_bg_subset(out["_node_state_bg"], out["render_params"], bg_idx)
         if out.get("_node_state_distant") is not None and out.get("_render_params_distant") is not None:
-            self._update_node_state_distant(out["_node_state_distant"], out["_render_params_distant"])
+            distant_idx = out.get("_distant_writeback_idx")
+            if distant_idx is None:
+                self._update_node_state_distant(out["_node_state_distant"], out["_render_params_distant"])
+            else:
+                self._update_node_state_distant_subset(out["_node_state_distant"], out["_render_params_distant"], distant_idx)
         if out.get("_node_state_rigid") is not None and out.get("_render_params_rigid_local") is not None:
             valid_idx = out.get("_rigid_writeback_idx", out.get("_rigid_valid_idx"))
             if valid_idx is None:
                 raise ValueError("Internal error: missing rigid writeback idx.")
             if valid_idx.numel() > 0:
-                self._update_node_state_rigid_local(
-                    out["_node_state_rigid"], out["_render_params_rigid_local"], valid_idx
-                )
+                self._update_node_state_rigid_local(out["_node_state_rigid"], out["_render_params_rigid_local"], valid_idx)
 
     def train_step(
         self,
@@ -682,11 +703,7 @@ class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
         self._perf_acc = {}
         node_state_sync_update = False
         node_state_sync_reset = False
-        timing_ms: Dict[str, float] = {
-            "forward_ms": 0.0,
-            "backward_ms": 0.0,
-            "optimizer_ms": 0.0,
-        }
+        timing_ms: Dict[str, float] = {"forward_ms": 0.0, "backward_ms": 0.0, "optimizer_ms": 0.0}
         t0 = time.perf_counter()
         self.optimizer.zero_grad()
         out = self.forward(batch)
@@ -733,9 +750,7 @@ class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
             seg = int(scheduler_node_sync["segment_local_step"])
             reset_after_block = bool(scheduler_node_sync.get("reset_after_block", False))
             if U < 1:
-                raise ValueError(
-                    "scheduler_node_sync requires U >= 1 (scheduler time_base.state_write_interval_steps)."
-                )
+                raise ValueError("scheduler_node_sync requires U >= 1 (scheduler time_base.state_write_interval_steps).")
             if seg > 0 and seg % U == 0:
                 self._writeback_node_states_from_out(out)
                 node_state_sync_update = True
@@ -757,28 +772,39 @@ class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
         writeback_idx = out.get("_rigid_writeback_idx")
         writeback_count = int(writeback_idx.numel()) if writeback_idx is not None else 0
         writeback_rigid_ratio = float(writeback_count / max(num_rigid_total, 1))
+        bg_w_idx = out.get("_bg_writeback_idx")
+        bg_w_count = int(bg_w_idx.numel()) if bg_w_idx is not None else num_gaussians_bg
+        writeback_bg_ratio = float(bg_w_count / max(num_gaussians_bg, 1))
+        distant_w_idx = out.get("_distant_writeback_idx")
+        distant_w_count = int(distant_w_idx.numel()) if distant_w_idx is not None else num_gaussians_distant
+        writeback_distant_ratio = float(distant_w_count / max(num_gaussians_distant, 1)) if num_gaussians_distant > 0 else 0.0
         hidden_stats = out.get("_hidden_stats", {})
         offset_stats = out.get("_offset_stats", {})
         frame_loss_map = out.get("_frame_loss_map", {})
+
+        num_bg_src_feat_valid = int(out.get("_num_bg_src_feat_valid", 0))
+        num_bg_update = int(out.get("_num_bg_update", 0))
+        num_distant_src_feat_valid = int(out.get("_num_distant_src_feat_valid", 0))
+        num_distant_update = int(out.get("_num_distant_update", 0))
         perf_metrics: Dict[str, float] = {}
         perf_calls = float(self._perf_acc.get("2d_call_count", 0.0))
         if perf_calls > 0.0:
             for k, v in self._perf_acc.items():
                 if k == "2d_call_count":
                     continue
+                # Memory fields keep summed values for deltas; timing fields are averaged per call.
                 if "cuda_mem_" in k:
                     perf_metrics[f"perf_{k}"] = float(v)
                 else:
                     perf_metrics[f"perf_{k}"] = float(v / perf_calls)
         perf_metrics["perf_2d_call_count"] = perf_calls
+
         return {
             "loss": out["loss"].item() if torch.is_tensor(out["loss"]) else out["loss"],
             "loss_l1": out["loss_l1"].item() if torch.is_tensor(out.get("loss_l1")) else float(out.get("loss_l1", 0.0)),
             "loss_ssim": out["loss_ssim"].item() if torch.is_tensor(out.get("loss_ssim")) else float(out.get("loss_ssim", 0.0)),
             "loss_mask": out["loss_mask"].item() if torch.is_tensor(out.get("loss_mask")) else float(out.get("loss_mask", 0.0)),
-            "loss_opacity_entropy": out["loss_opacity_entropy"].item()
-            if torch.is_tensor(out.get("loss_opacity_entropy"))
-            else float(out.get("loss_opacity_entropy", 0.0)),
+            "loss_opacity_entropy": out["loss_opacity_entropy"].item() if torch.is_tensor(out.get("loss_opacity_entropy")) else float(out.get("loss_opacity_entropy", 0.0)),
             "pred_rgbs": out["pred_rgbs"],
             "gt_images": out["gt_images"],
             "pred_rgb": out["pred_rgb"],
@@ -802,6 +828,15 @@ class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
             "hidden_norm_bg_mean": float(hidden_stats.get("hidden_norm_bg_mean", 0.0)),
             "hidden_norm_distant_mean": float(hidden_stats.get("hidden_norm_distant_mean", 0.0)),
             "hidden_norm_rigid_mean": float(hidden_stats.get("hidden_norm_rigid_mean", 0.0)),
+            "num_bg_src_feat_valid": num_bg_src_feat_valid,
+            "num_bg_update": num_bg_update,
+            "bg_update_ratio": float(num_bg_update / max(num_gaussians_bg, 1)),
+            "num_distant_src_feat_valid": num_distant_src_feat_valid,
+            "num_distant_update": num_distant_update,
+            "distant_update_ratio": float(num_distant_update / max(num_gaussians_distant, 1)) if num_gaussians_distant > 0 else 0.0,
+            "writeback_bg_ratio": writeback_bg_ratio,
+            "writeback_distant_ratio": writeback_distant_ratio,
+            "src_backproject_pass_count": int(out.get("_src_backproject_pass_count", 0)),
             **{k: float(v) for k, v in offset_stats.items()},
             **grad_norms,
             **timing_ms,
@@ -811,4 +846,5 @@ class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
         }
 
 
-__all__ = ["MinimalStreetForwardStage4_1"]
+__all__ = ["MinimalStreetForwardStage4_2"]
+
