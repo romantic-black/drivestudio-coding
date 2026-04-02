@@ -501,17 +501,32 @@ class MinimalStreetForwardStage4_0(MinimalStreetForwardStage3_3):
             ).permute(0, 2, 3, 1)
         multi = torch.cat([image_batch, rendered_batch], dim=-1)
         features_2d = self.image_feature_extractor(multi)
-        back_out = self.alpha_t_extractor.render_and_backproject_streaming(
-            gaussians=gaussians,
-            cameras=source_views,
-            features_2d=features_2d,
-            height=height,
-            width=width,
-            num_gaussians=num_gaussians,
-            backprojector=backprojector_override if backprojector_override is not None else self.feature_backprojector,
-            return_accumulated_weights=return_accumulated_weights,
-            return_debug_stats=True,
-        )
+        use_fused_v2 = bool(getattr(self, "use_fused_cuda_backproject_v2", False))
+        backprojector_impl = backprojector_override if backprojector_override is not None else self.feature_backprojector
+        if use_fused_v2:
+            back_out = self.alpha_t_extractor_v2.render_and_backproject_streaming_fused(
+                gaussians=gaussians,
+                cameras=source_views,
+                features_2d=features_2d,
+                height=height,
+                width=width,
+                num_gaussians=num_gaussians,
+                backprojector=backprojector_impl,
+                return_accumulated_weights=return_accumulated_weights,
+                return_debug_stats=True,
+            )
+        else:
+            back_out = self.alpha_t_extractor.render_and_backproject_streaming(
+                gaussians=gaussians,
+                cameras=source_views,
+                features_2d=features_2d,
+                height=height,
+                width=width,
+                num_gaussians=num_gaussians,
+                backprojector=backprojector_impl,
+                return_accumulated_weights=return_accumulated_weights,
+                return_debug_stats=True,
+            )
         if return_accumulated_weights:
             feat_2d_all, acc_w, bp_stats = back_out
             stats.update({f"2d_bp_{k}": float(v) for k, v in bp_stats.items()})

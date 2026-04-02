@@ -347,6 +347,8 @@ batch = {
 - **pointcloud_config**：**必需**，点云生成器配置（不再包含 AABB 与 use_bbx 开关）
   - `type`：生成器类型（"monocular" / "lidar" / "hybrid"）
   - 其余参数如 `sparsity/filter_sky/depth_consistency/downscale/...` 仍可配置
+  - `type=monocular` 时，`dynamic_filter` 为必填，动态mask键固定为 `dynamic_masks`；可选 `dynamic_recovery` 子配置启用 3D bbox 动态点回收
+- `type=hybrid` 时，单目动态过滤固定开启并使用 `dynamic_masks`，需提供 `monocular_dynamic_recovery_bbox_expand_xyz_m` / `monocular_dynamic_recovery_max_points_per_instance`
 
 ---
 
@@ -497,6 +499,12 @@ pointcloud_config = {
     'filter_sky': True,
     'depth_consistency': True,
     'downscale': 2,
+    'dynamic_filter': True,
+    'dynamic_recovery': {
+        'enable': True,
+        'bbox_expand_xyz_m': [0.3, 0.2, 0.5],
+        'max_points_per_instance': 3000,
+    },
 }
 
 dataset = MultiSceneDataset(

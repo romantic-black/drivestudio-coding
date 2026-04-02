@@ -78,6 +78,14 @@ pointcloud_config = {
     'filter_sky': True,            # 是否过滤天空区域
     'depth_consistency': True,     # 是否进行深度一致性检查
     'downscale': 2,                # 图像下采样比例
+    'dynamic_filter': True,        # 必须为 True：先用动态mask清理背景
+    # 可选：基于3D bbox回收动态点（推荐）
+    'dynamic_recovery': {
+        'enable': True,
+        'bbox_expand_xyz_m': [0.3, 0.2, 0.5],
+        'max_points_per_instance': 3000,
+        'assignment': 'first_hit',  # first_hit / nearest_center
+    },
     'crop_aabb': [[-20, -20, -20], [20, 4.8, 70]],  # 裁剪AABB
     'input_aabb': [[-20, -20, -20], [20, 4.8, 120]],  # 输入区域AABB
 }
@@ -127,11 +135,8 @@ pointcloud_config = {
     'monocular_filter_sky': True,
     'monocular_depth_consistency': True,
     'monocular_downscale': 2,
-    # 融合参数
-    'fusion_strategy': 'adaptive',           # 融合策略：merge/lidar_first/adaptive
-    'dynamic_source': 'lidar_only',          # 动态点来源：lidar_only/fuse
-    'downsample_dynamic': False,             # 是否对动态点云下采样
-    'background_downsample_method': 'uniform',  # 下采样方法：uniform/density/distance
+    'monocular_dynamic_recovery_bbox_expand_xyz_m': [0.3, 0.2, 0.5],
+    'monocular_dynamic_recovery_max_points_per_instance': 3000,
     # 通用参数
     'crop_aabb': [[-20, -20, -20], [20, 4.8, 70]],
     'input_aabb': [[-20, -20, -20], [20, 4.8, 120]],
@@ -158,6 +163,13 @@ pointcloud_config = {
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `chosen_cam_ids` | List[int] | [0] | 使用的相机ID列表 |
+| `dynamic_filter` | bool | True | 是否启用像素级动态mask过滤（当前要求为 `True`）。 |
+| `dynamic_recovery.enable` | bool | False | 是否启用基于3D bbox的动态点回收。 |
+| `dynamic_recovery.bbox_expand_xyz_m` | List[float] | None | 启用回收时必填，bbox扩张米值 `[dx,dy,dz]`。 |
+| `dynamic_recovery.max_points_per_instance` | int | None | 启用回收时必填，单实例点数上限。 |
+| `dynamic_recovery.assignment` | Literal | "first_hit" | 重叠bbox分配策略：`first_hit`/`nearest_center`。 |
+
+> 动态mask键固定为 `dynamic_masks`，不再暴露配置项。
 
 ### 混合生成器专用参数
 
@@ -169,10 +181,28 @@ pointcloud_config = {
 | | `monocular_filter_sky` | bool | True | 单目是否过滤天空 |
 | | `monocular_depth_consistency` | bool | True | 单目是否深度一致性检查 |
 | | `monocular_downscale` | int | 2 | 单目下采样比例 |
-| **融合参数** | `fusion_strategy` | Literal | "adaptive" | 融合策略：merge/lidar_first/adaptive |
-| | `dynamic_source` | Literal | "lidar_only" | 动态点来源：lidar_only/fuse |
-| | `downsample_dynamic` | bool | False | 是否对动态点云下采样 |
-| | `background_downsample_method` | Literal | "uniform" | 下采样方法：uniform/density/distance |
+| | `monocular_dynamic_recovery_enable` | bool | True | 固定开启单目3D bbox动态点回收（无需配置）。 |
+| | `monocular_dynamic_recovery_bbox_expand_xyz_m` | List[float] | None | 回收启用时必填，bbox扩张米值 |
+| | `monocular_dynamic_recovery_max_points_per_instance` | int | None | 回收启用时必填，单实例上限 |
+| | `monocular_dynamic_recovery_assignment` | Literal | "first_hit" | 固定 `first_hit`（不再暴露配置）。 |
+| **融合参数** | - | - | - | 融合策略固定：背景 merge，动态 fuse；不再暴露额外配置。 |
+
+### MultiScene：`static_instance_motion`（仅 `lidar` / `hybrid` 内 LiDAR 分支）
+
+在 [`datasets/multi_scene_dataset.py`](../../datasets/multi_scene_dataset.py) 的 `dataset.pointcloud` 下可配置（与 `DrivingDataset.get_init_objects(..., only_moving=True)` 的轨迹阈值语义对齐）：
+
+| 字段 | 说明 |
+|------|------|
+| `static_instance_motion.enable` | 是否启用：在 **段内** `frame_indices` 上根据 `instances_pose` 平移轨迹累计长度判定静止实例。 |
+| `static_instance_motion.traj_length_thresh_m` | 当 `enable=true` **必填**：累计相邻帧位移范数之和 **≤** 该阈值的实例视为静止。 |
+
+行为：
+
+- **LiDAR 分割**：静止实例不再从 background 抠入 `dynamic`（[`_separate_static_dynamic`](../../datasets/pointcloud_generators/base.py) 跳过对应 intid），框内点留在 **background**（世界坐标）。
+- **`dynamic_info`**：[`_build_dynamic_info`](../../datasets/multi_scene_dataset.py) 会排除 `metadata.static_instance_intids` 中的 intid，与点云 `dynamic` 字典一致。
+- **单目**：若启用 `dynamic_recovery.enable=true`，会输出 per-instance `dynamic`；否则仍仅有背景。`hybrid` 默认以 LiDAR 动态为主。
+
+若设置 `static_instance_motion` 块，则必须包含 `enable`；`enable=true` 时必须包含 `traj_length_thresh_m`（fast-fail）。
 
 ---
 
@@ -351,6 +381,12 @@ pointcloud_config = {
     'filter_sky': True,
     'depth_consistency': True,
     'downscale': 2,
+    'dynamic_filter': True,
+    'dynamic_recovery': {
+        'enable': True,
+        'bbox_expand_xyz_m': [0.3, 0.2, 0.5],
+        'max_points_per_instance': 3000,
+    },
     'crop_aabb': [[-20, -20, -20], [20, 4.8, 70]],
     'input_aabb': [[-20, -20, -20], [20, 4.8, 120]],
 }
@@ -407,11 +443,8 @@ pointcloud_config = {
     'monocular_filter_sky': True,
     'monocular_depth_consistency': True,
     'monocular_downscale': 2,
-    # 融合参数
-    'fusion_strategy': 'adaptive',
-    'dynamic_source': 'lidar_only',
-    'downsample_dynamic': False,
-    'background_downsample_method': 'uniform',
+    'monocular_dynamic_recovery_bbox_expand_xyz_m': [0.3, 0.2, 0.5],
+    'monocular_dynamic_recovery_max_points_per_instance': 3000,
     # 通用参数
     'crop_aabb': [[-20, -20, -20], [20, 4.8, 70]],
     'input_aabb': [[-20, -20, -20], [20, 4.8, 120]],
@@ -438,8 +471,10 @@ generator = MonocularRGBPointCloudGenerator(
     filter_sky=True,
     depth_consistency=True,
     downscale=2,
-    crop_aabb=np.array([[-20, -20, -20], [20, 4.8, 70]]),
-    input_aabb=np.array([[-20, -20, -20], [20, 4.8, 120]]),
+    dynamic_filter=True,
+    dynamic_recovery_enable=True,
+    dynamic_recovery_bbox_expand_xyz_m=[0.3, 0.2, 0.5],
+    dynamic_recovery_max_points_per_instance=3000,
     device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
 )
 
@@ -513,11 +548,8 @@ data:
     monocular_filter_sky: true
     monocular_depth_consistency: true
     monocular_downscale: 2
-    # 融合参数
-    fusion_strategy: adaptive
-    dynamic_source: lidar_only
-    downsample_dynamic: false
-    background_downsample_method: uniform
+    monocular_dynamic_recovery_bbox_expand_xyz_m: [0.3, 0.2, 0.5]
+    monocular_dynamic_recovery_max_points_per_instance: 3000
     # AABB配置
     crop_aabb: [[-20, -20, -20], [20, 4.8, 70]]
     input_aabb: [[-20, -20, -20], [20, 4.8, 120]]

@@ -234,6 +234,8 @@ model:
   feat_2d_channels: 32
   # 2D 特征下采样倍率。
   feat_2d_downscale: 1
+  # Extractor v2 fused 单视角反投影开关（默认关闭，支持 A/B 对比与回退）。
+  use_fused_cuda_backproject_v2: true
   # 参数嵌入维度。
   param_embed_dim: 48
   # offset GRU 隐状态维度。

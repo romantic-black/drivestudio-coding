@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from models.feature_extractors.alpha_t_extractor import _get_viewmat
 from models.feature_extractors import (
     AlphaTWeightExtractor,
+    AlphaTWeightExtractorV2,
     FeatureBackprojector,
     FeatureFusion,
     ImageFeatureExtractor,
@@ -169,6 +170,12 @@ class MinimalStreetForwardStage3_2d(MinimalStreetForwardStage2_1):
             feature_downscale=feat_2d_downscale,
         ).to(device)
         self.alpha_t_extractor = AlphaTWeightExtractor(
+            renderer=self.renderer,
+            sh_degree=self.sh_degree,
+            tile_size=16,
+        )
+        self.use_fused_cuda_backproject_v2 = bool(model_cfg.get("use_fused_cuda_backproject_v2", False))
+        self.alpha_t_extractor_v2 = AlphaTWeightExtractorV2(
             renderer=self.renderer,
             sh_degree=self.sh_degree,
             tile_size=16,

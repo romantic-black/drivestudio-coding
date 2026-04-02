@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from models.streetforward.minimal_trainer_stage4_1 import MinimalStreetForwardStage4_1
+from models.streetforward.minimal_trainer_stage4_0 import MinimalStreetForwardStage4_0
 from models.streetforward.minimal_trainer_stage4_2 import MinimalStreetForwardStage4_2
 from models.streetforward.node_states import NodeStateBackground, NodeStateDistant, NodeStateRigid
 
@@ -178,4 +179,90 @@ def test_one_pass_backprojection_reports_real_count():
         width=2,
     )
     assert out["src_backproject_pass_count"] == 1
+
+
+def test_stage4_0_switches_to_fused_v2_path():
+    trainer = MinimalStreetForwardStage4_0.__new__(MinimalStreetForwardStage4_0)
+    trainer.device = torch.device("cpu")
+    trainer.use_fused_cuda_backproject_v2 = True
+    trainer._perf_acc = {}
+
+    class _DummyRgbExtractor:
+        def render_rgb_only(self, *args, **kwargs):
+            return [torch.zeros(2, 2, 3)], {"num_views": 1}
+
+    class _DummyFusedExtractor:
+        def __init__(self):
+            self.called = False
+
+        def render_and_backproject_streaming_fused(self, **kwargs):
+            self.called = True
+            return torch.zeros(1, 2), {"pairs_total": 3, "pairs_after_threshold": 2}
+
+    trainer.alpha_t_extractor = _DummyRgbExtractor()
+    fused = _DummyFusedExtractor()
+    trainer.alpha_t_extractor_v2 = fused
+    trainer.feature_backprojector = SimpleNamespace(eps=1e-8)
+    trainer.image_feature_extractor = lambda x: torch.zeros(1, 2, 2, 2)
+
+    feat, acc = trainer._compute_2d_features_for_gaussians(
+        gaussians={
+            "means": torch.zeros(1, 3),
+            "quats": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+            "scales": torch.ones(1, 3),
+            "opacities": torch.ones(1),
+            "colors": torch.zeros(1, 4, 3),
+        },
+        source_views=[object()],
+        source_images=[torch.zeros(2, 2, 3)],
+        height=2,
+        width=2,
+        return_accumulated_weights=False,
+    )
+    assert fused.called is True
+    assert feat.shape == (1, 2)
+    assert acc is None
+
+
+def test_stage4_0_fused_training_path_keeps_feature_grad():
+    trainer = MinimalStreetForwardStage4_0.__new__(MinimalStreetForwardStage4_0)
+    trainer.device = torch.device("cpu")
+    trainer.use_fused_cuda_backproject_v2 = True
+    trainer._perf_acc = {}
+
+    class _DummyRgbExtractor:
+        def render_rgb_only(self, *args, **kwargs):
+            return [torch.zeros(2, 2, 3)], {"num_views": 1}
+
+    class _DummyFusedExtractor:
+        def render_and_backproject_streaming_fused(self, **kwargs):
+            feat = kwargs["features_2d"]
+            out = feat.mean(dim=(1, 2)).sum(dim=0, keepdim=True)
+            return out, {"pairs_total": 1, "pairs_after_threshold": 1}
+
+    trainer.alpha_t_extractor = _DummyRgbExtractor()
+    trainer.alpha_t_extractor_v2 = _DummyFusedExtractor()
+    trainer.feature_backprojector = SimpleNamespace(eps=1e-8)
+    scale = torch.tensor(1.0, requires_grad=True)
+    trainer.image_feature_extractor = (
+        lambda x: torch.ones(x.shape[0], x.shape[1], x.shape[2], 2, dtype=x.dtype) * scale
+    )
+
+    feat, _ = trainer._compute_2d_features_for_gaussians(
+        gaussians={
+            "means": torch.zeros(1, 3),
+            "quats": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+            "scales": torch.ones(1, 3),
+            "opacities": torch.ones(1),
+            "colors": torch.zeros(1, 4, 3),
+        },
+        source_views=[object()],
+        source_images=[torch.zeros(2, 2, 3)],
+        height=2,
+        width=2,
+        return_accumulated_weights=False,
+    )
+    loss = feat.sum()
+    loss.backward()
+    assert scale.grad is not None
 
