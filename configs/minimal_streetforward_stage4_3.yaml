@@ -1,5 +1,5 @@
 # 实验名；用于日志目录命名与配置落盘。
-output_name: minimal_sf_stage4_2_one_segment_1cam
+output_name: minimal_sf_stage4_3_one_segment_1cam
 
 # 数据源与加载总配置。
 data:
@@ -247,13 +247,17 @@ model:
   update_node_state_interval: 1
   # 仅当 scheduler_v3.model_node_state.sync_with_scheduler 为 false 或未设置时生效。
   reset_node_state_interval: 10
-  # 天空分支配置。
+  # Stage 4.3：天空半球 GS 壳层（非 cubemap；与旧 Stage3.1 cubemap 的 resolution 含义不同）。
   sky:
-    # 天空贴图分辨率。
-    resolution: 1024
-    # 天空初始值。
-    init_value: 0.5
-  # 三分支（bg/distant/rigid）参数配置。
+    # 每维概念分辨率；点数 N = resolution^2。
+    resolution: 300
+    # 世界系球半径（米）。
+    radius: 50.0
+    # 相对 segment AABB **地面面中心**的球心偏移 [x,y,z]（地面 = y_max 面中心，见 MultiSceneDataset 坐标系）。
+    center: [0.0, 0.0, 0.0]
+    # true：Fibonacci 半球（朝天空的一半，天空方向为 -Y）；false：完整 Fibonacci 球壳。
+    hemisphere: true
+  # 四分支（bg/distant/sky/rigid）参数配置。
   branches:
     # 背景分支。
     bg:
@@ -301,6 +305,37 @@ model:
 
     # 远景分支。
     distant:
+      src_backproject_support_min: 0
+      enable_selective_update: false
+      freeze_means: true
+      init:
+        scale_init:
+          mode: isotropic
+          isotropic_log_value: -1.90
+          knn_k: 3
+          knn_log_scale_bias: 0.0
+        opacity_init: 0.05
+      limits:
+        offset_max: 0.02
+        scale_max: 0.08
+        omega_max: 0.01
+        opacity_max: 0.05
+        sh_dc_max: 0.08
+        sh_rest_max: 0.015
+      eta:
+        means: 0.2
+        scales: 0.7
+        opacity: 0.5
+        sh_dc: 0.8
+        sh_rest: 0.4
+      mlp:
+        hidden_dim: 64
+        use_3d_feat: false
+        use_2d_feat: true
+        freeze_quat: true
+
+    # 天空半球 GS（2D-only + support；means/quat 冻结由 freeze_means / mlp.freeze_quat 控制）。
+    sky:
       src_backproject_support_min: 0
       enable_selective_update: false
       freeze_means: true

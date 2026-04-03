@@ -86,11 +86,34 @@ class NodeStateDistant:
         )
 
 
+@dataclass
+class NodeStateSky:
+    """Hemisphere sky shell Gaussians (world coordinates)."""
+
+    means: torch.Tensor
+    scales_log: torch.Tensor
+    quats: torch.Tensor
+    opacity_logit: torch.Tensor
+    sh_dc: torch.Tensor
+    sh_rest: torch.Tensor
+
+    def detach_clone(self) -> "NodeStateSky":
+        return NodeStateSky(
+            means=self.means.detach().clone(),
+            scales_log=self.scales_log.detach().clone(),
+            quats=self.quats.detach().clone(),
+            opacity_logit=self.opacity_logit.detach().clone(),
+            sh_dc=self.sh_dc.detach().clone(),
+            sh_rest=self.sh_rest.detach().clone(),
+        )
+
+
 NodeState = NodeStateBackground
 
 __all__ = [
     "NodeStateBackground",
     "NodeStateRigid",
     "NodeStateDistant",
+    "NodeStateSky",
     "NodeState",
 ]

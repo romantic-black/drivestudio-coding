@@ -280,13 +280,19 @@ class MinimalStreetForwardStage3_3(MinimalStreetForwardStage3_2):
         feat_head: torch.Tensor,
         *,
         limits: Dict[str, float],
-        mlp_offset_pos: nn.Module,
+        mlp_offset_pos: Optional[nn.Module],
         mlp_conv: nn.Module,
         mlp_opacity: nn.Module,
         gaussion_decoder: nn.Module,
         freeze_quat: bool,
+        omit_position_offset: bool = False,
     ) -> Dict[str, torch.Tensor]:
-        offset_pos = limits["offset_max"] * torch.tanh(mlp_offset_pos(feat_head))
+        if omit_position_offset:
+            offset_pos = torch.zeros(feat_head.shape[0], 3, device=feat_head.device, dtype=feat_head.dtype)
+        else:
+            if mlp_offset_pos is None:
+                raise ValueError("mlp_offset_pos is required when omit_position_offset is False.")
+            offset_pos = limits["offset_max"] * torch.tanh(mlp_offset_pos(feat_head))
         scales_and_omega = mlp_conv(feat_head)
         offset_scales_raw, offset_omega_raw = scales_and_omega.split([3, 3], dim=-1)
         offset_scales = limits["scale_max"] * torch.tanh(offset_scales_raw)

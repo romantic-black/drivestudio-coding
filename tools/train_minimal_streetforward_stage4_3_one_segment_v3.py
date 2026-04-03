@@ -1,10 +1,10 @@
 """
-Minimal StreetForward Stage 4.2 — 单段训练：Scheduler v3 + MultiSceneDatasetV2。
+Minimal StreetForward Stage 4.3 — 单段训练：Scheduler v3 + MultiSceneDatasetV2。
 
 默认配置：
   conda run -n drivestudio-new env PYTHONPATH=/root/drivestudio-coding \
-    python tools/train_minimal_streetforward_stage4_2_one_segment_v3.py \
-      --config_file configs/minimal_streetforward_stage4_2.yaml
+    python tools/train_minimal_streetforward_stage4_3_one_segment_v3.py \
+      --config_file configs/minimal_streetforward_stage4_3.yaml
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from pytorch_msssim import SSIM
 from torchmetrics.image import PeakSignalNoiseRatio
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
-from models.streetforward.minimal_trainer_stage4_2 import MinimalStreetForwardStage4_2
+from models.streetforward.minimal_trainer_stage4_3 import MinimalStreetForwardStage4_3
 from tools.train_minimal_streetforward_stage1_1 import (
     _compute_metrics,
     _open_metrics_history,
@@ -62,7 +62,7 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 current_time = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
-CKPT_PREFIX = "minimal_sf_stage4_2_one_segment_v3"
+CKPT_PREFIX = "minimal_sf_stage4_3_one_segment_v3"
 
 
 def main() -> None:
@@ -70,7 +70,7 @@ def main() -> None:
     parser.add_argument(
         "--config_file",
         type=str,
-        default="configs/minimal_streetforward_stage4_2.yaml",
+        default="configs/minimal_streetforward_stage4_3.yaml",
         help="Path to config YAML.",
     )
     parser.add_argument("--max_steps", type=int, default=0)
@@ -136,7 +136,7 @@ def main() -> None:
     diag_cfg = _parse_diagnostics_cfg(cfg)
     perf_cfg = _parse_perf_cfg(cfg)
 
-    model = MinimalStreetForwardStage4_2(config=cfg, device=device)
+    model = MinimalStreetForwardStage4_3(config=cfg, device=device)
     model.train()
     _load_init_checkpoint(
         args.init_checkpoint,
@@ -156,6 +156,7 @@ def main() -> None:
     sum_num_gaussians_bg = 0.0
     sum_num_gaussians_distant = 0.0
     sum_num_gaussians_rigid = 0.0
+    sum_num_gaussians_sky = 0.0
     sum_step_time_ms = 0.0
     step_time_ms_hist: List[float] = []
     peak_mem_bytes = 0
@@ -254,19 +255,21 @@ def main() -> None:
             sum_num_gaussians_bg += int(result.get("num_gaussians_bg", 0))
             sum_num_gaussians_distant += int(result.get("num_gaussians_distant", 0))
             sum_num_gaussians_rigid += int(result.get("num_gaussians_rigid", 0))
+            sum_num_gaussians_sky += int(result.get("num_gaussians_sky", 0))
 
             block_accum["loss_sum"] = float(block_accum.get("loss_sum", 0.0)) + float(loss_val)
             block_accum["count"] = int(block_accum.get("count", 0)) + 1
 
             if step % log_interval == 0:
                 logger.info(
-                    "Step %s: loss=%.6f views=%d rigid_update=%d bg_update=%d distant_update=%d onepass=%d",
+                    "Step %s: loss=%.6f views=%d rigid_update=%d bg_update=%d distant_update=%d sky_update=%d onepass=%d",
                     step,
                     loss_val,
                     num_views,
                     int(result.get("num_rigid_update", 0)),
                     int(result.get("num_bg_update", 0)),
                     int(result.get("num_distant_update", 0)),
+                    int(result.get("num_sky_update", 0)),
                     int(result.get("src_backproject_pass_count", 0)),
                 )
                 if perf_cfg["enable"]:
@@ -383,13 +386,19 @@ def main() -> None:
                     "distant_update_ratio": float(result.get("distant_update_ratio", 0.0)),
                     "writeback_bg_ratio": float(result.get("writeback_bg_ratio", 0.0)),
                     "writeback_distant_ratio": float(result.get("writeback_distant_ratio", 0.0)),
+                    "num_gaussians_sky": int(result.get("num_gaussians_sky", 0)),
+                    "num_sky_src_feat_valid": int(result.get("num_sky_src_feat_valid", 0)),
+                    "num_sky_update": int(result.get("num_sky_update", 0)),
+                    "sky_update_ratio": float(result.get("sky_update_ratio", 0.0)),
                     "src_backproject_pass_count": int(result.get("src_backproject_pass_count", 0)),
                     "hidden_norm_bg_mean": float(result.get("hidden_norm_bg_mean", 0.0)),
                     "hidden_norm_distant_mean": float(result.get("hidden_norm_distant_mean", 0.0)),
                     "hidden_norm_rigid_mean": float(result.get("hidden_norm_rigid_mean", 0.0)),
+                    "hidden_norm_sky_mean": float(result.get("hidden_norm_sky_mean", 0.0)),
                     "grad_norm_bg": float(result.get("grad_norm_bg", 0.0)),
                     "grad_norm_distant": float(result.get("grad_norm_distant", 0.0)),
                     "grad_norm_rigid": float(result.get("grad_norm_rigid", 0.0)),
+                    "grad_norm_sky": float(result.get("grad_norm_sky", 0.0)),
                     "step_time_ms": float(step_time_ms),
                     "forward_ms": float(result.get("forward_ms", 0.0)),
                     "backward_ms": float(result.get("backward_ms", 0.0)),
@@ -420,6 +429,7 @@ def main() -> None:
                     writer.add_scalar("train/mse", float(mse_val), step)
                     writer.add_scalar("train/num_bg_update", int(result.get("num_bg_update", 0)), step)
                     writer.add_scalar("train/num_distant_update", int(result.get("num_distant_update", 0)), step)
+                    writer.add_scalar("train/num_gaussians_sky", int(result.get("num_gaussians_sky", 0)), step)
                     writer.add_scalar("train/src_backproject_pass_count", int(result.get("src_backproject_pass_count", 0)), step)
                     for k, v in metric_vals.items():
                         writer.add_scalar(f"train/{k}", float(v), step)
@@ -468,6 +478,7 @@ def main() -> None:
                             "avg_num_gaussians_bg": sum_num_gaussians_bg / max(total_steps, 1),
                             "avg_num_gaussians_rigid": sum_num_gaussians_rigid / max(total_steps, 1),
                             "avg_num_gaussians_distant": sum_num_gaussians_distant / max(total_steps, 1),
+                            "avg_num_gaussians_sky": sum_num_gaussians_sky / max(total_steps, 1),
                         },
                         "profiling": {
                             "avg_step_time_ms": float(sum_step_time_ms / max(total_steps, 1)),

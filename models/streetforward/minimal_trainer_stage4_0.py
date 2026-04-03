@@ -34,6 +34,18 @@ from models.streetforward.node_states import NodeStateBackground, NodeStateDista
 logger = logging.getLogger(__name__)
 
 
+def _append_backward_pair(
+    render_tensors: List[torch.Tensor],
+    grad_tensors: List[torch.Tensor],
+    render_tensor: torch.Tensor,
+    grad_tensor: torch.Tensor,
+) -> None:
+    """Only pair proxy grads with render tensors that participate in autograd (e.g. skip frozen sky means/quats)."""
+    if render_tensor.requires_grad:
+        render_tensors.append(render_tensor)
+        grad_tensors.append(grad_tensor)
+
+
 def _merge_params_bg_rigid_distant(
     proxies_bg: Dict[str, torch.Tensor],
     proxies_rigid_world: Optional[Dict[str, torch.Tensor]],
@@ -70,81 +82,173 @@ def _backward_to_render_params_bg_rigid_distant(
     def _grad_or_zero(t: torch.Tensor) -> torch.Tensor:
         return t.grad if t.grad is not None else torch.zeros_like(t)
 
-    render_tensors: List[torch.Tensor] = [
-        render_params_bg["means_r"],
-        render_params_bg["scales_r"],
-        render_params_bg["quats_r"],
-        render_params_bg["opacities_r"],
-        render_params_bg["colors_r"],
-    ]
-    grad_tensors: List[torch.Tensor] = [
-        _grad_or_zero(proxies_bg["means_p"]),
-        _grad_or_zero(proxies_bg["scales_p"]),
-        _grad_or_zero(proxies_bg["quats_p"]),
-        _grad_or_zero(proxies_bg["opacities_p"]),
-        _grad_or_zero(proxies_bg["colors_p"]),
-    ]
+    render_tensors: List[torch.Tensor] = []
+    grad_tensors: List[torch.Tensor] = []
+    _append_backward_pair(render_tensors, grad_tensors, render_params_bg["means_r"], _grad_or_zero(proxies_bg["means_p"]))
+    _append_backward_pair(render_tensors, grad_tensors, render_params_bg["scales_r"], _grad_or_zero(proxies_bg["scales_p"]))
+    _append_backward_pair(render_tensors, grad_tensors, render_params_bg["quats_r"], _grad_or_zero(proxies_bg["quats_p"]))
+    _append_backward_pair(render_tensors, grad_tensors, render_params_bg["opacities_r"], _grad_or_zero(proxies_bg["opacities_p"]))
+    _append_backward_pair(render_tensors, grad_tensors, render_params_bg["colors_r"], _grad_or_zero(proxies_bg["colors_p"]))
     if rigid_world_proxy_pairs is not None:
         if render_params_rigid_world is not None or proxies_rigid_world is not None:
             raise ValueError("Use either rigid_world_proxy_pairs or single rigid world/proxy pair, not both.")
         for rp_w, px_w in rigid_world_proxy_pairs:
-            render_tensors.extend(
-                [
-                    rp_w["means_r"],
-                    rp_w["scales_r"],
-                    rp_w["quats_r"],
-                    rp_w["opacities_r"],
-                    rp_w["colors_r"],
-                ]
-            )
-            grad_tensors.extend(
-                [
-                    _grad_or_zero(px_w["means_p"]),
-                    _grad_or_zero(px_w["scales_p"]),
-                    _grad_or_zero(px_w["quats_p"]),
-                    _grad_or_zero(px_w["opacities_p"]),
-                    _grad_or_zero(px_w["colors_p"]),
-                ]
-            )
+            _append_backward_pair(render_tensors, grad_tensors, rp_w["means_r"], _grad_or_zero(px_w["means_p"]))
+            _append_backward_pair(render_tensors, grad_tensors, rp_w["scales_r"], _grad_or_zero(px_w["scales_p"]))
+            _append_backward_pair(render_tensors, grad_tensors, rp_w["quats_r"], _grad_or_zero(px_w["quats_p"]))
+            _append_backward_pair(render_tensors, grad_tensors, rp_w["opacities_r"], _grad_or_zero(px_w["opacities_p"]))
+            _append_backward_pair(render_tensors, grad_tensors, rp_w["colors_r"], _grad_or_zero(px_w["colors_p"]))
     elif render_params_rigid_world is not None and proxies_rigid_world is not None:
-        render_tensors.extend(
-            [
-                render_params_rigid_world["means_r"],
-                render_params_rigid_world["scales_r"],
-                render_params_rigid_world["quats_r"],
-                render_params_rigid_world["opacities_r"],
-                render_params_rigid_world["colors_r"],
-            ]
+        _append_backward_pair(
+            render_tensors, grad_tensors, render_params_rigid_world["means_r"], _grad_or_zero(proxies_rigid_world["means_p"])
         )
-        grad_tensors.extend(
-            [
-                _grad_or_zero(proxies_rigid_world["means_p"]),
-                _grad_or_zero(proxies_rigid_world["scales_p"]),
-                _grad_or_zero(proxies_rigid_world["quats_p"]),
-                _grad_or_zero(proxies_rigid_world["opacities_p"]),
-                _grad_or_zero(proxies_rigid_world["colors_p"]),
-            ]
+        _append_backward_pair(
+            render_tensors, grad_tensors, render_params_rigid_world["scales_r"], _grad_or_zero(proxies_rigid_world["scales_p"])
+        )
+        _append_backward_pair(
+            render_tensors, grad_tensors, render_params_rigid_world["quats_r"], _grad_or_zero(proxies_rigid_world["quats_p"])
+        )
+        _append_backward_pair(
+            render_tensors,
+            grad_tensors,
+            render_params_rigid_world["opacities_r"],
+            _grad_or_zero(proxies_rigid_world["opacities_p"]),
+        )
+        _append_backward_pair(
+            render_tensors, grad_tensors, render_params_rigid_world["colors_r"], _grad_or_zero(proxies_rigid_world["colors_p"])
         )
     if render_params_distant is not None and proxies_distant is not None:
-        render_tensors.extend(
-            [
-                render_params_distant["means_r"],
-                render_params_distant["scales_r"],
-                render_params_distant["quats_r"],
-                render_params_distant["opacities_r"],
-                render_params_distant["colors_r"],
-            ]
+        _append_backward_pair(
+            render_tensors, grad_tensors, render_params_distant["means_r"], _grad_or_zero(proxies_distant["means_p"])
         )
-        grad_tensors.extend(
-            [
-                _grad_or_zero(proxies_distant["means_p"]),
-                _grad_or_zero(proxies_distant["scales_p"]),
-                _grad_or_zero(proxies_distant["quats_p"]),
-                _grad_or_zero(proxies_distant["opacities_p"]),
-                _grad_or_zero(proxies_distant["colors_p"]),
-            ]
+        _append_backward_pair(
+            render_tensors, grad_tensors, render_params_distant["scales_r"], _grad_or_zero(proxies_distant["scales_p"])
         )
-    torch.autograd.backward(tensors=render_tensors, grad_tensors=grad_tensors)
+        _append_backward_pair(
+            render_tensors, grad_tensors, render_params_distant["quats_r"], _grad_or_zero(proxies_distant["quats_p"])
+        )
+        _append_backward_pair(
+            render_tensors,
+            grad_tensors,
+            render_params_distant["opacities_r"],
+            _grad_or_zero(proxies_distant["opacities_p"]),
+        )
+        _append_backward_pair(
+            render_tensors, grad_tensors, render_params_distant["colors_r"], _grad_or_zero(proxies_distant["colors_p"])
+        )
+    if render_tensors:
+        torch.autograd.backward(tensors=render_tensors, grad_tensors=grad_tensors)
+
+
+def _merge_params_sky_only(proxies_sky: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    return {
+        "means_r": proxies_sky["means_p"],
+        "scales_r": proxies_sky["scales_p"],
+        "quats_r": proxies_sky["quats_p"],
+        "opacities_r": proxies_sky["opacities_p"],
+        "colors_r": proxies_sky["colors_p"],
+    }
+
+
+def _tensor_merge_sky_only(render_params_sky: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    return {
+        "means_r": render_params_sky["means_r"],
+        "scales_r": render_params_sky["scales_r"],
+        "quats_r": render_params_sky["quats_r"],
+        "opacities_r": render_params_sky["opacities_r"],
+        "colors_r": render_params_sky["colors_r"],
+    }
+
+
+def _backward_to_render_params_bg_rigid_distant_sky(
+    render_params_bg: Dict[str, torch.Tensor],
+    proxies_bg: Dict[str, torch.Tensor],
+    render_params_rigid_world: Optional[Dict[str, torch.Tensor]],
+    proxies_rigid_world: Optional[Dict[str, torch.Tensor]],
+    render_params_distant: Optional[Dict[str, torch.Tensor]],
+    proxies_distant: Optional[Dict[str, torch.Tensor]],
+    render_params_sky: Optional[Dict[str, torch.Tensor]],
+    proxies_sky: Optional[Dict[str, torch.Tensor]],
+    rigid_world_proxy_pairs: Optional[List[Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]]] = None,
+) -> None:
+    def _grad_or_zero(t: torch.Tensor) -> torch.Tensor:
+        return t.grad if t.grad is not None else torch.zeros_like(t)
+
+    render_tensors: List[torch.Tensor] = []
+    grad_tensors: List[torch.Tensor] = []
+    _append_backward_pair(render_tensors, grad_tensors, render_params_bg["means_r"], _grad_or_zero(proxies_bg["means_p"]))
+    _append_backward_pair(render_tensors, grad_tensors, render_params_bg["scales_r"], _grad_or_zero(proxies_bg["scales_p"]))
+    _append_backward_pair(render_tensors, grad_tensors, render_params_bg["quats_r"], _grad_or_zero(proxies_bg["quats_p"]))
+    _append_backward_pair(render_tensors, grad_tensors, render_params_bg["opacities_r"], _grad_or_zero(proxies_bg["opacities_p"]))
+    _append_backward_pair(render_tensors, grad_tensors, render_params_bg["colors_r"], _grad_or_zero(proxies_bg["colors_p"]))
+    if rigid_world_proxy_pairs is not None:
+        if render_params_rigid_world is not None or proxies_rigid_world is not None:
+            raise ValueError("Use either rigid_world_proxy_pairs or single rigid world/proxy pair, not both.")
+        for rp_w, px_w in rigid_world_proxy_pairs:
+            _append_backward_pair(render_tensors, grad_tensors, rp_w["means_r"], _grad_or_zero(px_w["means_p"]))
+            _append_backward_pair(render_tensors, grad_tensors, rp_w["scales_r"], _grad_or_zero(px_w["scales_p"]))
+            _append_backward_pair(render_tensors, grad_tensors, rp_w["quats_r"], _grad_or_zero(px_w["quats_p"]))
+            _append_backward_pair(render_tensors, grad_tensors, rp_w["opacities_r"], _grad_or_zero(px_w["opacities_p"]))
+            _append_backward_pair(render_tensors, grad_tensors, rp_w["colors_r"], _grad_or_zero(px_w["colors_p"]))
+    elif render_params_rigid_world is not None and proxies_rigid_world is not None:
+        _append_backward_pair(
+            render_tensors, grad_tensors, render_params_rigid_world["means_r"], _grad_or_zero(proxies_rigid_world["means_p"])
+        )
+        _append_backward_pair(
+            render_tensors, grad_tensors, render_params_rigid_world["scales_r"], _grad_or_zero(proxies_rigid_world["scales_p"])
+        )
+        _append_backward_pair(
+            render_tensors, grad_tensors, render_params_rigid_world["quats_r"], _grad_or_zero(proxies_rigid_world["quats_p"])
+        )
+        _append_backward_pair(
+            render_tensors,
+            grad_tensors,
+            render_params_rigid_world["opacities_r"],
+            _grad_or_zero(proxies_rigid_world["opacities_p"]),
+        )
+        _append_backward_pair(
+            render_tensors, grad_tensors, render_params_rigid_world["colors_r"], _grad_or_zero(proxies_rigid_world["colors_p"])
+        )
+    if render_params_distant is not None and proxies_distant is not None:
+        _append_backward_pair(
+            render_tensors, grad_tensors, render_params_distant["means_r"], _grad_or_zero(proxies_distant["means_p"])
+        )
+        _append_backward_pair(
+            render_tensors, grad_tensors, render_params_distant["scales_r"], _grad_or_zero(proxies_distant["scales_p"])
+        )
+        _append_backward_pair(
+            render_tensors, grad_tensors, render_params_distant["quats_r"], _grad_or_zero(proxies_distant["quats_p"])
+        )
+        _append_backward_pair(
+            render_tensors,
+            grad_tensors,
+            render_params_distant["opacities_r"],
+            _grad_or_zero(proxies_distant["opacities_p"]),
+        )
+        _append_backward_pair(
+            render_tensors, grad_tensors, render_params_distant["colors_r"], _grad_or_zero(proxies_distant["colors_p"])
+        )
+    if render_params_sky is not None and proxies_sky is not None:
+        _append_backward_pair(
+            render_tensors, grad_tensors, render_params_sky["means_r"], _grad_or_zero(proxies_sky["means_p"])
+        )
+        _append_backward_pair(
+            render_tensors, grad_tensors, render_params_sky["scales_r"], _grad_or_zero(proxies_sky["scales_p"])
+        )
+        _append_backward_pair(
+            render_tensors, grad_tensors, render_params_sky["quats_r"], _grad_or_zero(proxies_sky["quats_p"])
+        )
+        _append_backward_pair(
+            render_tensors,
+            grad_tensors,
+            render_params_sky["opacities_r"],
+            _grad_or_zero(proxies_sky["opacities_p"]),
+        )
+        _append_backward_pair(
+            render_tensors, grad_tensors, render_params_sky["colors_r"], _grad_or_zero(proxies_sky["colors_p"])
+        )
+    if render_tensors:
+        torch.autograd.backward(tensors=render_tensors, grad_tensors=grad_tensors)
 
 
 class MinimalStreetForwardStage4_0(MinimalStreetForwardStage3_3):
