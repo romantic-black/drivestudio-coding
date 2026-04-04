@@ -4,6 +4,10 @@
 
 > **类与入口**：`MinimalStreetForwardStage4_2`；继承链 `4_2→4_1→4_0→3_3→3_2d→…→1_1`；脚本 `tools/train_minimal_streetforward_stage4_2.py`，配置示例 `configs/minimal_streetforward_stage4_2.yaml`。
 
+<a id="stage-43-sky-gs"></a>
+
+**Stage 4.3（Sky GS，可选主线）**：`MinimalStreetForwardStage4_3`（`models/streetforward/minimal_trainer_stage4_3.py`）；配置 `configs/minimal_streetforward_stage4_3.yaml`；入口 `tools/train_minimal_streetforward_stage4_3.py` 与 `tools/train_minimal_streetforward_stage4_3_one_segment_v3.py`。天空几何与 [MultiSceneDataset 坐标系](../dataloader/MultiSceneDataset_Usage.md)一致（**y 向下为正**，球心锚在 **y_max 面中心**，半球朝 **-Y**）。相对 4.2：用半球 Fibonacci sky 高斯替代 cubemap；one-pass 在 `bg|distant|rigid@S` 后追加 sky；渲染为场景 pass（bg+distant+rigid）与 sky pass 合成，`pred + rgb_sky * (1 - acc_scene)`。
+
 ## 目录（Canonical 优先）
 
 **Minimal Stage 4.2（主线）**
@@ -27,7 +31,7 @@
 6. [数据结构详解](#数据结构详解)
 7. [关键组件说明](#关键组件说明)
 8. [梯度反向传播机制](#梯度反向传播机制)
-9. [天空分支（Stage 3.1）](#天空分支stage-31)
+9. [天空分支（Stage 3.1 与 Stage 4.3）](#天空分支stage-31-与-stage-43)
 10. [Minimal Stage 3.3（bg/distant 解耦）](#minimal-stage-3-3-bg-distant)
 
 ---
@@ -2256,11 +2260,25 @@ log_images: False                # 是否保存渲染图像（节省GPU内存）
 
 ---
 
-## 天空分支（Stage 3.1）
+<a id="天空分支stage-31-与-stage-43"></a>
 
-本节将 [StreetForward_Sky_Model_Design.md](StreetForward_Sky_Model_Design.md) 的核心要点并入本文档，用于说明 **Stage 3.1（天空）** 如何与 StreetForward 的渲染与训练流程对接。
+## 天空分支（Stage 3.1 神经天空与 Stage 4.3 Sky GS）
 
-### 1. 输入与数据契约（viewdirs / sky_mask）
+合成 **始终是**「场景高斯先渲染，再在透射区域补天空」：
+
+\[
+\text{rgb\_composite} = \text{rgb\_scene} + \text{rgb\_sky} \cdot (1 - \mathrm{acc\_scene})
+\]
+
+其中 `acc_scene` 为 **场景 pass**（bg + distant + rigid，**不含** sky 高斯）的累积不透明度。差异只在 **`rgb_sky` 从何而来**：Stage 3.1 用 **神经 `sky_model(viewdirs)`**；`MinimalStreetForwardStage4_3` 用 **半球 shell 上的 3DGS 再渲染一层**（无 cubemap、无 `sky_model`——`__init__` 会删除 `sky_model` 模块）。实现上 Stage 4.3 用 `_composite_sky_gs`（`minimal_trainer_stage4_3.py`），与 Stage 3.1 的 `_composite_sky`（`minimal_trainer_stage3_1.py`）公式一致，仅 `rgb_sky` 来源不同。
+
+---
+
+### Stage 3.1：神经天空（`sky_model`）
+
+本节与 [StreetForward_Sky_Model_Design.md](StreetForward_Sky_Model_Design.md) 一致，说明 **Stage 3.1** 如何把 cubemap/MLP 天空接到 Minimal 管线（`MinimalStreetForwardStage3_1` 起）。
+
+#### 1. 输入与数据契约（viewdirs / sky_mask）
 
 - **viewdirs**：
   - 来源：`datasets/base/pixel_source.py:get_rays()`（MultiSceneDataset 在组 batch 时从 `image_infos['viewdirs']` 收集）。
@@ -2268,12 +2286,12 @@ log_images: False                # 是否保存渲染图像（节省GPU内存）
   - 语义：世界坐标系（seg0），单位向量。
   - **强约束**：viewdirs 必须与对应 `gt_image`/渲染分辨率一致；若分辨率不一致，应在数据侧/转换阶段用 `get_rays` 重算，而不是在 trainer 内插值 resize。
 
-- **sky_mask（可选）**：
+- **sky_mask（训练损失）**：
   - 形状：`[H, W]`（batch `[V, H, W]`）。
   - 约定：**`1=天空`，`0=非天空`**（float 0/1）；由 `MultiSceneDataset` 根据 `data.sky_mask_semantics` 从 loader 归一化。
-  - 用途：可用于 loss 加权（例如仅天空区域更强监督 sky）；non-sky 区域权重为 `1 - sky_mask`。
+  - 用途：mask 项将累积不透明度与 `(1 - sky_mask)` 等对齐；详见各 Stage 的 `forward` 内损失实现。
 
-### 2. 天空模型接口与坐标系约定
+#### 2. 天空模型接口与坐标系约定
 
 - **接口**：
   - 输入：`image_infos = {'viewdirs': viewdirs}`，其中 `viewdirs` shape 可为 `(H,W,3)` 或 batched `(B,H,W,3)`。
@@ -2284,31 +2302,71 @@ log_images: False                # 是否保存渲染图像（节省GPU内存）
   - 若使用 cubemap + nvdiffrast `dr.texture`：需按 OpenGL cubemap convention 采样方向。
     - 常用变换：`to_opengl: (x,y,z) -> (x, z, -y)`（与 EnvLight 一致），再进行 cubemap 采样。
 
-### 3. 合成公式与训练（单次 backward）
+#### 3. 合成与训练（单次 backward）
 
-Stage 3.1 的核心是把天空作为“未被高斯遮挡区域”的补全项：
+- 场景 pass：`rgb_scene`, `acc`（来自合并后的 bg/distant/rigid 代理参数渲染）。
+- 天空：`rgb_sky = sky_model(...)`（仅依赖 viewdirs）。
+- `rgb_composite = rgb_scene + rgb_sky * (1 - opacity)`（`opacity` 与 `acc_scene` 一致；实现中会对 `opacity` 做 `clamp` 与维度归一）。
 
-- 高斯渲染得到：`rgb_gaussians` 与 `opacity`（累积不透明度）
-- 天空渲染得到：`rgb_sky`（仅依赖 viewdirs）
-- 合成：
-  - `rgb_composite = rgb_gaussians + rgb_sky * (1 - opacity)`
+梯度经 `loss.backward()` 同时到达高斯分支与 `sky_model` 参数。
 
-训练时对 `rgb_composite` 与 `gt_image` 计算 loss（如 L1/L2），并执行一次 `loss.backward()`，梯度同时更新：
+#### 4. 多视角 batch 化（建议）
 
-- 高斯分支（proxy → render_params → offsets → 网络参数）
-- 天空分支（sky_model 参数）
-
-### 4. 多视角（multi-view）实现建议
-
-当一次迭代包含多个 target views 时，建议将 sky 采样 **batch 化**：
-
-- stack target viewdirs 为 `(T, H, W, 3)`
-- 一次 sky forward 得到 `(T, H, W, 3)`
-- 与 `(T, H, W, 3)` 的 `pred_rgbs` / `(T, H, W)` 的 `opacity` 一次性合成
-
-这样可减少重复的 `dr.texture` launch 与 Python 循环开销。
+当一次迭代包含多个 target views 时，可将 viewdirs stack 为 `(T, H, W, 3)`，一次 `sky_model` forward 得到 `(T, H, W, 3)`，再与场景渲染结果合成，减少循环与 kernel 启动开销。
 
 ---
+
+### Stage 4.3：Sky GS 节点（`NodeStateSky`，两 pass 渲染）
+
+**类**：`MinimalStreetForwardStage4_3`（`models/streetforward/minimal_trainer_stage4_3.py`），继承 `MinimalStreetForwardStage4_2`。天空几何与 [引言 Stage 4.3](#stage-43-sky-gs) 及 [MultiSceneDataset 坐标系](../dataloader/MultiSceneDataset_Usage.md) 一致（**y 向下为正**，shell 基准与 `segment_aabb` 对齐，`up` 使用 `sky_shell_init.SKY_UP_MULTISCENE`）。
+
+#### 1. 配置（fast-fail）
+
+- **`model.sky`（几何，与 branches 并列）**：`resolution`（Fibonacci 点数）、`radius`、`center`（相对 `sky_base_from_aabb` 的偏移，长度 3）、`hemisphere`（是否仅半球）。
+- **`model.branches.sky`**：`init` / `limits` / `eta` / `mlp` / `freeze_means` / `src_backproject_support_min` / `enable_selective_update`（与 bg/distant 同结构解析）。
+- **代码强制**：`mlp.use_3d_feat=false`，`mlp.use_2d_feat=true`，`freeze_means=true`，`mlp.freeze_quat=true`（固定 shell 上点的位置与朝向；偏移里位置项被置零，见下）。
+
+#### 2. 初始化：`NodeStateSky`
+
+- `_get_or_init_node_state_sky`：`sky_base_from_aabb(self.bbx_min, self.bbx_max) + sky_center_offset` 为球心锚点，`fibonacci_shell_means(..., hemisphere=..., up=SKY_UP_MULTISCENE)` 铺点；尺度按 `branches.sky.init`；`quats` identity；`sh` 由常数灰经 `_rgb_to_sh` 初始化。
+- 每 `(scene_id, segment_id)` 缓存在 `node_states_sky`；`h_cache_sky` 存 sky 分支 GRU 隐状态。
+
+#### 3. One-pass 2D 反投影（含 sky）
+
+- `_compute_2d_features_all_branches_once` 将 **`cat(bg, distant, rigid@S, sky)`** 拼成 `gaussians_all`，**一次** `_compute_2d_features_for_gaussians`，`FeatureBackprojector(..., weight_threshold=0.0)`，再按区间切出 `feat_2d_sky`、`acc_w_sky`。
+- **支持度**：`mask_src_feat_valid_sky = (acc_w_sky > sky_src_backproject_support_min)`；`mask_update_sky = mask_src_feat_valid_sky & mask_any_tgt_sky`。当前 `_build_any_target_mask_static` 在 selective 打开时仍 **全 1**（与 Stage 4.2 bg/distant 相同占位语义）；sky 若将来要 per-point target 可见性，注释中指向专用 `_build_sky_any_target_mask`。
+
+#### 4. 特征 → offsets（无位置头）
+
+- `feat_2d_sky` → `sky_feat_proj` → 与 **共用** GRU 主干（`mlp_params_embed`、`gru_*`、`gru_to_head` 等与 bg 同源）→ `_predict_offsets_gru_sky_masked`。
+- `_predict_offsets_with_heads(..., mlp_offset_pos=None, omit_position_offset=True)`：仅用 **`mlp_conv_sky` / `mlp_opacity_sky` / `gaussion_decoder_sky`** 预测尺度/不透明度/SH；**不**预测位置偏移。
+- `mask_update_sky` 非空时：对 offsets 与 `h_new` 做 **full gate**（与 distant masked 同类：无支持点则 offsets 置零、`offset_quat`→identity、`h` 保持）。
+
+#### 5. 渲染参数与冻结几何
+
+- `_render_params_from_offsets_sky`：`means_r = node_state_sky.means + offsets["offset_pos"] * 0.0`（位置不参与训练位移）；`quats_r` 仍走 `quat_multiply`，配合 `freeze_quat` 与零初值保持固定。
+- 因而 proxy 反传时 **`means_r` / `quats_r` 可无 `requires_grad`**；`minimal_trainer_stage4_0._backward_to_render_params_bg_rigid_distant_sky` 内 `_append_backward_pair` **仅当 `render_tensor.requires_grad` 为真** 才加入 sky 的 mean/quat 等对，避免对冻结张量做无效 backward 配对。
+
+#### 6. 两 pass 合成（每 target）
+
+1. **Pass A（场景）**：`_merge_params_bg_rigid_distant(proxies_bg, proxies_rigid, proxies_distant)` → `_render_single_view`（或 multi-view 路径）→ `pred_rgb`, `acc`（**仅**场景高斯）。
+2. **Pass B（sky）**：`_merge_params_sky_only(proxies_sky)` 或 eval 时 `_tensor_merge_sky_only(render_params_sky)`（`minimal_trainer_stage4_0`）→ 仅 sky 参数再 `_render_single_view` → `rgb_sky`。
+3. **`_composite_sky_gs(pred_rgb, acc, rgb_sky)`** → 最终 `pred_rgb`。
+
+`src_backproject_pass_count` 在 4.3 仍为 **1**（2D 反投影只跑一趟；「两 pass」指 **渲染** 上场景与 sky 各一次 rasterize）。
+
+#### 7. 损失与写回
+
+- **SSIM**：Stage 4.3 训练路径对 `compute_ssim_loss_masked` 传入 **`sky_mask=None`**（全图结构项）；**mask BCE** 等仍使用 target 的 `sky_mask`（见 `forward` 内循环）。
+- **写回**：`_update_node_state_sky` / `_update_node_state_sky_subset` **只**更新 `scales_log`、`opacity_logit`、`sh_dc`、`sh_rest`，**从不**写 `means` / `quats`。
+
+#### 8. 与 `minimal_trainer_stage4_0` 的衔接
+
+- **`_merge_params_sky_only` / `_tensor_merge_sky_only`**：把 sky 的 proxy 或 render_params 打成单层 GS 的 `means_r`…`colors_r` 字典供 `_render_single_view` 使用。
+- **`_backward_to_render_params_bg_rigid_distant_sky`**：在 `_backward_to_render_params_bg_rigid_distant` 基础上追加 sky 的 proxy→render 梯度对；与冻结几何配合见上。
+
+---
+
 
 <a id="minimal-stage-3-3-bg-distant"></a>
 

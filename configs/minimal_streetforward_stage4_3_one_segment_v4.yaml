@@ -1,5 +1,6 @@
+# tools/train_minimal_streetforward_stage4_3_one_segment_v4.py — 由 minimal_streetforward_stage4_3.yaml 派生（Stage4.3 模型/数据 + TrainSchedulerV4）。
 # 实验名；用于日志目录命名与配置落盘。
-output_name: minimal_sf_stage4_3_one_segment_1cam_3target
+output_name: minimal_sf_stage4_3_one_segment_v4
 
 # 数据源与加载总配置。
 data:
@@ -19,6 +20,10 @@ data:
   train_scene_ids: [1]
   # 评估场景 ID 列表；空表示不做独立 eval 场景。
   eval_scene_ids: []
+
+  # Dataset-side StreetForward preload（execute_hints=true 时需 enable=true 且键齐全）。
+  preload:
+    enable: false
 
   # 像素数据源（图像/掩码/深度）。
   pixel_source:
@@ -126,99 +131,41 @@ one_segment:
   # batch 中是否包含 test 视角字段。
   include_test: true
 
-# Scheduler v3 配置（本次改动核心）。
+# Scheduler v3：本脚本使用 TrainSchedulerV4；此处仅保留 model_node_state，供 NodeState 与 U / block 对齐。
 scheduler_v3:
-  # 是否启用 scheduler v3。
-  enable: true
-
-  # 时间基准层：所有 raw-step 时间尺度由 U 映射。
-  time_base:
-    # U: 每 U 个 raw steps 视作 1 个 update tick。
-    state_write_interval_steps: 4   # U
-    # 是否启用 update-units 语义（文档开关）。
-    use_update_units: true
-
-  # segment 预算配置（单位：update ticks）。
-  segment_budget:
-    # 每个 keyframe 分配的 update ticks（alpha_u）。
-    alpha_updates_per_keyframe: 12
-    # 每 segment 最小 update ticks。
-    min_updates_per_segment: 24
-    # 每 segment 最大 update ticks。
-    max_updates_per_segment: 128
-    # 是否把预算对齐到完整 source blocks。
-    align_budget_to_full_blocks: true
-
-  # source block 配置（单位：update ticks）。
-  source_block:
-    # 目标每 segment 的 source block 数（用于反推 K_u）。
-    target_source_blocks_per_segment: 2
-    # 每 block 最小 update ticks。
-    min_updates_per_source_block: 8
-    # 每 block 最大 update ticks。
-    max_updates_per_source_block: 24
-    # source keyframe 采样策略。
-    source_keyframe_policy: shuffled_cycle
-    # source frame 采样策略。
-    source_frame_policy: uniform_in_keyframe
-
-  # target 采样与刷新节奏配置。
-  target_sampling:
-    # target 是否强制包含 source frame（必须 true）。
-    include_source: true
-    # 总 target frame 数（包含 source）。
-    total_target_frames: 3
-    # 是否在整个 source block 内固定同一组 target（true 时 block 内不刷新）。
-    freeze_target_within_block: true
-    # 是否允许有效 target 数在短段下降。
-    allow_effective_target_drop: true
-    # target 保持周期（单位：update ticks，T_u）。
-    target_hold_updates: 1
-    # extra target 的 keyframe 采样策略。
-    extra_target_keyframe_policy: uniform_without_replacement
-    # extra target 的 frame 采样策略。
-    extra_target_frame_policy: uniform_in_keyframe
-
-  # reset 策略配置。
-  reset:
-    # reset policy：默认与 source block 对齐。
-    policy: align_with_source_block
-    # 每个 reset episode 覆盖多少个 source blocks。
-    reset_blocks_per_episode: 1
-    # 进入 segment 时是否 reset。
-    reset_at_segment_start: true
-    # 退出 segment 时是否 reset。
-    reset_at_segment_end: false
-
-  # scene/segment 遍历顺序配置。
-  ordering:
-    # 每个 epoch 是否打乱 scene 顺序。
-    shuffle_scenes_each_epoch: true
-    # 每个 epoch 是否打乱 segment 顺序。
-    shuffle_segments_each_epoch: true
-
-  # scheduler 事件日志开关（由训练脚本消费并落盘）。
-  logging:
-    # 控制台日志开关。
-    console: true
-    # JSONL 结构化日志开关。
-    jsonl: true
-    # TensorBoard 日志开关。
-    tensorboard: true
-    # 是否记录 segment_begin。
-    log_segment_begin: true
-    # 是否记录 block_begin。
-    log_block_begin: true
-    # 是否记录 block_end。
-    log_block_end: true
-    # 是否记录 reset_event。
-    log_reset_events: true
-
-  # MinimalStreetForward NodeState：与 v3 时间基准对齐（由 one-segment v3 训练脚本消费）。
-  # sync_with_scheduler=true：每 U 个 raw step（segment_local_step % U == 0）写回 NodeState；每个 source block 最后一步（block_end 对应 batch）之后 reset_node_state。
-  # 为 true 时忽略下方 model.update_node_state_interval / reset_node_state_interval。
+  enable: false
+  # sync_with_scheduler=true：每 U 个 raw step 写回 NodeState；每个 block_end 后 reset_node_state。
   model_node_state:
     sync_with_scheduler: true
+
+# TrainSchedulerV4：image-ref 调度（见 docs/trainers/TrainScheduler_V4_Implementation_Plan.md）。
+# segment_budget_u = episodes_per_segment * w_eff * num_cams * updates_per_block，其中 w_eff=min(keyframes_per_episode, nk)。
+scheduler_v4:
+  enable: true
+  time_base:
+    state_write_interval_steps: 4
+  source_block:
+    updates_per_block: 2
+  reset_episode:
+    keyframes_per_episode: 2
+    episodes_per_segment: 4
+    keyframe_window_policy: random_contiguous_window
+    pair_order_policy: shuffle_without_replacement
+  target_sampling:
+    total_target_images: 3
+    include_source: true
+    extra_target_policy: same_cam_different_keyframe
+    prefer_nearby_keyframes: true
+    fallback_expand_to_segment: true
+    fallback_with_replacement: true
+  overlap:
+    mode: none
+  preload:
+    emit_hints: false
+    execute_hints: false
+  traversal:
+    fixed_scene_id: null
+    fixed_segment_id: null
 
 # 模型结构与分支超参数。
 model:
