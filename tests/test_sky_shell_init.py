@@ -25,6 +25,29 @@ def test_sky_base_ground_is_y_max() -> None:
 
 
 @pytest.mark.parametrize("resolution", [4, 8, 16])
+def test_fibonacci_hemisphere_complementary_y_halfspace(resolution: int) -> None:
+    """Complementary Y cut (up=+Y): kept dirs satisfy dot(dir, (0,1,0)) >= 0 => dir_y >= 0."""
+    device = torch.device("cpu")
+    dtype = torch.float32
+    n_target = resolution**2
+    origin = torch.tensor([0.0, 5.0, 0.0], dtype=dtype)
+    means = fibonacci_shell_means(
+        resolution,
+        radius=2.0,
+        sky_origin=origin,
+        hemisphere=True,
+        device=device,
+        dtype=dtype,
+        up=(0.0, 1.0, 0.0),
+    )
+    assert means.shape == (n_target, 3)
+    dirs = (means - origin.unsqueeze(0)) / 2.0
+    up = torch.tensor([0.0, 1.0, 0.0], dtype=dtype)
+    dots = (dirs * up.unsqueeze(0)).sum(dim=-1)
+    assert (dots >= -1e-4).all()
+
+
+@pytest.mark.parametrize("resolution", [4, 8, 16])
 def test_fibonacci_hemisphere_count_and_sky_halfspace(resolution: int) -> None:
     device = torch.device("cpu")
     dtype = torch.float32

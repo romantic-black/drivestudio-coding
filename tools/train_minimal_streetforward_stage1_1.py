@@ -16,7 +16,7 @@ import json
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional, TextIO
+from typing import Any, Dict, List, Optional, TextIO, Tuple
 
 import numpy as np
 import torch
@@ -74,22 +74,23 @@ def _save_image_triplet(
     gt_image: torch.Tensor,
     out_dir: str,
     view_suffix: Optional[str] = None,
+    *,
+    save_error: bool = True,
 ) -> None:
-    """Save pred / gt / error images to out_dir as PNG. If view_suffix (e.g. 'view0'), use step{step:06d}_{view_suffix}_{name}.png."""
+    """Save pred / gt / (optional) error images to out_dir as PNG. If view_suffix (e.g. 'view0'), use step{step:06d}_{view_suffix}_{name}.png."""
     os.makedirs(out_dir, exist_ok=True)
     pred = torch.clamp(pred_rgb.detach().cpu(), 0.0, 1.0)
     gt = torch.clamp(gt_image.detach().cpu(), 0.0, 1.0)
     error = (pred - gt).abs()
-    if error.numel() > 0:
+    if save_error and error.numel() > 0:
         max_val = float(error.max().item())
         if max_val > 0:
             error = error / max_val
     name_prefix = f"step{step:06d}_{view_suffix}_" if view_suffix else f"step{step:06d}_"
-    for name, img in [
-        ("pred", pred),
-        ("gt", gt),
-        ("error", error),
-    ]:
+    triple: List[Tuple[str, torch.Tensor]] = [("pred", pred), ("gt", gt)]
+    if save_error:
+        triple.append(("error", error))
+    for name, img in triple:
         img_np = (img.numpy() * 255.0).clip(0, 255).astype(np.uint8)
         filename = os.path.join(out_dir, f"{name_prefix}{name}.png")
         try:
@@ -478,7 +479,7 @@ def setup(args: argparse.Namespace):
     )
     cfg.log_dir = log_dir
     os.makedirs(log_dir, exist_ok=True)
-    for sub in ("images", "checkpoints"):
+    for sub in ("images", "checkpoints", "tb"):
         os.makedirs(os.path.join(log_dir, sub), exist_ok=True)
 
     setup_logging(output=log_dir, level=logging.INFO, time_string=current_time)

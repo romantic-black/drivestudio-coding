@@ -223,7 +223,7 @@ class MultiSceneDataset:
         self.keyframe_split_config = keyframe_split_config or {
             'num_splits': 0,  # Auto-determine
             'min_count': 1,
-            'min_length': 0.0,
+            'min_length': 2.0,
         }
         self.min_keyframes_per_scene = min_keyframes_per_scene
         self.min_keyframes_per_segment = min_keyframes_per_segment
@@ -1881,6 +1881,7 @@ class MultiSceneDataset:
             segment_id=segment_id,
         )
         segment_first_pose = segment_first_pose.to(device=self.device, dtype=torch.float32)
+        segment_first_pose = segment_first_pose.contiguous().clone()
         try:
             world_to_seg0 = torch.linalg.inv(segment_first_pose)
         except RuntimeError as exc:

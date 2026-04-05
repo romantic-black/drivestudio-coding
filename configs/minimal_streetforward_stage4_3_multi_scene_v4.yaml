@@ -1,6 +1,6 @@
-# tools/train_minimal_streetforward_stage4_3_one_segment_v4.py — 由 minimal_streetforward_stage4_3.yaml 派生（Stage4.3 模型/数据 + TrainSchedulerV4）。
+# tools/train_minimal_streetforward_stage4_3_multi_scene_v4.py — 多场景 TrainSchedulerV4 + MultiSceneDatasetV3。
 # 实验名；用于日志目录命名与配置落盘。
-output_name: minimal_sf_stage4_3_one_segment_v4
+output_name: minimal_sf_stage4_3_multi_scene_v4
 
 # 数据源与加载总配置。
 data:
@@ -16,23 +16,57 @@ data:
   preload_device: cpu
   # sky mask 语义约定：1 表示天空。
   sky_mask_semantics: one_is_sky
-  # 训练场景 ID 列表。
-  train_scene_ids: [1]
+  # 训练场景 ID 列表（多场景；需均在数据集中存在且满足 min_keyframes 等约束）。
+  train_scene_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
   # 评估场景 ID 列表；空表示不做独立 eval 场景。
   eval_scene_ids: []
 
-  # Dataset-side StreetForward preload（execute_hints=true 时需 enable=true 且键齐全）。
+  # Dataset-side StreetForward 预加载（DatasetPreloadManager 单线程 worker；与 scheduler_v4.preload 的 hint 不同）。
+  # enable=true 时必须包含下方全部键（见 datasets/dataset_preload_manager._REQUIRED_PRELOAD_KEYS）。
   preload:
-    enable: false
+    # 是否启用数据集侧预加载线程与 view 缓存。
+    enable: true
+    # 后台 worker 数量；当前实现仅支持 1。
+    num_workers: 1
+    # 优先队列中待处理任务数上限；满时可按优先级挤掉低优任务。
+    max_pending_tasks: 64
+    # 是否缓存已加载的 image-ref view pack（CPU / pinned CPU）。
+    enable_view_pack_cache: true
+    # view 缓存全局最大条数（LRU）。
+    view_cache_max_items_total: 32
+    # 单场景 view 缓存条数上限。
+    view_cache_max_items_per_scene: 16
+    # 缓存驻留设备：cpu 或 cpu_pinned（后者配合 non_blocking 到 GPU）。
+    view_cache_device: cpu
+    # 是否与当前 scheduler 声明的 active (scene, segment) 不一致时丢弃过时预取任务。
+    drop_stale_hints: true
+    # 是否合并队列内重复的 (scene, segment, image_ref) / segment_static 任务。
+    dedupe_tasks: true
+    # 是否在适当时机预加载 segment 静态资源（由数据集实现决定具体含义）。
+    warm_segment_static: true
+    # 是否预加载 segment 点云相关（由数据集实现决定）。
+    warm_segment_pointcloud: true
+    # 是否根据下一 block 的精确 image-ref 做预取。
+    warm_next_block_exact: true
+    # 是否预取 test 视角 pack。
+    warm_test_refs: false
+    # 是否预取「episode 内可能出现的 source 图像」超集。
+    warm_episode_source_superset: true
+    # 是否在 episode_source_superset hint 中预计算 pointcloud_topk 的 representative pair score。
+    warm_overlap_pairs_episode_superset: true
+    # 是否在 next_block_exact hint 中预计算 overlap pair score（补漏）。
+    warm_overlap_pairs_next_block_exact: true
+    # 预加载统计日志间隔（raw step）；0 表示不按间隔打统计（实现依赖数据集 maybe_log_preload_stats）。
+    stats_log_interval_steps: 0
 
   # 像素数据源（图像/掩码/深度）。
   pixel_source:
     # 像素数据源实现类。
     type: datasets.nuscenes.nuscenes_sourceloader.NuScenesPixelSource
     # 使用的相机 ID。
-    cameras: [0]
+    cameras: [0, 1, 2, 3, 4, 5]
     # 各相机加载时缩放比例（先缩放再进入训练流）。
-    downscale_when_loading: [3]
+    downscale_when_loading: [3, 3, 3, 3, 3, 3]
     # 训练阶段额外缩放比例（1 表示不再缩放）。
     downscale: 1
     # 是否去畸变。
@@ -40,7 +74,7 @@ data:
     # 测试帧抽样步长；0 表示不按步长拆分 test。
     test_image_stride: 0
     # 每个 segment 最多保留的 test 图像数。
-    max_test_images: 4
+    max_test_images: 0
     # 是否加载天空掩码。
     load_sky_mask: true
     # 是否加载动态掩码。
@@ -67,7 +101,7 @@ data:
     # 是否加载 LiDAR 点云。
     load_lidar: true
     # LiDAR 下采样因子。
-    lidar_downsample_factor: 4
+    lidar_downsample_factor: 1
     # 距离截断分位数（去除离群点）。
     lidar_percentile: 0.02
 
@@ -86,7 +120,7 @@ dataset:
   # 启动时预加载场景数。
   preload_scene_count: 2
 
-  # Keyframe 分段（见 datasets/multi_scene_dataset.py）。
+  # Keyframe 分段（见 datasets/multi_scene_dataset.py MultiSceneDataset.keyframe_split_config）。
   keyframe_split_config:
     num_splits: 0
     min_count: 1
@@ -95,9 +129,9 @@ dataset:
   # segment AABB（在 segment 第一帧坐标系下）。
   segment_aabb:
     # [x_min, y_min, z_min]
-    - [-40.0, -20.0, -30.0]
+    - [-40.0, -20.0, -20.0]
     # [x_max, y_max, z_max]
-    - [40.0, 14.8, 90.0]
+    - [40.0, 4.8, 60.0]
 
   # 点云融合配置（背景/远景/动态）。
   pointcloud:
@@ -106,7 +140,7 @@ dataset:
     # LiDAR 采样密度策略。
     lidar_sparsity: full
     # 单目深度使用的相机 ID。
-    monocular_chosen_cam_ids: [0]
+    monocular_chosen_cam_ids: [0, 1, 2, 3, 4, 5]
     # 单目点云采样密度策略。
     monocular_sparsity: full
     # 是否过滤天空区域单目点。
@@ -119,20 +153,18 @@ dataset:
     monocular_dynamic_recovery_bbox_expand_xyz_m: [0.5, 0.2, 0.5]
     # 单实例动态点数上限。
     monocular_dynamic_recovery_max_points_per_instance: 20000
-    # 近景点云最大点数。
-    near_max_points: 500000
+    # 近景点云最大点数。  
+    near_max_points: 400000
     # 远景点云最大点数。
-    distant_max_points: 1000000
+    distant_max_points: 800000
     # 段内轨迹长度低于阈值的实例视为静止：LiDAR 框内点保留在 background，并排除 dynamic_info。
     static_instance_motion:
       enable: true
       traj_length_thresh_m: 0.5
 
-# 单段训练固定入口（one-segment overfit）；与 multi_scene_v4 配置互斥。
-one_segment:
-  scene_id: 1
-  segment_id: 0
-  include_test: true
+# 多场景训练：不要定义 one_segment；batch 是否含 test 字段由下方 multi_scene 控制。
+multi_scene:
+  include_test: false
 
 # Scheduler v3：本脚本使用 TrainSchedulerV4；此处仅保留 model_node_state，供 NodeState 与 U / block 对齐。
 scheduler_v3:
@@ -144,31 +176,64 @@ scheduler_v3:
 # TrainSchedulerV4：image-ref 调度（见 docs/trainers/TrainScheduler_V4_Implementation_Plan.md）。
 # segment_budget_u = episodes_per_segment * w_eff * num_cams * updates_per_block，其中 w_eff=min(keyframes_per_episode, nk)。
 scheduler_v4:
+  # 是否启用 TrainSchedulerV4（多场景脚本要求为 true）。
   enable: true
+  # 时间基准：raw step 与 update unit（U）的换算。
   time_base:
+    # U：每多少个 raw training step 计为 1 个 update tick（segment_local_u 等按 U 累计）。
     state_write_interval_steps: 4
+  # source block：固定一组 source/target 图像时，连续消耗的 update unit 数。
   source_block:
-    updates_per_block: 2
+    # 每个 block 内的 U 个数；满则发 block_end 并进入下一 block（或 segment_end）。
+    updates_per_block: 16
+  # reset episode：连续 keyframe 窗口上的 (keyframe, cam) 无放回遍历；与 segment 预算推导相关。
   reset_episode:
-    keyframes_per_episode: 2
-    episodes_per_segment: 4
+    # 每个 episode 窗口内连续 keyframe 个数（不超过 segment 内 keyframe 总数时取窗口长度）。
+    keyframes_per_episode: 3
+    # 同一 segment 内至多开启的 episode 个数（上界；硬结束仍由 segment_budget_u 决定）。
+    episodes_per_segment: 1
+    # keyframe 窗口策略：在 segment 的 keyframe 序列上取随机连续子窗。
     keyframe_window_policy: random_contiguous_window
+    # (kf, cam) 列表在 episode 内打乱顺序、无放回。
     pair_order_policy: shuffle_without_replacement
+  # target 采样：除 target[0]=source 外，extra 默认同 cam、异 keyframe。
   target_sampling:
+    # 含 source 在内的目标图像总数（list 长度）。
     total_target_images: 3
+    # 必须为 true：target[0] 与 source 为同一 image-ref。
     include_source: true
+    # 第一版仅支持：同相机、从非 source keyframe 采 extra。
     extra_target_policy: same_cam_different_keyframe
+    # extra 的 keyframe 候选按与 source keyframe 索引距离近到远排序。
     prefer_nearby_keyframes: true
+    # 窗口内 keyframe 不足时扩展到 segment 全部 keyframe。
     fallback_expand_to_segment: true
+    # 仍不足时允许有放回抽样非 source keyframe。
     fallback_with_replacement: true
+  # 视角对重叠评分（属于 target 采样逻辑，不是 data.preload）。
+  # mode=none：按邻近 keyframe 贪心选 extra target（与旧行为一致）。
+  # mode=pointcloud_topk：对候选 keyframe 全池算 overlap；在 score > overlap_min 的候选中随机选 extra，不足则按分数 top-k 回退；需 dataset.pointcloud 与下方字段。
   overlap:
-    mode: none
-    # point_sample_size / candidate_frame_policy / score_type / topk — 见 multi_scene_v4 配置说明
+    mode: pointcloud_topk
+    # 周期性 overlap_stats 日志（raw step 间隔；0 表示关闭）。
+    stats_log_interval_steps: 0
+    # --- 仅当 mode: pointcloud_topk 时必填（由 train_minimal_streetforward_stage4_3_v4_common 校验）---
+    point_sample_size: 32768
+    candidate_frame_policy: middle
+    score_type: nab_over_na
+    # nab_over_na 分数严格大于该阈值的候选进入随机池；池中数量 < extra 时回退为按分数排序的 top-k。
+    overlap_min: 0.7
+  # 调度器是否向数据集提交 preload hint（与 data.preload 后台 worker 独立）。
   preload:
-    emit_hints: false
-    execute_hints: false
+    # 是否发出 preload_hint 事件（由数据集 build_preload_hint）。
+    emit_hints: true
+    # 是否由调度器驱动数据集执行 submit_preload_hint（需 data.preload 完整配置）。
+    execute_hints: true
+  # 遍历：多场景时为 null，由调度器按 epoch 打乱 scene 再打乱 segment。
   traversal:
+    # 固定单场景 ID；多场景训练请设为 null。
     fixed_scene_id: null
+    # 固定单 segment ID；多场景训练请设为 null。
     fixed_segment_id: null
 
 # 模型结构与分支超参数。
@@ -201,14 +266,17 @@ model:
   # Stage 4.3：天空半球 GS 壳层（非 cubemap；与旧 Stage3.1 cubemap 的 resolution 含义不同）。
   sky:
     # 每维概念分辨率；点数 N = resolution^2。
-    resolution: 300
+    resolution: 600
     # 世界系球半径（米）。
-    radius: 50.0
+    radius: 75.0
     # 相对 segment AABB **地面面中心**的球心偏移 [x,y,z]（地面 = y_max 面中心，见 MultiSceneDataset 坐标系）。
     center: [0.0, 0.0, 0.0]
-    # true：Fibonacci 半球；false：完整 Fibonacci 球壳。
+    # true：Fibonacci 半球，点数 N = resolution^2（约全球的一半）；false：完整 Fibonacci 球壳。
     hemisphere: true
-    # 见 minimal_streetforward_stage4_3_multi_scene_v4.yaml 中 hemisphere_up 说明；互补 Y 半空间利于后视反投影。
+    # 半球保留 dot(shell_dir, hemisphere_up) >= 0 的 Fibonacci 方向（shell 点为 origin + R*dir）。
+    # 默认 [0,-1,0] 为「天顶」半空间（物理天空 / MultiScene 更小 y）。若后视源上 num_sky_src_feat_valid 恒为 0、
+    # 而改 hemisphere:false 后正常，多为「裁掉的那一半」才覆盖后视视锥：可改为互补 Y 半空间 [0,1,0]（dir_y>=0），
+    # 仍约为一半点数。若更关心车体后方半空间（MultiScene：z 前+/后-），可试 [0,0,-1] 或 [0,0,1]（会削弱另一侧相机）。
     hemisphere_up: [0.0, 1.0, 0.0]
   # 四分支（bg/distant/sky/rigid）参数配置。
   branches:
@@ -295,7 +363,7 @@ model:
       init:
         scale_init:
           mode: isotropic
-          isotropic_log_value: -1.90
+          isotropic_log_value: -0.50
           knn_k: 3
           knn_log_scale_bias: 0.0
         opacity_init: 0.05
@@ -382,7 +450,7 @@ optimizer:
 # 训练过程控制。
 training:
   # 最大训练步数。
-  max_iterations: 5010
+  max_iterations: 10000000
   # 常规训练日志间隔（step 级）。
   log_interval: 100
   # checkpoint 保存间隔。
@@ -392,15 +460,20 @@ training:
 
 # 评估开关（v3 中指标触发由 block_end 事件驱动，而非 metric_interval）。
 eval:
-  # 是否计算 PSNR/SSIM/LPIPS。
+  # 是否计算 PSNR/SSIM/LPIPS（block_end 写 jsonl；为 false 时日志里 psnr_mean 为 n/a，并非数值 0）。
   enable_psnr: true
+  # 若设为数字（如 18.0），在每个 block_end 若任一训练视角 PSNR 低于该值，则对该 block 全部视角保存 pred/gt（目录见 logging.low_psnr_train_images_subdir）；需 enable_psnr；null 表示关闭。
+  save_train_views_psnr_below: 17
   # 训练结束后是否运行 test views 评估。
-  run_test_at_end: true
+  run_test_at_end: false
 
 # 日志与诊断配置。
 logging:
-  # 图像可视化保存间隔。
-  image_interval: 96
+  # 每多少个 TrainSchedulerV4 block 保存一次训练 pred/gt 图（按 block，不按 step）；不保存 error 图。
+  # 例如 updates_per_block=12、U=1 时，8 个 block ≈ 旧版每 96 step 存一次。
+  image_interval_blocks: 6
+  # 当 eval.save_train_views_psnr_below 非 null 时，触发条件满足时的全视角图保存到 log_dir/images/<该子目录>/。
+  low_psnr_train_images_subdir: train_low_psnr
   # 是否写 metrics_history.jsonl。
   enable_jsonl_metrics: true
   # 是否启用 TensorBoard。
@@ -422,4 +495,4 @@ logging:
     # 是否统计 phase timing（forward/backward/optimizer）。
     phase_timing: true
     # 是否统计 CUDA 显存峰值。
-    cuda_memory: true
+    cuda_memory: false

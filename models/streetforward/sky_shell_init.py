@@ -59,7 +59,10 @@ def fibonacci_shell_means(
     """
     Exactly N = resolution**2 points: full Fibonacci sphere, or hemisphere (dir·up >= 0).
 
-    Default ``up`` is ``SKY_UP_MULTISCENE`` (-Y). Hemisphere keeps directions whose dot with ``up`` is non-negative.
+    ``up`` is the **outward** reference for the kept half-space: we keep unit directions with ``dot(dir, up) >= 0``.
+    Default ``up`` is ``SKY_UP_MULTISCENE`` ``(0,-1,0)`` (physical sky / smaller MultiScene ``y``).
+    For the **complementary** half of the Y cut (``dir_y >= 0`` from the sphere center), use ``up=(0,+1,0)``.
+    For a **rear-facing** half-space in MultiScene (``z`` back negative / front positive), try ``up=(0,0,-1)`` or ``(0,0,1)``.
     """
     n_target = int(resolution) ** 2
     if n_target < 1:

@@ -75,6 +75,13 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
         self.sky_center_offset = torch.tensor(list(center_raw), dtype=torch.float32, device=device)
 
         self.sky_hemisphere = bool(self._require_key(sky_geom, "hemisphere", "model.sky"))
+        up_raw = sky_geom.get("hemisphere_up") if hasattr(sky_geom, "get") else None
+        if up_raw is None:
+            self.sky_hemisphere_up: Tuple[float, float, float] = tuple(float(x) for x in SKY_UP_MULTISCENE)
+        else:
+            if not hasattr(up_raw, "__len__") or len(up_raw) != 3:
+                raise ValueError("model.sky.hemisphere_up must be a length-3 list/tuple when set.")
+            self.sky_hemisphere_up = tuple(float(up_raw[i]) for i in range(3))
 
         self.sky_cfg = self._parse_branch_cfg(sky_yaml, "sky")
         if bool(self.sky_cfg["mlp"]["use_3d_feat"]):
@@ -131,7 +138,7 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
             hemisphere=self.sky_hemisphere,
             device=self.device,
             dtype=torch.float32,
-            up=SKY_UP_MULTISCENE,
+            up=self.sky_hemisphere_up,
         )
         init_cfg = self.sky_cfg["init"]
         scales_log = self._compute_initial_scales_by_cfg(means, init_cfg)

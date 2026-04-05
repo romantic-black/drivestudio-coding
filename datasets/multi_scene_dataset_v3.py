@@ -15,6 +15,8 @@ import random
 import threading
 import time
 from collections import OrderedDict
+
+import numpy as np
 from dataclasses import dataclass
 from typing import Any, Dict, FrozenSet, List, Literal, Optional, Sequence, Set, Tuple
 
@@ -24,6 +26,7 @@ from torch import Tensor
 from datasets.dataset_preload_manager import (
     PRIORITY_EPISODE_SUPERSET,
     PRIORITY_NEXT_BLOCK_EXACT,
+    PRIORITY_SEGMENT_STATIC,
     PRIORITY_TEST_REFS,
     DatasetPreloadManager,
     LoadedViewPack,
@@ -42,6 +45,31 @@ ImageRef = Tuple[int, int]
 
 def _clamp_int(value: int, min_value: int, max_value: int) -> int:
     return max(min_value, min(max_value, value))
+
+
+def _visibility_mask_seg0(
+    points_xyz: np.ndarray,
+    c2w_seg0: np.ndarray,
+    K: np.ndarray,
+    height: int,
+    width: int,
+) -> np.ndarray:
+    """points_xyz (M,3) in seg0; c2w_seg0 (4,4); K (3,3). Returns visibility bool (M,)."""
+    m = int(points_xyz.shape[0])
+    if m == 0:
+        return np.zeros((0,), dtype=bool)
+    w2c = np.linalg.inv(c2w_seg0.astype(np.float64))
+    ph = np.concatenate([points_xyz.astype(np.float64), np.ones((m, 1), dtype=np.float64)], axis=1)
+    pc = (w2c @ ph.T).T[:, :3]
+    proj = (K.astype(np.float64) @ pc.T).T
+    zp = proj[:, 2]
+    valid_z = zp > 1e-8
+    u = np.zeros(m, dtype=np.float64)
+    v = np.zeros(m, dtype=np.float64)
+    u[valid_z] = proj[valid_z, 0] / zp[valid_z]
+    v[valid_z] = proj[valid_z, 1] / zp[valid_z]
+    vis = valid_z & (u >= 0.0) & (u < float(width)) & (v >= 0.0) & (v < float(height))
+    return vis.astype(bool)
 
 
 @dataclass(frozen=True)
@@ -133,15 +161,34 @@ def _build_segment_index_dict(
     )
 
 
+def representative_frame_for_keyframe(sidx: SegmentIndex, keyframe_idx: int) -> int:
+    frames = sidx.keyframe_to_frames[int(keyframe_idx)]
+    if len(frames) == 0:
+        raise ValueError(
+            f"keyframe {keyframe_idx} has no frames (scene={sidx.scene_id} segment={sidx.segment_id})"
+        )
+    return int(frames[len(frames) // 2])
+
+
 class MultiSceneDatasetV3(MultiSceneDataset):
     """
     Extends MultiSceneDataset with SegmentIndex cache and image-ref batch assembly.
     """
 
-    def __init__(self, *args: Any, preload_cfg: Optional[Dict[str, Any]] = None, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        preload_cfg: Optional[Dict[str, Any]] = None,
+        overlap_stats_log_interval_steps: int = 0,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
         self._segment_index_cache: Dict[Tuple[int, int], SegmentIndex] = {}
-        self._pair_score_cache: Dict[Tuple[int, int, Tuple[int, int], Tuple[int, int], str], float] = {}
+        # (score, n_a, n_b, n_ab) for pointcloud_topk
+        self._pair_score_cache: Dict[
+            Tuple[int, int, Tuple[int, int], Tuple[int, int], str, int],
+            Tuple[float, int, int, int],
+        ] = {}
         self._pixel_source_io_lock = threading.RLock()
         self._preload_rtcfg = parse_preload_cfg(preload_cfg)
         self._preload_manager: Optional[DatasetPreloadManager] = None
@@ -157,6 +204,26 @@ class MultiSceneDatasetV3(MultiSceneDataset):
         self._scene_preload_inflight_lock = threading.Lock()
         self._scene_unloading: Set[int] = set()
         self._scene_unloading_lock = threading.Lock()
+        self._scene_load_coord_lock = threading.Lock()
+        self._scene_load_inflight: Dict[int, threading.Event] = {}
+        self._view_load_coord_lock = threading.Lock()
+        self._view_load_inflight: Dict[Tuple[int, int, int, int], threading.Event] = {}
+        self._segment_pointcloud_coord_lock = threading.Lock()
+        self._segment_pointcloud_inflight: Dict[Tuple[int, int], threading.Event] = {}
+        self._segment_index_coord_lock = threading.Lock()
+        self._segment_index_inflight: Dict[Tuple[int, int], threading.Event] = {}
+        self._segment_pose_cache: Dict[Tuple[int, int], Dict[str, Any]] = {}
+        self._test_image_refs_cache: Dict[Tuple[int, int, int], List[ImageRef]] = {}
+        self._overlap_stats_log_interval_steps = int(overlap_stats_log_interval_steps)
+        self._overlap_stats: Dict[str, float] = {
+            "pair_queries": 0.0,
+            "pair_cache_hits": 0.0,
+            "pair_cache_misses": 0.0,
+            "pair_compute_miss_ms_sum": 0.0,
+            "pair_eval_wall_ms_sum": 0.0,
+            "src_rep_no_visible": 0.0,
+            "candidate_eval_count": 0.0,
+        }
 
     def __del__(self) -> None:
         try:
@@ -177,6 +244,112 @@ class MultiSceneDatasetV3(MultiSceneDataset):
         """Scheduler-declared (scene, segment) for preload stale checks; call before emit/submit preload hints."""
         self._preload_active_scene_id = int(scene_id)
         self._preload_active_segment_id = int(segment_id)
+
+    def clear_preload_active_scope(self) -> None:
+        self._preload_active_scene_id = None
+        self._preload_active_segment_id = None
+
+    def set_preload_training_scope(self, scene_id: int, segment_id: int) -> None:
+        """Training segment for scene-cache eviction protection; pair with clear on segment/epoch end."""
+        self._preload_training_scene_id = int(scene_id)
+        self._preload_training_segment_id = int(segment_id)
+
+    def clear_preload_training_scope(self) -> None:
+        self._preload_training_scene_id = None
+        self._preload_training_segment_id = None
+
+    def clear_preload_scheduler_scope(self) -> None:
+        self.clear_preload_active_scope()
+        self.clear_preload_training_scope()
+
+    def maybe_log_preload_stats(self, global_step: int) -> None:
+        cfg = self._preload_rtcfg
+        mgr = self._preload_manager
+        if cfg is None or mgr is None:
+            return
+        interval = int(cfg.stats_log_interval_steps)
+        if interval <= 0:
+            return
+        gs = int(global_step)
+        if gs % interval != 0:
+            return
+        stats = mgr.pop_stats()
+        if not stats:
+            return
+        completed = float(stats.get("tasks_completed", 0))
+        lat = float(stats.get("total_latency_ms", 0.0))
+        avg_ms = lat / max(completed, 1.0)
+        ol = int(stats.get("overlap_pairs_loaded", 0))
+        och = int(stats.get("overlap_pair_cache_hits_worker", 0))
+        olat = float(stats.get("overlap_pair_total_latency_ms", 0.0))
+        ol_done = max(ol + och, 1)
+        avg_ol_ms = olat / float(ol_done)
+        logger.info(
+            "preload_stats global_step=%s tasks_completed=%s views_loaded=%s cache_hits_worker=%s "
+            "segment_static_completed=%s tasks_failed=%s tasks_dropped_stale=%s tasks_dropped_queue_full=%s "
+            "avg_task_latency_ms=%.3f overlap_pairs_loaded=%s overlap_pair_cache_hits_worker=%s "
+            "overlap_pairs_failed=%s avg_overlap_pair_latency_ms=%.3f",
+            gs,
+            int(stats.get("tasks_completed", 0)),
+            int(stats.get("views_loaded", 0)),
+            int(stats.get("cache_hits_worker", 0)),
+            int(stats.get("segment_static_completed", 0)),
+            int(stats.get("tasks_failed", 0)),
+            int(stats.get("tasks_dropped_stale", 0)),
+            int(stats.get("tasks_dropped_queue_full", 0)),
+            avg_ms,
+            ol,
+            och,
+            int(stats.get("overlap_pairs_failed", 0)),
+            avg_ol_ms,
+        )
+
+    def maybe_log_overlap_stats(self, global_step: int) -> None:
+        interval = int(self._overlap_stats_log_interval_steps)
+        if interval <= 0:
+            return
+        gs = int(global_step)
+        if gs % interval != 0:
+            return
+        st = self._overlap_stats
+        pq = float(st.get("pair_queries", 0.0))
+        if pq <= 0:
+            return
+        hits = float(st.get("pair_cache_hits", 0.0))
+        misses = float(st.get("pair_cache_misses", 0.0))
+        miss_ms = float(st.get("pair_compute_miss_ms_sum", 0.0))
+        wall_ms = float(st.get("pair_eval_wall_ms_sum", 0.0))
+        avg_miss_ms = miss_ms / max(misses, 1.0)
+        avg_wall_ms = wall_ms / max(pq, 1.0)
+        logger.info(
+            "overlap_stats global_step=%s pair_queries=%s pair_cache_hits=%s pair_cache_misses=%s "
+            "avg_pair_compute_miss_ms=%.4f avg_pair_eval_wall_ms=%.4f src_rep_no_visible=%s candidate_eval_count=%s",
+            gs,
+            int(pq),
+            int(hits),
+            int(misses),
+            avg_miss_ms,
+            avg_wall_ms,
+            int(st.get("src_rep_no_visible", 0.0)),
+            int(st.get("candidate_eval_count", 0.0)),
+        )
+        for k in st:
+            st[k] = 0.0
+
+    def _preload_segment_static_redundant(self, scene_id: int, segment_id: int) -> bool:
+        key = (int(scene_id), int(segment_id))
+        cfg = self._preload_rtcfg
+        pixel_source_cfg = getattr(self.data_cfg, "pixel_source", {})
+        max_test_cap = int(pixel_source_cfg.get("max_test_images", 0))
+        tr_key = (int(scene_id), int(segment_id), max_test_cap)
+        with self._lock:
+            has_idx = key in self._segment_index_cache
+            has_pc = key in self._segment_pointcloud_cache
+            has_pose = key in self._segment_pose_cache
+            has_tr = tr_key in self._test_image_refs_cache
+        if cfg is not None and cfg.warm_segment_pointcloud and self.pointcloud_generator is not None:
+            return bool(has_idx and has_pc and has_pose and has_tr)
+        return bool(has_idx and has_pose and has_tr)
 
     def _scene_cache_protected_train_scene_ids_unlocked(self) -> Set[int]:
         """Scenes TrainSchedulerV4 + batch assembly care about; do not prefer evicting these (see _ensure_scene_loaded)."""
@@ -222,20 +395,42 @@ class MultiSceneDatasetV3(MultiSceneDataset):
                 break
             self._unload_scene(victim)
 
-        if scene_id in self.eval_scene_ids and scene_id not in self.eval_scenes:
+        with self._scene_load_coord_lock:
+            if scene_id in self._scene_load_inflight:
+                ev = self._scene_load_inflight[scene_id]
+                is_owner = False
+            else:
+                ev = threading.Event()
+                self._scene_load_inflight[scene_id] = ev
+                is_owner = True
+        if not is_owner:
+            ev.wait(timeout=600.0)
+            return self._ensure_scene_loaded(scene_id)
+        try:
+            with self._lock:
+                if scene_id in self.train_scenes_cache:
+                    return self.train_scenes_cache[scene_id]
+                if scene_id in self.eval_scene_ids and scene_id in self.eval_scenes:
+                    return self.eval_scenes[scene_id]
+            if scene_id in self.eval_scene_ids:
+                scene_data = self._load_and_prepare_scene(scene_id)
+                if scene_data is not None:
+                    with self._lock:
+                        if scene_id in self.eval_scenes:
+                            return self.eval_scenes[scene_id]
+                        self.eval_scenes[scene_id] = scene_data
+                return scene_data
             scene_data = self._load_and_prepare_scene(scene_id)
             if scene_data is not None:
                 with self._lock:
-                    self.eval_scenes[scene_id] = scene_data
-                return scene_data
-            return None
-
-        scene_data = self._load_and_prepare_scene(scene_id)
-        if scene_data is not None:
-            with self._lock:
-                self.train_scenes_cache[scene_id] = scene_data
+                    if scene_id in self.train_scenes_cache:
+                        return self.train_scenes_cache[scene_id]
+                    self.train_scenes_cache[scene_id] = scene_data
             return scene_data
-        return None
+        finally:
+            with self._scene_load_coord_lock:
+                self._scene_load_inflight.pop(scene_id, None)
+            ev.set()
 
     def _preload_should_abort_for_unload(self, scene_id: int) -> bool:
         sid = int(scene_id)
@@ -282,20 +477,78 @@ class MultiSceneDatasetV3(MultiSceneDataset):
             if self._preload_manager is not None:
                 self._preload_manager.clear_pending_for_scene(sid)
             self._wait_scene_preload_quiescent(sid)
-            super()._unload_scene(sid)
+            # Clear inflight coordination without holding the main lock to avoid lock-order deadlocks.
+            with self._segment_index_coord_lock:
+                for k in list(self._segment_index_inflight.keys()):
+                    if int(k[0]) == sid:
+                        ev = self._segment_index_inflight.pop(k, None)
+                        if ev is not None:
+                            ev.set()
+            with self._segment_pointcloud_coord_lock:
+                for k in list(self._segment_pointcloud_inflight.keys()):
+                    if int(k[0]) == sid:
+                        ev = self._segment_pointcloud_inflight.pop(k, None)
+                        if ev is not None:
+                            ev.set()
+            with self._view_load_coord_lock:
+                for k in list(self._view_load_inflight.keys()):
+                    if int(k[0]) == sid:
+                        ev = self._view_load_inflight.pop(k, None)
+                        if ev is not None:
+                            ev.set()
             with self._view_pack_lock:
                 stale_view_keys = [k for k in self._view_pack_cache if k[0] == sid]
                 for k in stale_view_keys:
                     del self._view_pack_cache[k]
-            stale_index_keys = [k for k in self._segment_index_cache if k[0] == scene_id]
-            for k in stale_index_keys:
-                del self._segment_index_cache[k]
-            stale_pair_keys = [k for k in self._pair_score_cache if k[0] == scene_id]
-            for k in stale_pair_keys:
-                del self._pair_score_cache[k]
+            with self._lock:
+                super()._unload_scene(sid)
+                stale_index_keys = [k for k in self._segment_index_cache if k[0] == sid]
+                for k in stale_index_keys:
+                    del self._segment_index_cache[k]
+                stale_pair_keys = [k for k in self._pair_score_cache if k[0] == sid]
+                for k in stale_pair_keys:
+                    del self._pair_score_cache[k]
+                for k in list(self._segment_pose_cache.keys()):
+                    if int(k[0]) == sid:
+                        del self._segment_pose_cache[k]
+                for k in list(self._test_image_refs_cache.keys()):
+                    if int(k[0]) == sid:
+                        del self._test_image_refs_cache[k]
         finally:
             with self._scene_unloading_lock:
                 self._scene_unloading.discard(sid)
+
+    def _switch_to_next_scene(self) -> None:
+        """Override base to avoid holding self._lock across unloads (preload can deadlock)."""
+        with self._lock:
+            if self.current_scene_index >= len(self.scene_training_queue):
+                logger.warning("No more scenes in training queue")
+                return
+            current_scene_id = self.scene_training_queue[self.current_scene_index]
+
+        self._unload_scene(current_scene_id)
+
+        with self._lock:
+            self.current_scene_index += 1
+            if self.current_scene_index >= len(self.scene_training_queue):
+                logger.info("All scenes in training queue have been processed")
+                self._ensure_training_queue_ready()
+                if self.current_scene_index >= len(self.scene_training_queue):
+                    return
+            self._ensure_training_queue_ready()
+
+        self._preload_scenes()
+
+    def mark_scene_completed(self, scene_id: int) -> None:
+        with self._lock:
+            if self.current_scene_index >= len(self.scene_training_queue) or len(self.scene_training_queue) == 0:
+                logger.warning("No current scene to mark as completed")
+                return
+            current_scene_id = self.scene_training_queue[self.current_scene_index]
+            if int(scene_id) != int(current_scene_id):
+                logger.warning("Scene %s does not match current scene %s. Ignoring.", scene_id, current_scene_id)
+                return
+        self._switch_to_next_scene()
 
     def _pick_view_cache_eviction_victim(
         self,
@@ -346,6 +599,134 @@ class MultiSceneDatasetV3(MultiSceneDataset):
                 break
             del self._view_pack_cache[drop]
 
+    def _materialize_view_pack_cache(
+        self,
+        key: Tuple[int, int, int, int],
+        scene_dataset: DrivingDataset,
+        ref_t: Tuple[int, int],
+    ) -> None:
+        cfg = self._preload_rtcfg
+        if cfg is None or not cfg.enable_view_pack_cache:
+            return
+        with self._view_load_coord_lock:
+            with self._view_pack_lock:
+                if key in self._view_pack_cache:
+                    return
+            if key in self._view_load_inflight:
+                ev = self._view_load_inflight[key]
+                is_waiter = True
+            else:
+                ev = threading.Event()
+                self._view_load_inflight[key] = ev
+                is_waiter = False
+        if is_waiter:
+            ev.wait(timeout=600.0)
+            return
+        try:
+            with self._view_pack_lock:
+                if key in self._view_pack_cache:
+                    return
+            raw = self._load_view_from_image_ref(scene_dataset, ref_t)
+            pin = pin_memory_from_cfg(cfg)
+            lvp = dict_to_loaded_view_pack(raw, pin_memory=pin)
+            with self._view_pack_lock:
+                if key in self._view_pack_cache:
+                    return
+                self._evict_view_cache_if_needed_unlocked(key)
+                self._view_pack_cache[key] = lvp
+                self._view_pack_cache.move_to_end(key)
+                self._trim_view_cache_per_scene_cap_unlocked(key[0])
+        finally:
+            with self._view_load_coord_lock:
+                self._view_load_inflight.pop(key, None)
+            ev.set()
+
+    def _ensure_segment_pose_cached(
+        self,
+        scene_id: int,
+        segment_id: int,
+        scene_dataset: DrivingDataset,
+        segment: Dict[str, Any],
+    ) -> Tuple[Tensor, Tensor, int, str]:
+        key = (int(scene_id), int(segment_id))
+        with self._lock:
+            ent = self._segment_pose_cache.get(key)
+        if ent is not None:
+            return (
+                ent["segment_first_pose"],
+                ent["world_to_seg0"],
+                int(ent["segment_first_frame_idx"]),
+                str(ent["segment_pose_source"]),
+            )
+        segment_first_pose, segment_first_frame_idx, segment_pose_source = self._get_segment_first_pose(
+            scene_dataset=scene_dataset,
+            segment=segment,
+            segment_id=int(segment_id),
+        )
+        segment_first_pose = segment_first_pose.to(device=self.device, dtype=torch.float32)
+        # Materialize: cam_to_world slices can be lazy/subclass tensors; linalg.inv may error with
+        # "lazy wrapper should be called at most once" if the input is not a plain dense tensor.
+        segment_first_pose = segment_first_pose.contiguous().clone()
+        try:
+            world_to_seg0 = torch.linalg.inv(segment_first_pose)
+        except RuntimeError as exc:
+            raise ValueError(
+                f"Segment {segment_id} first pose is non-invertible; cannot build segment coordinate transform."
+            ) from exc
+        with self._lock:
+            if key not in self._segment_pose_cache:
+                self._segment_pose_cache[key] = {
+                    "segment_first_pose": segment_first_pose,
+                    "world_to_seg0": world_to_seg0,
+                    "segment_first_frame_idx": int(segment_first_frame_idx),
+                    "segment_pose_source": str(segment_pose_source),
+                }
+        return segment_first_pose, world_to_seg0, int(segment_first_frame_idx), str(segment_pose_source)
+
+    def _ensure_segment_pointcloud_cached(
+        self,
+        scene_id: int,
+        segment_id: int,
+        segment_first_pose: Tensor,
+    ) -> Any:
+        if self.pointcloud_generator is None:
+            return None
+        pc_key = (int(scene_id), int(segment_id))
+        with self._lock:
+            if pc_key in self._segment_pointcloud_cache:
+                return self._segment_pointcloud_cache[pc_key]
+        with self._segment_pointcloud_coord_lock:
+            with self._lock:
+                if pc_key in self._segment_pointcloud_cache:
+                    return self._segment_pointcloud_cache[pc_key]
+            if pc_key in self._segment_pointcloud_inflight:
+                ev = self._segment_pointcloud_inflight[pc_key]
+                is_waiter = True
+            else:
+                ev = threading.Event()
+                self._segment_pointcloud_inflight[pc_key] = ev
+                is_waiter = False
+        if is_waiter:
+            ev.wait(timeout=600.0)
+            with self._lock:
+                return self._segment_pointcloud_cache.get(pc_key)
+        try:
+            pc = self.pointcloud_generator.generate_pointcloud(
+                dataset=self,
+                scene_id=scene_id,
+                segment_id=segment_id,
+                segment_first_pose=segment_first_pose,
+            )
+            with self._lock:
+                if pc_key not in self._segment_pointcloud_cache:
+                    self._segment_pointcloud_cache[pc_key] = pc
+            with self._lock:
+                return self._segment_pointcloud_cache.get(pc_key)
+        finally:
+            with self._segment_pointcloud_coord_lock:
+                self._segment_pointcloud_inflight.pop(pc_key, None)
+            ev.set()
+
     def _preload_worker_load_view_pack(
         self,
         scene_id: int,
@@ -366,19 +747,82 @@ class MultiSceneDatasetV3(MultiSceneDataset):
             if scene_data is None:
                 return "failed"
             scene_dataset = scene_data["dataset"]
-            raw = self._load_view_from_image_ref(scene_dataset, tuple(image_ref))
-            pin = pin_memory_from_cfg(cfg)
-            lvp = dict_to_loaded_view_pack(raw, pin_memory=pin)
+            self._materialize_view_pack_cache(key, scene_dataset, tuple(image_ref))
             with self._view_pack_lock:
                 if key in self._view_pack_cache:
-                    return "cache_hit"
-                self._evict_view_cache_if_needed_unlocked(key)
-                self._view_pack_cache[key] = lvp
-                self._view_pack_cache.move_to_end(key)
-                self._trim_view_cache_per_scene_cap_unlocked(key[0])
-            return "loaded"
+                    return "loaded"
+            return "failed"
         except Exception as exc:
             logger.debug("preload worker _preload_worker_load_view_pack: %s", exc, exc_info=True)
+            return "failed"
+
+    def _preload_worker_segment_static(self, scene_id: int, segment_id: int, meta: Dict[str, Any]) -> str:
+        cfg = self._preload_rtcfg
+        if cfg is None or not cfg.warm_segment_static:
+            return "skipped"
+        sid, seg = int(scene_id), int(segment_id)
+        try:
+            if self._preload_should_abort_for_unload(sid):
+                return "failed"
+            self.get_segment_index(sid, seg)
+            self.resolve_test_image_refs_deterministic(sid, seg)
+            scene_data = self._ensure_scene_loaded(sid)
+            if scene_data is None:
+                return "failed"
+            sidx = self.get_segment_index(sid, seg)
+            segment = scene_data["segments"][int(sidx.segment_id)]
+            scene_dataset = scene_data["dataset"]
+            segment_first_pose, _, _, _ = self._ensure_segment_pose_cached(sid, seg, scene_dataset, segment)
+            if cfg.warm_segment_pointcloud and self.pointcloud_generator is not None:
+                self._ensure_segment_pointcloud_cached(sid, seg, segment_first_pose)
+            return "loaded"
+        except Exception as exc:
+            logger.debug("_preload_worker_segment_static: %s", exc, exc_info=True)
+            return "failed"
+
+    def _preload_worker_overlap_pair(
+        self,
+        scene_id: int,
+        segment_id: int,
+        src_rep_image_ref: ImageRef,
+        tgt_rep_image_ref: ImageRef,
+        *,
+        mode: str,
+        point_sample_size: int,
+        meta: Dict[str, Any],
+    ) -> str:
+        sid, seg = int(scene_id), int(segment_id)
+        src_t = (int(src_rep_image_ref[0]), int(src_rep_image_ref[1]))
+        tgt_t = (int(tgt_rep_image_ref[0]), int(tgt_rep_image_ref[1]))
+        mode_s = str(mode)
+        pss = int(point_sample_size)
+        try:
+            if self._preload_should_abort_for_unload(sid):
+                return "failed"
+            if self.is_pair_score_cached(sid, seg, src_t, tgt_t, mode_s, pss):
+                return "cache_hit"
+            self.get_segment_index(sid, seg)
+            scene_data = self._ensure_scene_loaded(sid)
+            if scene_data is None:
+                return "failed"
+            sidx = self.get_segment_index(sid, seg)
+            segment = scene_data["segments"][int(sidx.segment_id)]
+            scene_dataset = scene_data["dataset"]
+            segment_first_pose, _, _, _ = self._ensure_segment_pose_cached(sid, seg, scene_dataset, segment)
+            if self.pointcloud_generator is not None:
+                self._ensure_segment_pointcloud_cached(sid, seg, segment_first_pose)
+            self.get_or_compute_pair_score(
+                sid,
+                seg,
+                src_t,
+                tgt_t,
+                mode=mode_s,
+                point_sample_size=pss,
+                account_runtime_stats=False,
+            )
+            return "loaded"
+        except Exception as exc:
+            logger.debug("_preload_worker_overlap_pair: %s", exc, exc_info=True)
             return "failed"
 
     def submit_preload_hint(
@@ -396,25 +840,86 @@ class MultiSceneDatasetV3(MultiSceneDataset):
         scene_id = int(hint["scene_id"])
         segment_id = int(hint["segment_id"])
         refs: List[ImageRef] = [(int(r[0]), int(r[1])) for r in hint["future_image_refs"]]
+        base_meta: Dict[str, Any] = {
+            "epoch_idx": int(epoch_idx),
+            "global_step": int(global_step),
+            "block_idx_global": int(block_idx_global),
+            "hint_scope": str(hint_scope),
+        }
+        overlap_pairs_raw = hint.get("future_overlap_pairs")
+        overlap_pairs: List[Dict[str, Any]] = list(overlap_pairs_raw) if overlap_pairs_raw else []
+        overlap_meta = hint.get("overlap_meta")
         if hint_scope == "next_block_exact":
             if not self._preload_rtcfg.warm_next_block_exact:
                 return
+            if self._preload_rtcfg.warm_segment_static:
+                self._preload_manager.submit_segment_static(
+                    PRIORITY_SEGMENT_STATIC, scene_id, segment_id, meta=base_meta
+                )
             for ref in refs:
                 self._preload_manager.submit_image_ref(
-                    PRIORITY_NEXT_BLOCK_EXACT, scene_id, segment_id, ref
+                    PRIORITY_NEXT_BLOCK_EXACT, scene_id, segment_id, ref, meta=base_meta
                 )
             if include_test and self._preload_rtcfg.warm_test_refs:
                 for ref in self.resolve_test_image_refs_deterministic(scene_id, segment_id):
                     self._preload_manager.submit_image_ref(
-                        PRIORITY_TEST_REFS, scene_id, segment_id, ref
+                        PRIORITY_TEST_REFS, scene_id, segment_id, ref, meta=base_meta
+                    )
+            if (
+                self._preload_rtcfg.warm_overlap_pairs_next_block_exact
+                and overlap_meta is not None
+                and str(overlap_meta.get("mode")) == "pointcloud_topk"
+                and overlap_pairs
+            ):
+                pss = int(overlap_meta["point_sample_size"])
+                for p in overlap_pairs:
+                    sr = p["src_rep_image_ref"]
+                    tr = p["tgt_rep_image_ref"]
+                    src_ref = (int(sr[0]), int(sr[1]))
+                    tgt_ref = (int(tr[0]), int(tr[1]))
+                    self._preload_manager.submit_overlap_pair(
+                        PRIORITY_NEXT_BLOCK_EXACT,
+                        scene_id,
+                        segment_id,
+                        src_ref,
+                        tgt_ref,
+                        mode="pointcloud_topk",
+                        point_sample_size=pss,
+                        meta=dict(base_meta),
                     )
         elif hint_scope == "episode_source_superset":
             if not self._preload_rtcfg.warm_episode_source_superset:
                 return
+            if self._preload_rtcfg.warm_segment_static:
+                self._preload_manager.submit_segment_static(
+                    PRIORITY_SEGMENT_STATIC, scene_id, segment_id, meta=base_meta
+                )
             for ref in refs:
                 self._preload_manager.submit_image_ref(
-                    PRIORITY_EPISODE_SUPERSET, scene_id, segment_id, ref
+                    PRIORITY_EPISODE_SUPERSET, scene_id, segment_id, ref, meta=base_meta
                 )
+            if (
+                self._preload_rtcfg.warm_overlap_pairs_episode_superset
+                and overlap_meta is not None
+                and str(overlap_meta.get("mode")) == "pointcloud_topk"
+                and overlap_pairs
+            ):
+                pss = int(overlap_meta["point_sample_size"])
+                for p in overlap_pairs:
+                    sr = p["src_rep_image_ref"]
+                    tr = p["tgt_rep_image_ref"]
+                    src_ref = (int(sr[0]), int(sr[1]))
+                    tgt_ref = (int(tr[0]), int(tr[1]))
+                    self._preload_manager.submit_overlap_pair(
+                        PRIORITY_EPISODE_SUPERSET,
+                        scene_id,
+                        segment_id,
+                        src_ref,
+                        tgt_ref,
+                        mode="pointcloud_topk",
+                        point_sample_size=pss,
+                        meta=dict(base_meta),
+                    )
         else:
             return
 
@@ -435,32 +940,111 @@ class MultiSceneDatasetV3(MultiSceneDataset):
                 self._view_pack_cache.move_to_end(key)
                 return loaded_view_pack_to_device(self._view_pack_cache[key], self.device)
 
-        raw = self._load_view_from_image_ref(scene_dataset, ref_t)
-        pin = pin_memory_from_cfg(self._preload_rtcfg)
-        lvp = dict_to_loaded_view_pack(raw, pin_memory=pin)
+        self._materialize_view_pack_cache(key, scene_dataset, ref_t)
         with self._view_pack_lock:
-            if key in self._view_pack_cache:
+            if key not in self._view_pack_cache:
+                raise RuntimeError(f"view pack cache still empty after materialize: key={key!r}")
+            return loaded_view_pack_to_device(self._view_pack_cache[key], self.device)
+
+    def _get_view_geometry_from_image_ref(
+        self,
+        scene_id: int,
+        segment_id: int,
+        scene_dataset: DrivingDataset,
+        image_ref: ImageRef,
+        *,
+        world_to_seg0_np: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, int, int]:
+        """
+        Extrinsic / intrinsic / image size for overlap scoring only.
+        Reuses ``_view_pack_cache`` without ``loaded_view_pack_to_device`` (no GPU pack materialization).
+        """
+        ref_t = (int(image_ref[0]), int(image_ref[1]))
+        key = (int(scene_id), int(segment_id), ref_t[0], ref_t[1])
+        cfg = self._preload_rtcfg
+
+        def _from_pack_tensors(ext_t: Tensor, intr_t: Tensor, h: int, w: int) -> Tuple[np.ndarray, np.ndarray, int, int]:
+            ext_np = ext_t.detach().cpu().numpy().astype(np.float64)
+            c2w_seg0 = world_to_seg0_np @ ext_np
+            intr_cpu = intr_t.detach().cpu().numpy().astype(np.float64)
+            if intr_cpu.shape == (4, 4):
+                K = intr_cpu[:3, :3]
+            elif intr_cpu.shape == (3, 3):
+                K = intr_cpu
+            else:
+                raise ValueError(f"unexpected intrinsic shape {intr_cpu.shape}")
+            return c2w_seg0, K, int(h), int(w)
+
+        if cfg is None or not cfg.enable_view_pack_cache:
+            pack = self._load_view_from_image_ref(scene_dataset, ref_t)
+            img = pack["image"]
+            H, Wim = int(img.shape[0]), int(img.shape[1])
+            ext_t = self._to_4x4_tensor(pack["extrinsic"]).to(device=self.device, dtype=torch.float64)
+            intr = pack["intrinsic"]
+            intr_t = intr if isinstance(intr, torch.Tensor) else torch.as_tensor(intr, device=self.device)
+            return _from_pack_tensors(ext_t, intr_t, H, Wim)
+
+        lvp: Optional[LoadedViewPack] = None
+        with self._view_pack_lock:
+            ent = self._view_pack_cache.get(key)
+            if ent is not None:
                 self._view_pack_cache.move_to_end(key)
-                return loaded_view_pack_to_device(self._view_pack_cache[key], self.device)
-            self._evict_view_cache_if_needed_unlocked(key)
-            self._view_pack_cache[key] = lvp
-            self._view_pack_cache.move_to_end(key)
-            self._trim_view_cache_per_scene_cap_unlocked(key[0])
-            return loaded_view_pack_to_device(lvp, self.device)
+                lvp = ent
+
+        if lvp is None:
+            self._materialize_view_pack_cache(key, scene_dataset, ref_t)
+            with self._view_pack_lock:
+                lvp = self._view_pack_cache.get(key)
+            if lvp is None:
+                raise RuntimeError(f"view pack cache still empty after materialize: key={key!r}")
+
+        H, Wim = int(lvp.image.shape[0]), int(lvp.image.shape[1])
+        ext_t = lvp.extrinsic
+        if not isinstance(ext_t, torch.Tensor):
+            ext_t = torch.as_tensor(ext_t)
+        ext_t = ext_t.to(dtype=torch.float64)
+        intr_t = lvp.intrinsic
+        if not isinstance(intr_t, torch.Tensor):
+            intr_t = torch.as_tensor(intr_t)
+        intr_t = intr_t.to(dtype=torch.float64)
+        return _from_pack_tensors(ext_t, intr_t, H, Wim)
 
     def get_segment_index(self, scene_id: int, segment_id: int) -> SegmentIndex:
         key = (int(scene_id), int(segment_id))
-        if key in self._segment_index_cache:
-            return self._segment_index_cache[key]
-        scene_data = self._ensure_scene_loaded(int(scene_id))
-        if scene_data is None:
-            raise ValueError(f"Scene {scene_id} cannot be loaded")
-        segments = scene_data.get("segments", [])
-        if int(segment_id) < 0 or int(segment_id) >= len(segments):
-            raise ValueError(f"segment_id={segment_id} out of range for scene {scene_id}")
-        idx = _build_segment_index_dict(int(scene_id), int(segment_id), scene_data)
-        self._segment_index_cache[key] = idx
-        return idx
+        with self._lock:
+            if key in self._segment_index_cache:
+                return self._segment_index_cache[key]
+        with self._segment_index_coord_lock:
+            if key in self._segment_index_inflight:
+                ev = self._segment_index_inflight[key]
+                is_waiter = True
+            else:
+                ev = threading.Event()
+                self._segment_index_inflight[key] = ev
+                is_waiter = False
+        if is_waiter:
+            ev.wait(timeout=600.0)
+            return self.get_segment_index(scene_id, segment_id)
+        try:
+            with self._lock:
+                if key in self._segment_index_cache:
+                    return self._segment_index_cache[key]
+            scene_data = self._ensure_scene_loaded(int(scene_id))
+            if scene_data is None:
+                raise ValueError(f"Scene {scene_id} cannot be loaded")
+            segments = scene_data.get("segments", [])
+            if int(segment_id) < 0 or int(segment_id) >= len(segments):
+                raise ValueError(f"segment_id={segment_id} out of range for scene {scene_id}")
+            idx = _build_segment_index_dict(int(scene_id), int(segment_id), scene_data)
+            with self._lock:
+                if key in self._segment_index_cache:
+                    return self._segment_index_cache[key]
+                self._segment_index_cache[key] = idx
+            return idx
+        finally:
+            with self._segment_index_coord_lock:
+                self._segment_index_inflight.pop(key, None)
+            ev.set()
 
     def validate_image_ref(
         self,
@@ -497,29 +1081,185 @@ class MultiSceneDatasetV3(MultiSceneDataset):
         src: ImageRef,
         tgt: ImageRef,
         mode: str = "none",
+        *,
+        point_sample_size: Optional[int] = None,
+        counts_out: Optional[Dict[str, int]] = None,
+        account_runtime_stats: bool = True,
     ) -> Optional[float]:
         if mode == "none":
             return None
-        raise NotImplementedError(
-            f"get_or_compute_pair_score with mode={mode!r} is not implemented in MultiSceneDatasetV3 v1"
+        if mode != "pointcloud_topk":
+            raise ValueError(f"get_or_compute_pair_score: unsupported mode={mode!r}")
+        if point_sample_size is None:
+            raise ValueError("get_or_compute_pair_score(mode='pointcloud_topk') requires point_sample_size")
+        if int(point_sample_size) < 1:
+            raise ValueError(f"point_sample_size must be >= 1, got {point_sample_size}")
+
+        t_wall0 = time.perf_counter()
+        sid, seg = int(scene_id), int(segment_id)
+        src_t = (int(src[0]), int(src[1]))
+        tgt_t = (int(tgt[0]), int(tgt[1]))
+        pss = int(point_sample_size)
+        cache_key = (sid, seg, src_t, tgt_t, str(mode), pss)
+        with self._lock:
+            cached = self._pair_score_cache.get(cache_key)
+        if cached is not None:
+            score, n_a, n_b, n_ab = cached
+            wall_ms = (time.perf_counter() - t_wall0) * 1000.0
+            if account_runtime_stats:
+                self._overlap_stats["pair_queries"] += 1.0
+                self._overlap_stats["pair_cache_hits"] += 1.0
+                self._overlap_stats["pair_eval_wall_ms_sum"] += wall_ms
+                self._overlap_stats["candidate_eval_count"] += 1.0
+            if counts_out is not None:
+                counts_out.clear()
+                counts_out.update({"n_a": int(n_a), "n_b": int(n_b), "n_ab": int(n_ab)})
+            return float(score)
+
+        if self.pointcloud_generator is None:
+            raise ValueError("get_or_compute_pair_score(pointcloud_topk) requires dataset.pointcloud_generator")
+
+        t_miss0 = time.perf_counter()
+        scene_data = self._ensure_scene_loaded(sid)
+        if scene_data is None:
+            raise ValueError(f"Scene {sid} cannot be loaded for pair score")
+        segments = scene_data.get("segments", [])
+        if seg < 0 or seg >= len(segments):
+            raise ValueError(f"segment_id={seg} out of range for scene {sid}")
+        segment = segments[seg]
+        scene_dataset = scene_data["dataset"]
+
+        segment_first_pose, world_to_seg0, _, _ = self._ensure_segment_pose_cached(
+            sid, seg, scene_dataset, segment
         )
+        world_to_seg0_np = world_to_seg0.detach().cpu().numpy().astype(np.float64)
+
+        pc_any = self._ensure_segment_pointcloud_cached(sid, seg, segment_first_pose)
+        if pc_any is None or not isinstance(pc_any, dict):
+            raise ValueError(f"segment pointcloud missing for scene={sid} segment={seg}")
+        bg = pc_any.get("background")
+        if bg is None:
+            raise ValueError(f"pointcloud has no 'background' for scene={sid} segment={seg}")
+        bg_np = np.asarray(bg, dtype=np.float64)
+        if bg_np.ndim != 2 or bg_np.shape[1] < 3:
+            raise ValueError(
+                f"background pointcloud must be 2D with >=3 columns, got shape={getattr(bg_np, 'shape', None)}"
+            )
+        xyz = bg_np[:, :3]
+        n_pts = int(xyz.shape[0])
+        if n_pts == 0:
+            score = 0.0
+            n_a = n_b = n_ab = 0
+            with self._lock:
+                self._pair_score_cache[cache_key] = (float(score), n_a, n_b, n_ab)
+            miss_ms = (time.perf_counter() - t_miss0) * 1000.0
+            wall_ms = (time.perf_counter() - t_wall0) * 1000.0
+            if account_runtime_stats:
+                self._overlap_stats["pair_queries"] += 1.0
+                self._overlap_stats["pair_cache_misses"] += 1.0
+                self._overlap_stats["pair_compute_miss_ms_sum"] += miss_ms
+                self._overlap_stats["pair_eval_wall_ms_sum"] += wall_ms
+                self._overlap_stats["candidate_eval_count"] += 1.0
+            if counts_out is not None:
+                counts_out.clear()
+                counts_out.update({"n_a": n_a, "n_b": n_b, "n_ab": n_ab})
+            return float(score)
+
+        m_take = min(pss, n_pts)
+        seed = (sid * 1_000_003 + seg) * 1_000_003 + pss
+        rng = np.random.default_rng(int(seed) & 0xFFFFFFFFFFFFFFFF)
+        if m_take < n_pts:
+            idx = rng.choice(n_pts, size=m_take, replace=False)
+            pts = xyz[idx].astype(np.float64, copy=False)
+        else:
+            pts = xyz.astype(np.float64, copy=False)
+
+        self.validate_image_ref(sid, seg, src_t, purpose="train")
+        self.validate_image_ref(sid, seg, tgt_t, purpose="train")
+
+        c2w_a, Ka, Ha, Wa = self._get_view_geometry_from_image_ref(
+            sid, seg, scene_dataset, src_t, world_to_seg0_np=world_to_seg0_np
+        )
+        c2w_b, Kb, Hb, Wb = self._get_view_geometry_from_image_ref(
+            sid, seg, scene_dataset, tgt_t, world_to_seg0_np=world_to_seg0_np
+        )
+
+        va = _visibility_mask_seg0(pts, c2w_a, Ka, Ha, Wa)
+        vb = _visibility_mask_seg0(pts, c2w_b, Kb, Hb, Wb)
+        n_a = int(np.sum(va))
+        n_b = int(np.sum(vb))
+        n_ab = int(np.sum(va & vb))
+        if n_a == 0:
+            score = 0.0
+            if account_runtime_stats:
+                self._overlap_stats["src_rep_no_visible"] += 1.0
+        else:
+            score = float(n_ab) / float(n_a)
+
+        with self._lock:
+            self._pair_score_cache[cache_key] = (float(score), n_a, n_b, n_ab)
+
+        miss_ms = (time.perf_counter() - t_miss0) * 1000.0
+        wall_ms = (time.perf_counter() - t_wall0) * 1000.0
+        if account_runtime_stats:
+            self._overlap_stats["pair_queries"] += 1.0
+            self._overlap_stats["pair_cache_misses"] += 1.0
+            self._overlap_stats["pair_compute_miss_ms_sum"] += miss_ms
+            self._overlap_stats["pair_eval_wall_ms_sum"] += wall_ms
+            self._overlap_stats["candidate_eval_count"] += 1.0
+
+        if counts_out is not None:
+            counts_out.clear()
+            counts_out.update({"n_a": n_a, "n_b": n_b, "n_ab": n_ab})
+        return float(score)
+
+    def is_pair_score_cached(
+        self,
+        scene_id: int,
+        segment_id: int,
+        src: ImageRef,
+        tgt: ImageRef,
+        mode: str,
+        point_sample_size: int,
+    ) -> bool:
+        cache_key = (
+            int(scene_id),
+            int(segment_id),
+            (int(src[0]), int(src[1])),
+            (int(tgt[0]), int(tgt[1])),
+            str(mode),
+            int(point_sample_size),
+        )
+        with self._lock:
+            return cache_key in self._pair_score_cache
 
     def build_preload_hint(
         self,
         scene_id: int,
         segment_id: int,
         future_image_refs: List[ImageRef],
+        future_overlap_pairs: Optional[List[Dict[str, Any]]] = None,
+        overlap_meta: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         frames = sorted({int(r[0]) for r in future_image_refs})
         cams = sorted({int(r[1]) for r in future_image_refs})
-        return {
+        hint_version = 2 if (
+            (future_overlap_pairs is not None and len(future_overlap_pairs) > 0)
+            or (overlap_meta is not None)
+        ) else 1
+        out: Dict[str, Any] = {
             "scene_id": int(scene_id),
             "segment_id": int(segment_id),
             "future_image_refs": list(future_image_refs),
             "unique_frame_indices": frames,
             "unique_cam_indices": cams,
-            "hint_version": 1,
+            "hint_version": int(hint_version),
         }
+        if future_overlap_pairs is not None:
+            out["future_overlap_pairs"] = list(future_overlap_pairs)
+        if overlap_meta is not None:
+            out["overlap_meta"] = dict(overlap_meta)
+        return out
 
     def _load_view_from_image_ref(
         self,
@@ -592,9 +1332,6 @@ class MultiSceneDatasetV3(MultiSceneDataset):
         for ref in target_image_refs:
             self.validate_image_ref(scene_id, segment_id, tuple(ref), purpose="train")
 
-        self._preload_training_scene_id = int(scene_id)
-        self._preload_training_segment_id = int(segment_id)
-
         if enforce_target0_equals_source:
             if len(source_image_refs) == 1:
                 if tuple(target_image_refs[0]) != tuple(source_image_refs[0]):
@@ -618,18 +1355,9 @@ class MultiSceneDatasetV3(MultiSceneDataset):
                         f"prefix (expected {srcs}, got target prefix {prefix})"
                     )
 
-        segment_first_pose, segment_first_frame_idx, segment_pose_source = self._get_segment_first_pose(
-            scene_dataset=scene_dataset,
-            segment=segment,
-            segment_id=int(segment_id),
+        segment_first_pose, world_to_seg0, segment_first_frame_idx, segment_pose_source = self._ensure_segment_pose_cached(
+            scene_id, segment_id, scene_dataset, segment
         )
-        segment_first_pose = segment_first_pose.to(device=self.device, dtype=torch.float32)
-        try:
-            world_to_seg0 = torch.linalg.inv(segment_first_pose)
-        except RuntimeError as exc:
-            raise ValueError(
-                f"Segment {segment_id} first pose is non-invertible; cannot build segment coordinate transform."
-            ) from exc
 
         def _transform_extrinsics_list(extrinsics_list: List[Tensor]) -> List[Tensor]:
             transformed: List[Tensor] = []
@@ -743,16 +1471,9 @@ class MultiSceneDatasetV3(MultiSceneDataset):
 
         pointcloud = None
         if self.pointcloud_generator is not None:
-            pc_key = (int(scene_id), int(segment_id))
-            pointcloud = self._segment_pointcloud_cache.get(pc_key)
-            if pointcloud is None:
-                pointcloud = self.pointcloud_generator.generate_pointcloud(
-                    dataset=self,
-                    scene_id=scene_id,
-                    segment_id=segment_id,
-                    segment_first_pose=segment_first_pose,
-                )
-                self._segment_pointcloud_cache[pc_key] = pointcloud
+            pointcloud = self._ensure_segment_pointcloud_cached(
+                int(scene_id), int(segment_id), segment_first_pose
+            )
 
         all_frame_indices: Set[int] = set(source_frame_idxs) | set(target_frame_idxs)
         if include_test:
@@ -1027,7 +1748,18 @@ class MultiSceneDatasetV3(MultiSceneDataset):
         Expand segment test frames to per-camera image refs in a fixed order (sorted frames, then cams).
         Matches the default test path in _assemble_segment_batch_from_image_refs when test_image_refs is None,
         but without random subsampling so TrainSchedulerV4 can pin the same refs for every step in a block.
+
+        Note: ``data.pixel_source.max_test_images`` caps the number of **test frame indices** selected from
+        ``test_frame_indices``; total image refs are ``len(selected_frames) * num_cams`` (not ``max_test_images``).
         """
+        pixel_source_cfg = getattr(self.data_cfg, "pixel_source", {})
+        max_test_cap = int(pixel_source_cfg.get("max_test_images", 0))
+        cache_key = (int(scene_id), int(segment_id), max_test_cap)
+        with self._lock:
+            cached = self._test_image_refs_cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
+
         sidx = self.get_segment_index(scene_id, segment_id)
         scene_data = self._ensure_scene_loaded(int(scene_id))
         if scene_data is None:
@@ -1035,11 +1767,12 @@ class MultiSceneDatasetV3(MultiSceneDataset):
         segment = scene_data["segments"][int(sidx.segment_id)]
         segment_test_frames = sorted(int(f) for f in segment.get("test_frame_indices", []))
         if len(segment_test_frames) == 0:
+            with self._lock:
+                if cache_key not in self._test_image_refs_cache:
+                    self._test_image_refs_cache[cache_key] = []
             return []
-        pixel_source_cfg = getattr(self.data_cfg, "pixel_source", {})
-        max_test_images = int(pixel_source_cfg.get("max_test_images", 0))
-        if max_test_images > 0 and len(segment_test_frames) > max_test_images:
-            selected = segment_test_frames[:max_test_images]
+        if max_test_cap > 0 and len(segment_test_frames) > max_test_cap:
+            selected = segment_test_frames[:max_test_cap]
         else:
             selected = list(segment_test_frames)
         num_cams = int(scene_data["dataset"].num_cams)
@@ -1049,6 +1782,9 @@ class MultiSceneDatasetV3(MultiSceneDataset):
                 ref: ImageRef = (int(frame_idx), int(cam_idx))
                 self.validate_image_ref(scene_id, segment_id, ref, purpose="test")
                 refs.append(ref)
+        with self._lock:
+            if cache_key not in self._test_image_refs_cache:
+                self._test_image_refs_cache[cache_key] = list(refs)
         return refs
 
     def get_segment_batch_from_image_refs(
@@ -1092,6 +1828,10 @@ class MultiSceneDatasetV3(MultiSceneDataset):
         include_test: bool,
         fixed_scene_id: Optional[int],
         fixed_segment_id: Optional[int],
+        overlap_point_sample_size: Optional[int] = None,
+        overlap_candidate_frame_policy: Optional[str] = None,
+        overlap_score_type: Optional[str] = None,
+        overlap_min: Optional[float] = None,
     ) -> "TrainSchedulerV4":
         return TrainSchedulerV4(
             dataset=self,
@@ -1113,6 +1853,10 @@ class MultiSceneDatasetV3(MultiSceneDataset):
             include_test=include_test,
             fixed_scene_id=fixed_scene_id,
             fixed_segment_id=fixed_segment_id,
+            overlap_point_sample_size=overlap_point_sample_size,
+            overlap_candidate_frame_policy=overlap_candidate_frame_policy,
+            overlap_score_type=overlap_score_type,
+            overlap_min=overlap_min,
         )
 
     def get_segment_batch_from_frames(
@@ -1207,6 +1951,10 @@ class TrainSchedulerV4:
         include_test: bool,
         fixed_scene_id: Optional[int],
         fixed_segment_id: Optional[int],
+        overlap_point_sample_size: Optional[int] = None,
+        overlap_candidate_frame_policy: Optional[str] = None,
+        overlap_score_type: Optional[str] = None,
+        overlap_min: Optional[float] = None,
     ) -> None:
         if state_write_interval_steps < 1:
             raise ValueError("state_write_interval_steps must be >= 1")
@@ -1226,10 +1974,28 @@ class TrainSchedulerV4:
             raise ValueError(f"Unsupported keyframe_window_policy={keyframe_window_policy!r}")
         if pair_order_policy != "shuffle_without_replacement":
             raise ValueError(f"Unsupported pair_order_policy={pair_order_policy!r}")
-        if overlap_mode != "none":
-            raise ValueError(
-                f"TrainSchedulerV4 v1 only supports overlap_mode='none', got {overlap_mode!r}"
-            )
+        om = str(overlap_mode)
+        if om not in ("none", "pointcloud_topk"):
+            raise ValueError(f"TrainSchedulerV4: unsupported overlap_mode={overlap_mode!r}")
+        if om == "pointcloud_topk":
+            if overlap_point_sample_size is None:
+                raise ValueError("TrainSchedulerV4: overlap_point_sample_size is required when overlap_mode=pointcloud_topk")
+            if int(overlap_point_sample_size) < 1:
+                raise ValueError(f"overlap_point_sample_size must be >= 1, got {overlap_point_sample_size}")
+            if overlap_candidate_frame_policy is None:
+                raise ValueError("overlap_candidate_frame_policy is required when overlap_mode=pointcloud_topk")
+            if str(overlap_candidate_frame_policy) != "middle":
+                raise ValueError(
+                    f"overlap_candidate_frame_policy must be 'middle', got {overlap_candidate_frame_policy!r}"
+                )
+            if overlap_score_type is None:
+                raise ValueError("overlap_score_type is required when overlap_mode=pointcloud_topk")
+            if str(overlap_score_type) != "nab_over_na":
+                raise ValueError(f"overlap_score_type must be 'nab_over_na', got {overlap_score_type!r}")
+            if overlap_min is None:
+                raise ValueError("overlap_min is required when overlap_mode=pointcloud_topk")
+            if getattr(dataset, "pointcloud_generator", None) is None:
+                raise ValueError("TrainSchedulerV4: overlap_mode=pointcloud_topk requires dataset.pointcloud_generator")
 
         self.dataset = dataset
         self.U = int(state_write_interval_steps)
@@ -1250,6 +2016,12 @@ class TrainSchedulerV4:
         self.include_test = bool(include_test)
         self.fixed_scene_id = int(fixed_scene_id) if fixed_scene_id is not None else None
         self.fixed_segment_id = int(fixed_segment_id) if fixed_segment_id is not None else None
+        self.overlap_point_sample_size = (
+            int(overlap_point_sample_size) if overlap_point_sample_size is not None else None
+        )
+        self.overlap_candidate_frame_policy = overlap_candidate_frame_policy
+        self.overlap_score_type = overlap_score_type
+        self.overlap_min = float(overlap_min) if overlap_min is not None else None
 
         self.epoch_idx = 0
         self.global_step = 0
@@ -1354,6 +2126,8 @@ class TrainSchedulerV4:
         self.epoch_idx += 1
         self.build_epoch_plan()
         self.current_segment_state = None
+        if hasattr(self.dataset, "clear_preload_scheduler_scope"):
+            self.dataset.clear_preload_scheduler_scope()
 
     def _validate_target_sampling_feasible(self, sidx: SegmentIndex) -> None:
         nk = len(sidx.keyframe_indices)
@@ -1405,12 +2179,42 @@ class TrainSchedulerV4:
     def _kf_positions(self, sidx: SegmentIndex) -> Dict[int, int]:
         return {int(k): i for i, k in enumerate(sidx.keyframe_indices)}
 
+    def _extra_target_keyframe_pool(
+        self,
+        sidx: SegmentIndex,
+        kf_src: int,
+        episode_window: List[int],
+        pos: Dict[int, int],
+        pos_src: int,
+    ) -> List[int]:
+        """Ordered unique keyframes != kf_src: episode window first, then segment-only (if expand)."""
+        window_kfs = {int(k) for k in episode_window}
+        part1 = [int(k) for k in episode_window if int(k) != int(kf_src)]
+        if self.prefer_nearby_keyframes:
+            part1.sort(key=lambda k: abs(int(pos[k]) - pos_src))
+        part2: List[int] = []
+        if self.fallback_expand_to_segment:
+            part2 = [
+                int(k)
+                for k in sidx.keyframe_indices
+                if int(k) != int(kf_src) and int(k) not in window_kfs
+            ]
+            if self.prefer_nearby_keyframes:
+                part2.sort(key=lambda k: abs(int(pos[k]) - pos_src))
+        seen: Set[int] = set()
+        out: List[int] = []
+        for k in part1 + part2:
+            if k not in seen:
+                seen.add(k)
+                out.append(k)
+        return out
+
     def _sample_target_image_refs(
         self,
         sidx: SegmentIndex,
         source_image_ref: ImageRef,
         episode_window: List[int],
-    ) -> List[ImageRef]:
+    ) -> Tuple[List[ImageRef], Optional[Dict[str, Any]]]:
         f_src, cam_src = int(source_image_ref[0]), int(source_image_ref[1])
         kf_src = int(sidx.frame_to_keyframe[f_src])
         pos = self._kf_positions(sidx)
@@ -1421,53 +2225,176 @@ class TrainSchedulerV4:
         refs: List[ImageRef] = [(f_src, cam_src)]
         extra_needed = self.total_target_images - 1
         if extra_needed <= 0:
-            return refs
+            return refs, None
 
-        def _sorted_window_others() -> List[int]:
-            others = [int(k) for k in episode_window if int(k) != kf_src]
-            if self.prefer_nearby_keyframes:
-                others.sort(key=lambda k: abs(int(pos[k]) - pos_src))
-            return others
+        if self.overlap_mode == "none":
 
-        def _sorted_segment_others() -> List[int]:
-            others = [int(k) for k in sidx.keyframe_indices if int(k) != kf_src]
-            if self.prefer_nearby_keyframes:
-                others.sort(key=lambda k: abs(int(pos[k]) - pos_src))
-            return others
+            def _sorted_window_others() -> List[int]:
+                others = [int(k) for k in episode_window if int(k) != kf_src]
+                if self.prefer_nearby_keyframes:
+                    others.sort(key=lambda k: abs(int(pos[k]) - pos_src))
+                return others
 
-        picked_kfs: List[int] = []
-        for kf in _sorted_window_others():
-            if len(picked_kfs) >= extra_needed:
-                break
-            picked_kfs.append(kf)
+            def _sorted_segment_others() -> List[int]:
+                others = [int(k) for k in sidx.keyframe_indices if int(k) != kf_src]
+                if self.prefer_nearby_keyframes:
+                    others.sort(key=lambda k: abs(int(pos[k]) - pos_src))
+                return others
 
-        if len(picked_kfs) < extra_needed and self.fallback_expand_to_segment:
-            for kf in _sorted_segment_others():
+            picked_kfs: List[int] = []
+            for kf in _sorted_window_others():
                 if len(picked_kfs) >= extra_needed:
                     break
-                if kf in picked_kfs:
-                    continue
                 picked_kfs.append(kf)
 
-        if len(picked_kfs) < extra_needed:
-            if not self.fallback_with_replacement:
-                raise ValueError(
-                    f"Not enough distinct keyframes for {extra_needed} extra targets "
-                    f"(scene={sidx.scene_id} segment={sidx.segment_id})"
-                )
-            pool = [int(k) for k in sidx.keyframe_indices if int(k) != kf_src]
-            if len(pool) == 0:
-                raise ValueError(
-                    f"No non-source keyframes for extra targets (scene={sidx.scene_id} segment={sidx.segment_id})"
-                )
-            while len(picked_kfs) < extra_needed:
-                picked_kfs.append(int(random.choice(pool)))
+            if len(picked_kfs) < extra_needed and self.fallback_expand_to_segment:
+                for kf in _sorted_segment_others():
+                    if len(picked_kfs) >= extra_needed:
+                        break
+                    if kf in picked_kfs:
+                        continue
+                    picked_kfs.append(kf)
 
-        for kf in picked_kfs[:extra_needed]:
+            if len(picked_kfs) < extra_needed:
+                if not self.fallback_with_replacement:
+                    raise ValueError(
+                        f"Not enough distinct keyframes for {extra_needed} extra targets "
+                        f"(scene={sidx.scene_id} segment={sidx.segment_id})"
+                    )
+                pool = [int(k) for k in sidx.keyframe_indices if int(k) != kf_src]
+                if len(pool) == 0:
+                    raise ValueError(
+                        f"No non-source keyframes for extra targets (scene={sidx.scene_id} segment={sidx.segment_id})"
+                    )
+                while len(picked_kfs) < extra_needed:
+                    picked_kfs.append(int(random.choice(pool)))
+
+            for kf in picked_kfs[:extra_needed]:
+                frame_tgt = int(random.choice(sidx.keyframe_to_frames[int(kf)]))
+                refs.append((frame_tgt, cam_src))
+
+            return refs, None
+
+        # overlap_mode == "pointcloud_topk"
+        assert self.overlap_point_sample_size is not None
+        pool = self._extra_target_keyframe_pool(sidx, kf_src, episode_window, pos, pos_src)
+        if len(pool) == 0:
+            raise ValueError(
+                f"No candidate keyframes for overlap (scene={sidx.scene_id} segment={sidx.segment_id})"
+            )
+
+        rep_src_frame = representative_frame_for_keyframe(sidx, kf_src)
+        rep_src: ImageRef = (rep_src_frame, cam_src)
+        candidate_rep_image_refs: List[ImageRef] = [
+            (representative_frame_for_keyframe(sidx, int(kf)), cam_src) for kf in pool
+        ]
+        candidate_keyframe_indices = [int(k) for k in pool]
+        candidate_target_image_ref_lists: List[List[List[int]]] = [
+            [[int(f), int(cam_src)] for f in sidx.keyframe_to_frames[int(kf)]] for kf in pool
+        ]
+
+        scored_rows: List[Tuple[int, int, float]] = []
+        cache_hits = 0
+        cache_misses = 0
+        pair_compute_miss_time_ms_total = 0.0
+        pair_eval_wall_time_ms_total = 0.0
+        candidate_pair_counts: List[Dict[str, int]] = []
+        pss = int(self.overlap_point_sample_size)
+        sid, seg = int(sidx.scene_id), int(sidx.segment_id)
+
+        for pi, kf in enumerate(pool):
+            rep_tgt = (representative_frame_for_keyframe(sidx, int(kf)), cam_src)
+            was_cached = self.dataset.is_pair_score_cached(
+                sid, seg, rep_src, rep_tgt, "pointcloud_topk", pss
+            )
+            t0 = time.perf_counter()
+            cnts: Dict[str, int] = {}
+            score = self.dataset.get_or_compute_pair_score(
+                sid,
+                seg,
+                rep_src,
+                rep_tgt,
+                mode="pointcloud_topk",
+                point_sample_size=pss,
+                counts_out=cnts,
+            )
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+            pair_eval_wall_time_ms_total += dt_ms
+            if score is None:
+                raise ValueError("get_or_compute_pair_score(pointcloud_topk) returned None")
+            s = float(score)
+            scored_rows.append((pi, int(kf), s))
+            candidate_pair_counts.append(dict(cnts))
+            if was_cached:
+                cache_hits += 1
+            else:
+                cache_misses += 1
+                pair_compute_miss_time_ms_total += dt_ms
+
+        scored_rows.sort(key=lambda r: (-r[2], r[0]))
+        ranked_kfs = [int(r[1]) for r in scored_rows]
+        candidate_scores = [float(r[2]) for r in sorted(scored_rows, key=lambda r: r[0])]
+
+        assert self.overlap_min is not None
+        thr = float(self.overlap_min)
+        above_kfs = [int(r[1]) for r in scored_rows if float(r[2]) > thr]
+        extra_target_pick_policy: str
+        picked_kfs: List[int] = []
+        if len(above_kfs) >= extra_needed:
+            extra_target_pick_policy = "random_above_min"
+            picked_kfs = list(random.sample(above_kfs, int(extra_needed)))
+        else:
+            extra_target_pick_policy = "topk_fallback"
+            if len(ranked_kfs) >= extra_needed:
+                picked_kfs = ranked_kfs[:extra_needed]
+            else:
+                if not self.fallback_with_replacement:
+                    raise ValueError(
+                        f"Not enough distinct keyframes for {extra_needed} extra targets "
+                        f"(scene={sidx.scene_id} segment={sidx.segment_id})"
+                    )
+                if len(ranked_kfs) == 0:
+                    raise ValueError("ranked_kfs is empty (internal error)")
+                for j in range(extra_needed):
+                    picked_kfs.append(ranked_kfs[j % len(ranked_kfs)])
+
+        selected_target_scores: List[float] = []
+        for kf in picked_kfs:
+            for r in scored_rows:
+                if r[1] == kf:
+                    selected_target_scores.append(float(r[2]))
+                    break
+
+        for kf in picked_kfs:
             frame_tgt = int(random.choice(sidx.keyframe_to_frames[int(kf)]))
             refs.append((frame_tgt, cam_src))
 
-        return refs
+        overlap_payload: Dict[str, Any] = {
+            "scene_id": sid,
+            "segment_id": seg,
+            "overlap_mode": "pointcloud_topk",
+            "overlap_score_type": str(self.overlap_score_type),
+            "overlap_min": float(thr),
+            "extra_target_pick_policy": extra_target_pick_policy,
+            "candidates_above_min_count": int(len(above_kfs)),
+            "extra_target_count": int(extra_needed),
+            "overlap_point_sample_size": pss,
+            "source_image_ref": [int(source_image_ref[0]), int(source_image_ref[1])],
+            "source_keyframe_idx": int(kf_src),
+            "source_rep_image_ref": [int(rep_src[0]), int(rep_src[1])],
+            "candidate_rep_image_refs": [[int(a[0]), int(a[1])] for a in candidate_rep_image_refs],
+            "candidate_target_image_ref_lists": candidate_target_image_ref_lists,
+            "candidate_keyframe_indices": candidate_keyframe_indices,
+            "candidate_scores": candidate_scores,
+            "candidate_pair_counts": candidate_pair_counts,
+            "selected_target_image_refs": [[int(x[0]), int(x[1])] for x in refs[1:]],
+            "selected_target_scores": selected_target_scores,
+            "cache_hits": int(cache_hits),
+            "cache_misses": int(cache_misses),
+            "pair_compute_miss_time_ms_total": float(pair_compute_miss_time_ms_total),
+            "pair_eval_wall_time_ms_total": float(pair_eval_wall_time_ms_total),
+        }
+        return refs, overlap_payload
 
     def _refs_for_pair(
         self,
@@ -1475,11 +2402,11 @@ class TrainSchedulerV4:
         kf: int,
         cam: int,
         episode_window: List[int],
-    ) -> Tuple[ImageRef, List[ImageRef]]:
+    ) -> Tuple[ImageRef, List[ImageRef], Optional[Dict[str, Any]]]:
         frame_src = int(random.choice(sidx.keyframe_to_frames[int(kf)]))
         source_ref: ImageRef = (frame_src, int(cam))
-        target_refs = self._sample_target_image_refs(sidx, source_ref, episode_window)
-        return source_ref, target_refs
+        target_refs, overlap_payload = self._sample_target_image_refs(sidx, source_ref, episode_window)
+        return source_ref, target_refs, overlap_payload
 
     def _emit_preload_hint_episode_superset(
         self, scene_id: int, segment_id: int, pair_list: List[Tuple[int, int]]
@@ -1496,7 +2423,44 @@ class TrainSchedulerV4:
                 if t not in seen:
                     seen.add(t)
                     ordered.append(t)
-        hint = self.dataset.build_preload_hint(scene_id, segment_id, future_image_refs=ordered)
+        if self.overlap_mode == "pointcloud_topk" and self.overlap_point_sample_size is not None:
+            st_ep = self.current_segment_state
+            if st_ep is None:
+                raise ValueError("TrainSchedulerV4: current_segment_state is None for episode superset overlap pairs")
+            episode_window = list(st_ep["episode_window_keyframes"])
+            pos = self._kf_positions(sidx)
+            seen_pairs: Set[Tuple[int, int, int, int]] = set()
+            pair_dicts: List[Dict[str, Any]] = []
+            for kf_src, cam_src in pair_list:
+                pos_src = int(pos[int(kf_src)])
+                pool = self._extra_target_keyframe_pool(
+                    sidx, int(kf_src), episode_window, pos, pos_src
+                )
+                rf_src = int(representative_frame_for_keyframe(sidx, int(kf_src)))
+                for kf_tgt in pool:
+                    rf_tgt = int(representative_frame_for_keyframe(sidx, int(kf_tgt)))
+                    key = (rf_src, int(cam_src), rf_tgt, int(cam_src))
+                    if key in seen_pairs:
+                        continue
+                    seen_pairs.add(key)
+                    pair_dicts.append(
+                        {
+                            "src_rep_image_ref": [key[0], key[1]],
+                            "tgt_rep_image_ref": [key[2], key[3]],
+                        }
+                    )
+            hint = self.dataset.build_preload_hint(
+                scene_id,
+                segment_id,
+                future_image_refs=ordered,
+                future_overlap_pairs=pair_dicts,
+                overlap_meta={
+                    "mode": "pointcloud_topk",
+                    "point_sample_size": int(self.overlap_point_sample_size),
+                },
+            )
+        else:
+            hint = self.dataset.build_preload_hint(scene_id, segment_id, future_image_refs=ordered)
         if self.emit_preload_hints:
             self._emit(
                 {
@@ -1533,9 +2497,30 @@ class TrainSchedulerV4:
         try:
             kf, cam = pair_list[pc]
             sidx = self.dataset.get_segment_index(scene_id, segment_id)
-            src, tgts = self._refs_for_pair(sidx, int(kf), int(cam), list(st["episode_window_keyframes"]))
+            src, tgts, overlap_pl = self._refs_for_pair(
+                sidx, int(kf), int(cam), list(st["episode_window_keyframes"])
+            )
             future = list(dict.fromkeys(list([src]) + list(tgts)))
-            hint = self.dataset.build_preload_hint(scene_id, segment_id, future_image_refs=future)
+            if overlap_pl is not None:
+                sr = overlap_pl["source_rep_image_ref"]
+                cands = overlap_pl["candidate_rep_image_refs"]
+                pss = int(overlap_pl["overlap_point_sample_size"])
+                overlap_pairs: List[Dict[str, Any]] = [
+                    {
+                        "src_rep_image_ref": [int(sr[0]), int(sr[1])],
+                        "tgt_rep_image_ref": [int(cr[0]), int(cr[1])],
+                    }
+                    for cr in cands
+                ]
+                hint = self.dataset.build_preload_hint(
+                    scene_id,
+                    segment_id,
+                    future_image_refs=future,
+                    future_overlap_pairs=overlap_pairs,
+                    overlap_meta={"mode": "pointcloud_topk", "point_sample_size": pss},
+                )
+            else:
+                hint = self.dataset.build_preload_hint(scene_id, segment_id, future_image_refs=future)
             if self.emit_preload_hints:
                 self._emit(
                     {
@@ -1621,7 +2606,7 @@ class TrainSchedulerV4:
 
         kf_src, cam_src = st["pair_list"][int(st["pair_cursor"])]
         st["pair_cursor"] = int(st["pair_cursor"]) + 1
-        source_ref, target_refs = self._refs_for_pair(
+        source_ref, target_refs, overlap_payload = self._refs_for_pair(
             sidx, int(kf_src), int(cam_src), list(st["episode_window_keyframes"])
         )
         frame_src = int(source_ref[0])
@@ -1650,31 +2635,46 @@ class TrainSchedulerV4:
         else:
             st["block_test_image_refs"] = None
 
-        self._emit(
-            {
-                "type": "block_begin",
+        if overlap_payload is not None:
+            ev_os = {
+                "type": "overlap_select",
                 "epoch_idx": int(self.epoch_idx),
                 "global_step": int(self.global_step),
-                "scene_id": scene_id,
-                "segment_id": segment_id,
                 "reset_episode_idx": int(self._reset_episode_idx),
                 "block_idx_in_episode": int(st["block_idx_in_episode"]),
                 "block_idx_in_segment": int(st["block_idx_in_segment"]),
                 "block_idx_global": int(st["block_idx_global"]),
-                "source_keyframe_idx": int(kf_src),
-                "source_frame_idx": int(frame_src),
-                "source_cam_idx": int(cam_src),
-                "source_image_ref": tuple(source_ref),
-                "target_image_refs": [tuple(x) for x in target_refs],
-                "U": int(self.U),
-                "updates_per_block": int(self.updates_per_block),
-                "effective_u_this_block": eff_u,
-                "K_u_nominal": int(self.updates_per_block),
-                "K_u_effective": eff_u,
-                "K_steps_effective": int(K_steps_effective),
-                "K_steps": int(K_steps_effective),
+                **overlap_payload,
             }
-        )
+            self._emit(ev_os)
+
+        bb: Dict[str, Any] = {
+            "type": "block_begin",
+            "epoch_idx": int(self.epoch_idx),
+            "global_step": int(self.global_step),
+            "scene_id": scene_id,
+            "segment_id": segment_id,
+            "reset_episode_idx": int(self._reset_episode_idx),
+            "block_idx_in_episode": int(st["block_idx_in_episode"]),
+            "block_idx_in_segment": int(st["block_idx_in_segment"]),
+            "block_idx_global": int(st["block_idx_global"]),
+            "source_keyframe_idx": int(kf_src),
+            "source_frame_idx": int(frame_src),
+            "source_cam_idx": int(cam_src),
+            "source_image_ref": tuple(source_ref),
+            "target_image_refs": [tuple(x) for x in target_refs],
+            "U": int(self.U),
+            "updates_per_block": int(self.updates_per_block),
+            "effective_u_this_block": eff_u,
+            "K_u_nominal": int(self.updates_per_block),
+            "K_u_effective": eff_u,
+            "K_steps_effective": int(K_steps_effective),
+            "K_steps": int(K_steps_effective),
+            "overlap_mode": str(self.overlap_mode),
+        }
+        if overlap_payload is not None and overlap_payload.get("selected_target_scores") is not None:
+            bb["selected_target_scores"] = list(overlap_payload["selected_target_scores"])
+        self._emit(bb)
         self._emit_preload_hint_next_block_exact(st)
         return True
 
@@ -1695,6 +2695,8 @@ class TrainSchedulerV4:
         )
         self.plan_cursor += 1
         self.current_segment_state = None
+        if hasattr(self.dataset, "clear_preload_scheduler_scope"):
+            self.dataset.clear_preload_scheduler_scope()
 
     def _enter_segment(self) -> None:
         self._ensure_epoch_plan_index(self.plan_cursor)
@@ -1729,6 +2731,8 @@ class TrainSchedulerV4:
             "source_cam_idx": -1,
         }
         self.dataset.set_preload_active_scope(scene_id, segment_id)
+        if hasattr(self.dataset, "set_preload_training_scope"):
+            self.dataset.set_preload_training_scope(scene_id, segment_id)
         self._emit(
             {
                 "type": "segment_begin",
@@ -1785,6 +2789,21 @@ class TrainSchedulerV4:
         st["segment_local_step"] = int(st["segment_local_step"]) + 1
         self.global_step += 1
 
+        # Aligns with this `batch` before block_end / _start_block mutates `st` (get_current_info() would
+        # otherwise describe the *next* block after a completed block).
+        batch["_scheduler_v4_aligned_info"] = {
+            "epoch_idx": int(self.epoch_idx),
+            "global_step": int(self.global_step),
+            "scene_id": int(st["scene_id"]),
+            "segment_id": int(st["segment_id"]),
+            "segment_local_step": int(st["segment_local_step"]),
+            "block_idx_in_segment": int(st.get("block_idx_in_segment", -1)),
+            "block_idx_global": int(st.get("block_idx_global", 0)),
+            "source_image_ref": tuple(st["source_image_ref"]),
+            "target_image_refs": [tuple(x) for x in st["target_image_refs"]],
+            "U": int(self.U),
+        }
+
         if int(st["segment_local_step"]) % self.U == 0:
             st["segment_local_u"] = int(st["segment_local_u"]) + 1
             st["u_in_block"] = int(st["u_in_block"]) + 1
@@ -1814,6 +2833,10 @@ class TrainSchedulerV4:
                 else:
                     self._start_block()
 
+        if hasattr(self.dataset, "maybe_log_preload_stats"):
+            self.dataset.maybe_log_preload_stats(int(self.global_step))
+        if hasattr(self.dataset, "maybe_log_overlap_stats"):
+            self.dataset.maybe_log_overlap_stats(int(self.global_step))
         return batch
 
     def get_current_info(self) -> Dict[str, Any]:
