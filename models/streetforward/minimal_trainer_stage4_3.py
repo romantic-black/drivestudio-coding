@@ -4,6 +4,7 @@ Minimal StreetForward Stage 4.3: Stage 4.2 + sky GS shell (hemisphere, two-pass 
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import logging
 import time
 from collections import defaultdict
@@ -29,6 +30,15 @@ from models.streetforward.node_states import NodeStateBackground, NodeStateDista
 from models.streetforward.sky_shell_init import SKY_UP_MULTISCENE, fibonacci_shell_means, sky_base_from_aabb
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class RuntimePolicy:
+    do_backward: bool
+    do_optimizer_step: bool
+    update_hidden_cache: bool
+    writeback_node_state: bool
+    reset_node_state_after_block: bool
 
 
 def _composite_sky_gs(pred_rgb: torch.Tensor, opacity: torch.Tensor, rgb_sky: torch.Tensor) -> torch.Tensor:
@@ -1059,6 +1069,338 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
             if valid_idx.numel() > 0:
                 self._update_node_state_rigid_local(out["_node_state_rigid"], out["_render_params_rigid_local"], valid_idx)
 
+    def _default_runtime_policy(self) -> RuntimePolicy:
+        return RuntimePolicy(
+            do_backward=True,
+            do_optimizer_step=True,
+            update_hidden_cache=True,
+            writeback_node_state=True,
+            reset_node_state_after_block=True,
+        )
+
+    def _resolve_export_key_and_ref_frame(
+        self,
+        batch_or_key: Dict[str, Any] | Tuple[int, int],
+        rigid_export_frame_idx: Optional[int],
+    ) -> Tuple[Tuple[int, int], int]:
+        if isinstance(batch_or_key, tuple):
+            key = (int(batch_or_key[0]), int(batch_or_key[1]))
+            if rigid_export_frame_idx is None:
+                raise ValueError(
+                    "export_3dgs_state(batch_or_key=tuple) requires rigid_export_frame_idx "
+                    "to export rigid branch in world/seg0 coordinates."
+                )
+            return key, int(rigid_export_frame_idx)
+        if not isinstance(batch_or_key, dict):
+            raise ValueError("batch_or_key must be a batch dict or cache key tuple(scene_id, segment_id)")
+        key = self._batch_key(batch_or_key)
+        if rigid_export_frame_idx is not None:
+            return key, int(rigid_export_frame_idx)
+        src_views = batch_or_key.get("source_views") or []
+        if src_views:
+            return key, int(src_views[0]["frame_idx"])
+        targets = batch_or_key.get("targets") or []
+        if targets:
+            return key, int(targets[0]["frame_idx"])
+        raise ValueError(
+            "Cannot infer rigid_export_frame_idx from batch; pass rigid_export_frame_idx explicitly."
+        )
+
+    def _as_cpu_tensor(self, x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if x is None:
+            return None
+        return x.detach().cpu()
+
+    def export_3dgs_state(
+        self,
+        batch_or_key: Dict[str, Any] | Tuple[int, int],
+        *,
+        include_hidden: bool = False,
+        rigid_export_frame_idx: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Export branch states. Rigid branch is exported in world/seg0 semantics under rigid_world.
+        """
+        key, rigid_ref_frame = self._resolve_export_key_and_ref_frame(batch_or_key, rigid_export_frame_idx)
+        node_bg = self.node_states_bg.get(key)
+        if node_bg is None:
+            raise ValueError(f"No bg node state for cache key {key}")
+        node_distant = self.node_states_distant.get(key)
+        node_rigid = self.node_states_rigid.get(key)
+        node_sky = self.node_states_sky.get(key)
+
+        def _pack_branch(state: Any) -> Optional[Dict[str, torch.Tensor]]:
+            if state is None:
+                return None
+            return {
+                "means": self._as_cpu_tensor(state.means),
+                "scales_log": self._as_cpu_tensor(state.scales_log),
+                "quats": self._as_cpu_tensor(state.quats),
+                "opacity_logit": self._as_cpu_tensor(state.opacity_logit),
+                "sh_dc": self._as_cpu_tensor(state.sh_dc),
+                "sh_rest": self._as_cpu_tensor(state.sh_rest),
+            }
+
+        rigid_world: Optional[Dict[str, torch.Tensor]] = None
+        rigid_local = _pack_branch(node_rigid)
+        if node_rigid is not None:
+            point_ids = node_rigid.point_ids[:, 0] if node_rigid.point_ids.dim() > 1 else node_rigid.point_ids
+            means_w = self._transform_rigid_to_world(node_rigid, node_rigid.means, rigid_ref_frame, point_ids_subset=point_ids)
+            quats_w = self._transform_rigid_quats_to_world(
+                node_rigid, node_rigid.quats, rigid_ref_frame, point_ids_subset=point_ids
+            )
+            rigid_world = {
+                "means": self._as_cpu_tensor(means_w),
+                "scales_log": self._as_cpu_tensor(node_rigid.scales_log),
+                "quats": self._as_cpu_tensor(quats_w),
+                "opacity_logit": self._as_cpu_tensor(node_rigid.opacity_logit),
+                "sh_dc": self._as_cpu_tensor(node_rigid.sh_dc),
+                "sh_rest": self._as_cpu_tensor(node_rigid.sh_rest),
+            }
+
+        state: Dict[str, Any] = {
+            "cache_key": {"scene_id": int(key[0]), "segment_id": int(key[1])},
+            "coordinate_frame": "world/seg0",
+            "rigid_export_frame_idx": int(rigid_ref_frame),
+            "branches": {
+                "bg": _pack_branch(node_bg),
+                "distant": _pack_branch(node_distant),
+                "sky": _pack_branch(node_sky),
+                "rigid_local": rigid_local,
+                "rigid_world": rigid_world,
+            },
+        }
+
+        if isinstance(batch_or_key, dict):
+            req_meta = batch_or_key.get("request_meta") or {}
+            src_refs = req_meta.get("source_image_refs")
+            test_refs = req_meta.get("test_image_refs")
+            if src_refs is not None:
+                state["source_image_refs"] = list(src_refs)
+            if test_refs is not None:
+                state["test_image_refs"] = list(test_refs)
+            if batch_or_key.get("aabb") is not None:
+                state["segment_aabb"] = self._as_cpu_tensor(batch_or_key["aabb"])
+            if batch_or_key.get("segment_first_frame_idx") is not None:
+                state["segment_first_frame_idx"] = int(batch_or_key["segment_first_frame_idx"])
+
+        if include_hidden:
+            state["hidden"] = {
+                "bg": self._as_cpu_tensor(self.h_cache_bg.get(key)),
+                "distant": self._as_cpu_tensor(self.h_cache_distant.get(key)),
+                "rigid": self._as_cpu_tensor(self.h_cache_rigid.get(key)),
+                "sky": self._as_cpu_tensor(self.h_cache_sky.get(key)),
+            }
+        return state
+
+    def ensure_runtime_state_from_batch(self, batch: Dict[str, Any]) -> Tuple[NodeStateBackground, Optional[NodeStateRigid], Optional[NodeStateDistant], NodeStateSky]:
+        targets = batch.get("targets") or []
+        if len(targets) == 0:
+            raise ValueError("ensure_runtime_state_from_batch requires non-empty batch['targets']")
+        node_bg, node_rigid, node_distant = self._get_or_init_node_states_bg_rigid_distant(batch)
+        node_sky = self._get_or_init_node_state_sky(batch)
+        return node_bg, node_rigid, node_distant, node_sky
+
+    def _snapshot_runtime_state(self, key: Tuple[int, int]) -> Dict[str, Any]:
+        def _clone_state(s: Any) -> Any:
+            if s is None:
+                return None
+            out: Dict[str, Any] = {}
+            for k, v in vars(s).items():
+                if torch.is_tensor(v):
+                    out[k] = v.detach().clone()
+                else:
+                    out[k] = v
+            return out
+
+        return {
+            "bg": _clone_state(self.node_states_bg.get(key)),
+            "distant": _clone_state(self.node_states_distant.get(key)),
+            "rigid": _clone_state(self.node_states_rigid.get(key)),
+            "sky": _clone_state(self.node_states_sky.get(key)),
+            "h_bg": self.h_cache_bg.get(key).detach().clone() if key in self.h_cache_bg else None,
+            "h_distant": self.h_cache_distant.get(key).detach().clone() if key in self.h_cache_distant else None,
+            "h_rigid": self.h_cache_rigid.get(key).detach().clone() if key in self.h_cache_rigid else None,
+            "h_sky": self.h_cache_sky.get(key).detach().clone() if key in self.h_cache_sky else None,
+        }
+
+    def _restore_runtime_state(self, key: Tuple[int, int], snap: Dict[str, Any]) -> None:
+        def _restore(dst: Any, src: Dict[str, Any]) -> None:
+            for k, v in src.items():
+                if torch.is_tensor(v):
+                    setattr(dst, k, v.to(self.device))
+                else:
+                    setattr(dst, k, v)
+
+        if snap.get("bg") is not None and key in self.node_states_bg:
+            _restore(self.node_states_bg[key], snap["bg"])
+        if snap.get("distant") is not None and key in self.node_states_distant:
+            _restore(self.node_states_distant[key], snap["distant"])
+        if snap.get("rigid") is not None and key in self.node_states_rigid:
+            _restore(self.node_states_rigid[key], snap["rigid"])
+        if snap.get("sky") is not None and key in self.node_states_sky:
+            _restore(self.node_states_sky[key], snap["sky"])
+
+        for cache, name in (
+            (self.h_cache_bg, "h_bg"),
+            (self.h_cache_distant, "h_distant"),
+            (self.h_cache_rigid, "h_rigid"),
+            (self.h_cache_sky, "h_sky"),
+        ):
+            v = snap.get(name)
+            if v is None:
+                cache.pop(key, None)
+            else:
+                cache[key] = v.to(self.device)
+
+    def import_3dgs_state(self, state: Dict[str, Any], *, batch_context: Optional[Dict[str, Any]] = None) -> None:
+        key_block = state.get("cache_key")
+        if not isinstance(key_block, dict):
+            raise ValueError("state.cache_key is required")
+        key = (int(key_block["scene_id"]), int(key_block["segment_id"]))
+        branches = state.get("branches")
+        if not isinstance(branches, dict):
+            raise ValueError("state.branches is required")
+        if batch_context is not None:
+            self.ensure_runtime_state_from_batch(batch_context)
+
+        def _apply(dst: Any, src: Dict[str, Any]) -> Any:
+            dst.means = src["means"].to(self.device)
+            dst.scales_log = src["scales_log"].to(self.device)
+            dst.quats = src["quats"].to(self.device)
+            dst.opacity_logit = src["opacity_logit"].to(self.device)
+            dst.sh_dc = src["sh_dc"].to(self.device)
+            dst.sh_rest = src["sh_rest"].to(self.device)
+            return dst
+
+        if branches.get("bg") is not None:
+            if key not in self.node_states_bg:
+                raise ValueError(f"Cannot import bg: key {key} does not exist in model caches")
+            self.node_states_bg[key] = _apply(self.node_states_bg[key], branches["bg"])
+        if branches.get("distant") is not None:
+            if key not in self.node_states_distant:
+                raise ValueError(f"Cannot import distant: key {key} does not exist in model caches")
+            self.node_states_distant[key] = _apply(self.node_states_distant[key], branches["distant"])
+        if branches.get("sky") is not None:
+            if key not in self.node_states_sky:
+                raise ValueError(f"Cannot import sky: key {key} does not exist in model caches")
+            self.node_states_sky[key] = _apply(self.node_states_sky[key], branches["sky"])
+        if branches.get("rigid_local") is not None:
+            if key not in self.node_states_rigid:
+                raise ValueError(f"Cannot import rigid_local: key {key} does not exist in model caches")
+            self.node_states_rigid[key] = _apply(self.node_states_rigid[key], branches["rigid_local"])
+
+        hidden = state.get("hidden")
+        if isinstance(hidden, dict):
+            for cache, name in (
+                (self.h_cache_bg, "bg"),
+                (self.h_cache_distant, "distant"),
+                (self.h_cache_rigid, "rigid"),
+                (self.h_cache_sky, "sky"),
+            ):
+                h = hidden.get(name)
+                if h is not None:
+                    cache[key] = h.to(self.device)
+
+    def build_scene_representation_from_source(
+        self,
+        batch: Dict,
+        *,
+        allow_hidden_cache_update: bool,
+        allow_node_state_writeback: bool,
+    ) -> Dict[str, Any]:
+        source_views = batch.get("source_views") or []
+        source_images = batch.get("source_images") or []
+        if len(source_views) == 0 or len(source_images) == 0:
+            raise ValueError("batch must contain non-empty source_views/source_images")
+        first_view = source_views[0]
+        first_image = source_images[0]
+        src_target = {
+            "view": first_view,
+            "gt_image": first_image,
+            "frame_idx": int(first_view["frame_idx"]),
+            "cam_idx": int(first_view["cam_idx"]),
+            "sky_mask": first_view.get("sky_mask"),
+            "egocar_mask": first_view.get("egocar_mask"),
+        }
+        infer_batch = dict(batch)
+        infer_batch["targets"] = [src_target]
+        # Ensure runtime states exist for this cache key before building representation.
+        self.ensure_runtime_state_from_batch(infer_batch)
+        key = self._batch_key(infer_batch)
+        snap = self._snapshot_runtime_state(key)
+        prev_mode = self.training
+        self.eval()
+        with torch.no_grad():
+            out = self.forward(infer_batch)
+        if prev_mode:
+            self.train()
+
+        out_key = out.get("_cache_key")
+        if out_key is not None and tuple(out_key) != tuple(key):
+            key = (int(out_key[0]), int(out_key[1]))
+        if allow_hidden_cache_update:
+            if out.get("_h_new_bg") is not None:
+                self.h_cache_bg[key] = out["_h_new_bg"].detach()
+            if out.get("_h_new_distant") is not None:
+                self.h_cache_distant[key] = out["_h_new_distant"].detach()
+            if out.get("_h_new_rigid") is not None:
+                self.h_cache_rigid[key] = out["_h_new_rigid"].detach()
+            if out.get("_h_new_sky") is not None:
+                self.h_cache_sky[key] = out["_h_new_sky"].detach()
+        # Always materialize one built state for export, but restore runtime when writeback is disallowed.
+        self._writeback_node_states_from_out(out)
+        gs_state = self.export_3dgs_state(
+            infer_batch,
+            include_hidden=allow_hidden_cache_update,
+            rigid_export_frame_idx=int(src_target["frame_idx"]),
+        )
+        if not allow_node_state_writeback:
+            self._restore_runtime_state(key, snap)
+        return {
+            "cache_key": key,
+            "base_batch": infer_batch,
+            "gs_state": gs_state,
+        }
+
+    def render_views_from_scene_state(
+        self,
+        scene_state: Dict[str, Any],
+        eval_views: List[Dict[str, Any]],
+    ) -> List[torch.Tensor]:
+        if len(eval_views) == 0:
+            return []
+        if "base_batch" not in scene_state or "gs_state" not in scene_state:
+            raise ValueError("scene_state must contain base_batch and gs_state")
+        src_batch = dict(scene_state["base_batch"])
+        self.ensure_runtime_state_from_batch(src_batch)
+        key = self._batch_key(src_batch)
+        snap = self._snapshot_runtime_state(key)
+        targets: List[Dict[str, Any]] = []
+        for v in eval_views:
+            if "gt_image" not in v:
+                raise ValueError("Each eval_view must provide gt_image for render size inference")
+            targets.append(
+                {
+                    "view": v["view"],
+                    "gt_image": v["gt_image"],
+                    "frame_idx": int(v["frame_idx"]),
+                    "cam_idx": int(v.get("cam_idx", -1)),
+                    "sky_mask": v.get("sky_mask"),
+                    "egocar_mask": v.get("egocar_mask"),
+                }
+            )
+        src_batch["targets"] = targets
+        self.import_3dgs_state(scene_state["gs_state"], batch_context=src_batch)
+        prev_mode = self.training
+        self.eval()
+        with torch.no_grad():
+            out = self.forward(src_batch)
+        if prev_mode:
+            self.train()
+        self._restore_runtime_state(key, snap)
+        return list(out["pred_rgbs"])
+
     def train_step(
         self,
         batch: Dict,
@@ -1066,14 +1408,19 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
         profile_phase_timing: bool = False,
         sync_cuda_timing: bool = False,
         scheduler_node_sync: Optional[Dict[str, Any]] = None,
+        runtime_policy: Optional[RuntimePolicy] = None,
     ) -> Dict[str, Any]:
+        policy = runtime_policy or self._default_runtime_policy()
+        if policy.do_optimizer_step and not policy.do_backward:
+            raise ValueError("RuntimePolicy invalid: do_optimizer_step=true requires do_backward=true")
         self.train()
         self._perf_acc = {}
         node_state_sync_update = False
         node_state_sync_reset = False
         timing_ms: Dict[str, float] = {"forward_ms": 0.0, "backward_ms": 0.0, "optimizer_ms": 0.0}
         t0 = time.perf_counter()
-        self.optimizer.zero_grad()
+        if policy.do_backward:
+            self.optimizer.zero_grad()
         out = self.forward(batch)
         if logger.isEnabledFor(logging.DEBUG):
             _ns = out.get("_node_state_sky")
@@ -1091,9 +1438,9 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
             if sync_cuda_timing and torch.cuda.is_available():
                 torch.cuda.synchronize()
             timing_ms["forward_ms"] = float((t1 - t0) * 1000.0)
-        if torch.is_tensor(out.get("loss")):
+        if policy.do_backward and torch.is_tensor(out.get("loss")):
             out["loss"].backward()
-        if out.get("proxies") is not None:
+        if policy.do_backward and out.get("proxies") is not None:
             _backward_to_render_params_bg_rigid_distant_sky(
                 out["render_params"],
                 out["proxies"],
@@ -1105,19 +1452,20 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
                 out.get("_proxies_sky"),
                 rigid_world_proxy_pairs=out.get("_rigid_world_proxy_pairs"),
             )
-        grad_norms = self._compute_branch_grad_norms()
+        grad_norms = self._compute_branch_grad_norms() if policy.do_backward else {}
         t2 = time.perf_counter()
         if profile_phase_timing:
             if sync_cuda_timing and torch.cuda.is_available():
                 torch.cuda.synchronize()
             timing_ms["backward_ms"] = float((t2 - t1) * 1000.0)
-        self.optimizer.step()
+        if policy.do_optimizer_step:
+            self.optimizer.step()
         t3 = time.perf_counter()
         if profile_phase_timing:
             if sync_cuda_timing and torch.cuda.is_available():
                 torch.cuda.synchronize()
             timing_ms["optimizer_ms"] = float((t3 - t2) * 1000.0)
-        if "_cache_key" in out:
+        if policy.update_hidden_cache and "_cache_key" in out:
             key = out["_cache_key"]
             if out.get("_h_new_bg") is not None:
                 self.h_cache_bg[key] = out["_h_new_bg"].detach()
@@ -1128,10 +1476,10 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
             if out.get("_h_new_sky") is not None:
                 self.h_cache_sky[key] = out["_h_new_sky"].detach()
 
-        if scheduler_node_sync is not None:
+        if scheduler_node_sync is not None and policy.writeback_node_state:
             U = int(scheduler_node_sync["U"])
             seg = int(scheduler_node_sync["segment_local_step"])
-            reset_after_block = bool(scheduler_node_sync.get("reset_after_block", False))
+            reset_after_block = bool(scheduler_node_sync.get("reset_after_block", False)) and policy.reset_node_state_after_block
             if U < 1:
                 raise ValueError("scheduler_node_sync requires U >= 1 (scheduler time_base.state_write_interval_steps).")
             if seg > 0 and seg % U == 0:
@@ -1140,9 +1488,9 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
             if reset_after_block:
                 self.reset_node_state()
                 node_state_sync_reset = True
-        elif self.update_node_state_interval > 0 and step is not None and step % self.update_node_state_interval == 0:
+        elif policy.writeback_node_state and self.update_node_state_interval > 0 and step is not None and step % self.update_node_state_interval == 0:
             self._writeback_node_states_from_out(out)
-            if self.reset_node_state_interval > 0 and step % self.reset_node_state_interval == 0:
+            if policy.reset_node_state_after_block and self.reset_node_state_interval > 0 and step % self.reset_node_state_interval == 0:
                 self.reset_node_state()
 
         num_gaussians_bg = int(out["_node_state_bg"].means.shape[0])
@@ -1236,5 +1584,5 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
         }
 
 
-__all__ = ["MinimalStreetForwardStage4_3"]
+__all__ = ["MinimalStreetForwardStage4_3", "RuntimePolicy"]
 

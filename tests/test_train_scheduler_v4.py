@@ -46,6 +46,21 @@ def _make_sidx_three_kf() -> SegmentIndex:
     return _build_segment_index_dict(1, 0, scene_data)
 
 
+def _make_sidx_four_kf() -> SegmentIndex:
+    scene_data = {
+        "dataset": MagicMock(num_cams=2),
+        "keyframe_segments": [[10], [11], [12], [13]],
+        "segments": [
+            {
+                "frame_indices": [10, 11, 12, 13],
+                "test_frame_indices": [],
+                "keyframe_indices": [0, 1, 2, 3],
+            }
+        ],
+    }
+    return _build_segment_index_dict(1, 0, scene_data)
+
+
 def _make_sidx_single_keyframe() -> SegmentIndex:
     scene_data = {
         "dataset": MagicMock(num_cams=2),
@@ -371,6 +386,134 @@ def test_v4_episode_preload_hint_includes_future_overlap_pairs_pointcloud_topk()
     assert hint["overlap_meta"]["mode"] == "pointcloud_topk"
     assert hint["overlap_meta"]["point_sample_size"] == 1024
     assert len(hint["future_overlap_pairs"]) >= 1
+
+
+def test_v4_temporal_ring_requires_max_ring():
+    sidx = _make_sidx()
+    ds = _make_mock_dataset(sidx)
+    ds.pointcloud_generator = MagicMock()
+    kw = dict(_sch_kwargs_common())
+    del kw["overlap_mode"]
+    with pytest.raises(ValueError, match="temporal_neighbor_max_ring"):
+        TrainSchedulerV4(
+            dataset=ds,
+            state_write_interval_steps=1,
+            updates_per_block=1,
+            keyframes_per_episode=2,
+            episodes_per_segment=1,
+            temporal_neighbor_pool="ring",
+            temporal_neighbor_max_ring=None,
+            overlap_mode="pointcloud_topk",
+            overlap_point_sample_size=1024,
+            overlap_candidate_frame_policy="middle",
+            overlap_score_type="nab_over_na",
+            overlap_min=0.0,
+            **kw,
+            **_sch_fallback_defaults(),
+        )
+
+
+def test_v4_temporal_ring_pointcloud_topk_scores_ring_subset_first():
+    """Source at last keyframe: ring R=1 intersects pool in one keyframe only => one pair score call."""
+    sidx = _make_sidx_four_kf()
+    ds = _make_mock_dataset(sidx)
+    ds.pointcloud_generator = MagicMock()
+    n_calls = {"n": 0}
+
+    def gcs(
+        scene_id: int,
+        seg_id: int,
+        src: tuple,
+        tgt: tuple,
+        mode: str = "none",
+        **kwargs: Any,
+    ):
+        n_calls["n"] += 1
+        return 0.9
+
+    ds.get_or_compute_pair_score = MagicMock(side_effect=gcs)
+    ds.is_pair_score_cached = MagicMock(return_value=False)
+
+    def pair_shuffle_shim(seq):
+        seq.sort(key=lambda t: (0 if t == (3, 0) else 1, t[0], t[1]))
+
+    kw = dict(_sch_kwargs_common())
+    del kw["overlap_mode"]
+    sch = TrainSchedulerV4(
+        dataset=ds,
+        state_write_interval_steps=1,
+        updates_per_block=4,
+        keyframes_per_episode=4,
+        episodes_per_segment=1,
+        temporal_neighbor_pool="ring",
+        temporal_neighbor_max_ring=4,
+        temporal_neighbor_cams=None,
+        overlap_mode="pointcloud_topk",
+        overlap_point_sample_size=1024,
+        overlap_candidate_frame_policy="middle",
+        overlap_score_type="nab_over_na",
+        overlap_min=0.5,
+        **kw,
+        **_sch_fallback_defaults(),
+    )
+    with mock.patch.object(msv3.random, "shuffle", pair_shuffle_shim), mock.patch.object(
+        msv3.random, "choice", side_effect=lambda seq: seq[0]
+    ):
+        sch.next_batch()
+
+    assert n_calls["n"] == 1
+    evs = sch.pop_events()
+    bb = [e for e in evs if e.get("type") == "block_begin"][0]
+    assert bb["temporal_neighbor_pool"] == "ring"
+    assert bb["temporal_neighbor_ring_effective"] == 1
+    assert bb["temporal_neighbor_fallback_full_pool"] is False
+
+
+def test_v4_temporal_ring_cam_gate_skips_ring():
+    """temporal_neighbor_cams=[0]: cam 1 uses full-pool overlap scoring (more pair evaluations)."""
+    sidx = _make_sidx_four_kf()
+    ds = _make_mock_dataset(sidx)
+    ds.pointcloud_generator = MagicMock()
+    n_calls = {"n": 0}
+
+    def gcs(*args: Any, **kwargs: Any):
+        n_calls["n"] += 1
+        return 0.9
+
+    ds.get_or_compute_pair_score = MagicMock(side_effect=gcs)
+    ds.is_pair_score_cached = MagicMock(return_value=False)
+
+    def pair_shuffle_shim(seq):
+        seq.sort(key=lambda t: (0 if t == (3, 1) else 1, t[0], t[1]))
+
+    kw = dict(_sch_kwargs_common())
+    del kw["overlap_mode"]
+    sch = TrainSchedulerV4(
+        dataset=ds,
+        state_write_interval_steps=1,
+        updates_per_block=4,
+        keyframes_per_episode=4,
+        episodes_per_segment=1,
+        temporal_neighbor_pool="ring",
+        temporal_neighbor_max_ring=4,
+        temporal_neighbor_cams=[0],
+        overlap_mode="pointcloud_topk",
+        overlap_point_sample_size=1024,
+        overlap_candidate_frame_policy="middle",
+        overlap_score_type="nab_over_na",
+        overlap_min=0.5,
+        **kw,
+        **_sch_fallback_defaults(),
+    )
+    with mock.patch.object(msv3.random, "shuffle", pair_shuffle_shim), mock.patch.object(
+        msv3.random, "choice", side_effect=lambda seq: seq[0]
+    ):
+        sch.next_batch()
+
+    assert n_calls["n"] == 3
+    bb = [e for e in sch.pop_events() if e.get("type") == "block_begin"][0]
+    assert bb["temporal_neighbor_ring_effective"] is None
+    assert bb["temporal_neighbor_fallback_full_pool"] is False
 
 
 def test_v4_all_blocks_full_when_budget_is_multiple_of_updates_per_block():

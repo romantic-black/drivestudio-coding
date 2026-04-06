@@ -48,7 +48,6 @@ from tools.train_minimal_streetforward_stage1_1 import (
 )
 from tools.train_minimal_streetforward_stage4_1 import (
     _diagnose_step,
-    _merge_bg_distant_rigid_for_eval,
     _parse_diagnostics_cfg,
     _parse_perf_cfg,
     _percentile,
@@ -166,6 +165,11 @@ def main() -> None:
         train_ids,
         parse_include_test_v4(cfg),
     )
+    if cfg.get("test") is not None and bool(cfg.test.get("enable", False)):
+        raise ValueError(
+            "Formal testing is not supported in training script. "
+            "Use tools/test_minimal_streetforward_stage4_3.py instead."
+        )
     dataset = build_multi_scene_dataset_v3(cfg, device)
     dataset.initialize()
     scheduler = build_train_scheduler_v4_from_cfg(cfg, dataset)
@@ -198,7 +202,12 @@ def main() -> None:
     log_interval = cfg.training.get("log_interval", 50)
     save_every = cfg.training.get("save_checkpoint_freq", 500)
     enable_psnr = bool(cfg.eval.get("enable_psnr", True))
-    run_test_at_end = bool(cfg.eval.get("run_test_at_end", True))
+    run_test_at_end = bool(cfg.eval.get("run_test_at_end", False))
+    if run_test_at_end:
+        logger.warning(
+            "eval.run_test_at_end=true is deprecated in training script and will be ignored; "
+            "use tools/test_minimal_streetforward_stage4_3.py for formal testing."
+        )
     save_train_views_psnr_below: Optional[float]
     _raw_psnr_below = cfg.eval.get("save_train_views_psnr_below", None)
     if _raw_psnr_below is None:
@@ -256,7 +265,7 @@ def main() -> None:
 
     metrics_fh: Optional[TextIO] = None
     writer: Optional[Any] = None
-    result: Dict[str, Any] = {}
+    result: Optional[Dict[str, Any]] = None
     total_steps = 0
     sum_num_gaussians_bg = 0.0
     sum_num_gaussians_distant = 0.0
@@ -379,6 +388,8 @@ def main() -> None:
                 peak_mem_bytes = int(max(peak_mem_bytes, int(torch.cuda.max_memory_allocated())))
                 peak_mem_reserved_bytes = int(max(peak_mem_reserved_bytes, int(torch.cuda.max_memory_reserved())))
 
+            if result is None:
+                raise ValueError("train_step returned None")
             loss_val = float(result["loss"])
             pred_rgbs = result["pred_rgbs"]
             gt_images = result["gt_images"]
@@ -643,59 +654,29 @@ def main() -> None:
                 )
                 logger.info("Saved checkpoint to %s", ckpt_path)
 
-        if run_test_at_end and minimal_batch.get("test_views"):
-            prev_mode = model.training
-            model.eval()
-            with torch.no_grad():
-                out = model.forward(minimal_batch)
-                test_frame_indices = minimal_batch.get("test_frame_indices")
-                default_fi = int(minimal_batch["targets"][0]["frame_idx"]) if minimal_batch.get("targets") else 0
-                psnr_list = []
-                ssim_list = []
-                lpips_list = []
-                for i, (view, gt) in enumerate(zip(minimal_batch.get("test_views", []), minimal_batch.get("test_images", []))):
-                    fi = default_fi
-                    if test_frame_indices is not None and i < len(test_frame_indices):
-                        fi = int(test_frame_indices[i])
-                    merged = _merge_bg_distant_rigid_for_eval(model, out, fi)
-                    h, w = int(gt.shape[0]), int(gt.shape[1])
-                    pred, _ = model._render_single_view(merged, view, h, w)
-                    vals = _compute_metrics(pred, gt, psnr_metric, ssim_metric, lpips_metric, True, True)
-                    psnr_list.append(vals["psnr"])
-                    ssim_list.append(vals["ssim"])
-                    lpips_list.append(vals["lpips"])
-                if psnr_list:
-                    summary = {
-                        "final_step": int(max_iterations - 1),
-                        "train": {"loss": float(result["loss"])},
-                        "test": {
-                            "psnr": float(np.mean(psnr_list)),
-                            "ssim": float(np.mean(ssim_list)),
-                            "lpips": float(np.mean(lpips_list)),
-                            "num_test_views": int(len(psnr_list)),
-                        },
-                        "gs_stats": {
-                            "avg_num_gaussians_bg": sum_num_gaussians_bg / max(total_steps, 1),
-                            "avg_num_gaussians_rigid": sum_num_gaussians_rigid / max(total_steps, 1),
-                            "avg_num_gaussians_distant": sum_num_gaussians_distant / max(total_steps, 1),
-                            "avg_num_gaussians_sky": sum_num_gaussians_sky / max(total_steps, 1),
-                        },
-                        "profiling": {
-                            "avg_step_time_ms": float(sum_step_time_ms / max(total_steps, 1)),
-                            "p50_step_time_ms": _percentile(step_time_ms_hist, 50.0),
-                            "p95_step_time_ms": _percentile(step_time_ms_hist, 95.0),
-                            "peak_mem_bytes": int(peak_mem_bytes),
-                            "peak_mem_reserved_bytes": int(peak_mem_reserved_bytes),
-                        },
-                    }
-                    with open(os.path.join(cfg.log_dir, "metrics_final.json"), "w", encoding="utf-8") as f:
-                        json.dump(summary, f, indent=2)
-                    try:
-                        upload_experiment_summary(cfg.log_dir, summary)
-                    except Exception:
-                        logger.exception("Vika upload failed for log_dir=%s", cfg.log_dir)
-            if prev_mode:
-                model.train()
+        summary = {
+            "final_step": int(max_iterations - 1),
+            "train": {"loss": float(result["loss"]) if result is not None else float("nan")},
+            "gs_stats": {
+                "avg_num_gaussians_bg": sum_num_gaussians_bg / max(total_steps, 1),
+                "avg_num_gaussians_rigid": sum_num_gaussians_rigid / max(total_steps, 1),
+                "avg_num_gaussians_distant": sum_num_gaussians_distant / max(total_steps, 1),
+                "avg_num_gaussians_sky": sum_num_gaussians_sky / max(total_steps, 1),
+            },
+            "profiling": {
+                "avg_step_time_ms": float(sum_step_time_ms / max(total_steps, 1)),
+                "p50_step_time_ms": _percentile(step_time_ms_hist, 50.0),
+                "p95_step_time_ms": _percentile(step_time_ms_hist, 95.0),
+                "peak_mem_bytes": int(peak_mem_bytes),
+                "peak_mem_reserved_bytes": int(peak_mem_reserved_bytes),
+            },
+        }
+        with open(os.path.join(cfg.log_dir, "metrics_final.json"), "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
+        try:
+            upload_experiment_summary(cfg.log_dir, summary)
+        except Exception:
+            logger.exception("Vika upload failed for log_dir=%s", cfg.log_dir)
     finally:
         if metrics_fh is not None:
             metrics_fh.close()

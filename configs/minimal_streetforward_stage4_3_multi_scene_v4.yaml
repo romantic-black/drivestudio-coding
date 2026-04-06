@@ -1,6 +1,6 @@
 # tools/train_minimal_streetforward_stage4_3_multi_scene_v4.py — 多场景 TrainSchedulerV4 + MultiSceneDatasetV3。
 # 实验名；用于日志目录命名与配置落盘。
-output_name: minimal_sf_stage4_3_multi_scene_v4
+output_name: minimal_sf_stage4_3_multi_scene_v4_ring
 
 # 数据源与加载总配置。
 data:
@@ -17,7 +17,7 @@ data:
   # sky mask 语义约定：1 表示天空。
   sky_mask_semantics: one_is_sky
   # 训练场景 ID 列表（多场景；需均在数据集中存在且满足 min_keyframes 等约束）。
-  train_scene_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+  train_scene_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
   # 评估场景 ID 列表；空表示不做独立 eval 场景。
   eval_scene_ids: []
 
@@ -185,7 +185,7 @@ scheduler_v4:
   # source block：固定一组 source/target 图像时，连续消耗的 update unit 数。
   source_block:
     # 每个 block 内的 U 个数；满则发 block_end 并进入下一 block（或 segment_end）。
-    updates_per_block: 16
+    updates_per_block: 24
   # reset episode：连续 keyframe 窗口上的 (keyframe, cam) 无放回遍历；与 segment 预算推导相关。
   reset_episode:
     # 每个 episode 窗口内连续 keyframe 个数（不超过 segment 内 keyframe 总数时取窗口长度）。
@@ -210,6 +210,10 @@ scheduler_v4:
     fallback_expand_to_segment: true
     # 仍不足时允许有放回抽样非 source keyframe。
     fallback_with_replacement: true
+    # 时间环带约束候选 keyframe：none 关闭；ring 时需在下方填写 temporal_neighbor_max_ring。
+    temporal_neighbor_pool: ring
+    temporal_neighbor_max_ring: 2
+    temporal_neighbor_cams: [0, 1, 2, 3, 4, 5]
   # 视角对重叠评分（属于 target 采样逻辑，不是 data.preload）。
   # mode=none：按邻近 keyframe 贪心选 extra target（与旧行为一致）。
   # mode=pointcloud_topk：对候选 keyframe 全池算 overlap；在 score > overlap_min 的候选中随机选 extra，不足则按分数 top-k 回退；需 dataset.pointcloud 与下方字段。
@@ -277,7 +281,7 @@ model:
     # 默认 [0,-1,0] 为「天顶」半空间（物理天空 / MultiScene 更小 y）。若后视源上 num_sky_src_feat_valid 恒为 0、
     # 而改 hemisphere:false 后正常，多为「裁掉的那一半」才覆盖后视视锥：可改为互补 Y 半空间 [0,1,0]（dir_y>=0），
     # 仍约为一半点数。若更关心车体后方半空间（MultiScene：z 前+/后-），可试 [0,0,-1] 或 [0,0,1]（会削弱另一侧相机）。
-    hemisphere_up: [0.0, 1.0, 0.0]
+    hemisphere_up: [0.0, -1.0, 0.0]
   # 四分支（bg/distant/sky/rigid）参数配置。
   branches:
     # 背景分支。
@@ -463,9 +467,55 @@ eval:
   # 是否计算 PSNR/SSIM/LPIPS（block_end 写 jsonl；为 false 时日志里 psnr_mean 为 n/a，并非数值 0）。
   enable_psnr: true
   # 若设为数字（如 18.0），在每个 block_end 若任一训练视角 PSNR 低于该值，则对该 block 全部视角保存 pred/gt（目录见 logging.low_psnr_train_images_subdir）；需 enable_psnr；null 表示关闭。
-  save_train_views_psnr_below: 17
+  save_train_views_psnr_below: 14
   # 训练结束后是否运行 test views 评估。
   run_test_at_end: false
+
+# 正式测试（独立 test runner）配置。
+test:
+  # 是否启用独立测试 runner 逻辑（训练脚本遇到 true 会提示改用 test 脚本）。
+  enable: false
+  # adapt_supervised | inference_only | both
+  mode: adapt_supervised
+  runner:
+    # 固定 scene/segment（null 表示遍历 eval_scene_ids 下全部 segment）。
+    fixed_scene_id: null
+    fixed_segment_id: null
+    deterministic: true
+    seed: 123
+    # source 选取协议：first_train_frame_cam0 | middle_keyframe_middle_frame_cam0
+    source_protocol: middle_keyframe_middle_frame_cam0
+    # 每个场景最多评估多少个 segment；0 表示不限制。
+    max_segments_per_scene: 0
+    # 每个 segment 最少 test 视角数（不足则跳过）。
+    min_test_views_per_segment: 6
+  split:
+    require_eval_scene_ids: true
+    require_nonzero_test_stride: true
+    require_nonempty_test_views: true
+  adapt_supervised:
+    enable: true
+    max_steps_per_segment: 2000
+    validate_every_blocks: 1
+    early_stop_patience: 8
+    keep_best_by: psnr
+    reset_runtime_state_each_segment: true
+  inference_only:
+    enable: true
+    allow_hidden_cache_update: false
+    allow_node_state_writeback: false
+    # 每次 next_eval_batch 最多组多少张 eval 图（chunk）。
+    eval_chunk_size: 16
+  # mode=both 时：在 inference_only 之前是否 reset 并重载 init checkpoint（需与 --init_checkpoint 同用）。
+  both:
+    reload_init_before_inference: true
+  export:
+    save_3dgs_init: true
+    save_3dgs_best: true
+    save_3dgs_final: true
+    save_ply: true
+    save_rendered_images: true
+    save_per_view_metrics_json: true
 
 # 日志与诊断配置。
 logging:

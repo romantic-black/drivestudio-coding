@@ -97,6 +97,14 @@ class BatchRequestV3:
     test_image_refs: Optional[List[ImageRef]] = None
 
 
+@dataclass(frozen=True)
+class EvalRequestV3:
+    scene_id: int
+    segment_id: int
+    source_image_ref: ImageRef
+    eval_image_refs: List[ImageRef]
+
+
 def _build_segment_index_dict(
     scene_id: int,
     segment_id: int,
@@ -1807,6 +1815,44 @@ class MultiSceneDatasetV3(MultiSceneDataset):
             enforce_target0_equals_source=enforce_target0_equals_source,
         )
 
+    def get_segment_eval_batch_from_image_refs(
+        self,
+        request: EvalRequestV3,
+    ) -> Dict[str, Any]:
+        if len(request.eval_image_refs) == 0:
+            raise ValueError("eval_image_refs must not be empty")
+        raw = self._assemble_segment_batch_from_image_refs(
+            request.scene_id,
+            request.segment_id,
+            [request.source_image_ref],
+            request.eval_image_refs,
+            include_test=False,
+            test_image_refs=None,
+            enforce_target0_equals_source=False,
+        )
+        out: Dict[str, Any] = {
+            "scene_id": raw["scene_id"],
+            "scene_folder_name": raw["scene_folder_name"],
+            "segment_id": raw["segment_id"],
+            "aabb": raw["aabb"],
+            "segment_first_pose": raw["segment_first_pose"],
+            "segment_first_frame_idx": raw["segment_first_frame_idx"],
+            "segment_first_pose_source": raw["segment_first_pose_source"],
+            "source": raw["source"],
+            "eval": raw["target"],
+            "request_meta": dict(raw.get("request_meta") or {}),
+            "index_meta": dict(raw.get("index_meta") or {}),
+            "keyframe_info": dict(raw.get("keyframe_info") or {}),
+        }
+        out["request_meta"]["eval_image_refs"] = [tuple(r) for r in request.eval_image_refs]
+        out["request_meta"]["assembly_mode"] = "eval_image_ref"
+        out["request_meta"].pop("target_image_refs", None)
+        if "pointcloud" in raw:
+            out["pointcloud"] = raw["pointcloud"]
+        if "dynamic_info" in raw:
+            out["dynamic_info"] = raw["dynamic_info"]
+        return out
+
     def create_train_scheduler_v4(
         self,
         *,
@@ -1832,6 +1878,9 @@ class MultiSceneDatasetV3(MultiSceneDataset):
         overlap_candidate_frame_policy: Optional[str] = None,
         overlap_score_type: Optional[str] = None,
         overlap_min: Optional[float] = None,
+        temporal_neighbor_pool: str = "none",
+        temporal_neighbor_max_ring: Optional[int] = None,
+        temporal_neighbor_cams: Optional[List[int]] = None,
     ) -> "TrainSchedulerV4":
         return TrainSchedulerV4(
             dataset=self,
@@ -1857,6 +1906,9 @@ class MultiSceneDatasetV3(MultiSceneDataset):
             overlap_candidate_frame_policy=overlap_candidate_frame_policy,
             overlap_score_type=overlap_score_type,
             overlap_min=overlap_min,
+            temporal_neighbor_pool=temporal_neighbor_pool,
+            temporal_neighbor_max_ring=temporal_neighbor_max_ring,
+            temporal_neighbor_cams=temporal_neighbor_cams,
         )
 
     def get_segment_batch_from_frames(
@@ -1955,6 +2007,9 @@ class TrainSchedulerV4:
         overlap_candidate_frame_policy: Optional[str] = None,
         overlap_score_type: Optional[str] = None,
         overlap_min: Optional[float] = None,
+        temporal_neighbor_pool: str = "none",
+        temporal_neighbor_max_ring: Optional[int] = None,
+        temporal_neighbor_cams: Optional[List[int]] = None,
     ) -> None:
         if state_write_interval_steps < 1:
             raise ValueError("state_write_interval_steps must be >= 1")
@@ -1997,6 +2052,20 @@ class TrainSchedulerV4:
             if getattr(dataset, "pointcloud_generator", None) is None:
                 raise ValueError("TrainSchedulerV4: overlap_mode=pointcloud_topk requires dataset.pointcloud_generator")
 
+        tnp = str(temporal_neighbor_pool)
+        if tnp not in ("none", "ring"):
+            raise ValueError(f"TrainSchedulerV4: temporal_neighbor_pool must be 'none' or 'ring', got {temporal_neighbor_pool!r}")
+        if tnp == "ring":
+            if temporal_neighbor_max_ring is None:
+                raise ValueError("TrainSchedulerV4: temporal_neighbor_max_ring is required when temporal_neighbor_pool=ring")
+            if int(temporal_neighbor_max_ring) < 1:
+                raise ValueError(f"temporal_neighbor_max_ring must be >= 1, got {temporal_neighbor_max_ring}")
+        elif temporal_neighbor_max_ring is not None:
+            raise ValueError("TrainSchedulerV4: temporal_neighbor_max_ring must be omitted when temporal_neighbor_pool=none")
+        if temporal_neighbor_cams is not None:
+            if len(temporal_neighbor_cams) == 0:
+                raise ValueError("TrainSchedulerV4: temporal_neighbor_cams must be null or a non-empty list of ints")
+
         self.dataset = dataset
         self.U = int(state_write_interval_steps)
         self.updates_per_block = int(updates_per_block)
@@ -2022,6 +2091,13 @@ class TrainSchedulerV4:
         self.overlap_candidate_frame_policy = overlap_candidate_frame_policy
         self.overlap_score_type = overlap_score_type
         self.overlap_min = float(overlap_min) if overlap_min is not None else None
+        self.temporal_neighbor_pool = tnp
+        self.temporal_neighbor_max_ring = (
+            int(temporal_neighbor_max_ring) if temporal_neighbor_max_ring is not None else None
+        )
+        self.temporal_neighbor_cams = (
+            [int(x) for x in temporal_neighbor_cams] if temporal_neighbor_cams is not None else None
+        )
 
         self.epoch_idx = 0
         self.global_step = 0
@@ -2209,6 +2285,57 @@ class TrainSchedulerV4:
                 out.append(k)
         return out
 
+    def _use_temporal_neighbor_ring(self, cam_src: int) -> bool:
+        if self.temporal_neighbor_pool != "ring":
+            return False
+        if self.temporal_neighbor_cams is None:
+            return True
+        return int(cam_src) in self.temporal_neighbor_cams
+
+    def _ring_keyframes_in_pool(
+        self,
+        full_pool: List[int],
+        pos: Dict[int, int],
+        pos_src: int,
+        R: int,
+    ) -> Set[int]:
+        r = int(R)
+        pos_s = int(pos_src)
+        out: Set[int] = set()
+        for kf in full_pool:
+            if abs(int(pos[int(kf)]) - pos_s) <= r:
+                out.add(int(kf))
+        return out
+
+    def _pointcloud_topk_pick_from_scored_rows(
+        self,
+        scored_rows: List[Tuple[int, int, float]],
+        extra_needed: int,
+        thr: float,
+    ) -> Optional[Tuple[List[int], str, List[int]]]:
+        """Returns (picked_kfs, policy, above_threshold_keyframes) or None if pick is impossible."""
+        if not scored_rows:
+            return None
+        rows = sorted(scored_rows, key=lambda r: (-r[2], r[0]))
+        ranked_kfs = [int(r[1]) for r in rows]
+        above_kfs = [int(r[1]) for r in rows if float(r[2]) > thr]
+        if len(above_kfs) >= extra_needed:
+            return (
+                list(random.sample(above_kfs, int(extra_needed))),
+                "random_above_min",
+                above_kfs,
+            )
+        if len(ranked_kfs) >= extra_needed:
+            return ranked_kfs[:extra_needed], "topk_fallback", above_kfs
+        if not self.fallback_with_replacement:
+            return None
+        if len(ranked_kfs) == 0:
+            return None
+        picked: List[int] = []
+        for j in range(extra_needed):
+            picked.append(ranked_kfs[j % len(ranked_kfs)])
+        return picked, "topk_fallback", above_kfs
+
     def _sample_target_image_refs(
         self,
         sidx: SegmentIndex,
@@ -2241,68 +2368,108 @@ class TrainSchedulerV4:
                     others.sort(key=lambda k: abs(int(pos[k]) - pos_src))
                 return others
 
-            picked_kfs: List[int] = []
-            for kf in _sorted_window_others():
-                if len(picked_kfs) >= extra_needed:
-                    break
-                picked_kfs.append(kf)
-
-            if len(picked_kfs) < extra_needed and self.fallback_expand_to_segment:
-                for kf in _sorted_segment_others():
-                    if len(picked_kfs) >= extra_needed:
+            def _legacy_none_pick() -> List[int]:
+                picked: List[int] = []
+                for kf in _sorted_window_others():
+                    if len(picked) >= extra_needed:
                         break
-                    if kf in picked_kfs:
+                    picked.append(kf)
+
+                if len(picked) < extra_needed and self.fallback_expand_to_segment:
+                    for kf in _sorted_segment_others():
+                        if len(picked) >= extra_needed:
+                            break
+                        if kf in picked:
+                            continue
+                        picked.append(kf)
+
+                if len(picked) < extra_needed:
+                    if not self.fallback_with_replacement:
+                        raise ValueError(
+                            f"Not enough distinct keyframes for {extra_needed} extra targets "
+                            f"(scene={sidx.scene_id} segment={sidx.segment_id})"
+                        )
+                    pool_kf = [int(k) for k in sidx.keyframe_indices if int(k) != kf_src]
+                    if len(pool_kf) == 0:
+                        raise ValueError(
+                            f"No non-source keyframes for extra targets (scene={sidx.scene_id} segment={sidx.segment_id})"
+                        )
+                    while len(picked) < extra_needed:
+                        picked.append(int(random.choice(pool_kf)))
+                return picked[:extra_needed]
+
+            temporal_meta: Optional[Dict[str, Any]] = None
+            if self._use_temporal_neighbor_ring(cam_src) and self.temporal_neighbor_max_ring is not None:
+                full_pool = self._extra_target_keyframe_pool(sidx, kf_src, episode_window, pos, pos_src)
+                picked_kfs: Optional[List[int]] = None
+                ring_eff: Optional[int] = None
+                for R in range(1, int(self.temporal_neighbor_max_ring) + 1):
+                    ring_set = self._ring_keyframes_in_pool(full_pool, pos, pos_src, R)
+                    ring_ordered = [int(kf) for kf in full_pool if int(kf) in ring_set]
+                    picked_try: List[int] = []
+                    for kf in ring_ordered:
+                        if len(picked_try) >= extra_needed:
+                            break
+                        if kf not in picked_try:
+                            picked_try.append(kf)
+                    if len(picked_try) >= extra_needed:
+                        picked_kfs = picked_try[:extra_needed]
+                        ring_eff = R
+                        break
+                    if len(ring_ordered) < extra_needed and not self.fallback_with_replacement:
                         continue
-                    picked_kfs.append(kf)
+                    if len(ring_ordered) >= 1 and self.fallback_with_replacement:
+                        picked_rep: List[int] = []
+                        while len(picked_rep) < extra_needed:
+                            picked_rep.append(int(random.choice(ring_ordered)))
+                        picked_kfs = picked_rep
+                        ring_eff = R
+                        break
+                if picked_kfs is None:
+                    picked_kfs = _legacy_none_pick()
+                    temporal_meta = {
+                        "temporal_neighbor_pool": "ring",
+                        "temporal_neighbor_ring_effective": None,
+                        "temporal_neighbor_fallback_full_pool": True,
+                    }
+                else:
+                    temporal_meta = {
+                        "temporal_neighbor_pool": "ring",
+                        "temporal_neighbor_ring_effective": int(ring_eff) if ring_eff is not None else None,
+                        "temporal_neighbor_fallback_full_pool": False,
+                    }
+            else:
+                picked_kfs = _legacy_none_pick()
 
-            if len(picked_kfs) < extra_needed:
-                if not self.fallback_with_replacement:
-                    raise ValueError(
-                        f"Not enough distinct keyframes for {extra_needed} extra targets "
-                        f"(scene={sidx.scene_id} segment={sidx.segment_id})"
-                    )
-                pool = [int(k) for k in sidx.keyframe_indices if int(k) != kf_src]
-                if len(pool) == 0:
-                    raise ValueError(
-                        f"No non-source keyframes for extra targets (scene={sidx.scene_id} segment={sidx.segment_id})"
-                    )
-                while len(picked_kfs) < extra_needed:
-                    picked_kfs.append(int(random.choice(pool)))
-
-            for kf in picked_kfs[:extra_needed]:
+            for kf in picked_kfs:
                 frame_tgt = int(random.choice(sidx.keyframe_to_frames[int(kf)]))
                 refs.append((frame_tgt, cam_src))
 
-            return refs, None
+            return refs, temporal_meta
 
         # overlap_mode == "pointcloud_topk"
         assert self.overlap_point_sample_size is not None
-        pool = self._extra_target_keyframe_pool(sidx, kf_src, episode_window, pos, pos_src)
-        if len(pool) == 0:
+        full_pool = self._extra_target_keyframe_pool(sidx, kf_src, episode_window, pos, pos_src)
+        if len(full_pool) == 0:
             raise ValueError(
                 f"No candidate keyframes for overlap (scene={sidx.scene_id} segment={sidx.segment_id})"
             )
 
         rep_src_frame = representative_frame_for_keyframe(sidx, kf_src)
         rep_src: ImageRef = (rep_src_frame, cam_src)
-        candidate_rep_image_refs: List[ImageRef] = [
-            (representative_frame_for_keyframe(sidx, int(kf)), cam_src) for kf in pool
-        ]
-        candidate_keyframe_indices = [int(k) for k in pool]
-        candidate_target_image_ref_lists: List[List[List[int]]] = [
-            [[int(f), int(cam_src)] for f in sidx.keyframe_to_frames[int(kf)]] for kf in pool
-        ]
+        pss = int(self.overlap_point_sample_size)
+        sid, seg = int(sidx.scene_id), int(sidx.segment_id)
+        assert self.overlap_min is not None
+        thr = float(self.overlap_min)
 
-        scored_rows: List[Tuple[int, int, float]] = []
+        scored_by_kf: Dict[int, Tuple[int, float, Dict[str, int]]] = {}
         cache_hits = 0
         cache_misses = 0
         pair_compute_miss_time_ms_total = 0.0
         pair_eval_wall_time_ms_total = 0.0
-        candidate_pair_counts: List[Dict[str, int]] = []
-        pss = int(self.overlap_point_sample_size)
-        sid, seg = int(sidx.scene_id), int(sidx.segment_id)
 
-        for pi, kf in enumerate(pool):
+        def score_kf(pi: int, kf: int) -> None:
+            nonlocal cache_hits, cache_misses, pair_compute_miss_time_ms_total, pair_eval_wall_time_ms_total
             rep_tgt = (representative_frame_for_keyframe(sidx, int(kf)), cam_src)
             was_cached = self.dataset.is_pair_score_cached(
                 sid, seg, rep_src, rep_tgt, "pointcloud_topk", pss
@@ -2322,41 +2489,83 @@ class TrainSchedulerV4:
             pair_eval_wall_time_ms_total += dt_ms
             if score is None:
                 raise ValueError("get_or_compute_pair_score(pointcloud_topk) returned None")
-            s = float(score)
-            scored_rows.append((pi, int(kf), s))
-            candidate_pair_counts.append(dict(cnts))
+            scored_by_kf[int(kf)] = (int(pi), float(score), dict(cnts))
             if was_cached:
                 cache_hits += 1
             else:
                 cache_misses += 1
                 pair_compute_miss_time_ms_total += dt_ms
 
-        scored_rows.sort(key=lambda r: (-r[2], r[0]))
-        ranked_kfs = [int(r[1]) for r in scored_rows]
-        candidate_scores = [float(r[2]) for r in sorted(scored_rows, key=lambda r: r[0])]
-
-        assert self.overlap_min is not None
-        thr = float(self.overlap_min)
-        above_kfs = [int(r[1]) for r in scored_rows if float(r[2]) > thr]
+        ring_effective: Optional[int] = None
+        fallback_full = False
+        picked_kfs: List[int]
         extra_target_pick_policy: str
-        picked_kfs: List[int] = []
-        if len(above_kfs) >= extra_needed:
-            extra_target_pick_policy = "random_above_min"
-            picked_kfs = list(random.sample(above_kfs, int(extra_needed)))
-        else:
-            extra_target_pick_policy = "topk_fallback"
-            if len(ranked_kfs) >= extra_needed:
-                picked_kfs = ranked_kfs[:extra_needed]
-            else:
-                if not self.fallback_with_replacement:
+        above_kfs: List[int]
+
+        use_ring = self._use_temporal_neighbor_ring(cam_src) and self.temporal_neighbor_max_ring is not None
+        pick_result: Optional[Tuple[List[int], str, List[int]]] = None
+        if use_ring:
+            for R in range(1, int(self.temporal_neighbor_max_ring) + 1):
+                ring_set = self._ring_keyframes_in_pool(full_pool, pos, pos_src, R)
+                for pi, kf in enumerate(full_pool):
+                    if int(kf) not in ring_set or int(kf) in scored_by_kf:
+                        continue
+                    score_kf(pi, int(kf))
+                scored_rows_ring = [
+                    (scored_by_kf[int(kf)][0], int(kf), scored_by_kf[int(kf)][1])
+                    for kf in full_pool
+                    if int(kf) in ring_set and int(kf) in scored_by_kf
+                ]
+                pick_result = self._pointcloud_topk_pick_from_scored_rows(scored_rows_ring, extra_needed, thr)
+                if pick_result is not None:
+                    picked_kfs, extra_target_pick_policy, above_kfs = pick_result
+                    ring_effective = R
+                    break
+            if pick_result is None:
+                for pi, kf in enumerate(full_pool):
+                    if int(kf) not in scored_by_kf:
+                        score_kf(pi, int(kf))
+                scored_rows_full = [
+                    (scored_by_kf[int(kf)][0], int(kf), scored_by_kf[int(kf)][1])
+                    for kf in full_pool
+                    if int(kf) in scored_by_kf
+                ]
+                pick_result = self._pointcloud_topk_pick_from_scored_rows(scored_rows_full, extra_needed, thr)
+                if pick_result is None:
                     raise ValueError(
-                        f"Not enough distinct keyframes for {extra_needed} extra targets "
+                        f"pointcloud_topk temporal ring fallback: could not pick {extra_needed} extra targets "
                         f"(scene={sidx.scene_id} segment={sidx.segment_id})"
                     )
-                if len(ranked_kfs) == 0:
-                    raise ValueError("ranked_kfs is empty (internal error)")
-                for j in range(extra_needed):
-                    picked_kfs.append(ranked_kfs[j % len(ranked_kfs)])
+                picked_kfs, extra_target_pick_policy, above_kfs = pick_result
+                ring_effective = None
+                fallback_full = True
+        else:
+            for pi, kf in enumerate(full_pool):
+                score_kf(pi, int(kf))
+            scored_rows_full = [
+                (scored_by_kf[int(kf)][0], int(kf), scored_by_kf[int(kf)][1])
+                for kf in full_pool
+                if int(kf) in scored_by_kf
+            ]
+            pick_result = self._pointcloud_topk_pick_from_scored_rows(scored_rows_full, extra_needed, thr)
+            if pick_result is None:
+                raise ValueError("ranked_kfs is empty (internal error)")
+            picked_kfs, extra_target_pick_policy, above_kfs = pick_result
+
+        pool_final = [int(kf) for kf in full_pool if int(kf) in scored_by_kf]
+        candidate_rep_image_refs: List[ImageRef] = [
+            (representative_frame_for_keyframe(sidx, int(kf)), cam_src) for kf in pool_final
+        ]
+        candidate_keyframe_indices = [int(k) for k in pool_final]
+        candidate_scores = [float(scored_by_kf[int(kf)][1]) for kf in pool_final]
+        candidate_pair_counts = [dict(scored_by_kf[int(kf)][2]) for kf in pool_final]
+        candidate_target_image_ref_lists: List[List[List[int]]] = [
+            [[int(f), int(cam_src)] for f in sidx.keyframe_to_frames[int(kf)]] for kf in pool_final
+        ]
+
+        scored_rows = [
+            (scored_by_kf[int(kf)][0], int(kf), scored_by_kf[int(kf)][1]) for kf in pool_final
+        ]
 
         selected_target_scores: List[float] = []
         for kf in picked_kfs:
@@ -2393,6 +2602,9 @@ class TrainSchedulerV4:
             "cache_misses": int(cache_misses),
             "pair_compute_miss_time_ms_total": float(pair_compute_miss_time_ms_total),
             "pair_eval_wall_time_ms_total": float(pair_eval_wall_time_ms_total),
+            "temporal_neighbor_pool": self.temporal_neighbor_pool,
+            "temporal_neighbor_ring_effective": ring_effective,
+            "temporal_neighbor_fallback_full_pool": fallback_full,
         }
         return refs, overlap_payload
 
@@ -2431,6 +2643,8 @@ class TrainSchedulerV4:
             pos = self._kf_positions(sidx)
             seen_pairs: Set[Tuple[int, int, int, int]] = set()
             pair_dicts: List[Dict[str, Any]] = []
+            # Use the full extra-target pool (same as _extra_target_keyframe_pool), not the temporal ring
+            # subset, so DatasetPreloadManager overlap tasks still warm pairs used if ring expands to full.
             for kf_src, cam_src in pair_list:
                 pos_src = int(pos[int(kf_src)])
                 pool = self._extra_target_keyframe_pool(
@@ -2635,7 +2849,7 @@ class TrainSchedulerV4:
         else:
             st["block_test_image_refs"] = None
 
-        if overlap_payload is not None:
+        if overlap_payload is not None and overlap_payload.get("overlap_mode") == "pointcloud_topk":
             ev_os = {
                 "type": "overlap_select",
                 "epoch_idx": int(self.epoch_idx),
@@ -2674,6 +2888,14 @@ class TrainSchedulerV4:
         }
         if overlap_payload is not None and overlap_payload.get("selected_target_scores") is not None:
             bb["selected_target_scores"] = list(overlap_payload["selected_target_scores"])
+        if overlap_payload is not None:
+            for k in (
+                "temporal_neighbor_pool",
+                "temporal_neighbor_ring_effective",
+                "temporal_neighbor_fallback_full_pool",
+            ):
+                if k in overlap_payload:
+                    bb[k] = overlap_payload[k]
         self._emit(bb)
         self._emit_preload_hint_next_block_exact(st)
         return True

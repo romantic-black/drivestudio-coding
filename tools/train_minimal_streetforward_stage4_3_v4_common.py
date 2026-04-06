@@ -105,6 +105,12 @@ def build_train_scheduler_v4_from_cfg(cfg: Any, dataset: MultiSceneDatasetV3) ->
         overlap_candidate_frame_policy = None
         overlap_score_type = None
         overlap_min = None
+
+    tnp = str(ts.get("temporal_neighbor_pool", "none"))
+    tnr_max = ts.get("temporal_neighbor_max_ring")
+    tnc = ts.get("temporal_neighbor_cams")
+    tnc_list = None if tnc is None else [int(x) for x in list(tnc)]
+
     return dataset.create_train_scheduler_v4(
         state_write_interval_steps=int(tb["state_write_interval_steps"]),
         updates_per_block=int(sb["updates_per_block"]),
@@ -132,6 +138,9 @@ def build_train_scheduler_v4_from_cfg(cfg: Any, dataset: MultiSceneDatasetV3) ->
         ),
         overlap_score_type=str(overlap_score_type) if overlap_score_type is not None else None,
         overlap_min=float(overlap_min) if overlap_min is not None else None,
+        temporal_neighbor_pool=tnp,
+        temporal_neighbor_max_ring=int(tnr_max) if tnr_max is not None else None,
+        temporal_neighbor_cams=tnc_list,
     )
 
 
