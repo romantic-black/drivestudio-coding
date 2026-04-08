@@ -358,6 +358,54 @@ class MinimalStreetForwardStage4_0(MinimalStreetForwardStage3_3):
             return node_state_rigid.frame_ids.index(frame_idx)
         return None
 
+    def _extend_rigid_frames(self, node_state_rigid: NodeStateRigid, dynamic_info: Dict) -> NodeStateRigid:
+        if not dynamic_info:
+            return node_state_rigid
+        existing_frame_ids = set(node_state_rigid.frame_ids)
+        candidate_frame_ids = [int(fid) for fid in dynamic_info.keys()]
+        new_frame_ids = [fid for fid in candidate_frame_ids if fid not in existing_frame_ids]
+        if not new_frame_ids:
+            return node_state_rigid
+
+        new_frame_ids = sorted(new_frame_ids)
+        num_new_frames = len(new_frame_ids)
+        num_instances = node_state_rigid.instances_quats.shape[1]
+        device = node_state_rigid.instances_quats.device
+
+        new_quats = torch.zeros((num_new_frames, num_instances, 4), device=device)
+        new_trans = torch.zeros((num_new_frames, num_instances, 3), device=device)
+        new_fv = torch.zeros((num_new_frames, num_instances), dtype=torch.bool, device=device)
+        new_quats[..., 0] = 1.0
+
+        if node_state_rigid.instance_ids:
+            instance_id_map = {int(ins_id): idx for idx, ins_id in enumerate(node_state_rigid.instance_ids)}
+        else:
+            instance_id_map = {int(idx): idx for idx in range(num_instances)}
+
+        for frame_slot, frame_id in enumerate(new_frame_ids):
+            frame_info = dynamic_info.get(frame_id)
+            if frame_info is None:
+                frame_info = dynamic_info.get(str(frame_id))
+            if not frame_info:
+                continue
+            instances = frame_info.get("instances", {})
+            if not isinstance(instances, dict):
+                continue
+            for instance_id, instance_pose in instances.items():
+                ins_id = int(instance_id)
+                if ins_id not in instance_id_map:
+                    continue
+                ins_slot = instance_id_map[ins_id]
+                new_quats[frame_slot, ins_slot] = torch.tensor(instance_pose["quat"], device=device)
+                new_trans[frame_slot, ins_slot] = torch.tensor(instance_pose["trans"], device=device)
+                new_fv[frame_slot, ins_slot] = True
+
+        node_state_rigid.instances_quats = torch.cat([node_state_rigid.instances_quats, new_quats], dim=0)
+        node_state_rigid.instances_trans = torch.cat([node_state_rigid.instances_trans, new_trans], dim=0)
+        node_state_rigid.instances_fv = torch.cat([node_state_rigid.instances_fv, new_fv], dim=0)
+        node_state_rigid.frame_ids.extend(new_frame_ids)
+        return node_state_rigid
+
     def _rigid_instance_valid_mask(self, node_state_rigid: NodeStateRigid, frame_idx: int) -> torch.Tensor:
         resolved = self._resolve_rigid_frame_idx(node_state_rigid, frame_idx)
         if resolved is None:
@@ -479,7 +527,12 @@ class MinimalStreetForwardStage4_0(MinimalStreetForwardStage3_3):
     ) -> Tuple[NodeStateBackground, Optional[NodeStateRigid], Optional[NodeStateDistant]]:
         key = self._batch_key(batch)
         if key in self.node_states_bg and key in self.node_states_distant and key in self.node_states_rigid:
-            return self.node_states_bg[key], self.node_states_rigid[key], self.node_states_distant[key]
+            node_state_rigid = self.node_states_rigid[key]
+            dynamic_info = batch.get("dynamic_info")
+            if node_state_rigid is not None and dynamic_info:
+                node_state_rigid = self._extend_rigid_frames(node_state_rigid, dynamic_info)
+                self.node_states_rigid[key] = node_state_rigid
+            return self.node_states_bg[key], node_state_rigid, self.node_states_distant[key]
 
         node_state_bg, node_state_distant = super()._get_or_init_node_states_bg_distant(batch)
         node_state_rigid: Optional[NodeStateRigid] = None
@@ -1122,4 +1175,3 @@ class MinimalStreetForwardStage4_0(MinimalStreetForwardStage3_3):
 
 
 __all__ = ["MinimalStreetForwardStage4_0"]
-

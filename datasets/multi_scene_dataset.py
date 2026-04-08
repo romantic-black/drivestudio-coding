@@ -1135,7 +1135,14 @@ class MultiSceneDataset:
             
             # 6. Check if scene is suitable for training (sufficient keyframes)
             if not self._is_scene_suitable(keyframe_segments):
-                logger.warning(f"Scene {scene_id} is not suitable for training (insufficient keyframes), skipping...")
+                logger.warning(
+                    "Scene %s is not suitable for training (insufficient keyframe segments: "
+                    "got %s segments from split_trajectory, need >= %s; train_frames=%s). skipping...",
+                    scene_id,
+                    len(keyframe_segments),
+                    self.min_keyframes_per_scene,
+                    len(train_frame_indices),
+                )
                 return None  # Return None to indicate scene is not suitable
             
             # 7. Split segments (based on AABB constraints and keyframe distances)

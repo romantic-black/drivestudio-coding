@@ -69,8 +69,9 @@ def validate_test_config(cfg: Any) -> Dict[str, Any]:
     if split is None:
         raise ValueError("test.split is required")
     req_eval_scene_ids = _as_bool(split, "require_eval_scene_ids", "test.split")
-    req_nonzero_stride = _as_bool(split, "require_nonzero_test_stride", "test.split")
+    req_exhaustive_test_refs = _as_bool(split, "require_exhaustive_test_refs", "test.split")
     req_nonempty_test = _as_bool(split, "require_nonempty_test_views", "test.split")
+    allow_overlap_stride_zero = _as_bool(split, "allow_train_test_overlap_when_stride_zero", "test.split")
 
     eval_scene_ids = resolve_eval_scene_ids(cfg)
     if req_eval_scene_ids and len(eval_scene_ids) == 0:
@@ -79,12 +80,20 @@ def validate_test_config(cfg: Any) -> Dict[str, Any]:
     if cfg.get("data") is None or cfg.data.get("pixel_source") is None:
         raise ValueError("config.data.pixel_source is required")
     pixel = cfg.data.pixel_source
-    test_stride = int(pixel.get("test_image_stride", 0))
-    max_test_images = int(pixel.get("max_test_images", 0))
-    if req_nonzero_stride and test_stride == 0:
-        raise ValueError("data.pixel_source.test_image_stride must be non-zero for formal testing")
-    if req_nonempty_test and max_test_images <= 0:
-        raise ValueError("data.pixel_source.max_test_images must be > 0 for formal testing")
+    test_stride = _as_int(pixel, "test_image_stride", "data.pixel_source")
+    max_test_images = _as_int(pixel, "max_test_images", "data.pixel_source")
+    if test_stride < 0:
+        raise ValueError("data.pixel_source.test_image_stride must be >= 0")
+    if req_exhaustive_test_refs and max_test_images != 0:
+        raise ValueError(
+            "data.pixel_source.max_test_images must be 0 when "
+            "test.split.require_exhaustive_test_refs=true"
+        )
+    if test_stride == 0 and not allow_overlap_stride_zero:
+        raise ValueError(
+            "test_image_stride=0 requires "
+            "test.split.allow_train_test_overlap_when_stride_zero=true"
+        )
 
     adapt = t.get("adapt_supervised")
     if adapt is None:
@@ -110,6 +119,17 @@ def validate_test_config(cfg: Any) -> Dict[str, Any]:
     inf_enable = _as_bool(inf, "enable", "test.inference_only")
     _ = _as_bool(inf, "allow_hidden_cache_update", "test.inference_only")
     _ = _as_bool(inf, "allow_node_state_writeback", "test.inference_only")
+    eval_trigger = _as_str(inf, "eval_trigger", "test.inference_only")
+    if eval_trigger != "episode_end":
+        raise ValueError("test.inference_only.eval_trigger must be 'episode_end'")
+    aggregate_mode = _as_str(inf, "aggregate_across_episodes", "test.inference_only")
+    if aggregate_mode != "mean":
+        raise ValueError("test.inference_only.aggregate_across_episodes must be 'mean'")
+    max_episodes_per_segment = _as_int(inf, "max_episodes_per_segment", "test.inference_only")
+    if max_episodes_per_segment < 0:
+        raise ValueError("test.inference_only.max_episodes_per_segment must be >= 0")
+    _ = _as_bool(inf, "save_per_episode_metrics_json", "test.inference_only")
+    _ = _as_bool(inf, "save_per_episode_per_view_metrics_json", "test.inference_only")
 
     exp = t.get("export")
     if exp is None:
@@ -143,7 +163,46 @@ def validate_test_config(cfg: Any) -> Dict[str, Any]:
         "adapt_keep_best_by": keep_best_by,
         "pixel_test_image_stride": test_stride,
         "pixel_max_test_images": max_test_images,
+        "require_nonempty_test_views": req_nonempty_test,
+        "allow_train_test_overlap_when_stride_zero": allow_overlap_stride_zero,
+        "inference_eval_trigger": eval_trigger,
+        "inference_aggregate_across_episodes": aggregate_mode,
+        "inference_max_episodes_per_segment": max_episodes_per_segment,
     }
+
+
+def validate_dataset_test_split_or_raise(dataset: Any, test_cfg: Dict[str, Any]) -> None:
+    """
+    Validate dataset-level split semantics after dataset initialization.
+    Fast-fail on first invalid eval segment.
+    """
+    eval_scene_ids = [int(x) for x in list(test_cfg["eval_scene_ids"])]
+    stride = int(test_cfg["pixel_test_image_stride"])
+    require_nonempty = bool(test_cfg["require_nonempty_test_views"])
+
+    for scene_id in eval_scene_ids:
+        scene_data = dataset.get_scene(int(scene_id))
+        if scene_data is None:
+            raise ValueError(f"scene_id={scene_id} cannot be loaded for test split validation")
+        segments = list(scene_data.get("segments") or [])
+        for segment_id, segment in enumerate(segments):
+            train_frames = list(segment.get("frame_indices") or [])
+            test_frames = list(segment.get("test_frame_indices") or [])
+            if stride > 0 and len(train_frames) == 0:
+                raise ValueError(
+                    f"test split invalid: stride>0 but train_frame_indices is empty "
+                    f"(scene={scene_id} segment={segment_id})"
+                )
+            if stride > 0 and len(test_frames) == 0:
+                raise ValueError(
+                    f"test split invalid: stride>0 but test_frame_indices is empty "
+                    f"(scene={scene_id} segment={segment_id})"
+                )
+            if require_nonempty and len(test_frames) == 0:
+                raise ValueError(
+                    f"test split invalid: require_nonempty_test_views=true but "
+                    f"test_frame_indices is empty (scene={scene_id} segment={segment_id})"
+                )
 
 
 def ensure_dataset_initialized_for_test(dataset: Any, cfg: Any) -> None:

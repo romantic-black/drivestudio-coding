@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
+from datasets.base.pixel_source import get_rays
 from models.feature_extractors import FeatureBackprojector
 from models.feature_extractors.alpha_t_extractor import AlphaTWeightExtractor, _get_viewmat
 from models.streetforward.math_utils import _num_sh_bases, _normalize_quat, _quat_multiply, _rgb_to_sh, _sh_to_rgb
@@ -1315,13 +1316,24 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
             raise ValueError("batch must contain non-empty source_views/source_images")
         first_view = source_views[0]
         first_image = source_images[0]
+        source_sky_masks = batch.get("source_sky_mask") or []
+        source_egocar_masks = batch.get("source_egocar_mask") or []
+        source_viewdirs = batch.get("source_viewdirs") or []
+        source_frame_idx = int(batch.get("source_frame_idx", 0))
+        # convert_batch_to_minimal_format builds lightweight View objects (attribute-based),
+        # while some paths may pass dict-like views; support both without branching callers.
+        if isinstance(first_view, dict):
+            source_cam_idx = int(first_view.get("cam_idx", -1))
+        else:
+            source_cam_idx = int(getattr(first_view, "cam_idx", -1))
         src_target = {
             "view": first_view,
             "gt_image": first_image,
-            "frame_idx": int(first_view["frame_idx"]),
-            "cam_idx": int(first_view["cam_idx"]),
-            "sky_mask": first_view.get("sky_mask"),
-            "egocar_mask": first_view.get("egocar_mask"),
+            "frame_idx": source_frame_idx,
+            "cam_idx": source_cam_idx,
+            "sky_mask": source_sky_masks[0] if len(source_sky_masks) > 0 else None,
+            "egocar_mask": source_egocar_masks[0] if len(source_egocar_masks) > 0 else None,
+            "viewdirs": source_viewdirs[0] if len(source_viewdirs) > 0 else None,
         }
         infer_batch = dict(batch)
         infer_batch["targets"] = [src_target]
@@ -1363,6 +1375,91 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
             "gs_state": gs_state,
         }
 
+    def export_viewer_snapshot(
+        self,
+        batch: Dict[str, Any],
+        *,
+        scheduler_meta: Optional[Dict[str, Any]] = None,
+        segment_aabb: Optional[torch.Tensor] = None,
+        include_hidden: bool = False,
+        allow_hidden_cache_update: bool = False,
+        allow_node_state_writeback: bool = False,
+        rigid_export_frame_idx: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Build a viewer-friendly immutable snapshot from one train batch."""
+        if not isinstance(batch, dict):
+            raise ValueError("export_viewer_snapshot requires batch dict input")
+
+        scene_repr = self.build_scene_representation_from_source(
+            batch,
+            allow_hidden_cache_update=allow_hidden_cache_update,
+            allow_node_state_writeback=allow_node_state_writeback,
+        )
+        gs_state = scene_repr["gs_state"]
+        if include_hidden and not allow_hidden_cache_update:
+            base_batch = scene_repr["base_batch"]
+            gs_state = self.export_3dgs_state(
+                base_batch,
+                include_hidden=True,
+                rigid_export_frame_idx=rigid_export_frame_idx,
+            )
+
+        aligned = batch.get("_scheduler_v4_aligned_info") or {}
+        sched = dict(aligned)
+        if scheduler_meta is not None:
+            sched.update(scheduler_meta)
+
+        source_image_ref = sched.get("source_image_ref")
+        if source_image_ref is None:
+            req_meta = batch.get("request_meta") or {}
+            src_refs = req_meta.get("source_image_refs") or []
+            if len(src_refs) > 0:
+                source_image_ref = tuple(src_refs[0])
+        if source_image_ref is None:
+            source_image_ref = (-1, -1)
+        source_image_ref = (int(source_image_ref[0]), int(source_image_ref[1]))
+
+        target_image_refs_raw = sched.get("target_image_refs")
+        if target_image_refs_raw is None:
+            req_meta = batch.get("request_meta") or {}
+            target_image_refs_raw = req_meta.get("target_image_refs") or []
+        target_image_refs = [(int(r[0]), int(r[1])) for r in target_image_refs_raw]
+
+        stats: Dict[str, Any] = {
+            "num_bg_update": int(sched.get("num_bg_update", 0)),
+            "num_distant_update": int(sched.get("num_distant_update", 0)),
+            "num_sky_update": int(sched.get("num_sky_update", 0)),
+            "num_rigid_update": int(sched.get("num_rigid_update", 0)),
+            "src_backproject_pass_count": int(sched.get("src_backproject_pass_count", 0)),
+        }
+
+        if segment_aabb is None:
+            seg_aabb = batch.get("aabb")
+            seg_aabb_cpu = self._as_cpu_tensor(seg_aabb) if torch.is_tensor(seg_aabb) else None
+        else:
+            seg_aabb_cpu = self._as_cpu_tensor(segment_aabb) if torch.is_tensor(segment_aabb) else None
+
+        rigid_ref = rigid_export_frame_idx
+        if rigid_ref is None:
+            rigid_ref = gs_state.get("rigid_export_frame_idx")
+
+        snapshot: Dict[str, Any] = {
+            "cache_key": dict(gs_state.get("cache_key", {})),
+            "source_image_ref": source_image_ref,
+            "target_image_refs": target_image_refs,
+            "block_idx_global": int(sched.get("block_idx_global", -1)),
+            "segment_local_step": int(sched.get("segment_local_step", -1)),
+            "rigid_export_frame_idx": int(rigid_ref) if rigid_ref is not None else -1,
+            "gs_state": gs_state,
+            "stats": stats,
+            "include_hidden": bool(include_hidden),
+            "allow_hidden_cache_update": bool(allow_hidden_cache_update),
+            "allow_node_state_writeback": bool(allow_node_state_writeback),
+        }
+        if seg_aabb_cpu is not None:
+            snapshot["segment_aabb"] = seg_aabb_cpu
+        return snapshot
+
     def render_views_from_scene_state(
         self,
         scene_state: Dict[str, Any],
@@ -1380,14 +1477,40 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
         for v in eval_views:
             if "gt_image" not in v:
                 raise ValueError("Each eval_view must provide gt_image for render size inference")
+            view = v["view"]
+            viewdirs = v.get("viewdirs")
+            if viewdirs is None:
+                gt = v["gt_image"]
+                if gt.dim() == 4:
+                    gt = gt.squeeze(0)
+                h, w = int(gt.shape[0]), int(gt.shape[1])
+                c2w = view.camtoworlds if hasattr(view, "camtoworlds") else view["camtoworlds"]
+                intr = view.Ks if hasattr(view, "Ks") else view["Ks"]
+                if c2w.dim() == 2:
+                    c2w = c2w.unsqueeze(0)
+                if intr.dim() == 2:
+                    intr = intr.unsqueeze(0)
+                y_coords = torch.arange(h, device=gt.device, dtype=torch.float32)
+                x_coords = torch.arange(w, device=gt.device, dtype=torch.float32)
+                x_grid, y_grid = torch.meshgrid(x_coords, y_coords, indexing="xy")
+                _, viewdirs, _ = get_rays(
+                    x_grid.flatten(),
+                    y_grid.flatten(),
+                    c2w.to(gt.device),
+                    intr.to(gt.device),
+                )
+                viewdirs = viewdirs.reshape(h, w, 3)
+            elif torch.is_tensor(viewdirs):
+                viewdirs = viewdirs.to(v["gt_image"].device)
             targets.append(
                 {
-                    "view": v["view"],
+                    "view": view,
                     "gt_image": v["gt_image"],
                     "frame_idx": int(v["frame_idx"]),
                     "cam_idx": int(v.get("cam_idx", -1)),
                     "sky_mask": v.get("sky_mask"),
                     "egocar_mask": v.get("egocar_mask"),
+                    "viewdirs": viewdirs,
                 }
             )
         src_batch["targets"] = targets
@@ -1400,6 +1523,71 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
             self.train()
         self._restore_runtime_state(key, snap)
         return list(out["pred_rgbs"])
+
+    def inference_step_from_train_batch(
+        self,
+        batch: Dict,
+        step: Optional[int] = None,
+        scheduler_node_sync: Optional[Dict[str, Any]] = None,
+        runtime_policy: Optional[RuntimePolicy] = None,
+    ) -> Dict[str, Any]:
+        policy = runtime_policy or RuntimePolicy(
+            do_backward=False,
+            do_optimizer_step=False,
+            update_hidden_cache=True,
+            writeback_node_state=True,
+            reset_node_state_after_block=True,
+        )
+        if policy.do_backward or policy.do_optimizer_step:
+            raise ValueError("inference_step_from_train_batch requires do_backward=false and do_optimizer_step=false")
+
+        self.train()
+        self._perf_acc = {}
+        node_state_sync_update = False
+        node_state_sync_reset = False
+        with torch.no_grad():
+            out = self.forward(batch)
+
+        if policy.update_hidden_cache and "_cache_key" in out:
+            key = out["_cache_key"]
+            if out.get("_h_new_bg") is not None:
+                self.h_cache_bg[key] = out["_h_new_bg"].detach()
+            if out.get("_h_new_distant") is not None:
+                self.h_cache_distant[key] = out["_h_new_distant"].detach()
+            if out.get("_h_new_rigid") is not None:
+                self.h_cache_rigid[key] = out["_h_new_rigid"].detach()
+            if out.get("_h_new_sky") is not None:
+                self.h_cache_sky[key] = out["_h_new_sky"].detach()
+
+        if scheduler_node_sync is not None and policy.writeback_node_state:
+            U = int(scheduler_node_sync["U"])
+            seg = int(scheduler_node_sync["segment_local_step"])
+            reset_after_block = bool(scheduler_node_sync.get("reset_after_block", False)) and policy.reset_node_state_after_block
+            if U < 1:
+                raise ValueError("scheduler_node_sync requires U >= 1 (scheduler time_base.state_write_interval_steps).")
+            if seg > 0 and seg % U == 0:
+                self._writeback_node_states_from_out(out)
+                node_state_sync_update = True
+            if reset_after_block:
+                self.reset_node_state()
+                node_state_sync_reset = True
+        elif policy.writeback_node_state and self.update_node_state_interval > 0 and step is not None and step % self.update_node_state_interval == 0:
+            self._writeback_node_states_from_out(out)
+            if policy.reset_node_state_after_block and self.reset_node_state_interval > 0 and step % self.reset_node_state_interval == 0:
+                self.reset_node_state()
+
+        loss_val = out.get("loss")
+        return {
+            "loss": loss_val.item() if torch.is_tensor(loss_val) else float(loss_val) if loss_val is not None else 0.0,
+            "pred_rgbs": out["pred_rgbs"],
+            "gt_images": out["gt_images"],
+            "pred_rgb": out["pred_rgb"],
+            "gt_image": out["gt_image"],
+            "num_targets": len(batch.get("targets", [])),
+            "num_source_views": len(batch.get("source_views", [])),
+            "node_state_sync_update": node_state_sync_update,
+            "node_state_sync_reset": node_state_sync_reset,
+        }
 
     def train_step(
         self,
@@ -1585,4 +1773,3 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
 
 
 __all__ = ["MinimalStreetForwardStage4_3", "RuntimePolicy"]
-

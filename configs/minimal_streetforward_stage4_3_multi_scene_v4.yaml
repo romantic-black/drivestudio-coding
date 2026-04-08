@@ -212,8 +212,14 @@ scheduler_v4:
     fallback_with_replacement: true
     # 时间环带约束候选 keyframe：none 关闭；ring 时需在下方填写 temporal_neighbor_max_ring。
     temporal_neighbor_pool: ring
+
     temporal_neighbor_max_ring: 2
+
     temporal_neighbor_cams: [0, 1, 2, 3, 4, 5]
+    # 同一 reset episode 内：每个 block 结束后将上一 block 的 target[1:]（非 source 的 target 视角）写入 episode 状态，供下一 block 采样参考。
+    episode_carry_non_src_targets: true
+    # 在 episode_carry_non_src_targets 为 true 且上一 block 已产生非空 carry 时，以该概率跳过 overlap 与 temporal ring，改为从 carry 中按「当前 cam + 异 keyframe」过滤后的池子里随机抽取 extra target（有放回凑满 extra 个数）；取值 [0,1]；大于 0 时必须开启 episode_carry_non_src_targets。
+    random_bypass_overlap_ring_probability: 0.4
   # 视角对重叠评分（属于 target 采样逻辑，不是 data.preload）。
   # mode=none：按邻近 keyframe 贪心选 extra target（与旧行为一致）。
   # mode=pointcloud_topk：对候选 keyframe 全池算 overlap；在 score > overlap_min 的候选中随机选 extra，不足则按分数 top-k 回退；需 dataset.pointcloud 与下方字段。
@@ -476,7 +482,7 @@ test:
   # 是否启用独立测试 runner 逻辑（训练脚本遇到 true 会提示改用 test 脚本）。
   enable: false
   # adapt_supervised | inference_only | both
-  mode: adapt_supervised
+  mode: inference_only
   runner:
     # 固定 scene/segment（null 表示遍历 eval_scene_ids 下全部 segment）。
     fixed_scene_id: null
@@ -491,10 +497,11 @@ test:
     min_test_views_per_segment: 6
   split:
     require_eval_scene_ids: true
-    require_nonzero_test_stride: true
+    require_exhaustive_test_refs: true
     require_nonempty_test_views: true
+    allow_train_test_overlap_when_stride_zero: true
   adapt_supervised:
-    enable: true
+    enable: false
     max_steps_per_segment: 2000
     validate_every_blocks: 1
     early_stop_patience: 8
@@ -502,10 +509,13 @@ test:
     reset_runtime_state_each_segment: true
   inference_only:
     enable: true
+    eval_trigger: episode_end
+    aggregate_across_episodes: mean
+    max_episodes_per_segment: 0
+    save_per_episode_metrics_json: true
+    save_per_episode_per_view_metrics_json: false
     allow_hidden_cache_update: false
     allow_node_state_writeback: false
-    # 每次 next_eval_batch 最多组多少张 eval 图（chunk）。
-    eval_chunk_size: 16
   # mode=both 时：在 inference_only 之前是否 reset 并重载 init checkpoint（需与 --init_checkpoint 同用）。
   both:
     reload_init_before_inference: true

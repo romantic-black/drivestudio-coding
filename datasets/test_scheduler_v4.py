@@ -15,7 +15,7 @@ class TestSchedulerV4:
     """
     Scheduler for formal evaluation.
     - adapt_supervised: delegates to TrainSchedulerV4 when provided.
-    - inference_only: emits source + eval refs in chunks, no training/block semantics.
+    - inference_only: emits source + full eval refs per segment, no training/block semantics.
     """
 
     def __init__(
@@ -26,7 +26,6 @@ class TestSchedulerV4:
         eval_scene_ids: List[int],
         min_test_views_per_segment: int,
         max_segments_per_scene: int = 0,
-        eval_chunk_size: int = 16,
         deterministic: bool = True,
         seed: int = 123,
         source_protocol: str = "middle_keyframe_middle_frame_cam0",
@@ -42,7 +41,6 @@ class TestSchedulerV4:
         self.eval_scene_ids = [int(x) for x in eval_scene_ids]
         self.min_test_views_per_segment = int(min_test_views_per_segment)
         self.max_segments_per_scene = int(max_segments_per_scene)
-        self.eval_chunk_size = int(eval_chunk_size)
         self.deterministic = bool(deterministic)
         self.seed = int(seed)
         self.source_protocol = str(source_protocol)
@@ -51,8 +49,6 @@ class TestSchedulerV4:
         self._events: List[Dict[str, Any]] = []
         self._adapt_scheduler = adapt_scheduler
 
-        if self.eval_chunk_size < 1:
-            raise ValueError("eval_chunk_size must be >= 1")
         if self.min_test_views_per_segment < 1:
             raise ValueError("min_test_views_per_segment must be >= 1")
         if self.source_protocol not in ("first_train_frame_cam0", "middle_keyframe_middle_frame_cam0"):
@@ -138,7 +134,7 @@ class TestSchedulerV4:
                 }
             )
         start = int(self._eval_ref_cursor)
-        end = min(start + self.eval_chunk_size, len(refs))
+        end = int(len(refs))
         chunk = refs[start:end]
         source_ref = self._source_ref_for_segment(scene_id, segment_id)
         req = EvalRequestV3(

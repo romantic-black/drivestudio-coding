@@ -671,16 +671,18 @@ class MultiSceneDatasetV3(MultiSceneDataset):
             segment=segment,
             segment_id=int(segment_id),
         )
-        segment_first_pose = segment_first_pose.to(device=self.device, dtype=torch.float32)
-        # Materialize: cam_to_world slices can be lazy/subclass tensors; linalg.inv may error with
-        # "lazy wrapper should be called at most once" if the input is not a plain dense tensor.
-        segment_first_pose = segment_first_pose.contiguous().clone()
+        # Materialize: cam_to_world slices can be lazy/subclass tensors; roundtrip through numpy
+        # to force a plain dense array, then invert in numpy to avoid torch lazy wrapper issues.
+        pose_cpu = segment_first_pose.detach().cpu()
+        pose_np = np.asarray(pose_cpu, dtype=np.float64)
         try:
-            world_to_seg0 = torch.linalg.inv(segment_first_pose)
-        except RuntimeError as exc:
+            world_to_seg0_np = np.linalg.inv(pose_np)
+        except np.linalg.LinAlgError as exc:
             raise ValueError(
                 f"Segment {segment_id} first pose is non-invertible; cannot build segment coordinate transform."
             ) from exc
+        segment_first_pose = torch.from_numpy(pose_np.astype(np.float32)).to(device=self.device)
+        world_to_seg0 = torch.from_numpy(world_to_seg0_np.astype(np.float32)).to(device=self.device)
         with self._lock:
             if key not in self._segment_pose_cache:
                 self._segment_pose_cache[key] = {
@@ -1322,6 +1324,7 @@ class MultiSceneDatasetV3(MultiSceneDataset):
         include_test: bool,
         test_image_refs: Optional[Sequence[ImageRef]],
         enforce_target0_equals_source: bool,
+        target_ref_purpose: Literal["train", "test"] = "train",
     ) -> Dict[str, Any]:
         if len(source_image_refs) < 1:
             raise ValueError("source_image_refs must be non-empty")
@@ -1338,7 +1341,9 @@ class MultiSceneDatasetV3(MultiSceneDataset):
         for ref in source_image_refs:
             self.validate_image_ref(scene_id, segment_id, tuple(ref), purpose="train")
         for ref in target_image_refs:
-            self.validate_image_ref(scene_id, segment_id, tuple(ref), purpose="train")
+            self.validate_image_ref(
+                scene_id, segment_id, tuple(ref), purpose=target_ref_purpose
+            )
 
         if enforce_target0_equals_source:
             if len(source_image_refs) == 1:
@@ -1376,6 +1381,9 @@ class MultiSceneDatasetV3(MultiSceneDataset):
 
         def _load_stack_role(
             refs: Sequence[ImageRef],
+            *,
+            allow_missing_keyframe: bool,
+            role: str,
         ) -> Tuple[
             List[Tensor],
             List[Tensor],
@@ -1416,7 +1424,17 @@ class MultiSceneDatasetV3(MultiSceneDataset):
                 depths.append(pack["depth"])
                 frame_idxs.append(fidx)
                 cam_idxs.append(int(pack["cam_idx"]))
-                kf_idxs.append(int(sidx.frame_to_keyframe[fidx]))
+                kf_idx = sidx.frame_to_keyframe.get(fidx)
+                if kf_idx is None:
+                    if allow_missing_keyframe:
+                        kf_idxs.append(-1)
+                    else:
+                        raise KeyError(
+                            f"Frame {fidx} missing keyframe mapping for {role} "
+                            f"(scene={scene_id} segment={segment_id})"
+                        )
+                else:
+                    kf_idxs.append(int(kf_idx))
                 sm = pack.get("sky_mask")
                 if sm is not None:
                     has_sky = True
@@ -1446,8 +1464,16 @@ class MultiSceneDatasetV3(MultiSceneDataset):
                 has_ego,
             )
 
-        src_pack = _load_stack_role(source_image_refs)
-        tgt_pack = _load_stack_role(target_image_refs)
+        src_pack = _load_stack_role(
+            source_image_refs,
+            allow_missing_keyframe=False,
+            role="source",
+        )
+        tgt_pack = _load_stack_role(
+            target_image_refs,
+            allow_missing_keyframe=(target_ref_purpose == "test"),
+            role="target",
+        )
 
         source_images = src_pack[0]
         source_extrinsics = _transform_extrinsics_list(src_pack[1])
@@ -1829,6 +1855,7 @@ class MultiSceneDatasetV3(MultiSceneDataset):
             include_test=False,
             test_image_refs=None,
             enforce_target0_equals_source=False,
+            target_ref_purpose="test",
         )
         out: Dict[str, Any] = {
             "scene_id": raw["scene_id"],
@@ -1881,6 +1908,8 @@ class MultiSceneDatasetV3(MultiSceneDataset):
         temporal_neighbor_pool: str = "none",
         temporal_neighbor_max_ring: Optional[int] = None,
         temporal_neighbor_cams: Optional[List[int]] = None,
+        episode_carry_non_src_targets: bool = False,
+        random_bypass_overlap_ring_probability: float = 0.0,
     ) -> "TrainSchedulerV4":
         return TrainSchedulerV4(
             dataset=self,
@@ -1909,6 +1938,8 @@ class MultiSceneDatasetV3(MultiSceneDataset):
             temporal_neighbor_pool=temporal_neighbor_pool,
             temporal_neighbor_max_ring=temporal_neighbor_max_ring,
             temporal_neighbor_cams=temporal_neighbor_cams,
+            episode_carry_non_src_targets=episode_carry_non_src_targets,
+            random_bypass_overlap_ring_probability=random_bypass_overlap_ring_probability,
         )
 
     def get_segment_batch_from_frames(
@@ -2010,6 +2041,8 @@ class TrainSchedulerV4:
         temporal_neighbor_pool: str = "none",
         temporal_neighbor_max_ring: Optional[int] = None,
         temporal_neighbor_cams: Optional[List[int]] = None,
+        episode_carry_non_src_targets: bool = False,
+        random_bypass_overlap_ring_probability: float = 0.0,
     ) -> None:
         if state_write_interval_steps < 1:
             raise ValueError("state_write_interval_steps must be >= 1")
@@ -2066,6 +2099,16 @@ class TrainSchedulerV4:
             if len(temporal_neighbor_cams) == 0:
                 raise ValueError("TrainSchedulerV4: temporal_neighbor_cams must be null or a non-empty list of ints")
 
+        ebp = float(random_bypass_overlap_ring_probability)
+        if ebp < 0.0 or ebp > 1.0:
+            raise ValueError(
+                f"TrainSchedulerV4: random_bypass_overlap_ring_probability must be in [0, 1], got {ebp}"
+            )
+        if ebp > 0.0 and not bool(episode_carry_non_src_targets):
+            raise ValueError(
+                "TrainSchedulerV4: random_bypass_overlap_ring_probability > 0 requires episode_carry_non_src_targets=true"
+            )
+
         self.dataset = dataset
         self.U = int(state_write_interval_steps)
         self.updates_per_block = int(updates_per_block)
@@ -2098,6 +2141,8 @@ class TrainSchedulerV4:
         self.temporal_neighbor_cams = (
             [int(x) for x in temporal_neighbor_cams] if temporal_neighbor_cams is not None else None
         )
+        self.episode_carry_non_src_targets = bool(episode_carry_non_src_targets)
+        self.random_bypass_overlap_ring_probability = ebp
 
         self.epoch_idx = 0
         self.global_step = 0
@@ -2608,6 +2653,78 @@ class TrainSchedulerV4:
         }
         return refs, overlap_payload
 
+    def _filter_carry_refs_for_current_src(
+        self,
+        sidx: SegmentIndex,
+        kf_src: int,
+        cam_src: int,
+        prev: List[ImageRef],
+    ) -> List[ImageRef]:
+        """Carry list filtered to same cam as current source and excluding source keyframe."""
+        out: List[ImageRef] = []
+        seen: Set[Tuple[int, int]] = set()
+        for f, c in prev:
+            if int(c) != int(cam_src):
+                continue
+            kf = int(sidx.frame_to_keyframe[int(f)])
+            if kf == int(kf_src):
+                continue
+            t = (int(f), int(c))
+            if t in seen:
+                continue
+            seen.add(t)
+            out.append(t)
+        return out
+
+    def _try_bypass_targets_from_episode_carry(
+        self,
+        sidx: SegmentIndex,
+        source_ref: ImageRef,
+        kf_src: int,
+        cam_src: int,
+    ) -> Optional[Tuple[List[ImageRef], Dict[str, Any]]]:
+        """
+        With probability random_bypass_overlap_ring_probability, skip overlap / temporal ring and
+        pick extra targets by uniform random from the previous block's non-src targets (episode carry),
+        filtered to current cam and keyframe constraints.
+        """
+        if not self.episode_carry_non_src_targets:
+            return None
+        if self.random_bypass_overlap_ring_probability <= 0.0:
+            return None
+        st = self.current_segment_state
+        if st is None:
+            return None
+        prev_raw = st.get("episode_prev_non_src_targets") or []
+        if not prev_raw:
+            return None
+        prev: List[ImageRef] = [(int(x[0]), int(x[1])) for x in prev_raw]
+        filtered = self._filter_carry_refs_for_current_src(sidx, kf_src, cam_src, prev)
+        if len(filtered) == 0:
+            return None
+        if random.random() >= float(self.random_bypass_overlap_ring_probability):
+            return None
+        extra_needed = self.total_target_images - 1
+        if extra_needed <= 0:
+            return None
+        if len(filtered) >= extra_needed:
+            extras = random.sample(filtered, int(extra_needed))
+        else:
+            extras = random.choices(filtered, k=int(extra_needed))
+        refs: List[ImageRef] = [source_ref] + list(extras)
+        sid, seg = int(sidx.scene_id), int(sidx.segment_id)
+        payload: Dict[str, Any] = {
+            "scene_id": sid,
+            "segment_id": seg,
+            "target_sampling_bypass_random_carry": True,
+            "target_sampling_bypass_carry_pool_size": int(len(filtered)),
+            "source_image_ref": [int(source_ref[0]), int(source_ref[1])],
+            "selected_target_image_refs": [[int(x[0]), int(x[1])] for x in refs[1:]],
+        }
+        if self.overlap_mode == "pointcloud_topk":
+            payload["overlap_mode"] = "pointcloud_topk"
+        return refs, payload
+
     def _refs_for_pair(
         self,
         sidx: SegmentIndex,
@@ -2617,6 +2734,9 @@ class TrainSchedulerV4:
     ) -> Tuple[ImageRef, List[ImageRef], Optional[Dict[str, Any]]]:
         frame_src = int(random.choice(sidx.keyframe_to_frames[int(kf)]))
         source_ref: ImageRef = (frame_src, int(cam))
+        bypass = self._try_bypass_targets_from_episode_carry(sidx, source_ref, int(kf), int(cam))
+        if bypass is not None:
+            return source_ref, bypass[0], bypass[1]
         target_refs, overlap_payload = self._sample_target_image_refs(sidx, source_ref, episode_window)
         return source_ref, target_refs, overlap_payload
 
@@ -2776,6 +2896,7 @@ class TrainSchedulerV4:
         st["pair_list"] = pair_list
         st["pair_cursor"] = 0
         st["block_idx_in_episode"] = -1
+        st["episode_prev_non_src_targets"] = []
 
         self._reset_episode_idx += 1
         self._emit(
@@ -2792,6 +2913,22 @@ class TrainSchedulerV4:
             }
         )
         self._emit_preload_hint_episode_superset(scene_id, segment_id, pair_list)
+
+    def _emit_episode_end(self, st: Dict[str, Any], *, reason: str) -> None:
+        pair_list = list(st.get("pair_list") or [])
+        self._emit(
+            {
+                "type": "episode_end",
+                "epoch_idx": int(self.epoch_idx),
+                "global_step": int(self.global_step),
+                "scene_id": int(st["scene_id"]),
+                "segment_id": int(st["segment_id"]),
+                "reset_episode_idx": int(self._reset_episode_idx),
+                "reason": str(reason),
+                "window_keyframes": list(st.get("episode_window_keyframes") or []),
+                "num_pairs": int(len(pair_list)),
+            }
+        )
 
     def _start_block(self) -> bool:
         st = self.current_segment_state
@@ -2811,6 +2948,7 @@ class TrainSchedulerV4:
                 self._end_segment()
                 return False
             if int(st["episodes_started"]) < self.episodes_per_segment:
+                self._emit_episode_end(st, reason="episode_switch")
                 self._start_episode()
                 continue
             raise ValueError(
@@ -2830,6 +2968,8 @@ class TrainSchedulerV4:
         st["source_cam_idx"] = int(cam_src)
         st["source_image_ref"] = source_ref
         st["target_image_refs"] = list(target_refs)
+        if self.episode_carry_non_src_targets:
+            st["episode_prev_non_src_targets"] = [tuple(x) for x in target_refs[1:]]
 
         remaining_u = int(st["segment_budget_u"]) - int(st["segment_local_u"])
         st["effective_u_this_block"] = int(min(self.updates_per_block, remaining_u))
@@ -2849,7 +2989,11 @@ class TrainSchedulerV4:
         else:
             st["block_test_image_refs"] = None
 
-        if overlap_payload is not None and overlap_payload.get("overlap_mode") == "pointcloud_topk":
+        if (
+            overlap_payload is not None
+            and overlap_payload.get("overlap_mode") == "pointcloud_topk"
+            and not overlap_payload.get("target_sampling_bypass_random_carry")
+        ):
             ev_os = {
                 "type": "overlap_select",
                 "epoch_idx": int(self.epoch_idx),
@@ -2893,6 +3037,8 @@ class TrainSchedulerV4:
                 "temporal_neighbor_pool",
                 "temporal_neighbor_ring_effective",
                 "temporal_neighbor_fallback_full_pool",
+                "target_sampling_bypass_random_carry",
+                "target_sampling_bypass_carry_pool_size",
             ):
                 if k in overlap_payload:
                     bb[k] = overlap_payload[k]
@@ -2904,6 +3050,8 @@ class TrainSchedulerV4:
         st = self.current_segment_state
         if st is None:
             return
+        if int(st.get("episodes_started", 0)) > 0:
+            self._emit_episode_end(st, reason="segment_end")
         self._emit(
             {
                 "type": "segment_end",
@@ -2951,6 +3099,7 @@ class TrainSchedulerV4:
             "source_keyframe_idx": -1,
             "source_frame_idx": -1,
             "source_cam_idx": -1,
+            "episode_prev_non_src_targets": [],
         }
         self.dataset.set_preload_active_scope(scene_id, segment_id)
         if hasattr(self.dataset, "set_preload_training_scope"):
@@ -2978,6 +3127,59 @@ class TrainSchedulerV4:
         self._start_episode()
         if not self._start_block():
             raise ValueError("TrainSchedulerV4: could not start first block in segment (configuration error)")
+
+    def materialize_current_batch_without_advance(self) -> Dict[str, Any]:
+        """
+        Build the same batch tensor dict as the next ``next_batch()`` call would return, but **do not**
+        increment ``global_step``, ``segment_local_step``, or block/U counters.
+
+        Use this for viewer priming / previews so the first on-screen ``segment_local_step`` stays 0
+        until the first real ``next_batch()`` + ``train_step`` pipeline runs.
+
+        ``_scheduler_v4_aligned_info`` uses **pre-advance** counters (unlike ``next_batch()``, which
+        attaches info after incrementing local step).
+        """
+        self._ensure_epoch_plan_index(self.plan_cursor)
+        if self.plan_cursor >= len(self.epoch_plan):
+            self.start_new_epoch()
+            self._ensure_epoch_plan_index(self.plan_cursor)
+        if self.plan_cursor >= len(self.epoch_plan):
+            raise ValueError(
+                "TrainSchedulerV4: epoch has no (scene, segment) pairs; check dataset.scene_training_queue"
+            )
+        if self.current_segment_state is None:
+            self._enter_segment()
+
+        st = self.current_segment_state
+        if st is None:
+            raise ValueError("TrainSchedulerV4 internal state is not initialized")
+
+        scene_id = int(st["scene_id"])
+        segment_id = int(st["segment_id"])
+        block_test = st.get("block_test_image_refs") if self.include_test else None
+        req = BatchRequestV3(
+            scene_id=scene_id,
+            segment_id=segment_id,
+            source_image_ref=tuple(st["source_image_ref"]),
+            target_image_refs=[tuple(x) for x in st["target_image_refs"]],
+            include_test=self.include_test,
+            test_image_refs=block_test,
+        )
+        batch = self.dataset.get_segment_batch_from_image_refs(req, enforce_target0_equals_source=True)
+        batch["_scheduler_v4_aligned_info"] = {
+            "epoch_idx": int(self.epoch_idx),
+            "global_step": int(self.global_step),
+            "scene_id": int(st["scene_id"]),
+            "segment_id": int(st["segment_id"]),
+            "segment_local_step": int(st["segment_local_step"]),
+            "block_idx_in_segment": int(st.get("block_idx_in_segment", -1)),
+            "block_idx_global": int(st.get("block_idx_global", 0)),
+            "source_image_ref": tuple(st["source_image_ref"]),
+            "target_image_refs": [tuple(x) for x in st["target_image_refs"]],
+            "U": int(self.U),
+        }
+        batch["_scheduler_v4_peek"] = True
+        return batch
 
     def next_batch(self) -> Dict[str, Any]:
         self._ensure_epoch_plan_index(self.plan_cursor)

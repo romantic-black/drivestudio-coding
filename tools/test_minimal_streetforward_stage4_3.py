@@ -13,10 +13,13 @@ from pytorch_msssim import SSIM
 from torchmetrics.image import PeakSignalNoiseRatio
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
-from datasets.multi_scene_dataset_v3 import BatchRequestV3
-from datasets.test_scheduler_v4 import TestSchedulerV4
-from models.streetforward.minimal_trainer_stage4_3 import MinimalStreetForwardStage4_3
-from tools.streetforward_test_config import ensure_dataset_initialized_for_test, validate_test_config
+from datasets.multi_scene_dataset_v3 import EvalRequestV3
+from models.streetforward.minimal_trainer_stage4_3 import MinimalStreetForwardStage4_3, RuntimePolicy
+from tools.streetforward_test_config import (
+    ensure_dataset_initialized_for_test,
+    validate_dataset_test_split_or_raise,
+    validate_test_config,
+)
 from tools.streetforward_test_export import save_3dgs_ply, save_3dgs_state, save_test_summary
 from tools.train_minimal_streetforward_stage1_1 import _compute_metrics, _save_image_triplet, convert_batch_to_minimal_format, setup
 from tools.train_minimal_streetforward_stage4_1_one_segment_v3 import _build_scheduler_node_sync, _load_init_checkpoint
@@ -49,15 +52,15 @@ def _build_minimal_eval_from_refs(
     test_refs: List[Tuple[int, int]],
     device: torch.device,
 ) -> Dict[str, Any]:
-    req = BatchRequestV3(
+    req = EvalRequestV3(
         scene_id=int(scene_id),
         segment_id=int(segment_id),
         source_image_ref=tuple(source_ref),
-        target_image_refs=[tuple(r) for r in test_refs],
-        include_test=False,
-        test_image_refs=None,
+        eval_image_refs=[tuple(r) for r in test_refs],
     )
-    raw = dataset.get_segment_batch_from_image_refs(req, enforce_target0_equals_source=False)
+    raw_eval = dataset.get_segment_eval_batch_from_image_refs(req)
+    raw = dict(raw_eval)
+    raw["target"] = raw_eval["eval"]
     return convert_batch_to_minimal_format(
         raw,
         device,
@@ -314,105 +317,165 @@ def run_inference_only(
     psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
     ssim_metric = SSIM(data_range=1.0, size_average=True, channel=3).to(device)
     lpips_metric = LearnedPerceptualImagePatchSimilarity(normalize=True).to(device)
-    sched = TestSchedulerV4(
-        dataset=dataset,
-        mode="inference_only",
-        eval_scene_ids=[int(x) for x in test_cfg["eval_scene_ids"]],
-        min_test_views_per_segment=int(test_cfg["min_test_views_per_segment"]),
-        max_segments_per_scene=int(test_cfg["max_segments_per_scene"]),
-        eval_chunk_size=int(cfg.test.inference_only.get("eval_chunk_size", 16)),
-        deterministic=bool(cfg.test.runner.deterministic),
-        seed=int(cfg.test.runner.seed),
-        source_protocol=str(cfg.test.runner.source_protocol),
-        fixed_scene_id=cfg.test.runner.get("fixed_scene_id"),
-        fixed_segment_id=cfg.test.runner.get("fixed_segment_id"),
-        adapt_scheduler=None,
-    )
-    per_seg_summary: Dict[Tuple[int, int], Dict[str, Any]] = {}
-    per_seg_views: Dict[Tuple[int, int], List[Dict[str, Any]]] = {}
-    per_seg_scene_state: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    eval_scene_ids = [int(x) for x in test_cfg["eval_scene_ids"]]
+    fixed_scene_id = cfg.test.runner.get("fixed_scene_id")
+    fixed_segment_id = cfg.test.runner.get("fixed_segment_id")
+    if fixed_scene_id is not None:
+        eval_scene_ids = [int(fixed_scene_id)]
 
-    while True:
-        try:
-            raw_eval = sched.next_eval_batch()
-        except StopIteration:
-            break
-        events = sched.pop_events()
-        for ev in events:
-            if ev.get("type") == "eval_begin":
-                key = (int(ev["scene_id"]), int(ev["segment_id"]))
-                per_seg_summary[key] = {"psnr": [], "ssim": [], "lpips": [], "num_views": 0}
-                per_seg_views[key] = []
+    infer_policy = RuntimePolicy(
+        do_backward=False,
+        do_optimizer_step=False,
+        update_hidden_cache=bool(cfg.test.inference_only.allow_hidden_cache_update),
+        writeback_node_state=bool(cfg.test.inference_only.allow_node_state_writeback),
+        reset_node_state_after_block=True,
+    )
+
+    for scene_id in eval_scene_ids:
+        scene_data = dataset.get_scene(int(scene_id))
+        if scene_data is None:
+            logger.warning("Skip scene_id=%s because scene cannot be loaded", scene_id)
+            continue
+        seg_ids = list(range(len(scene_data["segments"])))
+        if fixed_segment_id is not None:
+            seg_ids = [int(fixed_segment_id)]
+        max_seg = int(test_cfg["max_segments_per_scene"])
+        used = 0
+        for segment_id in seg_ids:
+            test_refs = dataset.resolve_test_image_refs_deterministic(int(scene_id), int(segment_id))
+            if len(test_refs) < int(test_cfg["min_test_views_per_segment"]):
                 logger.info(
-                    "Inference eval begin scene=%s segment=%s num_views=%s",
-                    ev["scene_id"],
-                    ev["segment_id"],
-                    ev["num_eval_views"],
+                    "Skip scene=%s segment=%s: test refs %s < min_test_views_per_segment %s",
+                    scene_id,
+                    segment_id,
+                    len(test_refs),
+                    int(test_cfg["min_test_views_per_segment"]),
+                )
+                continue
+            if max_seg > 0 and used >= max_seg:
+                break
+            used += 1
+            seg_dir = _scene_seg_dir(cfg.log_dir, scene_id, segment_id, "inference_only")
+            logger.info("Inference-only episode test start scene=%s segment=%s", scene_id, segment_id)
+
+            seg_cfg = _override_cfg_for_fixed_segment(cfg, int(scene_id), int(segment_id))
+            scheduler = build_train_scheduler_v4_from_cfg(seg_cfg, dataset)
+            max_episodes_per_segment = int(cfg.test.inference_only.max_episodes_per_segment)
+
+            final_minimal: Optional[Dict[str, Any]] = None
+            init_saved = False
+            step = 0
+            segment_done = False
+            per_episode: List[Dict[str, Any]] = []
+            per_episode_per_view: List[Dict[str, Any]] = []
+
+            while not segment_done:
+                raw_batch = scheduler.next_batch()
+                scheduler_info = raw_batch.get("_scheduler_v4_aligned_info")
+                if scheduler_info is None:
+                    scheduler_info = scheduler.get_current_info()
+                step_events = scheduler.pop_events()
+                scheduler_node_sync = _build_scheduler_node_sync(seg_cfg, scheduler_info, step_events)
+                minimal_batch = convert_batch_to_minimal_format(
+                    raw_batch,
+                    device,
+                    num_targets=int(raw_batch["target"]["image"].shape[0]),
+                    include_source_for_2d=True,
+                    view_selection=None,
+                )
+                final_minimal = minimal_batch
+                if not init_saved and bool(cfg.test.export.save_3dgs_init):
+                    model.ensure_runtime_state_from_batch(minimal_batch)
+                    init_state = model.export_3dgs_state(
+                        minimal_batch,
+                        rigid_export_frame_idx=int(minimal_batch["source_frame_idx"]),
+                    )
+                    save_3dgs_state(os.path.join(seg_dir, "3dgs_init.pt"), init_state)
+                    if bool(cfg.test.export.save_ply):
+                        save_3dgs_ply(os.path.join(seg_dir, "3dgs_init.ply"), init_state)
+                    init_saved = True
+
+                model.inference_step_from_train_batch(
+                    minimal_batch,
+                    step=step,
+                    scheduler_node_sync=scheduler_node_sync,
+                    runtime_policy=infer_policy,
+                )
+                step += 1
+
+                for ev in step_events:
+                    if ev.get("type") != "episode_end":
+                        continue
+                    source_ref = _source_ref_by_protocol(cfg, scheduler_info, minimal_batch)
+                    ep_summary, ep_per_view = _eval_on_test_refs(
+                        model,
+                        dataset,
+                        int(scene_id),
+                        int(segment_id),
+                        source_ref,  # type: ignore[arg-type]
+                        [tuple(r) for r in test_refs],
+                        device,
+                        psnr_metric,
+                        ssim_metric,
+                        lpips_metric,
+                    )
+                    episode_idx = int(ev.get("reset_episode_idx", len(per_episode) + 1))
+                    per_episode.append(
+                        {
+                            "episode_idx": episode_idx,
+                            "source_ref": [int(source_ref[0]), int(source_ref[1])],
+                            "num_views": int(ep_summary["num_views"]),
+                            "psnr": float(ep_summary["psnr"]),
+                            "ssim": float(ep_summary["ssim"]),
+                            "lpips": float(ep_summary["lpips"]),
+                        }
+                    )
+                    if bool(cfg.test.inference_only.save_per_episode_per_view_metrics_json):
+                        for row in ep_per_view:
+                            out_row = dict(row)
+                            out_row["episode_idx"] = int(episode_idx)
+                            per_episode_per_view.append(out_row)
+                    if max_episodes_per_segment > 0 and len(per_episode) >= max_episodes_per_segment:
+                        segment_done = True
+                        break
+
+                if segment_done:
+                    break
+                if any(ev.get("type") == "segment_end" for ev in step_events):
+                    segment_done = True
+
+            if final_minimal is None:
+                continue
+            if len(per_episode) == 0:
+                raise ValueError(
+                    f"inference_only requires at least one episode_end evaluation "
+                    f"(scene={scene_id} segment={segment_id})"
                 )
 
-        raw = dict(raw_eval)
-        raw["target"] = raw_eval["eval"]
-        minimal = convert_batch_to_minimal_format(
-            raw,
-            device,
-            num_targets=int(raw["target"]["image"].shape[0]),
-            include_source_for_2d=True,
-            view_selection=None,
-        )
-        key = (int(minimal["scene_id"]), int(minimal["segment_id"]))
-        if key not in per_seg_scene_state:
-            scene_state = model.build_scene_representation_from_source(
-                minimal,
-                allow_hidden_cache_update=bool(cfg.test.inference_only.allow_hidden_cache_update),
-                allow_node_state_writeback=bool(cfg.test.inference_only.allow_node_state_writeback),
-            )
-            per_seg_scene_state[key] = scene_state
-            if bool(cfg.test.export.save_3dgs_init):
-                init_state = scene_state["gs_state"]
-                seg_dir = _scene_seg_dir(cfg.log_dir, key[0], key[1], "inference_only")
-                save_3dgs_state(os.path.join(seg_dir, "3dgs_init.pt"), init_state)
-                if bool(cfg.test.export.save_ply):
-                    save_3dgs_ply(os.path.join(seg_dir, "3dgs_init.ply"), init_state)
-        preds = model.render_views_from_scene_state(per_seg_scene_state[key], minimal["targets"])
-        index_base = int(len(per_seg_views[key]))
-        for i, (pred, gt, tgt) in enumerate(zip(preds, minimal["targets"], minimal["targets"])):
-            vals = _compute_metrics(pred, gt["gt_image"], psnr_metric, ssim_metric, lpips_metric, True, True)
-            per_seg_summary[key]["psnr"].append(float(vals["psnr"]))
-            per_seg_summary[key]["ssim"].append(float(vals["ssim"]))
-            per_seg_summary[key]["lpips"].append(float(vals["lpips"]))
-            per_seg_summary[key]["num_views"] += 1
-            per_seg_views[key].append(
-                {
-                    "index": int(index_base + i),
-                    "frame_idx": int(tgt["frame_idx"]),
-                    "psnr": float(vals["psnr"]),
-                    "ssim": float(vals["ssim"]),
-                    "lpips": float(vals["lpips"]),
-                }
-            )
-
-        for ev in events:
-            if ev.get("type") != "segment_eval_end":
-                continue
-            seg_key = (int(ev["scene_id"]), int(ev["segment_id"]))
-            seg_dir = _scene_seg_dir(cfg.log_dir, seg_key[0], seg_key[1], "inference_only")
-            summary_raw = per_seg_summary.get(seg_key, {"psnr": [], "ssim": [], "lpips": [], "num_views": 0})
             summary = {
                 "mode": "inference_only",
-                "scene_id": int(seg_key[0]),
-                "segment_id": int(seg_key[1]),
-                "num_views": int(summary_raw["num_views"]),
-                "psnr": float(np.mean(summary_raw["psnr"])) if summary_raw["psnr"] else 0.0,
-                "ssim": float(np.mean(summary_raw["ssim"])) if summary_raw["ssim"] else 0.0,
-                "lpips": float(np.mean(summary_raw["lpips"])) if summary_raw["lpips"] else 0.0,
+                "scene_id": int(scene_id),
+                "segment_id": int(segment_id),
+                "aggregate_across_episodes": "mean",
+                "num_episodes": int(len(per_episode)),
+                "num_views_per_episode": int(per_episode[0]["num_views"]) if per_episode else 0,
+                "psnr": float(np.mean([float(x["psnr"]) for x in per_episode])),
+                "ssim": float(np.mean([float(x["ssim"]) for x in per_episode])),
+                "lpips": float(np.mean([float(x["lpips"]) for x in per_episode])),
             }
             save_test_summary(os.path.join(seg_dir, "summary.json"), summary)
-            if bool(cfg.test.export.save_per_view_metrics_json):
-                with open(os.path.join(seg_dir, "per_view_metrics.json"), "w", encoding="utf-8") as f:
-                    json.dump(per_seg_views.get(seg_key, []), f, indent=2)
-            final_scene_state = per_seg_scene_state.get(seg_key)
-            if final_scene_state is not None and bool(cfg.test.export.save_3dgs_final):
-                final_state = final_scene_state["gs_state"]
+            if bool(cfg.test.inference_only.save_per_episode_metrics_json):
+                with open(os.path.join(seg_dir, "per_episode_metrics.json"), "w", encoding="utf-8") as f:
+                    json.dump(per_episode, f, indent=2)
+            if bool(cfg.test.inference_only.save_per_episode_per_view_metrics_json):
+                with open(os.path.join(seg_dir, "per_episode_per_view_metrics.json"), "w", encoding="utf-8") as f:
+                    json.dump(per_episode_per_view, f, indent=2)
+
+            final_state = model.export_3dgs_state(
+                final_minimal,
+                rigid_export_frame_idx=int(final_minimal["source_frame_idx"]),
+            )
+            if bool(cfg.test.export.save_3dgs_final):
                 save_3dgs_state(os.path.join(seg_dir, "3dgs_final.pt"), final_state)
                 if bool(cfg.test.export.save_ply):
                     save_3dgs_ply(os.path.join(seg_dir, "3dgs_final.ply"), final_state)
@@ -441,6 +504,7 @@ def main() -> None:
     set_deterministic_seed(int(args.seed))
     dataset = build_multi_scene_dataset_v3(cfg, device)
     ensure_dataset_initialized_for_test(dataset, cfg)
+    validate_dataset_test_split_or_raise(dataset, test_cfg)
 
     model = MinimalStreetForwardStage4_3(config=cfg, device=device)
     model.train()

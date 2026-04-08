@@ -589,11 +589,13 @@ class DrivingDataset(SceneDataset):
                 self.num_img_timesteps,
                 self.data_cfg.pixel_source.test_image_stride,
             )
+            train_timesteps = np.array(
+                [i for i in range(self.num_img_timesteps) if i not in test_timesteps]
+            )
         else:
-            test_timesteps = []
-        train_timesteps = np.array(
-            [i for i in range(self.num_img_timesteps) if i not in test_timesteps]
-        )
+            # Canonical semantics for stride=0: train/test both use all frames.
+            test_timesteps = np.arange(self.num_img_timesteps)
+            train_timesteps = np.arange(self.num_img_timesteps)
         logger.info(
             f"Train timesteps: \n{np.arange(self.start_timestep, self.end_timestep)[train_timesteps]}"
         )
@@ -607,7 +609,7 @@ class DrivingDataset(SceneDataset):
             if t in train_timesteps:
                 for cam in range(self.pixel_source.num_cams):
                     train_indices.append(t * self.pixel_source.num_cams + cam)
-            elif t in test_timesteps:
+            if t in test_timesteps:
                 for cam in range(self.pixel_source.num_cams):
                     test_indices.append(t * self.pixel_source.num_cams + cam)
         logger.info(f"Number of train indices: {len(train_indices)}")

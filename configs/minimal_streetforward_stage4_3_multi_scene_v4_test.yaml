@@ -1,18 +1,34 @@
-# Stage4.3 多场景 V4 正式测试配置模板（供 tools/test_minimal_streetforward_stage4_3.py 使用）。
-# 继承/对齐训练配置字段；这里给出测试相关建议值。
+# =============================================================================
+# Stage4.3 多场景 V4 — 正式测试配置模板
+# 入口：PYTHONPATH=/root/drivestudio-coding python tools/test_minimal_streetforward_stage4_3.py \
+#   --config_file configs/minimal_streetforward_stage4_3_multi_scene_v4_test.yaml \
+#   --init_checkpoint <path/to/checkpoint.pt> [--init_weights_only]
+#
+# 说明：
+# - data.eval_scene_ids：仅列出「能成功经 MultiSceneDataset 加载」的场景 ID。
+#   加载失败常见原因见文件末尾「故障排查」。
+# - data.train_scene_ids: []：eval-only 时允许为空；test runner 会处理 initialize()。
+# - dataset.min_keyframes_per_scene：场景级门槛；某 scene 在 train split + keyframe 切分后
+#   keyframe 段数 < 该值时，整场景会被跳过（日志：insufficient keyframes）。
+# =============================================================================
 output_name: minimal_sf_stage4_3_multi_scene_v4_test
 
 data:
+  # 需与本机 nuScenes 预处理路径一致；不对则所有 scene 都会加载失败。
   data_root: "/root/autodl-tmp/nuScenes/"
   dataset: "nuscenes"
   start_timestep: 0
   end_timestep: -1
   preload_device: cpu
   sky_mask_semantics: one_is_sky
-  # 测试 runner 仅消费 eval_scene_ids；此处 train_scene_ids 不参与正式 hold-out 统计。
+  # 测试 runner 仅消费 eval_scene_ids；train_scene_ids 不参与 hold-out 语义统计。
   train_scene_ids: []
-  eval_scene_ids: [0]
+  # 正式 eval 场景 ID；必须存在于数据集中，且满足 _is_scene_suitable（keyframe 数 >= min_keyframes_per_scene）。
+  # 若某 ID 在日志里被标为「insufficient keyframes」，请换 scene 或检查下述 dataset 门槛。
+  eval_scene_ids: [1]
   preload:
+    # 预加载子系统：用于降低 I/O 抖动与跨阶段等待。
+    # 单机测试推荐先保持 1 worker，先验证语义正确，再加并发。
     enable: true
     num_workers: 1
     max_pending_tasks: 64
@@ -31,15 +47,19 @@ data:
     warm_overlap_pairs_next_block_exact: true
     stats_log_interval_steps: 0
   pixel_source:
+    # 像素数据源：决定相机集合、图像缩放与 train/test 帧切分语义。
     type: datasets.nuscenes.nuscenes_sourceloader.NuScenesPixelSource
     cameras: [0, 1, 2, 3, 4, 5]
     downscale_when_loading: [3, 3, 3, 3, 3, 3]
     downscale: 1
     undistort: False
-    # 正式测试必须非 0。
-    test_image_stride: 8
-    # 正式测试必须 > 0。
-    max_test_images: 8
+    # 0: 所有 frame 同时用于训练与测试（train=test 全帧自评估模式）。
+    # >0: 先按 stride 抽取 test frames，剩余 frames 作为 train；
+    #     keyframe / segment 仅基于 train frames 构建。
+    test_image_stride: 0
+    # 0: 不截断，测试时评估该 segment 的全部 test frames（exhaustive）。
+    # 本修订方案固定使用 0，max_test_images > 0 会触发 fast-fail。
+    max_test_images: 0
     load_sky_mask: true
     load_dynamic_mask: true
     load_depth_maps: true
@@ -50,15 +70,21 @@ data:
       buffer_ratio: 0.5
       start_enhance_weight: 3
   lidar_source:
+    # 激光数据源：用于点云构建与自动 AABB。
     type: datasets.nuscenes.nuscenes_sourceloader.NuScenesLiDARSource
     load_lidar: true
     lidar_downsample_factor: 1
     lidar_percentile: 0.02
 
 dataset:
+  # keyframe/segment 的 canonical 语义：
+  # - stride>0: 仅在 train_frame_indices 上构建 keyframe/segment；
+  # - stride=0: train/test 同为全帧，此时 keyframe 实际在全帧上构建。
   num_source_keyframes: 1
   num_target_keyframes: 3
   segment_overlap_ratio: 0.2
+  # 场景是否可用的硬门槛：split_trajectory 在「train 帧子集」上得到的段数 >= 此值。
+  # 与整场景总帧数无关；test_image_stride=1 时常只剩 1 个 train 帧 → 段数恒为 1。
   min_keyframes_per_scene: 2
   min_keyframes_per_segment: 2
   preload_scene_count: 2
@@ -86,6 +112,7 @@ dataset:
       traj_length_thresh_m: 0.5
 
 multi_scene:
+  # formal test runner 下固定 false，避免训练 batch 混入 test 视角。
   include_test: false
 
 scheduler_v3:
@@ -94,6 +121,7 @@ scheduler_v3:
     sync_with_scheduler: true
 
 scheduler_v4:
+  # 训练侧调度器（adapt_supervised 会使用）；inference_only 不消费该调度器的 next_batch。
   enable: true
   time_base:
     state_write_interval_steps: 4
@@ -129,6 +157,7 @@ scheduler_v4:
     fixed_segment_id: null
 
 model:
+  # 模型结构参数：保持与 Stage4.3 训练配置一致，避免测试形态与训练形态漂移。
   scale_init_value: 0.1
   sh_degree: 1
   voxel_size: 0.2
@@ -265,6 +294,7 @@ model:
         freeze_quat: false
 
 losses:
+  # adapt_supervised 训练阶段损失。
   rgb: {w: 1.0}
   ssim: {w: 0.05}
   mask:
@@ -273,38 +303,53 @@ losses:
   opacity_entropy: {w: 0.0}
 
 optimizer:
+  # adapt_supervised 训练阶段优化器。
   lr: 1.0e-4
   eps: 1.0e-15
   weight_decay: 0.0
 
 training:
+  # 仅供模型与通用工具读取；formal test runner 自身不依赖 max_iterations 主循环。
   max_iterations: 10000000
   log_interval: 100
   save_checkpoint_freq: 20000
   seed: 42
 
 eval:
+  # 与旧训练脚本兼容的评估配置；正式测试请以 test: 区块为准。
   enable_psnr: true
   save_train_views_psnr_below: 14
   run_test_at_end: false
 
 test:
+  # 正式测试主入口配置。
   enable: true
-  mode: adapt_supervised
+  # mode:
+  # - adapt_supervised: 先监督适配，再按 test refs 评估；
+  # - inference_only: 仅构建 scene_state + test refs 渲染评估；
+  # - both: 先 adapt_supervised，再 inference_only（可选重载 checkpoint）。
+  mode: inference_only
   runner:
     fixed_scene_id: null
     fixed_segment_id: null
     deterministic: true
     seed: 123
     source_protocol: middle_keyframe_middle_frame_cam0
+    # 0 表示不限制 segment 数；>0 表示每个 scene 最多评估多少个 segment。
     max_segments_per_scene: 0
+    # segment 级最小 test 视角数门槛（逐相机 refs 计数）。
     min_test_views_per_segment: 6
   split:
+    # true: data.eval_scene_ids 必须非空。
     require_eval_scene_ids: true
-    require_nonzero_test_stride: true
+    # true: 强制 max_test_images=0，确保评估 refs 不裁剪（exhaustive）。
+    require_exhaustive_test_refs: true
+    # true: 任何 eval segment 的 test_frame_indices 为空都 fast-fail。
     require_nonempty_test_views: true
+    # true: 允许 stride=0 时 train/test 全重合（train=test 全帧自评估）。
+    allow_train_test_overlap_when_stride_zero: true
   adapt_supervised:
-    enable: true
+    enable: false
     max_steps_per_segment: 2000
     validate_every_blocks: 1
     early_stop_patience: 8
@@ -312,12 +357,26 @@ test:
     reset_runtime_state_each_segment: true
   inference_only:
     enable: true
+    # inference_only 新语义：train scheduler 推进；每个 episode_end 在 test refs 上评估。
+    eval_trigger: episode_end
+    # segment 最终指标为各 episode 指标的均值。
+    aggregate_across_episodes: mean
+    # 0: 不截断，使用 scheduler_v4.reset_episode.episodes_per_segment 完整配额。
+    # >0: 仅统计前 N 个 episode。
+    max_episodes_per_segment: 0
+    # 输出每个 episode 的 summary 指标。
+    save_per_episode_metrics_json: true
+    # 输出每个 episode 的逐视角指标（文件较大）。
+    save_per_episode_per_view_metrics_json: false
+    # false: 不把 forward 的 hidden 写回缓存，保证纯推理稳定性。
     allow_hidden_cache_update: false
+    # false: 不把 forward 的 node state 写回模型缓存。
     allow_node_state_writeback: false
-    eval_chunk_size: 16
   both:
+    # mode=both 时，inference_only 前是否重置并重载 init checkpoint。
     reload_init_before_inference: true
   export:
+    # 导出项开关：3DGS init/best/final、PLY、渲染图、每视角指标。
     save_3dgs_init: true
     save_3dgs_best: true
     save_3dgs_final: true
@@ -326,6 +385,7 @@ test:
     save_per_view_metrics_json: true
 
 logging:
+  # 测试阶段日志与性能观测。
   image_interval_blocks: 6
   low_psnr_train_images_subdir: train_low_psnr
   enable_jsonl_metrics: true
@@ -339,3 +399,24 @@ logging:
     enable: true
     phase_timing: true
     cuda_memory: false
+
+# -----------------------------------------------------------------------------
+# 故障排查（与终端日志对应）
+#
+# 1) test_image_stride < 0
+#    → 非法配置，直接 fast-fail。
+#
+# 2) max_test_images != 0
+#    → 与“测试时评估全部 test frames（exhaustive）”冲突，直接 fast-fail。
+#      当前 resolve_test_image_refs_deterministic() 在 max_test_images > 0 时会裁剪 refs。
+#
+# 3) test_image_stride > 0 且某 segment 的 train/test 任一为空
+#    → 配置与数据切分语义冲突，直接 fast-fail。
+#
+# 4) test_image_stride == 0
+#    → 合法。语义是所有 frames 同时用于训练和测试，不视为错误。
+#
+# 5) 「Skip scene_id=N because scene cannot be loaded」
+#    → dataset.get_scene(N) 得到 None（路径错误、数据损坏或场景不可用等）。
+#      正式测试建议先修复加载问题，再运行 runner。
+# -----------------------------------------------------------------------------
