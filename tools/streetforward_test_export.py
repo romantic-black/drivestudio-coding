@@ -64,23 +64,11 @@ def _collect_vertices(state: Dict[str, Any]) -> List[str]:
 
 
 def save_3dgs_ply(path: str, state: Dict[str, Any]) -> None:
-    vertices = _collect_vertices(state)
-    lines = [
-        "ply",
-        "format ascii 1.0",
-        f"element vertex {len(vertices)}",
-        "property float x",
-        "property float y",
-        "property float z",
-        "property uchar red",
-        "property uchar green",
-        "property uchar blue",
-        "property float opacity",
-        "end_header",
-    ]
-    lines.extend(vertices)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+    raise ValueError(
+        "save_3dgs_ply is disabled for formal test export. "
+        "PLY is a lossy visualization format and cannot preserve complete 3DGS parameters. "
+        "Export/save *.pt via save_3dgs_state instead."
+    )
 
 
 def save_test_summary(path: str, summary: Dict[str, Any]) -> None:

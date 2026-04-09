@@ -20,7 +20,7 @@ from tools.streetforward_test_config import (
     validate_dataset_test_split_or_raise,
     validate_test_config,
 )
-from tools.streetforward_test_export import save_3dgs_ply, save_3dgs_state, save_test_summary
+from tools.streetforward_test_export import save_3dgs_state, save_test_summary
 from tools.train_minimal_streetforward_stage1_1 import _compute_metrics, _save_image_triplet, convert_batch_to_minimal_format, setup
 from tools.train_minimal_streetforward_stage4_1_one_segment_v3 import _build_scheduler_node_sync, _load_init_checkpoint
 from tools.train_minimal_streetforward_stage4_3_v4_common import build_multi_scene_dataset_v3, build_train_scheduler_v4_from_cfg
@@ -152,6 +152,9 @@ def run_adapt_supervised(
     psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
     ssim_metric = SSIM(data_range=1.0, size_average=True, channel=3).to(device)
     lpips_metric = LearnedPerceptualImagePatchSimilarity(normalize=True).to(device)
+    log_interval_blocks = int(cfg.logging.get("image_interval_blocks", 1))
+    if log_interval_blocks < 1:
+        raise ValueError("logging.image_interval_blocks must be >= 1 for test runner logs")
     eval_scene_ids = [int(x) for x in test_cfg["eval_scene_ids"]]
     fixed_scene_id = cfg.test.runner.get("fixed_scene_id")
     fixed_segment_id = cfg.test.runner.get("fixed_segment_id")
@@ -184,6 +187,14 @@ def run_adapt_supervised(
             used += 1
             seg_dir = _scene_seg_dir(cfg.log_dir, scene_id, segment_id, "adapt_supervised")
             logger.info("Adapt-supervised test start scene=%s segment=%s", scene_id, segment_id)
+            logger.info(
+                "Adapt-supervised segment settings scene=%s segment=%s test_views=%s validate_every_blocks=%s max_steps=%s",
+                scene_id,
+                segment_id,
+                len(test_refs),
+                int(cfg.test.adapt_supervised.validate_every_blocks),
+                int(cfg.test.adapt_supervised.max_steps_per_segment),
+            )
 
             if bool(cfg.test.adapt_supervised.reset_runtime_state_each_segment):
                 model.reset_node_state()
@@ -219,8 +230,6 @@ def run_adapt_supervised(
                     model.ensure_runtime_state_from_batch(minimal_batch)
                     init_state = model.export_3dgs_state(minimal_batch, rigid_export_frame_idx=int(minimal_batch["source_frame_idx"]))
                     save_3dgs_state(os.path.join(seg_dir, "3dgs_init.pt"), init_state)
-                    if bool(cfg.test.export.save_ply):
-                        save_3dgs_ply(os.path.join(seg_dir, "3dgs_init.ply"), init_state)
                     init_saved = True
                 result = model.train_step(
                     minimal_batch,
@@ -235,6 +244,16 @@ def run_adapt_supervised(
                     if ev.get("type") != "block_end":
                         continue
                     block_counter += 1
+                    if block_counter % log_interval_blocks == 0:
+                        logger.info(
+                            "Adapt train progress scene=%s segment=%s block=%s step=%s source_ref=%s loss=%.6f",
+                            scene_id,
+                            segment_id,
+                            block_counter,
+                            step,
+                            scheduler_info.get("source_image_ref"),
+                            float(result.get("loss", 0.0)),
+                        )
                     if block_counter % int(cfg.test.adapt_supervised.validate_every_blocks) != 0:
                         continue
                     source_ref = _source_ref_by_protocol(cfg, scheduler_info, minimal_batch)
@@ -251,19 +270,36 @@ def run_adapt_supervised(
                         lpips_metric,
                     )
                     cur_metric = float(eval_summary[best_metric_name])
+                    logger.info(
+                        "Adapt eval scene=%s segment=%s step=%s block=%s source_ref=%s metric(psnr=%.4f ssim=%.4f lpips=%.4f)",
+                        scene_id,
+                        segment_id,
+                        step,
+                        block_counter,
+                        source_ref,
+                        float(eval_summary["psnr"]),
+                        float(eval_summary["ssim"]),
+                        float(eval_summary["lpips"]),
+                    )
                     if _metric_better(best_metric_name, cur_metric, best_metric_val):
                         best_metric_val = cur_metric
                         best_eval_summary = dict(eval_summary)
                         best_eval_per_view = list(eval_per_view)
                         best_step = int(step)
                         validations_without_improve = 0
+                        logger.info(
+                            "Adapt best updated scene=%s segment=%s step=%s best_%s=%.6f",
+                            scene_id,
+                            segment_id,
+                            best_step,
+                            best_metric_name,
+                            float(cur_metric),
+                        )
                         if bool(cfg.test.export.save_3dgs_best):
                             best_state = model.export_3dgs_state(
                                 minimal_batch, rigid_export_frame_idx=int(minimal_batch["source_frame_idx"])
                             )
                             save_3dgs_state(os.path.join(seg_dir, "3dgs_best.pt"), best_state)
-                            if bool(cfg.test.export.save_ply):
-                                save_3dgs_ply(os.path.join(seg_dir, "3dgs_best.ply"), best_state)
                         if bool(cfg.test.export.save_rendered_images):
                             render_dir = os.path.join(seg_dir, "renders")
                             for idx, (pred, gt) in enumerate(zip(result["pred_rgbs"], result["gt_images"])):
@@ -290,8 +326,6 @@ def run_adapt_supervised(
             final_state = model.export_3dgs_state(final_minimal, rigid_export_frame_idx=int(final_minimal["source_frame_idx"]))
             if bool(cfg.test.export.save_3dgs_final):
                 save_3dgs_state(os.path.join(seg_dir, "3dgs_final.pt"), final_state)
-                if bool(cfg.test.export.save_ply):
-                    save_3dgs_ply(os.path.join(seg_dir, "3dgs_final.ply"), final_state)
             summary = {
                 "mode": "adapt_supervised",
                 "scene_id": int(scene_id),
@@ -302,6 +336,14 @@ def run_adapt_supervised(
                 "best_eval": best_eval_summary,
             }
             save_test_summary(os.path.join(seg_dir, "summary.json"), summary)
+            logger.info(
+                "Adapt-supervised segment done scene=%s segment=%s best_step=%s best_%s=%s",
+                scene_id,
+                segment_id,
+                best_step,
+                best_metric_name,
+                "None" if best_metric_val is None else f"{float(best_metric_val):.6f}",
+            )
             if bool(cfg.test.export.save_per_view_metrics_json):
                 with open(os.path.join(seg_dir, "per_view_metrics.json"), "w", encoding="utf-8") as f:
                     json.dump(best_eval_per_view, f, indent=2)
@@ -317,6 +359,9 @@ def run_inference_only(
     psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
     ssim_metric = SSIM(data_range=1.0, size_average=True, channel=3).to(device)
     lpips_metric = LearnedPerceptualImagePatchSimilarity(normalize=True).to(device)
+    log_interval_blocks = int(cfg.logging.get("image_interval_blocks", 1))
+    if log_interval_blocks < 1:
+        raise ValueError("logging.image_interval_blocks must be >= 1 for test runner logs")
     eval_scene_ids = [int(x) for x in test_cfg["eval_scene_ids"]]
     fixed_scene_id = cfg.test.runner.get("fixed_scene_id")
     fixed_segment_id = cfg.test.runner.get("fixed_segment_id")
@@ -330,6 +375,11 @@ def run_inference_only(
         writeback_node_state=bool(cfg.test.inference_only.allow_node_state_writeback),
         reset_node_state_after_block=True,
     )
+    if not bool(cfg.test.inference_only.allow_hidden_cache_update) and not bool(cfg.test.inference_only.allow_node_state_writeback):
+        logger.warning(
+            "inference_only is configured with allow_hidden_cache_update=false and "
+            "allow_node_state_writeback=false; runtime state will barely change from checkpoint."
+        )
 
     for scene_id in eval_scene_ids:
         scene_data = dataset.get_scene(int(scene_id))
@@ -357,6 +407,16 @@ def run_inference_only(
             used += 1
             seg_dir = _scene_seg_dir(cfg.log_dir, scene_id, segment_id, "inference_only")
             logger.info("Inference-only episode test start scene=%s segment=%s", scene_id, segment_id)
+            logger.info(
+                "Inference-only segment settings scene=%s segment=%s test_views=%s max_episodes_per_segment=%s "
+                "allow_hidden_cache_update=%s allow_node_state_writeback=%s",
+                scene_id,
+                segment_id,
+                len(test_refs),
+                int(cfg.test.inference_only.max_episodes_per_segment),
+                bool(cfg.test.inference_only.allow_hidden_cache_update),
+                bool(cfg.test.inference_only.allow_node_state_writeback),
+            )
 
             seg_cfg = _override_cfg_for_fixed_segment(cfg, int(scene_id), int(segment_id))
             scheduler = build_train_scheduler_v4_from_cfg(seg_cfg, dataset)
@@ -368,6 +428,7 @@ def run_inference_only(
             segment_done = False
             per_episode: List[Dict[str, Any]] = []
             per_episode_per_view: List[Dict[str, Any]] = []
+            block_end_count = 0
 
             while not segment_done:
                 raw_batch = scheduler.next_batch()
@@ -391,11 +452,9 @@ def run_inference_only(
                         rigid_export_frame_idx=int(minimal_batch["source_frame_idx"]),
                     )
                     save_3dgs_state(os.path.join(seg_dir, "3dgs_init.pt"), init_state)
-                    if bool(cfg.test.export.save_ply):
-                        save_3dgs_ply(os.path.join(seg_dir, "3dgs_init.ply"), init_state)
                     init_saved = True
 
-                model.inference_step_from_train_batch(
+                infer_result = model.inference_step_from_train_batch(
                     minimal_batch,
                     step=step,
                     scheduler_node_sync=scheduler_node_sync,
@@ -404,6 +463,18 @@ def run_inference_only(
                 step += 1
 
                 for ev in step_events:
+                    if ev.get("type") == "block_end":
+                        block_end_count += 1
+                        if block_end_count % log_interval_blocks == 0:
+                            logger.info(
+                                "Inference train-like progress scene=%s segment=%s block=%s step=%s source_ref=%s pseudo_loss=%.6f",
+                                scene_id,
+                                segment_id,
+                                block_end_count,
+                                step,
+                                scheduler_info.get("source_image_ref"),
+                                float(infer_result.get("loss", 0.0)),
+                            )
                     if ev.get("type") != "episode_end":
                         continue
                     source_ref = _source_ref_by_protocol(cfg, scheduler_info, minimal_batch)
@@ -429,6 +500,18 @@ def run_inference_only(
                             "ssim": float(ep_summary["ssim"]),
                             "lpips": float(ep_summary["lpips"]),
                         }
+                    )
+                    logger.info(
+                        "Inference episode eval scene=%s segment=%s episode=%s source_ref=%s "
+                        "psnr=%.4f ssim=%.4f lpips=%.4f num_views=%s",
+                        scene_id,
+                        segment_id,
+                        episode_idx,
+                        source_ref,
+                        float(ep_summary["psnr"]),
+                        float(ep_summary["ssim"]),
+                        float(ep_summary["lpips"]),
+                        int(ep_summary["num_views"]),
                     )
                     if bool(cfg.test.inference_only.save_per_episode_per_view_metrics_json):
                         for row in ep_per_view:
@@ -464,6 +547,17 @@ def run_inference_only(
                 "lpips": float(np.mean([float(x["lpips"]) for x in per_episode])),
             }
             save_test_summary(os.path.join(seg_dir, "summary.json"), summary)
+            logger.info(
+                "Inference-only segment done scene=%s segment=%s episodes=%s block_ends=%s "
+                "mean(psnr=%.4f ssim=%.4f lpips=%.4f)",
+                scene_id,
+                segment_id,
+                int(len(per_episode)),
+                int(block_end_count),
+                float(summary["psnr"]),
+                float(summary["ssim"]),
+                float(summary["lpips"]),
+            )
             if bool(cfg.test.inference_only.save_per_episode_metrics_json):
                 with open(os.path.join(seg_dir, "per_episode_metrics.json"), "w", encoding="utf-8") as f:
                     json.dump(per_episode, f, indent=2)
@@ -477,8 +571,6 @@ def run_inference_only(
             )
             if bool(cfg.test.export.save_3dgs_final):
                 save_3dgs_state(os.path.join(seg_dir, "3dgs_final.pt"), final_state)
-                if bool(cfg.test.export.save_ply):
-                    save_3dgs_ply(os.path.join(seg_dir, "3dgs_final.ply"), final_state)
 
 
 def main() -> None:

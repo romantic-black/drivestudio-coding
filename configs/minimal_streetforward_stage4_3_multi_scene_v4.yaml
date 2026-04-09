@@ -129,9 +129,9 @@ dataset:
   # segment AABB（在 segment 第一帧坐标系下）。
   segment_aabb:
     # [x_min, y_min, z_min]
-    - [-40.0, -20.0, -20.0]
+    - [-20.0, -10.0, -20.0]
     # [x_max, y_max, z_max]
-    - [40.0, 4.8, 60.0]
+    - [20.0, 4.8, 60.0]
 
   # 点云融合配置（背景/远景/动态）。
   pointcloud:
@@ -152,11 +152,11 @@ dataset:
     # 单目动态点回收：3D bbox 扩张（米）。
     monocular_dynamic_recovery_bbox_expand_xyz_m: [0.5, 0.2, 0.5]
     # 单实例动态点数上限。
-    monocular_dynamic_recovery_max_points_per_instance: 20000
+    monocular_dynamic_recovery_max_points_per_instance: 40000
     # 近景点云最大点数。  
-    near_max_points: 400000
+    near_max_points: 600000
     # 远景点云最大点数。
-    distant_max_points: 800000
+    distant_max_points: 1200000
     # 段内轨迹长度低于阈值的实例视为静止：LiDAR 框内点保留在 background，并排除 dynamic_info。
     static_instance_motion:
       enable: true
@@ -189,7 +189,7 @@ scheduler_v4:
   # reset episode：连续 keyframe 窗口上的 (keyframe, cam) 无放回遍历；与 segment 预算推导相关。
   reset_episode:
     # 每个 episode 窗口内连续 keyframe 个数（不超过 segment 内 keyframe 总数时取窗口长度）。
-    keyframes_per_episode: 3
+    keyframes_per_episode: 12
     # 同一 segment 内至多开启的 episode 个数（上界；硬结束仍由 segment_budget_u 决定）。
     episodes_per_segment: 1
     # keyframe 窗口策略：在 segment 的 keyframe 序列上取随机连续子窗。
@@ -276,9 +276,9 @@ model:
   # Stage 4.3：天空半球 GS 壳层（非 cubemap；与旧 Stage3.1 cubemap 的 resolution 含义不同）。
   sky:
     # 每维概念分辨率；点数 N = resolution^2。
-    resolution: 600
+    resolution: 500
     # 世界系球半径（米）。
-    radius: 75.0
+    radius: 50.0
     # 相对 segment AABB **地面面中心**的球心偏移 [x,y,z]（地面 = y_max 面中心，见 MultiSceneDataset 坐标系）。
     center: [0.0, 0.0, 0.0]
     # true：Fibonacci 半球，点数 N = resolution^2（约全球的一半）；false：完整 Fibonacci 球壳。

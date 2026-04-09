@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-import os
 from types import SimpleNamespace
 
-import torch
 from omegaconf import OmegaConf
 
 from datasets.multi_scene_dataset_v3 import TrainSchedulerV4
 from tools.streetforward_test_config import validate_dataset_test_split_or_raise, validate_test_config
-from tools.streetforward_test_export import save_3dgs_ply
 
 
 def _make_cfg() -> OmegaConf:
@@ -59,7 +56,7 @@ def _make_cfg() -> OmegaConf:
                     "save_3dgs_init": True,
                     "save_3dgs_best": True,
                     "save_3dgs_final": True,
-                    "save_ply": True,
+                    "save_ply": False,
                     "save_rendered_images": True,
                     "save_per_view_metrics_json": True,
                 },
@@ -149,6 +146,17 @@ def test_validate_test_config_fails_for_invalid_inference_aggregate_mode() -> No
     raise AssertionError("validate_test_config must fail when aggregate_across_episodes is invalid")
 
 
+def test_validate_test_config_fails_when_save_ply_enabled() -> None:
+    cfg = _make_cfg()
+    cfg.test.export.save_ply = True
+    try:
+        validate_test_config(cfg)
+    except ValueError as exc:
+        assert "save_ply must be false" in str(exc)
+        return
+    raise AssertionError("validate_test_config must fail when test.export.save_ply=true")
+
+
 class _FakeDataset:
     def __init__(self, scene_map):
         self._scene_map = scene_map
@@ -191,29 +199,6 @@ def test_validate_dataset_test_split_or_raise_fails_for_empty_train_segment_stri
         assert "train_frame_indices is empty" in str(exc)
         return
     raise AssertionError("dataset split validation must fail for stride>0 with empty train frames")
-
-
-def test_save_3dgs_ply_requires_rigid_world(tmp_path) -> None:
-    n = 2
-    branch = {
-        "means": torch.zeros((n, 3), dtype=torch.float32),
-        "opacity_logit": torch.zeros((n, 1), dtype=torch.float32),
-        "sh_dc": torch.zeros((n, 3), dtype=torch.float32),
-    }
-    state = {
-        "branches": {
-            "bg": branch,
-            "rigid_local": branch,
-            "rigid_world": None,
-        }
-    }
-    out = os.path.join(tmp_path, "x.ply")
-    try:
-        save_3dgs_ply(out, state)
-    except ValueError as exc:
-        assert "rigid_world" in str(exc)
-        return
-    raise AssertionError("save_3dgs_ply must fail when rigid_local exists but rigid_world is missing")
 
 
 def test_train_scheduler_v4_end_segment_emits_episode_end_then_segment_end() -> None:

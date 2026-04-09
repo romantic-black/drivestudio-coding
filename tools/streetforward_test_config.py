@@ -143,6 +143,12 @@ def validate_test_config(cfg: Any) -> Dict[str, Any]:
         "save_per_view_metrics_json",
     ):
         _ = _as_bool(exp, key, "test.export")
+    if bool(exp.get("save_ply")):
+        raise ValueError(
+            "test.export.save_ply must be false. "
+            "PLY export is a lossy visualization format and cannot preserve complete 3DGS state; "
+            "use save_3dgs_init/best/final (.pt) for full-fidelity export."
+        )
 
     if mode == "adapt_supervised" and not adapt_enable:
         raise ValueError("test.mode=adapt_supervised requires test.adapt_supervised.enable=true")

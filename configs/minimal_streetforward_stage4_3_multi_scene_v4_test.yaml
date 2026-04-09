@@ -124,11 +124,11 @@ scheduler_v4:
   # 训练侧调度器（adapt_supervised 会使用）；inference_only 不消费该调度器的 next_batch。
   enable: true
   time_base:
-    state_write_interval_steps: 4
+    state_write_interval_steps: 1
   source_block:
     updates_per_block: 24
   reset_episode:
-    keyframes_per_episode: 3
+    keyframes_per_episode: 12
     episodes_per_segment: 1
     keyframe_window_policy: random_contiguous_window
     pair_order_policy: shuffle_without_replacement
@@ -338,7 +338,7 @@ test:
     # 0 表示不限制 segment 数；>0 表示每个 scene 最多评估多少个 segment。
     max_segments_per_scene: 0
     # segment 级最小 test 视角数门槛（逐相机 refs 计数）。
-    min_test_views_per_segment: 6
+    min_test_views_per_segment: 50
   split:
     # true: data.eval_scene_ids 必须非空。
     require_eval_scene_ids: true
@@ -367,20 +367,20 @@ test:
     # 输出每个 episode 的 summary 指标。
     save_per_episode_metrics_json: true
     # 输出每个 episode 的逐视角指标（文件较大）。
-    save_per_episode_per_view_metrics_json: false
+    save_per_episode_per_view_metrics_json: true
     # false: 不把 forward 的 hidden 写回缓存，保证纯推理稳定性。
-    allow_hidden_cache_update: false
+    allow_hidden_cache_update: true
     # false: 不把 forward 的 node state 写回模型缓存。
-    allow_node_state_writeback: false
+    allow_node_state_writeback: node
   both:
     # mode=both 时，inference_only 前是否重置并重载 init checkpoint。
     reload_init_before_inference: true
   export:
-    # 导出项开关：3DGS init/best/final、PLY、渲染图、每视角指标。
+    # 导出项开关：只保留完整 3DGS state(.pt) 与评估产物；禁用 lossy PLY 导出。
     save_3dgs_init: true
     save_3dgs_best: true
     save_3dgs_final: true
-    save_ply: true
+    save_ply: false
     save_rendered_images: true
     save_per_view_metrics_json: true
 
