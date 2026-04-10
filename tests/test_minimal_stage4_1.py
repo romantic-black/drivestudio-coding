@@ -3,7 +3,11 @@ from __future__ import annotations
 import torch
 
 from models.streetforward.minimal_trainer_stage2_1 import _create_proxy_params
-from models.streetforward.minimal_trainer_stage4_0 import _backward_to_render_params_bg_rigid_distant
+from models.streetforward.minimal_trainer_stage4_0 import (
+    _backward_to_render_params_bg_rigid_distant,
+    merge_debug_stats_as_perf_floats,
+    spatial_hw_from_image_tensor,
+)
 from models.streetforward.minimal_trainer_stage4_1 import MinimalStreetForwardStage4_1
 from models.streetforward.node_states import NodeStateRigid
 
@@ -24,6 +28,29 @@ def _make_rigid_state(device: torch.device) -> NodeStateRigid:
         frame_ids=[7, 8],
         cur_frame=7,
     )
+
+
+def test_spatial_hw_from_image_tensor_hwc_vs_chw():
+    hwc = torch.zeros(10, 20, 3)
+    assert spatial_hw_from_image_tensor(hwc) == (10, 20)
+    chw = torch.zeros(3, 10, 20)
+    assert spatial_hw_from_image_tensor(chw) == (10, 20)
+
+
+def test_merge_debug_stats_flattens_per_view_lists():
+    out: dict = {}
+    merge_debug_stats_as_perf_floats(
+        out,
+        "2d_bp_",
+        {
+            "pairs_total": 5,
+            "render_packed_ms_per_view": [1.0, 2.0, 3.0],
+        },
+    )
+    assert out["2d_bp_pairs_total"] == 5.0
+    assert out["2d_bp_render_packed_ms_per_view_sum"] == 6.0
+    assert out["2d_bp_render_packed_ms_per_view_mean"] == 2.0
+    assert out["2d_bp_render_packed_ms_per_view_len"] == 3.0
 
 
 def test_global_to_subset_rows():
@@ -101,6 +128,55 @@ def test_validate_multi_frame_fails_missing_rigid_pose():
     except ValueError:
         return
     raise AssertionError("Expected ValueError for unknown frame_idx in rigid.")
+
+
+def test_validate_requires_source_frame_target_coverage_for_multi_src():
+    device = torch.device("cpu")
+    trainer = MinimalStreetForwardStage4_1.__new__(MinimalStreetForwardStage4_1)
+    trainer.device = device
+    eye = torch.eye(4)
+    src_v0 = type("View", (), {"camtoworlds": eye.clone(), "Ks": torch.eye(3).unsqueeze(0), "cam_idx": 0})()
+    src_v1 = type("View", (), {"camtoworlds": eye.clone(), "Ks": torch.eye(3).unsqueeze(0), "cam_idx": 1})()
+    img = torch.zeros(4, 5, 3)
+    sm = torch.ones(4, 5)
+    vd = torch.zeros(4, 5, 3)
+    targets = [
+        {"frame_idx": 7, "view": src_v0, "gt_image": img, "sky_mask": sm, "viewdirs": vd},
+    ]
+    try:
+        trainer._validate_stage4_1_batch(
+            {"source_views": [src_v0, src_v1], "source_images": [img, img], "source_frame_idx": 7},
+            targets,
+            None,
+        )
+    except ValueError as e:
+        assert "coverage" in str(e).lower()
+        return
+    raise AssertionError("Expected ValueError for insufficient source-frame target coverage.")
+
+
+def test_validate_prefers_cam_idx_match_over_pose_match():
+    device = torch.device("cpu")
+    trainer = MinimalStreetForwardStage4_1.__new__(MinimalStreetForwardStage4_1)
+    trainer.device = device
+    eye = torch.eye(4)
+    # source view poses differ from target poses; cam_idx matching should still pass
+    src_v0 = type("View", (), {"camtoworlds": eye.clone(), "Ks": torch.eye(3).unsqueeze(0), "cam_idx": 0})()
+    src_v1 = type("View", (), {"camtoworlds": (eye * 2.0), "Ks": torch.eye(3).unsqueeze(0), "cam_idx": 1})()
+    tgt_v0 = type("View", (), {"camtoworlds": (eye * 3.0), "Ks": torch.eye(3).unsqueeze(0), "cam_idx": 0})()
+    tgt_v1 = type("View", (), {"camtoworlds": (eye * 4.0), "Ks": torch.eye(3).unsqueeze(0), "cam_idx": 1})()
+    img = torch.zeros(4, 5, 3)
+    sm = torch.ones(4, 5)
+    vd = torch.zeros(4, 5, 3)
+    targets = [
+        {"frame_idx": 7, "view": tgt_v0, "gt_image": img, "sky_mask": sm, "viewdirs": vd},
+        {"frame_idx": 7, "view": tgt_v1, "gt_image": img, "sky_mask": sm, "viewdirs": vd},
+    ]
+    trainer._validate_stage4_1_batch(
+        {"source_views": [src_v0, src_v1], "source_images": [img, img], "source_frame_idx": 7},
+        targets,
+        None,
+    )
 
 
 def test_backward_accepts_rigid_world_proxy_pairs():

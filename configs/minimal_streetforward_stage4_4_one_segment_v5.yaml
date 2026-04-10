@@ -1,0 +1,186 @@
+output_name: minimal_sf_stage4_4_one_segment_v5
+
+data:
+  data_root: "/root/autodl-tmp/nuScenes/"
+  dataset: "nuscenes"
+  start_timestep: 0
+  end_timestep: -1
+  preload_device: cpu
+  sky_mask_semantics: one_is_sky
+  train_scene_ids: [1]
+  eval_scene_ids: []
+  preload:
+    enable: false
+  pixel_source:
+    type: datasets.nuscenes.nuscenes_sourceloader.NuScenesPixelSource
+    cameras: [0]
+    downscale_when_loading: [3]
+    downscale: 1
+    undistort: false
+    test_image_stride: 0
+    max_test_images: 4
+    load_sky_mask: true
+    load_dynamic_mask: true
+    load_depth_maps: true
+    load_objects: true
+    load_smpl: false
+    sampler:
+      buffer_downscale: 8
+      buffer_ratio: 0.5
+      start_enhance_weight: 3
+  lidar_source:
+    type: datasets.nuscenes.nuscenes_sourceloader.NuScenesLiDARSource
+    load_lidar: true
+    lidar_downsample_factor: 4
+    lidar_percentile: 0.02
+
+dataset:
+  num_source_keyframes: 1
+  num_target_keyframes: 3
+  segment_overlap_ratio: 0.2
+  min_keyframes_per_scene: 2
+  min_keyframes_per_segment: 2
+  preload_scene_count: 2
+  keyframe_split_config:
+    num_splits: 0
+    min_count: 1
+    min_length: 2.0
+  segment_aabb:
+    - [-40.0, -20.0, -30.0]
+    - [40.0, 14.8, 90.0]
+  pointcloud:
+    type: "hybrid"
+    lidar_sparsity: full
+    monocular_chosen_cam_ids: [0]
+    monocular_sparsity: full
+    monocular_filter_sky: true
+    monocular_depth_consistency: false
+    monocular_downscale: 2
+    monocular_dynamic_recovery_bbox_expand_xyz_m: [0.5, 0.2, 0.5]
+    monocular_dynamic_recovery_max_points_per_instance: 20000
+    near_max_points: 500000
+    distant_max_points: 1000000
+    static_instance_motion:
+      enable: true
+      traj_length_thresh_m: 0.5
+
+one_segment:
+  scene_id: 1
+  segment_id: 0
+  include_test: true
+
+scheduler_v3:
+  enable: false
+  model_node_state:
+    sync_with_scheduler: true
+
+scheduler_v5:
+  enable: true
+  time_base:
+    state_write_interval_steps: 4
+  source_block:
+    updates_per_block: 2
+  reset_episode:
+    keyframes_per_episode: 3
+    episodes_per_segment: 2
+  target_sampling:
+    include_source_frame: true
+    total_target_frames: 3
+    policy: neighbor_keyframes_random_frames
+    neighbor_ring: 1
+    prefer_nearby_keyframes: true
+    fallback_expand_to_segment: true
+    with_replacement: true
+  overlap:
+    mode: none
+  traversal:
+    fixed_scene_id: null
+    fixed_segment_id: null
+
+model:
+  scale_init_value: 0.1
+  sh_degree: 1
+  voxel_size: 0.2
+  sparseConv_outdim: 32
+  feat_2d_channels: 32
+  feat_2d_downscale: 1
+  use_fused_cuda_backproject_v2: true
+  use_fused_cuda_backproject_v3: true
+  param_embed_dim: 48
+  offset_gru_hidden_dim: 48
+  offset_gru_use_reset_gate: true
+  update_node_state_interval: 1
+  reset_node_state_interval: 10
+  sky:
+    resolution: 300
+    radius: 50.0
+    center: [0.0, 0.0, 0.0]
+    hemisphere: true
+    hemisphere_up: [0.0, 1.0, 0.0]
+  branches:
+    bg:
+      src_backproject_support_min: 1e-6
+      enable_selective_update: false
+      freeze_means: false
+      init: {scale_init: {mode: isotropic, isotropic_log_value: -2.30, knn_k: 3, knn_log_scale_bias: 0.0}, opacity_init: 0.1}
+      limits: {offset_max: 0.1, scale_max: 0.1, omega_max: 0.1, opacity_max: 0.1, sh_dc_max: 0.1, sh_rest_max: 0.05}
+      eta: {means: 1.0, scales: 1.0, opacity: 1.0, sh_dc: 1.0, sh_rest: 1.0}
+      mlp: {hidden_dim: 64, use_3d_feat: true, use_2d_feat: true, freeze_quat: false}
+    distant:
+      src_backproject_support_min: 1e-6
+      enable_selective_update: false
+      freeze_means: true
+      init: {scale_init: {mode: isotropic, isotropic_log_value: -1.90, knn_k: 3, knn_log_scale_bias: 0.0}, opacity_init: 0.05}
+      limits: {offset_max: 0.02, scale_max: 0.08, omega_max: 0.01, opacity_max: 0.05, sh_dc_max: 0.08, sh_rest_max: 0.015}
+      eta: {means: 0.2, scales: 0.7, opacity: 0.5, sh_dc: 0.8, sh_rest: 0.4}
+      mlp: {hidden_dim: 64, use_3d_feat: false, use_2d_feat: true, freeze_quat: true}
+    sky:
+      src_backproject_support_min: 1e-6
+      enable_selective_update: false
+      freeze_means: true
+      init: {scale_init: {mode: isotropic, isotropic_log_value: -1.90, knn_k: 3, knn_log_scale_bias: 0.0}, opacity_init: 0.05}
+      limits: {offset_max: 0.02, scale_max: 0.08, omega_max: 0.01, opacity_max: 0.05, sh_dc_max: 0.08, sh_rest_max: 0.015}
+      eta: {means: 0.2, scales: 0.7, opacity: 0.5, sh_dc: 0.8, sh_rest: 0.4}
+      mlp: {hidden_dim: 64, use_3d_feat: false, use_2d_feat: true, freeze_quat: true}
+    rigid:
+      src_backproject_support_min: 1e-6
+      freeze_means: false
+      init: {scale_init: {mode: isotropic, isotropic_log_value: -2.10, knn_k: 3, knn_log_scale_bias: 0.0}, opacity_init: 0.10}
+      limits: {offset_max: 0.05, scale_max: 0.08, omega_max: 0.05, opacity_max: 0.08, sh_dc_max: 0.08, sh_rest_max: 0.03}
+      eta: {means: 0.5, scales: 0.8, opacity: 0.8, sh_dc: 0.8, sh_rest: 0.5}
+      mlp: {hidden_dim: 64, use_3d_feat: false, use_2d_feat: true, freeze_quat: false}
+
+losses:
+  rgb: {w: 1.0}
+  ssim: {w: 0.05}
+  mask: {w: 0.02, opacity_loss_type: bce}
+  opacity_entropy: {w: 0.0}
+
+optimizer:
+  lr: 1.0e-4
+  eps: 1.0e-15
+  weight_decay: 0.0
+
+training:
+  max_iterations: 5010
+  log_interval: 100
+  save_checkpoint_freq: 20000
+  seed: 42
+
+eval:
+  enable_psnr: true
+  run_test_at_end: true
+
+logging:
+  image_interval: 96
+  enable_jsonl_metrics: true
+  use_tensorboard: true
+  diagnostics:
+    enable: false
+    interval: 500
+    window_size: 50
+    save_branch_renders: true
+  performance:
+    enable: true
+    phase_timing: true
+    cuda_memory: true

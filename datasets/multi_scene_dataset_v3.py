@@ -1942,6 +1942,40 @@ class MultiSceneDatasetV3(MultiSceneDataset):
             random_bypass_overlap_ring_probability=random_bypass_overlap_ring_probability,
         )
 
+    def create_train_scheduler_v5(
+        self,
+        *,
+        state_write_interval_steps: int,
+        updates_per_block: int,
+        keyframes_per_episode: int,
+        episodes_per_segment: int,
+        total_target_frames: int,
+        include_source_frame: bool,
+        neighbor_ring: int,
+        prefer_nearby_keyframes: bool,
+        fallback_expand_to_segment: bool,
+        with_replacement: bool,
+        include_test: bool,
+        fixed_scene_id: Optional[int],
+        fixed_segment_id: Optional[int],
+    ) -> "TrainSchedulerV5":
+        return TrainSchedulerV5(
+            dataset=self,
+            state_write_interval_steps=state_write_interval_steps,
+            updates_per_block=updates_per_block,
+            keyframes_per_episode=keyframes_per_episode,
+            episodes_per_segment=episodes_per_segment,
+            total_target_frames=total_target_frames,
+            include_source_frame=include_source_frame,
+            neighbor_ring=neighbor_ring,
+            prefer_nearby_keyframes=prefer_nearby_keyframes,
+            fallback_expand_to_segment=fallback_expand_to_segment,
+            with_replacement=with_replacement,
+            include_test=include_test,
+            fixed_scene_id=fixed_scene_id,
+            fixed_segment_id=fixed_segment_id,
+        )
+
     def get_segment_batch_from_frames(
         self,
         scene_id: int,
@@ -1950,6 +1984,7 @@ class MultiSceneDatasetV3(MultiSceneDataset):
         target_frame_indices: List[int],
         include_test: bool = False,
         test_frame_indices: Optional[List[int]] = None,
+        enforce_target0_equals_source: bool = True,
     ) -> Dict[str, Any]:
         """
         Legacy frame-level API: expands each training frame to all cameras (scheduler v2 tensor layout).
@@ -1960,7 +1995,7 @@ class MultiSceneDatasetV3(MultiSceneDataset):
         """
         if len(target_frame_indices) == 0:
             raise ValueError("target_frame_indices must not be empty")
-        if target_frame_indices[0] != source_frame_idx:
+        if enforce_target0_equals_source and target_frame_indices[0] != source_frame_idx:
             raise ValueError(
                 "target_frame_indices[0] must equal source_frame_idx for scheduler v2 semantics"
             )
@@ -2002,7 +2037,7 @@ class MultiSceneDatasetV3(MultiSceneDataset):
             target_image_refs,
             include_test=include_test,
             test_image_refs=test_refs,
-            enforce_target0_equals_source=True,
+            enforce_target0_equals_source=bool(enforce_target0_equals_source),
         )
 
 
@@ -3349,3 +3384,648 @@ class TrainSchedulerV4:
             "R_steps": 0,
             "T_steps": int(K_steps_effective),
         }
+
+
+class TrainSchedulerV5:
+    """
+    Frame-level StreetForward scheduler:
+    - source is one full frame (all cameras)
+    - targets are frame indices, with target[0] == source_frame_idx
+    - no overlap scoring
+    """
+
+    def __init__(
+        self,
+        *,
+        dataset: MultiSceneDatasetV3,
+        state_write_interval_steps: int,
+        updates_per_block: int,
+        keyframes_per_episode: int,
+        episodes_per_segment: int,
+        total_target_frames: int,
+        include_source_frame: bool,
+        neighbor_ring: int,
+        prefer_nearby_keyframes: bool,
+        fallback_expand_to_segment: bool,
+        with_replacement: bool,
+        include_test: bool,
+        fixed_scene_id: Optional[int],
+        fixed_segment_id: Optional[int],
+    ) -> None:
+        if state_write_interval_steps < 1:
+            raise ValueError("state_write_interval_steps must be >= 1")
+        if updates_per_block < 1:
+            raise ValueError("updates_per_block must be >= 1")
+        if keyframes_per_episode < 1:
+            raise ValueError("keyframes_per_episode must be >= 1")
+        if episodes_per_segment < 1:
+            raise ValueError("episodes_per_segment must be >= 1")
+        if total_target_frames < 1:
+            raise ValueError("total_target_frames must be >= 1")
+        if neighbor_ring < 1:
+            raise ValueError("neighbor_ring must be >= 1")
+        self.dataset = dataset
+        self.U = int(state_write_interval_steps)
+        self.updates_per_block = int(updates_per_block)
+        self.keyframes_per_episode = int(keyframes_per_episode)
+        self.episodes_per_segment = int(episodes_per_segment)
+        self.total_target_frames = int(total_target_frames)
+        self.include_source_frame = bool(include_source_frame)
+        self.neighbor_ring = int(neighbor_ring)
+        self.prefer_nearby_keyframes = bool(prefer_nearby_keyframes)
+        self.fallback_expand_to_segment = bool(fallback_expand_to_segment)
+        self.with_replacement = bool(with_replacement)
+        self.include_test = bool(include_test)
+        self.fixed_scene_id = int(fixed_scene_id) if fixed_scene_id is not None else None
+        self.fixed_segment_id = int(fixed_segment_id) if fixed_segment_id is not None else None
+
+        self.epoch_idx = 0
+        self.global_step = 0
+        self.epoch_plan: List[Dict[str, Any]] = []
+        self.plan_cursor = 0
+        self.current_segment_state: Optional[Dict[str, Any]] = None
+        self._pending_events: List[Dict[str, Any]] = []
+        self._block_idx_global = 0
+        self._reset_episode_idx = 0
+
+        if not self.dataset._initialized:
+            self.dataset.initialize()
+        self.start_new_epoch()
+
+    def pop_events(self) -> List[Dict[str, Any]]:
+        events = list(self._pending_events)
+        self._pending_events.clear()
+        return events
+
+    def _emit(self, event: Dict[str, Any]) -> None:
+        self._pending_events.append(event)
+
+    def _init_epoch_segment_pair_iterator(self) -> None:
+        if self.fixed_scene_id is not None:
+            self._epoch_scene_queue = [int(self.fixed_scene_id)]
+        else:
+            if len(getattr(self.dataset, "scene_training_queue", [])) == 0:
+                self.dataset._initialize_training_queue()
+            q = list(getattr(self.dataset, "scene_training_queue", []))
+            if len(q) == 0:
+                raise ValueError("No valid scenes in dataset.scene_training_queue")
+            random.shuffle(q)
+            self._epoch_scene_queue = q
+        self._epoch_scene_q_idx = 0
+        self._epoch_current_scene_id = None
+        self._epoch_segment_ids = []
+        self._epoch_segment_pos = 0
+
+    def _next_scene_segment_pair(self) -> Optional[Tuple[int, int]]:
+        while True:
+            if self._epoch_segment_pos >= len(self._epoch_segment_ids):
+                if self._epoch_scene_q_idx >= len(self._epoch_scene_queue):
+                    return None
+                sid = int(self._epoch_scene_queue[self._epoch_scene_q_idx])
+                self._epoch_scene_q_idx += 1
+                scene_data = self.dataset.get_scene(sid)
+                if scene_data is None:
+                    raise ValueError(f"Scene {sid} cannot be loaded")
+                nseg = len(scene_data["segments"])
+                if self.fixed_segment_id is not None:
+                    if self.fixed_segment_id < 0 or self.fixed_segment_id >= nseg:
+                        raise ValueError(f"fixed_segment_id={self.fixed_segment_id} out of range in scene={sid}")
+                    self._epoch_segment_ids = [int(self.fixed_segment_id)]
+                else:
+                    self._epoch_segment_ids = list(range(nseg))
+                    random.shuffle(self._epoch_segment_ids)
+                self._epoch_segment_pos = 0
+                self._epoch_current_scene_id = sid
+            seg_id = int(self._epoch_segment_ids[self._epoch_segment_pos])
+            self._epoch_segment_pos += 1
+            assert self._epoch_current_scene_id is not None
+            return (int(self._epoch_current_scene_id), seg_id)
+
+    def _ensure_epoch_plan_index(self, idx: int) -> None:
+        while len(self.epoch_plan) <= idx:
+            p = self._next_scene_segment_pair()
+            if p is None:
+                break
+            self.epoch_plan.append({"scene_id": int(p[0]), "segment_id": int(p[1])})
+
+    def _hydrate_plan_item_budget(self, idx: int) -> None:
+        self._ensure_epoch_plan_index(idx)
+        if idx >= len(self.epoch_plan):
+            return
+        it = self.epoch_plan[idx]
+        if "segment_budget_u" in it:
+            return
+        sidx = self.dataset.get_segment_index(int(it["scene_id"]), int(it["segment_id"]))
+        num_keyframes = len(sidx.keyframe_indices)
+        w_eff = int(min(self.keyframes_per_episode, num_keyframes))
+        b_seg = int(self.episodes_per_segment * w_eff)
+        segment_budget_u = int(b_seg * self.updates_per_block)
+        it["num_keyframes"] = int(num_keyframes)
+        it["num_cams"] = int(sidx.num_cams)
+        it["w_eff"] = w_eff
+        it["b_seg"] = b_seg
+        it["segment_budget_u"] = segment_budget_u
+        it["segment_step_budget"] = int(segment_budget_u * self.U)
+        it["U"] = int(self.U)
+
+    def build_epoch_plan(self) -> None:
+        self._init_epoch_segment_pair_iterator()
+        self.epoch_plan = []
+        self.plan_cursor = 0
+
+    def start_new_epoch(self) -> None:
+        self.epoch_idx += 1
+        self.build_epoch_plan()
+        self.current_segment_state = None
+        if hasattr(self.dataset, "clear_preload_scheduler_scope"):
+            self.dataset.clear_preload_scheduler_scope()
+
+    def _validate_target_sampling_feasible(self, sidx: SegmentIndex) -> None:
+        nk = len(sidx.keyframe_indices)
+        mandatory_source_frames = 1 if self.include_source_frame else 0
+        extra_needed = self.total_target_frames - mandatory_source_frames
+        if extra_needed <= 0:
+            return
+        if nk < 2:
+            raise ValueError(
+                "TrainSchedulerV5: target sampling requires at least 2 keyframes in the segment when "
+                "total_target_frames exceeds mandatory source targets "
+                f"(scene={sidx.scene_id} segment={sidx.segment_id}, got {nk})"
+            )
+        if not self.with_replacement and nk - 1 < extra_needed:
+            raise ValueError(
+                "TrainSchedulerV5: with_replacement=false requires len(keyframe_indices)-1 >= total_target_frames-1 "
+                f"(scene={sidx.scene_id} segment={sidx.segment_id}, nk={nk}, need extras={extra_needed})"
+            )
+
+    def _sample_contiguous_window(self, sidx: SegmentIndex) -> List[int]:
+        seg_kfs = list(sidx.keyframe_indices)
+        r_kf = self.keyframes_per_episode
+        if len(seg_kfs) > r_kf:
+            start = random.randint(0, len(seg_kfs) - r_kf)
+            return list(seg_kfs[start : start + r_kf])
+        return list(seg_kfs)
+
+    @staticmethod
+    def _kf_positions(sidx: SegmentIndex) -> Dict[int, int]:
+        return {int(k): i for i, k in enumerate(sidx.keyframe_indices)}
+
+    def _build_pair_list(self, window: List[int]) -> List[int]:
+        pairs = [int(kf) for kf in window]
+        random.shuffle(pairs)
+        return pairs
+
+    def _neighbor_keyframe_pool(
+        self,
+        sidx: SegmentIndex,
+        source_kf: int,
+        episode_window: List[int],
+    ) -> List[int]:
+        pos = self._kf_positions(sidx)
+        src_pos = int(pos[int(source_kf)])
+        all_kf = [int(k) for k in sidx.keyframe_indices if int(k) != int(source_kf)]
+        by_ring = [k for k in all_kf if abs(int(pos[k]) - src_pos) <= self.neighbor_ring]
+        if self.prefer_nearby_keyframes:
+            by_ring.sort(key=lambda k: abs(int(pos[k]) - src_pos))
+        window_others = [int(k) for k in episode_window if int(k) != int(source_kf)]
+        if self.prefer_nearby_keyframes:
+            window_others.sort(key=lambda k: abs(int(pos[k]) - src_pos))
+        out: List[int] = []
+        seen: Set[int] = set()
+        for k in window_others + by_ring:
+            if k not in seen:
+                seen.add(k)
+                out.append(k)
+        if self.fallback_expand_to_segment:
+            for k in all_kf:
+                if k not in seen:
+                    seen.add(k)
+                    out.append(k)
+        return out
+
+    def _sample_target_frame_indices(
+        self,
+        sidx: SegmentIndex,
+        source_frame_idx: int,
+        source_keyframe_idx: int,
+        episode_window: List[int],
+    ) -> List[int]:
+        refs: List[int] = []
+        if self.include_source_frame:
+            refs.append(int(source_frame_idx))
+        extra_needed = self.total_target_frames - len(refs)
+        if extra_needed <= 0:
+            return refs
+        pool_kf = self._neighbor_keyframe_pool(sidx, source_keyframe_idx, episode_window)
+        if len(pool_kf) == 0:
+            raise ValueError(
+                "TrainSchedulerV5: no candidate keyframes for extra targets "
+                f"(scene={sidx.scene_id} segment={sidx.segment_id})"
+            )
+        chosen_kf: List[int] = []
+        if len(pool_kf) >= extra_needed:
+            if self.with_replacement:
+                chosen_kf = [int(random.choice(pool_kf)) for _ in range(extra_needed)]
+            else:
+                chosen_kf = [int(x) for x in random.sample(pool_kf, extra_needed)]
+        else:
+            if not self.with_replacement:
+                raise ValueError(
+                    f"TrainSchedulerV5: not enough distinct keyframes for extras={extra_needed} "
+                    f"(scene={sidx.scene_id} segment={sidx.segment_id})"
+                )
+            chosen_kf = [int(random.choice(pool_kf)) for _ in range(extra_needed)]
+        for kf in chosen_kf:
+            frame_tgt = int(random.choice(sidx.keyframe_to_frames[int(kf)]))
+            refs.append(frame_tgt)
+        return refs
+
+    @staticmethod
+    def _pseudo_image_ref(frame_idx: int) -> Tuple[int, int]:
+        return (int(frame_idx), -1)
+
+    def _emit_segment_begin(self, st: Dict[str, Any]) -> None:
+        self._emit(
+            {
+                "type": "segment_begin",
+                "epoch_idx": int(self.epoch_idx),
+                "global_step": int(self.global_step),
+                "scene_id": int(st["scene_id"]),
+                "segment_id": int(st["segment_id"]),
+                "U": int(self.U),
+                "num_keyframes": int(st["num_keyframes"]),
+                "num_cams": int(st["num_cams"]),
+                "w_eff": int(st["w_eff"]),
+                "b_seg": int(st["b_seg"]),
+                "segment_budget_u": int(st["segment_budget_u"]),
+                "segment_step_budget": int(st["segment_step_budget"]),
+                "updates_per_block": int(self.updates_per_block),
+                "scheduler_version": "v5",
+            }
+        )
+
+    def _start_episode(self) -> None:
+        if self.current_segment_state is None:
+            raise ValueError("TrainSchedulerV5 internal state is not initialized")
+        st = self.current_segment_state
+        if int(st["episodes_started"]) >= self.episodes_per_segment:
+            raise ValueError("TrainSchedulerV5: _start_episode called when episode quota is exhausted")
+        sidx = self.dataset.get_segment_index(int(st["scene_id"]), int(st["segment_id"]))
+        window = self._sample_contiguous_window(sidx)
+        pair_list = self._build_pair_list(window)
+        st["episodes_started"] = int(st["episodes_started"]) + 1
+        st["episode_window_keyframes"] = list(window)
+        st["pair_list"] = list(pair_list)
+        st["pair_cursor"] = 0
+        st["reset_episode_idx"] = int(self._reset_episode_idx)
+        self._emit(
+            {
+                "type": "reset_event",
+                "epoch_idx": int(self.epoch_idx),
+                "global_step": int(self.global_step),
+                "scene_id": int(st["scene_id"]),
+                "segment_id": int(st["segment_id"]),
+                "reset_episode_idx": int(st["reset_episode_idx"]),
+                "reason": "episode_begin",
+                "window_keyframes": list(window),
+                "num_pairs": int(len(pair_list)),
+                "scheduler_version": "v5",
+            }
+        )
+        self._reset_episode_idx += 1
+
+    def _start_block(self) -> bool:
+        if self.current_segment_state is None:
+            raise ValueError("TrainSchedulerV5 internal state is not initialized")
+        st = self.current_segment_state
+        scene_id = int(st["scene_id"])
+        segment_id = int(st["segment_id"])
+        sidx = self.dataset.get_segment_index(scene_id, segment_id)
+
+        if int(st["segment_local_u"]) >= int(st["segment_budget_u"]):
+            return False
+
+        while int(st["pair_cursor"]) >= len(st["pair_list"]):
+            self._emit(
+                {
+                    "type": "episode_end",
+                    "epoch_idx": int(self.epoch_idx),
+                    "global_step": int(self.global_step),
+                    "scene_id": scene_id,
+                    "segment_id": segment_id,
+                    "reset_episode_idx": int(st["reset_episode_idx"]),
+                    "reason": "pair_list_exhausted",
+                    "scheduler_version": "v5",
+                }
+            )
+            if int(st["episodes_started"]) >= self.episodes_per_segment:
+                return False
+            self._start_episode()
+            st = self.current_segment_state
+            if st is None:
+                raise ValueError("TrainSchedulerV5 internal state became None")
+
+        source_kf = int(st["pair_list"][st["pair_cursor"]])
+        st["pair_cursor"] = int(st["pair_cursor"]) + 1
+        source_frame_idx = int(random.choice(sidx.keyframe_to_frames[int(source_kf)]))
+        target_frame_indices = self._sample_target_frame_indices(
+            sidx=sidx,
+            source_frame_idx=source_frame_idx,
+            source_keyframe_idx=source_kf,
+            episode_window=list(st["episode_window_keyframes"]),
+        )
+
+        remaining_u = int(st["segment_budget_u"]) - int(st["segment_local_u"])
+        effective_u = int(min(self.updates_per_block, max(remaining_u, 0)))
+        if effective_u <= 0:
+            return False
+
+        st["u_in_block"] = 0
+        st["effective_u_this_block"] = int(effective_u)
+        st["source_keyframe_idx"] = int(source_kf)
+        st["source_frame_idx"] = int(source_frame_idx)
+        st["target_frame_indices"] = [int(x) for x in target_frame_indices]
+        st["source_image_ref"] = self._pseudo_image_ref(source_frame_idx)
+        st["target_image_refs"] = [self._pseudo_image_ref(x) for x in target_frame_indices]
+        st["block_idx_global"] = int(self._block_idx_global)
+
+        self._emit(
+            {
+                "type": "block_begin",
+                "epoch_idx": int(self.epoch_idx),
+                "global_step": int(self.global_step),
+                "scene_id": scene_id,
+                "segment_id": segment_id,
+                "reset_episode_idx": int(st["reset_episode_idx"]),
+                "block_idx_in_segment": int(st["block_idx_in_segment"]),
+                "block_idx_global": int(st["block_idx_global"]),
+                "U": int(self.U),
+                "K_u_nominal": int(self.updates_per_block),
+                "K_u_effective": int(effective_u),
+                "K_steps_effective": int(effective_u * self.U),
+                "source_keyframe_idx": int(source_kf),
+                "source_frame_idx": int(source_frame_idx),
+                "source_image_ref": self._pseudo_image_ref(source_frame_idx),
+                "target_frame_indices": [int(x) for x in target_frame_indices],
+                "scheduler_version": "v5",
+            }
+        )
+        self._block_idx_global += 1
+        st["block_idx_in_segment"] = int(st["block_idx_in_segment"]) + 1
+        return True
+
+    def _end_segment(self) -> None:
+        if self.current_segment_state is None:
+            raise ValueError("TrainSchedulerV5 internal state is not initialized")
+        st = self.current_segment_state
+        self._emit(
+            {
+                "type": "segment_end",
+                "epoch_idx": int(self.epoch_idx),
+                "global_step": int(self.global_step),
+                "scene_id": int(st["scene_id"]),
+                "segment_id": int(st["segment_id"]),
+                "segment_local_u": int(st["segment_local_u"]),
+                "segment_budget_u": int(st["segment_budget_u"]),
+                "segment_local_step": int(st["segment_local_step"]),
+                "segment_step_budget": int(st["segment_step_budget"]),
+                "source_frame_idx": int(st.get("source_frame_idx", -1)),
+                "source_image_ref": self._pseudo_image_ref(int(st.get("source_frame_idx", -1))),
+                "target_frame_indices": [int(x) for x in st.get("target_frame_indices", [])],
+                "scheduler_version": "v5",
+            }
+        )
+        self.current_segment_state = None
+        self.plan_cursor += 1
+        if hasattr(self.dataset, "clear_preload_scheduler_scope"):
+            self.dataset.clear_preload_scheduler_scope()
+
+    def _enter_segment(self) -> None:
+        self._hydrate_plan_item_budget(self.plan_cursor)
+        if self.plan_cursor >= len(self.epoch_plan):
+            raise ValueError("TrainSchedulerV5: failed to hydrate epoch plan")
+        item = self.epoch_plan[self.plan_cursor]
+        sidx = self.dataset.get_segment_index(int(item["scene_id"]), int(item["segment_id"]))
+        self._validate_target_sampling_feasible(sidx)
+
+        test_frame_indices: Optional[List[int]] = None
+        if self.include_test and len(sidx.test_frame_indices) > 0:
+            test_frame_indices = [int(x) for x in sidx.test_frame_indices]
+
+        st: Dict[str, Any] = {
+            "scene_id": int(item["scene_id"]),
+            "segment_id": int(item["segment_id"]),
+            "num_keyframes": int(item["num_keyframes"]),
+            "num_cams": int(item["num_cams"]),
+            "w_eff": int(item["w_eff"]),
+            "b_seg": int(item["b_seg"]),
+            "segment_budget_u": int(item["segment_budget_u"]),
+            "segment_step_budget": int(item["segment_step_budget"]),
+            "segment_local_u": 0,
+            "segment_local_step": 0,
+            "block_idx_in_segment": 0,
+            "block_idx_global": int(self._block_idx_global),
+            "u_in_block": 0,
+            "effective_u_this_block": int(self.updates_per_block),
+            "source_keyframe_idx": -1,
+            "source_frame_idx": -1,
+            "target_frame_indices": [],
+            "source_image_ref": (-1, -1),
+            "target_image_refs": [],
+            "test_frame_indices": test_frame_indices,
+            "episode_window_keyframes": [],
+            "pair_list": [],
+            "pair_cursor": 0,
+            "episodes_started": 0,
+            "reset_episode_idx": -1,
+        }
+        self.dataset.set_preload_active_scope(int(item["scene_id"]), int(item["segment_id"]))
+        if hasattr(self.dataset, "set_preload_training_scope"):
+            self.dataset.set_preload_training_scope(int(item["scene_id"]), int(item["segment_id"]))
+        self.current_segment_state = st
+        self._emit_segment_begin(st)
+        self._start_episode()
+        if not self._start_block():
+            raise ValueError("TrainSchedulerV5: could not start first block in segment (configuration error)")
+
+    def _batch_from_state(self, st: Dict[str, Any]) -> Dict[str, Any]:
+        return self.dataset.get_segment_batch_from_frames(
+            scene_id=int(st["scene_id"]),
+            segment_id=int(st["segment_id"]),
+            source_frame_idx=int(st["source_frame_idx"]),
+            target_frame_indices=[int(x) for x in st["target_frame_indices"]],
+            include_test=self.include_test,
+            test_frame_indices=st.get("test_frame_indices"),
+            enforce_target0_equals_source=bool(self.include_source_frame),
+        )
+
+    def _aligned_info(self, st: Dict[str, Any]) -> Dict[str, Any]:
+        k_u_nominal = int(self.updates_per_block)
+        k_u_effective = int(st.get("effective_u_this_block", k_u_nominal))
+        k_steps_effective = int(k_u_effective * self.U)
+        source_frame_idx = int(st.get("source_frame_idx", -1))
+        target_frame_indices = [int(x) for x in st.get("target_frame_indices", [])]
+        return {
+            "epoch_idx": int(self.epoch_idx),
+            "global_step": int(self.global_step),
+            "scene_id": int(st["scene_id"]),
+            "segment_id": int(st["segment_id"]),
+            "segment_local_step": int(st["segment_local_step"]),
+            "segment_step_budget": int(st["segment_step_budget"]),
+            "segment_local_u": int(st["segment_local_u"]),
+            "segment_budget_u": int(st["segment_budget_u"]),
+            "block_idx_in_segment": int(st.get("block_idx_in_segment", -1)),
+            "block_idx_global": int(st.get("block_idx_global", 0)),
+            "source_frame_idx": source_frame_idx,
+            "source_keyframe_idx": int(st.get("source_keyframe_idx", -1)),
+            "source_cam_idx": -1,
+            "source_image_ref": self._pseudo_image_ref(source_frame_idx),
+            "target_frame_indices": target_frame_indices,
+            "target_image_refs": [self._pseudo_image_ref(x) for x in target_frame_indices],
+            "U": int(self.U),
+            "K_u_nominal": k_u_nominal,
+            "K_u_effective": k_u_effective,
+            "K_steps_effective": int(k_steps_effective),
+            "K_steps": int(k_steps_effective),
+            "R_steps": 0,
+            "T_steps": int(k_steps_effective),
+            "scheduler_version": "v5",
+        }
+
+    def materialize_current_batch_without_advance(self) -> Dict[str, Any]:
+        self._ensure_epoch_plan_index(self.plan_cursor)
+        if self.plan_cursor >= len(self.epoch_plan):
+            self.start_new_epoch()
+            self._ensure_epoch_plan_index(self.plan_cursor)
+        if self.plan_cursor >= len(self.epoch_plan):
+            raise ValueError("TrainSchedulerV5: epoch has no (scene, segment) pairs")
+        if self.current_segment_state is None:
+            self._enter_segment()
+        st = self.current_segment_state
+        if st is None:
+            raise ValueError("TrainSchedulerV5 internal state is not initialized")
+        batch = self._batch_from_state(st)
+        batch["_scheduler_v4_aligned_info"] = self._aligned_info(st)
+        batch["_scheduler_v5_aligned_info"] = dict(batch["_scheduler_v4_aligned_info"])
+        batch["_scheduler_v5_peek"] = True
+        return batch
+
+    def next_batch(self) -> Dict[str, Any]:
+        self._ensure_epoch_plan_index(self.plan_cursor)
+        if self.plan_cursor >= len(self.epoch_plan):
+            self.start_new_epoch()
+            self._ensure_epoch_plan_index(self.plan_cursor)
+        if self.plan_cursor >= len(self.epoch_plan):
+            raise ValueError("TrainSchedulerV5: epoch has no (scene, segment) pairs")
+        if self.current_segment_state is None:
+            self._enter_segment()
+
+        st = self.current_segment_state
+        if st is None:
+            raise ValueError("TrainSchedulerV5 internal state is not initialized")
+
+        batch = self._batch_from_state(st)
+        st["segment_local_step"] = int(st["segment_local_step"]) + 1
+        self.global_step += 1
+        batch["_scheduler_v4_aligned_info"] = self._aligned_info(st)
+        batch["_scheduler_v5_aligned_info"] = dict(batch["_scheduler_v4_aligned_info"])
+
+        if int(st["segment_local_step"]) % self.U == 0:
+            st["segment_local_u"] = int(st["segment_local_u"]) + 1
+            st["u_in_block"] = int(st["u_in_block"]) + 1
+            if int(st["u_in_block"]) >= int(st["effective_u_this_block"]):
+                eff_u_end = int(st["effective_u_this_block"])
+                self._emit(
+                    {
+                        "type": "block_end",
+                        "epoch_idx": int(self.epoch_idx),
+                        "global_step": int(self.global_step),
+                        "scene_id": int(st["scene_id"]),
+                        "segment_id": int(st["segment_id"]),
+                        "block_idx_in_segment": int(st["block_idx_in_segment"]),
+                        "block_idx_global": int(st.get("block_idx_global", 0)),
+                        "source_frame_idx": int(st.get("source_frame_idx", -1)),
+                        "source_image_ref": self._pseudo_image_ref(int(st.get("source_frame_idx", -1))),
+                        "target_frame_indices": [int(x) for x in st.get("target_frame_indices", [])],
+                        "num_updates_in_block": eff_u_end,
+                        "K_u_nominal": int(self.updates_per_block),
+                        "K_u_effective": eff_u_end,
+                        "K_steps_effective": int(eff_u_end * self.U),
+                        "U": int(self.U),
+                        "scheduler_version": "v5",
+                    }
+                )
+                done_seg = int(st["segment_local_u"]) >= int(st["segment_budget_u"])
+                if done_seg:
+                    self._end_segment()
+                else:
+                    if not self._start_block():
+                        self._end_segment()
+
+        if hasattr(self.dataset, "maybe_log_preload_stats"):
+            self.dataset.maybe_log_preload_stats(int(self.global_step))
+        if hasattr(self.dataset, "maybe_log_overlap_stats"):
+            self.dataset.maybe_log_overlap_stats(int(self.global_step))
+        return batch
+
+    def get_current_info(self) -> Dict[str, Any]:
+        st = self.current_segment_state
+        if st is None:
+            self._ensure_epoch_plan_index(self.plan_cursor)
+        if st is None and self.plan_cursor < len(self.epoch_plan):
+            self._hydrate_plan_item_budget(self.plan_cursor)
+            item = self.epoch_plan[self.plan_cursor]
+            return {
+                "epoch_idx": int(self.epoch_idx),
+                "global_step": int(self.global_step),
+                "scene_id": int(item["scene_id"]),
+                "segment_id": int(item["segment_id"]),
+                "segment_local_step": 0,
+                "segment_step_budget": int(item["segment_step_budget"]),
+                "segment_local_u": 0,
+                "segment_budget_u": int(item["segment_budget_u"]),
+                "block_idx_in_segment": 0,
+                "block_idx_global": int(self._block_idx_global),
+                "source_frame_idx": -1,
+                "source_keyframe_idx": -1,
+                "source_cam_idx": -1,
+                "source_image_ref": (-1, -1),
+                "target_frame_indices": [],
+                "target_image_refs": [],
+                "U": int(self.U),
+                "K_u_nominal": int(self.updates_per_block),
+                "K_u_effective": int(self.updates_per_block),
+                "K_steps_effective": int(self.updates_per_block * self.U),
+                "K_steps": int(self.updates_per_block * self.U),
+                "R_steps": 0,
+                "T_steps": int(self.updates_per_block * self.U),
+                "scheduler_version": "v5",
+            }
+        if st is None:
+            return {
+                "epoch_idx": int(self.epoch_idx),
+                "global_step": int(self.global_step),
+                "scene_id": -1,
+                "segment_id": -1,
+                "segment_local_step": 0,
+                "segment_step_budget": 0,
+                "segment_local_u": 0,
+                "segment_budget_u": 0,
+                "block_idx_in_segment": 0,
+                "block_idx_global": int(self._block_idx_global),
+                "source_frame_idx": -1,
+                "source_keyframe_idx": -1,
+                "source_cam_idx": -1,
+                "source_image_ref": (-1, -1),
+                "target_frame_indices": [],
+                "target_image_refs": [],
+                "U": int(self.U),
+                "K_u_nominal": 0,
+                "K_u_effective": 0,
+                "K_steps_effective": 0,
+                "K_steps": 0,
+                "R_steps": 0,
+                "T_steps": 0,
+                "scheduler_version": "v5",
+            }
+        return self._aligned_info(st)

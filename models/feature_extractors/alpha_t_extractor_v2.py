@@ -264,6 +264,9 @@ class AlphaTWeightExtractorV2(AlphaTWeightExtractor):
             raise RuntimeError("ExtractorV2 fast-fail: features_2d must be CUDA tensor.")
         if features_2d.requires_grad and backproject_feature_grad_in_range is None:
             raise RuntimeError("ExtractorV2 fast-fail: fused backward op is unavailable.")
+        orig_dtype = features_2d.dtype
+        if orig_dtype != torch.float32:
+            features_2d = features_2d.float()
 
         t_total_start = time.perf_counter()
         device = features_2d.device
@@ -338,9 +341,13 @@ class AlphaTWeightExtractorV2(AlphaTWeightExtractor):
 
         feat_out = accumulated_feat / (accumulated_weight_feature.unsqueeze(-1) + eps)
         stats["streaming_total_ms"] = float((time.perf_counter() - t_total_start) * 1000.0)
+        if orig_dtype != torch.float32:
+            feat_out = feat_out.to(orig_dtype)
         if return_accumulated_weights:
             if accumulated_weight_support is None:
                 raise RuntimeError("Internal error: accumulated_weight_support is None.")
+            if orig_dtype != torch.float32:
+                accumulated_weight_support = accumulated_weight_support.to(orig_dtype)
             if return_debug_stats:
                 return feat_out, accumulated_weight_support, stats
             return feat_out, accumulated_weight_support

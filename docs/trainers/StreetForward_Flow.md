@@ -66,8 +66,8 @@
 `_validate_stage4_1_batch` **硬约束**（不满足即抛错，不是建议）：
 
 - `batch["targets"]` 非空；`source_views` 与 `source_images` **必须存在**且 `len` 一致。
-- 至少存在一个 `targets[*]` 的 `frame_idx == source_frame_idx`（用于 source/target 对齐检查）。
-- **每个** `source_views[i]` 必须在上述 source-frame targets 中找到 **同 `camtoworlds`（atol=1e-4, rtol=1e-4）** 的一条 target view。
+- source-frame 对齐检查要求：`targets` 中 `frame_idx == source_frame_idx` 的条目数需覆盖全部 `source_views`（多 src/full-frame 语义）。
+- **每个** `source_views[i]` 必须在 source-frame targets 中匹配到一条 target：优先按 `cam_idx` 匹配；若缺 `cam_idx` 再回退 `camtoworlds`（`atol=1e-4, rtol=1e-4`）。
 - 每个 target **必须**含 `sky_mask`、`viewdirs`；`gt_image` 与二者 **HW 一致**（`viewdirs` 为 `[H,W,3]`）。
 - 若存在 rigid：`dynamic_info` 中须含 `source_frame_idx` 与各 target 的 `frame_idx`（`_resolve_rigid_frame_idx` 非空）。
 

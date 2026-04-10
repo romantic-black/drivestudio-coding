@@ -50,8 +50,8 @@ from tools.train_minimal_streetforward_stage4_1_one_segment_v3 import (
 )
 from tools.train_minimal_streetforward_stage4_3_v4_common import (
     build_multi_scene_dataset_v3,
-    build_train_scheduler_v4_from_cfg,
-    parse_include_test_v4,
+    build_train_scheduler_from_cfg,
+    parse_include_test,
     resolve_fixed_scene_segment,
     validate_train_scene_for_fixed,
 )
@@ -111,18 +111,18 @@ def main() -> None:
     if fixed_scene_id is None or fixed_segment_id is None:
         raise ValueError(
             "one-segment v4 training requires one_segment.scene_id/segment_id in config, "
-            "or scheduler_v4.traversal.fixed_scene_id and fixed_segment_id."
+            "or scheduler_v5/scheduler_v4 traversal fixed_scene_id and fixed_segment_id."
         )
 
     logger.info(
         "Building MultiSceneDatasetV3; fixed scene_id=%s segment_id=%s include_test=%s",
         fixed_scene_id,
         fixed_segment_id,
-        parse_include_test_v4(cfg),
+        parse_include_test(cfg),
     )
     dataset = build_multi_scene_dataset_v3(cfg, device)
     dataset.initialize()
-    scheduler = build_train_scheduler_v4_from_cfg(cfg, dataset)
+    scheduler = build_train_scheduler_from_cfg(cfg, dataset)
 
     sv3_mns = cfg.get("scheduler_v3", {}).get("model_node_state") if cfg.get("scheduler_v3") else None
     if sv3_mns and bool(sv3_mns.get("sync_with_scheduler")):

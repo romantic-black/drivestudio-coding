@@ -59,8 +59,8 @@ from tools.train_minimal_streetforward_stage4_1_one_segment_v3 import (
 )
 from tools.train_minimal_streetforward_stage4_3_v4_common import (
     build_multi_scene_dataset_v3,
-    build_train_scheduler_v4_from_cfg,
-    parse_include_test_v4,
+    build_train_scheduler_from_cfg,
+    parse_include_test,
     resolve_fixed_scene_segment,
 )
 from tools.upload_to_vika import upload_experiment_summary
@@ -163,7 +163,7 @@ def main() -> None:
     logger.info(
         "Building MultiSceneDatasetV3; multi_scene train_scene_ids=%s include_test=%s",
         train_ids,
-        parse_include_test_v4(cfg),
+        parse_include_test(cfg),
     )
     if cfg.get("test") is not None and bool(cfg.test.get("enable", False)):
         raise ValueError(
@@ -172,17 +172,28 @@ def main() -> None:
         )
     dataset = build_multi_scene_dataset_v3(cfg, device)
     dataset.initialize()
-    scheduler = build_train_scheduler_v4_from_cfg(cfg, dataset)
+    scheduler = build_train_scheduler_from_cfg(cfg, dataset)
 
-    ov = cfg.get("scheduler_v4", {}).get("overlap") or {}
-    logger.info(
-        "TrainSchedulerV4 overlap: mode=%s point_sample_size=%s candidate_frame_policy=%s score_type=%s topk=%s",
-        ov.get("mode"),
-        ov.get("point_sample_size"),
-        ov.get("candidate_frame_policy"),
-        ov.get("score_type"),
-        ov.get("topk"),
-    )
+    sv5 = cfg.get("scheduler_v5")
+    if sv5 is not None and bool(sv5.get("enable", False)):
+        ts5 = sv5.get("target_sampling") or {}
+        logger.info(
+            "TrainSchedulerV5 target sampling: total_target_frames=%s include_source_frame=%s policy=%s neighbor_ring=%s",
+            ts5.get("total_target_frames"),
+            ts5.get("include_source_frame"),
+            ts5.get("policy"),
+            ts5.get("neighbor_ring"),
+        )
+    else:
+        ov = cfg.get("scheduler_v4", {}).get("overlap") or {}
+        logger.info(
+            "TrainSchedulerV4 overlap: mode=%s point_sample_size=%s candidate_frame_policy=%s score_type=%s topk=%s",
+            ov.get("mode"),
+            ov.get("point_sample_size"),
+            ov.get("candidate_frame_policy"),
+            ov.get("score_type"),
+            ov.get("topk"),
+        )
     pd = cfg.data.get("preload") if cfg.data is not None else None
     logger.info(
         "Dataset preload overlap: episode_superset=%s next_block_exact=%s",

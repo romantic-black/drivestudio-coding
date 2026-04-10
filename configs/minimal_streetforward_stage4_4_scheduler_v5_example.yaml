@@ -1,0 +1,35 @@
+# Stage4_4 scheduler v5 example snippet.
+# This file is a scheduler-focused reference and should be merged into a full stage4_4 config.
+
+scheduler_v5:
+  enable: true
+
+  # Keep U semantics unchanged for node-state sync integration.
+  time_base:
+    state_write_interval_steps: 4
+
+  # One source block = fixed source frame + fixed target frame set for K_u updates.
+  source_block:
+    updates_per_block: 2
+
+  # One reset episode samples a contiguous keyframe window.
+  reset_episode:
+    keyframes_per_episode: 3
+    episodes_per_segment: 2
+
+  # Frame-level target sampling (no frame/cam image-ref contract).
+  target_sampling:
+    include_source_frame: true
+    total_target_frames: 3
+    policy: neighbor_keyframes_random_frames
+    neighbor_ring: 1
+    prefer_nearby_keyframes: true
+    fallback_expand_to_segment: true
+    with_replacement: true
+
+  overlap:
+    mode: none
+
+  traversal:
+    fixed_scene_id: null
+    fixed_segment_id: null

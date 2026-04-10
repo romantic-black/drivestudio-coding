@@ -34,6 +34,58 @@ from models.streetforward.node_states import NodeStateBackground, NodeStateDista
 logger = logging.getLogger(__name__)
 
 
+def spatial_hw_from_image_tensor(img: torch.Tensor) -> Tuple[int, int]:
+    """
+    Return (H, W) for a single image or a batch of identical layouts.
+
+    - 3D HWC: [H, W, C]
+    - 3D CHW (RGB): [3, H, W]
+    - 4D NHWC: [N, H, W, C]
+    - 4D NCHW: [N, C, H, W] when C is small (<= 4), e.g. RGB or single-channel CHW
+    """
+    if not isinstance(img, torch.Tensor):
+        raise TypeError(f"spatial_hw_from_image_tensor expected torch.Tensor, got {type(img)}")
+    d = int(img.dim())
+    if d == 3:
+        if int(img.shape[0]) == 3:
+            return int(img.shape[1]), int(img.shape[2])
+        return int(img.shape[0]), int(img.shape[1])
+    if d == 4:
+        c1 = int(img.shape[1])
+        c2 = int(img.shape[2])
+        c3 = int(img.shape[3])
+        if c1 <= 4 and c2 > c1 and c3 > c1:
+            return c2, c3
+        return c1, c2
+    raise ValueError(f"spatial_hw_from_image_tensor expects dim 3 or 4, got {d}")
+
+
+def merge_debug_stats_as_perf_floats(dest: Dict[str, float], prefix: str, raw: Dict[str, Any]) -> None:
+    """
+    Copy debug stats into dest with string keys suitable for _perf_acc (all float values).
+
+    Scalar values are stored as dest[prefix + k]. List[float|int] values are expanded into
+    dest[prefix + k + _sum/_mean/_max/_min/_len] so callers never call float(list).
+    """
+    for k, v in raw.items():
+        key = f"{prefix}{k}"
+        if isinstance(v, (bool, int, float)):
+            dest[key] = float(v)
+            continue
+        if isinstance(v, list):
+            if len(v) == 0:
+                dest[f"{key}_len"] = 0.0
+                continue
+            if not all(isinstance(x, (bool, int, float)) for x in v):
+                continue
+            xs = [float(x) for x in v]
+            dest[f"{key}_sum"] = float(sum(xs))
+            dest[f"{key}_mean"] = float(sum(xs) / len(xs))
+            dest[f"{key}_max"] = float(max(xs))
+            dest[f"{key}_min"] = float(min(xs))
+            dest[f"{key}_len"] = float(len(xs))
+
+
 def _append_backward_pair(
     render_tensors: List[torch.Tensor],
     grad_tensors: List[torch.Tensor],
@@ -790,8 +842,7 @@ class MinimalStreetForwardStage4_0(MinimalStreetForwardStage3_3):
         source_views = batch.get("source_views")
         source_images = batch.get("source_images")
         sample_img = source_images[0]
-        height = int(sample_img.shape[0] if sample_img.dim() == 3 else sample_img.shape[1])
-        width = int(sample_img.shape[1] if sample_img.dim() == 3 else sample_img.shape[2])
+        height, width = spatial_hw_from_image_tensor(sample_img)
 
         means_bg = node_state_bg.means
         anchor_rgb_bg = _sh_to_rgb(node_state_bg.sh_dc)
@@ -1174,4 +1225,8 @@ class MinimalStreetForwardStage4_0(MinimalStreetForwardStage3_3):
         self.h_cache_rigid.clear()
 
 
-__all__ = ["MinimalStreetForwardStage4_0"]
+__all__ = [
+    "MinimalStreetForwardStage4_0",
+    "merge_debug_stats_as_perf_floats",
+    "spatial_hw_from_image_tensor",
+]

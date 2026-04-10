@@ -25,6 +25,7 @@ from models.streetforward.minimal_trainer_stage4_0 import (
     _merge_params_bg_rigid_distant,
     _merge_params_sky_only,
     _tensor_merge_sky_only,
+    spatial_hw_from_image_tensor,
 )
 from models.streetforward.minimal_trainer_stage4_2 import MinimalStreetForwardStage4_2
 from models.streetforward.node_states import NodeStateBackground, NodeStateDistant, NodeStateRigid, NodeStateSky
@@ -597,8 +598,7 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
         source_views = batch.get("source_views")
         source_images = batch.get("source_images")
         sample_img = source_images[0]
-        height = int(sample_img.shape[0] if sample_img.dim() == 3 else sample_img.shape[1])
-        width = int(sample_img.shape[1] if sample_img.dim() == 3 else sample_img.shape[2])
+        height, width = spatial_hw_from_image_tensor(sample_img)
 
         means_bg = node_state_bg.means
         anchor_rgb_bg = _sh_to_rgb(node_state_bg.sh_dc)

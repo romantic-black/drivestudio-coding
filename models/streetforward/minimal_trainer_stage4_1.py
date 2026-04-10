@@ -19,6 +19,7 @@ from models.streetforward.minimal_trainer_stage4_0 import (
     MinimalStreetForwardStage4_0,
     _backward_to_render_params_bg_rigid_distant,
     _merge_params_bg_rigid_distant,
+    spatial_hw_from_image_tensor,
 )
 from models.streetforward.node_states import NodeStateRigid
 from models.streetforward.metrics import compute_ssim_loss_masked
@@ -60,25 +61,63 @@ class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
                 "Stage4.1 requires at least one target on source_frame_idx for source/target alignment checks. "
                 f"source_frame_idx={source_frame_idx}, target_frames={sorted(target_frames)}"
             )
+        if len(src_frame_targets) < len(source_views):
+            raise ValueError(
+                "Stage4.1 source-frame target coverage is insufficient for multi-src validation: "
+                f"num_source_views={len(source_views)} requires at least as many source-frame targets, "
+                f"got {len(src_frame_targets)} on source_frame_idx={source_frame_idx}."
+            )
+
+        def _extract_cam_idx(v: Any) -> Optional[int]:
+            if v is None:
+                return None
+            if hasattr(v, "cam_idx"):
+                ci = getattr(v, "cam_idx")
+                if ci is not None:
+                    return int(ci)
+            if isinstance(v, dict) and v.get("cam_idx") is not None:
+                return int(v["cam_idx"])
+            return None
+
+        def _extract_c2w(v: Any) -> torch.Tensor:
+            c2w = v.camtoworlds if hasattr(v, "camtoworlds") else v["camtoworlds"]
+            return c2w if c2w.dim() == 2 else c2w[0]
+
         used_target_idx = set()
         for i, src_view in enumerate(source_views):
-            src_c2w = src_view.camtoworlds if hasattr(src_view, "camtoworlds") else src_view["camtoworlds"]
-            src_c2w = src_c2w if src_c2w.dim() == 2 else src_c2w[0]
+            src_cam_idx = _extract_cam_idx(src_view)
+            src_c2w = _extract_c2w(src_view)
             matched = False
+
+            # Fast path: match by discrete cam_idx when both sides provide it.
+            if src_cam_idx is not None:
+                for j, t in enumerate(src_frame_targets):
+                    if j in used_target_idx:
+                        continue
+                    tgt_view = t["view"]
+                    tgt_cam_idx = _extract_cam_idx(tgt_view)
+                    if tgt_cam_idx is not None and int(tgt_cam_idx) == int(src_cam_idx):
+                        used_target_idx.add(j)
+                        matched = True
+                        break
+
+            # Fallback path: pose matching when cam_idx is unavailable or no cam_idx match found.
+            if matched:
+                continue
             for j, t in enumerate(src_frame_targets):
                 if j in used_target_idx:
                     continue
                 tgt_view = t["view"]
-                tgt_c2w = tgt_view.camtoworlds if hasattr(tgt_view, "camtoworlds") else tgt_view["camtoworlds"]
-                tgt_c2w = tgt_c2w if tgt_c2w.dim() == 2 else tgt_c2w[0]
+                tgt_c2w = _extract_c2w(tgt_view)
                 if torch.allclose(src_c2w.to(self.device), tgt_c2w.to(self.device), atol=1e-4, rtol=1e-4):
                     used_target_idx.add(j)
                     matched = True
                     break
             if not matched:
+                cam_msg = f", cam_idx={src_cam_idx}" if src_cam_idx is not None else ""
                 raise ValueError(
                     "Stage4.1 source/target camera-frame mismatch: no target view on source_frame_idx matches "
-                    f"source_views[{i}] (source_frame_idx={source_frame_idx})."
+                    f"source_views[{i}] (source_frame_idx={source_frame_idx}{cam_msg})."
                 )
         if node_state_rigid is not None:
             for fid in {source_frame_idx, *target_frames}:
@@ -257,8 +296,7 @@ class MinimalStreetForwardStage4_1(MinimalStreetForwardStage4_0):
         source_views = batch.get("source_views")
         source_images = batch.get("source_images")
         sample_img = source_images[0]
-        height = int(sample_img.shape[0] if sample_img.dim() == 3 else sample_img.shape[1])
-        width = int(sample_img.shape[1] if sample_img.dim() == 3 else sample_img.shape[2])
+        height, width = spatial_hw_from_image_tensor(sample_img)
 
         means_bg = node_state_bg.means
         anchor_rgb_bg = _sh_to_rgb(node_state_bg.sh_dc)
