@@ -44,6 +44,58 @@ def _metric_better(metric: str, new_val: float, old_val: Optional[float]) -> boo
     return float(new_val) > float(old_val)
 
 
+def _log_block_interval_train_psnr_and_images(
+    *,
+    step: int,
+    block_idx: int,
+    scene_id: int,
+    segment_id: int,
+    mode_label: str,
+    result: Dict[str, Any],
+    psnr_metric: PeakSignalNoiseRatio,
+    ssim_metric: SSIM,
+    lpips_metric: LearnedPerceptualImagePatchSimilarity,
+    seg_dir: str,
+    save_images: bool,
+) -> None:
+    """When logging.image_interval_blocks fires: log train-batch PSNR and optionally save pred/gt/error PNGs."""
+    preds = result.get("pred_rgbs")
+    gts = result.get("gt_images")
+    if preds is None or gts is None:
+        return
+    pred_list = list(preds) if not isinstance(preds, list) else preds
+    gt_list = list(gts) if not isinstance(gts, list) else gts
+    if len(pred_list) == 0 or len(gt_list) == 0:
+        return
+    psnr_vals: List[float] = []
+    for pred, gt in zip(pred_list, gt_list):
+        vals = _compute_metrics(pred, gt, psnr_metric, ssim_metric, lpips_metric, True, False)
+        psnr_vals.append(float(vals["psnr"]))
+    mean_psnr = float(np.mean(psnr_vals)) if psnr_vals else 0.0
+    logger.info(
+        "%s block_interval scene=%s segment=%s block=%s step=%s train_psnr_mean=%.4f train_psnr_per_view=%s",
+        mode_label,
+        scene_id,
+        segment_id,
+        block_idx,
+        step,
+        mean_psnr,
+        [round(x, 4) for x in psnr_vals],
+    )
+    if save_images:
+        out_dir = os.path.join(seg_dir, "renders", "block_interval")
+        os.makedirs(out_dir, exist_ok=True)
+        for idx, (pred, gt) in enumerate(zip(pred_list, gt_list)):
+            _save_image_triplet(
+                step,
+                pred,
+                gt,
+                out_dir,
+                view_suffix=f"{mode_label}_b{block_idx}_v{idx}",
+                save_error=True,
+            )
+
+
 def _build_minimal_eval_from_refs(
     dataset: Any,
     scene_id: int,
@@ -245,8 +297,21 @@ def run_adapt_supervised(
                         continue
                     block_counter += 1
                     if block_counter % log_interval_blocks == 0:
+                        _log_block_interval_train_psnr_and_images(
+                            step=step,
+                            block_idx=block_counter,
+                            scene_id=int(scene_id),
+                            segment_id=int(segment_id),
+                            mode_label="adapt",
+                            result=result,
+                            psnr_metric=psnr_metric,
+                            ssim_metric=ssim_metric,
+                            lpips_metric=lpips_metric,
+                            seg_dir=seg_dir,
+                            save_images=bool(cfg.test.export.save_rendered_images),
+                        )
                         logger.info(
-                            "Adapt train progress scene=%s segment=%s block=%s step=%s source_ref=%s loss=%.6f",
+                            "Adapt block_interval scene=%s segment=%s block=%s step=%s source_ref=%s loss=%.6f",
                             scene_id,
                             segment_id,
                             block_counter,
@@ -454,9 +519,10 @@ def run_inference_only(
                     save_3dgs_state(os.path.join(seg_dir, "3dgs_init.pt"), init_state)
                     init_saved = True
 
+                infer_step = step
                 infer_result = model.inference_step_from_train_batch(
                     minimal_batch,
-                    step=step,
+                    step=infer_step,
                     scheduler_node_sync=scheduler_node_sync,
                     runtime_policy=infer_policy,
                 )
@@ -466,12 +532,25 @@ def run_inference_only(
                     if ev.get("type") == "block_end":
                         block_end_count += 1
                         if block_end_count % log_interval_blocks == 0:
+                            _log_block_interval_train_psnr_and_images(
+                                step=infer_step,
+                                block_idx=block_end_count,
+                                scene_id=int(scene_id),
+                                segment_id=int(segment_id),
+                                mode_label="infer",
+                                result=infer_result,
+                                psnr_metric=psnr_metric,
+                                ssim_metric=ssim_metric,
+                                lpips_metric=lpips_metric,
+                                seg_dir=seg_dir,
+                                save_images=bool(cfg.test.export.save_rendered_images),
+                            )
                             logger.info(
-                                "Inference train-like progress scene=%s segment=%s block=%s step=%s source_ref=%s pseudo_loss=%.6f",
+                                "Inference block_interval scene=%s segment=%s block=%s step=%s source_ref=%s pseudo_loss=%.6f",
                                 scene_id,
                                 segment_id,
                                 block_end_count,
-                                step,
+                                infer_step,
                                 scheduler_info.get("source_image_ref"),
                                 float(infer_result.get("loss", 0.0)),
                             )
