@@ -22,6 +22,10 @@ class MinimalStreetForwardStage4_4(MinimalStreetForwardStage4_3):
     def __init__(self, config, device: torch.device, **kwargs):
         super().__init__(config, device, **kwargs)
         model_cfg = config.model
+        self.use_fused_cuda_backproject_v4 = bool(model_cfg.get("use_fused_cuda_backproject_v4", False))
+        self.fused_cuda_backproject_v4_force_fallback = bool(
+            model_cfg.get("fused_cuda_backproject_v4_force_fallback", False)
+        )
         self.use_fused_cuda_backproject_v3 = bool(model_cfg.get("use_fused_cuda_backproject_v3", True))
         self.alpha_t_extractor_v3 = AlphaTWeightExtractorV3(
             renderer=self.renderer,
@@ -87,10 +91,24 @@ class MinimalStreetForwardStage4_4(MinimalStreetForwardStage4_3):
         multi = torch.cat([image_batch, rendered_batch], dim=-1)
         features_2d = self.image_feature_extractor(multi)
         backprojector_impl = backprojector_override if backprojector_override is not None else self.feature_backprojector
+        use_fused_v4 = bool(getattr(self, "use_fused_cuda_backproject_v4", False))
+        force_fallback_v4 = bool(getattr(self, "fused_cuda_backproject_v4_force_fallback", False))
         use_fused_v3 = bool(getattr(self, "use_fused_cuda_backproject_v3", True))
         use_fused_v2 = bool(getattr(self, "use_fused_cuda_backproject_v2", False))
-        if use_fused_v3:
-            back_out = self.alpha_t_extractor_v3.render_and_backproject_streaming_fused(
+        if use_fused_v4 and not force_fallback_v4:
+            back_out = self.alpha_t_extractor_v3.render_and_backproject_streaming_fused_multi_camera(
+                gaussians=gaussians,
+                cameras=source_views,
+                features_2d=features_2d,
+                height=height,
+                width=width,
+                num_gaussians=num_gaussians,
+                backprojector=backprojector_impl,
+                return_accumulated_weights=return_accumulated_weights,
+                return_debug_stats=True,
+            )
+        elif use_fused_v3:
+            back_out = self.alpha_t_extractor_v3.render_and_backproject_streaming_fused_multi_camera(
                 gaussians=gaussians,
                 cameras=source_views,
                 features_2d=features_2d,

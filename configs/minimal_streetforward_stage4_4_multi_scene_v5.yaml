@@ -104,6 +104,8 @@ model:
   feat_2d_downscale: 1
   use_fused_cuda_backproject_v2: true
   use_fused_cuda_backproject_v3: true
+  use_fused_cuda_backproject_v4: true
+  fused_cuda_backproject_v4_force_fallback: false
   param_embed_dim: 48
   offset_gru_hidden_dim: 48
   offset_gru_use_reset_gate: true
