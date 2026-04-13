@@ -15,12 +15,15 @@ import random
 import threading
 import time
 from collections import OrderedDict
+from pathlib import Path
 
 import numpy as np
 from dataclasses import dataclass
 from typing import Any, Dict, FrozenSet, List, Literal, Optional, Sequence, Set, Tuple
 
 import torch
+import torch.nn.functional as F
+from PIL import Image
 from torch import Tensor
 
 from datasets.dataset_preload_manager import (
@@ -85,6 +88,8 @@ class SegmentIndex:
     keyframe_to_frames: Dict[int, List[int]]
     frame_to_keyframe: Dict[int, int]
     segment_first_frame_idx: int
+    train_image_refs: Optional[Tuple[ImageRef, ...]] = None
+    test_image_refs: Optional[Tuple[ImageRef, ...]] = None
 
 
 @dataclass(frozen=True)
@@ -154,6 +159,14 @@ def _build_segment_index_dict(
             )
 
     first_frame = train_frames[0]
+    train_image_refs: List[ImageRef] = []
+    test_image_refs: List[ImageRef] = []
+    for f in train_frames:
+        for cam_id in range(num_cams):
+            train_image_refs.append((int(f), int(cam_id)))
+    for f in test_frames:
+        for cam_id in range(num_cams):
+            test_image_refs.append((int(f), int(cam_id)))
     return SegmentIndex(
         scene_id=int(scene_id),
         segment_id=int(segment_id),
@@ -166,6 +179,8 @@ def _build_segment_index_dict(
         keyframe_to_frames=keyframe_to_frames,
         frame_to_keyframe=frame_to_keyframe,
         segment_first_frame_idx=int(first_frame),
+        train_image_refs=tuple(train_image_refs),
+        test_image_refs=tuple(test_image_refs),
     )
 
 
@@ -222,6 +237,7 @@ class MultiSceneDatasetV3(MultiSceneDataset):
         self._segment_index_inflight: Dict[Tuple[int, int], threading.Event] = {}
         self._segment_pose_cache: Dict[Tuple[int, int], Dict[str, Any]] = {}
         self._test_image_refs_cache: Dict[Tuple[int, int, int], List[ImageRef]] = {}
+        self._segment_dynamic_tracks_cache: Dict[Tuple[int, int], Dict[str, Any]] = {}
         self._overlap_stats_log_interval_steps = int(overlap_stats_log_interval_steps)
         self._overlap_stats: Dict[str, float] = {
             "pair_queries": 0.0,
@@ -232,6 +248,303 @@ class MultiSceneDatasetV3(MultiSceneDataset):
             "src_rep_no_visible": 0.0,
             "candidate_eval_count": 0.0,
         }
+
+    def _asset_dataset_name(self) -> str:
+        ds = self.data_cfg.get("dataset")
+        if ds is None:
+            raise ValueError(
+                "data.dataset is required when assets are enabled; cannot resolve StreetForward asset namespace."
+            )
+        return str(ds)
+
+    def _asset_handle_or_raise(self, scene_id: int, segment_id: int):
+        if not bool(getattr(self, "use_prebuilt_assets", False)) or getattr(self, "asset_store", None) is None:
+            return None
+        dataset_name = self._asset_dataset_name()
+        try:
+            return self.asset_store.verify_segment_asset(dataset_name, int(scene_id), int(segment_id))
+        except Exception:
+            policy = str(getattr(self, "asset_missing_policy", "error"))
+            if policy == "rebuild":
+                raise NotImplementedError(
+                    "missing_policy=rebuild is reserved but online rebuild is not enabled yet."
+                )
+            if policy == "error":
+                raise
+            return None
+
+    def _asset_scene_handle_or_raise(self, scene_id: int):
+        if not bool(getattr(self, "use_prebuilt_assets", False)) or getattr(self, "asset_store", None) is None:
+            return None
+        dataset_name = self._asset_dataset_name()
+        try:
+            return self.asset_store.get_scene_asset(dataset_name, int(scene_id))
+        except Exception:
+            policy = str(getattr(self, "asset_missing_policy", "error"))
+            if policy == "rebuild":
+                raise NotImplementedError(
+                    "missing_policy=rebuild is reserved but online rebuild is not enabled yet."
+                )
+            if policy == "error":
+                raise
+            return None
+
+    def _allow_runtime_fallback(self) -> bool:
+        """Strict prebuilt+asset_store 模式下，是否允许在资产不足时回退到 runtime（仅 ignore）。"""
+        policy = str(getattr(self, "asset_missing_policy", "error"))
+        if policy == "ignore":
+            return True
+        if policy == "rebuild":
+            return False
+        return False
+
+    def _runtime_data_allowed(self) -> bool:
+        """是否允许加载整 scene / DrivingDataset（含纯 runtime 训练与 ignore 下的混合路径）。"""
+        if not bool(getattr(self, "use_prebuilt_assets", False)) or getattr(self, "asset_store", None) is None:
+            return True
+        return self._allow_runtime_fallback()
+
+    def _require_no_runtime_for_rebuild(self, where: str) -> None:
+        policy = str(getattr(self, "asset_missing_policy", "error"))
+        if policy == "rebuild":
+            raise NotImplementedError(
+                f"missing_policy=rebuild is reserved but online rebuild is not enabled yet ({where})."
+            )
+
+    def _runtime_fallback_or_raise(self, where: str) -> None:
+        self._require_no_runtime_for_rebuild(where)
+        if not self._runtime_data_allowed():
+            raise ValueError(
+                f"{where} requires runtime scene loading, but missing_policy="
+                f"{getattr(self, 'asset_missing_policy', 'error')} forbids runtime fallback."
+            )
+
+    def _test_refs_enabled(self) -> bool:
+        return False
+
+    def _load_view_meta_from_asset(
+        self,
+        scene_id: int,
+        image_ref: ImageRef,
+    ) -> Optional[Dict[str, Any]]:
+        handle = self._asset_scene_handle_or_raise(scene_id)
+        if handle is None:
+            return None
+        metas = handle.load_image_meta([(int(image_ref[0]), int(image_ref[1]))])
+        if len(metas) != 1:
+            raise ValueError(
+                f"Expected single image meta for scene={scene_id} ref={image_ref}, got {len(metas)}"
+            )
+        meta = dict(metas[0])
+        intr_flat = np.asarray(meta["intrinsic_4x4_flat"], dtype=np.float32).reshape(4, 4)
+        c2w_flat = np.asarray(meta["camera_to_world_flat"], dtype=np.float32).reshape(4, 4)
+        meta["intrinsic_4x4"] = intr_flat
+        meta["camera_to_world"] = c2w_flat
+        return meta
+
+    @staticmethod
+    def _resize_2d_tensor_to_hw(x: Tensor, height: int, width: int, *, mode: str) -> Tensor:
+        """Resize a (H, W) or (H, W, C) tensor to (height, width[, C]) using 2D interpolate."""
+        if int(x.shape[0]) == int(height) and int(x.shape[1]) == int(width):
+            return x
+        if x.dim() == 2:
+            y = x.unsqueeze(0).unsqueeze(0).float()
+            if mode == "bilinear":
+                y = F.interpolate(y, size=(int(height), int(width)), mode="bilinear", align_corners=False)
+            else:
+                y = F.interpolate(y, size=(int(height), int(width)), mode="nearest")
+            return y[0, 0].to(dtype=x.dtype)
+        if x.dim() == 3:
+            # (H, W, C) -> (1, C, H, W)
+            y = x.permute(2, 0, 1).unsqueeze(0).float()
+            if mode == "bilinear":
+                y = F.interpolate(y, size=(int(height), int(width)), mode="bilinear", align_corners=False)
+            else:
+                y = F.interpolate(y, size=(int(height), int(width)), mode="nearest")
+            return y[0].permute(1, 2, 0).to(dtype=x.dtype)
+        raise ValueError(f"_resize_2d_tensor_to_hw expects 2D or 3D tensor, got shape {tuple(x.shape)}")
+
+    def _load_depth_from_asset_path(self, depth_path: str, height: int, width: int) -> Tensor:
+        path = Path(depth_path)
+        suffix = path.suffix.lower()
+        if suffix == ".npy":
+            arr = np.load(str(path), allow_pickle=False)
+        elif suffix == ".npz":
+            z = np.load(str(path), allow_pickle=False)
+            keys = list(z.keys())
+            if len(keys) != 1:
+                raise ValueError(f"depth npz must contain exactly one array, got keys={keys}")
+            arr = z[keys[0]]
+        else:
+            arr = np.asarray(Image.open(str(path)))
+        if arr.ndim == 3:
+            arr = arr[..., 0]
+        t = torch.as_tensor(arr, dtype=torch.float32)
+        if t.shape[0] != int(height) or t.shape[1] != int(width):
+            t = self._resize_2d_tensor_to_hw(t, int(height), int(width), mode="bilinear")
+        return t.to(device=self.device)
+
+    def _load_mask_from_asset_path(self, path_str: str, height: int, width: int) -> Tensor:
+        arr = np.asarray(Image.open(path_str))
+        if arr.ndim == 3:
+            arr = arr[..., 0]
+        mask = torch.as_tensor(arr, dtype=torch.float32)
+        if mask.shape[0] != int(height) or mask.shape[1] != int(width):
+            mask = self._resize_2d_tensor_to_hw(mask, int(height), int(width), mode="nearest")
+        mask = mask.to(device=self.device)
+        if mask.max().item() > 1.0:
+            mask = (mask > 0.0).float()
+        return mask
+
+    def _load_view_from_asset_paths(
+        self,
+        scene_id: int,
+        image_ref: ImageRef,
+        meta: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        image_path = str(meta.get("image_path", ""))
+        depth_path = str(meta.get("depth_path", ""))
+        sky_mask_path = str(meta.get("sky_mask_path", ""))
+        dynamic_mask_path = str(meta.get("dynamic_mask_path", ""))
+        if not image_path:
+            raise ValueError(
+                f"Missing image_path in asset image table for scene={scene_id} ref={image_ref}"
+            )
+
+        H = int(meta["height"])
+        W = int(meta["width"])
+        pil_img = Image.open(image_path).convert("RGB")
+        # Asset table may record training resolution (e.g. after downscale_when_loading) while paths
+        # still point at full-res files; resize so pixels match intrinsic_4x4 / height / width in meta.
+        if pil_img.size != (W, H):
+            try:
+                resample = Image.Resampling.BILINEAR
+            except AttributeError:
+                resample = Image.BILINEAR  # type: ignore[attr-defined]
+            pil_img = pil_img.resize((W, H), resample=resample)
+        image_arr = np.asarray(pil_img, dtype=np.float32)
+        image = torch.as_tensor(image_arr / 255.0, dtype=torch.float32, device=self.device)
+
+        if depth_path:
+            depth = self._load_depth_from_asset_path(depth_path, H, W)
+        else:
+            depth = torch.ones((H, W), dtype=torch.float32, device=self.device) * 10.0
+
+        sky_mask: Optional[Tensor] = None
+        if sky_mask_path:
+            sky_mask = self._normalize_sky_mask(self._load_mask_from_asset_path(sky_mask_path, H, W))
+
+        egocar_mask: Optional[Tensor] = None
+        if dynamic_mask_path:
+            egocar_mask = self._load_mask_from_asset_path(dynamic_mask_path, H, W)
+
+        return {
+            "image": image,
+            "extrinsic": torch.as_tensor(meta["camera_to_world"], dtype=torch.float32, device=self.device),
+            "intrinsic": torch.as_tensor(meta["intrinsic_4x4"], dtype=torch.float32, device=self.device),
+            "depth": depth,
+            "sky_mask": sky_mask,
+            "viewdirs": None,
+            "egocar_mask": egocar_mask,
+            "frame_idx": int(image_ref[0]),
+            "cam_idx": int(image_ref[1]),
+        }
+
+    def _overlay_pack_geometry_from_asset(
+        self,
+        *,
+        scene_id: int,
+        image_ref: ImageRef,
+        pack: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        meta = self._load_view_meta_from_asset(scene_id, image_ref)
+        if meta is None:
+            return pack
+        out = dict(pack)
+        out["extrinsic"] = torch.as_tensor(meta["camera_to_world"], dtype=torch.float32, device=self.device)
+        out["intrinsic"] = torch.as_tensor(meta["intrinsic_4x4"], dtype=torch.float32, device=self.device)
+        return out
+
+    def _build_segment_index_from_asset_payload(self, payload: Dict[str, Any]) -> SegmentIndex:
+        frame_indices = [int(x) for x in payload["frame_indices"]]
+        test_frame_indices = [int(x) for x in payload["test_frame_indices"]]
+        train_refs = tuple((int(r[0]), int(r[1])) for r in payload["train_image_refs"].tolist())
+        test_refs = tuple((int(r[0]), int(r[1])) for r in payload["test_image_refs"].tolist())
+        return SegmentIndex(
+            scene_id=int(payload["scene_id"]),
+            segment_id=int(payload["segment_id"]),
+            num_cams=int(payload["num_cams"]),
+            frame_indices=frame_indices,
+            test_frame_indices=test_frame_indices,
+            train_frame_set=frozenset(frame_indices),
+            test_frame_set=frozenset(test_frame_indices),
+            keyframe_indices=[int(x) for x in payload["keyframe_indices"]],
+            keyframe_to_frames={int(k): [int(x) for x in v] for k, v in payload["keyframe_to_frames"].items()},
+            frame_to_keyframe={int(k): int(v) for k, v in payload["frame_to_keyframe"].items()},
+            segment_first_frame_idx=int(payload["segment_first_frame_idx"]),
+            train_image_refs=train_refs,
+            test_image_refs=test_refs,
+        )
+
+    def _load_segment_dynamic_tracks_cached(self, scene_id: int, segment_id: int) -> Optional[Dict[str, Any]]:
+        key = (int(scene_id), int(segment_id))
+        with self._lock:
+            cached = self._segment_dynamic_tracks_cache.get(key)
+        if cached is not None:
+            return cached
+        handle = self._asset_handle_or_raise(scene_id, segment_id)
+        if handle is None:
+            return None
+        try:
+            tracks = handle.load_dynamic_tracks()
+        except Exception:
+            if self.asset_missing_policy in ("error", "rebuild"):
+                raise
+            return None
+        with self._lock:
+            if key not in self._segment_dynamic_tracks_cache:
+                self._segment_dynamic_tracks_cache[key] = tracks
+            return self._segment_dynamic_tracks_cache[key]
+
+    def _build_dynamic_info_from_asset_tracks(
+        self,
+        tracks: Dict[str, Any],
+        *,
+        frame_indices: Sequence[int],
+    ) -> Optional[Dict[int, Dict[str, Any]]]:
+        frames = np.asarray(tracks["frame_indices"]).astype(np.int32, copy=False)
+        intids = np.asarray(tracks["instance_intids"]).astype(np.int32, copy=False)
+        quats = np.asarray(tracks["instances_quats"]).astype(np.float32, copy=False)
+        trans = np.asarray(tracks["instances_trans"]).astype(np.float32, copy=False)
+        fv = np.asarray(tracks["instances_fv"]).astype(np.uint8, copy=False)
+
+        if quats.shape[:2] != fv.shape or trans.shape[:2] != fv.shape:
+            raise ValueError("dynamic_tracks arrays shape mismatch")
+        if quats.shape[2] != 4 or trans.shape[2] != 3:
+            raise ValueError("dynamic_tracks quats/trans last dim mismatch")
+        if quats.shape[0] != len(frames) or quats.shape[1] != len(intids):
+            raise ValueError("dynamic_tracks frame/instance axes mismatch")
+
+        frame_to_row = {int(f): i for i, f in enumerate(frames.tolist())}
+        out: Dict[int, Dict[str, Any]] = {}
+        for f in sorted(set(int(x) for x in frame_indices)):
+            row = frame_to_row.get(int(f))
+            if row is None:
+                continue
+            inst: Dict[int, Dict[str, Any]] = {}
+            for col, intid in enumerate(intids.tolist()):
+                if int(fv[row, col]) == 0:
+                    continue
+                inst[int(intid)] = {
+                    "quat": quats[row, col].tolist(),
+                    "trans": trans[row, col].tolist(),
+                }
+            out[int(f)] = {"instances": inst}
+        if not out:
+            return None
+        if not any(len(v.get("instances", {})) > 0 for v in out.values()):
+            return None
+        return out
 
     def __del__(self) -> None:
         try:
@@ -522,6 +835,11 @@ class MultiSceneDatasetV3(MultiSceneDataset):
                 for k in list(self._test_image_refs_cache.keys()):
                     if int(k[0]) == sid:
                         del self._test_image_refs_cache[k]
+                tracks_cache = getattr(self, "_segment_dynamic_tracks_cache", None)
+                if tracks_cache is not None:
+                    for k in list(tracks_cache.keys()):
+                        if int(k[0]) == sid:
+                            del tracks_cache[k]
         finally:
             with self._scene_unloading_lock:
                 self._scene_unloading.discard(sid)
@@ -610,8 +928,8 @@ class MultiSceneDatasetV3(MultiSceneDataset):
     def _materialize_view_pack_cache(
         self,
         key: Tuple[int, int, int, int],
-        scene_dataset: DrivingDataset,
         ref_t: Tuple[int, int],
+        scene_dataset_opt: Optional[DrivingDataset] = None,
     ) -> None:
         cfg = self._preload_rtcfg
         if cfg is None or not cfg.enable_view_pack_cache:
@@ -634,7 +952,21 @@ class MultiSceneDatasetV3(MultiSceneDataset):
             with self._view_pack_lock:
                 if key in self._view_pack_cache:
                     return
-            raw = self._load_view_from_image_ref(scene_dataset, ref_t)
+            meta = self._load_view_meta_from_asset(int(key[0]), ref_t)
+            if meta is not None:
+                raw = self._load_view_from_asset_paths(int(key[0]), ref_t, meta)
+            else:
+                if scene_dataset_opt is None:
+                    self._runtime_fallback_or_raise("_materialize_view_pack_cache")
+                    raise ValueError(
+                        f"_materialize_view_pack_cache requires scene_dataset when asset meta is missing, key={key!r}"
+                    )
+                raw = self._load_view_from_image_ref(scene_dataset_opt, ref_t)
+                raw = self._overlay_pack_geometry_from_asset(
+                    scene_id=int(key[0]),
+                    image_ref=ref_t,
+                    pack=raw,
+                )
             pin = pin_memory_from_cfg(cfg)
             lvp = dict_to_loaded_view_pack(raw, pin_memory=pin)
             with self._view_pack_lock:
@@ -666,6 +998,34 @@ class MultiSceneDatasetV3(MultiSceneDataset):
                 int(ent["segment_first_frame_idx"]),
                 str(ent["segment_pose_source"]),
             )
+        handle = self._asset_handle_or_raise(scene_id, segment_id)
+        if handle is not None:
+            try:
+                payload = handle.load_segment_pose()
+                segment_first_pose = payload["segment_first_pose_world"].to(
+                    device=self.device, dtype=torch.float32
+                )
+                world_to_seg0 = payload["world_to_seg0"].to(device=self.device, dtype=torch.float32)
+                segment_first_frame_idx = int(payload["segment_first_frame_idx"])
+                segment_pose_source = str(payload["segment_pose_source"])
+                with self._lock:
+                    if key not in self._segment_pose_cache:
+                        self._segment_pose_cache[key] = {
+                            "segment_first_pose": segment_first_pose,
+                            "world_to_seg0": world_to_seg0,
+                            "segment_first_frame_idx": int(segment_first_frame_idx),
+                            "segment_pose_source": str(segment_pose_source),
+                        }
+                return (
+                    segment_first_pose,
+                    world_to_seg0,
+                    int(segment_first_frame_idx),
+                    str(segment_pose_source),
+                )
+            except Exception:
+                if self.asset_missing_policy in ("error", "rebuild"):
+                    raise
+        self._runtime_fallback_or_raise("_ensure_segment_pose_cached")
         segment_first_pose, segment_first_frame_idx, segment_pose_source = self._get_segment_first_pose(
             scene_dataset=scene_dataset,
             segment=segment,
@@ -693,18 +1053,72 @@ class MultiSceneDatasetV3(MultiSceneDataset):
                 }
         return segment_first_pose, world_to_seg0, int(segment_first_frame_idx), str(segment_pose_source)
 
+    def _ensure_segment_pose_cached_from_assets_only(
+        self,
+        scene_id: int,
+        segment_id: int,
+    ) -> Tuple[Tensor, Tensor, int, str]:
+        key = (int(scene_id), int(segment_id))
+        with self._lock:
+            ent = self._segment_pose_cache.get(key)
+        if ent is not None:
+            return (
+                ent["segment_first_pose"],
+                ent["world_to_seg0"],
+                int(ent["segment_first_frame_idx"]),
+                str(ent["segment_pose_source"]),
+            )
+        handle = self._asset_handle_or_raise(scene_id, segment_id)
+        if handle is None:
+            self._runtime_fallback_or_raise("_ensure_segment_pose_cached_from_assets_only")
+            raise ValueError(
+                f"segment pose asset is required for scene={scene_id} segment={segment_id} in asset-only path"
+            )
+        payload = handle.load_segment_pose()
+        segment_first_pose = payload["segment_first_pose_world"].to(device=self.device, dtype=torch.float32)
+        world_to_seg0 = payload["world_to_seg0"].to(device=self.device, dtype=torch.float32)
+        segment_first_frame_idx = int(payload["segment_first_frame_idx"])
+        segment_pose_source = str(payload["segment_pose_source"])
+        with self._lock:
+            if key not in self._segment_pose_cache:
+                self._segment_pose_cache[key] = {
+                    "segment_first_pose": segment_first_pose,
+                    "world_to_seg0": world_to_seg0,
+                    "segment_first_frame_idx": segment_first_frame_idx,
+                    "segment_pose_source": segment_pose_source,
+                }
+        return segment_first_pose, world_to_seg0, segment_first_frame_idx, segment_pose_source
+
     def _ensure_segment_pointcloud_cached(
         self,
         scene_id: int,
         segment_id: int,
         segment_first_pose: Tensor,
     ) -> Any:
-        if self.pointcloud_generator is None:
-            return None
         pc_key = (int(scene_id), int(segment_id))
         with self._lock:
             if pc_key in self._segment_pointcloud_cache:
                 return self._segment_pointcloud_cache[pc_key]
+        handle = self._asset_handle_or_raise(scene_id, segment_id)
+        if handle is not None:
+            try:
+                pc = handle.load_pointcloud()
+                with self._lock:
+                    if pc_key not in self._segment_pointcloud_cache:
+                        self._segment_pointcloud_cache[pc_key] = pc
+                    return self._segment_pointcloud_cache.get(pc_key)
+            except Exception:
+                if self.asset_missing_policy in ("error", "rebuild"):
+                    raise
+
+        self._runtime_fallback_or_raise("_ensure_segment_pointcloud_cached")
+        if self.pointcloud_generator is None:
+            if self.asset_missing_policy in ("error", "rebuild") and self.use_prebuilt_assets:
+                raise ValueError(
+                    "Segment pointcloud asset missing and pointcloud_generator is unavailable; "
+                    f"cannot proceed for scene={scene_id} segment={segment_id} in missing_policy=error mode."
+                )
+            return None
         with self._segment_pointcloud_coord_lock:
             with self._lock:
                 if pc_key in self._segment_pointcloud_cache:
@@ -753,11 +1167,12 @@ class MultiSceneDatasetV3(MultiSceneDataset):
         try:
             if self._preload_should_abort_for_unload(int(scene_id)):
                 return "failed"
-            scene_data = self._ensure_scene_loaded(int(scene_id))
-            if scene_data is None:
-                return "failed"
-            scene_dataset = scene_data["dataset"]
-            self._materialize_view_pack_cache(key, scene_dataset, tuple(image_ref))
+            scene_dataset_opt: Optional[DrivingDataset] = None
+            if self._runtime_data_allowed():
+                scene_data = self._ensure_scene_loaded(int(scene_id))
+                if scene_data is not None:
+                    scene_dataset_opt = scene_data["dataset"]
+            self._materialize_view_pack_cache(key, tuple(image_ref), scene_dataset_opt=scene_dataset_opt)
             with self._view_pack_lock:
                 if key in self._view_pack_cache:
                     return "loaded"
@@ -774,15 +1189,24 @@ class MultiSceneDatasetV3(MultiSceneDataset):
         try:
             if self._preload_should_abort_for_unload(sid):
                 return "failed"
-            self.get_segment_index(sid, seg)
-            self.resolve_test_image_refs_deterministic(sid, seg)
-            scene_data = self._ensure_scene_loaded(sid)
-            if scene_data is None:
-                return "failed"
             sidx = self.get_segment_index(sid, seg)
-            segment = scene_data["segments"][int(sidx.segment_id)]
-            scene_dataset = scene_data["dataset"]
-            segment_first_pose, _, _, _ = self._ensure_segment_pose_cached(sid, seg, scene_dataset, segment)
+            scene_data_opt: Optional[Dict[str, Any]] = None
+            scene_dataset_opt: Optional[DrivingDataset] = None
+            segment_opt: Optional[Dict[str, Any]] = None
+            if self._runtime_data_allowed():
+                scene_data_opt = self._ensure_scene_loaded(sid)
+                if scene_data_opt is None:
+                    return "failed"
+                scene_dataset_opt = scene_data_opt["dataset"]
+                segment_opt = scene_data_opt["segments"][int(sidx.segment_id)]
+            elif str(getattr(self, "asset_missing_policy", "error")) == "rebuild":
+                self._require_no_runtime_for_rebuild("_preload_worker_segment_static")
+            if scene_dataset_opt is None or segment_opt is None:
+                segment_first_pose, _, _, _ = self._ensure_segment_pose_cached_from_assets_only(sid, seg)
+            else:
+                segment_first_pose, _, _, _ = self._ensure_segment_pose_cached(
+                    sid, seg, scene_dataset_opt, segment_opt
+                )
             if cfg.warm_segment_pointcloud and self.pointcloud_generator is not None:
                 self._ensure_segment_pointcloud_cached(sid, seg, segment_first_pose)
             return "loaded"
@@ -812,13 +1236,18 @@ class MultiSceneDatasetV3(MultiSceneDataset):
             if self.is_pair_score_cached(sid, seg, src_t, tgt_t, mode_s, pss):
                 return "cache_hit"
             self.get_segment_index(sid, seg)
-            scene_data = self._ensure_scene_loaded(sid)
-            if scene_data is None:
-                return "failed"
             sidx = self.get_segment_index(sid, seg)
-            segment = scene_data["segments"][int(sidx.segment_id)]
-            scene_dataset = scene_data["dataset"]
-            segment_first_pose, _, _, _ = self._ensure_segment_pose_cached(sid, seg, scene_dataset, segment)
+            if self._runtime_data_allowed():
+                scene_data = self._ensure_scene_loaded(sid)
+                if scene_data is None:
+                    return "failed"
+                segment = scene_data["segments"][int(sidx.segment_id)]
+                scene_dataset = scene_data["dataset"]
+                segment_first_pose, _, _, _ = self._ensure_segment_pose_cached(
+                    sid, seg, scene_dataset, segment
+                )
+            else:
+                segment_first_pose, _, _, _ = self._ensure_segment_pose_cached_from_assets_only(sid, seg)
             if self.pointcloud_generator is not None:
                 self._ensure_segment_pointcloud_cached(sid, seg, segment_first_pose)
             self.get_or_compute_pair_score(
@@ -870,7 +1299,7 @@ class MultiSceneDatasetV3(MultiSceneDataset):
                 self._preload_manager.submit_image_ref(
                     PRIORITY_NEXT_BLOCK_EXACT, scene_id, segment_id, ref, meta=base_meta
                 )
-            if include_test and self._preload_rtcfg.warm_test_refs:
+            if self._test_refs_enabled() and include_test and self._preload_rtcfg.warm_test_refs:
                 for ref in self.resolve_test_image_refs_deterministic(scene_id, segment_id):
                     self._preload_manager.submit_image_ref(
                         PRIORITY_TEST_REFS, scene_id, segment_id, ref, meta=base_meta
@@ -937,20 +1366,29 @@ class MultiSceneDatasetV3(MultiSceneDataset):
         self,
         scene_id: int,
         segment_id: int,
-        scene_dataset: DrivingDataset,
         image_ref: ImageRef,
+        scene_dataset_opt: Optional[DrivingDataset] = None,
     ) -> Dict[str, Any]:
         ref_t = (int(image_ref[0]), int(image_ref[1]))
         key = (int(scene_id), int(segment_id), ref_t[0], ref_t[1])
+        meta = self._load_view_meta_from_asset(int(scene_id), ref_t)
         if self._preload_rtcfg is None or not self._preload_rtcfg.enable_view_pack_cache:
-            return self._load_view_from_image_ref(scene_dataset, ref_t)
+            if meta is not None:
+                return self._load_view_from_asset_paths(int(scene_id), ref_t, meta)
+            if scene_dataset_opt is None:
+                self._runtime_fallback_or_raise("_get_cached_or_load_view_from_image_ref")
+                raise ValueError(
+                    f"scene_dataset is required for runtime fallback when asset meta is missing ref={ref_t}"
+                )
+            raw = self._load_view_from_image_ref(scene_dataset_opt, ref_t)
+            return self._overlay_pack_geometry_from_asset(scene_id=int(scene_id), image_ref=ref_t, pack=raw)
 
         with self._view_pack_lock:
             if key in self._view_pack_cache:
                 self._view_pack_cache.move_to_end(key)
                 return loaded_view_pack_to_device(self._view_pack_cache[key], self.device)
 
-        self._materialize_view_pack_cache(key, scene_dataset, ref_t)
+        self._materialize_view_pack_cache(key, ref_t, scene_dataset_opt=scene_dataset_opt)
         with self._view_pack_lock:
             if key not in self._view_pack_cache:
                 raise RuntimeError(f"view pack cache still empty after materialize: key={key!r}")
@@ -960,10 +1398,10 @@ class MultiSceneDatasetV3(MultiSceneDataset):
         self,
         scene_id: int,
         segment_id: int,
-        scene_dataset: DrivingDataset,
         image_ref: ImageRef,
         *,
         world_to_seg0_np: np.ndarray,
+        scene_dataset_opt: Optional[DrivingDataset] = None,
     ) -> Tuple[np.ndarray, np.ndarray, int, int]:
         """
         Extrinsic / intrinsic / image size for overlap scoring only.
@@ -985,8 +1423,21 @@ class MultiSceneDatasetV3(MultiSceneDataset):
                 raise ValueError(f"unexpected intrinsic shape {intr_cpu.shape}")
             return c2w_seg0, K, int(h), int(w)
 
+        meta = self._load_view_meta_from_asset(int(scene_id), ref_t)
+        if meta is not None:
+            ext_t = torch.as_tensor(meta["camera_to_world"], dtype=torch.float64)
+            intr_t = torch.as_tensor(meta["intrinsic_4x4"], dtype=torch.float64)
+            H = int(meta["height"])
+            Wim = int(meta["width"])
+            return _from_pack_tensors(ext_t, intr_t, H, Wim)
+
         if cfg is None or not cfg.enable_view_pack_cache:
-            pack = self._load_view_from_image_ref(scene_dataset, ref_t)
+            if scene_dataset_opt is None:
+                self._runtime_fallback_or_raise("_get_view_geometry_from_image_ref")
+                raise ValueError(
+                    f"scene_dataset is required for runtime fallback when asset meta is missing ref={ref_t}"
+                )
+            pack = self._load_view_from_image_ref(scene_dataset_opt, ref_t)
             img = pack["image"]
             H, Wim = int(img.shape[0]), int(img.shape[1])
             ext_t = self._to_4x4_tensor(pack["extrinsic"]).to(device=self.device, dtype=torch.float64)
@@ -1002,7 +1453,7 @@ class MultiSceneDatasetV3(MultiSceneDataset):
                 lvp = ent
 
         if lvp is None:
-            self._materialize_view_pack_cache(key, scene_dataset, ref_t)
+            self._materialize_view_pack_cache(key, ref_t, scene_dataset_opt=scene_dataset_opt)
             with self._view_pack_lock:
                 lvp = self._view_pack_cache.get(key)
             if lvp is None:
@@ -1039,6 +1490,20 @@ class MultiSceneDatasetV3(MultiSceneDataset):
             with self._lock:
                 if key in self._segment_index_cache:
                     return self._segment_index_cache[key]
+            handle = self._asset_handle_or_raise(scene_id, segment_id)
+            if handle is not None:
+                try:
+                    payload = handle.load_segment_index()
+                    idx = self._build_segment_index_from_asset_payload(payload)
+                    with self._lock:
+                        if key in self._segment_index_cache:
+                            return self._segment_index_cache[key]
+                        self._segment_index_cache[key] = idx
+                    return idx
+                except Exception:
+                    if self.asset_missing_policy in ("error", "rebuild"):
+                        raise
+            self._runtime_fallback_or_raise("get_segment_index")
             scene_data = self._ensure_scene_loaded(int(scene_id))
             if scene_data is None:
                 raise ValueError(f"Scene {scene_id} cannot be loaded")
@@ -1130,18 +1595,26 @@ class MultiSceneDatasetV3(MultiSceneDataset):
             raise ValueError("get_or_compute_pair_score(pointcloud_topk) requires dataset.pointcloud_generator")
 
         t_miss0 = time.perf_counter()
-        scene_data = self._ensure_scene_loaded(sid)
-        if scene_data is None:
-            raise ValueError(f"Scene {sid} cannot be loaded for pair score")
-        segments = scene_data.get("segments", [])
-        if seg < 0 or seg >= len(segments):
-            raise ValueError(f"segment_id={seg} out of range for scene {sid}")
-        segment = segments[seg]
-        scene_dataset = scene_data["dataset"]
+        scene_dataset_opt: Optional[DrivingDataset] = None
+        segment_opt: Optional[Dict[str, Any]] = None
+        if self._runtime_data_allowed():
+            scene_data = self._ensure_scene_loaded(sid)
+            if scene_data is None:
+                raise ValueError(f"Scene {sid} cannot be loaded for pair score")
+            segments = scene_data.get("segments", [])
+            if seg < 0 or seg >= len(segments):
+                raise ValueError(f"segment_id={seg} out of range for scene {sid}")
+            segment_opt = segments[seg]
+            scene_dataset_opt = scene_data["dataset"]
+        else:
+            self._require_no_runtime_for_rebuild("get_or_compute_pair_score")
 
-        segment_first_pose, world_to_seg0, _, _ = self._ensure_segment_pose_cached(
-            sid, seg, scene_dataset, segment
-        )
+        if scene_dataset_opt is None or segment_opt is None:
+            segment_first_pose, world_to_seg0, _, _ = self._ensure_segment_pose_cached_from_assets_only(sid, seg)
+        else:
+            segment_first_pose, world_to_seg0, _, _ = self._ensure_segment_pose_cached(
+                sid, seg, scene_dataset_opt, segment_opt
+            )
         world_to_seg0_np = world_to_seg0.detach().cpu().numpy().astype(np.float64)
 
         pc_any = self._ensure_segment_pointcloud_cached(sid, seg, segment_first_pose)
@@ -1188,10 +1661,10 @@ class MultiSceneDatasetV3(MultiSceneDataset):
         self.validate_image_ref(sid, seg, tgt_t, purpose="train")
 
         c2w_a, Ka, Ha, Wa = self._get_view_geometry_from_image_ref(
-            sid, seg, scene_dataset, src_t, world_to_seg0_np=world_to_seg0_np
+            sid, seg, src_t, world_to_seg0_np=world_to_seg0_np, scene_dataset_opt=scene_dataset_opt
         )
         c2w_b, Kb, Hb, Wb = self._get_view_geometry_from_image_ref(
-            sid, seg, scene_dataset, tgt_t, world_to_seg0_np=world_to_seg0_np
+            sid, seg, tgt_t, world_to_seg0_np=world_to_seg0_np, scene_dataset_opt=scene_dataset_opt
         )
 
         va = _visibility_mask_seg0(pts, c2w_a, Ka, Ha, Wa)
@@ -1331,12 +1804,24 @@ class MultiSceneDatasetV3(MultiSceneDataset):
         if len(target_image_refs) < 1:
             raise ValueError("target_image_refs must be non-empty")
 
+        if include_test or test_image_refs is not None:
+            logger.warning(
+                "Phase C2 temporarily disables test refs in batch assembly; include_test/test_image_refs are ignored."
+            )
+            include_test = False
+            test_image_refs = None
+
         sidx = self.get_segment_index(scene_id, segment_id)
-        scene_data = self._ensure_scene_loaded(int(scene_id))
-        if scene_data is None:
-            raise ValueError(f"Scene {scene_id} cannot be loaded")
-        segment = scene_data["segments"][int(sidx.segment_id)]
-        scene_dataset = scene_data["dataset"]
+        scene_dataset: Optional[DrivingDataset] = None
+        segment: Optional[Dict[str, Any]] = None
+        if self._runtime_data_allowed():
+            scene_data = self._ensure_scene_loaded(int(scene_id))
+            if scene_data is None:
+                raise ValueError(f"Scene {scene_id} cannot be loaded")
+            segment = scene_data["segments"][int(sidx.segment_id)]
+            scene_dataset = scene_data["dataset"]
+        else:
+            self._require_no_runtime_for_rebuild("_assemble_segment_batch_from_image_refs")
 
         for ref in source_image_refs:
             self.validate_image_ref(scene_id, segment_id, tuple(ref), purpose="train")
@@ -1368,9 +1853,14 @@ class MultiSceneDatasetV3(MultiSceneDataset):
                         f"prefix (expected {srcs}, got target prefix {prefix})"
                     )
 
-        segment_first_pose, world_to_seg0, segment_first_frame_idx, segment_pose_source = self._ensure_segment_pose_cached(
-            scene_id, segment_id, scene_dataset, segment
-        )
+        if scene_dataset is None or segment is None:
+            segment_first_pose, world_to_seg0, segment_first_frame_idx, segment_pose_source = (
+                self._ensure_segment_pose_cached_from_assets_only(scene_id, segment_id)
+            )
+        else:
+            segment_first_pose, world_to_seg0, segment_first_frame_idx, segment_pose_source = (
+                self._ensure_segment_pose_cached(scene_id, segment_id, scene_dataset, segment)
+            )
 
         def _transform_extrinsics_list(extrinsics_list: List[Tensor]) -> List[Tensor]:
             transformed: List[Tensor] = []
@@ -1415,7 +1905,7 @@ class MultiSceneDatasetV3(MultiSceneDataset):
 
             for ref in refs:
                 pack = self._get_cached_or_load_view_from_image_ref(
-                    scene_id, segment_id, scene_dataset, tuple(ref)
+                    scene_id, segment_id, tuple(ref), scene_dataset_opt=scene_dataset
                 )
                 fidx = int(pack["frame_idx"])
                 images.append(pack["image"])
@@ -1510,23 +2000,12 @@ class MultiSceneDatasetV3(MultiSceneDataset):
             )
 
         all_frame_indices: Set[int] = set(source_frame_idxs) | set(target_frame_idxs)
-        if include_test:
-            if test_image_refs is not None:
-                for ref in test_image_refs:
-                    if int(ref[0]) not in sidx.test_frame_set:
-                        raise ValueError(
-                            f"test_image_ref {ref} frame not in segment test_frame_indices "
-                            f"(scene={scene_id} segment={segment_id})"
-                        )
-                    self.validate_image_ref(scene_id, segment_id, tuple(ref), purpose="test")
-                    all_frame_indices.add(int(ref[0]))
-            else:
-                all_frame_indices.update(segment.get("test_frame_indices", []))
 
         dynamic_info = None
         if pointcloud is not None and isinstance(pointcloud, dict) and "dynamic" in pointcloud:
             dynamic_pcd = pointcloud.get("dynamic")
-            if isinstance(dynamic_pcd, dict) and len(dynamic_pcd) > 0 and pointcloud.get("instance_mapping") is None:
+            dynamic_non_empty = isinstance(dynamic_pcd, dict) and len(dynamic_pcd) > 0
+            if dynamic_non_empty and pointcloud.get("instance_mapping") is None:
                 raise ValueError(
                     "Dynamic pointcloud provided but instance_mapping is missing; "
                     "cannot build dynamic_info without mapping original IDs to pointcloud intids."
@@ -1538,14 +2017,31 @@ class MultiSceneDatasetV3(MultiSceneDataset):
                 raw = meta.get("static_instance_intids")
                 if raw:
                     exclude_instance_intids = {int(x) for x in raw}
-            if scene_dataset.pixel_source is not None and scene_dataset.pixel_source.instances_pose is not None:
-                dynamic_info = self._build_dynamic_info(
-                    scene_dataset=scene_dataset,
-                    frame_indices=sorted(all_frame_indices),
-                    instance_mapping=instance_mapping,
-                    world_to_seg0=world_to_seg0,
-                    exclude_instance_intids=exclude_instance_intids,
-                )
+            if dynamic_non_empty:
+                tracks = self._load_segment_dynamic_tracks_cached(scene_id, segment_id)
+                if tracks is not None:
+                    dynamic_info = self._build_dynamic_info_from_asset_tracks(
+                        tracks,
+                        frame_indices=sorted(all_frame_indices),
+                    )
+                elif self._allow_runtime_fallback():
+                    if scene_dataset is None:
+                        raise ValueError(
+                            "dynamic tracks missing and runtime scene_dataset unavailable for fallback."
+                        )
+                    if (
+                        scene_dataset.pixel_source is not None
+                        and scene_dataset.pixel_source.instances_pose is not None
+                    ):
+                        dynamic_info = self._build_dynamic_info(
+                            scene_dataset=scene_dataset,
+                            frame_indices=sorted(all_frame_indices),
+                            instance_mapping=instance_mapping,
+                            world_to_seg0=world_to_seg0,
+                            exclude_instance_intids=exclude_instance_intids,
+                        )
+                else:
+                    self._runtime_fallback_or_raise("_build_dynamic_info")
 
         test_images: List[Tensor] = []
         test_extrinsics: List[Tensor] = []
@@ -1560,7 +2056,7 @@ class MultiSceneDatasetV3(MultiSceneDataset):
         test_egocar_masks: List[Optional[Tensor]] = []
         has_test_egocar_mask = False
 
-        num_cams = int(scene_dataset.num_cams)
+        num_cams = int(sidx.num_cams)
 
         resolved_test_image_refs: Optional[List[Tuple[int, int]]] = None
 
@@ -1591,7 +2087,7 @@ class MultiSceneDatasetV3(MultiSceneDataset):
                 for ref in test_image_refs:
                     ref_t = (int(ref[0]), int(ref[1]))
                     pack = self._get_cached_or_load_view_from_image_ref(
-                        scene_id, segment_id, scene_dataset, ref_t
+                        scene_id, segment_id, ref_t, scene_dataset_opt=scene_dataset
                     )
                     _append_test_pack(pack)
                     resolved_test_image_refs.append(ref_t)
@@ -1611,7 +2107,7 @@ class MultiSceneDatasetV3(MultiSceneDataset):
                         for cam_idx in range(num_cams):
                             ref = (int(frame_idx), int(cam_idx))
                             pack = self._get_cached_or_load_view_from_image_ref(
-                                scene_id, segment_id, scene_dataset, ref
+                                scene_id, segment_id, ref, scene_dataset_opt=scene_dataset
                             )
                             _append_test_pack(pack)
                             resolved_test_image_refs.append(ref)
@@ -1646,7 +2142,7 @@ class MultiSceneDatasetV3(MultiSceneDataset):
                 "target_keyframe_indices": target_kf_idxs,
             },
             "keyframe_info": {
-                "segment_keyframes": segment["keyframe_indices"],
+                "segment_keyframes": list(sidx.keyframe_indices),
                 "source_keyframes": list(dict.fromkeys(source_kf_idxs)),
                 "target_keyframes": list(dict.fromkeys(target_kf_idxs)),
             },
@@ -1777,49 +2273,32 @@ class MultiSceneDatasetV3(MultiSceneDataset):
 
         return batch
 
-    def resolve_test_image_refs_deterministic(self, scene_id: int, segment_id: int) -> List[ImageRef]:
-        """
-        Expand segment test frames to per-camera image refs in a fixed order (sorted frames, then cams).
-        Matches the default test path in _assemble_segment_batch_from_image_refs when test_image_refs is None,
-        but without random subsampling so TrainSchedulerV4 can pin the same refs for every step in a block.
-
-        Note: ``data.pixel_source.max_test_images`` caps the number of **test frame indices** selected from
-        ``test_frame_indices``; total image refs are ``len(selected_frames) * num_cams`` (not ``max_test_images``).
-        """
+    def resolve_test_image_refs_deterministic_from_sidx(self, sidx: SegmentIndex) -> List[ImageRef]:
         pixel_source_cfg = getattr(self.data_cfg, "pixel_source", {})
         max_test_cap = int(pixel_source_cfg.get("max_test_images", 0))
-        cache_key = (int(scene_id), int(segment_id), max_test_cap)
-        with self._lock:
-            cached = self._test_image_refs_cache.get(cache_key)
-        if cached is not None:
-            return list(cached)
-
-        sidx = self.get_segment_index(scene_id, segment_id)
-        scene_data = self._ensure_scene_loaded(int(scene_id))
-        if scene_data is None:
-            raise ValueError(f"Scene {scene_id} cannot be loaded")
-        segment = scene_data["segments"][int(sidx.segment_id)]
-        segment_test_frames = sorted(int(f) for f in segment.get("test_frame_indices", []))
-        if len(segment_test_frames) == 0:
-            with self._lock:
-                if cache_key not in self._test_image_refs_cache:
-                    self._test_image_refs_cache[cache_key] = []
-            return []
-        if max_test_cap > 0 and len(segment_test_frames) > max_test_cap:
-            selected = segment_test_frames[:max_test_cap]
+        unique_frames = sorted(int(f) for f in sidx.test_frame_set)
+        if max_test_cap > 0 and len(unique_frames) > max_test_cap:
+            selected = unique_frames[:max_test_cap]
         else:
-            selected = list(segment_test_frames)
-        num_cams = int(scene_data["dataset"].num_cams)
+            selected = list(unique_frames)
         refs: List[ImageRef] = []
         for frame_idx in selected:
-            for cam_idx in range(num_cams):
-                ref: ImageRef = (int(frame_idx), int(cam_idx))
-                self.validate_image_ref(scene_id, segment_id, ref, purpose="test")
-                refs.append(ref)
+            for cam_idx in range(int(sidx.num_cams)):
+                refs.append((int(frame_idx), int(cam_idx)))
+        return refs
+
+    def resolve_test_image_refs_deterministic(self, scene_id: int, segment_id: int) -> List[ImageRef]:
+        """
+        Phase C2 policy: test refs are disabled on the main chain.
+        Keep deterministic helper for compatibility/tests but default to returning [].
+        """
+        sidx = self.get_segment_index(scene_id, segment_id)
+        _ = self.resolve_test_image_refs_deterministic_from_sidx(sidx)
+        cache_key = (int(scene_id), int(segment_id), 0)
         with self._lock:
             if cache_key not in self._test_image_refs_cache:
-                self._test_image_refs_cache[cache_key] = list(refs)
-        return refs
+                self._test_image_refs_cache[cache_key] = []
+        return []
 
     def get_segment_batch_from_image_refs(
         self,
@@ -1829,15 +2308,15 @@ class MultiSceneDatasetV3(MultiSceneDataset):
     ) -> Dict[str, Any]:
         if len(request.target_image_refs) == 0:
             raise ValueError("target_image_refs must not be empty")
-        if request.test_image_refs is not None and not request.include_test:
-            raise ValueError("test_image_refs is set but include_test=False")
+        include_test = bool(request.include_test and self._test_refs_enabled())
+        test_image_refs = request.test_image_refs if include_test else None
         return self._assemble_segment_batch_from_image_refs(
             request.scene_id,
             request.segment_id,
             [request.source_image_ref],
             request.target_image_refs,
-            include_test=request.include_test,
-            test_image_refs=request.test_image_refs,
+            include_test=include_test,
+            test_image_refs=test_image_refs,
             enforce_target0_equals_source=enforce_target0_equals_source,
         )
 

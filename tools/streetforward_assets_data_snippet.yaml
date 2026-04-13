@@ -1,0 +1,208 @@
+# =============================================================================
+# StreetForward：完整训练配置 + data.assets（默认同 configs/minimal_streetforward_stage4_4_multi_scene_v5.yaml）
+#
+# 用途：
+#   - 可直接作为 tools/build_streetforward_scene_assets.py / build_streetforward_segment_assets.py
+#     以及训练脚本的 --config_file（含顶层 dataset: / data:）。
+#   - 请按本机修改：data.data_root、data.assets.root、data.train_scene_ids 等路径与场景列表。
+#
+# 文档：docs/dataloader/StreetForward_Reproducible_Asset_System.md §12 / §13
+# =============================================================================
+
+output_name: minimal_sf_stage4_4_multi_scene_v5
+
+data:
+  data_root: "/root/autodl-tmp/nuScenes/"
+  dataset: "nuscenes"
+  start_timestep: 0
+  end_timestep: -1
+  preload_device: cpu
+  sky_mask_semantics: one_is_sky
+  train_scene_ids: [0, 1]
+  eval_scene_ids: []
+  preload:
+    enable: false
+  pixel_source:
+    type: datasets.nuscenes.nuscenes_sourceloader.NuScenesPixelSource
+    cameras: [0, 1, 2, 3, 4, 5]
+    downscale_when_loading: [3, 3, 3, 3, 3, 3]
+    downscale: 1
+    undistort: false
+    test_image_stride: 0
+    max_test_images: 0
+    load_sky_mask: true
+    load_dynamic_mask: true
+    load_depth_maps: true
+    load_objects: true
+    load_smpl: false
+    sampler:
+      buffer_downscale: 8
+      buffer_ratio: 0.5
+      start_enhance_weight: 3
+  lidar_source:
+    type: datasets.nuscenes.nuscenes_sourceloader.NuScenesLiDARSource
+    load_lidar: true
+    lidar_downsample_factor: 1
+    lidar_percentile: 0.02
+  # ---------------------------------------------------------------------------
+  # assets：StreetForward 离线资产（与 multi_scene_v5 合并；导出/训练共用同一路径约定）
+  # ---------------------------------------------------------------------------
+  assets:
+    enable: true # enable：是否启用资产子系统；为 true 时 root / use_prebuilt_assets / missing_policy 必填
+    root: "/root/autodl-tmp/streetforward_assets" # root：资产根目录；scene_pool、segment_pool、registries 将写在其下
+    use_prebuilt_assets: true # use_prebuilt_assets：训练时优先从已导出 segment 资产加载索引/位姿/点云等
+    missing_policy: error # missing_policy：资产缺失或校验失败时直接报错（不静默回退）
+    # 若 image_table 的 height/width 为训练分辨率而路径仍指向全分辨率文件，MultiSceneDatasetV3 会将 RGB/深度/掩码缩放到 meta 尺寸以对齐 intrinsic
+
+dataset:
+  num_source_keyframes: 1
+  num_target_keyframes: 3
+  segment_overlap_ratio: 0.2
+  min_keyframes_per_scene: 2
+  min_keyframes_per_segment: 2
+  preload_scene_count: 0
+  keyframe_split_config:
+    num_splits: 0
+    min_count: 1
+    min_length: 2.0
+  segment_aabb:
+    - [-20.0, -10.0, -20.0]
+    - [20.0, 4.8, 60.0]
+  pointcloud:
+    type: "hybrid"
+    lidar_sparsity: full
+    monocular_chosen_cam_ids: [0, 1, 2, 3, 4, 5]
+    monocular_sparsity: full
+    monocular_filter_sky: true
+    monocular_depth_consistency: false
+    monocular_downscale: 2
+    monocular_dynamic_recovery_bbox_expand_xyz_m: [0.5, 0.2, 0.5]
+    monocular_dynamic_recovery_max_points_per_instance: 40000
+    near_max_points: 600000
+    distant_max_points: 1200000
+    static_instance_motion:
+      enable: true
+      traj_length_thresh_m: 0.5
+
+multi_scene:
+  include_test: false
+
+scheduler_v3:
+  enable: false
+  model_node_state:
+    sync_with_scheduler: true
+
+scheduler_v5:
+  enable: true
+  time_base:
+    state_write_interval_steps: 4
+  source_block:
+    updates_per_block: 24
+  reset_episode:
+    keyframes_per_episode: 12
+    episodes_per_segment: 1
+  target_sampling:
+    include_source_frame: true
+    total_target_frames: 3
+    policy: neighbor_keyframes_random_frames
+    neighbor_ring: 2
+    prefer_nearby_keyframes: true
+    fallback_expand_to_segment: true
+    with_replacement: true
+  overlap:
+    mode: none
+  traversal:
+    fixed_scene_id: null
+    fixed_segment_id: null
+
+model:
+  scale_init_value: 0.1
+  sh_degree: 1
+  voxel_size: 0.2
+  sparseConv_outdim: 32
+  feat_2d_channels: 32
+  feat_2d_downscale: 1
+  use_fused_cuda_backproject_v2: true
+  use_fused_cuda_backproject_v3: true
+  use_fused_cuda_backproject_v4: true
+  fused_cuda_backproject_v4_force_fallback: false
+  param_embed_dim: 48
+  offset_gru_hidden_dim: 48
+  offset_gru_use_reset_gate: true
+  update_node_state_interval: 1
+  reset_node_state_interval: 10
+  sky:
+    resolution: 500
+    radius: 50.0
+    center: [0.0, 0.0, 0.0]
+    hemisphere: true
+    hemisphere_up: [0.0, -1.0, 0.0]
+  branches:
+    bg:
+      src_backproject_support_min: 1e-6
+      enable_selective_update: false
+      freeze_means: false
+      init: {scale_init: {mode: isotropic, isotropic_log_value: -2.30, knn_k: 3, knn_log_scale_bias: 0.0}, opacity_init: 0.1}
+      limits: {offset_max: 0.1, scale_max: 0.1, omega_max: 0.1, opacity_max: 0.1, sh_dc_max: 0.1, sh_rest_max: 0.05}
+      eta: {means: 1.0, scales: 1.0, opacity: 1.0, sh_dc: 1.0, sh_rest: 1.0}
+      mlp: {hidden_dim: 64, use_3d_feat: true, use_2d_feat: true, freeze_quat: false}
+    distant:
+      src_backproject_support_min: 1e-6
+      enable_selective_update: false
+      freeze_means: true
+      init: {scale_init: {mode: isotropic, isotropic_log_value: -1.90, knn_k: 3, knn_log_scale_bias: 0.0}, opacity_init: 0.05}
+      limits: {offset_max: 0.02, scale_max: 0.08, omega_max: 0.01, opacity_max: 0.05, sh_dc_max: 0.08, sh_rest_max: 0.015}
+      eta: {means: 0.2, scales: 0.7, opacity: 0.5, sh_dc: 0.8, sh_rest: 0.4}
+      mlp: {hidden_dim: 64, use_3d_feat: false, use_2d_feat: true, freeze_quat: true}
+    sky:
+      src_backproject_support_min: 1e-6
+      enable_selective_update: false
+      freeze_means: true
+      init: {scale_init: {mode: isotropic, isotropic_log_value: -0.50, knn_k: 3, knn_log_scale_bias: 0.0}, opacity_init: 0.05}
+      limits: {offset_max: 0.02, scale_max: 0.08, omega_max: 0.01, opacity_max: 0.05, sh_dc_max: 0.08, sh_rest_max: 0.015}
+      eta: {means: 0.2, scales: 0.7, opacity: 0.5, sh_dc: 0.8, sh_rest: 0.4}
+      mlp: {hidden_dim: 64, use_3d_feat: false, use_2d_feat: true, freeze_quat: true}
+    rigid:
+      src_backproject_support_min: 1e-6
+      freeze_means: false
+      init: {scale_init: {mode: isotropic, isotropic_log_value: -2.10, knn_k: 3, knn_log_scale_bias: 0.0}, opacity_init: 0.10}
+      limits: {offset_max: 0.05, scale_max: 0.08, omega_max: 0.05, opacity_max: 0.08, sh_dc_max: 0.08, sh_rest_max: 0.03}
+      eta: {means: 0.5, scales: 0.8, opacity: 0.8, sh_dc: 0.8, sh_rest: 0.5}
+      mlp: {hidden_dim: 64, use_3d_feat: false, use_2d_feat: true, freeze_quat: false}
+
+losses:
+  rgb: {w: 1.0}
+  ssim: {w: 0.05}
+  mask: {w: 0.02, opacity_loss_type: bce}
+  opacity_entropy: {w: 0.0}
+
+optimizer:
+  lr: 1.0e-4
+  eps: 1.0e-15
+  weight_decay: 0.0
+
+training:
+  max_iterations: 10000000
+  log_interval: 100
+  save_checkpoint_freq: 20000
+  seed: 42
+
+eval:
+  enable_psnr: true
+  save_train_views_psnr_below: 14
+  run_test_at_end: false
+
+logging:
+  image_interval_blocks: 6
+  low_psnr_train_images_subdir: train_low_psnr
+  enable_jsonl_metrics: true
+  use_tensorboard: true
+  diagnostics:
+    enable: false
+    interval: 500
+    window_size: 50
+    save_branch_renders: true
+  performance:
+    enable: true
+    phase_timing: true
+    cuda_memory: false

@@ -21,6 +21,11 @@ from omegaconf import OmegaConf
 from torch import Tensor
 
 from datasets.driving_dataset import DrivingDataset
+from datasets.streetforward_assets import (
+    AssetConfig,
+    StreetForwardAssetStore,
+    normalize_missing_policy,
+)
 from datasets.sky_mask_semantics import (
     normalize_sky_mask_to_one_is_sky,
     parse_sky_mask_semantics_from_data_cfg,
@@ -290,6 +295,44 @@ class MultiSceneDataset:
         # Segment-level pointcloud cache: {(scene_id, segment_id): pointcloud_dict}
         # Pointclouds are static for a segment and should not be rebuilt per step.
         self._segment_pointcloud_cache: Dict[Tuple[int, int], Dict] = {}
+
+        assets_cfg_raw = data_cfg.get("assets")
+        self.asset_config: Optional[AssetConfig] = None
+        self.asset_store: Optional[StreetForwardAssetStore] = None
+        self.use_prebuilt_assets = False
+        self.asset_missing_policy = "error"
+        if assets_cfg_raw is not None:
+            assets_enable = bool(assets_cfg_raw.get("enable"))
+            if assets_enable:
+                if assets_cfg_raw.get("root") is None:
+                    raise ValueError("data.assets.root is required when data.assets.enable=true.")
+                if assets_cfg_raw.get("use_prebuilt_assets") is None:
+                    raise ValueError(
+                        "data.assets.use_prebuilt_assets is required when data.assets.enable=true."
+                    )
+                if assets_cfg_raw.get("missing_policy") is None:
+                    raise ValueError(
+                        "data.assets.missing_policy is required when data.assets.enable=true."
+                    )
+                missing_policy = normalize_missing_policy(assets_cfg_raw.get("missing_policy"))
+                self.asset_config = AssetConfig(
+                    enable=True,
+                    root=str(assets_cfg_raw.get("root")),
+                    use_prebuilt_assets=bool(assets_cfg_raw.get("use_prebuilt_assets")),
+                    missing_policy=missing_policy,
+                )
+                self.asset_store = StreetForwardAssetStore(
+                    self.asset_config.root,
+                    missing_policy=self.asset_config.missing_policy,
+                )
+                self.use_prebuilt_assets = bool(self.asset_config.use_prebuilt_assets)
+                self.asset_missing_policy = str(self.asset_config.missing_policy)
+                if self.use_prebuilt_assets and self.asset_missing_policy == "error":
+                    logger.info(
+                        "StreetForward assets enabled in strict mode: root=%s, missing_policy=%s",
+                        self.asset_config.root,
+                        self.asset_missing_policy,
+                    )
         
         # Track if initialized
         self._initialized = False
