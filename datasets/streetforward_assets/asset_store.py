@@ -340,6 +340,7 @@ class StreetForwardAssetStore:
         self.tmp_dir = self.root / "tmp"
         self.registries_dir = self.root / "registries"
         self._scene_image_table_cache: Dict[Tuple[str, int, str], Dict[Tuple[int, int], Dict[str, Any]]] = {}
+        self._registry_cache: Dict[str, List[Dict[str, Any]]] = {}
 
     def _resolve_segment_dir(self, dataset: str, scene_id: int, segment_id: int) -> Optional[Path]:
         prefix = f"seg-{dataset}-{int(scene_id):06d}-{int(segment_id):06d}-"
@@ -360,9 +361,16 @@ class StreetForwardAssetStore:
         return matches[0]
 
     def has_segment_asset(self, dataset: str, scene_id: int, segment_id: int) -> bool:
+        if self._resolve_segment_asset_id_from_registry(dataset, scene_id, segment_id) is not None:
+            return True
         return self._resolve_segment_dir(dataset, scene_id, segment_id) is not None
 
     def get_scene_asset(self, dataset: str, scene_id: int) -> SceneAssetHandle:
+        scene_asset_id = self._resolve_scene_asset_id_from_scene_registry(dataset, scene_id)
+        if scene_asset_id is not None:
+            return self.get_scene_asset_by_asset_id(
+                scene_asset_id, dataset=str(dataset), scene_id=int(scene_id)
+            )
         p = self._resolve_scene_dir(dataset, scene_id)
         if p is None:
             raise ValueError(f"scene asset not found: dataset={dataset} scene={scene_id}")
@@ -376,12 +384,180 @@ class StreetForwardAssetStore:
         return handle
 
     def get_segment_asset(self, dataset: str, scene_id: int, segment_id: int) -> SegmentAssetHandle:
+        seg_asset_id = self._resolve_segment_asset_id_from_registry(dataset, scene_id, segment_id)
+        if seg_asset_id is not None:
+            return self._get_segment_handle_for_registry_asset_id(
+                dataset, scene_id, segment_id, seg_asset_id
+            )
         p = self._resolve_segment_dir(dataset, scene_id, segment_id)
         if p is None:
             raise ValueError(
                 f"segment asset not found: dataset={dataset} scene={scene_id} segment={segment_id}"
             )
         return SegmentAssetHandle(asset_dir=p)
+
+    def _load_registry_rows(self, registry_name: str) -> List[Dict[str, Any]]:
+        if registry_name in self._registry_cache:
+            return list(self._registry_cache[registry_name])
+        path = self.registries_dir / registry_name
+        if not path.exists():
+            self._registry_cache[registry_name] = []
+            return []
+        rows = read_parquet_table(path)
+        self._registry_cache[registry_name] = list(rows)
+        return rows
+
+    def get_scene_asset_by_asset_id(
+        self,
+        scene_asset_id: str,
+        *,
+        dataset: Optional[str] = None,
+        scene_id: Optional[int] = None,
+    ) -> SceneAssetHandle:
+        asset_dir = self.scene_pool_dir / str(scene_asset_id)
+        if not asset_dir.exists():
+            raise ValueError(f"scene asset_id not found in scene_pool: {scene_asset_id}")
+        handle = SceneAssetHandle(
+            asset_dir=asset_dir,
+            store=self,
+            dataset=str(dataset) if dataset is not None else "",
+            scene_id=int(scene_id) if scene_id is not None else -1,
+        )
+        manifest = handle.load_manifest()
+        if str(manifest["asset_id"]) != str(scene_asset_id):
+            raise ValueError(
+                f"scene asset_id mismatch: requested={scene_asset_id} got={manifest.get('asset_id')}"
+            )
+        if dataset is not None and str(manifest["dataset"]) != str(dataset):
+            raise ValueError(
+                f"scene asset dataset mismatch: expected={dataset} got={manifest['dataset']}"
+            )
+        if scene_id is not None and int(manifest["scene_id"]) != int(scene_id):
+            raise ValueError(
+                f"scene asset scene_id mismatch: expected={scene_id} got={manifest['scene_id']}"
+            )
+        return SceneAssetHandle(
+            asset_dir=asset_dir,
+            store=self,
+            dataset=str(manifest["dataset"]),
+            scene_id=int(manifest["scene_id"]),
+        )
+
+    def _resolve_scene_asset_id_from_scene_registry(self, dataset: str, scene_id: int) -> Optional[str]:
+        rows = self._load_registry_rows("scene_registry.parquet")
+        matches = [
+            r
+            for r in rows
+            if str(r.get("dataset")) == str(dataset) and int(r.get("scene_id")) == int(scene_id)
+        ]
+        if len(matches) == 0:
+            return None
+        matches = sorted(matches, key=lambda r: int(r.get("created_at_unix", 0)), reverse=True)
+        return str(matches[0]["scene_asset_id"])
+
+    def _get_segment_handle_for_registry_asset_id(
+        self,
+        dataset: str,
+        scene_id: int,
+        segment_id: int,
+        seg_asset_id: str,
+    ) -> SegmentAssetHandle:
+        asset_dir = self.segment_pool_dir / str(seg_asset_id)
+        if not asset_dir.exists():
+            raise ValueError(
+                f"segment registry points to missing asset directory: {seg_asset_id}"
+            )
+        handle = SegmentAssetHandle(asset_dir=asset_dir)
+        manifest = handle.load_manifest()
+        if str(manifest["dataset"]) != str(dataset):
+            raise ValueError(
+                f"segment asset dataset mismatch: expected={dataset} got={manifest['dataset']}"
+            )
+        if int(manifest["scene_id"]) != int(scene_id) or int(manifest["segment_id"]) != int(segment_id):
+            raise ValueError(
+                "segment asset scene/segment mismatch: "
+                f"expected=({scene_id},{segment_id}) got=({manifest['scene_id']},{manifest['segment_id']})"
+            )
+        return handle
+
+    def _resolve_segment_asset_id_from_registry(
+        self,
+        dataset: str,
+        scene_id: int,
+        segment_id: int,
+    ) -> Optional[str]:
+        rows = self._load_registry_rows("segment_registry.parquet")
+        matches = [
+            r
+            for r in rows
+            if str(r.get("dataset")) == str(dataset)
+            and int(r.get("scene_id")) == int(scene_id)
+            and int(r.get("segment_id")) == int(segment_id)
+        ]
+        if len(matches) == 0:
+            return None
+        matches = sorted(matches, key=lambda r: int(r.get("created_at_unix", 0)), reverse=True)
+        return str(matches[0]["segment_asset_id"])
+
+    def list_registered_scene_ids(self, dataset: str) -> List[int]:
+        rows = self._load_registry_rows("segment_registry.parquet")
+        out = sorted(
+            {
+                int(r.get("scene_id"))
+                for r in rows
+                if str(r.get("dataset")) == str(dataset)
+            }
+        )
+        return out
+
+    def list_registered_segment_ids(self, dataset: str, scene_id: int) -> List[int]:
+        rows = self._load_registry_rows("segment_registry.parquet")
+        out = sorted(
+            {
+                int(r.get("segment_id"))
+                for r in rows
+                if str(r.get("dataset")) == str(dataset)
+                and int(r.get("scene_id")) == int(scene_id)
+            }
+        )
+        return out
+
+    def get_segment_asset_registry_first(
+        self,
+        dataset: str,
+        scene_id: int,
+        segment_id: int,
+    ) -> SegmentAssetHandle:
+        seg_asset_id = self._resolve_segment_asset_id_from_registry(dataset, scene_id, segment_id)
+        if seg_asset_id is None:
+            raise ValueError(
+                "segment is not registered in segment_registry.parquet (registry-first resolution only): "
+                f"dataset={dataset} scene_id={scene_id} segment_id={segment_id}"
+            )
+        return self._get_segment_handle_for_registry_asset_id(
+            dataset, scene_id, segment_id, seg_asset_id
+        )
+
+    def resolve_segment_scene_assets_registry_first(
+        self,
+        dataset: str,
+        scene_id: int,
+        segment_id: int,
+    ) -> Dict[str, Any]:
+        segment_handle = self.get_segment_asset_registry_first(dataset, scene_id, segment_id)
+        segment_manifest = segment_handle.load_manifest()
+        parent_scene_asset_id = str(segment_manifest["parent_scene_asset_id"])
+        scene_handle = self.get_scene_asset_by_asset_id(
+            parent_scene_asset_id,
+            dataset=str(dataset),
+            scene_id=int(scene_id),
+        )
+        return {
+            "segment_handle": segment_handle,
+            "segment_manifest": segment_manifest,
+            "scene_handle": scene_handle,
+            "parent_scene_asset_id": parent_scene_asset_id,
+        }
 
     def verify_segment_asset(
         self,
@@ -481,6 +657,7 @@ class StreetForwardAssetStore:
                 "created_at_unix": now,
             },
         )
+        self._registry_cache.pop("scene_registry.parquet", None)
         return asset_id
 
     def export_segment_asset(
@@ -643,4 +820,5 @@ class StreetForwardAssetStore:
                 "created_at_unix": now,
             },
         )
+        self._registry_cache.pop("segment_registry.parquet", None)
         return asset_id

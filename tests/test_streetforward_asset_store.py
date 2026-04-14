@@ -180,3 +180,117 @@ def test_segment_asset_roundtrip(tmp_path):
     assert rows[0]["img_idx"] == 0
     with pytest.raises(ValueError, match="not found"):
         scene_handle.load_image_meta([(99, 0)])
+
+
+def test_registry_first_resolve_segment_and_parent_scene(tmp_path):
+    store = StreetForwardAssetStore(str(tmp_path), missing_policy="error")
+    scene_asset_id = store.export_scene_asset(
+        dataset="nuscenes",
+        scene_id=3,
+        scene_name="000003",
+        num_frames=2,
+        num_cams=1,
+        split_config={"test_image_stride": 0},
+        scene_index_arrays={
+            "scene_id": np.asarray([3], dtype=np.int32),
+            "train_frame_indices": np.asarray([0], dtype=np.int32),
+            "test_frame_indices": np.asarray([1], dtype=np.int32),
+            "keyframe_indices": np.asarray([0], dtype=np.int32),
+            "keyframe_to_frames_flat": np.asarray([0], dtype=np.int32),
+            "keyframe_to_frames_offsets": np.asarray([0, 1], dtype=np.int64),
+            "segment_ids": np.asarray([0], dtype=np.int32),
+            "segment_frame_indices_flat": np.asarray([0], dtype=np.int32),
+            "segment_frame_offsets": np.asarray([0, 1], dtype=np.int64),
+            "segment_keyframe_indices_flat": np.asarray([0], dtype=np.int32),
+            "segment_keyframe_offsets": np.asarray([0, 1], dtype=np.int64),
+        },
+        image_table_rows=[
+            {
+                "frame_idx": 0,
+                "cam_id": 0,
+                "img_idx": 0,
+                "is_train": True,
+                "is_test": False,
+                "image_path": "/tmp/im0.jpg",
+                "depth_path": "/tmp/d0.npy",
+                "sky_mask_path": "/tmp/s0.png",
+                "dynamic_mask_path": "/tmp/m0.png",
+                "height": 10,
+                "width": 20,
+                "intrinsic_4x4_flat": np.eye(4, dtype=np.float32).reshape(-1).tolist(),
+                "camera_to_world_flat": np.eye(4, dtype=np.float32).reshape(-1).tolist(),
+            }
+        ],
+    )
+    store.export_segment_asset(
+        dataset="nuscenes",
+        scene_id=3,
+        segment_id=0,
+        parent_scene_asset_id=scene_asset_id,
+        segment_index_payload={
+            "num_cams": 1,
+            "frame_indices": [0],
+            "test_frame_indices": [1],
+            "keyframe_indices": [0],
+            "keyframe_to_frames": {0: [0]},
+            "frame_to_keyframe": {0: 0},
+            "segment_first_frame_idx": 0,
+            "train_image_refs": np.asarray([[0, 0]], dtype=np.int32),
+            "test_image_refs": np.asarray([[1, 0]], dtype=np.int32),
+        },
+        segment_pose_payload={
+            "segment_first_pose_world": np.eye(4, dtype=np.float32),
+            "world_to_seg0": np.eye(4, dtype=np.float32),
+            "segment_first_frame_idx": 0,
+            "segment_pose_source": "camera",
+        },
+        pointcloud_payload={
+            "background": np.zeros((1, 6), dtype=np.float32),
+            "dynamic": {},
+            "instance_mapping": {},
+            "metadata": {},
+        },
+        dynamic_tracks_payload={
+            "frame_indices": np.asarray([0], dtype=np.int32),
+            "instance_intids": np.asarray([], dtype=np.int32),
+            "instances_quats": np.zeros((1, 0, 4), dtype=np.float32),
+            "instances_trans": np.zeros((1, 0, 3), dtype=np.float32),
+            "instances_fv": np.zeros((1, 0), dtype=np.uint8),
+            "static_instance_intids": np.asarray([], dtype=np.int32),
+        },
+        segment_aabb=np.asarray([[-1, -1, -1], [1, 1, 1]], dtype=np.float32),
+        pointcloud_config_normalized={"type": "hybrid"},
+        stats={"background_points": 1},
+    )
+    resolved = store.resolve_segment_scene_assets_registry_first("nuscenes", 3, 0)
+    assert str(resolved["segment_manifest"]["parent_scene_asset_id"]) == scene_asset_id
+    scene_manifest = resolved["scene_handle"].load_manifest()
+    assert scene_manifest["asset_id"] == scene_asset_id
+
+
+def test_get_scene_asset_by_asset_id_validates_scene_id(tmp_path):
+    store = StreetForwardAssetStore(str(tmp_path), missing_policy="error")
+    scene_asset_id = store.export_scene_asset(
+        dataset="nuscenes",
+        scene_id=7,
+        scene_name="000007",
+        num_frames=1,
+        num_cams=1,
+        split_config={"test_image_stride": 0},
+        scene_index_arrays={
+            "scene_id": np.asarray([7], dtype=np.int32),
+            "train_frame_indices": np.asarray([0], dtype=np.int32),
+            "test_frame_indices": np.asarray([], dtype=np.int32),
+            "keyframe_indices": np.asarray([0], dtype=np.int32),
+            "keyframe_to_frames_flat": np.asarray([0], dtype=np.int32),
+            "keyframe_to_frames_offsets": np.asarray([0, 1], dtype=np.int64),
+            "segment_ids": np.asarray([0], dtype=np.int32),
+            "segment_frame_indices_flat": np.asarray([0], dtype=np.int32),
+            "segment_frame_offsets": np.asarray([0, 1], dtype=np.int64),
+            "segment_keyframe_indices_flat": np.asarray([0], dtype=np.int32),
+            "segment_keyframe_offsets": np.asarray([0, 1], dtype=np.int64),
+        },
+        image_table_rows=[],
+    )
+    with pytest.raises(ValueError, match="scene_id mismatch"):
+        store.get_scene_asset_by_asset_id(scene_asset_id, dataset="nuscenes", scene_id=8)
