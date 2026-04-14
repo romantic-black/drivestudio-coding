@@ -98,6 +98,7 @@ class PreloadRuntimeConfigV2:
     warm_next_block_exact: bool
     warm_test_refs: bool
     warm_episode_source_superset: bool
+    warm_episode_chain_exact: bool
     enable_view_pack_cache: bool
     stats_log_interval_steps: int
 
@@ -166,6 +167,7 @@ def parse_preload_cfg_v2(raw: Optional[Dict[str, Any]]) -> Optional[PreloadRunti
         warm_next_block_exact=bool(raw["warm_next_block_exact"]),
         warm_test_refs=bool(raw["warm_test_refs"]),
         warm_episode_source_superset=bool(raw["warm_episode_source_superset"]),
+        warm_episode_chain_exact=bool(raw.get("warm_episode_chain_exact", raw["warm_episode_source_superset"])),
         enable_view_pack_cache=bool(raw["enable_view_pack_cache"]),
         stats_log_interval_steps=int(raw["stats_log_interval_steps"]),
     )
@@ -363,6 +365,12 @@ class AssetPreloadManagerV2:
             if self._cfg.warm_episode_source_superset:
                 for ref in refs:
                     self.submit_view_meta(PRIORITY_EPISODE_SUPERSET, scene_id, segment_id, ref, meta={})
+        elif hint_scope == "episode_chain_exact":
+            if self._cfg.warm_episode_chain_exact:
+                for ref in refs:
+                    self.submit_view_meta(PRIORITY_EPISODE_SUPERSET, scene_id, segment_id, ref, meta={})
+                    if self._cfg.enable_view_pack_cache:
+                        self.submit_view_pack(PRIORITY_EPISODE_SUPERSET, scene_id, segment_id, ref, meta={})
         if include_test and self._cfg.warm_test_refs:
             sidx = self._dataset.get_segment_index(scene_id, segment_id)
             for ref in self._dataset._resolve_test_image_refs(sidx):

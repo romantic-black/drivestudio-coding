@@ -27,6 +27,7 @@ from datasets.asset_preload_manager_v2 import (
 from datasets.sky_mask_semantics import normalize_sky_mask_to_one_is_sky
 from datasets.streetforward_assets import StreetForwardAssetStore
 from datasets.train_scheduler_v6 import TrainSchedulerV6
+from datasets.train_scheduler_v7 import TrainSchedulerV7
 
 ImageRef = Tuple[int, int]
 
@@ -61,6 +62,7 @@ class BatchRequestV4:
     segment_id: int
     source_image_ref: ImageRef
     target_image_refs: List[ImageRef]
+    source_image_refs: Optional[List[ImageRef]] = None
     include_test: bool = False
     test_image_refs: Optional[List[ImageRef]] = None
 
@@ -399,6 +401,10 @@ class MultiSceneDatasetV4:
             segment_pose = segment_handle.load_segment_pose()
             pointcloud = segment_handle.load_pointcloud()
             dynamic_tracks = segment_handle.load_dynamic_tracks()
+            pointcloud, dynamic_tracks = self._reconcile_dynamic_payloads(
+                pointcloud=pointcloud,
+                dynamic_tracks=dynamic_tracks,
+            )
             sidx = self._build_segment_index_from_asset_payload(segment_payload)
 
             asset_aabb = segment_manifest.get("segment_aabb")
@@ -440,6 +446,53 @@ class MultiSceneDatasetV4:
                 return self._segment_static_cache[key] if cached else bundle
         finally:
             self._finish_inflight(self._segment_bundle_inflight, self._segment_bundle_inflight_lock, key)
+
+    @staticmethod
+    def _reconcile_dynamic_payloads(
+        *,
+        pointcloud: Dict[str, Any],
+        dynamic_tracks: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        dynamic = pointcloud.get("dynamic")
+        if not isinstance(dynamic, dict) or len(dynamic) == 0:
+            return pointcloud, dynamic_tracks
+
+        instance_intids = np.asarray(dynamic_tracks["instance_intids"]).astype(np.int32, copy=False)
+        quats = np.asarray(dynamic_tracks["instances_quats"]).astype(np.float32, copy=False)
+        trans = np.asarray(dynamic_tracks["instances_trans"]).astype(np.float32, copy=False)
+        fv = np.asarray(dynamic_tracks["instances_fv"]).astype(np.uint8, copy=False)
+        if quats.shape[:2] != fv.shape or trans.shape[:2] != fv.shape:
+            raise ValueError("dynamic_tracks arrays shape mismatch")
+        if quats.shape[1] != len(instance_intids):
+            raise ValueError("dynamic_tracks instance axis mismatch")
+
+        visible_mask = (fv > 0).any(axis=0)
+        visible_intids = {int(instance_intids[i]) for i in np.where(visible_mask)[0].tolist()}
+        pointcloud_intids = {int(k) for k in dynamic.keys()}
+        keep_intids = sorted(pointcloud_intids & visible_intids)
+
+        reconciled_pointcloud = dict(pointcloud)
+        reconciled_tracks = dict(dynamic_tracks)
+        reconciled_pointcloud["dynamic"] = {int(i): dynamic[int(i)] for i in keep_intids}
+
+        if len(keep_intids) == 0:
+            frame_count = int(fv.shape[0])
+            reconciled_tracks["instance_intids"] = np.zeros((0,), dtype=np.int32)
+            reconciled_tracks["instances_quats"] = np.zeros((frame_count, 0, 4), dtype=np.float32)
+            reconciled_tracks["instances_trans"] = np.zeros((frame_count, 0, 3), dtype=np.float32)
+            reconciled_tracks["instances_fv"] = np.zeros((frame_count, 0), dtype=np.uint8)
+            return reconciled_pointcloud, reconciled_tracks
+
+        intid_to_col = {int(v): i for i, v in enumerate(instance_intids.tolist())}
+        cols = [intid_to_col[i] for i in keep_intids if i in intid_to_col]
+        if len(cols) != len(keep_intids):
+            raise ValueError("dynamic pointcloud instance ids are not covered by dynamic_tracks")
+
+        reconciled_tracks["instance_intids"] = np.asarray(keep_intids, dtype=np.int32)
+        reconciled_tracks["instances_quats"] = quats[:, cols, :]
+        reconciled_tracks["instances_trans"] = trans[:, cols, :]
+        reconciled_tracks["instances_fv"] = fv[:, cols]
+        return reconciled_pointcloud, reconciled_tracks
 
     def _build_segment_index_from_asset_payload(self, payload: Dict[str, Any]) -> SegmentIndexV4:
         train_frames = [int(x) for x in payload["frame_indices"]]
@@ -901,6 +954,23 @@ class MultiSceneDatasetV4:
             dynamic_info = self._build_dynamic_info_from_asset_tracks(
                 bundle.dynamic_tracks, frame_indices=sorted(int(x) for x in all_frames)
             )
+            # Keep pointcloud.dynamic aligned with the current batch frame window.
+            # Some segments contain dynamic instances that are only visible in other frames.
+            visible_intids_in_batch: set[int] = set()
+            if dynamic_info is not None:
+                for frame_obj in dynamic_info.values():
+                    instances = frame_obj.get("instances", {})
+                    for intid in instances.keys():
+                        visible_intids_in_batch.add(int(intid))
+            pointcloud = dict(pointcloud)
+            if len(visible_intids_in_batch) == 0:
+                pointcloud["dynamic"] = {}
+            else:
+                pointcloud["dynamic"] = {
+                    int(intid): dynamic_points[int(intid)]
+                    for intid in sorted(visible_intids_in_batch)
+                    if int(intid) in dynamic_points
+                }
 
         batch: Dict[str, Any] = {
             "scene_id": torch.tensor([int(scene_id)], dtype=torch.long),
@@ -941,10 +1011,15 @@ class MultiSceneDatasetV4:
         enforce_target0_equals_source: bool = True,
     ) -> Dict[str, Any]:
         include_test = bool(request.include_test)
+        source_refs = (
+            [tuple(x) for x in request.source_image_refs]
+            if request.source_image_refs is not None
+            else [tuple(request.source_image_ref)]
+        )
         return self._assemble_segment_batch_from_image_refs(
             request.scene_id,
             request.segment_id,
-            [request.source_image_ref],
+            source_refs,
             request.target_image_refs,
             include_test=include_test,
             test_image_refs=request.test_image_refs if include_test else None,
@@ -1062,6 +1137,46 @@ class MultiSceneDatasetV4:
             include_test=include_test,
             fixed_scene_id=fixed_scene_id,
             fixed_segment_id=fixed_segment_id,
+        )
+
+    def create_train_scheduler_v7(
+        self,
+        *,
+        steps_per_block: int,
+        blocks_per_episode: int,
+        total_target_frames: int,
+        include_source_frame: bool,
+        frame_within_keyframe_policy: str,
+        min_keyframes_required_policy: str,
+        traversal_mode: str,
+        switch_after_episode: bool,
+        segment_order: str,
+        scene_order: str,
+        include_test: bool,
+        fixed_scene_id: Optional[int],
+        fixed_segment_id: Optional[int],
+        emit_preload_hints: bool,
+        warm_next_block_exact: bool,
+        warm_next_episode_chain: bool,
+    ) -> TrainSchedulerV7:
+        return TrainSchedulerV7(
+            dataset=self,
+            steps_per_block=steps_per_block,
+            blocks_per_episode=blocks_per_episode,
+            total_target_frames=total_target_frames,
+            include_source_frame=include_source_frame,
+            frame_within_keyframe_policy=frame_within_keyframe_policy,
+            min_keyframes_required_policy=min_keyframes_required_policy,
+            traversal_mode=traversal_mode,
+            switch_after_episode=switch_after_episode,
+            segment_order=segment_order,
+            scene_order=scene_order,
+            include_test=include_test,
+            fixed_scene_id=fixed_scene_id,
+            fixed_segment_id=fixed_segment_id,
+            emit_preload_hints=emit_preload_hints,
+            warm_next_block_exact=warm_next_block_exact,
+            warm_next_episode_chain=warm_next_episode_chain,
         )
 
     # Preload worker hooks

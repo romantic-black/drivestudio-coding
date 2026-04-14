@@ -8,6 +8,7 @@ from datasets.multi_scene_dataset_v3 import (
 )
 from datasets.multi_scene_dataset_v4 import BatchRequestV4, MultiSceneDatasetV4, SegmentIndexV4
 from datasets.train_scheduler_v6 import TrainSchedulerV6
+from datasets.train_scheduler_v7 import TrainSchedulerV7
 
 __all__ = [
     "MultiSceneDataset",
@@ -19,6 +20,7 @@ __all__ = [
     "SegmentIndexV4",
     "TrainSchedulerV4",
     "TrainSchedulerV6",
+    "TrainSchedulerV7",
     "MultiSceneDatasetV4",
 ]
 

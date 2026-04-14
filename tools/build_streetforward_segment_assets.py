@@ -139,12 +139,32 @@ def _build_segment_asset(
     )
 
 
+def _try_get_existing_segment_asset_id(
+    store: StreetForwardAssetStore,
+    *,
+    dataset_name: str,
+    scene_id: int,
+    segment_id: int,
+) -> Optional[str]:
+    if not store.has_segment_asset(dataset_name, int(scene_id), int(segment_id)):
+        return None
+    try:
+        existing = store.get_segment_asset(dataset_name, int(scene_id), int(segment_id))
+        return str(existing.load_manifest()["asset_id"])
+    except ValueError as e:
+        msg = str(e)
+        if "segment registry points to missing asset directory" in msg:
+            print(
+                f"[segment-asset] scene_id={scene_id} segment_id={segment_id} "
+                f"registry points to missing directory; rebuilding"
+            )
+            return None
+        raise
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build StreetForward segment assets")
     parser.add_argument("--config_file", type=str, required=True)
-    parser.add_argument("--scene_id", type=int, default=None)
-    parser.add_argument("--segment_id", type=int, default=None)
-    parser.add_argument("--all_train_scenes", action="store_true")
     args = parser.parse_args()
 
     cfg = OmegaConf.load(args.config_file)
@@ -160,32 +180,33 @@ def main() -> None:
         raise ValueError("data.assets.root is required for export scripts.")
     store = StreetForwardAssetStore(str(assets_cfg.root), missing_policy="error")
 
-    if args.all_train_scenes:
-        scene_ids = [int(x) for x in cfg.data.train_scene_ids]
-    elif args.scene_id is not None:
-        scene_ids = [int(args.scene_id)]
-    else:
-        raise ValueError("Provide either --scene_id or --all_train_scenes")
-
+    scene_ids = cfg.data.train_scene_ids
     for scene_id in scene_ids:
         dataset_name = str(dataset.data_cfg.get("dataset"))
         try:
             scene_handle = store.get_scene_asset(dataset_name, int(scene_id))
             scene_asset_id = str(scene_handle.load_manifest()["asset_id"])
         except Exception:
-            scene_asset_id = _build_scene_asset(store, dataset, scene_id)
+            try:
+                scene_asset_id = _build_scene_asset(store, dataset, scene_id)
+            except ValueError as e:
+                if str(e) == f"Scene {int(scene_id)} cannot be loaded":
+                    print(f"[segment-asset] scene_id={scene_id} skipped=true reason=scene_not_loaded")
+                    continue
+                raise
         scene_data = dataset._ensure_scene_loaded(int(scene_id))
         if scene_data is None:
-            raise ValueError(f"Scene {scene_id} cannot be loaded")
-        segment_ids = (
-            [int(args.segment_id)]
-            if args.segment_id is not None and args.scene_id is not None
-            else list(range(len(scene_data.get("segments", []))))
-        )
+            print(f"[segment-asset] scene_id={scene_id} skipped=true reason=scene_not_loaded")
+            continue
+        segment_ids = list(range(len(scene_data.get("segments", []))))
         for seg_id in segment_ids:
-            if store.has_segment_asset(dataset_name, int(scene_id), int(seg_id)):
-                existing = store.get_segment_asset(dataset_name, int(scene_id), int(seg_id))
-                existing_id = str(existing.load_manifest()["asset_id"])
+            existing_id = _try_get_existing_segment_asset_id(
+                store,
+                dataset_name=dataset_name,
+                scene_id=int(scene_id),
+                segment_id=int(seg_id),
+            )
+            if existing_id is not None:
                 print(
                     f"[segment-asset] scene_id={scene_id} segment_id={seg_id} asset_id={existing_id} "
                     f"(existing=true parent_scene_asset_id={scene_asset_id})"

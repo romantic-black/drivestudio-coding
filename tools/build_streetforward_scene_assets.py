@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -172,11 +172,22 @@ def _build_scene_asset(store: StreetForwardAssetStore, dataset, scene_id: int) -
     )
 
 
+def _try_get_existing_scene_asset_id(
+    store: StreetForwardAssetStore,
+    *,
+    dataset_name: str,
+    scene_id: int,
+) -> Optional[str]:
+    try:
+        existing = store.get_scene_asset(dataset_name, int(scene_id))
+        return str(existing.load_manifest()["asset_id"])
+    except ValueError:
+        return None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build StreetForward scene assets")
     parser.add_argument("--config_file", type=str, required=True)
-    parser.add_argument("--scene_id", type=int, default=None)
-    parser.add_argument("--all_train_scenes", action="store_true")
     args = parser.parse_args()
 
     cfg = OmegaConf.load(args.config_file)
@@ -190,17 +201,26 @@ def main() -> None:
     assets_cfg = cfg.data.get("assets")
     if assets_cfg is None or assets_cfg.get("root") is None:
         raise ValueError("data.assets.root is required for export scripts.")
+    scene_ids = cfg.data.train_scene_ids
     store = StreetForwardAssetStore(str(assets_cfg.root), missing_policy="error")
 
-    if args.all_train_scenes:
-        scene_ids: List[int] = [int(x) for x in cfg.data.train_scene_ids]
-    elif args.scene_id is not None:
-        scene_ids = [int(args.scene_id)]
-    else:
-        raise ValueError("Provide either --scene_id or --all_train_scenes")
-
     for scene_id in scene_ids:
-        asset_id = _build_scene_asset(store, dataset, scene_id)
+        dataset_name = str(dataset.data_cfg.get("dataset"))
+        existing_id = _try_get_existing_scene_asset_id(
+            store,
+            dataset_name=dataset_name,
+            scene_id=int(scene_id),
+        )
+        if existing_id is not None:
+            print(f"[scene-asset] scene_id={scene_id} asset_id={existing_id} (existing=true)")
+            continue
+        try:
+            asset_id = _build_scene_asset(store, dataset, scene_id)
+        except ValueError as e:
+            if str(e) == f"Scene {int(scene_id)} cannot be loaded":
+                print(f"[scene-asset] scene_id={scene_id} skipped=true reason=scene_not_loaded")
+                continue
+            raise
         print(f"[scene-asset] scene_id={scene_id} asset_id={asset_id}")
 
 

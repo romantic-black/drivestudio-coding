@@ -1,15 +1,4 @@
-# =============================================================================
-# StreetForward：完整训练配置 + data.assets（默认同 configs/minimal_streetforward_stage4_4_multi_scene_v5.yaml）
-#
-# 用途：
-#   - 可直接作为 tools/build_streetforward_scene_assets.py / build_streetforward_segment_assets.py
-#     以及训练脚本的 --config_file（含顶层 dataset: / data:）。
-#   - 请按本机修改：data.data_root、data.assets.root、data.train_scene_ids 等路径与场景列表。
-#
-# 文档：docs/dataloader/StreetForward_Reproducible_Asset_System.md §12 / §13
-# =============================================================================
-
-output_name: minimal_sf_stage4_4_multi_scene_v5
+output_name: minimal_sf_stage4_4_multi_scene_v7
 
 data:
   data_root: "/root/autodl-tmp/nuScenes/"
@@ -18,17 +7,21 @@ data:
   end_timestep: -1
   preload_device: cpu
   sky_mask_semantics: one_is_sky
-  train_scene_ids: [000, 008, 016, 024, 032, 040, 099, 107, 115, 123, 131, 139, 147, 155, 163, 171, 179, 187, 195, 214, 
-    001, 009, 017, 025, 033, 041, 049, 100, 108, 116, 124, 132, 140, 148, 156, 164, 172, 180, 188, 196, 215, 
-    002, 010, 018, 026, 034, 042, 093, 101, 109, 117, 125, 133, 141, 149, 157, 165, 173, 181, 189, 197, 216,
-    003, 011, 019, 027, 035, 043, 094, 102, 110, 118, 126, 134, 142, 150, 158, 166, 174, 182, 190, 198, 217,
-    004, 012, 020, 036, 044, 095, 103, 111, 119, 127, 135, 143, 151, 159, 167, 175, 183, 191, 199, 218,
-    005, 013, 021, 029, 037, 045, 096, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 
-    006, 014, 022, 030, 038, 046, 097, 105, 113, 121, 129, 137, 145, 153, 161, 169, 177, 185, 193, 201,
-    007, 015, 023, 031, 039, 047, 098, 106, 114, 122, 130, 138, 146, 154, 162, 170, 178, 186, 194, 202]
+  train_scene_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8,  9, 10]
   eval_scene_ids: []
   preload:
-    enable: false
+    enable: true
+    num_workers: 1
+    max_pending_tasks: 64
+    dedupe_tasks: true
+    drop_stale_hints: true
+    warm_scene_meta: true
+    warm_segment_static: true
+    warm_next_block_exact: true
+    warm_test_refs: false
+    warm_episode_source_superset: true
+    enable_view_pack_cache: true
+    stats_log_interval_steps: 0
   pixel_source:
     type: datasets.nuscenes.nuscenes_sourceloader.NuScenesPixelSource
     cameras: [0, 1, 2, 3, 4, 5]
@@ -51,15 +44,12 @@ data:
     load_lidar: true
     lidar_downsample_factor: 1
     lidar_percentile: 0.02
-  # ---------------------------------------------------------------------------
-  # assets：StreetForward 离线资产（与 multi_scene_v5 合并；导出/训练共用同一路径约定）
-  # ---------------------------------------------------------------------------
   assets:
-    enable: true # enable：是否启用资产子系统；为 true 时 root / use_prebuilt_assets / missing_policy 必填
-    root: "/root/autodl-tmp/streetforward_assets" # root：资产根目录；scene_pool、segment_pool、registries 将写在其下
-    use_prebuilt_assets: true # use_prebuilt_assets：训练时优先从已导出 segment 资产加载索引/位姿/点云等
-    missing_policy: error # missing_policy：资产缺失或校验失败时直接报错（不静默回退）
-    # 若 image_table 的 height/width 为训练分辨率而路径仍指向全分辨率文件，MultiSceneDatasetV3 会将 RGB/深度/掩码缩放到 meta 尺寸以对齐 intrinsic
+    root: "/root/autodl-tmp/streetforward_assets"
+  scene_asset_cache_max_items: 64
+  segment_static_cache_max_items: 128
+  image_meta_cache_max_items: 8192
+  view_pack_cache_max_items: 4096
 
 dataset:
   num_source_keyframes: 1
@@ -67,7 +57,7 @@ dataset:
   segment_overlap_ratio: 0.2
   min_keyframes_per_scene: 2
   min_keyframes_per_segment: 2
-  preload_scene_count: 0
+  preload_scene_count: 2
   keyframe_split_config:
     num_splits: 0
     min_count: 1
@@ -99,28 +89,27 @@ scheduler_v3:
   model_node_state:
     sync_with_scheduler: true
 
-scheduler_v5:
+scheduler_v7:
   enable: true
-  time_base:
-    state_write_interval_steps: 4
-  source_block:
-    updates_per_block: 24
-  reset_episode:
-    keyframes_per_episode: 12
-    episodes_per_segment: 1
-  target_sampling:
-    include_source_frame: true
+  block:
+    steps_per_block: 6
+  episode:
+    blocks_per_episode: 3
     total_target_frames: 3
-    policy: neighbor_keyframes_random_frames
-    neighbor_ring: 2
-    prefer_nearby_keyframes: true
-    fallback_expand_to_segment: true
-    with_replacement: true
-  overlap:
-    mode: none
+    include_source_frame: true
+    frame_within_keyframe_policy: random_once_per_episode
+    min_keyframes_required_policy: skip_if_less_than_window
   traversal:
+    mode: round_robin_episode_interleave
+    switch_after_episode: true
     fixed_scene_id: null
     fixed_segment_id: null
+    segment_order: ascending
+    scene_order: shuffle_per_epoch
+  preload:
+    emit_hints: true
+    warm_next_block_exact: true
+    warm_next_episode_chain: true
 
 model:
   scale_init_value: 0.1
@@ -177,6 +166,7 @@ model:
       eta: {means: 0.5, scales: 0.8, opacity: 0.8, sh_dc: 0.8, sh_rest: 0.5}
       mlp: {hidden_dim: 64, use_3d_feat: false, use_2d_feat: true, freeze_quat: false}
 
+
 losses:
   rgb: {w: 1.0}
   ssim: {w: 0.05}
@@ -191,16 +181,16 @@ optimizer:
 training:
   max_iterations: 10000000
   log_interval: 100
-  save_checkpoint_freq: 20000
+  save_checkpoint_freq: 10000
   seed: 42
 
 eval:
   enable_psnr: true
-  save_train_views_psnr_below: 14
+  save_train_views_psnr_below: 12
   run_test_at_end: false
 
 logging:
-  image_interval_blocks: 6
+  image_interval_blocks: 96
   low_psnr_train_images_subdir: train_low_psnr
   enable_jsonl_metrics: true
   use_tensorboard: true
@@ -213,3 +203,4 @@ logging:
     enable: true
     phase_timing: true
     cuda_memory: false
+

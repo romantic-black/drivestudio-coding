@@ -10,7 +10,12 @@ from datasets.multi_scene_dataset_v4 import BatchRequestV4, MultiSceneDatasetV4
 from datasets.streetforward_assets import StreetForwardAssetStore
 
 
-def _prepare_demo_assets(tmp_path):
+def _prepare_demo_assets(
+    tmp_path,
+    *,
+    tracks_all_invisible: bool = False,
+    instances_fv_override: np.ndarray | None = None,
+):
     image0 = tmp_path / "im0.png"
     image1 = tmp_path / "im1.png"
     sky0 = tmp_path / "sky0.png"
@@ -98,6 +103,12 @@ def _prepare_demo_assets(tmp_path):
             },
         ],
     )
+    instances_fv = np.asarray([[1], [1]], dtype=np.uint8)
+    if tracks_all_invisible:
+        instances_fv = np.asarray([[0], [0]], dtype=np.uint8)
+    if instances_fv_override is not None:
+        instances_fv = np.asarray(instances_fv_override, dtype=np.uint8)
+
     store.export_segment_asset(
         dataset="nuscenes",
         scene_id=1,
@@ -131,7 +142,7 @@ def _prepare_demo_assets(tmp_path):
             "instance_intids": np.asarray([9], dtype=np.int32),
             "instances_quats": np.asarray([[[1, 0, 0, 0]], [[1, 0, 0, 0]]], dtype=np.float32),
             "instances_trans": np.asarray([[[0, 0, 0]], [[1, 0, 0]]], dtype=np.float32),
-            "instances_fv": np.asarray([[1], [1]], dtype=np.uint8),
+            "instances_fv": instances_fv,
             "static_instance_intids": np.asarray([], dtype=np.int32),
         },
         segment_aabb=np.asarray([[-1, -1, -1], [1, 1, 1]], dtype=np.float32),
@@ -191,6 +202,53 @@ def test_v4_batch_from_assets_strict_success(tmp_path):
     assert torch.allclose(batch["aabb"], torch.tensor([[-1, -1, -1], [1, 1, 1]], dtype=torch.float32))
     assert "pointcloud" in batch
     assert "dynamic_info" in batch
+
+
+def test_v4_reconcile_drops_invisible_dynamic_instances(tmp_path):
+    store = _prepare_demo_assets(tmp_path, tracks_all_invisible=True)
+    data_cfg, dataset_cfg = _build_cfg(tmp_path)
+    ds = MultiSceneDatasetV4(
+        dataset_cfg=dataset_cfg,
+        data_cfg=data_cfg,
+        device=torch.device("cpu"),
+        asset_store=store,
+    )
+    ds.initialize()
+    req = BatchRequestV4(
+        scene_id=1,
+        segment_id=0,
+        source_image_ref=(0, 0),
+        target_image_refs=[(0, 0), (1, 0)],
+        include_test=False,
+    )
+    batch = ds.get_segment_batch_from_image_refs(req, enforce_target0_equals_source=True)
+    assert "dynamic_info" not in batch
+    assert batch["pointcloud"]["dynamic"] == {}
+
+
+def test_v4_batch_window_drops_non_visible_dynamic_instances(tmp_path):
+    store = _prepare_demo_assets(
+        tmp_path,
+        instances_fv_override=np.asarray([[1], [0]], dtype=np.uint8),
+    )
+    data_cfg, dataset_cfg = _build_cfg(tmp_path)
+    ds = MultiSceneDatasetV4(
+        dataset_cfg=dataset_cfg,
+        data_cfg=data_cfg,
+        device=torch.device("cpu"),
+        asset_store=store,
+    )
+    ds.initialize()
+    req = BatchRequestV4(
+        scene_id=1,
+        segment_id=0,
+        source_image_ref=(1, 0),
+        target_image_refs=[(1, 0)],
+        include_test=False,
+    )
+    batch = ds.get_segment_batch_from_image_refs(req, enforce_target0_equals_source=True)
+    assert "dynamic_info" not in batch
+    assert batch["pointcloud"]["dynamic"] == {}
 
 
 def test_v4_enforce_target0_equals_source(tmp_path):
