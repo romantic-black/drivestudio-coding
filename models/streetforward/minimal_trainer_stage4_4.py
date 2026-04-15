@@ -142,6 +142,7 @@ class MinimalStreetForwardStage4_4(MinimalStreetForwardStage4_3):
             return_debug_stats=True,
         )
         merge_debug_stats_as_perf_floats(self._perf_acc, "2d_bp_scene_", bp_stats)
+        self._perf_acc["2d_bp_scene_call_count"] = float(self._perf_acc.get("2d_bp_scene_call_count", 0.0) + 1.0)
         return feat_2d_all, acc_w
 
     def _backproject_sky_features_gated_multi_camera(
@@ -173,6 +174,7 @@ class MinimalStreetForwardStage4_4(MinimalStreetForwardStage4_3):
             return_debug_stats=True,
         )
         merge_debug_stats_as_perf_floats(self._perf_acc, "2d_bp_sky_", bp_stats)
+        self._perf_acc["2d_bp_sky_call_count"] = float(self._perf_acc.get("2d_bp_sky_call_count", 0.0) + 1.0)
         return feat_2d_all, acc_w
 
     def _compute_2d_features_for_gaussians(

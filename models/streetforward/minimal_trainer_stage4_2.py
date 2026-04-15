@@ -285,6 +285,7 @@ class MinimalStreetForwardStage4_2(MinimalStreetForwardStage4_1):
 
         source_views = batch.get("source_views")
         source_images = batch.get("source_images")
+        source_images = self._apply_source_egocar_mask(source_images, batch.get("source_egocar_mask"))
         sample_img = source_images[0]
         height, width = spatial_hw_from_image_tensor(sample_img)
 

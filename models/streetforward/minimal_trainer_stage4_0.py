@@ -764,6 +764,44 @@ class MinimalStreetForwardStage4_0(MinimalStreetForwardStage3_3):
         self._perf_acc["2d_call_count"] = float(self._perf_acc.get("2d_call_count", 0.0) + 1.0)
         return feat_2d_all, None
 
+    def _apply_source_egocar_mask(
+        self,
+        source_images: List[torch.Tensor],
+        source_egocar_masks: Optional[List[torch.Tensor]],
+    ) -> List[torch.Tensor]:
+        """
+        Mask source images before 2D feature extraction/backprojection.
+
+        egocar_mask convention: 1=ignore (ego region), 0=valid.
+        """
+        if source_egocar_masks is None:
+            return source_images
+        if len(source_egocar_masks) != len(source_images):
+            raise ValueError(
+                "source_egocar_mask/source_images length mismatch: "
+                f"{len(source_egocar_masks)} vs {len(source_images)}."
+            )
+        masked_images: List[torch.Tensor] = []
+        for i, (img, ego_mask) in enumerate(zip(source_images, source_egocar_masks)):
+            if ego_mask is None:
+                masked_images.append(img)
+                continue
+            h, w = spatial_hw_from_image_tensor(img)
+            m = ego_mask.to(device=img.device, dtype=torch.float32)
+            if m.dim() == 3:
+                m = m.squeeze(-1)
+            if m.dim() != 2 or int(m.shape[0]) != h or int(m.shape[1]) != w:
+                raise ValueError(
+                    f"source_egocar_mask[{i}] must have shape [H,W]=({h},{w}), got {tuple(m.shape)}."
+                )
+            valid = (1.0 - m).clamp(0.0, 1.0)
+            if img.dim() == 3 and int(img.shape[0]) == 3:
+                valid = valid.unsqueeze(0)
+            else:
+                valid = valid.unsqueeze(-1)
+            masked_images.append(img * valid.to(dtype=img.dtype))
+        return masked_images
+
     def _render_params_from_offsets_rigid_local(
         self, node_state_rigid: NodeStateRigid, offsets: Dict[str, torch.Tensor]
     ) -> Dict[str, torch.Tensor]:

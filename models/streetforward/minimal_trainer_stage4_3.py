@@ -674,6 +674,7 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
 
         source_views = batch.get("source_views")
         source_images = batch.get("source_images")
+        source_images = self._apply_source_egocar_mask(source_images, batch.get("source_egocar_mask"))
         sample_img = source_images[0]
         height, width = spatial_hw_from_image_tensor(sample_img)
 
@@ -1813,15 +1814,22 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
         num_distant_update = int(out.get("_num_distant_update", 0))
         perf_metrics: Dict[str, float] = {}
         perf_calls = float(self._perf_acc.get("2d_call_count", 0.0))
+        scene_bp_calls = float(self._perf_acc.get("2d_bp_scene_call_count", 0.0))
+        sky_bp_calls = float(self._perf_acc.get("2d_bp_sky_call_count", 0.0))
         if perf_calls > 0.0:
             for k, v in self._perf_acc.items():
-                if k == "2d_call_count":
+                if k in {"2d_call_count", "2d_bp_scene_call_count", "2d_bp_sky_call_count"}:
                     continue
                 # Memory fields keep summed values for deltas; timing fields are averaged per call.
                 if "cuda_mem_" in k:
                     perf_metrics[f"perf_{k}"] = float(v)
                 else:
-                    perf_metrics[f"perf_{k}"] = float(v / perf_calls)
+                    denom = perf_calls
+                    if k.startswith("2d_bp_scene_") and scene_bp_calls > 0.0:
+                        denom = scene_bp_calls
+                    elif k.startswith("2d_bp_sky_") and sky_bp_calls > 0.0:
+                        denom = sky_bp_calls
+                    perf_metrics[f"perf_{k}"] = float(v / denom)
         perf_metrics["perf_2d_call_count"] = perf_calls
 
         return {
