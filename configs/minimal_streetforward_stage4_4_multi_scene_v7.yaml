@@ -1,4 +1,4 @@
-output_name: minimal_sf_stage4_4_multi_scene_v7
+output_name: experiment001
 
 data:
   data_root: "/root/autodl-tmp/nuScenes/"
@@ -117,7 +117,7 @@ validation_v7:
   eval_enable: true
   trigger:
     by: train_episode_interval
-    validate_every_n_episodes: 50
+    validate_every_n_episodes: 200
     run_at_train_start: true
   episode_selection:
     policy: middle
@@ -142,9 +142,10 @@ model:
   offset_gru_hidden_dim: 48
   offset_gru_use_reset_gate: true
   sky:
+    origin_mode: camera_centered_rotation_only
+    center_local: [0.0, 0.0, 0.0]
     resolution: 500
     radius: 30.0
-    center: [0.0, 0.0, 0.0]
     hemisphere: true
     hemisphere_up: [0.0, -1.0, 0.0]
   branches:
@@ -204,6 +205,9 @@ eval:
   run_test_at_end: false
 
 logging:
+  output_root: /root/autodl-tmp/outputs
+  project: minimal_sf_stage4_4_multi_scene_v7
+  log_dir: null
   image_interval_blocks: 96
   low_psnr_train_images_subdir: train_low_psnr
   enable_jsonl_metrics: true

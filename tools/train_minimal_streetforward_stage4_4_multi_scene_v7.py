@@ -1,5 +1,9 @@
 """
 Stage 4.4 multi-scene training entry for V4 dataset + V7 scheduler.
+
+Log location can be configured in YAML via:
+- logging.log_dir (absolute path, highest priority), or
+- logging.output_root + logging.project + output_name
 """
 
 from __future__ import annotations

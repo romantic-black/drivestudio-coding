@@ -227,8 +227,15 @@ class AlphaTWeightExtractor:
         cameras: List,
         height: int,
         width: int,
+        return_acc: bool = False,
+        viewmats_override: Optional[torch.Tensor] = None,
         return_debug_stats: bool = False,
-    ) -> Union[List[torch.Tensor], Tuple[List[torch.Tensor], Dict[str, float]]]:
+    ) -> Union[
+        List[torch.Tensor],
+        Tuple[List[torch.Tensor], List[torch.Tensor]],
+        Tuple[List[torch.Tensor], Dict[str, float]],
+        Tuple[List[torch.Tensor], List[torch.Tensor], Dict[str, float]],
+    ]:
         """
         First render pass: collect RGB only and release meta immediately.
         """
@@ -238,25 +245,37 @@ class AlphaTWeightExtractor:
         # Batched multi-view render when possible (one gsplat call, packed=False).
         t_start = time.perf_counter()
         rendered_rgbs: List[torch.Tensor] = []
+        rendered_accs: List[torch.Tensor] = []
         with torch.no_grad():
-            cam0 = cameras[0]
-            cam0_ctw = cam0.camtoworlds if hasattr(cam0, "camtoworlds") else cam0["camtoworlds"]
-            viewmat0 = _get_viewmat(cam0_ctw)
-            k_mat0 = self._resolve_intrinsics(cam0)
+            if viewmats_override is not None:
+                if viewmats_override.dim() == 2:
+                    viewmats_override = viewmats_override.unsqueeze(0)
+                if int(viewmats_override.shape[0]) != int(len(cameras)):
+                    raise ValueError(
+                        "viewmats_override first dim must match len(cameras), "
+                        f"got {viewmats_override.shape[0]} vs {len(cameras)}."
+                    )
+                viewmats_list = [viewmats_override]
+            else:
+                cam0 = cameras[0]
+                cam0_ctw = cam0.camtoworlds if hasattr(cam0, "camtoworlds") else cam0["camtoworlds"]
+                viewmat0 = _get_viewmat(cam0_ctw)
+                viewmats_list = [viewmat0]
+            k_mat0 = self._resolve_intrinsics(cameras[0])
 
-            viewmats_list = [viewmat0]
             Ks_list = [k_mat0]
             for cam in cameras[1:]:
-                cam_ctw = cam.camtoworlds if hasattr(cam, "camtoworlds") else cam["camtoworlds"]
-                viewmat = _get_viewmat(cam_ctw)
                 k_mat = self._resolve_intrinsics(cam)
-                viewmats_list.append(viewmat)
+                if viewmats_override is None:
+                    cam_ctw = cam.camtoworlds if hasattr(cam, "camtoworlds") else cam["camtoworlds"]
+                    viewmat = _get_viewmat(cam_ctw)
+                    viewmats_list.append(viewmat)
                 Ks_list.append(k_mat)
 
             viewmats = torch.cat(viewmats_list, dim=0)
             Ks = torch.cat(Ks_list, dim=0)
 
-            render_colors, _, _ = self.renderer(
+            render_colors, render_alphas, _ = self.renderer(
                 means=gaussians["means"],
                 quats=gaussians["quats"],
                 scales=gaussians["scales"],
@@ -284,6 +303,9 @@ class AlphaTWeightExtractor:
                 rgb = render_colors[c]
                 rgb = torch.clamp(rgb, 0.0, 1.0).detach()
                 rendered_rgbs.append(rgb)
+                if return_acc:
+                    acc = render_alphas[c]
+                    rendered_accs.append(acc.detach())
 
         if return_debug_stats:
             stats = {
@@ -291,7 +313,11 @@ class AlphaTWeightExtractor:
                 "num_views": int(len(cameras)),
                 "num_gaussians": int(gaussians["means"].shape[0]),
             }
+            if return_acc:
+                return rendered_rgbs, rendered_accs, stats
             return rendered_rgbs, stats
+        if return_acc:
+            return rendered_rgbs, rendered_accs
         return rendered_rgbs
 
     def extract_single_weight(

@@ -6,7 +6,8 @@
 
 <a id="stage-43-sky-gs"></a>
 
-**Stage 4.3（Sky GS，可选主线）**：`MinimalStreetForwardStage4_3`（`models/streetforward/minimal_trainer_stage4_3.py`）；配置 `configs/minimal_streetforward_stage4_3.yaml`；入口 `tools/train_minimal_streetforward_stage4_3.py` 与 `tools/train_minimal_streetforward_stage4_3_one_segment_v3.py`。天空几何与 [MultiSceneDataset 坐标系](../dataloader/MultiSceneDataset_Usage.md)一致（**y 向下为正**，球心锚在 **y_max 面中心**，半球朝 **-Y**）。相对 4.2：用半球 Fibonacci sky 高斯替代 cubemap；one-pass 在 `bg|distant|rigid@S` 后追加 sky；渲染为场景 pass（bg+distant+rigid）与 sky pass 合成，`pred + rgb_sky * (1 - acc_scene)`。
+**Stage 4.3 / 4.4（Sky GS）**：`MinimalStreetForwardStage4_3` 在 4.2 上增加 `NodeStateSky` 与两 pass **target** 渲染（场景 + sky 合成）。**整帧多相机 + fused V3 反投影的 v7 主线** 使用 **`MinimalStreetForwardStage4_4`**（`models/streetforward/minimal_trainer_stage4_4.py`），配置示例 `configs/minimal_streetforward_stage4_4_multi_scene_v7.yaml`，入口 `tools/train_minimal_streetforward_stage4_4_multi_scene_v7.py`。  
+**Sky 语义（当前实现，与旧版不兼容）**：`NodeStateSky.means` 为 **局部壳偏移**（`fibonacci_shell_means` 绕 `model.sky.center_local`）；**禁止** `model.sky.center` 与 AABB 锚定初始化；`model.sky.origin_mode` 必须为 `camera_centered_rotation_only`。sky **渲染** 使用 **rotation-only viewmat**（忽略相机平移）。**Source 2D** 为 **两次** fused backproject：`scene`（bg+distant+rigid@S）与 **gated** `sky`（kernel 内 `vis_eff = vis * (1 - acc_scene_src)`），CNN 输入为与合成公式一致的 `scene_rgb + sky_rgb * (1 - acc_scene)`；详见 [天空分支](#天空分支stage-31-与-stage-43--44) 与 [Stage4_4_Sky_Semantics_Fix_Implementation.md](Stage4_4_Sky_Semantics_Fix_Implementation.md)。
 
 ## 目录（Canonical 优先）
 
@@ -31,7 +32,7 @@
 6. [数据结构详解](#数据结构详解)
 7. [关键组件说明](#关键组件说明)
 8. [梯度反向传播机制](#梯度反向传播机制)
-9. [天空分支（Stage 3.1 与 Stage 4.3）](#天空分支stage-31-与-stage-43)
+9. [天空分支（Stage 3.1 与 Stage 4.3 / 4.4）](#天空分支stage-31-与-stage-43--44)
 10. [Minimal Stage 3.3（bg/distant 解耦）](#minimal-stage-3-3-bg-distant)
 
 ---
@@ -124,7 +125,8 @@ Stage 4.1 / 4.2 **不是** `mean((pred-gt)^2)` 作为主损失。
    `weight_threshold` 仅影响 **特征聚合**时是否过滤高斯–像素对（省显存）。**累积支持权重**（用于 `mask_src_feat_valid`）必须在 **未过滤** 的权重上统计；否则 support 会被近似超参污染。Stage 4.1/4.2 在 rigid 掩码与 4.2 one-pass 中显式使用 **`weight_threshold=0.0`** 的 `FeatureBackprojector`。
 
 2. **像素格点与 `grid_sample`（`align_corners=True`）**  
-   行主序 `pixel_id → (i,j)` 后，归一化坐标须为 **`g = 2*k/(S-1) - 1`**（`k` 为像素索引，`S` 为 H 或 W），**不是** `2*k/S - 1`。实现：`pixel_ids_to_grid_sample_coords_align_corners`。
+   行主序 `pixel_id → (i,j)` 后，归一化坐标须为 **`g = 2*k/(S-1) - 1`**（`k` 为像素索引，`S` 为 H 或 W），**不是** `2*k/S - 1`。实现：`pixel_ids_to_grid_sample_coords_align_corners`。  
+   **Stage 4.4** 在将 source 合成 RGB / `acc_scene` resize 到 CNN 输入分辨率时，同样使用 **`F.interpolate(..., align_corners=True)`**，避免与上述几何契约混用 `align_corners=False`。
 
 3. **Packed 渲染的 local → global 高斯 id**  
    `AlphaTWeightExtractor` 在 packed 路径用 `meta["gaussian_ids"]` 将 rasterizer 返回的 **local id** 映射回 **全局 id**（含 range/device/dtype 检查）。反投影聚合必须与全局索引一致，否则会表现为 support=0、索引错位等。
@@ -869,7 +871,7 @@ with torch.no_grad():
 - **仅 bg** 构建稀疏 3D 体积并插值：`_build_3d_features`。
 - **rigid**：**不参与** 3D volume；**2D-only**（`use_3d_feat=false`）。
 - **distant**：**2D-only** → `distant_feat_proj` → distant 头。
-- **2D**：bg+distant+rigid(`S`) **one-pass** 反投影（见正文）。
+- **2D**：bg+distant+rigid(`S`) **one-pass** 反投影（见正文）。**含 sky 的 Stage 4.3 / 4.4** 不在此小节展开：source 2D 为 **scene fused + sky gated** 两次反投影，见 [天空分支](#天空分支stage-31-与-stage-43--44)。
 
 ### 附录：主编排器路径（`feature_volume_mixin._build_3d_feature_volume`）
 
@@ -2256,13 +2258,13 @@ log_images: False                # 是否保存渲染图像（节省GPU内存）
 
 **`StreetForwardTrainer`** 另具 `train_iter`、`_build_3d_feature_volume` 命名、`RigidMasks` 预计算与 inner iteration 等差异，作对照时勿与 Stage 4.2 混为一谈。
 
-**Minimal Stage 3.3** 是 bg+distant 解耦的较早阶段；完整 Minimal 管线以 **Stage 4.2** 为终点，详见 [Minimal Stage 3.3（bg/distant 解耦）](#minimal-stage-3-3-bg-distant) 与 [标准实现：Minimal Stage 4.2](#标准实现minimal-stage-42)。
+**Minimal Stage 3.3** 是 bg+distant 解耦的较早阶段；无 sky 时以 **Stage 4.2** 为常用终点。含 **Sky GS** 的整帧多相机 fused 主线见 **Stage 4.4**（[引言](#stage-43-sky-gs)、[天空分支](#天空分支stage-31-与-stage-43--44)）。详见 [Minimal Stage 3.3（bg/distant 解耦）](#minimal-stage-3-3-bg-distant) 与 [标准实现：Minimal Stage 4.2](#标准实现minimal-stage-42)。
 
 ---
 
-<a id="天空分支stage-31-与-stage-43"></a>
+<a id="天空分支stage-31-与-stage-43--44"></a>
 
-## 天空分支（Stage 3.1 神经天空与 Stage 4.3 Sky GS）
+## 天空分支（Stage 3.1 神经天空与 Stage 4.3 / 4.4 Sky GS）
 
 合成 **始终是**「场景高斯先渲染，再在透射区域补天空」：
 
@@ -2316,54 +2318,69 @@ log_images: False                # 是否保存渲染图像（节省GPU内存）
 
 ---
 
-### Stage 4.3：Sky GS 节点（`NodeStateSky`，两 pass 渲染）
+### Stage 4.3 / 4.4：Sky GS 节点（`NodeStateSky`）
 
-**类**：`MinimalStreetForwardStage4_3`（`models/streetforward/minimal_trainer_stage4_3.py`），继承 `MinimalStreetForwardStage4_2`。天空几何与 [引言 Stage 4.3](#stage-43-sky-gs) 及 [MultiSceneDataset 坐标系](../dataloader/MultiSceneDataset_Usage.md) 一致（**y 向下为正**，shell 基准与 `segment_aabb` 对齐，`up` 使用 `sky_shell_init.SKY_UP_MULTISCENE`）。
+**类**：`MinimalStreetForwardStage4_3`（`models/streetforward/minimal_trainer_stage4_3.py`）继承 `MinimalStreetForwardStage4_2`；**`MinimalStreetForwardStage4_4`** 实现 source 侧 **复合渲染 + V3 多相机 fused 反投影**（`_render_source_composite_for_cnn`、`_backproject_scene_features_multi_camera`、`_backproject_sky_features_gated_multi_camera`）。`forward` 内统一调用 `_compute_2d_features_scene_and_sky_gated`；该方法依赖上述 **Stage 4.4** 钩子，因此 **实际训练/评估整帧多相机 fused 路径应使用 `MinimalStreetForwardStage4_4`**（旧版「全分支 one-pass」与 `model.sky.center` 已移除，配置不符即 fast-fail）。
+
+半球朝向与数据集 viewdirs 仍与 [MultiSceneDataset 坐标系](../dataloader/MultiSceneDataset_Usage.md) 对齐；**壳几何** 由 `model.sky.hemisphere` / `hemisphere_up` 与 `fibonacci_shell_means` 决定，**不再**用 `segment_aabb` 推导 sky 原点。
 
 #### 1. 配置（fast-fail）
 
-- **`model.sky`（几何，与 branches 并列）**：`resolution`（Fibonacci 点数）、`radius`、`center`（相对 `sky_base_from_aabb` 的偏移，长度 3）、`hemisphere`（是否仅半球）。
+- **`model.sky`（几何，与 branches 并列）**  
+  - **必填**：`origin_mode`（唯一合法值 `camera_centered_rotation_only`）、`center_local`（长度 3，局部壳中心）、`resolution`、`radius`、`hemisphere`、`hemisphere_up`。  
+  - **禁止**：`center`（旧 AABB 锚偏移字段）；出现即报错。  
 - **`model.branches.sky`**：`init` / `limits` / `eta` / `mlp` / `freeze_means` / `src_backproject_support_min` / `enable_selective_update`（与 bg/distant 同结构解析）。
-- **代码强制**：`mlp.use_3d_feat=false`，`mlp.use_2d_feat=true`，`freeze_means=true`，`mlp.freeze_quat=true`（固定 shell 上点的位置与朝向；偏移里位置项被置零，见下）。
+- **代码强制**：`mlp.use_3d_feat=false`，`mlp.use_2d_feat=true`，`freeze_means=true`，`mlp.freeze_quat=true`（shell 点位移与朝向冻结；偏移里位置项乘零，见下）。
 
 #### 2. 初始化：`NodeStateSky`
 
-- `_get_or_init_node_state_sky`：`sky_base_from_aabb(self.bbx_min, self.bbx_max) + sky_center_offset` 为球心锚点，`fibonacci_shell_means(..., hemisphere=..., up=SKY_UP_MULTISCENE)` 铺点；尺度按 `branches.sky.init`；`quats` identity；`sh` 由常数灰经 `_rgb_to_sh` 初始化。
+- `_get_or_init_node_state_sky`：`means = fibonacci_shell_means(..., sky_origin=self.sky_center_local, ...)`，存 **局部壳偏移**（非世界绝对坐标）；尺度按 `branches.sky.init`；`quats` identity；`sh` 由常数灰经 `_rgb_to_sh` 初始化。
 - 每 `(scene_id, segment_id)` 缓存在 `node_states_sky`；`h_cache_sky` 存 sky 分支 GRU 隐状态。
+- `sky_shell_init.sky_base_from_aabb` 等仍存在于工具文件，**主线不再调用**（仅 legacy/调试）。
 
-#### 3. One-pass 2D 反投影（含 sky）
+#### 3. Source 2D：scene pass + sky gated pass（两次 fused 反投影）
 
-- `_compute_2d_features_all_branches_once` 将 **`cat(bg, distant, rigid@S, sky)`** 拼成 `gaussians_all`，**一次** `_compute_2d_features_for_gaussians`，`FeatureBackprojector(..., weight_threshold=0.0)`，再按区间切出 `feat_2d_sky`、`acc_w_sky`。
-- **支持度**：`mask_src_feat_valid_sky = (acc_w_sky > sky_src_backproject_support_min)`；`mask_update_sky = mask_src_feat_valid_sky & mask_any_tgt_sky`。当前 `_build_any_target_mask_static` 在 selective 打开时仍 **全 1**（与 Stage 4.2 bg/distant 相同占位语义）；sky 若将来要 per-point target 可见性，注释中指向专用 `_build_sky_any_target_mask`。
+- 调度函数：`_compute_2d_features_scene_and_sky_gated`（`minimal_trainer_stage4_3.py`）。  
+- **Scene**：`gaussians_scene = bg | distant | rigid@S`，普通 viewmat，`AlphaTWeightExtractorV3.render_and_backproject_streaming_fused_multi_camera`（与 Stage 4.4 配置一致）。  
+- **Sky**：单独 `gaussians_sky`，**rotation-only** `viewmats_override`，`gate_image = 1 - acc_scene_src`（与渲染合成一致），`render_and_backproject_streaming_fused_multi_camera_gated`（gsplat kernel 内 `vis_eff = vis * gate`；**不对** `gate` 反传）。  
+- **CNN 输入**（`MinimalStreetForwardStage4_4._render_source_composite_for_cnn`）：先 `render_rgb_only(..., return_acc=True)` 得 `scene_rgb`、`acc_scene_src`；再 sky + `viewmats_override` 得 `sky_rgb`；`rendered = scene_rgb + sky_rgb * (1 - acc_scene_src)`；与 `image_batch` 拼接后过 `image_feature_extractor`。若渲染分辨率与 GT 不一致，`F.interpolate` 对 RGB 与 `acc` **统一** `align_corners=True`，与反投影像素–特征几何一致。  
+- **`src_backproject_pass_count = 2`**（口径：scene fused + sky gated 各一次）。  
+- **支持度**：`mask_src_feat_valid_sky = (acc_w_sky > sky_src_backproject_support_min)` 等；`_build_any_target_mask_static` 对 static 分支仍为占位全 1（与 Stage 4.2 bg/distant 相同语义）。
 
 #### 4. 特征 → offsets（无位置头）
 
-- `feat_2d_sky` → `sky_feat_proj` → 与 **共用** GRU 主干（`mlp_params_embed`、`gru_*`、`gru_to_head` 等与 bg 同源）→ `_predict_offsets_gru_sky_masked`。
-- `_predict_offsets_with_heads(..., mlp_offset_pos=None, omit_position_offset=True)`：仅用 **`mlp_conv_sky` / `mlp_opacity_sky` / `gaussion_decoder_sky`** 预测尺度/不透明度/SH；**不**预测位置偏移。
-- `mask_update_sky` 非空时：对 offsets 与 `h_new` 做 **full gate**（与 distant masked 同类：无支持点则 offsets 置零、`offset_quat`→identity、`h` 保持）。
+- `feat_2d_sky` → `sky_feat_proj` → **共用** GRU 主干 → `_predict_offsets_gru_sky_masked`。
+- `_predict_offsets_with_heads(..., mlp_offset_pos=None, omit_position_offset=True)`：仅用 **`mlp_conv_sky` / `mlp_opacity_sky` / `gaussion_decoder_sky`**；**不**预测位置偏移。
+- `mask_update_sky` 非空时：**full gate**（与 distant masked 同类）。
 
 #### 5. 渲染参数与冻结几何
 
-- `_render_params_from_offsets_sky`：`means_r = node_state_sky.means + offsets["offset_pos"] * 0.0`（位置不参与训练位移）；`quats_r` 仍走 `quat_multiply`，配合 `freeze_quat` 与零初值保持固定。
-- 因而 proxy 反传时 **`means_r` / `quats_r` 可无 `requires_grad`**；`minimal_trainer_stage4_0._backward_to_render_params_bg_rigid_distant_sky` 内 `_append_backward_pair` **仅当 `render_tensor.requires_grad` 为真** 才加入 sky 的 mean/quat 等对，避免对冻结张量做无效 backward 配对。
+- `_render_params_from_offsets_sky`：`means_r = node_state_sky.means + offsets["offset_pos"] * 0.0`；`quats_r` 配合 `freeze_quat` 固定。
+- **Target / eval sky pass**：在 `_render_sky_single_view` 路径上使用 **rotation-only viewmat**（`_sky_viewmat_from_view` / `_sky_viewmats_from_views`），使 sky 不随相机平移漂移。
+- Proxy 反传：`minimal_trainer_stage4_0._backward_to_render_params_bg_rigid_distant_sky` 中仅对 `requires_grad` 的张量建立梯度对。
 
-#### 6. 两 pass 合成（每 target）
+#### 6. 两 pass 合成（每 target，公式不变）
 
-1. **Pass A（场景）**：`_merge_params_bg_rigid_distant(proxies_bg, proxies_rigid, proxies_distant)` → `_render_single_view`（或 multi-view 路径）→ `pred_rgb`, `acc`（**仅**场景高斯）。
-2. **Pass B（sky）**：`_merge_params_sky_only(proxies_sky)` 或 eval 时 `_tensor_merge_sky_only(render_params_sky)`（`minimal_trainer_stage4_0`）→ 仅 sky 参数再 `_render_single_view` → `rgb_sky`。
-3. **`_composite_sky_gs(pred_rgb, acc, rgb_sky)`** → 最终 `pred_rgb`。
+1. **Pass A（场景）**：合并 bg + distant + rigid → `pred_scene`, `acc_scene`。  
+2. **Pass B（sky）**：仅 sky 参数，**rotation-only viewmat** → `rgb_sky`。  
+3. **`_composite_sky_gs(pred_scene, acc_scene, rgb_sky)`** → `pred_scene + rgb_sky * (1 - acc_scene)`。
 
-`src_backproject_pass_count` 在 4.3 仍为 **1**（2D 反投影只跑一趟；「两 pass」指 **渲染** 上场景与 sky 各一次 rasterize）。
+「两 pass」仍指 **target 渲染** 上场景与 sky 各一次 rasterize；**source 2D** 另计 **两次** fused backproject（见上）。
 
 #### 7. 损失与写回
 
-- **SSIM**：Stage 4.3 训练路径对 `compute_ssim_loss_masked` 传入 **`sky_mask=None`**（全图结构项）；**mask BCE** 等仍使用 target 的 `sky_mask`（见 `forward` 内循环）。
-- **写回**：`_update_node_state_sky` / `_update_node_state_sky_subset` **只**更新 `scales_log`、`opacity_logit`、`sh_dc`、`sh_rest`，**从不**写 `means` / `quats`。
+- **SSIM**：训练路径可对结构项传 **`sky_mask=None`**（全图）；**mask BCE** 等仍用 target 的 `sky_mask`（见 `forward`）。  
+- **写回**：`_update_node_state_sky` / `_update_node_state_sky_subset` **只**更新 `scales_log`、`opacity_logit`、`sh_dc`、`sh_rest`，**不写** `means` / `quats`。
 
-#### 8. 与 `minimal_trainer_stage4_0` 的衔接
+#### 8. 导出 / 导入
 
-- **`_merge_params_sky_only` / `_tensor_merge_sky_only`**：把 sky 的 proxy 或 render_params 打成单层 GS 的 `means_r`…`colors_r` 字典供 `_render_single_view` 使用。
-- **`_backward_to_render_params_bg_rigid_distant_sky`**：在 `_backward_to_render_params_bg_rigid_distant` 基础上追加 sky 的 proxy→render 梯度对；与冻结几何配合见上。
+- `export_3dgs_state` 写入 **`sky_metadata`**（`origin_mode`、`center_local`、`radius`、`resolution`、`hemisphere`、`hemisphere_up` 等）；导入时与 `model.sky` **严格一致**校验，否则 fast-fail。  
+- 详见 [Stage4_4_Sky_Semantics_Fix_Implementation.md](Stage4_4_Sky_Semantics_Fix_Implementation.md)。
+
+#### 9. 与 `minimal_trainer_stage4_0` 的衔接
+
+- **Target sky 渲染**：`_render_sky_single_view` 将 `sky_render_params` 直接送入 `renderer`，并传入 **rotation-only** `viewmats`（与 scene pass 的普通 viewmat 分离）。  
+- **Proxy 反传**：仍经 `_backward_to_render_params_bg_rigid_distant_sky`；`stage4_0` 中仍保留 `_merge_params_sky_only` 等工具函数，供需要「单层 GS 参数字典」的调用方使用（当前 sky pass 主路径以 `_render_sky_single_view` 为准）。
 
 ---
 

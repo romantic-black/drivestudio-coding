@@ -20,16 +20,13 @@ from models.streetforward.math_utils import _num_sh_bases, _normalize_quat, _qua
 from models.streetforward.metrics import compute_ssim_loss_masked
 from models.streetforward.minimal_trainer_stage3_2d import _create_proxy_params
 from models.streetforward.minimal_trainer_stage4_0 import (
-    _backward_to_render_params_bg_rigid_distant,
     _backward_to_render_params_bg_rigid_distant_sky,
     _merge_params_bg_rigid_distant,
-    _merge_params_sky_only,
-    _tensor_merge_sky_only,
     spatial_hw_from_image_tensor,
 )
 from models.streetforward.minimal_trainer_stage4_2 import MinimalStreetForwardStage4_2
 from models.streetforward.node_states import NodeStateBackground, NodeStateDistant, NodeStateRigid, NodeStateSky
-from models.streetforward.sky_shell_init import SKY_UP_MULTISCENE, fibonacci_shell_means, sky_base_from_aabb
+from models.streetforward.sky_shell_init import SKY_UP_MULTISCENE, fibonacci_shell_means
 
 logger = logging.getLogger(__name__)
 
@@ -79,12 +76,17 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
         )
 
         sky_geom = self._require_key(config.model, "sky", "model")
+        self.sky_origin_mode = str(self._require_key(sky_geom, "origin_mode", "model.sky"))
+        if self.sky_origin_mode != "camera_centered_rotation_only":
+            raise ValueError("model.sky.origin_mode must be 'camera_centered_rotation_only'.")
+        if "center" in sky_geom:
+            raise ValueError("model.sky.center is removed. Use model.sky.center_local instead.")
+        center_raw = self._require_key(sky_geom, "center_local", "model.sky")
+        if not hasattr(center_raw, "__len__") or len(center_raw) != 3:
+            raise ValueError("model.sky.center_local must be a length-3 list/tuple.")
+        self.sky_center_local = torch.tensor(list(center_raw), dtype=torch.float32, device=device)
         self.sky_resolution = int(self._require_key(sky_geom, "resolution", "model.sky"))
         self.sky_radius = float(self._require_key(sky_geom, "radius", "model.sky"))
-        center_raw = self._require_key(sky_geom, "center", "model.sky")
-        if not hasattr(center_raw, "__len__") or len(center_raw) != 3:
-            raise ValueError("model.sky.center must be a length-3 list/tuple.")
-        self.sky_center_offset = torch.tensor(list(center_raw), dtype=torch.float32, device=device)
 
         self.sky_hemisphere = bool(self._require_key(sky_geom, "hemisphere", "model.sky"))
         up_raw = sky_geom.get("hemisphere_up") if hasattr(sky_geom, "get") else None
@@ -141,8 +143,7 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
         key = self._batch_key(batch)
         if key in self.node_states_sky:
             return self.node_states_sky[key]
-        base = sky_base_from_aabb(self.bbx_min, self.bbx_max)
-        sky_origin = base.to(self.device) + self.sky_center_offset.to(self.device)
+        sky_origin = self.sky_center_local.to(self.device)
         means = fibonacci_shell_means(
             self.sky_resolution,
             self.sky_radius,
@@ -174,6 +175,16 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
         )
         self.node_states_sky[key] = ns
         return ns
+
+    def _sky_viewmat_from_view(self, view) -> torch.Tensor:
+        cam_ctw = view.camtoworlds if hasattr(view, "camtoworlds") else view["camtoworlds"]
+        viewmat = _get_viewmat(cam_ctw).clone()
+        viewmat[..., :3, 3] = 0.0
+        return viewmat
+
+    def _sky_viewmats_from_views(self, views: List[Any]) -> torch.Tensor:
+        mats = [self._sky_viewmat_from_view(v) for v in views]
+        return torch.cat(mats, dim=0)
 
     def _prepare_gaussians_sky(self, node_state_sky: NodeStateSky) -> Dict[str, torch.Tensor]:
         num_sh = _num_sh_bases(self.sh_degree)
@@ -219,6 +230,44 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
             "opacities_r": opacities_r,
             "colors_r": colors_r,
         }
+
+    def _render_sky_single_view(
+        self,
+        sky_render_params: Dict[str, torch.Tensor],
+        view,
+        height: int,
+        width: int,
+    ) -> torch.Tensor:
+        sky_viewmat = self._sky_viewmat_from_view(view)
+        if hasattr(view, "Ks"):
+            k_mat = view.Ks[0:1]
+        elif hasattr(view, "K"):
+            k_mat = view.K
+        else:
+            k_mat = torch.eye(3, device=self.device).unsqueeze(0)
+        if k_mat.dim() == 2:
+            k_mat = k_mat.unsqueeze(0)
+        render, _, _ = self.renderer(
+            means=sky_render_params["means_r"],
+            quats=sky_render_params["quats_r"],
+            scales=sky_render_params["scales_r"],
+            opacities=sky_render_params["opacities_r"],
+            colors=sky_render_params["colors_r"],
+            viewmats=sky_viewmat,
+            Ks=k_mat,
+            width=width,
+            height=height,
+            tile_size=16,
+            packed=False,
+            near_plane=0.01,
+            far_plane=1e10,
+            render_mode="RGB",
+            sh_degree=self.sh_degree,
+            sparse_grad=False,
+            absgrad=True,
+            rasterize_mode="classic",
+        )
+        return render[:, ..., :3].squeeze(0)
 
     def _predict_offsets_gru_sky_masked(
         self,
@@ -422,7 +471,7 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
             h_new = h_old * (1.0 - gate) + h_new * gate
         return offsets, h_new
 
-    def _compute_2d_features_all_branches_once(
+    def _compute_2d_features_scene_and_sky_gated(
         self,
         node_state_bg: NodeStateBackground,
         node_state_distant: Optional[NodeStateDistant],
@@ -436,16 +485,29 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
         width: int,
     ) -> Dict[str, Optional[torch.Tensor]]:
         """
-        One-pass source backprojection for [bg, distant, rigid_S, sky], then split by ranges.
+        Source 2D: scene fused backprojection + sky gated fused backprojection.
         """
+        if not hasattr(self, "_render_source_composite_for_cnn"):
+            raise ValueError(
+                "Stage4.4 sky-gated source 2D requires _render_source_composite_for_cnn implementation."
+            )
+        if not hasattr(self, "_backproject_scene_features_multi_camera"):
+            raise ValueError(
+                "Stage4.4 sky-gated source 2D requires _backproject_scene_features_multi_camera implementation."
+            )
+        if not hasattr(self, "_backproject_sky_features_gated_multi_camera"):
+            raise ValueError(
+                "Stage4.4 sky-gated source 2D requires _backproject_sky_features_gated_multi_camera implementation."
+            )
+
         gaussians_bg_distant, num_bg, num_distant = self._prepare_gaussians_bg_distant(node_state_bg, node_state_distant)
         num_rigid_S = int(rigid_idx_S.numel())
 
-        parts_means = [gaussians_bg_distant["means"]]
-        parts_scales = [gaussians_bg_distant["scales"]]
-        parts_quats = [gaussians_bg_distant["quats"]]
-        parts_opacities = [gaussians_bg_distant["opacities"]]
-        parts_colors = [gaussians_bg_distant["colors"]]
+        scene_means = [gaussians_bg_distant["means"]]
+        scene_scales = [gaussians_bg_distant["scales"]]
+        scene_quats = [gaussians_bg_distant["quats"]]
+        scene_opacities = [gaussians_bg_distant["opacities"]]
+        scene_colors = [gaussians_bg_distant["colors"]]
 
         if node_state_rigid is not None and num_rigid_S > 0:
             rigid_point_ids_subset = node_state_rigid.point_ids[rigid_idx_S, 0]
@@ -454,65 +516,80 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
             rigid_means_world = self._transform_rigid_to_world(
                 node_state_rigid, means_local_S, source_frame_idx, point_ids_subset=rigid_point_ids_subset
             )
-            parts_means.append(rigid_means_world)
-            parts_quats.append(
+            scene_means.append(rigid_means_world)
+            scene_quats.append(
                 self._transform_rigid_quats_to_world(
                     node_state_rigid, quats_local_S, source_frame_idx, point_ids_subset=rigid_point_ids_subset
                 )
             )
-            parts_scales.append(torch.exp(node_state_rigid.scales_log[rigid_idx_S]))
-            parts_opacities.append(torch.sigmoid(node_state_rigid.opacity_logit[rigid_idx_S]).squeeze(-1))
-            parts_colors.append(torch.cat([node_state_rigid.sh_dc[rigid_idx_S, None, :], node_state_rigid.sh_rest[rigid_idx_S]], dim=1))
+            scene_scales.append(torch.exp(node_state_rigid.scales_log[rigid_idx_S]))
+            scene_opacities.append(torch.sigmoid(node_state_rigid.opacity_logit[rigid_idx_S]).squeeze(-1))
+            scene_colors.append(torch.cat([node_state_rigid.sh_dc[rigid_idx_S, None, :], node_state_rigid.sh_rest[rigid_idx_S]], dim=1))
 
         g_sky = self._prepare_gaussians_sky(node_state_sky)
         num_sky = int(g_sky["means"].shape[0])
-        parts_means.append(g_sky["means"])
-        parts_scales.append(g_sky["scales"])
-        parts_quats.append(g_sky["quats"])
-        parts_opacities.append(g_sky["opacities"])
-        parts_colors.append(g_sky["colors"])
 
-        gaussians_all = {
-            "means": torch.cat(parts_means, dim=0),
-            "scales": torch.cat(parts_scales, dim=0),
-            "quats": torch.cat(parts_quats, dim=0),
-            "opacities": torch.cat(parts_opacities, dim=0),
-            "colors": torch.cat(parts_colors, dim=0),
+        gaussians_scene = {
+            "means": torch.cat(scene_means, dim=0),
+            "scales": torch.cat(scene_scales, dim=0),
+            "quats": torch.cat(scene_quats, dim=0),
+            "opacities": torch.cat(scene_opacities, dim=0),
+            "colors": torch.cat(scene_colors, dim=0),
         }
+        gaussians_sky = g_sky
 
         bp_unfiltered = FeatureBackprojector(
             eps=getattr(self.feature_backprojector, "eps", 1e-8),
             weight_threshold=0.0,
         )
-        pass_count = 1
-        feat_2d_all, acc_w_all = self._compute_2d_features_for_gaussians(
-            gaussians=gaussians_all,
+
+        scene_ctx = self._render_source_composite_for_cnn(
+            gaussians_scene=gaussians_scene,
+            gaussians_sky=gaussians_sky,
             source_views=source_views,
             source_images=source_images,
             height=height,
             width=width,
-            return_accumulated_weights=True,
+        )
+
+        feat_2d_scene, acc_w_scene = self._backproject_scene_features_multi_camera(
+            gaussians_scene=gaussians_scene,
+            source_views=source_views,
+            features_2d=scene_ctx["features_2d"],
+            height=height,
+            width=width,
             backprojector_override=bp_unfiltered,
         )
-        if feat_2d_all is None or acc_w_all is None:
-            raise ValueError("Stage4.3 one-pass backprojection returned None unexpectedly.")
+        if feat_2d_scene is None or acc_w_scene is None:
+            raise ValueError("Stage4.4 scene fused backprojection returned None unexpectedly.")
+
+        feat_2d_sky, acc_w_sky = self._backproject_sky_features_gated_multi_camera(
+            gaussians_sky=gaussians_sky,
+            source_views=source_views,
+            features_2d=scene_ctx["features_2d"],
+            gate_image=scene_ctx["gate_image"],
+            sky_viewmats=scene_ctx["sky_viewmats"],
+            height=height,
+            width=width,
+            backprojector_override=bp_unfiltered,
+        )
+        if feat_2d_sky is None or acc_w_sky is None:
+            raise ValueError("Stage4.4 sky gated fused backprojection returned None unexpectedly.")
+        self._perf_acc["2d_call_count"] = float(self._perf_acc.get("2d_call_count", 0.0) + 2.0)
 
         idx0 = 0
         idx1 = idx0 + num_bg
         idx2 = idx1 + num_distant
         idx3 = idx2 + num_rigid_S
-        idx4 = idx3 + num_sky
-        if idx4 != int(feat_2d_all.shape[0]):
-            raise ValueError("Stage4.3 split size mismatch for one-pass backprojection.")
+        if idx3 != int(feat_2d_scene.shape[0]):
+            raise ValueError("Stage4.4 scene split size mismatch for fused backprojection.")
 
-        feat_2d_bg = feat_2d_all[idx0:idx1]
-        acc_w_bg = acc_w_all[idx0:idx1]
-        feat_2d_distant = feat_2d_all[idx1:idx2] if num_distant > 0 else None
-        acc_w_distant = acc_w_all[idx1:idx2] if num_distant > 0 else None
-        feat_2d_rigid_S = feat_2d_all[idx2:idx3] if num_rigid_S > 0 else None
-        acc_w_rigid_S = acc_w_all[idx2:idx3] if num_rigid_S > 0 else None
-        feat_2d_sky = feat_2d_all[idx3:idx4]
-        acc_w_sky = acc_w_all[idx3:idx4]
+        feat_2d_bg = feat_2d_scene[idx0:idx1]
+        acc_w_bg = acc_w_scene[idx0:idx1]
+        feat_2d_distant = feat_2d_scene[idx1:idx2] if num_distant > 0 else None
+        acc_w_distant = acc_w_scene[idx1:idx2] if num_distant > 0 else None
+        feat_2d_rigid_S = feat_2d_scene[idx2:idx3] if num_rigid_S > 0 else None
+        acc_w_rigid_S = acc_w_scene[idx2:idx3] if num_rigid_S > 0 else None
 
         return {
             "num_bg": num_bg,
@@ -526,7 +603,7 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
             "acc_w_rigid_S": acc_w_rigid_S,
             "feat_2d_sky": feat_2d_sky,
             "acc_w_sky": acc_w_sky,
-            "src_backproject_pass_count": pass_count,
+            "src_backproject_pass_count": 2,
         }
 
     def _build_any_target_mask_static(
@@ -621,7 +698,7 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
             mask_any_tgt_rigid = mask_any_tgt_rigid | m
 
         S = torch.nonzero(mask_src_rigid, as_tuple=False).squeeze(1)
-        one_pass = self._compute_2d_features_all_branches_once(
+        one_pass = self._compute_2d_features_scene_and_sky_gated(
             node_state_bg=node_state_bg,
             node_state_distant=node_state_distant,
             node_state_rigid=node_state_rigid,
@@ -858,8 +935,7 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
                 hh, ww = int(gt.shape[0]), int(gt.shape[1])
                 view = targets[i]["view"]
                 if render_params_sky is not None:
-                    merged_sky = _tensor_merge_sky_only(render_params_sky)
-                    rgb_sky, _ = self._render_single_view(merged_sky, view, hh, ww)
+                    rgb_sky = self._render_sky_single_view(render_params_sky, view, hh, ww)
                     pred_rgbs.append(_composite_sky_gs(pr, acc, rgb_sky))
                 else:
                     pred_rgbs.append(pr)
@@ -912,8 +988,14 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
             hh, ww = int(gt.shape[0]), int(gt.shape[1])
             view = targets[i]["view"]
             if proxies_sky is not None:
-                merged_sky = _merge_params_sky_only(proxies_sky)
-                rgb_sky, _ = self._render_single_view(merged_sky, view, hh, ww)
+                sky_render_params = {
+                    "means_r": proxies_sky["means_p"],
+                    "scales_r": proxies_sky["scales_p"],
+                    "quats_r": proxies_sky["quats_p"],
+                    "opacities_r": proxies_sky["opacities_p"],
+                    "colors_r": proxies_sky["colors_p"],
+                }
+                rgb_sky = self._render_sky_single_view(sky_render_params, view, hh, ww)
                 pred_rgbs_t.append(_composite_sky_gs(pr, acc, rgb_sky))
             else:
                 pred_rgbs_t.append(pr)
@@ -1163,6 +1245,14 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
             "cache_key": {"scene_id": int(key[0]), "segment_id": int(key[1])},
             "coordinate_frame": "world/seg0",
             "rigid_export_frame_idx": int(rigid_ref_frame),
+            "sky_metadata": {
+                "sky_origin_mode": self.sky_origin_mode,
+                "sky_center_local": self._as_cpu_tensor(self.sky_center_local),
+                "sky_radius": float(self.sky_radius),
+                "sky_resolution": int(self.sky_resolution),
+                "sky_hemisphere": bool(self.sky_hemisphere),
+                "sky_hemisphere_up": list(self.sky_hemisphere_up),
+            },
             "branches": {
                 "bg": _pack_branch(node_bg),
                 "distant": _pack_branch(node_distant),
@@ -1262,6 +1352,28 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
         branches = state.get("branches")
         if not isinstance(branches, dict):
             raise ValueError("state.branches is required")
+        sky_metadata = state.get("sky_metadata")
+        if not isinstance(sky_metadata, dict):
+            raise ValueError("state.sky_metadata is required")
+        sky_origin_mode = sky_metadata.get("sky_origin_mode")
+        if sky_origin_mode != "camera_centered_rotation_only":
+            raise ValueError(
+                "state.sky_metadata.sky_origin_mode must be 'camera_centered_rotation_only'."
+            )
+        if sky_origin_mode != self.sky_origin_mode:
+            raise ValueError("Imported sky_origin_mode does not match model.sky.origin_mode.")
+        center_local = sky_metadata.get("sky_center_local")
+        if center_local is None:
+            raise ValueError("state.sky_metadata.sky_center_local is required")
+        center_local_t = torch.as_tensor(center_local, dtype=torch.float32, device=self.device).reshape(-1)
+        if center_local_t.numel() != 3:
+            raise ValueError("state.sky_metadata.sky_center_local must have 3 elements")
+        if not torch.allclose(center_local_t, self.sky_center_local.to(self.device), atol=1e-6, rtol=0.0):
+            raise ValueError("Imported sky_center_local does not match current model.sky.center_local.")
+        if int(sky_metadata.get("sky_resolution", -1)) != int(self.sky_resolution):
+            raise ValueError("Imported sky_resolution does not match current model.sky.resolution.")
+        if abs(float(sky_metadata.get("sky_radius", -1.0)) - float(self.sky_radius)) > 1e-6:
+            raise ValueError("Imported sky_radius does not match current model.sky.radius.")
         if batch_context is not None:
             self.ensure_runtime_state_from_batch(batch_context)
 

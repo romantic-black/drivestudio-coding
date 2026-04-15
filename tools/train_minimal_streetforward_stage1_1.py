@@ -474,11 +474,20 @@ def setup(args: argparse.Namespace):
         cfg.logging.use_tensorboard = False
 
     run_name = cfg.get("output_name", getattr(args, "run_name", "overfit"))
-    log_dir = os.path.join(
-        getattr(args, "output_root", "outputs"),
-        getattr(args, "project", "minimal_sf"),
-        run_name,
-    )
+    logging_cfg = cfg.logging if cfg.get("logging") is not None else {}
+    log_dir_override = logging_cfg.get("log_dir")
+    if log_dir_override is not None:
+        log_dir_override = str(log_dir_override).strip()
+    if log_dir_override:
+        log_dir = os.path.abspath(log_dir_override)
+    else:
+        output_root = str(logging_cfg.get("output_root", getattr(args, "output_root", "outputs"))).strip()
+        project = str(logging_cfg.get("project", getattr(args, "project", "minimal_sf"))).strip()
+        if not output_root:
+            raise ValueError("logging.output_root must be non-empty when logging.log_dir is not set")
+        if not project:
+            raise ValueError("logging.project must be non-empty when logging.log_dir is not set")
+        log_dir = os.path.join(output_root, project, run_name)
     cfg.log_dir = log_dir
     os.makedirs(log_dir, exist_ok=True)
     for sub in ("images", "checkpoints", "tb"):

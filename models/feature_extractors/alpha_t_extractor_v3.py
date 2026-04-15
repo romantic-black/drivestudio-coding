@@ -9,7 +9,7 @@ v3 keeps v2 fused numerical semantics:
 from __future__ import annotations
 
 import time
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -18,11 +18,15 @@ from models.feature_extractors.alpha_t_extractor_v2 import AlphaTWeightExtractor
 try:
     from gsplat.cuda._wrapper import (
         backproject_feature_grad_multi_camera_sharded_in_range,
+        backproject_feature_grad_multi_camera_gated_sharded_in_range,
         rasterize_and_backproject_multi_camera_in_range,
+        rasterize_and_backproject_multi_camera_gated_in_range,
     )
 except Exception:  # pragma: no cover
     backproject_feature_grad_multi_camera_sharded_in_range = None
+    backproject_feature_grad_multi_camera_gated_sharded_in_range = None
     rasterize_and_backproject_multi_camera_in_range = None
+    rasterize_and_backproject_multi_camera_gated_in_range = None
 
 
 class _RasterizeAndBackprojectFeatOnlyMultiCamFn(torch.autograd.Function):
@@ -112,6 +116,99 @@ class _RasterizeAndBackprojectFeatOnlyMultiCamFn(torch.autograd.Function):
         )
 
 
+class _RasterizeAndBackprojectFeatOnlyMultiCamGatedFn(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        means2d: torch.Tensor,
+        conics: torch.Tensor,
+        opacities: torch.Tensor,
+        isect_offsets: torch.Tensor,
+        flatten_ids: torch.Tensor,
+        packed_global_gaussian_ids: torch.Tensor,
+        feat2d: torch.Tensor,
+        gate_image: torch.Tensor,
+        image_width: int,
+        image_height: int,
+        tile_size: int,
+        num_gaussians: int,
+        weight_threshold: float,
+        return_support: bool,
+    ):
+        feat2d_c = feat2d.contiguous()
+        gate_c = gate_image.contiguous()
+        out = rasterize_and_backproject_multi_camera_gated_in_range(
+            range_start=0,
+            range_end=int(1e9),
+            means2d=means2d,
+            conics=conics,
+            opacities=opacities,
+            image_width=image_width,
+            image_height=image_height,
+            tile_size=tile_size,
+            isect_offsets=isect_offsets,
+            flatten_ids=flatten_ids,
+            packed_global_gaussian_ids=packed_global_gaussian_ids,
+            feat2d=feat2d_c,
+            gate_image=gate_c,
+            num_gaussians=num_gaussians,
+            weight_threshold=weight_threshold,
+            return_support=return_support,
+        )
+        feat_sum, w_feat, w_sup, pairs_total, pairs_kept = out
+        ctx.save_for_backward(
+            means2d,
+            conics,
+            opacities,
+            isect_offsets,
+            flatten_ids,
+            packed_global_gaussian_ids,
+            gate_c,
+        )
+        ctx.image_width = int(image_width)
+        ctx.image_height = int(image_height)
+        ctx.tile_size = int(tile_size)
+        ctx.weight_threshold = float(weight_threshold)
+        ctx.feat_h = int(feat2d_c.shape[1])
+        ctx.feat_w = int(feat2d_c.shape[2])
+        ctx.channels = int(feat2d_c.shape[3])
+        ctx.mark_non_differentiable(w_feat, w_sup, pairs_total, pairs_kept)
+        return feat_sum, w_feat, w_sup, pairs_total, pairs_kept
+
+    @staticmethod
+    def backward(ctx, grad_feat_sum, grad_w_feat, grad_w_sup, grad_pairs_total, grad_pairs_kept):
+        del grad_w_feat, grad_w_sup, grad_pairs_total, grad_pairs_kept
+        if grad_feat_sum is None:
+            grad_feat2d = None
+        else:
+            means2d, conics, opacities, isect_offsets, flatten_ids, packed_global, gate_image = ctx.saved_tensors
+            grad_feat2d = backproject_feature_grad_multi_camera_gated_sharded_in_range(
+                range_start=0,
+                range_end=int(1e9),
+                means2d=means2d,
+                conics=conics,
+                opacities=opacities,
+                image_width=ctx.image_width,
+                image_height=ctx.image_height,
+                tile_size=ctx.tile_size,
+                isect_offsets=isect_offsets,
+                flatten_ids=flatten_ids,
+                packed_global_gaussian_ids=packed_global,
+                gate_image=gate_image,
+                grad_feat_sum=grad_feat_sum.contiguous(),
+                feat_h=ctx.feat_h,
+                feat_w=ctx.feat_w,
+                channels=ctx.channels,
+                weight_threshold=ctx.weight_threshold,
+            )
+        return (
+            None, None, None, None, None, None,
+            grad_feat2d,
+            None,
+            None, None, None, None, None, None,
+        )
+
+
 class AlphaTWeightExtractorV3(AlphaTWeightExtractorV2):
     """Extractor v3 with explicit multi-src contract on top of v2 fused path."""
 
@@ -169,27 +266,25 @@ class AlphaTWeightExtractorV3(AlphaTWeightExtractorV2):
                     break
         return isect_offsets
 
-    def _build_multi_camera_meta_from_views(
+    def _build_multi_camera_meta_from_viewmats(
         self,
         gaussians: Dict[str, torch.Tensor],
-        cameras: List,
+        viewmats: torch.Tensor,
+        Ks: torch.Tensor,
         height: int,
         width: int,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, float]]:
         t_start = time.perf_counter()
-        if len(cameras) < 1:
+        if viewmats.dim() == 2:
+            viewmats = viewmats.unsqueeze(0)
+        if Ks.dim() == 2:
+            Ks = Ks.unsqueeze(0)
+        if int(viewmats.shape[0]) < 1:
             raise ValueError("Multi-camera meta builder requires at least one camera.")
-
-        viewmats_list = []
-        ks_list = []
-        for cam in cameras:
-            cam_ctw = cam.camtoworlds if hasattr(cam, "camtoworlds") else cam["camtoworlds"]
-            viewmat = _get_viewmat(cam_ctw)
-            k_mat = self._resolve_intrinsics(cam)
-            viewmats_list.append(viewmat)
-            ks_list.append(k_mat)
-        viewmats = torch.cat(viewmats_list, dim=0)
-        ks = torch.cat(ks_list, dim=0)
+        if int(Ks.shape[0]) != int(viewmats.shape[0]):
+            raise ValueError(
+                f"Ks/viewmats first dim mismatch: {Ks.shape[0]} vs {viewmats.shape[0]}."
+            )
 
         t_render = time.perf_counter()
         with torch.no_grad():
@@ -200,7 +295,7 @@ class AlphaTWeightExtractorV3(AlphaTWeightExtractorV2):
                 opacities=gaussians["opacities"],
                 colors=gaussians["colors"],
                 viewmats=viewmats,
-                Ks=ks,
+                Ks=Ks,
                 width=width,
                 height=height,
                 tile_size=self.tile_size,
@@ -232,9 +327,9 @@ class AlphaTWeightExtractorV3(AlphaTWeightExtractorV2):
             tile_offsets = tile_offsets.squeeze(0)
         if tile_offsets.dim() != 3:
             raise ValueError(f"isect_offsets must be rank-3 [V, tile_h, tile_w], got {tile_offsets.shape}")
-        if int(tile_offsets.shape[0]) != int(len(cameras)):
+        if int(tile_offsets.shape[0]) != int(viewmats.shape[0]):
             raise ValueError(
-                f"isect_offsets first dim ({tile_offsets.shape[0]}) must equal num cameras ({len(cameras)})."
+                f"isect_offsets first dim ({tile_offsets.shape[0]}) must equal num cameras ({viewmats.shape[0]})."
             )
         if tile_offsets.dtype != torch.int32:
             tile_offsets = tile_offsets.to(torch.int32)
@@ -258,6 +353,40 @@ class AlphaTWeightExtractorV3(AlphaTWeightExtractorV2):
         }
         return meta_out, stats
 
+    def _build_multi_camera_meta_from_views(
+        self,
+        gaussians: Dict[str, torch.Tensor],
+        cameras: List,
+        height: int,
+        width: int,
+        viewmats_override: Optional[torch.Tensor] = None,
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, float]]:
+        if len(cameras) < 1:
+            raise ValueError("Multi-camera meta builder requires at least one camera.")
+        ks_list = [self._resolve_intrinsics(cam) for cam in cameras]
+        Ks = torch.cat(ks_list, dim=0)
+        if viewmats_override is None:
+            viewmats_list = []
+            for cam in cameras:
+                cam_ctw = cam.camtoworlds if hasattr(cam, "camtoworlds") else cam["camtoworlds"]
+                viewmats_list.append(_get_viewmat(cam_ctw))
+            viewmats = torch.cat(viewmats_list, dim=0)
+        else:
+            viewmats = viewmats_override
+            if viewmats.dim() == 2:
+                viewmats = viewmats.unsqueeze(0)
+            if int(viewmats.shape[0]) != int(len(cameras)):
+                raise ValueError(
+                    f"viewmats_override.shape[0] ({viewmats.shape[0]}) must equal len(cameras) ({len(cameras)})."
+                )
+        return self._build_multi_camera_meta_from_viewmats(
+            gaussians=gaussians,
+            viewmats=viewmats,
+            Ks=Ks,
+            height=height,
+            width=width,
+        )
+
     def render_and_backproject_streaming_fused_multi_camera(
         self,
         gaussians: Dict[str, torch.Tensor],
@@ -267,6 +396,7 @@ class AlphaTWeightExtractorV3(AlphaTWeightExtractorV2):
         width: int,
         num_gaussians: int,
         backprojector,
+        viewmats_override: Optional[torch.Tensor] = None,
         return_accumulated_weights: bool = False,
         return_debug_stats: bool = False,
     ) -> Union[
@@ -303,6 +433,7 @@ class AlphaTWeightExtractorV3(AlphaTWeightExtractorV2):
             cameras=cameras,
             height=height,
             width=width,
+            viewmats_override=viewmats_override,
         )
 
         t_fused = time.perf_counter()
@@ -486,6 +617,143 @@ class AlphaTWeightExtractorV3(AlphaTWeightExtractorV2):
             if return_debug_stats:
                 return feat_out, accumulated_weight_support, stats
             return feat_out, accumulated_weight_support
+        if return_debug_stats:
+            return feat_out, stats
+        return feat_out
+
+    def render_and_backproject_streaming_fused_multi_camera_gated(
+        self,
+        gaussians: Dict[str, torch.Tensor],
+        cameras: List,
+        features_2d: torch.Tensor,
+        gate_image: torch.Tensor,
+        height: int,
+        width: int,
+        num_gaussians: int,
+        backprojector,
+        viewmats_override: Optional[torch.Tensor] = None,
+        return_accumulated_weights: bool = False,
+        return_debug_stats: bool = False,
+    ) -> Union[
+        torch.Tensor,
+        Tuple[torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, Dict[str, float]],
+        Tuple[torch.Tensor, torch.Tensor, Dict[str, float]],
+    ]:
+        if rasterize_and_backproject_multi_camera_gated_in_range is None:
+            raise RuntimeError("ExtractorV3 fast-fail: gated multi-camera fused forward op is unavailable.")
+        if backproject_feature_grad_multi_camera_gated_sharded_in_range is None:
+            raise RuntimeError("ExtractorV3 fast-fail: gated multi-camera fused backward op is unavailable.")
+        if not features_2d.is_cuda:
+            raise RuntimeError("ExtractorV3 fast-fail: features_2d must be CUDA tensor.")
+        if features_2d.ndim != 4:
+            raise ValueError(
+                "ExtractorV3 multi-camera gated expects features_2d with shape [V, Hf, Wf, C], "
+                f"got ndim={features_2d.ndim}."
+            )
+        if gate_image.ndim != 3:
+            raise ValueError(f"gate_image must be rank-3 [V, H, W], got {gate_image.shape}")
+        if int(gate_image.shape[0]) != int(len(cameras)):
+            raise ValueError(
+                f"gate_image.shape[0] ({gate_image.shape[0]}) must equal num cameras ({len(cameras)})."
+            )
+        if int(features_2d.shape[0]) != int(len(cameras)):
+            raise ValueError(
+                f"features_2d.shape[0] ({features_2d.shape[0]}) must equal num cameras ({len(cameras)})."
+            )
+        if gate_image.dtype != torch.float32:
+            gate_image = gate_image.float()
+        if gate_image.requires_grad:
+            gate_image = gate_image.detach()
+
+        t_total_start = time.perf_counter()
+        orig_dtype = features_2d.dtype
+        if orig_dtype != torch.float32:
+            features_2d = features_2d.float()
+        if gate_image.device != features_2d.device:
+            gate_image = gate_image.to(features_2d.device)
+        eps = float(getattr(backprojector, "eps", 1e-8))
+        weight_threshold = float(getattr(backprojector, "weight_threshold", 0.0))
+
+        meta, meta_stats = self._build_multi_camera_meta_from_views(
+            gaussians=gaussians,
+            cameras=cameras,
+            height=height,
+            width=width,
+            viewmats_override=viewmats_override,
+        )
+
+        t_fused = time.perf_counter()
+        if features_2d.requires_grad:
+            (
+                feat_sum,
+                weight_sum_feature,
+                weight_sum_support,
+                pair_count_total,
+                pair_count_after_threshold,
+            ) = _RasterizeAndBackprojectFeatOnlyMultiCamGatedFn.apply(
+                meta["means2d"],
+                meta["conics"],
+                meta["opacities"],
+                meta["isect_offsets"],
+                meta["flatten_ids"],
+                meta["packed_global_gaussian_ids"],
+                features_2d,
+                gate_image,
+                int(width),
+                int(height),
+                int(meta.get("tile_size", 16)),
+                int(num_gaussians),
+                float(weight_threshold),
+                bool(return_accumulated_weights),
+            )
+        else:
+            (
+                feat_sum,
+                weight_sum_feature,
+                weight_sum_support,
+                pair_count_total,
+                pair_count_after_threshold,
+            ) = rasterize_and_backproject_multi_camera_gated_in_range(
+                range_start=0,
+                range_end=int(1e9),
+                means2d=meta["means2d"],
+                conics=meta["conics"],
+                opacities=meta["opacities"],
+                image_width=int(width),
+                image_height=int(height),
+                tile_size=int(meta.get("tile_size", 16)),
+                isect_offsets=meta["isect_offsets"],
+                flatten_ids=meta["flatten_ids"],
+                packed_global_gaussian_ids=meta["packed_global_gaussian_ids"],
+                feat2d=features_2d,
+                gate_image=gate_image,
+                num_gaussians=int(num_gaussians),
+                weight_threshold=float(weight_threshold),
+                return_support=bool(return_accumulated_weights),
+            )
+        fused_ms = float((time.perf_counter() - t_fused) * 1000.0)
+        feat_out = feat_sum / (weight_sum_feature.unsqueeze(-1) + eps)
+        if orig_dtype != torch.float32:
+            feat_out = feat_out.to(orig_dtype)
+            if return_accumulated_weights:
+                weight_sum_support = weight_sum_support.to(orig_dtype)
+        stats = {
+            "num_views": int(len(cameras)),
+            "num_gaussians": int(num_gaussians),
+            "render_packed_total_ms": float(meta_stats["render_packed_total_ms"]),
+            "build_multi_meta_ms": float(meta_stats["build_multi_meta_ms"]),
+            "fused_backproject_total_ms": float(fused_ms),
+            "streaming_total_ms": float((time.perf_counter() - t_total_start) * 1000.0),
+            "pairs_total": int(pair_count_total.item()),
+            "pairs_after_threshold": int(pair_count_after_threshold.item()),
+            "nnz_total": int(meta_stats["nnz_total"]),
+            "isects_total": int(meta_stats["isects_total"]),
+        }
+        if return_accumulated_weights:
+            if return_debug_stats:
+                return feat_out, weight_sum_support, stats
+            return feat_out, weight_sum_support
         if return_debug_stats:
             return feat_out, stats
         return feat_out
