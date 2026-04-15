@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import logging
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -9,6 +12,7 @@ from typing import Any, Dict, FrozenSet, List, Literal, Optional, Sequence, Tupl
 import numpy as np
 import torch
 import torch.nn.functional as F
+from omegaconf import OmegaConf
 from PIL import Image
 from torch import Tensor
 
@@ -30,6 +34,14 @@ from datasets.train_scheduler_v6 import TrainSchedulerV6
 from datasets.train_scheduler_v7 import TrainSchedulerV7
 
 ImageRef = Tuple[int, int]
+
+logger = logging.getLogger(__name__)
+
+_POINTCLOUD_CAP_KEYS = (
+    "near_max_points",
+    "distant_max_points",
+    "monocular_dynamic_recovery_max_points_per_instance",
+)
 
 _V4_CACHE_MAX_ITEM_KEYS = (
     "scene_asset_cache_max_items",
@@ -84,6 +96,124 @@ class SegmentStaticBundle:
     segment_pose: Dict[str, Any]
     pointcloud: Dict[str, Any]
     dynamic_tracks: Dict[str, Any]
+
+
+def _cap_int_or_none(d: Dict[str, Any], k: str) -> Optional[int]:
+    v = d.get(k)
+    if v is None:
+        return None
+    i = int(v)
+    if i <= 0:
+        raise ValueError(f"dataset.pointcloud.{k} must be > 0 when set, got {v!r}")
+    return i
+
+
+def _pointcloud_cap_triplet_differs(asset_pc: Dict[str, Any], runtime_pc: Dict[str, Any]) -> bool:
+    for key in _POINTCLOUD_CAP_KEYS:
+        if _cap_int_or_none(asset_pc, key) != _cap_int_or_none(runtime_pc, key):
+            return True
+    return False
+
+
+def _make_cap_downsample_rng(segment_manifest: Dict[str, Any], runtime_pc: Dict[str, Any]) -> np.random.Generator:
+    payload = {
+        "asset_id": str(segment_manifest["asset_id"]),
+        "near_max_points": _cap_int_or_none(runtime_pc, "near_max_points"),
+        "distant_max_points": _cap_int_or_none(runtime_pc, "distant_max_points"),
+        "monocular_dynamic_recovery_max_points_per_instance": _cap_int_or_none(
+            runtime_pc, "monocular_dynamic_recovery_max_points_per_instance"
+        ),
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")
+    ).digest()
+    seed = int.from_bytes(digest[:8], "big")
+    return np.random.default_rng(seed)
+
+
+def _random_subset_rows(arr: np.ndarray, max_count: Optional[int], rng: np.random.Generator) -> np.ndarray:
+    if max_count is None:
+        return arr
+    n = int(arr.shape[0])
+    if n == 0:
+        return arr
+    m = int(max_count)
+    if m <= 0:
+        raise ValueError("max_count must be > 0 when set")
+    if n <= m:
+        return arr
+    idx = rng.choice(n, size=m, replace=False)
+    idx.sort()
+    return arr[idx].astype(np.float32, copy=False)
+
+
+def _split_background_near_distant(background: np.ndarray, segment_aabb: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    seg_aabb = np.asarray(segment_aabb, dtype=np.float32).reshape(2, 3)
+    crop_min = seg_aabb[0]
+    crop_max = seg_aabb[1]
+    xyz = background[:, :3].astype(np.float32, copy=False)
+    in_crop = ((xyz >= crop_min[None, :]) & (xyz <= crop_max[None, :])).all(axis=1)
+    near = background[in_crop]
+    distant = background[~in_crop]
+    return near, distant
+
+
+def _apply_runtime_random_pointcloud_downsample(
+    *,
+    pointcloud: Dict[str, Any],
+    segment_manifest: Dict[str, Any],
+    segment_aabb: Tensor,
+    runtime_pc: Dict[str, Any],
+) -> Dict[str, Any]:
+    asset_pc = segment_manifest.get("pointcloud_config_normalized")
+    if not isinstance(asset_pc, dict):
+        return pointcloud
+    if not _pointcloud_cap_triplet_differs(asset_pc, runtime_pc):
+        return pointcloud
+
+    r_near = _cap_int_or_none(runtime_pc, "near_max_points")
+    r_distant = _cap_int_or_none(runtime_pc, "distant_max_points")
+    r_mono = _cap_int_or_none(runtime_pc, "monocular_dynamic_recovery_max_points_per_instance")
+    if r_near is None and r_distant is None and r_mono is None:
+        return pointcloud
+
+    rng = _make_cap_downsample_rng(segment_manifest, runtime_pc)
+    out = dict(pointcloud)
+    aabb_np = segment_aabb.detach().cpu().numpy() if torch.is_tensor(segment_aabb) else np.asarray(segment_aabb)
+
+    bg = np.asarray(out.get("background"), dtype=np.float32)
+    if bg.size > 0:
+        near, distant = _split_background_near_distant(bg, aabb_np)
+        near = _random_subset_rows(near, r_near, rng)
+        distant = _random_subset_rows(distant, r_distant, rng)
+        if near.size == 0 and distant.size == 0:
+            out["background"] = np.zeros((0, 6), dtype=np.float32)
+        else:
+            out["background"] = np.concatenate([near, distant], axis=0).astype(np.float32, copy=False)
+
+    dyn = out.get("dynamic")
+    if isinstance(dyn, dict) and len(dyn) > 0 and r_mono is not None:
+        new_dyn: Dict[int, np.ndarray] = {}
+        for intid, pts in dyn.items():
+            arr = np.asarray(pts, dtype=np.float32)
+            if arr.size == 0:
+                new_dyn[int(intid)] = arr
+            else:
+                new_dyn[int(intid)] = _random_subset_rows(arr, r_mono, rng)
+        out["dynamic"] = new_dyn
+
+    ds_name = segment_manifest.get("dataset")
+    scene_id = segment_manifest.get("scene_id")
+    seg_id = segment_manifest.get("segment_id")
+    logger.debug(
+        "Runtime pointcloud caps differ from segment asset manifest; applied random subsample to runtime caps "
+        "(dataset=%s scene_id=%s segment_id=%s asset_id=%s)",
+        ds_name,
+        scene_id,
+        seg_id,
+        segment_manifest.get("asset_id"),
+    )
+    return out
 
 
 class MultiSceneDatasetV4:
@@ -419,6 +549,17 @@ class MultiSceneDatasetV4:
                 raise ValueError(
                     "segment_aabb mismatch between dataset config and segment manifest: "
                     f"config={self.segment_aabb.tolist()} asset={segment_aabb.tolist()}"
+                )
+
+            pc_rt = self._cfg_get(self.dataset_cfg, "pointcloud")
+            if pc_rt is not None and OmegaConf.is_config(pc_rt):
+                pc_rt = OmegaConf.to_container(pc_rt, resolve=True)
+            if isinstance(pc_rt, dict):
+                pointcloud = _apply_runtime_random_pointcloud_downsample(
+                    pointcloud=pointcloud,
+                    segment_manifest=segment_manifest,
+                    segment_aabb=segment_aabb,
+                    runtime_pc=pc_rt,
                 )
 
             bundle = SegmentStaticBundle(

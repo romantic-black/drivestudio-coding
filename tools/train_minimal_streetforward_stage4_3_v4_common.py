@@ -69,11 +69,11 @@ def resolve_fixed_scene_segment(cfg: Any) -> Tuple[Optional[int], Optional[int]]
 def parse_include_test(cfg: Any) -> bool:
     os_cfg = cfg.get("one_segment")
     if os_cfg is not None:
-        return bool(os_cfg.get("include_test", True))
+        return bool(os_cfg.get("include_test", False))
     ms = cfg.get("multi_scene")
     if ms is not None:
-        return bool(ms.get("include_test", True))
-    return True
+        return bool(ms.get("include_test", False))
+    return False
 
 
 def parse_include_test_v4(cfg: Any) -> bool:

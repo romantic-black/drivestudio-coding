@@ -1571,10 +1571,6 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
             if reset_after_block:
                 self.reset_node_state()
                 node_state_sync_reset = True
-        elif policy.writeback_node_state and self.update_node_state_interval > 0 and step is not None and step % self.update_node_state_interval == 0:
-            self._writeback_node_states_from_out(out)
-            if policy.reset_node_state_after_block and self.reset_node_state_interval > 0 and step % self.reset_node_state_interval == 0:
-                self.reset_node_state()
 
         loss_val = out.get("loss")
         return {
@@ -1676,10 +1672,6 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
             if reset_after_block:
                 self.reset_node_state()
                 node_state_sync_reset = True
-        elif policy.writeback_node_state and self.update_node_state_interval > 0 and step is not None and step % self.update_node_state_interval == 0:
-            self._writeback_node_states_from_out(out)
-            if policy.reset_node_state_after_block and self.reset_node_state_interval > 0 and step % self.reset_node_state_interval == 0:
-                self.reset_node_state()
 
         num_gaussians_bg = int(out["_node_state_bg"].means.shape[0])
         node_state_distant = out.get("_node_state_distant")

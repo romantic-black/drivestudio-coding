@@ -346,11 +346,13 @@ def convert_batch_to_minimal_format(
                 )
                 viewdirs_list[i] = viewdirs.reshape(h, w, 3)
         frame_indices = target_data.get("frame_indices")
+        cam_indices = target_data.get("cam_indices")
         sky_mask = target_data.get("sky_mask")
         egocar_mask = target_data.get("egocar_mask")
         targets = [
             {
                 "frame_idx": int(frame_indices[i]) if frame_indices is not None else 0,
+                **({"cam_idx": int(cam_indices[i])} if cam_indices is not None else {}),
                 "view": target_views[i],
                 "gt_image": gt_images[i],
                 **({"sky_mask": sky_mask[i].to(device)} if sky_mask is not None else {}),

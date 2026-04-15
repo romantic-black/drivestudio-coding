@@ -393,6 +393,7 @@ def run_adapt_supervised(
                 save_3dgs_state(os.path.join(seg_dir, "3dgs_final.pt"), final_state)
             summary = {
                 "mode": "adapt_supervised",
+                "split": "test_adapt_supervised",
                 "scene_id": int(scene_id),
                 "segment_id": int(segment_id),
                 "best_step": int(best_step),
@@ -616,6 +617,7 @@ def run_inference_only(
 
             summary = {
                 "mode": "inference_only",
+                "split": "test_inference_only",
                 "scene_id": int(scene_id),
                 "segment_id": int(segment_id),
                 "aggregate_across_episodes": "mean",

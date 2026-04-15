@@ -15,6 +15,8 @@ def _prepare_demo_assets(
     *,
     tracks_all_invisible: bool = False,
     instances_fv_override: np.ndarray | None = None,
+    pointcloud_config_normalized: dict | None = None,
+    pointcloud_payload: dict | None = None,
 ):
     image0 = tmp_path / "im0.png"
     image1 = tmp_path / "im1.png"
@@ -109,6 +111,17 @@ def _prepare_demo_assets(
     if instances_fv_override is not None:
         instances_fv = np.asarray(instances_fv_override, dtype=np.uint8)
 
+    if pointcloud_payload is None:
+        pointcloud_payload = {
+            "background": np.zeros((2, 6), dtype=np.float32),
+            "dynamic": {9: np.ones((1, 6), dtype=np.float32)},
+            "instance_mapping": {1009: 9},
+            "metadata": {"static_instance_intids": []},
+        }
+    if pointcloud_config_normalized is None:
+        pointcloud_config_normalized = {"type": "hybrid"}
+    bg_n = int(np.asarray(pointcloud_payload["background"]).shape[0])
+    dyn_n = sum(int(np.asarray(v).shape[0]) for v in pointcloud_payload.get("dynamic", {}).values())
     store.export_segment_asset(
         dataset="nuscenes",
         scene_id=1,
@@ -131,12 +144,7 @@ def _prepare_demo_assets(
             "segment_first_frame_idx": 0,
             "segment_pose_source": "camera",
         },
-        pointcloud_payload={
-            "background": np.zeros((2, 6), dtype=np.float32),
-            "dynamic": {9: np.ones((1, 6), dtype=np.float32)},
-            "instance_mapping": {1009: 9},
-            "metadata": {"static_instance_intids": []},
-        },
+        pointcloud_payload=pointcloud_payload,
         dynamic_tracks_payload={
             "frame_indices": np.asarray([0, 1], dtype=np.int32),
             "instance_intids": np.asarray([9], dtype=np.int32),
@@ -146,13 +154,13 @@ def _prepare_demo_assets(
             "static_instance_intids": np.asarray([], dtype=np.int32),
         },
         segment_aabb=np.asarray([[-1, -1, -1], [1, 1, 1]], dtype=np.float32),
-        pointcloud_config_normalized={"type": "hybrid"},
-        stats={"background_points": 2},
+        pointcloud_config_normalized=pointcloud_config_normalized,
+        stats={"background_points": bg_n, "dynamic_points": dyn_n},
     )
     return store
 
 
-def _build_cfg(tmp_path):
+def _build_cfg(tmp_path, *, pointcloud: dict | None = None):
     data_cfg = OmegaConf.create(
         {
             "dataset": "nuscenes",
@@ -169,11 +177,12 @@ def _build_cfg(tmp_path):
             "sky_mask_semantics": "one_is_sky",
         }
     )
-    dataset_cfg = OmegaConf.create(
-        {
-            "segment_aabb": [[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]],
-        }
-    )
+    ds: dict = {
+        "segment_aabb": [[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]],
+    }
+    if pointcloud is not None:
+        ds["pointcloud"] = pointcloud
+    dataset_cfg = OmegaConf.create(ds)
     return data_cfg, dataset_cfg
 
 
@@ -316,6 +325,88 @@ def test_v4_requires_explicit_cache_limits(tmp_path):
             device=torch.device("cpu"),
             asset_store=store,
         )
+
+
+def test_v4_runtime_cap_mismatch_random_downsamples(tmp_path):
+    inside_pts = np.zeros((60, 6), dtype=np.float32)
+    outside_pts = np.zeros((80, 6), dtype=np.float32)
+    outside_pts[:, 0] = 3.0
+    background = np.concatenate([inside_pts, outside_pts], axis=0)
+    store = _prepare_demo_assets(
+        tmp_path,
+        pointcloud_config_normalized={
+            "type": "hybrid",
+            "near_max_points": 1000,
+            "distant_max_points": 1000,
+            "monocular_dynamic_recovery_max_points_per_instance": 1000,
+        },
+        pointcloud_payload={
+            "background": background,
+            "dynamic": {9: np.ones((20, 6), dtype=np.float32)},
+            "instance_mapping": {1009: 9},
+            "metadata": {"static_instance_intids": []},
+        },
+    )
+    data_cfg, dataset_cfg = _build_cfg(
+        tmp_path,
+        pointcloud={
+            "type": "hybrid",
+            "near_max_points": 30,
+            "distant_max_points": 40,
+            "monocular_dynamic_recovery_max_points_per_instance": 5,
+        },
+    )
+    ds = MultiSceneDatasetV4(
+        dataset_cfg=dataset_cfg,
+        data_cfg=data_cfg,
+        device=torch.device("cpu"),
+        asset_store=store,
+    )
+    ds.initialize()
+    bundle = ds._resolve_segment_bundle(1, 0)
+    assert bundle.pointcloud["background"].shape[0] == 70
+    assert bundle.pointcloud["dynamic"][9].shape[0] == 5
+
+
+def test_v4_matching_pointcloud_caps_skips_runtime_downsample(tmp_path):
+    inside_pts = np.zeros((60, 6), dtype=np.float32)
+    outside_pts = np.zeros((80, 6), dtype=np.float32)
+    outside_pts[:, 0] = 3.0
+    background = np.concatenate([inside_pts, outside_pts], axis=0)
+    store = _prepare_demo_assets(
+        tmp_path,
+        pointcloud_config_normalized={
+            "type": "hybrid",
+            "near_max_points": 1000,
+            "distant_max_points": 1000,
+            "monocular_dynamic_recovery_max_points_per_instance": 1000,
+        },
+        pointcloud_payload={
+            "background": background,
+            "dynamic": {9: np.ones((20, 6), dtype=np.float32)},
+            "instance_mapping": {1009: 9},
+            "metadata": {"static_instance_intids": []},
+        },
+    )
+    data_cfg, dataset_cfg = _build_cfg(
+        tmp_path,
+        pointcloud={
+            "type": "hybrid",
+            "near_max_points": 1000,
+            "distant_max_points": 1000,
+            "monocular_dynamic_recovery_max_points_per_instance": 1000,
+        },
+    )
+    ds = MultiSceneDatasetV4(
+        dataset_cfg=dataset_cfg,
+        data_cfg=data_cfg,
+        device=torch.device("cpu"),
+        asset_store=store,
+    )
+    ds.initialize()
+    bundle = ds._resolve_segment_bundle(1, 0)
+    assert bundle.pointcloud["background"].shape[0] == 140
+    assert bundle.pointcloud["dynamic"][9].shape[0] == 20
 
 
 def test_v4_scheduler_v6_factory_and_next_batch(tmp_path):
