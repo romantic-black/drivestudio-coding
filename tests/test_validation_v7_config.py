@@ -35,6 +35,9 @@ def test_parse_validation_v7_config_success():
     assert cfg.eval_enable is True
     assert cfg.validate_every_n_episodes == 20
     assert cfg.eval_scene_ids == [10, 11]
+    assert cfg.use_sky_mask_regions is False
+    assert cfg.min_valid_pixels_per_region == 32
+    assert cfg.require_sky_mask is False
 
 
 def test_parse_validation_v7_config_fast_fail_on_legacy_fields():
@@ -50,4 +53,40 @@ def test_parse_validation_v7_config_disabled_defaults():
     cfg = parse_validation_v7_config(raw)
     assert cfg.eval_enable is False
     assert cfg.validate_every_n_episodes == 0
+    assert cfg.use_sky_mask_regions is False
+    assert cfg.min_valid_pixels_per_region == 32
+    assert cfg.require_sky_mask is False
+
+
+def test_parse_validation_v7_config_metrics_block_success():
+    raw = _base_cfg()
+    raw["validation_v7"]["metrics"] = {
+        "use_sky_mask_regions": True,
+        "min_valid_pixels_per_region": 64,
+        "require_sky_mask": True,
+    }
+    cfg = parse_validation_v7_config(raw)
+    assert cfg.use_sky_mask_regions is True
+    assert cfg.min_valid_pixels_per_region == 64
+    assert cfg.require_sky_mask is True
+
+
+def test_parse_validation_v7_config_metrics_fast_fail_invalid():
+    raw = _base_cfg()
+    raw["validation_v7"]["metrics"] = {
+        "use_sky_mask_regions": False,
+        "min_valid_pixels_per_region": 0,
+        "require_sky_mask": False,
+    }
+    with pytest.raises(ValueError, match="min_valid_pixels_per_region"):
+        parse_validation_v7_config(raw)
+
+    raw2 = _base_cfg()
+    raw2["validation_v7"]["metrics"] = {
+        "use_sky_mask_regions": False,
+        "min_valid_pixels_per_region": 16,
+        "require_sky_mask": True,
+    }
+    with pytest.raises(ValueError, match="requires validation_v7.metrics.use_sky_mask_regions=true"):
+        parse_validation_v7_config(raw2)
 

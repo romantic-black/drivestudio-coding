@@ -1,7 +1,7 @@
 """
-Minimal StreetForward Stage 4.3 — 多场景训练：TrainSchedulerV4 + MultiSceneDatasetV3（image-ref batch）。
+Minimal StreetForward multi-scene training loop（shared by stage wrappers）。
 
-按 epoch 打乱 `data.train_scene_ids` 顺序，对每个场景打乱 segment 顺序遍历（见 `TrainSchedulerV4._init_epoch_segment_pair_iterator`）。
+默认配置与 Trainer 类可由上层入口脚本覆盖（例如 stage4_3/4_4/4_5 + scheduler_v7 包装）。
 
 日志里的 `scene_id` 与数据配置中的 `train_scene_ids` / 预处理时的 `scene_idx` 一致；`scene_dir` 为三位补零目录名（如 scene_id=5 -> 005），与 nuScenes 等导出目录 `str(scene_idx).zfill(3)` 对齐。
 
@@ -39,6 +39,7 @@ from torchmetrics.image import PeakSignalNoiseRatio
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 from datasets.validation_scheduler_v7 import ValidationEpisodeSpecV7, build_validation_episode_specs_v7
+from models.streetforward.metrics import compute_ssim_loss_masked
 from models.streetforward.minimal_trainer_stage4_3 import MinimalStreetForwardStage4_3, RuntimePolicy
 from tools.streetforward_validation_v7_config import ValidationV7Config, parse_validation_v7_config
 from tools.train_minimal_streetforward_stage1_1 import (
@@ -78,6 +79,8 @@ except ImportError:
 logger = logging.getLogger(__name__)
 current_time = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
 CKPT_PREFIX = "minimal_sf_stage4_3_multi_scene_v4"
+TRAINER_CLASS = MinimalStreetForwardStage4_3
+DEFAULT_CONFIG_FILE = "configs/minimal_streetforward_stage4_3_multi_scene_v4.yaml"
 
 
 def _scene_dir_str(scene_id: Any) -> str:
@@ -122,11 +125,83 @@ class _BatchRequestValidationV7:
     test_image_refs: Optional[List[Tuple[int, int]]] = None
 
 
+def _safe_mean(values: List[float]) -> float:
+    if not values:
+        return 0.0
+    return float(np.mean(values))
+
+
+def _compute_masked_psnr(pred: torch.Tensor, gt: torch.Tensor, mask_hw: torch.Tensor) -> Optional[float]:
+    if pred.shape[:2] != gt.shape[:2]:
+        raise ValueError(f"masked PSNR shape mismatch: pred={tuple(pred.shape)} gt={tuple(gt.shape)}")
+    if mask_hw.shape != pred.shape[:2]:
+        raise ValueError(
+            f"masked PSNR mask shape mismatch: mask={tuple(mask_hw.shape)} pred_hw={tuple(pred.shape[:2])}"
+        )
+    mask = mask_hw.to(pred.device).float()
+    valid = float(mask.sum().item())
+    if valid <= 0.0:
+        return None
+    diff2 = ((torch.clamp(pred, 0.0, 1.0) - torch.clamp(gt, 0.0, 1.0)) ** 2) * mask.unsqueeze(-1)
+    mse = diff2.sum() / (mask.sum() * 3.0)
+    mse_val = float(mse.item())
+    if mse_val <= 0.0:
+        return float("inf")
+    return float(-10.0 * np.log10(mse_val))
+
+
+def _compute_masked_ssim(pred: torch.Tensor, gt: torch.Tensor, mask_hw: torch.Tensor) -> Optional[float]:
+    if pred.shape[:2] != gt.shape[:2]:
+        raise ValueError(f"masked SSIM shape mismatch: pred={tuple(pred.shape)} gt={tuple(gt.shape)}")
+    if mask_hw.shape != pred.shape[:2]:
+        raise ValueError(
+            f"masked SSIM mask shape mismatch: mask={tuple(mask_hw.shape)} pred_hw={tuple(pred.shape[:2])}"
+        )
+    valid = float(mask_hw.float().sum().item())
+    if valid <= 0.0:
+        return None
+    loss = compute_ssim_loss_masked(
+        pred,
+        gt,
+        valid_mask=mask_hw.to(pred.device).float(),
+        sky_mask=None,
+        data_range=1.0,
+    )
+    return float((1.0 - float(loss.item())))
+
+
+def _compute_masked_lpips(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    mask_hw: torch.Tensor,
+    lpips_metric: LearnedPerceptualImagePatchSimilarity,
+) -> Optional[float]:
+    if pred.shape[:2] != gt.shape[:2]:
+        raise ValueError(f"masked LPIPS shape mismatch: pred={tuple(pred.shape)} gt={tuple(gt.shape)}")
+    if mask_hw.shape != pred.shape[:2]:
+        raise ValueError(
+            f"masked LPIPS mask shape mismatch: mask={tuple(mask_hw.shape)} pred_hw={tuple(pred.shape[:2])}"
+        )
+    mask = mask_hw.to(pred.device).float().clamp(0.0, 1.0)
+    valid = float(mask.sum().item())
+    if valid <= 0.0:
+        return None
+    pred_c = torch.clamp(pred, 0.0, 1.0)
+    gt_c = torch.clamp(gt, 0.0, 1.0)
+    mask_3 = mask.unsqueeze(-1)
+    pred_masked = pred_c * mask_3 + gt_c * (1.0 - mask_3)
+    lp = lpips_metric(
+        pred_masked.permute(2, 0, 1).unsqueeze(0),
+        gt_c.permute(2, 0, 1).unsqueeze(0),
+    )
+    return float(lp.item())
+
+
 def _run_validation_v7_round(
     *,
     cfg: Any,
     dataset: Any,
-    model: MinimalStreetForwardStage4_3,
+    model: Any,
     specs: List[ValidationEpisodeSpecV7],
     validation_cfg: ValidationV7Config,
     device: torch.device,
@@ -256,6 +331,12 @@ def _run_validation_v7_round(
         psnr_vals: List[float] = []
         ssim_vals: List[float] = []
         lpips_vals: List[float] = []
+        psnr_non_sky_vals: List[float] = []
+        ssim_non_sky_vals: List[float] = []
+        lpips_non_sky_vals: List[float] = []
+        psnr_sky_vals: List[float] = []
+        ssim_sky_vals: List[float] = []
+        sky_coverage_vals: List[float] = []
 
         seg_dir = os.path.join(
             val_root,
@@ -280,16 +361,65 @@ def _run_validation_v7_round(
             psnr_vals.append(float(m["psnr"]))
             ssim_vals.append(float(m["ssim"]))
             lpips_vals.append(float(m["lpips"]))
-            per_view_rows.append(
-                {
-                    "index": int(idx),
-                    "frame_idx": int(tgt.get("frame_idx", int(fallback_ref[0]))),
-                    "cam_idx": int(tgt.get("cam_idx", int(fallback_ref[1]))),
-                    "psnr": float(m["psnr"]),
-                    "ssim": float(m["ssim"]),
-                    "lpips": float(m["lpips"]),
-                }
-            )
+            row = {
+                "index": int(idx),
+                "frame_idx": int(tgt.get("frame_idx", int(fallback_ref[0]))),
+                "cam_idx": int(tgt.get("cam_idx", int(fallback_ref[1]))),
+                "psnr": float(m["psnr"]),
+                "ssim": float(m["ssim"]),
+                "lpips": float(m["lpips"]),
+            }
+
+            if bool(validation_cfg.use_sky_mask_regions):
+                sky_mask = tgt.get("sky_mask")
+                if sky_mask is None and bool(validation_cfg.require_sky_mask):
+                    raise ValueError(
+                        "validation_v7.metrics.require_sky_mask=true but target missing sky_mask "
+                        f"(scene={int(spec.scene_id)} segment={int(spec.segment_id)} idx={int(idx)})"
+                    )
+                if sky_mask is not None:
+                    sm = sky_mask.to(device).float()
+                    if sm.dim() == 3:
+                        sm = sm.squeeze(-1)
+                    if sm.shape != gt.shape[:2]:
+                        raise ValueError(
+                            "validation sky_mask shape mismatch: "
+                            f"sky_mask={tuple(sm.shape)} gt_hw={tuple(gt.shape[:2])}"
+                        )
+                    min_valid = int(validation_cfg.min_valid_pixels_per_region)
+                    non_sky = (1.0 - sm).clamp(0.0, 1.0)
+                    sky = sm.clamp(0.0, 1.0)
+                    non_sky_count = int((non_sky > 0.5).sum().item())
+                    sky_count = int((sky > 0.5).sum().item())
+                    row["sky_mask_coverage"] = float(sm.mean().item())
+                    row["non_sky_pixel_count"] = int(non_sky_count)
+                    row["sky_pixel_count"] = int(sky_count)
+                    sky_coverage_vals.append(float(row["sky_mask_coverage"]))
+
+                    if non_sky_count >= min_valid:
+                        psnr_non = _compute_masked_psnr(pred, gt, non_sky)
+                        ssim_non = _compute_masked_ssim(pred, gt, non_sky)
+                        lpips_non = _compute_masked_lpips(pred, gt, non_sky, lpips_metric)
+                        if psnr_non is not None:
+                            row["psnr_non_sky"] = float(psnr_non)
+                            psnr_non_sky_vals.append(float(psnr_non))
+                        if ssim_non is not None:
+                            row["ssim_non_sky"] = float(ssim_non)
+                            ssim_non_sky_vals.append(float(ssim_non))
+                        if lpips_non is not None:
+                            row["lpips_non_sky"] = float(lpips_non)
+                            lpips_non_sky_vals.append(float(lpips_non))
+                    if sky_count >= min_valid:
+                        psnr_s = _compute_masked_psnr(pred, gt, sky)
+                        ssim_s = _compute_masked_ssim(pred, gt, sky)
+                        if psnr_s is not None:
+                            row["psnr_sky"] = float(psnr_s)
+                            psnr_sky_vals.append(float(psnr_s))
+                        if ssim_s is not None:
+                            row["ssim_sky"] = float(ssim_s)
+                            ssim_sky_vals.append(float(ssim_s))
+
+            per_view_rows.append(row)
             if validation_cfg.save_images:
                 _save_image_triplet(
                     int(trigger_step),
@@ -308,11 +438,28 @@ def _run_validation_v7_round(
             "segment_id": int(spec.segment_id),
             "episode_start_keyframe_pos": int(spec.episode_start_keyframe_pos),
             "num_views": int(len(per_view_rows)),
-            "psnr": float(np.mean(psnr_vals)) if psnr_vals else 0.0,
-            "ssim": float(np.mean(ssim_vals)) if ssim_vals else 0.0,
-            "lpips": float(np.mean(lpips_vals)) if lpips_vals else 0.0,
+            "psnr_full": float(np.mean(psnr_vals)) if psnr_vals else 0.0,
+            "ssim_full": float(np.mean(ssim_vals)) if ssim_vals else 0.0,
+            "lpips_full": float(np.mean(lpips_vals)) if lpips_vals else 0.0,
+            "psnr_non_sky": _safe_mean(psnr_non_sky_vals),
+            "ssim_non_sky": _safe_mean(ssim_non_sky_vals),
+            "lpips_non_sky": _safe_mean(lpips_non_sky_vals),
+            "psnr_sky": _safe_mean(psnr_sky_vals),
+            "ssim_sky": _safe_mean(ssim_sky_vals),
+            "sky_mask_coverage": _safe_mean(sky_coverage_vals),
+            "num_views_non_sky_metric": int(len(psnr_non_sky_vals)),
+            "num_views_sky_metric": int(len(psnr_sky_vals)),
             "views_formula": f"({len(spec.frame_chain)})x{int(spec.num_cams)}",
         }
+        episode_row["psnr"] = float(episode_row["psnr_full"])
+        episode_row["ssim"] = float(episode_row["ssim_full"])
+        episode_row["lpips"] = float(episode_row["lpips_full"])
+        episode_row["metric_scope"] = "full_image"
+        if bool(validation_cfg.use_sky_mask_regions) and int(episode_row["num_views_non_sky_metric"]) > 0:
+            episode_row["psnr"] = float(episode_row["psnr_non_sky"])
+            episode_row["ssim"] = float(episode_row["ssim_non_sky"])
+            episode_row["lpips"] = float(episode_row["lpips_non_sky"])
+            episode_row["metric_scope"] = "non_sky"
         all_episode_rows.append(episode_row)
 
         with open(os.path.join(seg_dir, "per_view_metrics.json"), "w", encoding="utf-8") as f:
@@ -345,13 +492,61 @@ def _run_validation_v7_round(
                 float(episode_row["num_views"]),
                 tb_step,
             )
+            if bool(validation_cfg.use_sky_mask_regions):
+                writer.add_scalar(
+                    f"validation_v7/episode/psnr_non_sky/scene_{sid:03d}_segment_{seg:03d}",
+                    float(episode_row["psnr_non_sky"]),
+                    tb_step,
+                )
+                writer.add_scalar(
+                    f"validation_v7/episode/ssim_non_sky/scene_{sid:03d}_segment_{seg:03d}",
+                    float(episode_row["ssim_non_sky"]),
+                    tb_step,
+                )
+                writer.add_scalar(
+                    f"validation_v7/episode/lpips_non_sky/scene_{sid:03d}_segment_{seg:03d}",
+                    float(episode_row["lpips_non_sky"]),
+                    tb_step,
+                )
+                writer.add_scalar(
+                    f"validation_v7/episode/psnr_sky/scene_{sid:03d}_segment_{seg:03d}",
+                    float(episode_row["psnr_sky"]),
+                    tb_step,
+                )
+                writer.add_scalar(
+                    f"validation_v7/episode/ssim_sky/scene_{sid:03d}_segment_{seg:03d}",
+                    float(episode_row["ssim_sky"]),
+                    tb_step,
+                )
+                writer.add_scalar(
+                    f"validation_v7/episode/sky_mask_coverage/scene_{sid:03d}_segment_{seg:03d}",
+                    float(episode_row["sky_mask_coverage"]),
+                    tb_step,
+                )
+                writer.add_scalar(
+                    f"validation_v7/episode/psnr_full/scene_{sid:03d}_segment_{seg:03d}",
+                    float(episode_row["psnr_full"]),
+                    tb_step,
+                )
+                writer.add_scalar(
+                    f"validation_v7/episode/ssim_full/scene_{sid:03d}_segment_{seg:03d}",
+                    float(episode_row["ssim_full"]),
+                    tb_step,
+                )
+                writer.add_scalar(
+                    f"validation_v7/episode/lpips_full/scene_{sid:03d}_segment_{seg:03d}",
+                    float(episode_row["lpips_full"]),
+                    tb_step,
+                )
 
         logger.info(
-            "VALIDATION_V7_EPISODE_END scene_id=%s segment_id=%s episode_start=%s num_views=%s psnr=%.4f ssim=%.4f lpips=%.4f",
+            "VALIDATION_V7_EPISODE_END scene_id=%s segment_id=%s episode_start=%s num_views=%s "
+            "metric_scope=%s psnr=%.4f ssim=%.4f lpips=%.4f",
             int(spec.scene_id),
             int(spec.segment_id),
             int(spec.episode_start_keyframe_pos),
             int(episode_row["num_views"]),
+            str(episode_row["metric_scope"]),
             float(episode_row["psnr"]),
             float(episode_row["ssim"]),
             float(episode_row["lpips"]),
@@ -368,6 +563,9 @@ def _run_validation_v7_round(
                 "psnr": float(np.mean([float(r["psnr"]) for r in rows])),
                 "ssim": float(np.mean([float(r["ssim"]) for r in rows])),
                 "lpips": float(np.mean([float(r["lpips"]) for r in rows])),
+                "psnr_full": float(np.mean([float(r["psnr_full"]) for r in rows])),
+                "ssim_full": float(np.mean([float(r["ssim_full"]) for r in rows])),
+                "lpips_full": float(np.mean([float(r["lpips_full"]) for r in rows])),
             }
             for sid, rows in scene_to_rows.items()
         }
@@ -379,6 +577,21 @@ def _run_validation_v7_round(
             "psnr": float(np.mean([float(r["psnr"]) for r in all_episode_rows])),
             "ssim": float(np.mean([float(r["ssim"]) for r in all_episode_rows])),
             "lpips": float(np.mean([float(r["lpips"]) for r in all_episode_rows])),
+            "psnr_full": float(np.mean([float(r["psnr_full"]) for r in all_episode_rows])),
+            "ssim_full": float(np.mean([float(r["ssim_full"]) for r in all_episode_rows])),
+            "lpips_full": float(np.mean([float(r["lpips_full"]) for r in all_episode_rows])),
+            "psnr_non_sky": _safe_mean([float(r["psnr_non_sky"]) for r in all_episode_rows]),
+            "ssim_non_sky": _safe_mean([float(r["ssim_non_sky"]) for r in all_episode_rows]),
+            "lpips_non_sky": _safe_mean([float(r["lpips_non_sky"]) for r in all_episode_rows]),
+            "psnr_sky": _safe_mean([float(r["psnr_sky"]) for r in all_episode_rows]),
+            "ssim_sky": _safe_mean([float(r["ssim_sky"]) for r in all_episode_rows]),
+            "sky_mask_coverage": _safe_mean([float(r["sky_mask_coverage"]) for r in all_episode_rows]),
+            "metric_scope": (
+                "non_sky"
+                if bool(validation_cfg.use_sky_mask_regions)
+                and any(str(r.get("metric_scope", "")) == "non_sky" for r in all_episode_rows)
+                else "full_image"
+            ),
             "per_scene": scene_agg,
         }
         with open(
@@ -396,6 +609,20 @@ def _run_validation_v7_round(
             writer.add_scalar("validation_v7/global/ssim", float(global_summary["ssim"]), tb_step)
             writer.add_scalar("validation_v7/global/lpips", float(global_summary["lpips"]), tb_step)
             writer.add_scalar("validation_v7/global/num_episodes", float(global_summary["num_episodes"]), tb_step)
+            if bool(validation_cfg.use_sky_mask_regions):
+                writer.add_scalar("validation_v7/global/psnr_non_sky", float(global_summary["psnr_non_sky"]), tb_step)
+                writer.add_scalar("validation_v7/global/ssim_non_sky", float(global_summary["ssim_non_sky"]), tb_step)
+                writer.add_scalar("validation_v7/global/lpips_non_sky", float(global_summary["lpips_non_sky"]), tb_step)
+                writer.add_scalar("validation_v7/global/psnr_sky", float(global_summary["psnr_sky"]), tb_step)
+                writer.add_scalar("validation_v7/global/ssim_sky", float(global_summary["ssim_sky"]), tb_step)
+                writer.add_scalar(
+                    "validation_v7/global/sky_mask_coverage",
+                    float(global_summary["sky_mask_coverage"]),
+                    tb_step,
+                )
+                writer.add_scalar("validation_v7/global/psnr_full", float(global_summary["psnr_full"]), tb_step)
+                writer.add_scalar("validation_v7/global/ssim_full", float(global_summary["ssim_full"]), tb_step)
+                writer.add_scalar("validation_v7/global/lpips_full", float(global_summary["lpips_full"]), tb_step)
             # A second x-axis view to inspect cadence by train episode count.
             writer.add_scalar(
                 "validation_v7/global_by_train_episode/psnr",
@@ -413,9 +640,10 @@ def _run_validation_v7_round(
                 ep_counter,
             )
         logger.info(
-            "VALIDATION_V7_END trigger_episode_counter=%s num_episodes=%s psnr=%.4f ssim=%.4f lpips=%.4f",
+            "VALIDATION_V7_END trigger_episode_counter=%s num_episodes=%s metric_scope=%s psnr=%.4f ssim=%.4f lpips=%.4f",
             int(trigger_train_episode_counter),
             int(global_summary["num_episodes"]),
+            str(global_summary["metric_scope"]),
             float(global_summary["psnr"]),
             float(global_summary["ssim"]),
             float(global_summary["lpips"]),
@@ -428,7 +656,7 @@ def main() -> None:
     parser.add_argument(
         "--config_file",
         type=str,
-        default="configs/minimal_streetforward_stage4_3_multi_scene_v4.yaml",
+        default=DEFAULT_CONFIG_FILE,
         help="Path to config YAML.",
     )
     parser.add_argument("--max_steps", type=int, default=0)
@@ -452,7 +680,7 @@ def main() -> None:
     cfg.data.eval_scene_ids = [int(x) for x in list(cfg.data.get("eval_scene_ids", []) or [])]
     if parse_view_selection(cfg.training.get("view_selection")) is not None:
         raise ValueError(
-            "multi_scene v4 does not support training.view_selection.mode=explicit; "
+            "multi_scene training does not support training.view_selection.mode=explicit; "
             "remove view_selection from the config (dataset already samples keyframes per batch)."
         )
 
@@ -462,19 +690,34 @@ def main() -> None:
     set_deterministic_seed(args.seed)
     logger.info("Seed: %s", args.seed)
     validation_v7_cfg = parse_validation_v7_config(cfg)
+    losses_cfg = cfg.get("losses") or {}
+    photometric_cfg = losses_cfg.get("photometric", {}) or {}
+    mask_cfg = losses_cfg.get("mask", {}) or {}
+    train_monitor_use_non_sky_region = bool(photometric_cfg.get("exclude_sky_region", False))
+    train_monitor_require_sky_mask = bool(mask_cfg.get("require_sky_mask", train_monitor_use_non_sky_region))
+    train_monitor_min_valid_pixels = int(validation_v7_cfg.min_valid_pixels_per_region)
+    if train_monitor_min_valid_pixels < 1:
+        raise ValueError("train monitor requires min_valid_pixels_per_region >= 1")
+    if train_monitor_use_non_sky_region:
+        logger.info(
+            "train monitor metric scope=non_sky (losses.photometric.exclude_sky_region=true, "
+            "require_sky_mask=%s, min_valid_pixels=%s)",
+            bool(train_monitor_require_sky_mask),
+            int(train_monitor_min_valid_pixels),
+        )
 
     if cfg.get("one_segment") is not None:
         raise ValueError(
-            "multi_scene v4: remove `one_segment` from config; "
-            "use configs/minimal_streetforward_stage4_3_multi_scene_v4.yaml."
+            "multi_scene training: remove `one_segment` from config; "
+            f"use {DEFAULT_CONFIG_FILE}."
         )
     train_ids = list(cfg.data.train_scene_ids)
     if len(train_ids) < 2:
-        raise ValueError("multi_scene v4 requires len(data.train_scene_ids) >= 2")
+        raise ValueError("multi_scene training requires len(data.train_scene_ids) >= 2")
     fixed_scene_id, fixed_segment_id = resolve_fixed_scene_segment(cfg)
     if fixed_scene_id is not None or fixed_segment_id is not None:
         raise ValueError(
-            "multi_scene v4 requires scheduler_v4.traversal.fixed_scene_id and fixed_segment_id to be null "
+            "multi_scene training requires scheduler traversal fixed_scene_id and fixed_segment_id to be null "
             "(unset one_segment and traversal overrides)."
         )
 
@@ -486,7 +729,7 @@ def main() -> None:
     if cfg.get("test") is not None and bool(cfg.test.get("enable", False)):
         raise ValueError(
             "Formal testing is not supported in training script. "
-            "Use tools/test_minimal_streetforward_stage4_3.py instead."
+            "Use the corresponding tools/test_minimal_streetforward_* entry instead."
         )
     dataset = build_multi_scene_dataset_v3(cfg, device)
     dataset.initialize()
@@ -545,7 +788,7 @@ def main() -> None:
     else:
         ov = cfg.get("scheduler_v4", {}).get("overlap") or {}
         logger.info(
-            "TrainSchedulerV4 overlap: mode=%s point_sample_size=%s candidate_frame_policy=%s score_type=%s topk=%s",
+            "TrainScheduler overlap: mode=%s point_sample_size=%s candidate_frame_policy=%s score_type=%s topk=%s",
             ov.get("mode"),
             ov.get("point_sample_size"),
             ov.get("candidate_frame_policy"),
@@ -584,7 +827,7 @@ def main() -> None:
     enable_jsonl_metrics = bool(cfg.logging.get("enable_jsonl_metrics", True))
     if "image_interval_blocks" not in cfg.logging:
         raise ValueError(
-            "logging.image_interval_blocks is required (train images are saved every N TrainSchedulerV4 blocks, not every N steps)."
+            "logging.image_interval_blocks is required (train images are saved every N scheduler blocks, not every N steps)."
         )
     image_interval_blocks = int(cfg.logging["image_interval_blocks"])
     if image_interval_blocks < 1:
@@ -613,7 +856,22 @@ def main() -> None:
         if pcams is not None:
             pixel_camera_ids = [int(x) for x in list(pcams)]
 
-    model = MinimalStreetForwardStage4_3(config=cfg, device=device)
+    trainer_cls = TRAINER_CLASS
+    model = trainer_cls(config=cfg, device=device)
+    required_validation_methods = [
+        "inference_step_from_train_batch",
+        "export_3dgs_state",
+        "render_views_from_scene_state",
+        "reset_node_state",
+    ]
+    if bool(validation_v7_cfg.eval_enable):
+        missing = [m for m in required_validation_methods if not hasattr(model, m)]
+        if missing:
+            raise ValueError(
+                f"validation_v7 requires trainer methods {required_validation_methods}, "
+                f"but {trainer_cls.__name__} is missing: {missing}. "
+                "Disable validation_v7.eval_enable or implement the missing APIs."
+            )
     model.train()
     _load_init_checkpoint(
         args.init_checkpoint,
@@ -860,10 +1118,18 @@ def main() -> None:
                 mse_val = float(np.mean(mse_vals))
 
                 metric_vals: Dict[str, float] = {}
+                metric_scope = "full_image"
                 if enable_psnr:
-                    psnr_list: List[float] = []
-                    ssim_list: List[float] = []
-                    lpips_list: List[float] = []
+                    psnr_full_list: List[float] = []
+                    ssim_full_list: List[float] = []
+                    lpips_full_list: List[float] = []
+                    psnr_primary_list: List[float] = []
+                    ssim_primary_list: List[float] = []
+                    lpips_primary_list: List[float] = []
+                    psnr_non_sky_list: List[float] = []
+                    ssim_non_sky_list: List[float] = []
+                    lpips_non_sky_list: List[float] = []
+                    non_sky_metric_views = 0
                     for v in range(num_views):
                         v_vals = _compute_metrics(
                             pred_rgb=pred_rgbs[v],
@@ -874,13 +1140,73 @@ def main() -> None:
                             compute_psnr=True,
                             compute_heavy=True,
                         )
-                        psnr_list.append(v_vals["psnr"])
-                        ssim_list.append(v_vals["ssim"])
-                        lpips_list.append(v_vals["lpips"])
-                        metric_vals[f"psnr_view{v}"] = float(v_vals["psnr"])
-                    metric_vals["psnr_mean"] = float(np.mean(psnr_list)) if psnr_list else 0.0
-                    metric_vals["ssim_mean"] = float(np.mean(ssim_list)) if ssim_list else 0.0
-                    metric_vals["lpips_mean"] = float(np.mean(lpips_list)) if lpips_list else 0.0
+                        psnr_full = float(v_vals["psnr"])
+                        ssim_full = float(v_vals["ssim"])
+                        lpips_full = float(v_vals["lpips"])
+                        psnr_full_list.append(psnr_full)
+                        ssim_full_list.append(ssim_full)
+                        lpips_full_list.append(lpips_full)
+
+                        psnr_primary = psnr_full
+                        ssim_primary = ssim_full
+                        lpips_primary = lpips_full
+                        if train_monitor_use_non_sky_region:
+                            tgt_view = minimal_batch["targets"][v]
+                            sky_mask = tgt_view.get("sky_mask")
+                            if sky_mask is None and train_monitor_require_sky_mask:
+                                raise ValueError(
+                                    "train monitor non-sky metrics require target['sky_mask'] "
+                                    f"(view={int(v)}, scene={int(minimal_batch.get('scene_id', -1))}, "
+                                    f"segment={int(minimal_batch.get('segment_id', -1))})."
+                                )
+                            if sky_mask is not None:
+                                sm = sky_mask.to(device).float()
+                                if sm.dim() == 3:
+                                    sm = sm.squeeze(-1)
+                                if sm.shape != gt_images[v].shape[:2]:
+                                    raise ValueError(
+                                        "train monitor sky_mask shape mismatch: "
+                                        f"sky_mask={tuple(sm.shape)} gt_hw={tuple(gt_images[v].shape[:2])}"
+                                    )
+                                non_sky_mask = (1.0 - sm).clamp(0.0, 1.0)
+                                if int((non_sky_mask > 0.5).sum().item()) >= train_monitor_min_valid_pixels:
+                                    psnr_non = _compute_masked_psnr(pred_rgbs[v], gt_images[v], non_sky_mask)
+                                    ssim_non = _compute_masked_ssim(pred_rgbs[v], gt_images[v], non_sky_mask)
+                                    lpips_non = _compute_masked_lpips(
+                                        pred_rgbs[v],
+                                        gt_images[v],
+                                        non_sky_mask,
+                                        lpips_metric,
+                                    )
+                                    if psnr_non is not None:
+                                        psnr_primary = float(psnr_non)
+                                        psnr_non_sky_list.append(float(psnr_non))
+                                    if ssim_non is not None:
+                                        ssim_primary = float(ssim_non)
+                                        ssim_non_sky_list.append(float(ssim_non))
+                                    if lpips_non is not None:
+                                        lpips_primary = float(lpips_non)
+                                        lpips_non_sky_list.append(float(lpips_non))
+                                    non_sky_metric_views += 1
+
+                        psnr_primary_list.append(psnr_primary)
+                        ssim_primary_list.append(ssim_primary)
+                        lpips_primary_list.append(lpips_primary)
+                        metric_vals[f"psnr_view{v}"] = float(psnr_primary)
+                        metric_vals[f"psnr_full_view{v}"] = float(psnr_full)
+
+                    metric_vals["psnr_mean"] = float(np.mean(psnr_primary_list)) if psnr_primary_list else 0.0
+                    metric_vals["ssim_mean"] = float(np.mean(ssim_primary_list)) if ssim_primary_list else 0.0
+                    metric_vals["lpips_mean"] = float(np.mean(lpips_primary_list)) if lpips_primary_list else 0.0
+                    metric_vals["psnr_full_mean"] = float(np.mean(psnr_full_list)) if psnr_full_list else 0.0
+                    metric_vals["ssim_full_mean"] = float(np.mean(ssim_full_list)) if ssim_full_list else 0.0
+                    metric_vals["lpips_full_mean"] = float(np.mean(lpips_full_list)) if lpips_full_list else 0.0
+                    metric_vals["psnr_non_sky_mean"] = _safe_mean(psnr_non_sky_list)
+                    metric_vals["ssim_non_sky_mean"] = _safe_mean(ssim_non_sky_list)
+                    metric_vals["lpips_non_sky_mean"] = _safe_mean(lpips_non_sky_list)
+                    metric_vals["num_views_non_sky_metric"] = float(non_sky_metric_views)
+                    if train_monitor_use_non_sky_region and non_sky_metric_views > 0:
+                        metric_scope = "non_sky"
 
                     if save_train_views_psnr_below is not None and low_psnr_train_images_subdir is not None:
                         out_low = os.path.join(cfg.log_dir, "images", low_psnr_train_images_subdir)
@@ -890,10 +1216,10 @@ def main() -> None:
                         block_idx_global = int(ev.get("block_idx_global", 0))
                         sdir = _scene_folder_label_from_batch(raw_batch, ev.get("scene_id"))
                         thr = float(save_train_views_psnr_below)
-                        n_psnr = min(num_views, len(psnr_list))
-                        if any(float(psnr_list[v]) < thr for v in range(n_psnr)):
+                        n_psnr = min(num_views, len(psnr_primary_list))
+                        if any(float(psnr_primary_list[v]) < thr for v in range(n_psnr)):
                             for v in range(num_views):
-                                if v >= len(psnr_list):
+                                if v >= len(psnr_primary_list):
                                     break
                                 if fi_t is not None and ci_t is not None and int(fi_t.shape[0]) > v and int(ci_t.shape[0]) > v:
                                     f_lab = int(fi_t[v].item())
@@ -901,11 +1227,11 @@ def main() -> None:
                                     nusc_suf = _nuscenes_cam_id_suffix(pixel_camera_ids, c_lab)
                                     vsuf = (
                                         f"b{block_idx_global:06d}_sc{sdir}_v{v}_f{f_lab:05d}_c{c_lab}{nusc_suf}"
-                                        f"_psnr{float(psnr_list[v]):.2f}"
+                                        f"_psnr{float(psnr_primary_list[v]):.2f}"
                                     )
                                 else:
                                     vsuf = (
-                                        f"b{block_idx_global:06d}_sc{sdir}_v{v}_psnr{float(psnr_list[v]):.2f}"
+                                        f"b{block_idx_global:06d}_sc{sdir}_v{v}_psnr{float(psnr_primary_list[v]):.2f}"
                                     )
                                 _save_image_triplet(
                                     step,
@@ -922,7 +1248,8 @@ def main() -> None:
                     else "n/a"
                 )
                 logger.info(
-                    "BLOCK_END global_step=%s scene_id=%s scene_dir=%s segment=%s block_seg=%s block_global=%s mean_loss=%.6f mse=%.6e psnr_mean=%s onepass=%d",
+                    "BLOCK_END global_step=%s scene_id=%s scene_dir=%s segment=%s block_seg=%s block_global=%s "
+                    "mean_loss=%.6f mse=%.6e metric_scope=%s psnr_mean=%s onepass=%d",
                     ev.get("global_step"),
                     ev.get("scene_id"),
                     _scene_dir_str(ev.get("scene_id", -1)),
@@ -931,6 +1258,7 @@ def main() -> None:
                     ev.get("block_idx_global"),
                     mean_loss,
                     mse_val,
+                    metric_scope,
                     psnr_log,
                     int(result.get("src_backproject_pass_count", 0)),
                 )
@@ -1001,6 +1329,7 @@ def main() -> None:
                     "backward_ms": float(result.get("backward_ms", 0.0)),
                     "optimizer_ms": float(result.get("optimizer_ms", 0.0)),
                     "mse": float(mse_val),
+                    "metric_scope": metric_scope,
                     "node_state_sync_update": bool(result.get("node_state_sync_update", False)),
                     "node_state_sync_reset": bool(result.get("node_state_sync_reset", False)),
                 }
@@ -1105,4 +1434,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

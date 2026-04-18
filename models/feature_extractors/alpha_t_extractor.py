@@ -325,6 +325,7 @@ class AlphaTWeightExtractor:
         meta: Dict[str, torch.Tensor],
         height: int,
         width: int,
+        pair_valid_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Extract sparse weight tuples from a single packed-meta output.
@@ -349,20 +350,45 @@ class AlphaTWeightExtractor:
                 else:
                     break
 
-        gaussian_ids_local, pixel_ids, _, weights = rasterize_to_indices_in_range(
-            range_start=0,
-            range_end=int(1e9),
-            transmittances=transmittances,
-            means2d=meta["means2d"],
-            conics=meta["conics"],
-            opacities=meta["opacities"],
-            image_width=width,
-            image_height=height,
-            tile_size=int(meta.get("tile_size", 16)),
-            isect_offsets=isect_offsets_raw,
-            flatten_ids=meta["flatten_ids"],
-            return_weights=True,
-        )
+        try:
+            gaussian_ids_local, pixel_ids, _, weights = rasterize_to_indices_in_range(
+                range_start=0,
+                range_end=int(1e9),
+                transmittances=transmittances,
+                means2d=meta["means2d"],
+                conics=meta["conics"],
+                opacities=meta["opacities"],
+                image_width=width,
+                image_height=height,
+                tile_size=int(meta.get("tile_size", 16)),
+                isect_offsets=isect_offsets_raw,
+                flatten_ids=meta["flatten_ids"],
+                return_weights=True,
+                pair_valid_mask=pair_valid_mask,
+            )
+        except TypeError:
+            gaussian_ids_local, pixel_ids, _, weights = rasterize_to_indices_in_range(
+                range_start=0,
+                range_end=int(1e9),
+                transmittances=transmittances,
+                means2d=meta["means2d"],
+                conics=meta["conics"],
+                opacities=meta["opacities"],
+                image_width=width,
+                image_height=height,
+                tile_size=int(meta.get("tile_size", 16)),
+                isect_offsets=isect_offsets_raw,
+                flatten_ids=meta["flatten_ids"],
+                return_weights=True,
+            )
+            if pair_valid_mask is not None and pixel_ids.numel() > 0:
+                valid_flat = pair_valid_mask.to(device=pixel_ids.device).reshape(-1)
+                if valid_flat.dtype != torch.bool:
+                    valid_flat = valid_flat > 0.5
+                keep = valid_flat[pixel_ids.long()]
+                gaussian_ids_local = gaussian_ids_local[keep]
+                pixel_ids = pixel_ids[keep]
+                weights = weights[keep]
         if "gaussian_ids" not in meta:
             raise ValueError("Packed render meta missing gaussian_ids; cannot remap local ids to global ids.")
         packed_to_global = meta["gaussian_ids"]
@@ -409,6 +435,7 @@ class AlphaTWeightExtractor:
         width: int,
         num_gaussians: int,
         backprojector: "FeatureBackprojector",
+        source_pair_valid_mask: Optional[torch.Tensor] = None,
         return_accumulated_weights: bool = False,
         return_debug_stats: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, Dict[str, float]], Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]]:
@@ -440,7 +467,39 @@ class AlphaTWeightExtractor:
             "pairs_after_threshold": 0,
             "num_views": int(len(cameras)),
             "num_gaussians": int(num_gaussians),
+            "pairs_after_mask": 0,
+            "masked_pixel_count": 0,
+            "valid_pixel_count": 0,
+            "source_pair_valid_ratio": 1.0,
         }
+        pair_valid_masks: Optional[List[torch.Tensor]] = None
+        if source_pair_valid_mask is not None:
+            if source_pair_valid_mask.dim() != 3:
+                raise ValueError(
+                    "source_pair_valid_mask must have shape [V, H, W], "
+                    f"got {tuple(source_pair_valid_mask.shape)}."
+                )
+            if int(source_pair_valid_mask.shape[0]) != int(len(cameras)):
+                raise ValueError(
+                    f"source_pair_valid_mask.shape[0] ({source_pair_valid_mask.shape[0]}) "
+                    f"must equal len(cameras) ({len(cameras)})."
+                )
+            if int(source_pair_valid_mask.shape[1]) != int(height) or int(source_pair_valid_mask.shape[2]) != int(width):
+                raise ValueError(
+                    "source_pair_valid_mask spatial shape mismatch with source render size: "
+                    f"expected ({height}, {width}), got ({source_pair_valid_mask.shape[1]}, {source_pair_valid_mask.shape[2]})."
+                )
+            m = source_pair_valid_mask.to(device=device)
+            if m.dtype != torch.bool:
+                m = m > 0.5
+            pair_valid_masks = [m[i].contiguous() for i in range(int(m.shape[0]))]
+            valid_pixel_count = int(m.sum().item())
+            total_pixel_count = int(m.numel())
+            masked_pixel_count = int(total_pixel_count - valid_pixel_count)
+            stats["valid_pixel_count"] = valid_pixel_count
+            stats["masked_pixel_count"] = masked_pixel_count
+            stats["source_pair_valid_ratio"] = float(valid_pixel_count / max(total_pixel_count, 1))
+
         for i, cam in enumerate(cameras):
             cam_ctw = cam.camtoworlds if hasattr(cam, "camtoworlds") else cam["camtoworlds"]
             viewmat = _get_viewmat(cam_ctw)
@@ -470,9 +529,21 @@ class AlphaTWeightExtractor:
             stats["render_packed_total_ms"] += float((time.perf_counter() - t_render) * 1000.0)
 
             t_extract = time.perf_counter()
-            weight_info = self.extract_single_weight(meta, height, width)
+            pair_mask_i = pair_valid_masks[i] if pair_valid_masks is not None else None
+            weight_info = self.extract_single_weight(meta, height, width, pair_valid_mask=None)
             stats["extract_weight_total_ms"] += float((time.perf_counter() - t_extract) * 1000.0)
-            stats["pairs_total"] += int(weight_info["gaussian_ids"].numel())
+            pairs_total_now = int(weight_info["gaussian_ids"].numel())
+            stats["pairs_total"] += pairs_total_now
+            if pair_mask_i is not None and pairs_total_now > 0:
+                valid_flat = pair_mask_i.reshape(-1)
+                keep = valid_flat[weight_info["pixel_ids"].long()]
+                weight_info = {
+                    "gaussian_ids": weight_info["gaussian_ids"][keep],
+                    "pixel_ids": weight_info["pixel_ids"][keep],
+                    "weights": weight_info["weights"][keep],
+                }
+            pairs_after_mask_now = int(weight_info["gaussian_ids"].numel())
+            stats["pairs_after_mask"] += pairs_after_mask_now
             del meta
 
             t_bp = time.perf_counter()

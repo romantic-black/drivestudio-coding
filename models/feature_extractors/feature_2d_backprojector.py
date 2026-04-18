@@ -48,7 +48,12 @@ class FeatureBackprojector:
     Aggregate per-pixel CNN features into per-Gaussian descriptors.
     """
 
-    def __init__(self, eps: float = 1e-8, weight_threshold: float = 1e-2) -> None:
+    def __init__(
+        self,
+        eps: float = 1e-8,
+        weight_threshold: float = 1e-2,
+        max_pairs_per_chunk: int = 65536,
+    ) -> None:
         """
         Args:
             eps: Small epsilon for numerical stability in division.
@@ -58,6 +63,9 @@ class FeatureBackprojector:
         """
         self.eps = eps
         self.weight_threshold = weight_threshold
+        if int(max_pairs_per_chunk) < 1:
+            raise ValueError("max_pairs_per_chunk must be >= 1.")
+        self.max_pairs_per_chunk = int(max_pairs_per_chunk)
 
     @staticmethod
     def sample_features_at_pixels(
@@ -227,14 +235,23 @@ class FeatureBackprojector:
                 return zeros_feat, zeros_w, debug
             return zeros_feat, zeros_w
 
-        sampled = self._sample_features_single_view(feat_2d, pixel_ids, height, width)
-        weighted_feat = sampled * weights.unsqueeze(-1)
-
         feat_sum = torch.zeros(num_gaussians, channels, device=device, dtype=feat_2d.dtype)
-        feat_sum.scatter_add_(0, gaussian_ids.unsqueeze(-1).expand(-1, channels), weighted_feat)
-
         weight_sum_feature = torch.zeros(num_gaussians, device=device, dtype=feat_2d.dtype)
-        weight_sum_feature.scatter_add_(0, gaussian_ids, weights)
+        chunk_size = self.max_pairs_per_chunk
+        for start in range(0, int(gaussian_ids.numel()), chunk_size):
+            end = min(start + chunk_size, int(gaussian_ids.numel()))
+            gaussian_ids_chunk = gaussian_ids[start:end]
+            pixel_ids_chunk = pixel_ids[start:end]
+            weights_chunk = weights[start:end]
+            sampled_chunk = self._sample_features_single_view(feat_2d, pixel_ids_chunk, height, width)
+            weighted_feat_chunk = sampled_chunk * weights_chunk.unsqueeze(-1)
+            feat_sum.scatter_add_(
+                0,
+                gaussian_ids_chunk.unsqueeze(-1).expand(-1, channels),
+                weighted_feat_chunk,
+            )
+            weight_sum_feature.scatter_add_(0, gaussian_ids_chunk, weights_chunk)
+
         debug = {
             "backproject_single_view_ms": float((time.perf_counter() - t_start) * 1000.0),
             "pairs_total": pairs_total,

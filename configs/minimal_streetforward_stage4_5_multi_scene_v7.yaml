@@ -1,4 +1,4 @@
-output_name: experiment004sky001
+output_name: experiment001
 
 data:
   data_root: "/root/autodl-tmp/nuScenes/"
@@ -13,7 +13,7 @@ data:
     011, 019, 027, 035, 043, 094, 102, 110, 118, 126, 134, 142, 150, 158, 166, 174, 182, 190, 198, 217,
     012, 020, 036, 044, 095, 103, 111, 119, 127, 135, 143, 151, 159, 167, 175, 183, 191, 199, 218,
     013, 021, 029, 037, 045, 096, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 
-    014, 022, 030, 038, 046, 097, 105, 113, 121, 129, 137, 145, 153, 161, 169, 177, 185, 193, 201, 202
+    014, 022, 030, 038, 046, 097, 105, 113, 121, 129, 137, 145, 153, 161, 169, 177, 185, 193, 201, 202,
     015, 023, 031, 039, 047, 098, 106, 114, 122, 130, 138, 146, 154, 162, 170, 178, 186, 194]
   eval_scene_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
   preload:
@@ -80,8 +80,8 @@ dataset:
     monocular_downscale: 2
     monocular_dynamic_recovery_bbox_expand_xyz_m: [0.5, 0.2, 0.5]
     monocular_dynamic_recovery_max_points_per_instance: 40000
-    near_max_points: 600000
-    distant_max_points: 1200000
+    near_max_points: 500000
+    distant_max_points: 1000000
     static_instance_motion:
       enable: true
       traj_length_thresh_m: 0.5
@@ -114,10 +114,10 @@ scheduler_v7:
     warm_next_episode_chain: true
 
 validation_v7:
-  eval_enable: false
+  eval_enable: true
   trigger:
     by: train_episode_interval
-    validate_every_n_episodes: 200
+    validate_every_n_episodes: 100
     run_at_train_start: true
   episode_selection:
     policy: middle
@@ -126,6 +126,10 @@ validation_v7:
     save_dir: validation/episodes
   cache:
     persist_across_training: true
+  metrics:
+    use_sky_mask_regions: true
+    min_valid_pixels_per_region: 32
+    require_sky_mask: true
 
 model:
   scale_init_value: 0.1
@@ -136,18 +140,11 @@ model:
   feat_2d_downscale: 1
   use_fused_cuda_backproject_v2: true
   use_fused_cuda_backproject_v3: true
-  use_fused_cuda_backproject_v4: true
+  use_fused_cuda_backproject_v4: false
   fused_cuda_backproject_v4_force_fallback: false
   param_embed_dim: 48
   offset_gru_hidden_dim: 48
   offset_gru_use_reset_gate: true
-  sky:
-    origin_mode: camera_centered_rotation_only
-    center_local: [0.0, 0.0, 0.0]
-    resolution: 500
-    radius: 30.0
-    hemisphere: true
-    hemisphere_up: [0.0, -1.0, 0.0]
   branches:
     bg:
       src_backproject_support_min: 1e-6
@@ -165,14 +162,6 @@ model:
       limits: {offset_max: 0.02, scale_max: 0.08, omega_max: 0.01, opacity_max: 0.05, sh_dc_max: 0.08, sh_rest_max: 0.015}
       eta: {means: 0.2, scales: 0.7, opacity: 0.5, sh_dc: 0.8, sh_rest: 0.4}
       mlp: {hidden_dim: 64, use_3d_feat: false, use_2d_feat: true, freeze_quat: true}
-    sky:
-      src_backproject_support_min: 1e-6
-      enable_selective_update: false
-      freeze_means: true
-      init: {scale_init: {mode: isotropic, isotropic_log_value: -1.0, knn_k: 3, knn_log_scale_bias: 0.0}, opacity_init: 0.05}
-      limits: {offset_max: 0.02, scale_max: 0.08, omega_max: 0.01, opacity_max: 0.05, sh_dc_max: 0.08, sh_rest_max: 0.015}
-      eta: {means: 0.2, scales: 0.7, opacity: 0.5, sh_dc: 0.8, sh_rest: 0.4}
-      mlp: {hidden_dim: 64, use_3d_feat: false, use_2d_feat: true, freeze_quat: true}
     rigid:
       src_backproject_support_min: 1e-6
       freeze_means: false
@@ -181,11 +170,12 @@ model:
       eta: {means: 0.5, scales: 0.8, opacity: 0.8, sh_dc: 0.8, sh_rest: 0.5}
       mlp: {hidden_dim: 64, use_3d_feat: false, use_2d_feat: true, freeze_quat: false}
 
-
 losses:
+  photometric:
+    exclude_sky_region: true
   rgb: {w: 1.0}
   ssim: {w: 0.05}
-  mask: {w: 0.02, opacity_loss_type: bce}
+  mask: {w: 0.02, opacity_loss_type: bce, require_sky_mask: true}
   opacity_entropy: {w: 0.0}
 
 optimizer:
@@ -206,7 +196,7 @@ eval:
 
 logging:
   output_root: /root/autodl-tmp/outputs
-  project: minimal_sf_stage4_4_multi_scene_v7
+  project: minimal_sf_stage4_5_multi_scene_v7
   log_dir: null
   image_interval_blocks: 96
   low_psnr_train_images_subdir: train_low_psnr
@@ -221,4 +211,3 @@ logging:
     enable: false
     phase_timing: true
     cuda_memory: false
-

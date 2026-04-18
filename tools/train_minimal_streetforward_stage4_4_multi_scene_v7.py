@@ -22,8 +22,10 @@ def main() -> None:
                 "configs/minimal_streetforward_stage4_4_multi_scene_v7.yaml",
             ]
         )
+    base.base.TRAINER_CLASS = MinimalStreetForwardStage4_4
     base.base.MinimalStreetForwardStage4_3 = MinimalStreetForwardStage4_4
     base.base.CKPT_PREFIX = "minimal_sf_stage4_4_multi_scene_v7"
+    base.base.DEFAULT_CONFIG_FILE = "configs/minimal_streetforward_stage4_4_multi_scene_v7.yaml"
     base.main()
 
 

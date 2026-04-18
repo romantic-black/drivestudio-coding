@@ -14,6 +14,9 @@ class ValidationV7Config:
     save_dir: str
     persist_across_training: bool
     eval_scene_ids: List[int]
+    use_sky_mask_regions: bool
+    min_valid_pixels_per_region: int
+    require_sky_mask: bool
 
 
 def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
@@ -65,6 +68,9 @@ def parse_validation_v7_config(cfg: Any) -> ValidationV7Config:
             save_dir="validation/episodes",
             persist_across_training=False,
             eval_scene_ids=eval_scene_ids,
+            use_sky_mask_regions=False,
+            min_valid_pixels_per_region=32,
+            require_sky_mask=False,
         )
 
     if len(eval_scene_ids) == 0:
@@ -98,6 +104,16 @@ def parse_validation_v7_config(cfg: Any) -> ValidationV7Config:
 
     cache = _cfg_get(raw, "cache", {}) or {}
     persist = bool(_cfg_get(cache, "persist_across_training", True))
+    metrics = _cfg_get(raw, "metrics", {}) or {}
+    use_sky_mask_regions = bool(_cfg_get(metrics, "use_sky_mask_regions", False))
+    min_valid_pixels_per_region = int(_cfg_get(metrics, "min_valid_pixels_per_region", 32))
+    require_sky_mask = bool(_cfg_get(metrics, "require_sky_mask", use_sky_mask_regions))
+    if min_valid_pixels_per_region < 1:
+        raise ValueError("validation_v7.metrics.min_valid_pixels_per_region must be >= 1")
+    if require_sky_mask and not use_sky_mask_regions:
+        raise ValueError(
+            "validation_v7.metrics.require_sky_mask=true requires validation_v7.metrics.use_sky_mask_regions=true"
+        )
 
     return ValidationV7Config(
         eval_enable=True,
@@ -108,5 +124,8 @@ def parse_validation_v7_config(cfg: Any) -> ValidationV7Config:
         save_dir=save_dir,
         persist_across_training=persist,
         eval_scene_ids=eval_scene_ids,
+        use_sky_mask_regions=use_sky_mask_regions,
+        min_valid_pixels_per_region=min_valid_pixels_per_region,
+        require_sky_mask=require_sky_mask,
     )
 

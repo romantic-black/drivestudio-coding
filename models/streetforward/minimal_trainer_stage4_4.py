@@ -156,26 +156,11 @@ class MinimalStreetForwardStage4_4(MinimalStreetForwardStage4_3):
         width: int,
         backprojector_override=None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        num_gaussians = int(gaussians_sky["means"].shape[0])
-        if num_gaussians == 0:
-            return None, None
-        backprojector_impl = backprojector_override if backprojector_override is not None else self.feature_backprojector
-        feat_2d_all, acc_w, bp_stats = self.alpha_t_extractor_v3.render_and_backproject_streaming_fused_multi_camera_gated(
-            gaussians=gaussians_sky,
-            cameras=source_views,
-            features_2d=features_2d,
-            gate_image=gate_image,
-            height=height,
-            width=width,
-            num_gaussians=num_gaussians,
-            backprojector=backprojector_impl,
-            viewmats_override=sky_viewmats,
-            return_accumulated_weights=True,
-            return_debug_stats=True,
+        del gaussians_sky, source_views, features_2d, gate_image, sky_viewmats, height, width, backprojector_override
+        raise RuntimeError(
+            "Stage4.4 sky gated fused backprojection has been removed in no-gated mode. "
+            "Use Stage4.5 no-sky pipeline instead."
         )
-        merge_debug_stats_as_perf_floats(self._perf_acc, "2d_bp_sky_", bp_stats)
-        self._perf_acc["2d_bp_sky_call_count"] = float(self._perf_acc.get("2d_bp_sky_call_count", 0.0) + 1.0)
-        return feat_2d_all, acc_w
 
     def _compute_2d_features_for_gaussians(
         self,

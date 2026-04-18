@@ -43,6 +43,7 @@ def test_multicam_feat_only_autograd_function_backpropagates_to_feat2d(monkeypat
         2,
         16,
         1,
+        None,
         0.0,
         True,
     )
@@ -145,3 +146,90 @@ def test_v3_multicam_streaming_matches_sum_then_divide_semantics(monkeypatch):
     assert stats["nnz_total"] == 2
     assert stats["isects_total"] == 2
     assert called["render"] == 1
+
+
+def test_v3_no_gated_api_contract():
+    assert not hasattr(AlphaTWeightExtractorV3, "render_and_backproject_streaming_fused_multi_camera_gated")
+
+
+def test_v3_multicam_forwards_pair_valid_mask_to_fused_op(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for v3 multi-camera streaming path")
+    extractor = AlphaTWeightExtractorV3.__new__(AlphaTWeightExtractorV3)
+    extractor.tile_size = 16
+    extractor.sh_degree = 0
+
+    means2d = torch.zeros(2, 2, dtype=torch.float32)
+    conics = torch.zeros(2, 3, dtype=torch.float32)
+    opac = torch.ones(2, dtype=torch.float32)
+    gids = torch.tensor([0, 1], dtype=torch.long)
+    flatten = torch.tensor([0, 1], dtype=torch.int32)
+    offsets = torch.zeros(2, 1, 1, dtype=torch.int32)
+
+    class _DummyCam:
+        def __init__(self):
+            self.camtoworlds = torch.eye(4).unsqueeze(0)
+            self.K = torch.eye(3).unsqueeze(0)
+
+    cams = [_DummyCam(), _DummyCam()]
+
+    def _fake_resolve_intrinsics(cam):
+        return cam.K
+
+    def _fake_renderer(**kwargs):
+        del kwargs
+        meta = {
+            "means2d": means2d,
+            "conics": conics,
+            "opacities": opac,
+            "gaussian_ids": gids,
+            "flatten_ids": flatten,
+            "isect_offsets": offsets,
+            "tile_size": 16,
+        }
+        return None, None, meta
+
+    called = {"pair_valid_masks": []}
+
+    def _fake_multi_fused(**kwargs):
+        called["pair_valid_masks"].append(kwargs["pair_valid_mask"])
+        n = int(kwargs["num_gaussians"])
+        feat = torch.zeros(n, 3, dtype=torch.float32)
+        w_feat = torch.ones(n, dtype=torch.float32)
+        w_sup = torch.ones(n, dtype=torch.float32)
+        total = torch.tensor([2], dtype=torch.long)
+        kept = torch.tensor([2], dtype=torch.long)
+        return feat, w_feat, w_sup, total, kept
+
+    extractor._resolve_intrinsics = _fake_resolve_intrinsics
+    extractor.renderer = _fake_renderer
+    monkeypatch.setattr(extractor_v3_mod, "rasterize_and_backproject_multi_camera_in_range", _fake_multi_fused)
+    monkeypatch.setattr(extractor_v3_mod, "backproject_feature_grad_multi_camera_sharded_in_range", _fake_multi_fused)
+
+    class _BP:
+        eps = 1e-8
+        weight_threshold = 0.0
+
+    features_2d = torch.zeros(2, 2, 2, 3, dtype=torch.float32, device="cuda")
+    source_pair_valid_mask = torch.ones(2, 2, 2, dtype=torch.bool, device="cuda")
+    source_pair_valid_mask[0, 0, 0] = False
+    _feat_out, _acc_w, _stats = extractor.render_and_backproject_streaming_fused_multi_camera(
+        gaussians={
+            "means": torch.zeros(2, 3, device="cuda"),
+            "quats": torch.zeros(2, 4, device="cuda"),
+            "scales": torch.zeros(2, 3, device="cuda"),
+            "opacities": torch.zeros(2, device="cuda"),
+            "colors": torch.zeros(2, 3, device="cuda"),
+        },
+        cameras=cams,
+        features_2d=features_2d,
+        height=2,
+        width=2,
+        num_gaussians=2,
+        backprojector=_BP(),
+        source_pair_valid_mask=source_pair_valid_mask,
+        return_accumulated_weights=True,
+        return_debug_stats=True,
+    )
+    assert any(m is not None for m in called["pair_valid_masks"])
+    assert any(torch.equal(m, source_pair_valid_mask) for m in called["pair_valid_masks"] if m is not None)

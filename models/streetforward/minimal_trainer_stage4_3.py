@@ -487,6 +487,10 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
         """
         Source 2D: scene fused backprojection + sky gated fused backprojection.
         """
+        raise RuntimeError(
+            "Stage4.3/4.4 gated source 2D pipeline has been removed in no-gated mode. "
+            "Use Stage4.5 no-sky pipeline instead."
+        )
         if not hasattr(self, "_render_source_composite_for_cnn"):
             raise ValueError(
                 "Stage4.4 sky-gated source 2D requires _render_source_composite_for_cnn implementation."
