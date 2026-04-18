@@ -24,7 +24,6 @@ from models.streetforward.math_utils import (
     _axis_angle_to_quat,
     _num_sh_bases,
     _normalize_quat,
-    _pairwise_neighbor_distances,
     _quat_multiply,
     _sh_to_rgb,
 )
@@ -181,17 +180,35 @@ class MinimalStreetForwardStage3_3(MinimalStreetForwardStage3_2):
             )
         return parsed
 
-    def _compute_initial_scales_by_cfg(self, means: torch.Tensor, init_cfg: Dict[str, Any]) -> torch.Tensor:
+    def _compute_initial_scales_by_cfg(
+        self,
+        means: torch.Tensor,
+        init_cfg: Dict[str, Any],
+        *,
+        precomputed_avg_dist: Optional[torch.Tensor] = None,
+        branch_name: str = "unknown",
+    ) -> torch.Tensor:
         n = int(means.shape[0])
         if init_cfg["scale_init_mode"] == "isotropic":
             return torch.full((n, 3), float(init_cfg["isotropic_log_value"]), device=means.device, dtype=means.dtype)
 
-        k = int(init_cfg["knn_k"])
+        if precomputed_avg_dist is None:
+            raise ValueError(
+                "KNN scale init requires precomputed knn_init asset, "
+                f"but branch={branch_name} has none. "
+                "Run tools/build_streetforward_segment_knn_assets.py before training."
+            )
+        avg_dist = precomputed_avg_dist.to(device=means.device, dtype=means.dtype).reshape(-1, 1)
+        if int(avg_dist.shape[0]) != int(n):
+            raise ValueError(
+                f"Precomputed KNN length mismatch for branch={branch_name}: "
+                f"expected {n}, got {int(avg_dist.shape[0])}"
+            )
+
         if n <= 1:
             base = torch.full((n, 3), float(init_cfg["isotropic_log_value"]), device=means.device, dtype=means.dtype)
         else:
-            distances = _pairwise_neighbor_distances(means, k=min(k, n - 1))
-            avg_dist = distances.mean(dim=-1, keepdim=True).clamp(min=1e-3)
+            avg_dist = avg_dist.clamp(min=1e-3)
             base = torch.log(avg_dist).repeat(1, 3)
         return base + float(init_cfg["knn_log_scale_bias"])
 
@@ -201,6 +218,7 @@ class MinimalStreetForwardStage3_3(MinimalStreetForwardStage3_2):
         colors: np.ndarray,
         state_cls: type,
         branch_name: str,
+        precomputed_avg_dist: Optional[np.ndarray] = None,
     ):
         if len(points) == 0:
             raise ValueError("Empty point cloud for node state.")
@@ -216,7 +234,17 @@ class MinimalStreetForwardStage3_3(MinimalStreetForwardStage3_2):
 
         from models.streetforward.math_utils import _rgb_to_sh
 
-        scales_log = self._compute_initial_scales_by_cfg(means, branch_cfg["init"])
+        precomputed_avg_dist_t: Optional[torch.Tensor] = None
+        if precomputed_avg_dist is not None:
+            precomputed_avg_dist_t = torch.from_numpy(
+                np.asarray(precomputed_avg_dist, dtype=np.float32).reshape(-1)
+            )
+        scales_log = self._compute_initial_scales_by_cfg(
+            means,
+            branch_cfg["init"],
+            precomputed_avg_dist=precomputed_avg_dist_t,
+            branch_name=branch_name,
+        )
         quats = torch.zeros((means.shape[0], 4), device=self.device, dtype=means.dtype)
         quats[:, 0] = 1.0
         opacity_logit = torch.logit(
@@ -261,14 +289,59 @@ class MinimalStreetForwardStage3_3(MinimalStreetForwardStage3_2):
         fg_points, fg_colors = points[in_crop], colors[in_crop]
         distant_points, distant_colors = points[~in_crop], colors[~in_crop]
 
+        bg_knn_avg: Optional[np.ndarray] = None
+        distant_knn_avg: Optional[np.ndarray] = None
+        need_bg_knn = str(self.bg_cfg["init"]["scale_init_mode"]) == "knn"
+        need_distant_knn = str(self.distant_cfg["init"]["scale_init_mode"]) == "knn" and len(distant_points) > 0
+        if need_bg_knn or need_distant_knn:
+            knn_init = batch.get("knn_init")
+            if not isinstance(knn_init, dict):
+                raise ValueError(
+                    "KNN scale init requested but batch.knn_init is missing. "
+                    "Run tools/build_streetforward_segment_knn_assets.py before training."
+                )
+            bg_map = knn_init.get("background_avg_dist_by_k", {})
+            if not isinstance(bg_map, dict):
+                raise ValueError("batch.knn_init.background_avg_dist_by_k must be a dict")
+
+            def _fetch_bg_knn(k_val: int, branch: str) -> np.ndarray:
+                arr = bg_map.get(int(k_val))
+                if arr is None:
+                    raise ValueError(
+                        f"KNN scale init requested but knn_init lacks background k={int(k_val)} for branch={branch}. "
+                        "Rebuild knn assets with the current config."
+                    )
+                arr_np = np.asarray(arr, dtype=np.float32).reshape(-1)
+                if int(arr_np.shape[0]) != int(points.shape[0]):
+                    raise ValueError(
+                        "KNN background length mismatch: "
+                        f"expected {points.shape[0]}, got {arr_np.shape[0]} (branch={branch}, k={int(k_val)})"
+                    )
+                return arr_np
+
+            if need_bg_knn:
+                bg_knn_avg = _fetch_bg_knn(int(self.bg_cfg["init"]["knn_k"]), "bg")[in_crop]
+            if need_distant_knn:
+                distant_knn_avg = _fetch_bg_knn(int(self.distant_cfg["init"]["knn_k"]), "distant")[~in_crop]
+
         if len(fg_points) == 0:
             raise ValueError("No points inside segment_aabb for stage3_3 bg node-state init.")
 
-        node_state_bg = self._init_node_state_from_arrays_branch(fg_points, fg_colors, NodeStateBackground, "bg")
+        node_state_bg = self._init_node_state_from_arrays_branch(
+            fg_points,
+            fg_colors,
+            NodeStateBackground,
+            "bg",
+            precomputed_avg_dist=bg_knn_avg,
+        )
         node_state_distant: Optional[NodeStateDistant] = None
         if len(distant_points) > 0:
             node_state_distant = self._init_node_state_from_arrays_branch(
-                distant_points, distant_colors, NodeStateDistant, "distant"
+                distant_points,
+                distant_colors,
+                NodeStateDistant,
+                "distant",
+                precomputed_avg_dist=distant_knn_avg,
             )
 
         self.node_states_bg[key] = node_state_bg
@@ -650,4 +723,3 @@ class MinimalStreetForwardStage3_3(MinimalStreetForwardStage3_2):
 
 
 __all__ = ["MinimalStreetForwardStage3_3"]
-

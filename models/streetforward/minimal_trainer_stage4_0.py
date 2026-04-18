@@ -22,7 +22,6 @@ from models.streetforward.math_utils import (
     _axis_angle_to_quat,
     _num_sh_bases,
     _normalize_quat,
-    _pairwise_neighbor_distances,
     _quat_multiply,
     _quat_to_rotmat,
     _sh_to_rgb,
@@ -511,6 +510,7 @@ class MinimalStreetForwardStage4_0(MinimalStreetForwardStage3_3):
         frame_ids: List[int],
         instance_id_map: Dict[int, int],
         instance_ids: List[int],
+        precomputed_avg_dist: Optional[np.ndarray] = None,
     ) -> NodeStateRigid:
         if points.shape[0] == 0:
             raise ValueError("Empty rigid pointcloud.")
@@ -523,8 +523,17 @@ class MinimalStreetForwardStage4_0(MinimalStreetForwardStage3_3):
         elif colors_tensor.shape[1] != 3:
             colors_tensor = colors_tensor[:, :3]
         from models.streetforward.math_utils import _rgb_to_sh
-
-        scales_log = self._compute_initial_scales_by_cfg(means, self.rigid_cfg["init"])
+        precomputed_avg_dist_t: Optional[torch.Tensor] = None
+        if precomputed_avg_dist is not None:
+            precomputed_avg_dist_t = torch.from_numpy(
+                np.asarray(precomputed_avg_dist, dtype=np.float32).reshape(-1)
+            )
+        scales_log = self._compute_initial_scales_by_cfg(
+            means,
+            self.rigid_cfg["init"],
+            precomputed_avg_dist=precomputed_avg_dist_t,
+            branch_name="rigid",
+        )
         quats = torch.zeros((means.shape[0], 4), device=self.device, dtype=means.dtype)
         quats[:, 0] = 1.0
         opacity_logit = torch.logit(
@@ -592,8 +601,29 @@ class MinimalStreetForwardStage4_0(MinimalStreetForwardStage3_3):
         pointcloud = batch["pointcloud"]
         dynamic = pointcloud.get("dynamic") if isinstance(pointcloud, dict) else None
         if dynamic:
+            knn_init = batch.get("knn_init")
+            need_rigid_knn = str(self.rigid_cfg["init"]["scale_init_mode"]) == "knn"
+            rigid_knn_by_instance: Optional[Dict[int, np.ndarray]] = None
+            if need_rigid_knn:
+                if not isinstance(knn_init, dict):
+                    raise ValueError(
+                        "Rigid KNN scale init requested but batch.knn_init is missing. "
+                        "Run tools/build_streetforward_segment_knn_assets.py before training."
+                    )
+                dyn_knn = knn_init.get("dynamic_avg_dist_by_k", {})
+                if not isinstance(dyn_knn, dict):
+                    raise ValueError("batch.knn_init.dynamic_avg_dist_by_k must be a dict")
+                rigid_k = int(self.rigid_cfg["init"]["knn_k"])
+                rigid_knn_by_instance = dyn_knn.get(int(rigid_k))
+                if not isinstance(rigid_knn_by_instance, dict):
+                    raise ValueError(
+                        "Rigid KNN scale init requested but knn_init lacks dynamic k="
+                        f"{rigid_k}. Rebuild knn assets with current config."
+                    )
+
             dynamic_points = []
             dynamic_colors = []
+            dynamic_knn = []
             point_ids = []
             instance_ids = sorted(int(ins_id) for ins_id in dynamic.keys())
             instance_id_map = {ins_id: idx for idx, ins_id in enumerate(instance_ids)}
@@ -604,6 +634,19 @@ class MinimalStreetForwardStage4_0(MinimalStreetForwardStage3_3):
                 n_points = instance_pcd.shape[0]
                 dynamic_points.append(instance_pcd[:, :3].astype(np.float32))
                 dynamic_colors.append(instance_pcd[:, 3:6].astype(np.float32))
+                if rigid_knn_by_instance is not None:
+                    knn_arr = rigid_knn_by_instance.get(int(ins_id))
+                    if knn_arr is None:
+                        raise ValueError(
+                            f"Rigid KNN scale init missing instance {int(ins_id)} in batch.knn_init"
+                        )
+                    knn_np = np.asarray(knn_arr, dtype=np.float32).reshape(-1)
+                    if int(knn_np.shape[0]) != int(n_points):
+                        raise ValueError(
+                            "Rigid KNN length mismatch: "
+                            f"intid={int(ins_id)} knn_len={knn_np.shape[0]} points={n_points}"
+                        )
+                    dynamic_knn.append(knn_np)
                 point_ids.extend([instance_id_map[ins_id]] * n_points)
             if dynamic_points:
                 dynamic_info = batch.get("dynamic_info")
@@ -611,6 +654,7 @@ class MinimalStreetForwardStage4_0(MinimalStreetForwardStage3_3):
                     raise ValueError("Stage4.0 requires batch.dynamic_info when dynamic pointcloud exists.")
                 d_points = np.concatenate(dynamic_points, axis=0)
                 d_colors = np.concatenate(dynamic_colors, axis=0)
+                d_knn = np.concatenate(dynamic_knn, axis=0).astype(np.float32, copy=False) if dynamic_knn else None
                 point_ids_tensor = torch.tensor(point_ids, dtype=torch.long, device=self.device).unsqueeze(-1)
                 frame_ids = sorted(int(fid) for fid in dynamic_info.keys())
                 node_state_rigid = self._init_rigid_node_state_from_pcd(
@@ -621,6 +665,7 @@ class MinimalStreetForwardStage4_0(MinimalStreetForwardStage3_3):
                     frame_ids=frame_ids,
                     instance_id_map=instance_id_map,
                     instance_ids=instance_ids,
+                    precomputed_avg_dist=d_knn,
                 )
 
         self.node_states_rigid[key] = node_state_rigid

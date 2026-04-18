@@ -98,6 +98,15 @@ class SegmentStaticBundle:
     segment_pose: Dict[str, Any]
     pointcloud: Dict[str, Any]
     dynamic_tracks: Dict[str, Any]
+    knn_init: Optional[Dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class KNNValidationRequirementsV4:
+    enabled: bool
+    background_ks: Tuple[int, ...]
+    dynamic_ks: Tuple[int, ...]
+    required_branches: Tuple[str, ...]
 
 
 def _cap_int_or_none(d: Dict[str, Any], k: str) -> Optional[int]:
@@ -110,11 +119,57 @@ def _cap_int_or_none(d: Dict[str, Any], k: str) -> Optional[int]:
     return i
 
 
+def _extract_pointcloud_caps(d: Dict[str, Any]) -> Dict[str, Optional[int]]:
+    return {k: _cap_int_or_none(d, k) for k in _POINTCLOUD_CAP_KEYS}
+
+
 def _pointcloud_cap_triplet_differs(asset_pc: Dict[str, Any], runtime_pc: Dict[str, Any]) -> bool:
     for key in _POINTCLOUD_CAP_KEYS:
         if _cap_int_or_none(asset_pc, key) != _cap_int_or_none(runtime_pc, key):
             return True
     return False
+
+
+def _parse_knn_validation_requirements(raw: Any) -> KNNValidationRequirementsV4:
+    if raw is None:
+        return KNNValidationRequirementsV4(
+            enabled=False,
+            background_ks=tuple(),
+            dynamic_ks=tuple(),
+            required_branches=tuple(),
+        )
+    payload = raw
+    if OmegaConf.is_config(payload):
+        payload = OmegaConf.to_container(payload, resolve=True)
+    if not isinstance(payload, dict):
+        raise TypeError(f"knn_requirements must be a dict when provided, got {type(raw)}")
+
+    bg_ks = sorted({int(x) for x in list(payload.get("background_ks", []) or [])})
+    dyn_ks = sorted({int(x) for x in list(payload.get("dynamic_ks", []) or [])})
+    for k in bg_ks + dyn_ks:
+        if int(k) <= 0:
+            raise ValueError(f"knn_requirements k must be > 0, got {k}")
+
+    branches = sorted({str(x).strip() for x in list(payload.get("required_branches", []) or []) if str(x).strip()})
+    invalid_branches = [b for b in branches if b not in {"bg", "distant", "rigid"}]
+    if invalid_branches:
+        raise ValueError(
+            "knn_requirements.required_branches contains unsupported entries: "
+            f"{invalid_branches}"
+        )
+
+    enabled = bool(payload.get("enabled", False)) or len(bg_ks) > 0 or len(dyn_ks) > 0
+    if enabled and len(bg_ks) == 0 and len(dyn_ks) == 0:
+        raise ValueError(
+            "knn_requirements.enabled=true requires at least one of background_ks/dynamic_ks"
+        )
+
+    return KNNValidationRequirementsV4(
+        enabled=bool(enabled),
+        background_ks=tuple(int(x) for x in bg_ks),
+        dynamic_ks=tuple(int(x) for x in dyn_ks),
+        required_branches=tuple(branches),
+    )
 
 
 def _make_cap_downsample_rng(segment_manifest: Dict[str, Any], runtime_pc: Dict[str, Any]) -> np.random.Generator:
@@ -227,6 +282,7 @@ class MultiSceneDatasetV4:
         device: torch.device,
         asset_store: Optional[StreetForwardAssetStore] = None,
         preload_cfg: Optional[Dict[str, Any]] = None,
+        knn_requirements: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.data_cfg = data_cfg
         self.dataset_cfg = dataset_cfg
@@ -253,6 +309,15 @@ class MultiSceneDatasetV4:
         if not torch.all(segment_aabb[0] < segment_aabb[1]):
             raise ValueError("dataset.segment_aabb min must be strictly less than max for all axes")
         self.segment_aabb = segment_aabb
+        runtime_pc = self._cfg_get(self.dataset_cfg, "pointcloud")
+        if runtime_pc is not None and OmegaConf.is_config(runtime_pc):
+            runtime_pc = OmegaConf.to_container(runtime_pc, resolve=True)
+        if runtime_pc is not None and not isinstance(runtime_pc, dict):
+            raise ValueError(f"dataset.pointcloud must be a mapping when provided, got {type(runtime_pc)}")
+        self._runtime_pointcloud_cfg: Optional[Dict[str, Any]] = (
+            dict(runtime_pc) if isinstance(runtime_pc, dict) else None
+        )
+        self._knn_requirements = _parse_knn_validation_requirements(knn_requirements)
 
         pixel_source_cfg = self._cfg_get(self.data_cfg, "pixel_source", {}) or {}
         self._load_sky_mask = bool(self._cfg_get(pixel_source_cfg, "load_sky_mask", False))
@@ -303,6 +368,132 @@ class MultiSceneDatasetV4:
         self._enable_view_pack_cache = True
         if self._preload_rtcfg is not None:
             self._enable_view_pack_cache = bool(self._preload_rtcfg.enable_view_pack_cache)
+
+    def _knn_required_branches_label(self) -> str:
+        if len(self._knn_requirements.required_branches) == 0:
+            return "unknown"
+        return ",".join(self._knn_requirements.required_branches)
+
+    def _assert_knn_runtime_caps_match(
+        self,
+        *,
+        segment_manifest: Dict[str, Any],
+        scene_id: int,
+        segment_id: int,
+        context: str,
+    ) -> None:
+        if not self._knn_requirements.enabled:
+            return
+        runtime_pc = self._runtime_pointcloud_cfg
+        if not isinstance(runtime_pc, dict):
+            return
+        asset_pc = segment_manifest.get("pointcloud_config_normalized")
+        if not isinstance(asset_pc, dict):
+            raise ValueError(
+                "KNN scale init requires segment manifest pointcloud_config_normalized for cap alignment checks, "
+                f"but it is missing/invalid (context={context} scene_id={int(scene_id)} segment_id={int(segment_id)})"
+            )
+        if not _pointcloud_cap_triplet_differs(asset_pc, runtime_pc):
+            return
+        raise ValueError(
+            "KNN init requires runtime pointcloud caps to match exported asset caps. "
+            f"(context={context} branches={self._knn_required_branches_label()} "
+            f"scene_id={int(scene_id)} segment_id={int(segment_id)} "
+            f"asset_caps={_extract_pointcloud_caps(asset_pc)} runtime_caps={_extract_pointcloud_caps(runtime_pc)}). "
+            "Re-export segment KNN assets with the current pointcloud config."
+        )
+
+    def _validate_required_knn_payload(
+        self,
+        *,
+        pointcloud: Dict[str, Any],
+        knn_init: Dict[str, Any],
+        scene_id: int,
+        segment_id: int,
+        context: str,
+    ) -> None:
+        if not self._knn_requirements.enabled:
+            return
+        bg_map_raw = knn_init.get("background_avg_dist_by_k", {})
+        dyn_map_raw = knn_init.get("dynamic_avg_dist_by_k", {})
+        if not isinstance(bg_map_raw, dict):
+            raise ValueError(
+                "knn_init.background_avg_dist_by_k must be a dict "
+                f"(context={context} scene_id={int(scene_id)} segment_id={int(segment_id)})"
+            )
+        if not isinstance(dyn_map_raw, dict):
+            raise ValueError(
+                "knn_init.dynamic_avg_dist_by_k must be a dict "
+                f"(context={context} scene_id={int(scene_id)} segment_id={int(segment_id)})"
+            )
+        bg_map = {int(k): v for k, v in bg_map_raw.items()}
+        dyn_map = {int(k): v for k, v in dyn_map_raw.items()}
+
+        missing_bg_ks = [int(k) for k in self._knn_requirements.background_ks if int(k) not in bg_map]
+        missing_dyn_ks = [int(k) for k in self._knn_requirements.dynamic_ks if int(k) not in dyn_map]
+        if missing_bg_ks or missing_dyn_ks:
+            raise ValueError(
+                "KNN scale init is required by model config but segment knn_init is missing required k values: "
+                f"(context={context} branches={self._knn_required_branches_label()} "
+                f"scene_id={int(scene_id)} segment_id={int(segment_id)} "
+                f"missing_background_ks={missing_bg_ks} missing_dynamic_ks={missing_dyn_ks}). "
+                "Re-export segment KNN assets with the current config."
+            )
+
+        background = np.asarray(pointcloud.get("background", np.zeros((0, 6), dtype=np.float32)), dtype=np.float32)
+        if background.ndim != 2 or background.shape[1] < 3:
+            raise ValueError(
+                "pointcloud.background must have shape [N,>=3] for KNN validation, "
+                f"got {tuple(background.shape)} (scene_id={int(scene_id)} segment_id={int(segment_id)})"
+            )
+        bg_count = int(background.shape[0])
+        for k in self._knn_requirements.background_ks:
+            arr_np = np.asarray(bg_map[int(k)], dtype=np.float32).reshape(-1)
+            if int(arr_np.shape[0]) != int(bg_count):
+                raise ValueError(
+                    "knn_init background length mismatch with pointcloud background during KNN validation: "
+                    f"(context={context} scene_id={int(scene_id)} segment_id={int(segment_id)} "
+                    f"k={int(k)} knn_len={int(arr_np.shape[0])} background_points={int(bg_count)})"
+                )
+
+        dynamic = pointcloud.get("dynamic", {})
+        if not isinstance(dynamic, dict):
+            raise ValueError(
+                f"pointcloud.dynamic must be a dict for KNN validation, got {type(dynamic)} "
+                f"(scene_id={int(scene_id)} segment_id={int(segment_id)})"
+            )
+        dynamic_intids = sorted(int(x) for x in dynamic.keys())
+        for k in self._knn_requirements.dynamic_ks:
+            per_instance_raw = dyn_map[int(k)]
+            if not isinstance(per_instance_raw, dict):
+                raise ValueError(
+                    f"knn_init.dynamic_avg_dist_by_k[{int(k)}] must be a dict[intid -> np.ndarray] "
+                    f"(context={context} scene_id={int(scene_id)} segment_id={int(segment_id)})"
+                )
+            per_instance = {int(intid): v for intid, v in per_instance_raw.items()}
+            missing_intids = [int(i) for i in dynamic_intids if int(i) not in per_instance]
+            if missing_intids:
+                raise ValueError(
+                    "knn_init dynamic KNN payload missing required instances: "
+                    f"(context={context} scene_id={int(scene_id)} segment_id={int(segment_id)} "
+                    f"k={int(k)} missing_intids={missing_intids}). "
+                    "Re-export segment KNN assets with the current config."
+                )
+            for intid in dynamic_intids:
+                pts = np.asarray(dynamic[int(intid)], dtype=np.float32)
+                if pts.ndim != 2 or pts.shape[1] < 3:
+                    raise ValueError(
+                        f"pointcloud.dynamic[{int(intid)}] must have shape [N,>=3], got {tuple(pts.shape)} "
+                        f"(scene_id={int(scene_id)} segment_id={int(segment_id)})"
+                    )
+                arr_np = np.asarray(per_instance[int(intid)], dtype=np.float32).reshape(-1)
+                if int(arr_np.shape[0]) != int(pts.shape[0]):
+                    raise ValueError(
+                        "knn_init dynamic length mismatch with pointcloud dynamic during KNN validation: "
+                        f"(context={context} scene_id={int(scene_id)} segment_id={int(segment_id)} "
+                        f"k={int(k)} intid={int(intid)} knn_len={int(arr_np.shape[0])} "
+                        f"dynamic_points={int(pts.shape[0])})"
+                    )
 
     @staticmethod
     def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
@@ -471,6 +662,29 @@ class MultiSceneDatasetV4:
                         "segment_index scene/segment_id mismatch vs registry: "
                         f"expected=({scene_id},{segment_id}) got=({seg_idx['scene_id']},{seg_idx['segment_id']})"
                     )
+                if self._knn_requirements.enabled:
+                    self._assert_knn_runtime_caps_match(
+                        segment_manifest=segment_manifest,
+                        scene_id=int(scene_id),
+                        segment_id=int(segment_id),
+                        context="initialize/_validate_training_assets",
+                    )
+                    knn_init = resolved["segment_handle"].load_knn_init()
+                    if not isinstance(knn_init, dict):
+                        raise ValueError(
+                            "KNN scale init is required by model config, but segment knn_init asset is missing: "
+                            f"(dataset={ds_name} scene_id={int(scene_id)} segment_id={int(segment_id)} "
+                            f"branches={self._knn_required_branches_label()}). "
+                            "Run tools/build_streetforward_segment_knn_assets.py before training."
+                        )
+                    pointcloud = resolved["segment_handle"].load_pointcloud()
+                    self._validate_required_knn_payload(
+                        pointcloud=pointcloud,
+                        knn_init=knn_init,
+                        scene_id=int(scene_id),
+                        segment_id=int(segment_id),
+                        context="initialize/_validate_training_assets",
+                    )
 
     def initialize(self) -> None:
         self._validate_training_assets()
@@ -538,10 +752,26 @@ class MultiSceneDatasetV4:
             segment_pose = segment_handle.load_segment_pose()
             pointcloud = segment_handle.load_pointcloud()
             dynamic_tracks = segment_handle.load_dynamic_tracks()
+            knn_init = segment_handle.load_knn_init()
             pointcloud, dynamic_tracks = self._reconcile_dynamic_payloads(
                 pointcloud=pointcloud,
                 dynamic_tracks=dynamic_tracks,
             )
+            if self._knn_requirements.enabled:
+                if not isinstance(knn_init, dict):
+                    raise ValueError(
+                        "KNN scale init is required by model config, but segment knn_init asset is missing: "
+                        f"(dataset={ds_name} scene_id={int(scene_id)} segment_id={int(segment_id)} "
+                        f"branches={self._knn_required_branches_label()}). "
+                        "Run tools/build_streetforward_segment_knn_assets.py before training."
+                    )
+                self._validate_required_knn_payload(
+                    pointcloud=pointcloud,
+                    knn_init=knn_init,
+                    scene_id=int(scene_id),
+                    segment_id=int(segment_id),
+                    context="_resolve_segment_bundle/pre_downsample",
+                )
             sidx = self._build_segment_index_from_asset_payload(segment_payload)
 
             asset_aabb = segment_manifest.get("segment_aabb")
@@ -558,9 +788,22 @@ class MultiSceneDatasetV4:
                     f"config={self.segment_aabb.tolist()} asset={segment_aabb.tolist()}"
                 )
 
-            pc_rt = self._cfg_get(self.dataset_cfg, "pointcloud")
-            if pc_rt is not None and OmegaConf.is_config(pc_rt):
-                pc_rt = OmegaConf.to_container(pc_rt, resolve=True)
+            pc_rt = self._runtime_pointcloud_cfg
+            if isinstance(pc_rt, dict) and knn_init is not None:
+                asset_pc = segment_manifest.get("pointcloud_config_normalized")
+                if not isinstance(asset_pc, dict):
+                    raise ValueError(
+                        "KNN init requires segment manifest pointcloud_config_normalized for cap alignment checks, "
+                        f"but it is missing/invalid (scene_id={int(scene_id)} segment_id={int(segment_id)})"
+                    )
+                if _pointcloud_cap_triplet_differs(asset_pc, pc_rt):
+                    raise ValueError(
+                        "KNN init requires runtime pointcloud caps to match exported asset caps. "
+                        f"(scene_id={int(scene_id)} segment_id={int(segment_id)} "
+                        f"asset_caps={_extract_pointcloud_caps(asset_pc)} "
+                        f"runtime_caps={_extract_pointcloud_caps(pc_rt)}). "
+                        "Re-export segment KNN assets with the current pointcloud config."
+                    )
             if isinstance(pc_rt, dict):
                 pointcloud = _apply_runtime_random_pointcloud_downsample(
                     pointcloud=pointcloud,
@@ -568,6 +811,21 @@ class MultiSceneDatasetV4:
                     segment_aabb=segment_aabb,
                     runtime_pc=pc_rt,
                 )
+
+            if knn_init is not None:
+                bg_knn_map = knn_init.get("background_avg_dist_by_k", {})
+                if isinstance(bg_knn_map, dict) and len(bg_knn_map) > 0:
+                    any_bg_knn = next(iter(bg_knn_map.values()))
+                    bg_count_knn = int(np.asarray(any_bg_knn).reshape(-1).shape[0])
+                    bg_count_pc = int(np.asarray(pointcloud.get("background", np.zeros((0, 6), dtype=np.float32)).shape[0]))
+                    if bg_count_knn != bg_count_pc:
+                        raise ValueError(
+                            "KNN init background length mismatch with runtime pointcloud. "
+                            f"(scene_id={int(scene_id)} segment_id={int(segment_id)} "
+                            f"knn_background_points={int(bg_count_knn)} "
+                            f"runtime_background_points={int(bg_count_pc)}). "
+                            "KNN row alignment is required; re-export segment KNN assets with the current pointcloud config."
+                        )
 
             bundle = SegmentStaticBundle(
                 segment_asset_id=str(segment_manifest["asset_id"]),
@@ -577,6 +835,7 @@ class MultiSceneDatasetV4:
                 segment_pose=segment_pose,
                 pointcloud=pointcloud,
                 dynamic_tracks=dynamic_tracks,
+                knn_init=knn_init,
             )
             with self._lock:
                 cached = self._cache_set(
@@ -1153,7 +1412,9 @@ class MultiSceneDatasetV4:
         all_frames = set(source["frame_indices"].tolist()) | set(target["frame_indices"].tolist())
 
         pointcloud = bundle.pointcloud
+        knn_init = bundle.knn_init
         dynamic_info = None
+        visible_intids_in_batch: set[int] = set()
         dynamic_points = pointcloud.get("dynamic")
         if isinstance(dynamic_points, dict) and len(dynamic_points) > 0:
             if not bundle.dynamic_tracks:
@@ -1165,7 +1426,6 @@ class MultiSceneDatasetV4:
             )
             # Keep pointcloud.dynamic aligned with the current batch frame window.
             # Some segments contain dynamic instances that are only visible in other frames.
-            visible_intids_in_batch: set[int] = set()
             if dynamic_info is not None:
                 for frame_obj in dynamic_info.values():
                     instances = frame_obj.get("instances", {})
@@ -1180,6 +1440,61 @@ class MultiSceneDatasetV4:
                     for intid in sorted(visible_intids_in_batch)
                     if int(intid) in dynamic_points
                 }
+
+        knn_init_batch: Optional[Dict[str, Any]] = None
+        if knn_init is not None:
+            bg_map_raw = knn_init.get("background_avg_dist_by_k", {})
+            if not isinstance(bg_map_raw, dict):
+                raise ValueError("knn_init.background_avg_dist_by_k must be a dict")
+            bg_count = int(np.asarray(pointcloud.get("background", np.zeros((0, 6), dtype=np.float32)).shape[0]))
+            bg_map: Dict[int, np.ndarray] = {}
+            for k, arr in bg_map_raw.items():
+                k_i = int(k)
+                arr_np = np.asarray(arr, dtype=np.float32).reshape(-1)
+                if int(arr_np.shape[0]) != int(bg_count):
+                    raise ValueError(
+                        "knn_init background length mismatch with runtime pointcloud: "
+                        f"k={k_i} knn_len={arr_np.shape[0]} bg_count={bg_count}"
+                    )
+                bg_map[k_i] = arr_np
+
+            dyn_map_raw = knn_init.get("dynamic_avg_dist_by_k", {})
+            if not isinstance(dyn_map_raw, dict):
+                raise ValueError("knn_init.dynamic_avg_dist_by_k must be a dict")
+            dyn_points_now = pointcloud.get("dynamic", {})
+            dyn_ids_now = (
+                sorted(int(x) for x in dyn_points_now.keys())
+                if isinstance(dyn_points_now, dict)
+                else []
+            )
+            dyn_map: Dict[int, Dict[int, np.ndarray]] = {}
+            for k, per_instance in dyn_map_raw.items():
+                k_i = int(k)
+                if not isinstance(per_instance, dict):
+                    raise ValueError(f"knn_init.dynamic_avg_dist_by_k[{k_i}] must be a dict[intid -> np.ndarray]")
+                out_per: Dict[int, np.ndarray] = {}
+                for intid in dyn_ids_now:
+                    if intid not in per_instance:
+                        raise ValueError(
+                            f"knn_init missing dynamic instance {intid} for k={k_i}"
+                        )
+                    arr_np = np.asarray(per_instance[intid], dtype=np.float32).reshape(-1)
+                    pts = np.asarray(dyn_points_now[intid], dtype=np.float32)
+                    if pts.ndim != 2 or pts.shape[1] < 3:
+                        raise ValueError(
+                            f"pointcloud.dynamic[{intid}] must have shape [N,>=3], got {tuple(pts.shape)}"
+                        )
+                    if int(arr_np.shape[0]) != int(pts.shape[0]):
+                        raise ValueError(
+                            "knn_init dynamic length mismatch with runtime pointcloud: "
+                            f"k={k_i} intid={intid} knn_len={arr_np.shape[0]} pts={pts.shape[0]}"
+                        )
+                    out_per[int(intid)] = arr_np
+                dyn_map[k_i] = out_per
+            knn_init_batch = {
+                "background_avg_dist_by_k": bg_map,
+                "dynamic_avg_dist_by_k": dyn_map,
+            }
 
         batch: Dict[str, Any] = {
             "scene_id": torch.tensor([int(scene_id)], dtype=torch.long),
@@ -1201,6 +1516,8 @@ class MultiSceneDatasetV4:
         }
         if dynamic_info is not None:
             batch["dynamic_info"] = dynamic_info
+        if knn_init_batch is not None:
+            batch["knn_init"] = knn_init_batch
 
         if include_test:
             resolved = [tuple(r) for r in (test_image_refs or self._resolve_test_image_refs(sidx))]

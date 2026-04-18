@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import heapq
 import itertools
+import logging
 import threading
 import time
 from dataclasses import dataclass
@@ -22,6 +23,8 @@ PRIORITY_SEGMENT_STATIC = -2
 PRIORITY_NEXT_BLOCK_EXACT = 0
 PRIORITY_TEST_REFS = 1
 PRIORITY_EPISODE_SUPERSET = 10
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -438,6 +441,14 @@ class AssetPreloadManagerV2:
                     raise ValueError(f"unknown preload task kind={task_kind}")
             except Exception:
                 ok = False
+                logger.exception(
+                    "Asset preload task failed (task_kind=%s scene_id=%s segment_id=%s image_ref=%s meta=%s)",
+                    int(task_kind),
+                    int(scene_id),
+                    int(segment_id),
+                    tuple(image_ref),
+                    dict(meta or {}),
+                )
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
             self._bump_stat("tasks_completed", 1)
             self._bump_stat("total_latency_ms", elapsed_ms)

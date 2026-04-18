@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -194,6 +195,138 @@ def stable_segment_asset_id_suffix(
     return h.hexdigest()[:8]
 
 
+def _serialize_knn_init_payload(payload: Dict[str, Any]) -> Dict[str, np.ndarray]:
+    bg_map_raw = payload.get("background_avg_dist_by_k", {})
+    dyn_map_raw = payload.get("dynamic_avg_dist_by_k", {})
+    if not isinstance(bg_map_raw, dict):
+        raise ValueError("knn payload field background_avg_dist_by_k must be a dict")
+    if not isinstance(dyn_map_raw, dict):
+        raise ValueError("knn payload field dynamic_avg_dist_by_k must be a dict")
+
+    bg_ks = sorted(int(k) for k in bg_map_raw.keys())
+    dyn_ks = sorted(int(k) for k in dyn_map_raw.keys())
+
+    arrays: Dict[str, np.ndarray] = {
+        "schema_version": np.asarray([1], dtype=np.int32),
+        "background_ks": np.asarray(bg_ks, dtype=np.int32),
+        "dynamic_ks": np.asarray(dyn_ks, dtype=np.int32),
+    }
+
+    bg_count: Optional[int] = None
+    for k in bg_ks:
+        arr = np.asarray(bg_map_raw[k]).astype(np.float32, copy=False).reshape(-1)
+        if bg_count is None:
+            bg_count = int(arr.shape[0])
+        elif int(arr.shape[0]) != int(bg_count):
+            raise ValueError(
+                "all background kNN arrays must share the same length; "
+                f"got {arr.shape[0]} vs {bg_count} for k={k}"
+            )
+        arrays[f"background_avg_dist_k{k}"] = arr
+
+    dynamic_instance_intids: List[int] = []
+    for k in dyn_ks:
+        m = dyn_map_raw[k]
+        if not isinstance(m, dict):
+            raise ValueError(f"dynamic_avg_dist_by_k[{k}] must be a dict[intid -> np.ndarray]")
+        ids = sorted(int(x) for x in m.keys())
+        if not dynamic_instance_intids:
+            dynamic_instance_intids = ids
+        elif ids != dynamic_instance_intids:
+            raise ValueError(
+                f"dynamic instance id sets must match across k values; expected={dynamic_instance_intids}, got={ids}"
+            )
+
+    offsets: List[int] = [0]
+    for intid in dynamic_instance_intids:
+        first_arr: Optional[np.ndarray] = None
+        for k in dyn_ks:
+            arr = np.asarray(dyn_map_raw[k][int(intid)]).astype(np.float32, copy=False).reshape(-1)
+            if first_arr is None:
+                first_arr = arr
+            elif int(arr.shape[0]) != int(first_arr.shape[0]):
+                raise ValueError(
+                    f"dynamic instance {intid} has inconsistent point count across k values: "
+                    f"{arr.shape[0]} vs {first_arr.shape[0]}"
+                )
+        offsets.append(offsets[-1] + (int(first_arr.shape[0]) if first_arr is not None else 0))
+
+    arrays["dynamic_instance_intids"] = np.asarray(dynamic_instance_intids, dtype=np.int32)
+    arrays["dynamic_offsets"] = np.asarray(offsets, dtype=np.int64)
+
+    for k in dyn_ks:
+        parts: List[np.ndarray] = []
+        for intid in dynamic_instance_intids:
+            arr = np.asarray(dyn_map_raw[k][int(intid)]).astype(np.float32, copy=False).reshape(-1)
+            parts.append(arr)
+        concat = (
+            np.concatenate(parts, axis=0).astype(np.float32, copy=False)
+            if parts
+            else np.zeros((0,), dtype=np.float32)
+        )
+        arrays[f"dynamic_avg_dist_k{k}"] = concat
+    return arrays
+
+
+def _deserialize_knn_init_payload(raw: Dict[str, np.ndarray]) -> Dict[str, Any]:
+    version_raw = np.asarray(raw.get("schema_version", np.asarray([1], dtype=np.int32))).reshape(-1)
+    if int(version_raw[0]) != 1:
+        raise ValueError(f"Unsupported knn_init schema_version={int(version_raw[0])}, expected 1")
+
+    bg_ks = [int(x) for x in np.asarray(raw.get("background_ks", np.zeros((0,), dtype=np.int32))).tolist()]
+    dyn_ks = [int(x) for x in np.asarray(raw.get("dynamic_ks", np.zeros((0,), dtype=np.int32))).tolist()]
+
+    background_avg_dist_by_k: Dict[int, np.ndarray] = {}
+    bg_count: Optional[int] = None
+    for k in bg_ks:
+        key = f"background_avg_dist_k{k}"
+        if key not in raw:
+            raise ValueError(f"knn_init missing required key: {key}")
+        arr = np.asarray(raw[key]).astype(np.float32, copy=False).reshape(-1)
+        if bg_count is None:
+            bg_count = int(arr.shape[0])
+        elif int(arr.shape[0]) != int(bg_count):
+            raise ValueError(
+                f"background kNN array length mismatch for k={k}: {arr.shape[0]} vs {bg_count}"
+            )
+        background_avg_dist_by_k[int(k)] = arr
+
+    intids = np.asarray(raw.get("dynamic_instance_intids", np.zeros((0,), dtype=np.int32))).astype(np.int32, copy=False)
+    offsets = np.asarray(raw.get("dynamic_offsets", np.zeros((1,), dtype=np.int64))).astype(np.int64, copy=False)
+    if offsets.ndim != 1 or int(offsets.shape[0]) != int(intids.shape[0]) + 1:
+        raise ValueError(
+            "knn_init dynamic_offsets shape mismatch: "
+            f"expected len={int(intids.shape[0]) + 1}, got {tuple(offsets.shape)}"
+        )
+    if int(offsets[0]) != 0:
+        raise ValueError("knn_init dynamic_offsets must start at 0")
+    if np.any(offsets[1:] < offsets[:-1]):
+        raise ValueError("knn_init dynamic_offsets must be non-decreasing")
+
+    dynamic_avg_dist_by_k: Dict[int, Dict[int, np.ndarray]] = {}
+    total = int(offsets[-1])
+    for k in dyn_ks:
+        key = f"dynamic_avg_dist_k{k}"
+        if key not in raw:
+            raise ValueError(f"knn_init missing required key: {key}")
+        concat = np.asarray(raw[key]).astype(np.float32, copy=False).reshape(-1)
+        if int(concat.shape[0]) != int(total):
+            raise ValueError(
+                f"knn_init {key} length mismatch: expected {total}, got {concat.shape[0]}"
+            )
+        per_instance: Dict[int, np.ndarray] = {}
+        for i, intid in enumerate(intids.tolist()):
+            lo = int(offsets[i])
+            hi = int(offsets[i + 1])
+            per_instance[int(intid)] = concat[lo:hi]
+        dynamic_avg_dist_by_k[int(k)] = per_instance
+
+    return {
+        "background_avg_dist_by_k": background_avg_dist_by_k,
+        "dynamic_avg_dist_by_k": dynamic_avg_dist_by_k,
+    }
+
+
 @dataclass(frozen=True)
 class SegmentAssetHandle:
     asset_dir: Path
@@ -295,6 +428,18 @@ class SegmentAssetHandle:
             "static_instance_intids": np.asarray(raw["static_instance_intids"]).astype(np.int32, copy=False),
         }
 
+    def has_knn_init(self) -> bool:
+        self._require_ready()
+        return (self.asset_dir / "knn_init.npz").exists()
+
+    def load_knn_init(self) -> Optional[Dict[str, Any]]:
+        self._require_ready()
+        path = self.asset_dir / "knn_init.npz"
+        if not path.exists():
+            return None
+        raw = read_npz(path)
+        return _deserialize_knn_init_payload(raw)
+
 
 @dataclass(frozen=True)
 class SceneAssetHandle:
@@ -364,6 +509,13 @@ class StreetForwardAssetStore:
         if self._resolve_segment_asset_id_from_registry(dataset, scene_id, segment_id) is not None:
             return True
         return self._resolve_segment_dir(dataset, scene_id, segment_id) is not None
+
+    def has_segment_knn_init_asset(self, dataset: str, scene_id: int, segment_id: int) -> bool:
+        try:
+            handle = self.get_segment_asset_registry_first(dataset, scene_id, segment_id)
+        except ValueError:
+            return False
+        return handle.has_knn_init()
 
     def get_scene_asset(self, dataset: str, scene_id: int) -> SceneAssetHandle:
         scene_asset_id = self._resolve_scene_asset_id_from_scene_registry(dataset, scene_id)
@@ -822,3 +974,33 @@ class StreetForwardAssetStore:
         )
         self._registry_cache.pop("segment_registry.parquet", None)
         return asset_id
+
+    def export_segment_knn_init_asset(
+        self,
+        *,
+        dataset: str,
+        scene_id: int,
+        segment_id: int,
+        knn_payload: Dict[str, Any],
+        overwrite: bool = False,
+    ) -> bool:
+        """
+        Export precomputed kNN init payload into an existing segment asset directory.
+
+        Returns True when a new file is written, False when skipped due to existing file and overwrite=False.
+        """
+        handle = self.get_segment_asset_registry_first(str(dataset), int(scene_id), int(segment_id))
+        final_path = handle.asset_dir / "knn_init.npz"
+        if final_path.exists() and not bool(overwrite):
+            return False
+
+        arrays = _serialize_knn_init_payload(knn_payload)
+        tmp_name = f"{final_path.name}.tmp.{os.getpid()}.{time.time_ns()}"
+        tmp_path = self.tmp_dir / tmp_name
+        try:
+            write_npz(tmp_path, arrays)
+            os.replace(str(tmp_path), str(final_path))
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        return True
