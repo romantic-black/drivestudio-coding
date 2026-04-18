@@ -50,6 +50,8 @@ _V4_CACHE_MAX_ITEM_KEYS = (
     "view_pack_cache_max_items",
 )
 
+_EGO_MASK_MISSING = object()
+
 
 @dataclass(frozen=True)
 class SegmentIndexV4:
@@ -255,7 +257,12 @@ class MultiSceneDatasetV4:
         pixel_source_cfg = self._cfg_get(self.data_cfg, "pixel_source", {}) or {}
         self._load_sky_mask = bool(self._cfg_get(pixel_source_cfg, "load_sky_mask", False))
         self._load_dynamic_mask = bool(self._cfg_get(pixel_source_cfg, "load_dynamic_mask", False))
+        self._load_egocar_mask = bool(self._cfg_get(pixel_source_cfg, "load_egocar_mask", True))
         self._sky_mask_loader_semantics = self._parse_sky_mask_semantics()
+        self._pixel_source_cameras: List[int] = [int(x) for x in list(self._cfg_get(pixel_source_cfg, "cameras", []) or [])]
+        self._egocar_mask_cache: "OrderedDict[Tuple[str, int, int, int], Any]" = OrderedDict()
+        self._egocar_mask_cache_max_items = 64
+        self._egocar_missing_warned: set[Tuple[str, int]] = set()
 
         (
             self._scene_asset_cache_max_items,
@@ -777,6 +784,66 @@ class MultiSceneDatasetV4:
             mask = (mask > 0.0).float()
         return mask
 
+    def _resolve_egocar_mask_path(self, cam_id: int) -> Optional[Path]:
+        ds_name = self._asset_dataset_name()
+        candidates: List[int] = [int(cam_id)]
+        # Some pipelines store cam indices as slot indices into pixel_source.cameras.
+        if 0 <= int(cam_id) < len(self._pixel_source_cameras):
+            mapped_cam_id = int(self._pixel_source_cameras[int(cam_id)])
+            if mapped_cam_id not in candidates:
+                candidates.append(mapped_cam_id)
+        for cid in candidates:
+            p = Path("data") / "ego_masks" / ds_name / f"{int(cid)}.png"
+            if p.exists():
+                return p
+        return None
+
+    def _load_egocar_mask_for_view(self, cam_id: int, height: int, width: int) -> Optional[Tensor]:
+        if not self._load_egocar_mask:
+            return None
+        key = (self._asset_dataset_name(), int(cam_id), int(height), int(width))
+        with self._lock:
+            cached = self._cache_get(self._egocar_mask_cache, key)
+        if cached is _EGO_MASK_MISSING:
+            return None
+        if torch.is_tensor(cached):
+            return cached
+
+        path = self._resolve_egocar_mask_path(int(cam_id))
+        if path is None:
+            ds_name = self._asset_dataset_name()
+            warn_key = (ds_name, int(cam_id))
+            with self._lock:
+                if warn_key not in self._egocar_missing_warned:
+                    self._egocar_missing_warned.add(warn_key)
+                    logger.warning(
+                        "No egocar mask template for dataset=%s cam_id=%d. "
+                        "Expected file under data/ego_masks/%s/{cam_id}.png; "
+                        "ego suppression for this camera will be disabled.",
+                        ds_name,
+                        int(cam_id),
+                        ds_name,
+                    )
+            with self._lock:
+                self._cache_set(
+                    self._egocar_mask_cache,
+                    key,
+                    _EGO_MASK_MISSING,
+                    max_items=self._egocar_mask_cache_max_items,
+                )
+            return None
+
+        mask = self._load_mask_from_asset_path(str(path), int(height), int(width))
+        mask = (mask > 0.5).float()
+        with self._lock:
+            self._cache_set(
+                self._egocar_mask_cache,
+                key,
+                mask,
+                max_items=self._egocar_mask_cache_max_items,
+            )
+        return mask
+
     @staticmethod
     def _normalize_sky_mask(mask: Tensor, semantics: str) -> Tensor:
         return normalize_sky_mask_to_one_is_sky((mask > 0.5).float(), semantics)
@@ -845,6 +912,7 @@ class MultiSceneDatasetV4:
         dynamic_mask = None
         if self._load_dynamic_mask and dynamic_mask_path:
             dynamic_mask = self._load_mask_from_asset_path(dynamic_mask_path, height, width)
+        egocar_mask = self._load_egocar_mask_for_view(int(image_ref[1]), height, width)
 
         viewdirs = self._compute_viewdirs(
             height,
@@ -861,7 +929,7 @@ class MultiSceneDatasetV4:
             "sky_mask": sky_mask,
             "viewdirs": viewdirs,
             "dynamic_mask": dynamic_mask,
-            "egocar_mask": None,
+            "egocar_mask": egocar_mask,
             "frame_idx": int(image_ref[0]),
             "cam_idx": int(image_ref[1]),
         }

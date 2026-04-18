@@ -21,6 +21,7 @@ data:
     max_test_images: 0
     load_sky_mask: true
     load_dynamic_mask: true
+    load_egocar_mask: true
     load_depth_maps: true
     load_objects: true
     load_smpl: false

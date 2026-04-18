@@ -37,6 +37,7 @@ data:
     undistort: false
     load_sky_mask: true
     load_dynamic_mask: true
+    load_egocar_mask: true
     load_depth_maps: true
     load_objects: true
     load_smpl: false
@@ -221,4 +222,3 @@ logging:
     enable: false
     phase_timing: true
     cuda_memory: false
-
