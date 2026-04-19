@@ -188,31 +188,38 @@ def _make_cap_downsample_rng(segment_manifest: Dict[str, Any], runtime_pc: Dict[
     return np.random.default_rng(seed)
 
 
-def _random_subset_rows(arr: np.ndarray, max_count: Optional[int], rng: np.random.Generator) -> np.ndarray:
-    if max_count is None:
-        return arr
+def _random_subset_rows_with_local_indices(
+    arr: np.ndarray, max_count: Optional[int], rng: np.random.Generator
+) -> Tuple[np.ndarray, np.ndarray]:
     n = int(arr.shape[0])
+    all_idx = np.arange(n, dtype=np.int64)
+    if max_count is None:
+        return arr, all_idx
     if n == 0:
-        return arr
+        return arr, all_idx
     m = int(max_count)
     if m <= 0:
         raise ValueError("max_count must be > 0 when set")
     if n <= m:
-        return arr
+        return arr, all_idx
     idx = rng.choice(n, size=m, replace=False)
     idx.sort()
-    return arr[idx].astype(np.float32, copy=False)
+    return arr[idx].astype(np.float32, copy=False), np.asarray(idx, dtype=np.int64)
 
 
-def _split_background_near_distant(background: np.ndarray, segment_aabb: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def _split_background_near_distant(
+    background: np.ndarray, segment_aabb: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     seg_aabb = np.asarray(segment_aabb, dtype=np.float32).reshape(2, 3)
     crop_min = seg_aabb[0]
     crop_max = seg_aabb[1]
     xyz = background[:, :3].astype(np.float32, copy=False)
     in_crop = ((xyz >= crop_min[None, :]) & (xyz <= crop_max[None, :])).all(axis=1)
-    near = background[in_crop]
-    distant = background[~in_crop]
-    return near, distant
+    near_idx = np.where(in_crop)[0].astype(np.int64, copy=False)
+    distant_idx = np.where(~in_crop)[0].astype(np.int64, copy=False)
+    near = background[near_idx]
+    distant = background[distant_idx]
+    return near, distant, near_idx, distant_idx
 
 
 def _apply_runtime_random_pointcloud_downsample(
@@ -221,43 +228,95 @@ def _apply_runtime_random_pointcloud_downsample(
     segment_manifest: Dict[str, Any],
     segment_aabb: Tensor,
     runtime_pc: Dict[str, Any],
-) -> Dict[str, Any]:
+    knn_init: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
     asset_pc = segment_manifest.get("pointcloud_config_normalized")
     if not isinstance(asset_pc, dict):
-        return pointcloud
+        return pointcloud, knn_init
     if not _pointcloud_cap_triplet_differs(asset_pc, runtime_pc):
-        return pointcloud
+        return pointcloud, knn_init
 
     r_near = _cap_int_or_none(runtime_pc, "near_max_points")
     r_distant = _cap_int_or_none(runtime_pc, "distant_max_points")
     r_mono = _cap_int_or_none(runtime_pc, "monocular_dynamic_recovery_max_points_per_instance")
     if r_near is None and r_distant is None and r_mono is None:
-        return pointcloud
+        return pointcloud, knn_init
 
     rng = _make_cap_downsample_rng(segment_manifest, runtime_pc)
     out = dict(pointcloud)
+    knn_out = dict(knn_init) if isinstance(knn_init, dict) else knn_init
     aabb_np = segment_aabb.detach().cpu().numpy() if torch.is_tensor(segment_aabb) else np.asarray(segment_aabb)
 
-    bg = np.asarray(out.get("background"), dtype=np.float32)
-    if bg.size > 0:
-        near, distant = _split_background_near_distant(bg, aabb_np)
-        near = _random_subset_rows(near, r_near, rng)
-        distant = _random_subset_rows(distant, r_distant, rng)
+    bg_orig = np.asarray(out.get("background"), dtype=np.float32)
+    if bg_orig.size > 0:
+        near, distant, near_idx, distant_idx = _split_background_near_distant(bg_orig, aabb_np)
+        near, near_local_idx = _random_subset_rows_with_local_indices(near, r_near, rng)
+        distant, distant_local_idx = _random_subset_rows_with_local_indices(distant, r_distant, rng)
+        selected_bg_idx_parts: List[np.ndarray] = []
+        if int(near_local_idx.shape[0]) > 0:
+            selected_bg_idx_parts.append(near_idx[near_local_idx])
+        if int(distant_local_idx.shape[0]) > 0:
+            selected_bg_idx_parts.append(distant_idx[distant_local_idx])
+        selected_bg_idx = (
+            np.concatenate(selected_bg_idx_parts, axis=0).astype(np.int64, copy=False)
+            if selected_bg_idx_parts
+            else np.zeros((0,), dtype=np.int64)
+        )
         if near.size == 0 and distant.size == 0:
             out["background"] = np.zeros((0, 6), dtype=np.float32)
         else:
             out["background"] = np.concatenate([near, distant], axis=0).astype(np.float32, copy=False)
+        if isinstance(knn_out, dict):
+            bg_map_raw = knn_out.get("background_avg_dist_by_k", {})
+            if not isinstance(bg_map_raw, dict):
+                raise ValueError("knn_init.background_avg_dist_by_k must be a dict")
+            new_bg_map: Dict[int, np.ndarray] = {}
+            for k, arr in bg_map_raw.items():
+                arr_np = np.asarray(arr, dtype=np.float32).reshape(-1)
+                if int(arr_np.shape[0]) != int(bg_orig.shape[0]):
+                    raise ValueError(
+                        "knn_init background length mismatch before runtime downsample: "
+                        f"k={int(k)} knn_len={arr_np.shape[0]} bg_points={bg_orig.shape[0]}"
+                    )
+                new_bg_map[int(k)] = arr_np[selected_bg_idx]
+            knn_out["background_avg_dist_by_k"] = new_bg_map
 
     dyn = out.get("dynamic")
     if isinstance(dyn, dict) and len(dyn) > 0 and r_mono is not None:
         new_dyn: Dict[int, np.ndarray] = {}
+        dyn_selected_local_idx: Dict[int, np.ndarray] = {}
+        dyn_orig_sizes: Dict[int, int] = {}
         for intid, pts in dyn.items():
             arr = np.asarray(pts, dtype=np.float32)
-            if arr.size == 0:
-                new_dyn[int(intid)] = arr
-            else:
-                new_dyn[int(intid)] = _random_subset_rows(arr, r_mono, rng)
+            sub, local_idx = _random_subset_rows_with_local_indices(arr, r_mono, rng)
+            new_dyn[int(intid)] = sub
+            dyn_selected_local_idx[int(intid)] = local_idx
+            dyn_orig_sizes[int(intid)] = int(arr.shape[0])
         out["dynamic"] = new_dyn
+        if isinstance(knn_out, dict):
+            dyn_map_raw = knn_out.get("dynamic_avg_dist_by_k", {})
+            if not isinstance(dyn_map_raw, dict):
+                raise ValueError("knn_init.dynamic_avg_dist_by_k must be a dict")
+            new_dyn_map: Dict[int, Dict[int, np.ndarray]] = {}
+            for k, per_instance_raw in dyn_map_raw.items():
+                if not isinstance(per_instance_raw, dict):
+                    raise ValueError(f"knn_init.dynamic_avg_dist_by_k[{int(k)}] must be a dict[intid -> np.ndarray]")
+                per_instance = {int(i): v for i, v in per_instance_raw.items()}
+                out_per: Dict[int, np.ndarray] = {}
+                for intid, local_idx in dyn_selected_local_idx.items():
+                    if intid not in per_instance:
+                        raise ValueError(
+                            f"knn_init missing dynamic instance {intid} during runtime downsample alignment for k={int(k)}"
+                        )
+                    arr_np = np.asarray(per_instance[intid], dtype=np.float32).reshape(-1)
+                    if int(arr_np.shape[0]) != int(dyn_orig_sizes[intid]):
+                        raise ValueError(
+                            "knn_init dynamic length mismatch before runtime downsample: "
+                            f"k={int(k)} intid={intid} knn_len={arr_np.shape[0]} dyn_points={dyn_orig_sizes[intid]}"
+                        )
+                    out_per[intid] = arr_np[local_idx]
+                new_dyn_map[int(k)] = out_per
+            knn_out["dynamic_avg_dist_by_k"] = new_dyn_map
 
     ds_name = segment_manifest.get("dataset")
     scene_id = segment_manifest.get("scene_id")
@@ -270,7 +329,7 @@ def _apply_runtime_random_pointcloud_downsample(
         seg_id,
         segment_manifest.get("asset_id"),
     )
-    return out
+    return out, knn_out
 
 
 class MultiSceneDatasetV4:
@@ -663,12 +722,6 @@ class MultiSceneDatasetV4:
                         f"expected=({scene_id},{segment_id}) got=({seg_idx['scene_id']},{seg_idx['segment_id']})"
                     )
                 if self._knn_requirements.enabled:
-                    self._assert_knn_runtime_caps_match(
-                        segment_manifest=segment_manifest,
-                        scene_id=int(scene_id),
-                        segment_id=int(segment_id),
-                        context="initialize/_validate_training_assets",
-                    )
                     knn_init = resolved["segment_handle"].load_knn_init()
                     if not isinstance(knn_init, dict):
                         raise ValueError(
@@ -789,27 +842,13 @@ class MultiSceneDatasetV4:
                 )
 
             pc_rt = self._runtime_pointcloud_cfg
-            if isinstance(pc_rt, dict) and knn_init is not None:
-                asset_pc = segment_manifest.get("pointcloud_config_normalized")
-                if not isinstance(asset_pc, dict):
-                    raise ValueError(
-                        "KNN init requires segment manifest pointcloud_config_normalized for cap alignment checks, "
-                        f"but it is missing/invalid (scene_id={int(scene_id)} segment_id={int(segment_id)})"
-                    )
-                if _pointcloud_cap_triplet_differs(asset_pc, pc_rt):
-                    raise ValueError(
-                        "KNN init requires runtime pointcloud caps to match exported asset caps. "
-                        f"(scene_id={int(scene_id)} segment_id={int(segment_id)} "
-                        f"asset_caps={_extract_pointcloud_caps(asset_pc)} "
-                        f"runtime_caps={_extract_pointcloud_caps(pc_rt)}). "
-                        "Re-export segment KNN assets with the current pointcloud config."
-                    )
             if isinstance(pc_rt, dict):
-                pointcloud = _apply_runtime_random_pointcloud_downsample(
+                pointcloud, knn_init = _apply_runtime_random_pointcloud_downsample(
                     pointcloud=pointcloud,
                     segment_manifest=segment_manifest,
                     segment_aabb=segment_aabb,
                     runtime_pc=pc_rt,
+                    knn_init=knn_init,
                 )
 
             if knn_init is not None:

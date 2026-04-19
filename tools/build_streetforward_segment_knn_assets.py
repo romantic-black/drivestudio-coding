@@ -40,6 +40,15 @@ def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
     return getattr(cfg, key, default)
 
 
+def _expand_topk_ks(requested_ks: Sequence[int]) -> List[int]:
+    if len(requested_ks) == 0:
+        return []
+    k_max = max(int(x) for x in requested_ks)
+    if k_max <= 0:
+        raise ValueError(f"knn_k must be > 0, got {k_max}")
+    return list(range(1, int(k_max) + 1))
+
+
 def _resolve_knn_modes(cfg: Any) -> Tuple[List[int], List[int], Dict[str, int]]:
     model_cfg = _cfg_get(cfg, "model")
     branches = _cfg_get(model_cfg, "branches")
@@ -72,19 +81,29 @@ def _resolve_knn_modes(cfg: Any) -> Tuple[List[int], List[int], Dict[str, int]]:
     return bg_distant_ks, rigid_ks, branch_k
 
 
-def _avg_knn_distance(points_xyz: np.ndarray, k: int) -> np.ndarray:
+def _avg_knn_distance_prefix(points_xyz: np.ndarray, max_k: int) -> Dict[int, np.ndarray]:
     pts = np.asarray(points_xyz, dtype=np.float32).reshape(-1, 3)
     n = int(pts.shape[0])
+    k_max = int(max_k)
+    if k_max <= 0:
+        raise ValueError(f"max_k must be > 0, got {k_max}")
     if n == 0:
-        return np.zeros((0,), dtype=np.float32)
+        return {k: np.zeros((0,), dtype=np.float32) for k in range(1, k_max + 1)}
     if n == 1:
-        return np.ones((1,), dtype=np.float32)
-    k_eff = min(max(int(k), 1), n - 1)
-    nn = NearestNeighbors(n_neighbors=k_eff + 1, algorithm="auto", metric="euclidean")
+        return {k: np.ones((1,), dtype=np.float32) for k in range(1, k_max + 1)}
+
+    k_eff_max = min(k_max, n - 1)
+    nn = NearestNeighbors(n_neighbors=k_eff_max + 1, algorithm="auto", metric="euclidean")
     nn.fit(pts)
     dists, _ = nn.kneighbors(pts)
-    avg = dists[:, 1:].mean(axis=1)
-    return np.asarray(avg, dtype=np.float32)
+    d = np.asarray(dists[:, 1:], dtype=np.float32)  # [N, k_eff_max]
+    csum = np.cumsum(d, axis=1)  # [N, k_eff_max]
+
+    out: Dict[int, np.ndarray] = {}
+    for k in range(1, k_max + 1):
+        k_eff = min(int(k), n - 1)
+        out[int(k)] = (csum[:, k_eff - 1] / float(k_eff)).astype(np.float32, copy=False)
+    return out
 
 
 def _build_knn_payload_from_pointcloud(
@@ -98,8 +117,11 @@ def _build_knn_payload_from_pointcloud(
         raise ValueError(f"pointcloud.background must have shape [N,>=3], got {tuple(background.shape)}")
     bg_xyz = background[:, :3].astype(np.float32, copy=False)
     background_avg_dist_by_k: Dict[int, np.ndarray] = {}
-    for k in sorted(int(x) for x in bg_distant_ks):
-        background_avg_dist_by_k[int(k)] = _avg_knn_distance(bg_xyz, int(k))
+    bg_ks_sorted = sorted(int(x) for x in bg_distant_ks)
+    if len(bg_ks_sorted) > 0:
+        bg_prefix = _avg_knn_distance_prefix(bg_xyz, max_k=max(bg_ks_sorted))
+        for k in bg_ks_sorted:
+            background_avg_dist_by_k[int(k)] = bg_prefix[int(k)]
 
     dynamic_raw = pointcloud.get("dynamic", {})
     if not isinstance(dynamic_raw, dict):
@@ -107,21 +129,51 @@ def _build_knn_payload_from_pointcloud(
     dynamic_instance_ids = sorted(int(x) for x in dynamic_raw.keys())
 
     dynamic_avg_dist_by_k: Dict[int, Dict[int, np.ndarray]] = {}
-    for k in sorted(int(x) for x in rigid_ks):
-        per_instance: Dict[int, np.ndarray] = {}
+    rigid_ks_sorted = sorted(int(x) for x in rigid_ks)
+    for k in rigid_ks_sorted:
+        dynamic_avg_dist_by_k[int(k)] = {}
+    if len(rigid_ks_sorted) > 0:
+        max_k = max(rigid_ks_sorted)
         for intid in dynamic_instance_ids:
             arr = np.asarray(dynamic_raw[int(intid)], dtype=np.float32)
             if arr.ndim != 2 or arr.shape[1] < 3:
                 raise ValueError(
                     f"pointcloud.dynamic[{intid}] must have shape [N,>=3], got {tuple(arr.shape)}"
                 )
-            per_instance[int(intid)] = _avg_knn_distance(arr[:, :3], int(k))
-        dynamic_avg_dist_by_k[int(k)] = per_instance
+            pref = _avg_knn_distance_prefix(arr[:, :3], max_k=max_k)
+            for k in rigid_ks_sorted:
+                dynamic_avg_dist_by_k[int(k)][int(intid)] = pref[int(k)]
 
     return {
         "background_avg_dist_by_k": background_avg_dist_by_k,
         "dynamic_avg_dist_by_k": dynamic_avg_dist_by_k,
     }
+
+
+def _existing_knn_covers_required_ks(
+    existing_knn: Any,
+    *,
+    bg_distant_ks: Sequence[int],
+    rigid_ks: Sequence[int],
+) -> bool:
+    if not isinstance(existing_knn, dict):
+        return False
+    bg_map = existing_knn.get("background_avg_dist_by_k", {})
+    dyn_map = existing_knn.get("dynamic_avg_dist_by_k", {})
+    if not isinstance(bg_map, dict) or not isinstance(dyn_map, dict):
+        return False
+    bg_have = {int(k) for k in bg_map.keys()}
+    dyn_have = {int(k) for k in dyn_map.keys()}
+    return all(int(k) in bg_have for k in bg_distant_ks) and all(int(k) in dyn_have for k in rigid_ks)
+
+
+def _resolve_target_scene_ids(data_cfg: Any, store: StreetForwardAssetStore, dataset_name: str) -> List[int]:
+    train_scene_ids = [int(x) for x in list(_cfg_get(data_cfg, "train_scene_ids", []) or [])]
+    eval_scene_ids = [int(x) for x in list(_cfg_get(data_cfg, "eval_scene_ids", []) or [])]
+    merged = sorted(set(train_scene_ids + eval_scene_ids))
+    if len(merged) > 0:
+        return merged
+    return store.list_registered_scene_ids(dataset_name)
 
 
 def main() -> None:
@@ -142,24 +194,29 @@ def main() -> None:
     if not dataset_name:
         raise ValueError("data.dataset is required")
 
-    bg_distant_ks, rigid_ks, branch_k = _resolve_knn_modes(cfg)
-    if len(bg_distant_ks) == 0 and len(rigid_ks) == 0:
+    bg_distant_ks_req, rigid_ks_req, branch_k = _resolve_knn_modes(cfg)
+    if len(bg_distant_ks_req) == 0 and len(rigid_ks_req) == 0:
         print("[segment-knn] skipped=true reason=no_branch_uses_knn")
         return
+    bg_distant_ks = _expand_topk_ks(bg_distant_ks_req)
+    rigid_ks = _expand_topk_ks(rigid_ks_req)
 
     print(
         "[segment-knn] config "
-        f"bg_distant_ks={bg_distant_ks} rigid_ks={rigid_ks} branch_k={branch_k} overwrite={bool(args.overwrite)}"
+        f"branch_k={branch_k} "
+        f"requested_bg_distant_ks={bg_distant_ks_req} requested_rigid_ks={rigid_ks_req} "
+        f"export_bg_distant_ks={bg_distant_ks} export_rigid_ks={rigid_ks} "
+        f"overwrite={bool(args.overwrite)}"
     )
 
     store = StreetForwardAssetStore(str(_cfg_get(assets_cfg, "root")), missing_policy="error")
-    scene_ids_cfg = [int(x) for x in list(_cfg_get(data_cfg, "train_scene_ids", []) or [])]
-    scene_ids = scene_ids_cfg if scene_ids_cfg else store.list_registered_scene_ids(dataset_name)
+    scene_ids = _resolve_target_scene_ids(data_cfg, store, dataset_name)
     if len(scene_ids) == 0:
         raise ValueError(
             f"No scene ids to process for dataset={dataset_name}: "
-            "data.train_scene_ids empty and segment_registry has no rows"
+            "data.train_scene_ids/data.eval_scene_ids are empty and segment_registry has no rows"
         )
+    print(f"[segment-knn] target_scenes={len(scene_ids)} ids={scene_ids}")
 
     for scene_id in scene_ids:
         segment_ids = store.list_registered_segment_ids(dataset_name, int(scene_id))
@@ -168,12 +225,23 @@ def main() -> None:
             continue
         for seg_id in segment_ids:
             segment_handle = store.get_segment_asset_registry_first(dataset_name, int(scene_id), int(seg_id))
-            if segment_handle.has_knn_init() and not bool(args.overwrite):
+            has_knn = bool(segment_handle.has_knn_init())
+            if has_knn and not bool(args.overwrite):
+                existing_knn = segment_handle.load_knn_init()
+                if _existing_knn_covers_required_ks(
+                    existing_knn,
+                    bg_distant_ks=bg_distant_ks,
+                    rigid_ks=rigid_ks,
+                ):
+                    print(
+                        f"[segment-knn] scene_id={scene_id} segment_id={seg_id} "
+                        "status=existing overwrite=false"
+                    )
+                    continue
                 print(
                     f"[segment-knn] scene_id={scene_id} segment_id={seg_id} "
-                    "status=existing overwrite=false"
+                    "status=refresh reason=missing_required_k overwrite=false"
                 )
-                continue
 
             pointcloud = segment_handle.load_pointcloud()
             payload = _build_knn_payload_from_pointcloud(
