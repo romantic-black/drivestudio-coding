@@ -7,7 +7,14 @@ data:
   end_timestep: -1
   preload_device: cpu
   sky_mask_semantics: one_is_sky
-  train_scene_ids: [194, 34, 35]
+  train_scene_ids: [016, 024, 032, 040, 099, 107, 115, 123, 131, 139, 147, 155, 163, 171, 179, 195, 214,
+    017, 025, 033, 041, 049, 100, 108, 116, 124, 132, 140, 148, 156, 164, 172, 180, 188, 196, 215,
+    010, 018, 026, 034, 042, 093, 101, 109, 117, 125, 133, 141, 149, 157, 165, 173, 181, 189, 197, 216,
+    011, 019, 027, 035, 043, 094, 102, 110, 118, 126, 134, 142, 150, 158, 166, 174, 182, 190, 198, 217,
+    012, 020, 036, 044, 095, 103, 111, 119, 127, 135, 143, 151, 159, 167, 175, 183, 191, 199, 218,
+    013, 021, 029, 037, 045, 096, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200,
+    014, 022, 030, 038, 046, 097, 105, 113, 121, 129, 137, 145, 153, 161, 169, 177, 185, 193, 201,
+    015, 023, 031, 039, 047, 098, 106, 114, 122, 130, 138, 146, 154, 162, 170, 178, 186, 194]
   eval_scene_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
   preload:
     enable: true
@@ -139,12 +146,19 @@ model:
   param_embed_dim: 48
   offset_gru_hidden_dim: 48
   offset_gru_use_reset_gate: true
+  rigid_routed:
+    route_space: source_frame_world
+    route_aabb: segment_aabb
+    inside_decoder: bg
+    outside_decoder: distant
+    update_means: true
+    update_quat: true
   branches:
     bg:
       src_backproject_support_min: 1e-2
       enable_selective_update: false
       freeze_means: false
-      init: {scale_init: {mode: knn, isotropic_log_value: -2.30, knn_k: 8, knn_log_scale_bias: -1.0}, opacity_init: 0.1}
+      init: {scale_init: {mode: isotropic, isotropic_log_value: -2.30, knn_k: 5, knn_log_scale_bias: 0.0}, opacity_init: 0.1}
       limits: {offset_max: 0.1, scale_max: 0.1, omega_max: 0.1, opacity_max: 0.1, sh_dc_max: 0.1, sh_rest_max: 0.05}
       eta: {means: 1.0, scales: 1.0, opacity: 1.0, sh_dc: 1.0, sh_rest: 1.0}
       mlp: {hidden_dim: 64, use_3d_feat: true, use_2d_feat: true, freeze_quat: false}
@@ -152,17 +166,14 @@ model:
       src_backproject_support_min: 1e-2
       enable_selective_update: false
       freeze_means: true
-      init: {scale_init: {mode: knn, isotropic_log_value: -1.90, knn_k: 8, knn_log_scale_bias: -1.0}, opacity_init: 0.1}
+      init: {scale_init: {mode: isotropic, isotropic_log_value: -1.90, knn_k: 5, knn_log_scale_bias: 0.0}, opacity_init: 0.05}
       limits: {offset_max: 0.02, scale_max: 0.08, omega_max: 0.01, opacity_max: 0.05, sh_dc_max: 0.08, sh_rest_max: 0.015}
       eta: {means: 0.2, scales: 0.7, opacity: 0.5, sh_dc: 0.8, sh_rest: 0.4}
       mlp: {hidden_dim: 64, use_3d_feat: false, use_2d_feat: true, freeze_quat: true}
     rigid:
       src_backproject_support_min: 1e-2
-      freeze_means: false
-      init: {scale_init: {mode: knn, isotropic_log_value: -2.30, knn_k: 8, knn_log_scale_bias: -1.0}, opacity_init: 0.1}
-      limits: {offset_max: 0.05, scale_max: 0.08, omega_max: 0.05, opacity_max: 0.08, sh_dc_max: 0.08, sh_rest_max: 0.03}
+      init: {scale_init: {mode: isotropic, isotropic_log_value: -2.90, knn_k: 5, knn_log_scale_bias: 0.0}, opacity_init: 0.1}
       eta: {means: 0.5, scales: 0.8, opacity: 0.8, sh_dc: 0.8, sh_rest: 0.5}
-      mlp: {hidden_dim: 64, use_3d_feat: false, use_2d_feat: true, freeze_quat: false}
 
 losses:
   photometric:
@@ -178,7 +189,7 @@ optimizer:
   weight_decay: 0.0
 
 training:
-  max_iterations: 100
+  max_iterations: 10000000
   log_interval: 100
   save_checkpoint_freq: 10000
   seed: 42
@@ -190,7 +201,7 @@ eval:
 
 logging:
   output_root: /root/autodl-tmp/outputs
-  project: minimal_sf_stage4_5_multi_scene_v7
+  project: minimal_sf_stage4_6_multi_scene_v7
   log_dir: null
   image_interval_blocks: 96
   low_psnr_train_images_subdir: train_low_psnr

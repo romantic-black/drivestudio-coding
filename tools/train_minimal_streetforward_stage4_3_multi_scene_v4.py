@@ -1333,12 +1333,15 @@ def main() -> None:
                     "node_state_sync_update": bool(result.get("node_state_sync_update", False)),
                     "node_state_sync_reset": bool(result.get("node_state_sync_reset", False)),
                 }
+                extra_metric_prefixes = ("bg_", "rigid_", "distant_", "scene_", "perf_")
                 for k, v in result.items():
-                    if (
-                        k.startswith("bg_offset_")
-                        or k.startswith("rigid_offset_")
-                        or k.startswith("perf_")
-                    ):
+                    if not k.startswith(extra_metric_prefixes):
+                        continue
+                    if k in row:
+                        continue
+                    if isinstance(v, bool):
+                        row[k] = bool(v)
+                    elif isinstance(v, (int, float)):
                         row[k] = float(v)
                 row["loss_mask_ratio"] = float(row["loss_mask"] / max(float(loss_val), 1e-8))
                 row.update(metric_vals)
@@ -1359,6 +1362,11 @@ def main() -> None:
                     writer.add_scalar("train/src_backproject_pass_count", int(result.get("src_backproject_pass_count", 0)), step)
                     for k, v in metric_vals.items():
                         writer.add_scalar(f"train/{k}", float(v), step)
+                    for k, v in result.items():
+                        if not k.startswith(extra_metric_prefixes):
+                            continue
+                        if isinstance(v, (int, float)):
+                            writer.add_scalar(f"train/{k}", float(v), step)
                     writer.add_scalar("train/perf/step_time_ms", float(step_time_ms), step)
 
             if bool(validation_v7_cfg.eval_enable) and len(validation_due_episode_counters) > 0:

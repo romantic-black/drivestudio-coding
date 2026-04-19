@@ -800,7 +800,7 @@ class MinimalStreetForwardStage4_2(MinimalStreetForwardStage4_1):
                     perf_metrics[f"perf_{k}"] = float(v / perf_calls)
         perf_metrics["perf_2d_call_count"] = perf_calls
 
-        return {
+        result = {
             "loss": out["loss"].item() if torch.is_tensor(out["loss"]) else out["loss"],
             "loss_l1": out["loss_l1"].item() if torch.is_tensor(out.get("loss_l1")) else float(out.get("loss_l1", 0.0)),
             "loss_ssim": out["loss_ssim"].item() if torch.is_tensor(out.get("loss_ssim")) else float(out.get("loss_ssim", 0.0)),
@@ -845,7 +845,15 @@ class MinimalStreetForwardStage4_2(MinimalStreetForwardStage4_1):
             "node_state_sync_update": node_state_sync_update,
             "node_state_sync_reset": node_state_sync_reset,
         }
+        # Preserve additional scalar diagnostics emitted by forward() for logging.
+        for k, v in out.items():
+            if k.startswith("_") or k in result:
+                continue
+            if isinstance(v, bool):
+                result[k] = bool(v)
+            elif isinstance(v, (int, float)):
+                result[k] = float(v)
+        return result
 
 
 __all__ = ["MinimalStreetForwardStage4_2"]
-
