@@ -226,6 +226,8 @@ def main() -> None:
         for seg_id in segment_ids:
             segment_handle = store.get_segment_asset_registry_first(dataset_name, int(scene_id), int(seg_id))
             has_knn = bool(segment_handle.has_knn_init())
+            force_overwrite = bool(args.overwrite)
+            refresh_missing_k = False
             if has_knn and not bool(args.overwrite):
                 existing_knn = segment_handle.load_knn_init()
                 if _existing_knn_covers_required_ks(
@@ -238,6 +240,8 @@ def main() -> None:
                         "status=existing overwrite=false"
                     )
                     continue
+                refresh_missing_k = True
+                force_overwrite = True
                 print(
                     f"[segment-knn] scene_id={scene_id} segment_id={seg_id} "
                     "status=refresh reason=missing_required_k overwrite=false"
@@ -254,8 +258,13 @@ def main() -> None:
                 scene_id=int(scene_id),
                 segment_id=int(seg_id),
                 knn_payload=payload,
-                overwrite=bool(args.overwrite),
+                overwrite=bool(force_overwrite),
             )
+            if refresh_missing_k and not bool(written):
+                raise RuntimeError(
+                    f"Internal error: refresh requested but KNN write was skipped "
+                    f"(scene_id={scene_id} segment_id={seg_id})."
+                )
             bg_n = int(np.asarray(pointcloud.get("background", np.zeros((0, 6), dtype=np.float32)).shape[0]))
             dyn_n = int(sum(int(np.asarray(v).shape[0]) for v in pointcloud.get("dynamic", {}).values()))
             print(

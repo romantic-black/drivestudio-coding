@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import threading
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -473,31 +474,12 @@ class MultiSceneDatasetV4:
     ) -> None:
         if not self._knn_requirements.enabled:
             return
-        bg_map_raw = knn_init.get("background_avg_dist_by_k", {})
-        dyn_map_raw = knn_init.get("dynamic_avg_dist_by_k", {})
-        if not isinstance(bg_map_raw, dict):
-            raise ValueError(
-                "knn_init.background_avg_dist_by_k must be a dict "
-                f"(context={context} scene_id={int(scene_id)} segment_id={int(segment_id)})"
-            )
-        if not isinstance(dyn_map_raw, dict):
-            raise ValueError(
-                "knn_init.dynamic_avg_dist_by_k must be a dict "
-                f"(context={context} scene_id={int(scene_id)} segment_id={int(segment_id)})"
-            )
-        bg_map = {int(k): v for k, v in bg_map_raw.items()}
-        dyn_map = {int(k): v for k, v in dyn_map_raw.items()}
-
-        missing_bg_ks = [int(k) for k in self._knn_requirements.background_ks if int(k) not in bg_map]
-        missing_dyn_ks = [int(k) for k in self._knn_requirements.dynamic_ks if int(k) not in dyn_map]
-        if missing_bg_ks or missing_dyn_ks:
-            raise ValueError(
-                "KNN scale init is required by model config but segment knn_init is missing required k values: "
-                f"(context={context} branches={self._knn_required_branches_label()} "
-                f"scene_id={int(scene_id)} segment_id={int(segment_id)} "
-                f"missing_background_ks={missing_bg_ks} missing_dynamic_ks={missing_dyn_ks}). "
-                "Re-export segment KNN assets with the current config."
-            )
+        bg_map, dyn_map = self._parse_and_validate_required_knn_maps(
+            knn_init=knn_init,
+            scene_id=scene_id,
+            segment_id=segment_id,
+            context=context,
+        )
 
         background = np.asarray(pointcloud.get("background", np.zeros((0, 6), dtype=np.float32)), dtype=np.float32)
         if background.ndim != 2 or background.shape[1] < 3:
@@ -553,6 +535,41 @@ class MultiSceneDatasetV4:
                         f"k={int(k)} intid={int(intid)} knn_len={int(arr_np.shape[0])} "
                         f"dynamic_points={int(pts.shape[0])})"
                     )
+
+    def _parse_and_validate_required_knn_maps(
+        self,
+        *,
+        knn_init: Dict[str, Any],
+        scene_id: int,
+        segment_id: int,
+        context: str,
+    ) -> Tuple[Dict[int, Any], Dict[int, Any]]:
+        bg_map_raw = knn_init.get("background_avg_dist_by_k", {})
+        dyn_map_raw = knn_init.get("dynamic_avg_dist_by_k", {})
+        if not isinstance(bg_map_raw, dict):
+            raise ValueError(
+                "knn_init.background_avg_dist_by_k must be a dict "
+                f"(context={context} scene_id={int(scene_id)} segment_id={int(segment_id)})"
+            )
+        if not isinstance(dyn_map_raw, dict):
+            raise ValueError(
+                "knn_init.dynamic_avg_dist_by_k must be a dict "
+                f"(context={context} scene_id={int(scene_id)} segment_id={int(segment_id)})"
+            )
+        bg_map = {int(k): v for k, v in bg_map_raw.items()}
+        dyn_map = {int(k): v for k, v in dyn_map_raw.items()}
+
+        missing_bg_ks = [int(k) for k in self._knn_requirements.background_ks if int(k) not in bg_map]
+        missing_dyn_ks = [int(k) for k in self._knn_requirements.dynamic_ks if int(k) not in dyn_map]
+        if missing_bg_ks or missing_dyn_ks:
+            raise ValueError(
+                "KNN scale init is required by model config but segment knn_init is missing required k values: "
+                f"(context={context} branches={self._knn_required_branches_label()} "
+                f"scene_id={int(scene_id)} segment_id={int(segment_id)} "
+                f"missing_background_ks={missing_bg_ks} missing_dynamic_ks={missing_dyn_ks}). "
+                "Re-export segment KNN assets with the current config."
+            )
+        return bg_map, dyn_map
 
     @staticmethod
     def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
@@ -684,8 +701,31 @@ class MultiSceneDatasetV4:
 
     def _validate_training_assets(self) -> None:
         ds_name = self._asset_dataset_name()
-        for scene_id in self.list_training_scene_ids():
-            for segment_id in self.list_segment_ids(scene_id):
+        scene_ids = self.list_training_scene_ids()
+        segments_by_scene: Dict[int, List[int]] = {}
+        total_segments = 0
+        for scene_id in scene_ids:
+            seg_ids = self.list_segment_ids(scene_id)
+            segments_by_scene[int(scene_id)] = seg_ids
+            total_segments += len(seg_ids)
+        logger.info(
+            "Asset validation begin: dataset=%s scenes=%d segments=%d knn_required=%s",
+            ds_name,
+            int(len(scene_ids)),
+            int(total_segments),
+            bool(self._knn_requirements.enabled),
+        )
+        checked = 0
+        t_start = time.monotonic()
+        for scene_id in scene_ids:
+            seg_ids = segments_by_scene[int(scene_id)]
+            logger.info(
+                "Asset validation scene begin: dataset=%s scene_id=%s segments=%d",
+                ds_name,
+                int(scene_id),
+                int(len(seg_ids)),
+            )
+            for segment_id in seg_ids:
                 resolved = self.asset_store.resolve_segment_scene_assets_registry_first(
                     ds_name, int(scene_id), int(segment_id)
                 )
@@ -730,6 +770,12 @@ class MultiSceneDatasetV4:
                             f"branches={self._knn_required_branches_label()}). "
                             "Run tools/build_streetforward_segment_knn_assets.py before training."
                         )
+                    self._parse_and_validate_required_knn_maps(
+                        knn_init=knn_init,
+                        scene_id=int(scene_id),
+                        segment_id=int(segment_id),
+                        context="initialize/_validate_training_assets/pre_pointcloud",
+                    )
                     pointcloud = resolved["segment_handle"].load_pointcloud()
                     self._validate_required_knn_payload(
                         pointcloud=pointcloud,
@@ -738,6 +784,23 @@ class MultiSceneDatasetV4:
                         segment_id=int(segment_id),
                         context="initialize/_validate_training_assets",
                     )
+                checked += 1
+                if checked == 1 or checked == total_segments or (checked % 50) == 0:
+                    logger.info(
+                        "Asset validation progress: %d/%d (scene_id=%s segment_id=%s elapsed=%.1fs)",
+                        int(checked),
+                        int(total_segments),
+                        int(scene_id),
+                        int(segment_id),
+                        float(time.monotonic() - t_start),
+                    )
+        logger.info(
+            "Asset validation done: dataset=%s scenes=%d segments=%d elapsed=%.1fs",
+            ds_name,
+            int(len(scene_ids)),
+            int(total_segments),
+            float(time.monotonic() - t_start),
+        )
 
     def initialize(self) -> None:
         self._validate_training_assets()
