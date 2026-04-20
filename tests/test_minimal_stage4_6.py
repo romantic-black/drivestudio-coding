@@ -15,6 +15,29 @@ def _base_config_dict() -> dict:
         "model": {
             "branches": {
                 "bg": {
+                    "init": {
+                        "scale_init": {
+                            "mode": "isotropic",
+                            "isotropic_log_value": -2.3,
+                            "knn_k": 3,
+                            "knn_log_scale_bias": 0.0,
+                        },
+                        "opacity_init": 0.1,
+                    },
+                    "eta": {
+                        "means": 1.0,
+                        "scales": 1.0,
+                        "opacity": 1.0,
+                        "sh_dc": 1.0,
+                        "sh_rest": 1.0,
+                    },
+                    "freeze_means": False,
+                    "mlp": {
+                        "hidden_dim": 64,
+                        "use_3d_feat": True,
+                        "use_2d_feat": True,
+                        "freeze_quat": False,
+                    },
                     "limits": {
                         "offset_max": 0.1,
                         "scale_max": 0.1,
@@ -22,7 +45,40 @@ def _base_config_dict() -> dict:
                         "opacity_max": 0.1,
                         "sh_dc_max": 0.1,
                         "sh_rest_max": 0.1,
-                    }
+                    },
+                },
+                "distant": {
+                    "init": {
+                        "scale_init": {
+                            "mode": "isotropic",
+                            "isotropic_log_value": -1.9,
+                            "knn_k": 3,
+                            "knn_log_scale_bias": 0.0,
+                        },
+                        "opacity_init": 0.05,
+                    },
+                    "eta": {
+                        "means": 0.2,
+                        "scales": 0.7,
+                        "opacity": 0.5,
+                        "sh_dc": 0.8,
+                        "sh_rest": 0.4,
+                    },
+                    "freeze_means": True,
+                    "mlp": {
+                        "hidden_dim": 64,
+                        "use_3d_feat": False,
+                        "use_2d_feat": True,
+                        "freeze_quat": True,
+                    },
+                    "limits": {
+                        "offset_max": 0.02,
+                        "scale_max": 0.08,
+                        "omega_max": 0.01,
+                        "opacity_max": 0.05,
+                        "sh_dc_max": 0.08,
+                        "sh_rest_max": 0.015,
+                    },
                 },
                 "rigid": {
                     "src_backproject_support_min": 1e-2,
@@ -104,6 +160,22 @@ def test_stage4_6_base_compat_config_injects_rigid_compat_fields():
     assert "mlp" in rigid
     assert "limits" in rigid
     assert "freeze_means" in rigid
+
+
+def test_stage4_6_base_compat_config_injects_bg_distant_mlp_freeze_quat():
+    trainer = MinimalStreetForwardStage4_5BaseNoRigidHead.__new__(MinimalStreetForwardStage4_5BaseNoRigidHead)
+    cfg = _base_config_dict()
+    cfg["model"]["branches"]["distant"] = {
+        "mlp": {"hidden_dim": 64, "use_3d_feat": False, "use_2d_feat": True}
+    }
+    cfg["model"]["branches"]["bg"]["mlp"] = {
+        "hidden_dim": 64,
+        "use_3d_feat": True,
+        "use_2d_feat": True,
+    }
+    compat = trainer._make_stage4_6_compat_config(cfg)
+    assert compat["model"]["branches"]["bg"]["mlp"]["freeze_quat"] is False
+    assert compat["model"]["branches"]["distant"]["mlp"]["freeze_quat"] is True
 
 
 def test_stage4_6_route_rigid_source_points_splits_by_aabb():

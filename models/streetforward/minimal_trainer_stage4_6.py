@@ -43,6 +43,13 @@ class RigidRoute:
     quats_world_S: torch.Tensor
 
 
+@dataclass
+class BgRigidInGRUInputs:
+    feat_bg_input: torch.Tensor
+    feat_rigid_in_input_all: Optional[torch.Tensor]
+    aux: Dict[str, Any]
+
+
 class MinimalStreetForwardStage4_5BaseNoRigidHead(MinimalStreetForwardStage4_5):
     """
     Compatibility base:
@@ -59,6 +66,7 @@ class MinimalStreetForwardStage4_5BaseNoRigidHead(MinimalStreetForwardStage4_5):
         self._init_stage4_6_rigid_cfg_from_original(self._stage4_6_orig_config)
         # Keep runtime config semantics aligned with Stage4_6 yaml after compat init.
         self.config = self._stage4_6_orig_config
+        self.bg_freeze_quat = bool(self.bg_cfg["mlp"]["freeze_quat"])
         if hasattr(self, "mlp_offset_pos_rigid"):
             raise RuntimeError("Stage4_6 must not create rigid-specific decoder heads.")
 
@@ -68,6 +76,30 @@ class MinimalStreetForwardStage4_5BaseNoRigidHead(MinimalStreetForwardStage4_5):
         branches = self._require_key(model_cfg, "branches", "model")
         rigid_yaml = self._require_key(branches, "rigid", "model.branches")
         bg_yaml = self._require_key(branches, "bg", "model.branches")
+        distant_yaml = self._require_key(branches, "distant", "model.branches")
+
+        def _ensure_branch_mlp_defaults(branch_yaml, *, use_3d_feat: bool, freeze_quat: bool) -> None:
+            mlp = branch_yaml.get("mlp")
+            if mlp is None:
+                branch_yaml["mlp"] = {
+                    "hidden_dim": 64,
+                    "use_3d_feat": bool(use_3d_feat),
+                    "use_2d_feat": True,
+                    "freeze_quat": bool(freeze_quat),
+                }
+                return
+            if mlp.get("hidden_dim") is None:
+                mlp["hidden_dim"] = 64
+            if mlp.get("use_3d_feat") is None:
+                mlp["use_3d_feat"] = bool(use_3d_feat)
+            if mlp.get("use_2d_feat") is None:
+                mlp["use_2d_feat"] = True
+            if mlp.get("freeze_quat") is None:
+                mlp["freeze_quat"] = bool(freeze_quat)
+
+        _ensure_branch_mlp_defaults(bg_yaml, use_3d_feat=True, freeze_quat=False)
+        _ensure_branch_mlp_defaults(distant_yaml, use_3d_feat=False, freeze_quat=True)
+
         if rigid_yaml.get("mlp") is None:
             rigid_yaml["mlp"] = {
                 "hidden_dim": 64,
@@ -352,6 +384,47 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
         feat_3d_bg = feat_all[:N_bg]
         feat_3d_rigid_in = feat_all[N_bg:] if route.S_in.numel() > 0 else None
         return feat_3d_bg, feat_3d_rigid_in
+
+    def _compute_bg_rigid_in_gru_inputs(
+        self,
+        *,
+        source_frame_idx: int,
+        node_state_bg: NodeStateBackground,
+        node_state_rigid: Optional[NodeStateRigid],
+        route: RigidRoute,
+        feat_2d_bg: torch.Tensor,
+        feat_2d_rigid_S: Optional[torch.Tensor],
+        acc_w_bg: torch.Tensor,
+        acc_w_rigid_S: Optional[torch.Tensor],
+    ) -> BgRigidInGRUInputs:
+        _ = source_frame_idx
+        _ = acc_w_rigid_S
+        feat_3d_bg, feat_3d_rigid_in = self._build_3d_features_bg_plus_rigid_in(
+            node_state_bg=node_state_bg,
+            node_state_rigid=node_state_rigid,
+            route=route,
+        )
+        feat_bg_input = self._fuse_features(
+            feat_3d_bg,
+            feat_2d_bg,
+            visibility=(acc_w_bg > self.bg_src_backproject_support_min),
+        )
+        feat_rigid_in_input_all = None
+        if route.S_in.numel() > 0:
+            if feat_2d_rigid_S is None or feat_3d_rigid_in is None:
+                raise RuntimeError("Stage4_6 expected rigid source features for S_in path.")
+            rows_rigid_in_in_S = torch.nonzero(route.inside_mask_S, as_tuple=False).squeeze(1)
+            feat_2d_rigid_in = feat_2d_rigid_S[rows_rigid_in_in_S]
+            feat_rigid_in_input_all = self._fuse_features(
+                feat_3d_rigid_in,
+                feat_2d_rigid_in,
+                visibility=torch.ones(route.S_in.numel(), dtype=torch.bool, device=self.device),
+            )
+        return BgRigidInGRUInputs(
+            feat_bg_input=feat_bg_input,
+            feat_rigid_in_input_all=feat_rigid_in_input_all,
+            aux={},
+        )
 
     def _predict_offsets_gru_with_heads(
         self,
@@ -695,11 +768,19 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
         acc_w_rigid_S = one_pass["acc_w_rigid_S"]
         src_backproject_pass_count = int(one_pass.get("src_backproject_pass_count", 0))
 
-        feat_3d_bg, feat_3d_rigid_in = self._build_3d_features_bg_plus_rigid_in(
+        bg_rigid_in_inputs = self._compute_bg_rigid_in_gru_inputs(
+            source_frame_idx=source_frame_idx,
             node_state_bg=node_state_bg,
             node_state_rigid=node_state_rigid,
             route=route,
+            feat_2d_bg=feat_2d_bg,
+            feat_2d_rigid_S=feat_2d_rigid_S,
+            acc_w_bg=acc_w_bg,
+            acc_w_rigid_S=acc_w_rigid_S,
         )
+        feat_bg_input = bg_rigid_in_inputs.feat_bg_input
+        feat_rigid_in_input_all = bg_rigid_in_inputs.feat_rigid_in_input_all
+        bg_rigid_in_aux = dict(bg_rigid_in_inputs.aux)
         mask_src_feat_valid_bg = acc_w_bg > self.bg_src_backproject_support_min
         mask_any_tgt_bg = self._build_any_target_mask_static(
             num_points=num_bg,
@@ -707,11 +788,6 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
             device=self.device,
         )
         mask_update_bg = mask_src_feat_valid_bg & mask_any_tgt_bg
-        feat_bg_input = self._fuse_features(
-            feat_3d_bg,
-            feat_2d_bg,
-            visibility=(acc_w_bg > self.bg_src_backproject_support_min),
-        )
         params_bg = self._build_params_for_embed(node_state_bg, coord_space="world")
         h_old_bg = self._get_or_init_hidden(self.h_cache_bg, key, node_state_bg.means.shape[0], node_state_bg, "bg")
         offsets_bg, h_new_bg = self._predict_offsets_gru_with_heads(
@@ -801,16 +877,10 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
                     raise RuntimeError("Routed rigid update point not present in source visible S.")
                 if bool((rows_S_in < 0).any().item()):
                     raise RuntimeError("U_in contains rigid point not present in S_in.")
-                if feat_2d_rigid_S is None or feat_3d_rigid_in is None:
+                if feat_rigid_in_input_all is None:
                     raise RuntimeError("Stage4_6 expected rigid source features for U_in path.")
-                feat_2d_U_in = feat_2d_rigid_S[rows_S]
-                feat_3d_U_in = feat_3d_rigid_in[rows_S_in]
                 rigid_in_acc_w_mean = float(acc_w_rigid_S[rows_S].mean().item()) if acc_w_rigid_S is not None else 0.0
-                feat_rigid_in_input = self._fuse_features(
-                    feat_3d_U_in,
-                    feat_2d_U_in,
-                    visibility=torch.ones(U_in.numel(), dtype=torch.bool, device=self.device),
-                )
+                feat_rigid_in_input = feat_rigid_in_input_all[rows_S_in]
                 params_rigid_in_world = self._build_rigid_params_for_embed_source_world(node_state_rigid, source_frame_idx, U_in)
                 offsets_rigid_in_world, h_new_rigid_in = self._predict_offsets_gru_with_heads(
                     feat_rigid_in_input,
@@ -878,8 +948,16 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
         if node_state_rigid is not None:
             if U_all.dtype != torch.long:
                 raise RuntimeError("Stage4_6 expects U_all to be torch.long.")
-            if U_all.device != self.device:
-                raise RuntimeError("Stage4_6 expects U_all on self.device.")
+            if U_all.device.type != self.device.type:
+                raise RuntimeError(
+                    f"Stage4_6 expects U_all device type {self.device.type}, got {U_all.device.type}."
+                )
+            # torch.device("cuda") != torch.device("cuda:0"), so only enforce index
+            # consistency when self.device explicitly pins one.
+            if self.device.index is not None and U_all.device.index != self.device.index:
+                raise RuntimeError(
+                    f"Stage4_6 expects U_all on {self.device}, got {U_all.device}."
+                )
             if bool((U_all < 0).any().item()) or bool((U_all >= N_rigid).any().item()):
                 raise RuntimeError("Stage4_6 U_all out of range.")
             if render_params_rigid_local_U is not None and U_all.numel() != int(render_params_rigid_local_U["means_r"].shape[0]):
@@ -1157,6 +1235,7 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
             "rigid_in_acc_w_mean": float(rigid_in_acc_w_mean),
             "rigid_out_acc_w_mean": float(rigid_out_acc_w_mean),
             "rigid_writeback_count": int(U_all.numel()),
+            **bg_rigid_in_aux,
         }
 
     def train_step(
@@ -1183,4 +1262,9 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
         return out
 
 
-__all__ = ["MinimalStreetForwardStage4_5BaseNoRigidHead", "MinimalStreetForwardStage4_6", "RigidRoute"]
+__all__ = [
+    "BgRigidInGRUInputs",
+    "MinimalStreetForwardStage4_5BaseNoRigidHead",
+    "MinimalStreetForwardStage4_6",
+    "RigidRoute",
+]
