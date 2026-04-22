@@ -208,6 +208,7 @@ class MinimalStreetForwardStage5_0(MinimalStreetForwardStage4_6):
     def _compute_bg_rigid_in_gru_inputs(
         self,
         *,
+        batch: Optional[Dict[str, Any]] = None,
         source_frame_idx: int,
         node_state_bg: NodeStateBackground,
         node_state_rigid: Optional[NodeStateRigid],
@@ -217,6 +218,7 @@ class MinimalStreetForwardStage5_0(MinimalStreetForwardStage4_6):
         acc_w_bg: torch.Tensor,
         acc_w_rigid_S: Optional[torch.Tensor],
     ) -> BgRigidInGRUInputs:
+        _ = batch
         struct_in = self._build_struct_decoder_input_bg_rigid_in(
             source_frame_idx=source_frame_idx,
             node_state_bg=node_state_bg,

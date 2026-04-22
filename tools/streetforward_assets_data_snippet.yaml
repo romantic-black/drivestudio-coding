@@ -1,15 +1,15 @@
 # =============================================================================
-# StreetForward：完整训练配置 + data.assets（默认同 configs/minimal_streetforward_stage4_4_multi_scene_v5.yaml）
+# StreetForward asset export config snippet (Stage5_1 aligned)
 #
 # 用途：
-#   - 可直接作为 tools/build_streetforward_scene_assets.py / build_streetforward_segment_assets.py
-#     以及训练脚本的 --config_file（含顶层 dataset: / data:）。
-#   - 请按本机修改：data.data_root、data.assets.root、data.train_scene_ids 等路径与场景列表。
-#
-# 文档：docs/dataloader/StreetForward_Reproducible_Asset_System.md §12 / §13
+# - 用于导出 scene / segment / segment_knn 资产
+# - 关键是与训练配置保持一致，尤其是：
+#   1) dataset.pointcloud.* cap 配置
+#   2) model.branches.*.init.scale_init
+#   3) model.struct_decoder.knn_attention.k（导出 fixed cached neighbors）
 # =============================================================================
 
-output_name: minimal_sf_stage4_4_multi_scene_v5
+output_name: minimal_sf_stage5_1_asset_export
 
 data:
   data_root: "/root/autodl-tmp/nuScenes/"
@@ -18,13 +18,14 @@ data:
   end_timestep: -1
   preload_device: cpu
   sky_mask_semantics: one_is_sky
-  train_scene_ids: [0,1,2,3,4,5, 6, 7, 8, 9,16, 24, 32, 40, 99, 25, 33, 41, 49, 196, 215,
-    10, 18, 26, 34, 42, 93, 197, 216,
-    11, 19, 27, 35, 43, 94, 198, 217,
-    12, 20, 36, 44, 95, 199, 218,
-    13, 21, 29, 37, 45, 96,
-    22, 30, 38, 46, 97,
-    15, 23, 31, 39 ]
+  train_scene_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9,14, 16, 24, 32, 40, 99, 107, 115, 123, 131, 139, 147, 155, 163, 171, 179, 195, 214,
+    17, 25, 33, 41, 49, 100, 108, 116, 124, 132, 140, 148, 156, 164, 172, 180, 188, 196, 215,
+    10, 18, 26, 34, 42, 93, 101, 109, 117, 125, 133, 141, 149, 157, 165, 173, 181, 189, 197, 216,
+    11, 19, 27, 35, 43, 94, 102, 110, 118, 126, 134, 142, 150, 158, 166, 174, 182, 190, 198, 217,
+    12, 20, 36, 44, 95, 103, 111, 119, 127, 135, 143, 151, 159, 167, 175, 183, 191, 199, 218,
+    13, 21, 29, 37, 45, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200,
+    22, 30, 38, 46, 97, 105, 113, 121, 129, 137, 145, 153, 161, 169, 177, 185, 193, 201,
+    15, 23, 31, 39, 47, 98, 106, 114, 122, 130, 138, 146, 154, 162, 170, 178, 186, 194]
   eval_scene_ids: []
   preload:
     enable: false
@@ -38,6 +39,7 @@ data:
     max_test_images: 0
     load_sky_mask: true
     load_dynamic_mask: true
+    load_egocar_mask: true
     load_depth_maps: true
     load_objects: true
     load_smpl: false
@@ -50,15 +52,8 @@ data:
     load_lidar: true
     lidar_downsample_factor: 1
     lidar_percentile: 0.02
-  # ---------------------------------------------------------------------------
-  # assets：StreetForward 离线资产（与 multi_scene_v5 合并；导出/训练共用同一路径约定）
-  # ---------------------------------------------------------------------------
   assets:
-    enable: true # enable：是否启用资产子系统；为 true 时 root / use_prebuilt_assets / missing_policy 必填
-    root: "/root/autodl-tmp/streetforward_assets" # root：资产根目录；scene_pool、segment_pool、registries 将写在其下
-    use_prebuilt_assets: true # use_prebuilt_assets：训练时优先从已导出 segment 资产加载索引/位姿/点云等
-    missing_policy: error # missing_policy：资产缺失或校验失败时直接报错（不静默回退）
-    # 若 image_table 的 height/width 为训练分辨率而路径仍指向全分辨率文件，MultiSceneDatasetV3 会将 RGB/深度/掩码缩放到 meta 尺寸以对齐 intrinsic
+    root: "/root/autodl-tmp/streetforward_assets_pt150w"
 
 dataset:
   num_source_keyframes: 1
@@ -66,7 +61,7 @@ dataset:
   segment_overlap_ratio: 0.2
   min_keyframes_per_scene: 2
   min_keyframes_per_segment: 2
-  preload_scene_count: 0
+  preload_scene_count: 2
   keyframe_split_config:
     num_splits: 0
     min_count: 1
@@ -83,132 +78,45 @@ dataset:
     monocular_depth_consistency: false
     monocular_downscale: 2
     monocular_dynamic_recovery_bbox_expand_xyz_m: [0.5, 0.2, 0.5]
-    monocular_dynamic_recovery_max_points_per_instance: 40000
+    monocular_dynamic_recovery_max_points_per_instance: 20000
     near_max_points: 600000
-    distant_max_points: 1200000
+    distant_max_points: 900000
     static_instance_motion:
       enable: true
       traj_length_thresh_m: 0.5
 
-multi_scene:
-  include_test: false
-
-scheduler_v3:
-  enable: false
-  model_node_state:
-    sync_with_scheduler: true
-
-scheduler_v5:
-  enable: true
-  time_base:
-    state_write_interval_steps: 4
-  source_block:
-    updates_per_block: 24
-  reset_episode:
-    keyframes_per_episode: 12
-    episodes_per_segment: 1
-  target_sampling:
-    include_source_frame: true
-    total_target_frames: 3
-    policy: neighbor_keyframes_random_frames
-    neighbor_ring: 2
-    prefer_nearby_keyframes: true
-    fallback_expand_to_segment: true
-    with_replacement: true
-  overlap:
-    mode: none
-  traversal:
-    fixed_scene_id: null
-    fixed_segment_id: null
-
 model:
-  scale_init_value: 0.1
-  sh_degree: 1
-  voxel_size: 0.2
-  sparseConv_outdim: 32
-  feat_2d_channels: 32
-  feat_2d_downscale: 1
-  use_fused_cuda_backproject_v2: true
-  use_fused_cuda_backproject_v3: true
-  use_fused_cuda_backproject_v4: true
-  fused_cuda_backproject_v4_force_fallback: false
-  param_embed_dim: 48
-  offset_gru_hidden_dim: 48
-  offset_gru_use_reset_gate: true
-  update_node_state_interval: 1
-  reset_node_state_interval: 10
-  sky:
-    resolution: 500
-    radius: 50.0
-    center: [0.0, 0.0, 0.0]
-    hemisphere: true
-    hemisphere_up: [0.0, -1.0, 0.0]
+  stage: "5_1"
+  struct_decoder:
+    enable: true
+    type: "xcpe_knn_attn"
+    knn_attention:
+      enable: true
+      neighbor_policy: "fixed_cached"
+      out_neighbor_policy: "mask_self_fallback"
+      k: 16
   branches:
     bg:
-      src_backproject_support_min: 1e-6
-      enable_selective_update: false
-      freeze_means: false
-      init: {scale_init: {mode: knn, isotropic_log_value: -2.30, knn_k: 8, knn_log_scale_bias: 0.0}, opacity_init: 0.1}
-      limits: {offset_max: 0.1, scale_max: 0.1, omega_max: 0.1, opacity_max: 0.1, sh_dc_max: 0.1, sh_rest_max: 0.05}
-      eta: {means: 1.0, scales: 1.0, opacity: 1.0, sh_dc: 1.0, sh_rest: 1.0}
-      mlp: {hidden_dim: 64, use_3d_feat: true, use_2d_feat: true, freeze_quat: false}
+      init:
+        scale_init:
+          mode: knn
+          isotropic_log_value: -2.30
+          knn_k: 8
+          knn_log_scale_bias: -1.5
+        opacity_init: 0.1
     distant:
-      src_backproject_support_min: 1e-6
-      enable_selective_update: false
-      freeze_means: true
-      init: {scale_init: {mode: knn, isotropic_log_value: -1.90, knn_k: 8, knn_log_scale_bias: 0.0}, opacity_init: 0.05}
-      limits: {offset_max: 0.02, scale_max: 0.08, omega_max: 0.01, opacity_max: 0.05, sh_dc_max: 0.08, sh_rest_max: 0.015}
-      eta: {means: 0.2, scales: 0.7, opacity: 0.5, sh_dc: 0.8, sh_rest: 0.4}
-      mlp: {hidden_dim: 64, use_3d_feat: false, use_2d_feat: true, freeze_quat: true}
-    sky:
-      src_backproject_support_min: 1e-6
-      enable_selective_update: false
-      freeze_means: true
-      init: {scale_init: {mode: isotropic, isotropic_log_value: -0.50, knn_k: 8, knn_log_scale_bias: 0.0}, opacity_init: 0.05}
-      limits: {offset_max: 0.02, scale_max: 0.08, omega_max: 0.01, opacity_max: 0.05, sh_dc_max: 0.08, sh_rest_max: 0.015}
-      eta: {means: 0.2, scales: 0.7, opacity: 0.5, sh_dc: 0.8, sh_rest: 0.4}
-      mlp: {hidden_dim: 64, use_3d_feat: false, use_2d_feat: true, freeze_quat: true}
+      init:
+        scale_init:
+          mode: isotropic
+          isotropic_log_value: -1.90
+          knn_k: 8
+          knn_log_scale_bias: -1.5
+        opacity_init: 0.05
     rigid:
-      src_backproject_support_min: 1e-6
-      freeze_means: false
-      init: {scale_init: {mode: knn, isotropic_log_value: -2.10, knn_k: 8, knn_log_scale_bias: 0.0}, opacity_init: 0.10}
-      limits: {offset_max: 0.05, scale_max: 0.08, omega_max: 0.05, opacity_max: 0.08, sh_dc_max: 0.08, sh_rest_max: 0.03}
-      eta: {means: 0.5, scales: 0.8, opacity: 0.8, sh_dc: 0.8, sh_rest: 0.5}
-      mlp: {hidden_dim: 64, use_3d_feat: false, use_2d_feat: true, freeze_quat: false}
-
-losses:
-  rgb: {w: 1.0}
-  ssim: {w: 0.05}
-  mask: {w: 0.02, opacity_loss_type: bce}
-  opacity_entropy: {w: 0.0}
-
-optimizer:
-  lr: 1.0e-4
-  eps: 1.0e-15
-  weight_decay: 0.0
-
-training:
-  max_iterations: 10000000
-  log_interval: 100
-  save_checkpoint_freq: 20000
-  seed: 42
-
-eval:
-  enable_psnr: true
-  save_train_views_psnr_below: 14
-  run_test_at_end: false
-
-logging:
-  image_interval_blocks: 6
-  low_psnr_train_images_subdir: train_low_psnr
-  enable_jsonl_metrics: true
-  use_tensorboard: true
-  diagnostics:
-    enable: false
-    interval: 500
-    window_size: 50
-    save_branch_renders: true
-  performance:
-    enable: true
-    phase_timing: true
-    cuda_memory: false
+      init:
+        scale_init:
+          mode: knn
+          isotropic_log_value: -2.90
+          knn_k: 8
+          knn_log_scale_bias: -1.5
+        opacity_init: 0.2

@@ -213,6 +213,7 @@ def convert_batch_to_minimal_format(
     if pointcloud is None:
         raise ValueError("batch must contain 'pointcloud'")
     knn_init_batch = batch.get("knn_init")
+    knn_struct_neighbors_batch = batch.get("knn_struct_neighbors")
     if isinstance(pointcloud, dict):
         # Keep all available branches (background/dynamic/...) so downstream
         # trainers (e.g. stage4 rigid) can access dynamic pointclouds.
@@ -291,6 +292,11 @@ def convert_batch_to_minimal_format(
                 "source_frame_idx": int(source_frame_idx),
                 **({"dynamic_info": batch.get("dynamic_info")} if batch.get("dynamic_info") is not None else {}),
                 **({"knn_init": knn_init_batch} if knn_init_batch is not None else {}),
+                **(
+                    {"knn_struct_neighbors": knn_struct_neighbors_batch}
+                    if isinstance(knn_struct_neighbors_batch, dict)
+                    else {}
+                ),
                 **({"source_sky_mask": source_sky_masks} if source_sky_masks else {}),
                 **({"source_viewdirs": source_viewdirs} if source_viewdirs else {}),
                 **({"source_egocar_mask": source_egocar_masks} if source_egocar_masks else {}),
@@ -308,6 +314,11 @@ def convert_batch_to_minimal_format(
             **({"test_frame_indices": test_frame_indices} if test_frame_indices else {}),
             **({"dynamic_info": batch.get("dynamic_info")} if batch.get("dynamic_info") is not None else {}),
             **({"knn_init": knn_init_batch} if knn_init_batch is not None else {}),
+            **(
+                {"knn_struct_neighbors": knn_struct_neighbors_batch}
+                if isinstance(knn_struct_neighbors_batch, dict)
+                else {}
+            ),
         }
 
     target_data = batch.get("target", batch.get("targets"))
@@ -412,6 +423,8 @@ def convert_batch_to_minimal_format(
         result["dynamic_info"] = batch["dynamic_info"]
     if knn_init_batch is not None:
         result["knn_init"] = knn_init_batch
+    if isinstance(knn_struct_neighbors_batch, dict):
+        result["knn_struct_neighbors"] = knn_struct_neighbors_batch
     if include_source_for_2d:
         source_data = batch.get("source")
         if isinstance(source_data, dict) and source_data.get("image") is not None:

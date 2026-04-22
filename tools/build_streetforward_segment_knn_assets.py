@@ -53,7 +53,7 @@ def _resolve_knn_modes(cfg: Any) -> Tuple[List[int], List[int], Dict[str, int]]:
     model_cfg = _cfg_get(cfg, "model")
     branches = _cfg_get(model_cfg, "branches")
     if branches is None:
-        raise ValueError("model.branches is required")
+        return [], [], {}
 
     branch_k: Dict[str, int] = {}
     for branch_name in ("bg", "distant", "rigid"):
@@ -81,6 +81,34 @@ def _resolve_knn_modes(cfg: Any) -> Tuple[List[int], List[int], Dict[str, int]]:
     return bg_distant_ks, rigid_ks, branch_k
 
 
+def _resolve_fixed_neighbor_k_store(cfg: Any) -> int:
+    model_cfg = _cfg_get(cfg, "model")
+    if model_cfg is None:
+        return 0
+
+    stage = str(_cfg_get(model_cfg, "stage", "") or "").strip()
+    struct_cfg = _cfg_get(model_cfg, "struct_decoder")
+    struct_type = str(_cfg_get(struct_cfg, "type", "") or "").strip()
+    knn_attn_cfg = _cfg_get(struct_cfg, "knn_attention")
+    if knn_attn_cfg is None:
+        knn_attn_cfg = _cfg_get(model_cfg, "knn_attention")
+
+    stage5_1_like = stage == "5_1" or struct_type == "xcpe_knn_attn"
+    knn_attn_enable = bool(_cfg_get(knn_attn_cfg, "enable", False)) if knn_attn_cfg is not None else False
+    if not stage5_1_like and not knn_attn_enable:
+        return 0
+
+    if knn_attn_cfg is None:
+        raise ValueError(
+            "Fixed cached KNN neighbors are required by model.stage/model.struct_decoder.type, "
+            "but knn_attention config is missing."
+        )
+    k = int(_cfg_get(knn_attn_cfg, "k", 0))
+    if k <= 1:
+        raise ValueError(f"knn_attention.k must be > 1 when fixed cached neighbors are enabled, got {k}")
+    return int(k - 1)
+
+
 def _avg_knn_distance_prefix(points_xyz: np.ndarray, max_k: int) -> Dict[int, np.ndarray]:
     pts = np.asarray(points_xyz, dtype=np.float32).reshape(-1, 3)
     n = int(pts.shape[0])
@@ -106,11 +134,36 @@ def _avg_knn_distance_prefix(points_xyz: np.ndarray, max_k: int) -> Dict[int, np
     return out
 
 
+def _build_knn_neighbor_index(points_xyz: np.ndarray, k_store: int) -> np.ndarray:
+    pts = np.asarray(points_xyz, dtype=np.float32).reshape(-1, 3)
+    n = int(pts.shape[0])
+    k_store_i = int(k_store)
+    if k_store_i < 0:
+        raise ValueError(f"k_store must be >= 0, got {k_store_i}")
+    if k_store_i == 0:
+        return np.zeros((n, 0), dtype=np.int32)
+    if n == 0:
+        return np.zeros((0, k_store_i), dtype=np.int32)
+    if n == 1:
+        return np.zeros((1, k_store_i), dtype=np.int32)
+
+    k_eff = min(k_store_i, n - 1)
+    nn = NearestNeighbors(n_neighbors=k_eff + 1, algorithm="auto", metric="euclidean")
+    nn.fit(pts)
+    _, idx = nn.kneighbors(pts)
+    neighbors = np.asarray(idx[:, 1:], dtype=np.int32)
+    if k_eff < k_store_i:
+        self_idx = np.repeat(np.arange(n, dtype=np.int32).reshape(n, 1), k_store_i - k_eff, axis=1)
+        neighbors = np.concatenate([neighbors, self_idx], axis=1)
+    return np.ascontiguousarray(neighbors, dtype=np.int32)
+
+
 def _build_knn_payload_from_pointcloud(
     pointcloud: Dict[str, Any],
     *,
     bg_distant_ks: Sequence[int],
     rigid_ks: Sequence[int],
+    neighbor_k_store: int,
 ) -> Dict[str, Any]:
     background = np.asarray(pointcloud.get("background", np.zeros((0, 6), dtype=np.float32)), dtype=np.float32)
     if background.ndim != 2 or background.shape[1] < 3:
@@ -122,6 +175,7 @@ def _build_knn_payload_from_pointcloud(
         bg_prefix = _avg_knn_distance_prefix(bg_xyz, max_k=max(bg_ks_sorted))
         for k in bg_ks_sorted:
             background_avg_dist_by_k[int(k)] = bg_prefix[int(k)]
+    bg_knn_idx = _build_knn_neighbor_index(bg_xyz, int(neighbor_k_store))
 
     dynamic_raw = pointcloud.get("dynamic", {})
     if not isinstance(dynamic_raw, dict):
@@ -144,10 +198,34 @@ def _build_knn_payload_from_pointcloud(
             for k in rigid_ks_sorted:
                 dynamic_avg_dist_by_k[int(k)][int(intid)] = pref[int(k)]
 
-    return {
+    rigid_xyz_parts: List[np.ndarray] = []
+    dynamic_offsets: List[int] = [0]
+    for intid in dynamic_instance_ids:
+        arr = np.asarray(dynamic_raw[int(intid)], dtype=np.float32)
+        if arr.ndim != 2 or arr.shape[1] < 3:
+            raise ValueError(
+                f"pointcloud.dynamic[{intid}] must have shape [N,>=3], got {tuple(arr.shape)}"
+            )
+        rigid_xyz_parts.append(arr[:, :3].astype(np.float32, copy=False))
+        dynamic_offsets.append(dynamic_offsets[-1] + int(arr.shape[0]))
+    rigid_xyz = (
+        np.concatenate(rigid_xyz_parts, axis=0).astype(np.float32, copy=False)
+        if rigid_xyz_parts
+        else np.zeros((0, 3), dtype=np.float32)
+    )
+    rigid_knn_idx = _build_knn_neighbor_index(rigid_xyz, int(neighbor_k_store))
+
+    payload = {
         "background_avg_dist_by_k": background_avg_dist_by_k,
         "dynamic_avg_dist_by_k": dynamic_avg_dist_by_k,
+        "knn_neighbor_k_store": int(neighbor_k_store),
+        "dynamic_instance_intids": np.asarray(dynamic_instance_ids, dtype=np.int32),
+        "dynamic_offsets": np.asarray(dynamic_offsets, dtype=np.int64),
     }
+    if int(neighbor_k_store) > 0:
+        payload["bg_knn_idx"] = bg_knn_idx
+        payload["rigid_knn_idx"] = rigid_knn_idx
+    return payload
 
 
 def _existing_knn_covers_required_ks(
@@ -155,6 +233,7 @@ def _existing_knn_covers_required_ks(
     *,
     bg_distant_ks: Sequence[int],
     rigid_ks: Sequence[int],
+    neighbor_k_store: int,
 ) -> bool:
     if not isinstance(existing_knn, dict):
         return False
@@ -164,7 +243,23 @@ def _existing_knn_covers_required_ks(
         return False
     bg_have = {int(k) for k in bg_map.keys()}
     dyn_have = {int(k) for k in dyn_map.keys()}
-    return all(int(k) in bg_have for k in bg_distant_ks) and all(int(k) in dyn_have for k in rigid_ks)
+    has_ks = all(int(k) in bg_have for k in bg_distant_ks) and all(int(k) in dyn_have for k in rigid_ks)
+    if not has_ks:
+        return False
+
+    need_k_store = int(neighbor_k_store)
+    if need_k_store <= 0:
+        return True
+
+    bg_knn_idx = existing_knn.get("bg_knn_idx")
+    rigid_knn_idx = existing_knn.get("rigid_knn_idx")
+    if bg_knn_idx is None or rigid_knn_idx is None:
+        return False
+    bg_arr = np.asarray(bg_knn_idx)
+    rigid_arr = np.asarray(rigid_knn_idx)
+    if bg_arr.ndim != 2 or rigid_arr.ndim != 2:
+        return False
+    return int(bg_arr.shape[1]) >= need_k_store and int(rigid_arr.shape[1]) >= need_k_store
 
 
 def _resolve_target_scene_ids(data_cfg: Any, store: StreetForwardAssetStore, dataset_name: str) -> List[int]:
@@ -195,17 +290,24 @@ def main() -> None:
         raise ValueError("data.dataset is required")
 
     bg_distant_ks_req, rigid_ks_req, branch_k = _resolve_knn_modes(cfg)
-    if len(bg_distant_ks_req) == 0 and len(rigid_ks_req) == 0:
+    fixed_neighbor_k_store = _resolve_fixed_neighbor_k_store(cfg)
+    if len(bg_distant_ks_req) == 0 and len(rigid_ks_req) == 0 and int(fixed_neighbor_k_store) <= 0:
         print("[segment-knn] skipped=true reason=no_branch_uses_knn")
         return
     bg_distant_ks = _expand_topk_ks(bg_distant_ks_req)
     rigid_ks = _expand_topk_ks(rigid_ks_req)
+    k_store_from_scale_init = 0
+    if len(bg_distant_ks) > 0 or len(rigid_ks) > 0:
+        max_scale_k = max([0] + [int(x) for x in bg_distant_ks] + [int(x) for x in rigid_ks])
+        k_store_from_scale_init = max(0, int(max_scale_k - 1))
+    export_neighbor_k_store = max(int(fixed_neighbor_k_store), int(k_store_from_scale_init))
 
     print(
         "[segment-knn] config "
         f"branch_k={branch_k} "
         f"requested_bg_distant_ks={bg_distant_ks_req} requested_rigid_ks={rigid_ks_req} "
         f"export_bg_distant_ks={bg_distant_ks} export_rigid_ks={rigid_ks} "
+        f"fixed_neighbor_k_store={int(fixed_neighbor_k_store)} export_neighbor_k_store={int(export_neighbor_k_store)} "
         f"overwrite={bool(args.overwrite)}"
     )
 
@@ -234,6 +336,7 @@ def main() -> None:
                     existing_knn,
                     bg_distant_ks=bg_distant_ks,
                     rigid_ks=rigid_ks,
+                    neighbor_k_store=int(export_neighbor_k_store),
                 ):
                     print(
                         f"[segment-knn] scene_id={scene_id} segment_id={seg_id} "
@@ -252,6 +355,7 @@ def main() -> None:
                 pointcloud,
                 bg_distant_ks=bg_distant_ks,
                 rigid_ks=rigid_ks,
+                neighbor_k_store=int(export_neighbor_k_store),
             )
             written = store.export_segment_knn_init_asset(
                 dataset=dataset_name,
@@ -267,10 +371,13 @@ def main() -> None:
                 )
             bg_n = int(np.asarray(pointcloud.get("background", np.zeros((0, 6), dtype=np.float32)).shape[0]))
             dyn_n = int(sum(int(np.asarray(v).shape[0]) for v in pointcloud.get("dynamic", {}).values()))
+            bg_knn_shape = tuple(np.asarray(payload.get("bg_knn_idx", np.zeros((0, 0), dtype=np.int32))).shape)
+            rigid_knn_shape = tuple(np.asarray(payload.get("rigid_knn_idx", np.zeros((0, 0), dtype=np.int32))).shape)
             print(
                 f"[segment-knn] scene_id={scene_id} segment_id={seg_id} "
                 f"status={'written' if written else 'existing'} "
-                f"background_points={bg_n} dynamic_points={dyn_n}"
+                f"background_points={bg_n} dynamic_points={dyn_n} "
+                f"bg_knn_shape={bg_knn_shape} rigid_knn_shape={rigid_knn_shape}"
             )
 
 

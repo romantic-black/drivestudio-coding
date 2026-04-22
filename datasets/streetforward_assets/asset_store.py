@@ -207,7 +207,7 @@ def _serialize_knn_init_payload(payload: Dict[str, Any]) -> Dict[str, np.ndarray
     dyn_ks = sorted(int(k) for k in dyn_map_raw.keys())
 
     arrays: Dict[str, np.ndarray] = {
-        "schema_version": np.asarray([1], dtype=np.int32),
+        "schema_version": np.asarray([2], dtype=np.int32),
         "background_ks": np.asarray(bg_ks, dtype=np.int32),
         "dynamic_ks": np.asarray(dyn_ks, dtype=np.int32),
     }
@@ -237,19 +237,47 @@ def _serialize_knn_init_payload(payload: Dict[str, Any]) -> Dict[str, np.ndarray
                 f"dynamic instance id sets must match across k values; expected={dynamic_instance_intids}, got={ids}"
             )
 
-    offsets: List[int] = [0]
-    for intid in dynamic_instance_intids:
-        first_arr: Optional[np.ndarray] = None
-        for k in dyn_ks:
-            arr = np.asarray(dyn_map_raw[k][int(intid)]).astype(np.float32, copy=False).reshape(-1)
-            if first_arr is None:
-                first_arr = arr
-            elif int(arr.shape[0]) != int(first_arr.shape[0]):
-                raise ValueError(
-                    f"dynamic instance {intid} has inconsistent point count across k values: "
-                    f"{arr.shape[0]} vs {first_arr.shape[0]}"
-                )
-        offsets.append(offsets[-1] + (int(first_arr.shape[0]) if first_arr is not None else 0))
+    dyn_intids_payload = payload.get("dynamic_instance_intids")
+    dyn_offsets_payload = payload.get("dynamic_offsets")
+    if dyn_intids_payload is not None or dyn_offsets_payload is not None:
+        if dyn_intids_payload is None or dyn_offsets_payload is None:
+            raise ValueError(
+                "knn payload dynamic_instance_intids and dynamic_offsets must either both be set or both be omitted"
+            )
+        dynamic_instance_intids_payload = [
+            int(x) for x in np.asarray(dyn_intids_payload, dtype=np.int32).reshape(-1).tolist()
+        ]
+        offsets_arr_payload = np.asarray(dyn_offsets_payload, dtype=np.int64).reshape(-1)
+        if offsets_arr_payload.ndim != 1 or int(offsets_arr_payload.shape[0]) != int(len(dynamic_instance_intids_payload)) + 1:
+            raise ValueError(
+                "knn payload dynamic_offsets shape mismatch: "
+                f"expected len={len(dynamic_instance_intids_payload) + 1}, got {tuple(offsets_arr_payload.shape)}"
+            )
+        if int(offsets_arr_payload[0]) != 0:
+            raise ValueError("knn payload dynamic_offsets must start at 0")
+        if np.any(offsets_arr_payload[1:] < offsets_arr_payload[:-1]):
+            raise ValueError("knn payload dynamic_offsets must be non-decreasing")
+        if dynamic_instance_intids and dynamic_instance_intids_payload != dynamic_instance_intids:
+            raise ValueError(
+                "knn payload dynamic_instance_intids mismatches dynamic_avg_dist_by_k instance ids: "
+                f"payload={dynamic_instance_intids_payload} from_dynamic_avg={dynamic_instance_intids}"
+            )
+        dynamic_instance_intids = dynamic_instance_intids_payload
+        offsets = [int(x) for x in offsets_arr_payload.tolist()]
+    else:
+        offsets = [0]
+        for intid in dynamic_instance_intids:
+            first_arr: Optional[np.ndarray] = None
+            for k in dyn_ks:
+                arr = np.asarray(dyn_map_raw[k][int(intid)]).astype(np.float32, copy=False).reshape(-1)
+                if first_arr is None:
+                    first_arr = arr
+                elif int(arr.shape[0]) != int(first_arr.shape[0]):
+                    raise ValueError(
+                        f"dynamic instance {intid} has inconsistent point count across k values: "
+                        f"{arr.shape[0]} vs {first_arr.shape[0]}"
+                    )
+            offsets.append(offsets[-1] + (int(first_arr.shape[0]) if first_arr is not None else 0))
 
     arrays["dynamic_instance_intids"] = np.asarray(dynamic_instance_intids, dtype=np.int32)
     arrays["dynamic_offsets"] = np.asarray(offsets, dtype=np.int64)
@@ -265,13 +293,69 @@ def _serialize_knn_init_payload(payload: Dict[str, Any]) -> Dict[str, np.ndarray
             else np.zeros((0,), dtype=np.float32)
         )
         arrays[f"dynamic_avg_dist_k{k}"] = concat
+
+    neighbor_k_store_raw = payload.get("knn_neighbor_k_store", 0)
+    neighbor_k_store = int(neighbor_k_store_raw)
+    if neighbor_k_store < 0:
+        raise ValueError(f"knn payload knn_neighbor_k_store must be >= 0, got {neighbor_k_store}")
+    arrays["knn_neighbor_k_store"] = np.asarray([int(neighbor_k_store)], dtype=np.int32)
+
+    bg_knn_idx_raw = payload.get("bg_knn_idx")
+    rigid_knn_idx_raw = payload.get("rigid_knn_idx")
+    if bg_knn_idx_raw is not None or rigid_knn_idx_raw is not None:
+        if bg_knn_idx_raw is None or rigid_knn_idx_raw is None:
+            raise ValueError("knn payload bg_knn_idx and rigid_knn_idx must either both be set or both be omitted")
+
+        bg_knn_idx = np.asarray(bg_knn_idx_raw, dtype=np.int32)
+        rigid_knn_idx = np.asarray(rigid_knn_idx_raw, dtype=np.int32)
+        if bg_knn_idx.ndim != 2:
+            raise ValueError(f"knn payload bg_knn_idx must be rank-2, got shape {tuple(bg_knn_idx.shape)}")
+        if rigid_knn_idx.ndim != 2:
+            raise ValueError(
+                f"knn payload rigid_knn_idx must be rank-2, got shape {tuple(rigid_knn_idx.shape)}"
+            )
+        if int(bg_knn_idx.shape[1]) != int(rigid_knn_idx.shape[1]):
+            raise ValueError(
+                "knn payload bg_knn_idx and rigid_knn_idx must share the same K_store: "
+                f"{bg_knn_idx.shape[1]} vs {rigid_knn_idx.shape[1]}"
+            )
+        if bg_count is not None and int(bg_knn_idx.shape[0]) != int(bg_count):
+            raise ValueError(
+                "knn payload bg_knn_idx row count mismatch with background_avg_dist_by_k: "
+                f"{bg_knn_idx.shape[0]} vs {bg_count}"
+            )
+        if int(bg_knn_idx.shape[0]) > 0:
+            if np.any(bg_knn_idx < 0) or np.any(bg_knn_idx >= int(bg_knn_idx.shape[0])):
+                raise ValueError("knn payload bg_knn_idx must be in [0, N_bg)")
+
+        total_dynamic = int(offsets[-1])
+        if total_dynamic > 0 and int(rigid_knn_idx.shape[0]) != total_dynamic:
+            raise ValueError(
+                "knn payload rigid_knn_idx row count mismatch with dynamic_offsets total: "
+                f"{rigid_knn_idx.shape[0]} vs {total_dynamic}"
+            )
+        if int(rigid_knn_idx.shape[0]) > 0:
+            if np.any(rigid_knn_idx < 0) or np.any(rigid_knn_idx >= int(rigid_knn_idx.shape[0])):
+                raise ValueError("knn payload rigid_knn_idx must be in [0, N_rigid)")
+
+        if neighbor_k_store <= 0:
+            neighbor_k_store = int(bg_knn_idx.shape[1])
+            arrays["knn_neighbor_k_store"] = np.asarray([int(neighbor_k_store)], dtype=np.int32)
+        elif int(bg_knn_idx.shape[1]) < int(neighbor_k_store):
+            raise ValueError(
+                "knn payload K_store mismatch: "
+                f"knn_neighbor_k_store={neighbor_k_store} but bg_knn_idx has {bg_knn_idx.shape[1]} columns"
+            )
+        arrays["bg_knn_idx"] = np.ascontiguousarray(bg_knn_idx, dtype=np.int32)
+        arrays["rigid_knn_idx"] = np.ascontiguousarray(rigid_knn_idx, dtype=np.int32)
     return arrays
 
 
 def _deserialize_knn_init_payload(raw: Dict[str, np.ndarray]) -> Dict[str, Any]:
     version_raw = np.asarray(raw.get("schema_version", np.asarray([1], dtype=np.int32))).reshape(-1)
-    if int(version_raw[0]) != 1:
-        raise ValueError(f"Unsupported knn_init schema_version={int(version_raw[0])}, expected 1")
+    schema_version = int(version_raw[0])
+    if schema_version not in (1, 2):
+        raise ValueError(f"Unsupported knn_init schema_version={schema_version}, expected 1 or 2")
 
     bg_ks = [int(x) for x in np.asarray(raw.get("background_ks", np.zeros((0,), dtype=np.int32))).tolist()]
     dyn_ks = [int(x) for x in np.asarray(raw.get("dynamic_ks", np.zeros((0,), dtype=np.int32))).tolist()]
@@ -321,10 +405,72 @@ def _deserialize_knn_init_payload(raw: Dict[str, np.ndarray]) -> Dict[str, Any]:
             per_instance[int(intid)] = concat[lo:hi]
         dynamic_avg_dist_by_k[int(k)] = per_instance
 
-    return {
+    out: Dict[str, Any] = {
         "background_avg_dist_by_k": background_avg_dist_by_k,
         "dynamic_avg_dist_by_k": dynamic_avg_dist_by_k,
+        "dynamic_instance_intids": intids,
+        "dynamic_offsets": offsets,
     }
+    if schema_version >= 2:
+        neighbor_k_store_raw = np.asarray(raw.get("knn_neighbor_k_store", np.asarray([0], dtype=np.int32))).reshape(-1)
+        neighbor_k_store = int(neighbor_k_store_raw[0]) if neighbor_k_store_raw.size > 0 else 0
+        if neighbor_k_store < 0:
+            raise ValueError(f"knn_init knn_neighbor_k_store must be >= 0, got {neighbor_k_store}")
+
+        has_bg_knn = "bg_knn_idx" in raw
+        has_rigid_knn = "rigid_knn_idx" in raw
+        if has_bg_knn != has_rigid_knn:
+            raise ValueError(
+                "knn_init must contain bg_knn_idx and rigid_knn_idx together when schema_version>=2"
+            )
+        if has_bg_knn:
+            bg_knn_idx = np.asarray(raw["bg_knn_idx"], dtype=np.int32)
+            rigid_knn_idx = np.asarray(raw["rigid_knn_idx"], dtype=np.int32)
+            if bg_knn_idx.ndim != 2:
+                raise ValueError(
+                    f"knn_init bg_knn_idx must be rank-2, got shape {tuple(bg_knn_idx.shape)}"
+                )
+            if rigid_knn_idx.ndim != 2:
+                raise ValueError(
+                    f"knn_init rigid_knn_idx must be rank-2, got shape {tuple(rigid_knn_idx.shape)}"
+                )
+            if int(bg_knn_idx.shape[1]) != int(rigid_knn_idx.shape[1]):
+                raise ValueError(
+                    "knn_init bg_knn_idx and rigid_knn_idx must share the same K_store: "
+                    f"{bg_knn_idx.shape[1]} vs {rigid_knn_idx.shape[1]}"
+                )
+            if bg_count is not None and int(bg_knn_idx.shape[0]) != int(bg_count):
+                raise ValueError(
+                    "knn_init bg_knn_idx row count mismatch with background_avg_dist_by_k: "
+                    f"{bg_knn_idx.shape[0]} vs {bg_count}"
+                )
+            if int(bg_knn_idx.shape[0]) > 0 and (
+                np.any(bg_knn_idx < 0) or np.any(bg_knn_idx >= int(bg_knn_idx.shape[0]))
+            ):
+                raise ValueError("knn_init bg_knn_idx must be in [0, N_bg)")
+
+            if total > 0 and int(rigid_knn_idx.shape[0]) != int(total):
+                raise ValueError(
+                    "knn_init rigid_knn_idx row count mismatch with dynamic_offsets total: "
+                    f"{rigid_knn_idx.shape[0]} vs {total}"
+                )
+            if int(rigid_knn_idx.shape[0]) > 0 and (
+                np.any(rigid_knn_idx < 0) or np.any(rigid_knn_idx >= int(rigid_knn_idx.shape[0]))
+            ):
+                raise ValueError("knn_init rigid_knn_idx must be in [0, N_rigid)")
+
+            if neighbor_k_store <= 0:
+                neighbor_k_store = int(bg_knn_idx.shape[1])
+            elif int(bg_knn_idx.shape[1]) < int(neighbor_k_store):
+                raise ValueError(
+                    "knn_init neighbor K_store mismatch: "
+                    f"knn_neighbor_k_store={neighbor_k_store} but bg_knn_idx has {bg_knn_idx.shape[1]} columns"
+                )
+            out["bg_knn_idx"] = np.ascontiguousarray(bg_knn_idx, dtype=np.int32)
+            out["rigid_knn_idx"] = np.ascontiguousarray(rigid_knn_idx, dtype=np.int32)
+
+        out["knn_neighbor_k_store"] = int(neighbor_k_store)
+    return out
 
 
 @dataclass(frozen=True)

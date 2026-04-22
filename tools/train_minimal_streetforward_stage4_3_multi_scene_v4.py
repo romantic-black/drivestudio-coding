@@ -924,7 +924,11 @@ def main() -> None:
             )
 
         for step in range(max_iterations):
+            iter_t0 = time.perf_counter()
+            fetch_t0 = time.perf_counter()
             raw_batch = scheduler.next_batch()
+            fetch_t1 = time.perf_counter()
+            batch_fetch_ms = float((fetch_t1 - fetch_t0) * 1000.0)
             scheduler_info = raw_batch.get("_scheduler_v4_aligned_info")
             if scheduler_info is None:
                 scheduler_info = scheduler.get_current_info()
@@ -1006,6 +1010,7 @@ def main() -> None:
             if not isinstance(tgt, dict) or tgt.get("image") is None:
                 raise ValueError("dataset batch must contain target.image")
             num_target_views = int(tgt["image"].shape[0])
+            convert_t0 = time.perf_counter()
             minimal_batch = convert_batch_to_minimal_format(
                 raw_batch,
                 device,
@@ -1013,8 +1018,13 @@ def main() -> None:
                 include_source_for_2d=True,
                 view_selection=None,
             )
+            convert_t1 = time.perf_counter()
+            batch_convert_ms = float((convert_t1 - convert_t0) * 1000.0)
 
             step_t0 = time.perf_counter()
+            if perf_cfg["enable"] and torch.cuda.is_available():
+                torch.cuda.synchronize()
+                step_t0 = time.perf_counter()
             if perf_cfg["enable"] and perf_cfg["cuda_memory"] and torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats()
             result = model.train_step(
@@ -1024,6 +1034,8 @@ def main() -> None:
                 sync_cuda_timing=bool(perf_cfg["enable"] and perf_cfg["phase_timing"]),
                 scheduler_node_sync=scheduler_node_sync,
             )
+            if perf_cfg["enable"] and torch.cuda.is_available():
+                torch.cuda.synchronize()
             step_t1 = time.perf_counter()
             step_time_ms = float((step_t1 - step_t0) * 1000.0)
             sum_step_time_ms += step_time_ms
@@ -1078,9 +1090,11 @@ def main() -> None:
             if diag_cfg["enable"] and diag_cfg["save_branch_renders"] and step % max(diag_cfg["interval"], 1) == 0:
                 _save_diagnostic_renders(model, minimal_batch, step, cfg.log_dir)
 
+            block_end_monitor_ms = 0.0
             for ev in step_events:
                 if ev.get("type") != "block_end":
                     continue
+                block_end_t0 = time.perf_counter()
 
                 block_idx_global = int(ev.get("block_idx_global", 0))
                 if block_idx_global >= 1 and (block_idx_global - 1) % image_interval_blocks == 0:
@@ -1368,8 +1382,11 @@ def main() -> None:
                         if isinstance(v, (int, float)):
                             writer.add_scalar(f"train/{k}", float(v), step)
                     writer.add_scalar("train/perf/step_time_ms", float(step_time_ms), step)
+                block_end_monitor_ms += float((time.perf_counter() - block_end_t0) * 1000.0)
 
+            validation_ms = 0.0
             if bool(validation_v7_cfg.eval_enable) and len(validation_due_episode_counters) > 0:
+                val_t0 = time.perf_counter()
                 for ep_counter in validation_due_episode_counters:
                     _run_validation_v7_round(
                         cfg=cfg,
@@ -1386,14 +1403,42 @@ def main() -> None:
                         metrics_fh=metrics_fh,
                         writer=writer,
                     )
+                validation_ms = float((time.perf_counter() - val_t0) * 1000.0)
 
+            checkpoint_ms = 0.0
             if save_every and step > 0 and step % save_every == 0:
+                ckpt_t0 = time.perf_counter()
                 ckpt_path = os.path.join(cfg.log_dir, "checkpoints", f"{CKPT_PREFIX}_step{step}.pt")
                 torch.save(
                     {"step": step, "model_state_dict": model.state_dict(), "optimizer_state_dict": model.optimizer.state_dict()},
                     ckpt_path,
                 )
                 logger.info("Saved checkpoint to %s", ckpt_path)
+                checkpoint_ms = float((time.perf_counter() - ckpt_t0) * 1000.0)
+
+            iter_wall_ms = float((time.perf_counter() - iter_t0) * 1000.0)
+            residual_non_train_ms = float(
+                iter_wall_ms
+                - step_time_ms
+                - batch_fetch_ms
+                - batch_convert_ms
+                - block_end_monitor_ms
+                - validation_ms
+                - checkpoint_ms
+            )
+            if perf_cfg["enable"] and step % log_interval == 0:
+                logger.info(
+                    "Perf iter=%s iter_wall_ms=%.2f train_step_ms=%.2f fetch_ms=%.2f convert_ms=%.2f block_end_ms=%.2f validation_ms=%.2f checkpoint_ms=%.2f residual_non_train_ms=%.2f",
+                    step,
+                    iter_wall_ms,
+                    step_time_ms,
+                    batch_fetch_ms,
+                    batch_convert_ms,
+                    block_end_monitor_ms,
+                    validation_ms,
+                    checkpoint_ms,
+                    residual_non_train_ms,
+                )
 
         summary = {
             "final_step": int(max_iterations - 1),

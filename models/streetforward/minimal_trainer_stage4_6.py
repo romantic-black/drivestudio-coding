@@ -388,6 +388,7 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
     def _compute_bg_rigid_in_gru_inputs(
         self,
         *,
+        batch: Optional[Dict[str, Any]] = None,
         source_frame_idx: int,
         node_state_bg: NodeStateBackground,
         node_state_rigid: Optional[NodeStateRigid],
@@ -397,6 +398,7 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
         acc_w_bg: torch.Tensor,
         acc_w_rigid_S: Optional[torch.Tensor],
     ) -> BgRigidInGRUInputs:
+        _ = batch
         _ = source_frame_idx
         _ = acc_w_rigid_S
         feat_3d_bg, feat_3d_rigid_in = self._build_3d_features_bg_plus_rigid_in(
@@ -769,6 +771,7 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
         src_backproject_pass_count = int(one_pass.get("src_backproject_pass_count", 0))
 
         bg_rigid_in_inputs = self._compute_bg_rigid_in_gru_inputs(
+            batch=batch,
             source_frame_idx=source_frame_idx,
             node_state_bg=node_state_bg,
             node_state_rigid=node_state_rigid,

@@ -8,6 +8,7 @@ from .common import (
     offsets_to_batch_ids,
 )
 from .xcpe_decoder import StreetForwardXCPEDecoder
+from .xcpe_knn_decoder import StreetForwardXCPEKNNDecoder
 
 __all__ = [
     "StructDecoderInput",
@@ -18,4 +19,5 @@ __all__ = [
     "normalize_params_for_embed",
     "offsets_to_batch_ids",
     "StreetForwardXCPEDecoder",
+    "StreetForwardXCPEKNNDecoder",
 ]

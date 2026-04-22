@@ -708,10 +708,11 @@ class MinimalStreetForwardStage4_2(MinimalStreetForwardStage4_1):
         t0 = time.perf_counter()
         self.optimizer.zero_grad()
         out = self.forward(batch)
-        t1 = time.perf_counter()
         if profile_phase_timing:
             if sync_cuda_timing and torch.cuda.is_available():
                 torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        if profile_phase_timing:
             timing_ms["forward_ms"] = float((t1 - t0) * 1000.0)
         if torch.is_tensor(out.get("loss")):
             out["loss"].backward()
@@ -726,16 +727,18 @@ class MinimalStreetForwardStage4_2(MinimalStreetForwardStage4_1):
                 rigid_world_proxy_pairs=out.get("_rigid_world_proxy_pairs"),
             )
         grad_norms = self._compute_branch_grad_norms()
+        if profile_phase_timing:
+            if sync_cuda_timing and torch.cuda.is_available():
+                torch.cuda.synchronize()
         t2 = time.perf_counter()
         if profile_phase_timing:
-            if sync_cuda_timing and torch.cuda.is_available():
-                torch.cuda.synchronize()
             timing_ms["backward_ms"] = float((t2 - t1) * 1000.0)
         self.optimizer.step()
-        t3 = time.perf_counter()
         if profile_phase_timing:
             if sync_cuda_timing and torch.cuda.is_available():
                 torch.cuda.synchronize()
+        t3 = time.perf_counter()
+        if profile_phase_timing:
             timing_ms["optimizer_ms"] = float((t3 - t2) * 1000.0)
         if "_cache_key" in out:
             key = out["_cache_key"]

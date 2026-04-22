@@ -20,6 +20,8 @@ class StructDecoderInput:
     split_bg: int
     split_rigid_in: int
     meta: Dict[str, Any] = field(default_factory=dict)
+    neighbor_idx: Optional[torch.Tensor] = None
+    neighbor_mask: Optional[torch.Tensor] = None
 
 
 @dataclass

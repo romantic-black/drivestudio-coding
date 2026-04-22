@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 import threading
 import time
@@ -108,6 +106,8 @@ class KNNValidationRequirementsV4:
     background_ks: Tuple[int, ...]
     dynamic_ks: Tuple[int, ...]
     required_branches: Tuple[str, ...]
+    fixed_neighbor_enabled: bool
+    neighbor_k_store: int
 
 
 def _cap_int_or_none(d: Dict[str, Any], k: str) -> Optional[int]:
@@ -138,6 +138,8 @@ def _parse_knn_validation_requirements(raw: Any) -> KNNValidationRequirementsV4:
             background_ks=tuple(),
             dynamic_ks=tuple(),
             required_branches=tuple(),
+            fixed_neighbor_enabled=False,
+            neighbor_k_store=0,
         )
     payload = raw
     if OmegaConf.is_config(payload):
@@ -159,8 +161,17 @@ def _parse_knn_validation_requirements(raw: Any) -> KNNValidationRequirementsV4:
             f"{invalid_branches}"
         )
 
-    enabled = bool(payload.get("enabled", False)) or len(bg_ks) > 0 or len(dyn_ks) > 0
-    if enabled and len(bg_ks) == 0 and len(dyn_ks) == 0:
+    fixed_neighbor_enabled = bool(payload.get("fixed_neighbor_enabled", False))
+    neighbor_k_store = int(payload.get("neighbor_k_store", 0))
+    if neighbor_k_store < 0:
+        raise ValueError(f"knn_requirements.neighbor_k_store must be >= 0, got {neighbor_k_store}")
+    if neighbor_k_store > 0:
+        fixed_neighbor_enabled = True
+    if fixed_neighbor_enabled and neighbor_k_store <= 0:
+        raise ValueError("knn_requirements.fixed_neighbor_enabled=true requires neighbor_k_store > 0")
+
+    enabled = bool(payload.get("enabled", False)) or len(bg_ks) > 0 or len(dyn_ks) > 0 or fixed_neighbor_enabled
+    if enabled and len(bg_ks) == 0 and len(dyn_ks) == 0 and not fixed_neighbor_enabled:
         raise ValueError(
             "knn_requirements.enabled=true requires at least one of background_ks/dynamic_ks"
         )
@@ -170,167 +181,9 @@ def _parse_knn_validation_requirements(raw: Any) -> KNNValidationRequirementsV4:
         background_ks=tuple(int(x) for x in bg_ks),
         dynamic_ks=tuple(int(x) for x in dyn_ks),
         required_branches=tuple(branches),
+        fixed_neighbor_enabled=bool(fixed_neighbor_enabled),
+        neighbor_k_store=int(neighbor_k_store),
     )
-
-
-def _make_cap_downsample_rng(segment_manifest: Dict[str, Any], runtime_pc: Dict[str, Any]) -> np.random.Generator:
-    payload = {
-        "asset_id": str(segment_manifest["asset_id"]),
-        "near_max_points": _cap_int_or_none(runtime_pc, "near_max_points"),
-        "distant_max_points": _cap_int_or_none(runtime_pc, "distant_max_points"),
-        "monocular_dynamic_recovery_max_points_per_instance": _cap_int_or_none(
-            runtime_pc, "monocular_dynamic_recovery_max_points_per_instance"
-        ),
-    }
-    digest = hashlib.sha256(
-        json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")
-    ).digest()
-    seed = int.from_bytes(digest[:8], "big")
-    return np.random.default_rng(seed)
-
-
-def _random_subset_rows_with_local_indices(
-    arr: np.ndarray, max_count: Optional[int], rng: np.random.Generator
-) -> Tuple[np.ndarray, np.ndarray]:
-    n = int(arr.shape[0])
-    all_idx = np.arange(n, dtype=np.int64)
-    if max_count is None:
-        return arr, all_idx
-    if n == 0:
-        return arr, all_idx
-    m = int(max_count)
-    if m <= 0:
-        raise ValueError("max_count must be > 0 when set")
-    if n <= m:
-        return arr, all_idx
-    idx = rng.choice(n, size=m, replace=False)
-    idx.sort()
-    return arr[idx].astype(np.float32, copy=False), np.asarray(idx, dtype=np.int64)
-
-
-def _split_background_near_distant(
-    background: np.ndarray, segment_aabb: np.ndarray
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    seg_aabb = np.asarray(segment_aabb, dtype=np.float32).reshape(2, 3)
-    crop_min = seg_aabb[0]
-    crop_max = seg_aabb[1]
-    xyz = background[:, :3].astype(np.float32, copy=False)
-    in_crop = ((xyz >= crop_min[None, :]) & (xyz <= crop_max[None, :])).all(axis=1)
-    near_idx = np.where(in_crop)[0].astype(np.int64, copy=False)
-    distant_idx = np.where(~in_crop)[0].astype(np.int64, copy=False)
-    near = background[near_idx]
-    distant = background[distant_idx]
-    return near, distant, near_idx, distant_idx
-
-
-def _apply_runtime_random_pointcloud_downsample(
-    *,
-    pointcloud: Dict[str, Any],
-    segment_manifest: Dict[str, Any],
-    segment_aabb: Tensor,
-    runtime_pc: Dict[str, Any],
-    knn_init: Optional[Dict[str, Any]] = None,
-) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
-    asset_pc = segment_manifest.get("pointcloud_config_normalized")
-    if not isinstance(asset_pc, dict):
-        return pointcloud, knn_init
-    if not _pointcloud_cap_triplet_differs(asset_pc, runtime_pc):
-        return pointcloud, knn_init
-
-    r_near = _cap_int_or_none(runtime_pc, "near_max_points")
-    r_distant = _cap_int_or_none(runtime_pc, "distant_max_points")
-    r_mono = _cap_int_or_none(runtime_pc, "monocular_dynamic_recovery_max_points_per_instance")
-    if r_near is None and r_distant is None and r_mono is None:
-        return pointcloud, knn_init
-
-    rng = _make_cap_downsample_rng(segment_manifest, runtime_pc)
-    out = dict(pointcloud)
-    knn_out = dict(knn_init) if isinstance(knn_init, dict) else knn_init
-    aabb_np = segment_aabb.detach().cpu().numpy() if torch.is_tensor(segment_aabb) else np.asarray(segment_aabb)
-
-    bg_orig = np.asarray(out.get("background"), dtype=np.float32)
-    if bg_orig.size > 0:
-        near, distant, near_idx, distant_idx = _split_background_near_distant(bg_orig, aabb_np)
-        near, near_local_idx = _random_subset_rows_with_local_indices(near, r_near, rng)
-        distant, distant_local_idx = _random_subset_rows_with_local_indices(distant, r_distant, rng)
-        selected_bg_idx_parts: List[np.ndarray] = []
-        if int(near_local_idx.shape[0]) > 0:
-            selected_bg_idx_parts.append(near_idx[near_local_idx])
-        if int(distant_local_idx.shape[0]) > 0:
-            selected_bg_idx_parts.append(distant_idx[distant_local_idx])
-        selected_bg_idx = (
-            np.concatenate(selected_bg_idx_parts, axis=0).astype(np.int64, copy=False)
-            if selected_bg_idx_parts
-            else np.zeros((0,), dtype=np.int64)
-        )
-        if near.size == 0 and distant.size == 0:
-            out["background"] = np.zeros((0, 6), dtype=np.float32)
-        else:
-            out["background"] = np.concatenate([near, distant], axis=0).astype(np.float32, copy=False)
-        if isinstance(knn_out, dict):
-            bg_map_raw = knn_out.get("background_avg_dist_by_k", {})
-            if not isinstance(bg_map_raw, dict):
-                raise ValueError("knn_init.background_avg_dist_by_k must be a dict")
-            new_bg_map: Dict[int, np.ndarray] = {}
-            for k, arr in bg_map_raw.items():
-                arr_np = np.asarray(arr, dtype=np.float32).reshape(-1)
-                if int(arr_np.shape[0]) != int(bg_orig.shape[0]):
-                    raise ValueError(
-                        "knn_init background length mismatch before runtime downsample: "
-                        f"k={int(k)} knn_len={arr_np.shape[0]} bg_points={bg_orig.shape[0]}"
-                    )
-                new_bg_map[int(k)] = arr_np[selected_bg_idx]
-            knn_out["background_avg_dist_by_k"] = new_bg_map
-
-    dyn = out.get("dynamic")
-    if isinstance(dyn, dict) and len(dyn) > 0 and r_mono is not None:
-        new_dyn: Dict[int, np.ndarray] = {}
-        dyn_selected_local_idx: Dict[int, np.ndarray] = {}
-        dyn_orig_sizes: Dict[int, int] = {}
-        for intid, pts in dyn.items():
-            arr = np.asarray(pts, dtype=np.float32)
-            sub, local_idx = _random_subset_rows_with_local_indices(arr, r_mono, rng)
-            new_dyn[int(intid)] = sub
-            dyn_selected_local_idx[int(intid)] = local_idx
-            dyn_orig_sizes[int(intid)] = int(arr.shape[0])
-        out["dynamic"] = new_dyn
-        if isinstance(knn_out, dict):
-            dyn_map_raw = knn_out.get("dynamic_avg_dist_by_k", {})
-            if not isinstance(dyn_map_raw, dict):
-                raise ValueError("knn_init.dynamic_avg_dist_by_k must be a dict")
-            new_dyn_map: Dict[int, Dict[int, np.ndarray]] = {}
-            for k, per_instance_raw in dyn_map_raw.items():
-                if not isinstance(per_instance_raw, dict):
-                    raise ValueError(f"knn_init.dynamic_avg_dist_by_k[{int(k)}] must be a dict[intid -> np.ndarray]")
-                per_instance = {int(i): v for i, v in per_instance_raw.items()}
-                out_per: Dict[int, np.ndarray] = {}
-                for intid, local_idx in dyn_selected_local_idx.items():
-                    if intid not in per_instance:
-                        raise ValueError(
-                            f"knn_init missing dynamic instance {intid} during runtime downsample alignment for k={int(k)}"
-                        )
-                    arr_np = np.asarray(per_instance[intid], dtype=np.float32).reshape(-1)
-                    if int(arr_np.shape[0]) != int(dyn_orig_sizes[intid]):
-                        raise ValueError(
-                            "knn_init dynamic length mismatch before runtime downsample: "
-                            f"k={int(k)} intid={intid} knn_len={arr_np.shape[0]} dyn_points={dyn_orig_sizes[intid]}"
-                        )
-                    out_per[intid] = arr_np[local_idx]
-                new_dyn_map[int(k)] = out_per
-            knn_out["dynamic_avg_dist_by_k"] = new_dyn_map
-
-    ds_name = segment_manifest.get("dataset")
-    scene_id = segment_manifest.get("scene_id")
-    seg_id = segment_manifest.get("segment_id")
-    logger.debug(
-        "Runtime pointcloud caps differ from segment asset manifest; applied random subsample to runtime caps "
-        "(dataset=%s scene_id=%s segment_id=%s asset_id=%s)",
-        ds_name,
-        scene_id,
-        seg_id,
-        segment_manifest.get("asset_id"),
-    )
-    return out, knn_out
 
 
 class MultiSceneDatasetV4:
@@ -431,7 +284,7 @@ class MultiSceneDatasetV4:
 
     def _knn_required_branches_label(self) -> str:
         if len(self._knn_requirements.required_branches) == 0:
-            return "unknown"
+            return "fixed_cached" if self._knn_requirements.fixed_neighbor_enabled else "unknown"
         return ",".join(self._knn_requirements.required_branches)
 
     def _assert_knn_runtime_caps_match(
@@ -442,25 +295,23 @@ class MultiSceneDatasetV4:
         segment_id: int,
         context: str,
     ) -> None:
-        if not self._knn_requirements.enabled:
-            return
         runtime_pc = self._runtime_pointcloud_cfg
         if not isinstance(runtime_pc, dict):
             return
         asset_pc = segment_manifest.get("pointcloud_config_normalized")
         if not isinstance(asset_pc, dict):
             raise ValueError(
-                "KNN scale init requires segment manifest pointcloud_config_normalized for cap alignment checks, "
+                "Strict asset alignment requires segment manifest pointcloud_config_normalized for cap checks, "
                 f"but it is missing/invalid (context={context} scene_id={int(scene_id)} segment_id={int(segment_id)})"
             )
         if not _pointcloud_cap_triplet_differs(asset_pc, runtime_pc):
             return
         raise ValueError(
-            "KNN init requires runtime pointcloud caps to match exported asset caps. "
+            "Runtime pointcloud caps must exactly match exported asset caps; runtime cap downsample is disabled in strict mode. "
             f"(context={context} branches={self._knn_required_branches_label()} "
             f"scene_id={int(scene_id)} segment_id={int(segment_id)} "
             f"asset_caps={_extract_pointcloud_caps(asset_pc)} runtime_caps={_extract_pointcloud_caps(runtime_pc)}). "
-            "Re-export segment KNN assets with the current pointcloud config."
+            "Re-export assets (segment + segment_knn) with the current pointcloud config."
         )
 
     def _validate_required_knn_payload(
@@ -535,6 +386,124 @@ class MultiSceneDatasetV4:
                         f"k={int(k)} intid={int(intid)} knn_len={int(arr_np.shape[0])} "
                         f"dynamic_points={int(pts.shape[0])})"
                     )
+
+        if self._knn_requirements.fixed_neighbor_enabled:
+            self._validate_required_knn_neighbors(
+                pointcloud=pointcloud,
+                knn_init=knn_init,
+                scene_id=scene_id,
+                segment_id=segment_id,
+                context=context,
+            )
+
+    def _validate_required_knn_neighbors(
+        self,
+        *,
+        pointcloud: Dict[str, Any],
+        knn_init: Dict[str, Any],
+        scene_id: int,
+        segment_id: int,
+        context: str,
+    ) -> None:
+        required_k_store = int(self._knn_requirements.neighbor_k_store)
+        if required_k_store <= 0:
+            raise ValueError(
+                "Internal error: fixed_neighbor_enabled requires neighbor_k_store > 0, "
+                f"got {required_k_store}"
+            )
+
+        bg_knn_raw = knn_init.get("bg_knn_idx")
+        rigid_knn_raw = knn_init.get("rigid_knn_idx")
+        if bg_knn_raw is None or rigid_knn_raw is None:
+            raise ValueError(
+                "Stage5_1 fixed cached KNN is required but segment knn_init lacks bg_knn_idx/rigid_knn_idx: "
+                f"(context={context} scene_id={int(scene_id)} segment_id={int(segment_id)}). "
+                "Run tools/build_streetforward_segment_knn_assets.py before training."
+            )
+
+        bg_knn = np.asarray(bg_knn_raw, dtype=np.int64)
+        rigid_knn = np.asarray(rigid_knn_raw, dtype=np.int64)
+        if bg_knn.ndim != 2:
+            raise ValueError(
+                f"knn_init.bg_knn_idx must be rank-2 (context={context} scene_id={int(scene_id)} "
+                f"segment_id={int(segment_id)}), got {tuple(bg_knn.shape)}"
+            )
+        if rigid_knn.ndim != 2:
+            raise ValueError(
+                f"knn_init.rigid_knn_idx must be rank-2 (context={context} scene_id={int(scene_id)} "
+                f"segment_id={int(segment_id)}), got {tuple(rigid_knn.shape)}"
+            )
+        if int(bg_knn.shape[1]) != int(required_k_store):
+            raise ValueError(
+                "knn_init.bg_knn_idx neighbor_k_store must exactly match required value: "
+                f"(context={context} scene_id={int(scene_id)} segment_id={int(segment_id)} "
+                f"required={required_k_store} got={int(bg_knn.shape[1])})"
+            )
+        if int(rigid_knn.shape[1]) != int(required_k_store):
+            raise ValueError(
+                "knn_init.rigid_knn_idx neighbor_k_store must exactly match required value: "
+                f"(context={context} scene_id={int(scene_id)} segment_id={int(segment_id)} "
+                f"required={required_k_store} got={int(rigid_knn.shape[1])})"
+            )
+
+        meta_k_store = int(knn_init.get("knn_neighbor_k_store", 0) or 0)
+        if int(meta_k_store) != int(required_k_store):
+            raise ValueError(
+                "knn_init.knn_neighbor_k_store must exactly match required neighbor_k_store: "
+                f"(context={context} scene_id={int(scene_id)} segment_id={int(segment_id)} "
+                f"required={required_k_store} got={meta_k_store})"
+            )
+
+        background = np.asarray(pointcloud.get("background", np.zeros((0, 6), dtype=np.float32)), dtype=np.float32)
+        if background.ndim != 2 or background.shape[1] < 3:
+            raise ValueError(
+                "pointcloud.background must have shape [N,>=3] for fixed neighbor validation, "
+                f"got {tuple(background.shape)} (scene_id={int(scene_id)} segment_id={int(segment_id)})"
+            )
+        bg_count = int(background.shape[0])
+        if int(bg_knn.shape[0]) != int(bg_count):
+            raise ValueError(
+                "knn_init.bg_knn_idx row count mismatch with pointcloud background: "
+                f"(context={context} scene_id={int(scene_id)} segment_id={int(segment_id)} "
+                f"knn_rows={int(bg_knn.shape[0])} background_points={bg_count})"
+            )
+        if int(bg_count) > 0 and (
+            np.any(bg_knn < 0) or np.any(bg_knn >= int(bg_count))
+        ):
+            raise ValueError(
+                "knn_init.bg_knn_idx contains out-of-range values; expected [0, N_bg) "
+                f"(context={context} scene_id={int(scene_id)} segment_id={int(segment_id)} N_bg={bg_count})"
+            )
+
+        dynamic = pointcloud.get("dynamic", {})
+        if not isinstance(dynamic, dict):
+            raise ValueError(
+                f"pointcloud.dynamic must be a dict for fixed neighbor validation, got {type(dynamic)} "
+                f"(scene_id={int(scene_id)} segment_id={int(segment_id)})"
+            )
+        rigid_total = 0
+        for intid in sorted(int(x) for x in dynamic.keys()):
+            pts = np.asarray(dynamic[int(intid)], dtype=np.float32)
+            if pts.ndim != 2 or pts.shape[1] < 3:
+                raise ValueError(
+                    f"pointcloud.dynamic[{int(intid)}] must have shape [N,>=3], got {tuple(pts.shape)} "
+                    f"(scene_id={int(scene_id)} segment_id={int(segment_id)})"
+                )
+            rigid_total += int(pts.shape[0])
+        if int(rigid_knn.shape[0]) != int(rigid_total):
+            raise ValueError(
+                "knn_init.rigid_knn_idx row count mismatch with pointcloud dynamic total: "
+                f"(context={context} scene_id={int(scene_id)} segment_id={int(segment_id)} "
+                f"knn_rows={int(rigid_knn.shape[0])} dynamic_points={rigid_total})"
+            )
+        if int(rigid_total) > 0 and (
+            np.any(rigid_knn < 0) or np.any(rigid_knn >= int(rigid_total))
+        ):
+            raise ValueError(
+                "knn_init.rigid_knn_idx contains out-of-range values; expected [0, N_rigid) "
+                f"(context={context} scene_id={int(scene_id)} segment_id={int(segment_id)} "
+                f"N_rigid={rigid_total})"
+            )
 
     def _parse_and_validate_required_knn_maps(
         self,
@@ -761,11 +730,17 @@ class MultiSceneDatasetV4:
                         "segment_index scene/segment_id mismatch vs registry: "
                         f"expected=({scene_id},{segment_id}) got=({seg_idx['scene_id']},{seg_idx['segment_id']})"
                     )
+                self._assert_knn_runtime_caps_match(
+                    segment_manifest=segment_manifest,
+                    scene_id=int(scene_id),
+                    segment_id=int(segment_id),
+                    context="initialize/_validate_training_assets/pre_pointcloud",
+                )
                 if self._knn_requirements.enabled:
                     knn_init = resolved["segment_handle"].load_knn_init()
                     if not isinstance(knn_init, dict):
                         raise ValueError(
-                            "KNN scale init is required by model config, but segment knn_init asset is missing: "
+                            "KNN assets are required by model config, but segment knn_init asset is missing: "
                             f"(dataset={ds_name} scene_id={int(scene_id)} segment_id={int(segment_id)} "
                             f"branches={self._knn_required_branches_label()}). "
                             "Run tools/build_streetforward_segment_knn_assets.py before training."
@@ -782,7 +757,7 @@ class MultiSceneDatasetV4:
                         knn_init=knn_init,
                         scene_id=int(scene_id),
                         segment_id=int(segment_id),
-                        context="initialize/_validate_training_assets",
+                        context="initialize/_validate_training_assets/strict_runtime_caps",
                     )
                 checked += 1
                 if checked == 1 or checked == total_segments or (checked % 50) == 0:
@@ -869,14 +844,15 @@ class MultiSceneDatasetV4:
             pointcloud = segment_handle.load_pointcloud()
             dynamic_tracks = segment_handle.load_dynamic_tracks()
             knn_init = segment_handle.load_knn_init()
-            pointcloud, dynamic_tracks = self._reconcile_dynamic_payloads(
-                pointcloud=pointcloud,
-                dynamic_tracks=dynamic_tracks,
-            )
+            if not self._knn_requirements.fixed_neighbor_enabled:
+                pointcloud, dynamic_tracks = self._reconcile_dynamic_payloads(
+                    pointcloud=pointcloud,
+                    dynamic_tracks=dynamic_tracks,
+                )
             if self._knn_requirements.enabled:
                 if not isinstance(knn_init, dict):
                     raise ValueError(
-                        "KNN scale init is required by model config, but segment knn_init asset is missing: "
+                        "KNN assets are required by model config, but segment knn_init asset is missing: "
                         f"(dataset={ds_name} scene_id={int(scene_id)} segment_id={int(segment_id)} "
                         f"branches={self._knn_required_branches_label()}). "
                         "Run tools/build_streetforward_segment_knn_assets.py before training."
@@ -886,7 +862,7 @@ class MultiSceneDatasetV4:
                     knn_init=knn_init,
                     scene_id=int(scene_id),
                     segment_id=int(segment_id),
-                    context="_resolve_segment_bundle/pre_downsample",
+                    context="_resolve_segment_bundle/pre_runtime_cap_check",
                 )
             sidx = self._build_segment_index_from_asset_payload(segment_payload)
 
@@ -903,15 +879,20 @@ class MultiSceneDatasetV4:
                     "segment_aabb mismatch between dataset config and segment manifest: "
                     f"config={self.segment_aabb.tolist()} asset={segment_aabb.tolist()}"
                 )
+            self._assert_knn_runtime_caps_match(
+                segment_manifest=segment_manifest,
+                scene_id=int(scene_id),
+                segment_id=int(segment_id),
+                context="_resolve_segment_bundle/pre_pointcloud",
+            )
 
-            pc_rt = self._runtime_pointcloud_cfg
-            if isinstance(pc_rt, dict):
-                pointcloud, knn_init = _apply_runtime_random_pointcloud_downsample(
+            if self._knn_requirements.enabled and isinstance(knn_init, dict):
+                self._validate_required_knn_payload(
                     pointcloud=pointcloud,
-                    segment_manifest=segment_manifest,
-                    segment_aabb=segment_aabb,
-                    runtime_pc=pc_rt,
                     knn_init=knn_init,
+                    scene_id=int(scene_id),
+                    segment_id=int(segment_id),
+                    context="_resolve_segment_bundle/strict_runtime_caps",
                 )
 
             if knn_init is not None:
@@ -1515,6 +1496,7 @@ class MultiSceneDatasetV4:
 
         pointcloud = bundle.pointcloud
         knn_init = bundle.knn_init
+        needs_fixed_neighbors = bool(self._knn_requirements.fixed_neighbor_enabled)
         dynamic_info = None
         visible_intids_in_batch: set[int] = set()
         dynamic_points = pointcloud.get("dynamic")
@@ -1533,15 +1515,16 @@ class MultiSceneDatasetV4:
                     instances = frame_obj.get("instances", {})
                     for intid in instances.keys():
                         visible_intids_in_batch.add(int(intid))
-            pointcloud = dict(pointcloud)
-            if len(visible_intids_in_batch) == 0:
-                pointcloud["dynamic"] = {}
-            else:
-                pointcloud["dynamic"] = {
-                    int(intid): dynamic_points[int(intid)]
-                    for intid in sorted(visible_intids_in_batch)
-                    if int(intid) in dynamic_points
-                }
+            if not needs_fixed_neighbors:
+                pointcloud = dict(pointcloud)
+                if len(visible_intids_in_batch) == 0:
+                    pointcloud["dynamic"] = {}
+                else:
+                    pointcloud["dynamic"] = {
+                        int(intid): dynamic_points[int(intid)]
+                        for intid in sorted(visible_intids_in_batch)
+                        if int(intid) in dynamic_points
+                    }
 
         knn_init_batch: Optional[Dict[str, Any]] = None
         if knn_init is not None:
@@ -1569,6 +1552,14 @@ class MultiSceneDatasetV4:
                 if isinstance(dyn_points_now, dict)
                 else []
             )
+            dyn_point_counts: Dict[int, int] = {}
+            for intid in dyn_ids_now:
+                pts = np.asarray(dyn_points_now[intid], dtype=np.float32)
+                if pts.ndim != 2 or pts.shape[1] < 3:
+                    raise ValueError(
+                        f"pointcloud.dynamic[{intid}] must have shape [N,>=3], got {tuple(pts.shape)}"
+                    )
+                dyn_point_counts[int(intid)] = int(pts.shape[0])
             dyn_map: Dict[int, Dict[int, np.ndarray]] = {}
             for k, per_instance in dyn_map_raw.items():
                 k_i = int(k)
@@ -1581,22 +1572,86 @@ class MultiSceneDatasetV4:
                             f"knn_init missing dynamic instance {intid} for k={k_i}"
                         )
                     arr_np = np.asarray(per_instance[intid], dtype=np.float32).reshape(-1)
-                    pts = np.asarray(dyn_points_now[intid], dtype=np.float32)
-                    if pts.ndim != 2 or pts.shape[1] < 3:
-                        raise ValueError(
-                            f"pointcloud.dynamic[{intid}] must have shape [N,>=3], got {tuple(pts.shape)}"
-                        )
-                    if int(arr_np.shape[0]) != int(pts.shape[0]):
+                    if int(arr_np.shape[0]) != int(dyn_point_counts[int(intid)]):
                         raise ValueError(
                             "knn_init dynamic length mismatch with runtime pointcloud: "
-                            f"k={k_i} intid={intid} knn_len={arr_np.shape[0]} pts={pts.shape[0]}"
+                            f"k={k_i} intid={intid} knn_len={arr_np.shape[0]} pts={dyn_point_counts[int(intid)]}"
                         )
                     out_per[int(intid)] = arr_np
                 dyn_map[k_i] = out_per
+            rigid_total_now = int(sum(int(x) for x in dyn_point_counts.values()))
+
+            bg_knn_batch: Optional[np.ndarray] = None
+            rigid_knn_batch: Optional[np.ndarray] = None
+            knn_neighbor_k_store_batch: Optional[int] = None
+            if needs_fixed_neighbors:
+                bg_knn_raw = knn_init.get("bg_knn_idx")
+                rigid_knn_raw = knn_init.get("rigid_knn_idx")
+                if bg_knn_raw is None or rigid_knn_raw is None:
+                    raise ValueError(
+                        "Stage5_1 fixed cached KNN requires knn_init.bg_knn_idx and knn_init.rigid_knn_idx."
+                    )
+                bg_knn_np = np.asarray(bg_knn_raw)
+                rigid_knn_np = np.asarray(rigid_knn_raw)
+                if bg_knn_np.ndim != 2 or rigid_knn_np.ndim != 2:
+                    raise ValueError(
+                        "knn_init bg_knn_idx/rigid_knn_idx must both be rank-2 "
+                        f"(got bg={tuple(bg_knn_np.shape)} rigid={tuple(rigid_knn_np.shape)})"
+                    )
+                if int(bg_knn_np.shape[1]) != int(rigid_knn_np.shape[1]):
+                    raise ValueError(
+                        "knn_init bg_knn_idx/rigid_knn_idx K_store mismatch: "
+                        f"{bg_knn_np.shape[1]} vs {rigid_knn_np.shape[1]}"
+                    )
+                if int(bg_knn_np.shape[0]) != int(bg_count):
+                    raise ValueError(
+                        "knn_init bg_knn_idx row mismatch with runtime background pointcloud: "
+                        f"knn_rows={bg_knn_np.shape[0]} bg_count={bg_count}"
+                    )
+                if int(rigid_knn_np.shape[0]) != int(rigid_total_now):
+                    raise ValueError(
+                        "knn_init rigid_knn_idx row mismatch with runtime dynamic pointcloud: "
+                        f"knn_rows={rigid_knn_np.shape[0]} rigid_total={rigid_total_now}"
+                    )
+                if not np.issubdtype(bg_knn_np.dtype, np.integer):
+                    bg_knn_np = bg_knn_np.astype(np.int64, copy=False)
+                if not np.issubdtype(rigid_knn_np.dtype, np.integer):
+                    rigid_knn_np = rigid_knn_np.astype(np.int64, copy=False)
+
+                required_k_store = int(self._knn_requirements.neighbor_k_store) if needs_fixed_neighbors else 0
+                if int(required_k_store) <= 0:
+                    raise ValueError(
+                        "Internal error: fixed cached KNN requires neighbor_k_store > 0, "
+                        f"got {required_k_store}"
+                    )
+                if int(bg_knn_np.shape[1]) != int(required_k_store):
+                    raise ValueError(
+                        "knn_init bg_knn_idx neighbor_k_store mismatch with runtime requirement: "
+                        f"required={required_k_store} got={bg_knn_np.shape[1]}"
+                    )
+                if int(rigid_knn_np.shape[1]) != int(required_k_store):
+                    raise ValueError(
+                        "knn_init rigid_knn_idx neighbor_k_store mismatch with runtime requirement: "
+                        f"required={required_k_store} got={rigid_knn_np.shape[1]}"
+                    )
+                meta_k_store = int(knn_init.get("knn_neighbor_k_store", 0) or 0)
+                if int(meta_k_store) != int(required_k_store):
+                    raise ValueError(
+                        "knn_init.knn_neighbor_k_store mismatch with runtime requirement: "
+                        f"required={required_k_store} got={meta_k_store}"
+                    )
+                bg_knn_batch = bg_knn_np
+                rigid_knn_batch = rigid_knn_np
+                knn_neighbor_k_store_batch = int(required_k_store)
+
             knn_init_batch = {
                 "background_avg_dist_by_k": bg_map,
                 "dynamic_avg_dist_by_k": dyn_map,
             }
+            if bg_knn_batch is not None and rigid_knn_batch is not None:
+                knn_init_batch["bg_knn_idx"] = bg_knn_batch
+                knn_init_batch["rigid_knn_idx"] = rigid_knn_batch
+                knn_init_batch["knn_neighbor_k_store"] = int(knn_neighbor_k_store_batch or 0)
 
         batch: Dict[str, Any] = {
             "scene_id": torch.tensor([int(scene_id)], dtype=torch.long),
@@ -1620,6 +1675,12 @@ class MultiSceneDatasetV4:
             batch["dynamic_info"] = dynamic_info
         if knn_init_batch is not None:
             batch["knn_init"] = knn_init_batch
+            if "bg_knn_idx" in knn_init_batch and "rigid_knn_idx" in knn_init_batch:
+                batch["knn_struct_neighbors"] = {
+                    "bg_knn_idx": knn_init_batch["bg_knn_idx"],
+                    "rigid_knn_idx": knn_init_batch["rigid_knn_idx"],
+                    "knn_neighbor_k_store": int(knn_init_batch.get("knn_neighbor_k_store", 0)),
+                }
 
         if include_test:
             resolved = [tuple(r) for r in (test_image_refs or self._resolve_test_image_refs(sidx))]
