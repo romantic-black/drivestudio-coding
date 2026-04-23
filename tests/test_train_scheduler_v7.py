@@ -218,3 +218,53 @@ def test_v7_factory_returns_scheduler():
         warm_next_episode_chain=False,
     )
     assert isinstance(sch, TrainSchedulerV7)
+
+
+def test_v7_step_major_round_robin_block_visits_and_events():
+    ds = _make_mock_dataset()
+    sch = TrainSchedulerV7(
+        dataset=ds,
+        steps_per_block=2,
+        blocks_per_episode=3,
+        total_target_frames=3,
+        include_source_frame=True,
+        frame_within_keyframe_policy="middle_frame",
+        min_keyframes_required_policy="skip_if_less_than_window",
+        traversal_mode="linear_scene_segment",
+        switch_after_episode=True,
+        segment_order="ascending",
+        scene_order="ascending",
+        include_test=False,
+        fixed_scene_id=1,
+        fixed_segment_id=0,
+        emit_preload_hints=False,
+        warm_next_block_exact=False,
+        warm_next_episode_chain=False,
+        block_order="step_major",
+    )
+
+    source_frames = []
+    block_idx_global = []
+    block_idx_in_episode = []
+    block_repeat_step = []
+    for _ in range(6):
+        batch = sch.next_batch()
+        info = batch["_scheduler_v7_aligned_info"]
+        source_frames.append(int(info["source_frame_idx"]))
+        block_idx_global.append(int(info["block_idx_global"]))
+        block_idx_in_episode.append(int(info["block_idx_in_episode"]))
+        block_repeat_step.append(int(info["block_repeat_step"]))
+        assert str(info["block_order"]) == "step_major"
+
+    assert source_frames == [10, 11, 12, 10, 11, 12]
+    assert block_idx_global == [0, 1, 2, 0, 1, 2]
+    assert block_idx_in_episode == [0, 1, 2, 0, 1, 2]
+    assert block_repeat_step == [1, 1, 1, 2, 2, 2]
+
+    events = sch.pop_events()
+    begin_blocks = [int(e["block_idx_in_episode"]) for e in events if e.get("type") == "block_begin"]
+    end_blocks = [int(e["block_idx_in_episode"]) for e in events if e.get("type") == "block_end"]
+    episode_end = [e for e in events if e.get("type") == "episode_end"]
+    assert begin_blocks == [0, 1, 2]
+    assert end_blocks == [0, 1, 2]
+    assert len(episode_end) == 1

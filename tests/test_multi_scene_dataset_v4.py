@@ -17,6 +17,7 @@ def _prepare_demo_assets(
     instances_fv_override: np.ndarray | None = None,
     pointcloud_config_normalized: dict | None = None,
     pointcloud_payload: dict | None = None,
+    knn_payload: dict | None = None,
 ):
     image0 = tmp_path / "im0.png"
     image1 = tmp_path / "im1.png"
@@ -157,6 +158,14 @@ def _prepare_demo_assets(
         pointcloud_config_normalized=pointcloud_config_normalized,
         stats={"background_points": bg_n, "dynamic_points": dyn_n},
     )
+    if knn_payload is not None:
+        store.export_segment_knn_init_asset(
+            dataset="nuscenes",
+            scene_id=1,
+            segment_id=0,
+            knn_payload=knn_payload,
+            overwrite=True,
+        )
     return store
 
 
@@ -474,3 +483,152 @@ def test_v4_scheduler_v6_factory_and_next_batch(tmp_path):
     )
     batch = sch.next_batch()
     assert "_scheduler_v6_aligned_info" in batch
+
+
+def test_v4_fixed_knn_overprovisioned_random_subsampled_to_required(tmp_path, monkeypatch):
+    pointcloud_payload = {
+        "background": np.zeros((2, 6), dtype=np.float32),
+        "dynamic": {9: np.ones((3, 6), dtype=np.float32)},
+        "instance_mapping": {1009: 9},
+        "metadata": {"static_instance_intids": []},
+    }
+    bg_knn_src = np.asarray(
+        [
+            [0, 1, 0, 1],
+            [1, 0, 1, 0],
+        ],
+        dtype=np.int64,
+    )
+    rigid_knn_src = np.asarray(
+        [
+            [0, 1, 2, 1],
+            [1, 0, 2, 0],
+            [2, 1, 0, 1],
+        ],
+        dtype=np.int64,
+    )
+    store = _prepare_demo_assets(
+        tmp_path,
+        pointcloud_payload=pointcloud_payload,
+        knn_payload={
+            "background_avg_dist_by_k": {},
+            "dynamic_avg_dist_by_k": {},
+            "bg_knn_idx": bg_knn_src,
+            "rigid_knn_idx": rigid_knn_src,
+            "knn_neighbor_k_store": 4,
+        },
+    )
+    data_cfg, dataset_cfg = _build_cfg(tmp_path)
+    ds = MultiSceneDatasetV4(
+        dataset_cfg=dataset_cfg,
+        data_cfg=data_cfg,
+        device=torch.device("cpu"),
+        asset_store=store,
+        knn_requirements={
+            "enabled": True,
+            "fixed_neighbor_enabled": True,
+            "neighbor_k_store": 2,
+        },
+    )
+    ds.initialize()
+
+    def _mock_choice(a, size, replace=False):
+        assert int(a) == 4
+        assert int(size) == 2
+        assert not bool(replace)
+        return np.asarray([3, 1], dtype=np.int64)
+
+    monkeypatch.setattr(np.random, "choice", _mock_choice)
+    req = BatchRequestV4(
+        scene_id=1,
+        segment_id=0,
+        source_image_ref=(0, 0),
+        target_image_refs=[(0, 0), (1, 0)],
+        include_test=False,
+    )
+    batch = ds.get_segment_batch_from_image_refs(req, enforce_target0_equals_source=True)
+    knn_struct = batch["knn_struct_neighbors"]
+    assert int(knn_struct["knn_neighbor_k_store"]) == 2
+    expected_cols = np.asarray([1, 3], dtype=np.int64)
+    np.testing.assert_array_equal(np.asarray(knn_struct["bg_knn_idx"]), bg_knn_src[:, expected_cols])
+    np.testing.assert_array_equal(np.asarray(knn_struct["rigid_knn_idx"]), rigid_knn_src[:, expected_cols])
+    np.testing.assert_array_equal(np.asarray(knn_struct["rigid_knn_row_ids"]), np.asarray([0, 1, 2], dtype=np.int64))
+    np.testing.assert_array_equal(np.asarray(knn_struct["rigid_instance_intids"]), np.asarray([9], dtype=np.int64))
+    np.testing.assert_array_equal(np.asarray(knn_struct["rigid_instance_offsets"]), np.asarray([0, 3], dtype=np.int64))
+
+
+def test_v4_fixed_knn_invisible_dynamic_window_slices_rigid_knn_rows(tmp_path, monkeypatch):
+    pointcloud_payload = {
+        "background": np.zeros((2, 6), dtype=np.float32),
+        "dynamic": {9: np.ones((3, 6), dtype=np.float32)},
+        "instance_mapping": {1009: 9},
+        "metadata": {"static_instance_intids": []},
+    }
+    bg_knn_src = np.asarray(
+        [
+            [0, 1, 0, 1],
+            [1, 0, 1, 0],
+        ],
+        dtype=np.int64,
+    )
+    rigid_knn_src = np.asarray(
+        [
+            [0, 1, 2, 1],
+            [1, 0, 2, 0],
+            [2, 1, 0, 1],
+        ],
+        dtype=np.int64,
+    )
+    store = _prepare_demo_assets(
+        tmp_path,
+        tracks_all_invisible=True,
+        pointcloud_payload=pointcloud_payload,
+        knn_payload={
+            "background_avg_dist_by_k": {},
+            "dynamic_avg_dist_by_k": {},
+            "bg_knn_idx": bg_knn_src,
+            "rigid_knn_idx": rigid_knn_src,
+            "knn_neighbor_k_store": 4,
+        },
+    )
+    data_cfg, dataset_cfg = _build_cfg(tmp_path)
+    ds = MultiSceneDatasetV4(
+        dataset_cfg=dataset_cfg,
+        data_cfg=data_cfg,
+        device=torch.device("cpu"),
+        asset_store=store,
+        knn_requirements={
+            "enabled": True,
+            "fixed_neighbor_enabled": True,
+            "neighbor_k_store": 2,
+        },
+    )
+    ds.initialize()
+
+    def _mock_choice(a, size, replace=False):
+        assert int(a) == 4
+        assert int(size) == 2
+        assert not bool(replace)
+        return np.asarray([3, 1], dtype=np.int64)
+
+    monkeypatch.setattr(np.random, "choice", _mock_choice)
+    req = BatchRequestV4(
+        scene_id=1,
+        segment_id=0,
+        source_image_ref=(0, 0),
+        target_image_refs=[(0, 0), (1, 0)],
+        include_test=False,
+    )
+    batch = ds.get_segment_batch_from_image_refs(req, enforce_target0_equals_source=True)
+    assert "dynamic_info" in batch
+    assert isinstance(batch["dynamic_info"], dict)
+    assert sorted(int(x) for x in batch["dynamic_info"].keys()) == [0, 1]
+    assert all(len(v.get("instances", {})) == 0 for v in batch["dynamic_info"].values())
+    assert set(int(x) for x in batch["pointcloud"]["dynamic"].keys()) == {9}
+    knn_struct = batch["knn_struct_neighbors"]
+    assert int(knn_struct["knn_neighbor_k_store"]) == 2
+    assert np.asarray(knn_struct["bg_knn_idx"]).shape == (2, 2)
+    assert np.asarray(knn_struct["rigid_knn_idx"]).shape == (3, 2)
+    np.testing.assert_array_equal(np.asarray(knn_struct["rigid_knn_row_ids"]), np.asarray([0, 1, 2], dtype=np.int64))
+    np.testing.assert_array_equal(np.asarray(knn_struct["rigid_instance_intids"]), np.asarray([9], dtype=np.int64))
+    np.testing.assert_array_equal(np.asarray(knn_struct["rigid_instance_offsets"]), np.asarray([0, 3], dtype=np.int64))

@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -18,8 +17,6 @@ from models.streetforward.minimal_trainer_stage4_6 import BgRigidInGRUInputs, Mi
 from models.streetforward.minimal_trainer_stage5_0 import MinimalStreetForwardStage5_0
 from models.streetforward.node_states import NodeStateBackground, NodeStateRigid
 from models.streetforward.struct_decoders import StructDecoderInput, StreetForwardXCPEKNNDecoder, cat_param_dict
-
-logger = logging.getLogger(__name__)
 
 
 class MinimalStreetForwardStage5_1(MinimalStreetForwardStage5_0):
@@ -36,6 +33,18 @@ class MinimalStreetForwardStage5_1(MinimalStreetForwardStage5_0):
         model_cfg = self._require_key(config, "model", "config")
         if str(self._require_key(model_cfg, "stage", "model")) != "5_1":
             raise ValueError("Stage5_1 requires model.stage='5_1'.")
+        branches_cfg = self._require_key(model_cfg, "branches", "model")
+        distant_cfg = self._require_key(branches_cfg, "distant", "model.branches")
+        distant_init_cfg = self._require_key(distant_cfg, "init", "model.branches.distant")
+        distant_scale_init_cfg = self._require_key(distant_init_cfg, "scale_init", "model.branches.distant.init")
+        distant_scale_mode = str(
+            self._require_key(distant_scale_init_cfg, "mode", "model.branches.distant.init.scale_init")
+        ).strip().lower()
+        if distant_scale_mode == "knn":
+            raise ValueError(
+                "Stage5_1 does not support model.branches.distant.init.scale_init.mode='knn'. "
+                "Use mode='isotropic'."
+            )
 
         struct_cfg = self._require_key(model_cfg, "struct_decoder", "model")
         if not bool(self._require_key(struct_cfg, "enable", "model.struct_decoder")):
@@ -361,33 +370,31 @@ class MinimalStreetForwardStage5_1(MinimalStreetForwardStage5_0):
                 )
             global_to_knn = torch.full((num_rigid,), -1, device=device, dtype=torch.long)
             global_to_knn[row_ids] = torch.arange(int(row_ids.shape[0]), device=device, dtype=torch.long)
-            query_knn_rows = global_to_knn[query_global]
-            query_has_row = query_knn_rows >= 0
-            # Clamp for safe gather; invalid rows are masked out by query_has_row.
-            query_knn_rows = query_knn_rows.clamp_min(0).to(device=rigid_knn_idx.device, non_blocking=True)
+            query_knn_rows_raw = global_to_knn[query_global]
+            query_has_row = query_knn_rows_raw >= 0
+            if bool((~query_has_row).any().item()):
+                missing = int((~query_has_row).sum().item())
+                raise RuntimeError(
+                    "rigid_knn_row_ids does not cover all rigid_in query rows. "
+                    f"missing={missing} num_queries={int(query_global.shape[0])}."
+                )
+            query_knn_rows = query_knn_rows_raw.to(device=rigid_knn_idx.device, non_blocking=True)
 
         knn_rows = int(rigid_knn_idx.shape[0])
         if knn_rows <= 0:
             raise RuntimeError("Stage5_1 rigid_knn_idx has zero rows while rigid_in queries are present.")
         query_row_valid = (query_knn_rows >= 0) & (query_knn_rows < knn_rows)
         query_has_row = query_has_row & query_row_valid.to(device=query_has_row.device)
-        query_knn_rows_safe = query_knn_rows.clamp(min=0, max=knn_rows - 1)
         if bool((~query_row_valid).any().item()):
             qmin = int(query_knn_rows.min().item()) if int(query_knn_rows.numel()) > 0 else -1
             qmax = int(query_knn_rows.max().item()) if int(query_knn_rows.numel()) > 0 else -1
             bad = int((~query_row_valid).sum().item())
-            # Fast-fail would be stricter, but runtime fallback is safer for long runs:
-            # invalid query rows are masked by query_has_row and use self fallback later.
-            logger.warning(
-                "Stage5_1 detected %d rigid query rows outside knn table range; "
-                "fallback to self-neighbor for invalid rows. qmin=%d qmax=%d knn_rows=%d",
-                bad,
-                qmin,
-                qmax,
-                knn_rows,
+            raise RuntimeError(
+                "Stage5_1 detected rigid query rows outside knn table range: "
+                f"bad={bad} qmin={qmin} qmax={qmax} knn_rows={knn_rows}."
             )
 
-        raw_global_full = rigid_knn_idx[query_knn_rows_safe].to(device=device, non_blocking=True).long()
+        raw_global_full = rigid_knn_idx[query_knn_rows].to(device=device, non_blocking=True).long()
         raw_global = raw_global_full
 
         raw_valid_global = (raw_global >= 0) & (raw_global < num_rigid)

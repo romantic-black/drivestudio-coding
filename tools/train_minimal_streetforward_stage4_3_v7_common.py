@@ -31,6 +31,7 @@ def _extract_knn_requirements_from_cfg(cfg: Any) -> Dict[str, Any]:
     bg_ks: List[int] = []
     dynamic_ks: List[int] = []
     required_branches: List[str] = []
+    scale_mode_by_branch: Dict[str, str] = {}
     if branches is not None:
         for branch_name in ("bg", "distant", "rigid"):
             branch_cfg = _cfg_get(branches, branch_name)
@@ -40,6 +41,7 @@ def _extract_knn_requirements_from_cfg(cfg: Any) -> Dict[str, Any]:
             if scale_init is None:
                 continue
             mode = str(_cfg_get(scale_init, "mode", "isotropic")).strip()
+            scale_mode_by_branch[branch_name] = mode
             if mode != "knn":
                 continue
             k = int(_cfg_get(scale_init, "knn_k", 0))
@@ -61,6 +63,11 @@ def _extract_knn_requirements_from_cfg(cfg: Any) -> Dict[str, Any]:
     if knn_attn_cfg is None:
         knn_attn_cfg = _cfg_get(model_cfg, "knn_attention")
     stage5_1_like = stage == "5_1" or struct_type == "xcpe_knn_attn"
+    if stage5_1_like and scale_mode_by_branch.get("distant", "").strip().lower() == "knn":
+        raise ValueError(
+            "Stage5_1 does not support model.branches.distant.init.scale_init.mode='knn'. "
+            "Set it to 'isotropic'."
+        )
     knn_attn_enable = bool(_cfg_get(knn_attn_cfg, "enable", False)) if knn_attn_cfg is not None else False
     fixed_neighbor_enabled = bool(stage5_1_like or knn_attn_enable)
     neighbor_k_store = 0
@@ -117,8 +124,12 @@ def build_train_scheduler_v7_from_cfg(cfg: Any, dataset: MultiSceneDatasetV4) ->
     ep = sv7.get("episode")
     trav = sv7.get("traversal")
     preload = sv7.get("preload")
+    execution = sv7.get("execution") or {}
     if block is None or ep is None or trav is None or preload is None:
         raise ValueError("scheduler_v7 must define block/episode/traversal/preload")
+    block_order = str(execution.get("block_order", "block_major"))
+    if block_order not in ("block_major", "step_major"):
+        raise ValueError("scheduler_v7.execution.block_order must be one of ['block_major', 'step_major']")
 
     fixed_scene_id, fixed_segment_id = resolve_fixed_scene_segment_v7(cfg)
     validate_train_scene_for_fixed(cfg, fixed_scene_id)
@@ -141,4 +152,5 @@ def build_train_scheduler_v7_from_cfg(cfg: Any, dataset: MultiSceneDatasetV4) ->
         emit_preload_hints=bool(preload["emit_hints"]),
         warm_next_block_exact=bool(preload["warm_next_block_exact"]),
         warm_next_episode_chain=bool(preload["warm_next_episode_chain"]),
+        block_order=block_order,
     )

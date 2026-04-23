@@ -433,23 +433,23 @@ class MultiSceneDatasetV4:
                 f"knn_init.rigid_knn_idx must be rank-2 (context={context} scene_id={int(scene_id)} "
                 f"segment_id={int(segment_id)}), got {tuple(rigid_knn.shape)}"
             )
-        if int(bg_knn.shape[1]) != int(required_k_store):
+        if int(bg_knn.shape[1]) < int(required_k_store):
             raise ValueError(
-                "knn_init.bg_knn_idx neighbor_k_store must exactly match required value: "
+                "knn_init.bg_knn_idx neighbor_k_store must be >= required value: "
                 f"(context={context} scene_id={int(scene_id)} segment_id={int(segment_id)} "
                 f"required={required_k_store} got={int(bg_knn.shape[1])})"
             )
-        if int(rigid_knn.shape[1]) != int(required_k_store):
+        if int(rigid_knn.shape[1]) < int(required_k_store):
             raise ValueError(
-                "knn_init.rigid_knn_idx neighbor_k_store must exactly match required value: "
+                "knn_init.rigid_knn_idx neighbor_k_store must be >= required value: "
                 f"(context={context} scene_id={int(scene_id)} segment_id={int(segment_id)} "
                 f"required={required_k_store} got={int(rigid_knn.shape[1])})"
             )
 
         meta_k_store = int(knn_init.get("knn_neighbor_k_store", 0) or 0)
-        if int(meta_k_store) != int(required_k_store):
+        if int(meta_k_store) > 0 and int(meta_k_store) < int(required_k_store):
             raise ValueError(
-                "knn_init.knn_neighbor_k_store must exactly match required neighbor_k_store: "
+                "knn_init.knn_neighbor_k_store must be >= required neighbor_k_store when provided: "
                 f"(context={context} scene_id={int(scene_id)} segment_id={int(segment_id)} "
                 f"required={required_k_store} got={meta_k_store})"
             )
@@ -504,6 +504,24 @@ class MultiSceneDatasetV4:
                 f"(context={context} scene_id={int(scene_id)} segment_id={int(segment_id)} "
                 f"N_rigid={rigid_total})"
             )
+
+    @staticmethod
+    def _sample_knn_neighbor_columns(
+        *,
+        available_k_store: int,
+        required_k_store: int,
+    ) -> Optional[np.ndarray]:
+        available = int(available_k_store)
+        required = int(required_k_store)
+        if available < required:
+            raise ValueError(f"available_k_store must be >= required_k_store, got {available} < {required}")
+        if required <= 0:
+            raise ValueError(f"required_k_store must be > 0 for fixed cached neighbors, got {required}")
+        if available == required:
+            return None
+        sampled = np.random.choice(available, size=required, replace=False)
+        sampled = np.sort(np.asarray(sampled, dtype=np.int64))
+        return sampled
 
     def _parse_and_validate_required_knn_maps(
         self,
@@ -983,6 +1001,98 @@ class MultiSceneDatasetV4:
         reconciled_tracks["instances_trans"] = trans[:, cols, :]
         reconciled_tracks["instances_fv"] = fv[:, cols]
         return reconciled_pointcloud, reconciled_tracks
+
+    @staticmethod
+    def _dynamic_point_counts_by_instance(dynamic_points: Any) -> Dict[int, int]:
+        if not isinstance(dynamic_points, dict):
+            return {}
+        out: Dict[int, int] = {}
+        for intid_raw, pts_raw in dynamic_points.items():
+            intid = int(intid_raw)
+            pts = np.asarray(pts_raw, dtype=np.float32)
+            if pts.ndim != 2 or pts.shape[1] < 3:
+                raise ValueError(
+                    f"pointcloud.dynamic[{intid}] must have shape [N,>=3], got {tuple(pts.shape)}"
+                )
+            out[intid] = int(pts.shape[0])
+        return out
+
+    @staticmethod
+    def _build_rigid_instance_layout(
+        *,
+        instance_intids: Sequence[int],
+        point_counts_by_instance: Dict[int, int],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        intids = [int(x) for x in instance_intids]
+        offsets: List[int] = [0]
+        for intid in intids:
+            n = int(point_counts_by_instance.get(intid, 0))
+            if n < 0:
+                raise ValueError(f"dynamic point count must be >= 0 for intid={intid}, got {n}")
+            offsets.append(offsets[-1] + n)
+        return (
+            np.asarray(intids, dtype=np.int64),
+            np.asarray(offsets, dtype=np.int64),
+        )
+
+    @staticmethod
+    def _validate_runtime_dynamic_layout_against_knn_init(
+        *,
+        knn_init: Dict[str, Any],
+        runtime_instance_intids: Sequence[int],
+        runtime_instance_offsets: np.ndarray,
+    ) -> None:
+        asset_intids_raw = knn_init.get("dynamic_instance_intids")
+        asset_offsets_raw = knn_init.get("dynamic_offsets")
+        if asset_intids_raw is None and asset_offsets_raw is None:
+            return
+        if asset_intids_raw is None or asset_offsets_raw is None:
+            raise ValueError(
+                "knn_init dynamic_instance_intids and dynamic_offsets must both be present when either is set."
+            )
+
+        asset_intids = [int(x) for x in np.asarray(asset_intids_raw, dtype=np.int64).reshape(-1).tolist()]
+        asset_offsets = np.asarray(asset_offsets_raw, dtype=np.int64).reshape(-1)
+        if asset_offsets.ndim != 1 or int(asset_offsets.shape[0]) != int(len(asset_intids)) + 1:
+            raise ValueError(
+                "knn_init dynamic_offsets shape mismatch: "
+                f"expected len={len(asset_intids) + 1}, got {tuple(asset_offsets.shape)}"
+            )
+        if int(asset_offsets[0]) != 0:
+            raise ValueError("knn_init dynamic_offsets must start at 0")
+        if np.any(asset_offsets[1:] < asset_offsets[:-1]):
+            raise ValueError("knn_init dynamic_offsets must be non-decreasing")
+
+        runtime_intids = [int(x) for x in runtime_instance_intids]
+        runtime_offsets = np.asarray(runtime_instance_offsets, dtype=np.int64).reshape(-1)
+        if runtime_offsets.ndim != 1 or int(runtime_offsets.shape[0]) != int(len(runtime_intids)) + 1:
+            raise ValueError(
+                "runtime dynamic_offsets shape mismatch: "
+                f"expected len={len(runtime_intids) + 1}, got {tuple(runtime_offsets.shape)}"
+            )
+        if int(runtime_offsets[0]) != 0:
+            raise ValueError("runtime dynamic_offsets must start at 0")
+        if np.any(runtime_offsets[1:] < runtime_offsets[:-1]):
+            raise ValueError("runtime dynamic_offsets must be non-decreasing")
+
+        asset_count_by_intid: Dict[int, int] = {}
+        for i, intid in enumerate(asset_intids):
+            cnt = int(asset_offsets[i + 1] - asset_offsets[i])
+            if cnt < 0:
+                raise ValueError(f"knn_init dynamic_offsets invalid count for intid={intid}: {cnt}")
+            asset_count_by_intid[int(intid)] = cnt
+
+        for i, intid in enumerate(runtime_intids):
+            if intid not in asset_count_by_intid:
+                raise ValueError(
+                    f"runtime dynamic instance {intid} is missing in knn_init.dynamic_instance_intids"
+                )
+            runtime_cnt = int(runtime_offsets[i + 1] - runtime_offsets[i])
+            if runtime_cnt != int(asset_count_by_intid[int(intid)]):
+                raise ValueError(
+                    "runtime dynamic point count mismatches knn_init layout: "
+                    f"intid={intid} runtime={runtime_cnt} asset={asset_count_by_intid[int(intid)]}"
+                )
 
     def _build_segment_index_from_asset_payload(self, payload: Dict[str, Any]) -> SegmentIndexV4:
         train_frames = [int(x) for x in payload["frame_indices"]]
@@ -1499,8 +1609,8 @@ class MultiSceneDatasetV4:
         needs_fixed_neighbors = bool(self._knn_requirements.fixed_neighbor_enabled)
         dynamic_info = None
         visible_intids_in_batch: set[int] = set()
-        dynamic_points = pointcloud.get("dynamic")
-        if isinstance(dynamic_points, dict) and len(dynamic_points) > 0:
+        dynamic_points_full = pointcloud.get("dynamic")
+        if isinstance(dynamic_points_full, dict) and len(dynamic_points_full) > 0:
             if not bundle.dynamic_tracks:
                 raise ValueError(
                     "dynamic pointcloud is non-empty but dynamic_tracks is missing in strict asset mode"
@@ -1508,23 +1618,29 @@ class MultiSceneDatasetV4:
             dynamic_info = self._build_dynamic_info_from_asset_tracks(
                 bundle.dynamic_tracks, frame_indices=sorted(int(x) for x in all_frames)
             )
-            # Keep pointcloud.dynamic aligned with the current batch frame window.
-            # Some segments contain dynamic instances that are only visible in other frames.
+            if needs_fixed_neighbors and not dynamic_info:
+                # Fixed cached KNN keeps full-segment dynamic row-space in pointcloud.dynamic.
+                # Some frame windows can have no visible dynamic instances; provide empty per-frame
+                # entries so trainer rigid initialization can proceed without requiring visible poses.
+                dynamic_info = {
+                    int(fid): {"instances": {}}
+                    for fid in sorted(int(x) for x in all_frames)
+                }
             if dynamic_info is not None:
                 for frame_obj in dynamic_info.values():
                     instances = frame_obj.get("instances", {})
                     for intid in instances.keys():
                         visible_intids_in_batch.add(int(intid))
+            # Non-fixed KNN path can window dynamic points to current batch-visible instances.
+            # Fixed cached KNN must keep full-segment rigid row-space stable across batches,
+            # otherwise cached node_state_rigid rows will drift from rigid_knn_idx rows.
             if not needs_fixed_neighbors:
                 pointcloud = dict(pointcloud)
-                if len(visible_intids_in_batch) == 0:
-                    pointcloud["dynamic"] = {}
-                else:
-                    pointcloud["dynamic"] = {
-                        int(intid): dynamic_points[int(intid)]
-                        for intid in sorted(visible_intids_in_batch)
-                        if int(intid) in dynamic_points
-                    }
+                pointcloud["dynamic"] = {
+                    int(intid): dynamic_points_full[int(intid)]
+                    for intid in sorted(visible_intids_in_batch)
+                    if int(intid) in dynamic_points_full
+                }
 
         knn_init_batch: Optional[Dict[str, Any]] = None
         if knn_init is not None:
@@ -1580,10 +1696,17 @@ class MultiSceneDatasetV4:
                     out_per[int(intid)] = arr_np
                 dyn_map[k_i] = out_per
             rigid_total_now = int(sum(int(x) for x in dyn_point_counts.values()))
+            rigid_instance_intids_now, rigid_instance_offsets_now = self._build_rigid_instance_layout(
+                instance_intids=dyn_ids_now,
+                point_counts_by_instance=dyn_point_counts,
+            )
 
             bg_knn_batch: Optional[np.ndarray] = None
             rigid_knn_batch: Optional[np.ndarray] = None
             knn_neighbor_k_store_batch: Optional[int] = None
+            rigid_knn_row_ids_batch: Optional[np.ndarray] = None
+            rigid_instance_intids_batch: Optional[np.ndarray] = None
+            rigid_instance_offsets_batch: Optional[np.ndarray] = None
             if needs_fixed_neighbors:
                 bg_knn_raw = knn_init.get("bg_knn_idx")
                 rigid_knn_raw = knn_init.get("rigid_knn_idx")
@@ -1609,9 +1732,12 @@ class MultiSceneDatasetV4:
                         f"knn_rows={bg_knn_np.shape[0]} bg_count={bg_count}"
                     )
                 if int(rigid_knn_np.shape[0]) != int(rigid_total_now):
+                    rigid_counts_full = self._dynamic_point_counts_by_instance(dynamic_points_full)
+                    rigid_total_full = int(sum(int(x) for x in rigid_counts_full.values()))
                     raise ValueError(
-                        "knn_init rigid_knn_idx row mismatch with runtime dynamic pointcloud: "
-                        f"knn_rows={rigid_knn_np.shape[0]} rigid_total={rigid_total_now}"
+                        "fixed_cached rigid KNN requires runtime rigid row-space == full-segment row-space: "
+                        f"knn_rows={rigid_knn_np.shape[0]} rigid_total_now={rigid_total_now} "
+                        f"full_segment_rigid_total={rigid_total_full} selected_instances={dyn_ids_now}"
                     )
                 if not np.issubdtype(bg_knn_np.dtype, np.integer):
                     bg_knn_np = bg_knn_np.astype(np.int64, copy=False)
@@ -1624,25 +1750,44 @@ class MultiSceneDatasetV4:
                         "Internal error: fixed cached KNN requires neighbor_k_store > 0, "
                         f"got {required_k_store}"
                     )
-                if int(bg_knn_np.shape[1]) != int(required_k_store):
+                available_k_store = int(bg_knn_np.shape[1])
+                if int(available_k_store) < int(required_k_store):
                     raise ValueError(
-                        "knn_init bg_knn_idx neighbor_k_store mismatch with runtime requirement: "
-                        f"required={required_k_store} got={bg_knn_np.shape[1]}"
+                        "knn_init bg_knn_idx neighbor_k_store is smaller than runtime requirement: "
+                        f"required={required_k_store} got={available_k_store}"
                     )
-                if int(rigid_knn_np.shape[1]) != int(required_k_store):
+                if int(rigid_knn_np.shape[1]) < int(required_k_store):
                     raise ValueError(
-                        "knn_init rigid_knn_idx neighbor_k_store mismatch with runtime requirement: "
+                        "knn_init rigid_knn_idx neighbor_k_store is smaller than runtime requirement: "
                         f"required={required_k_store} got={rigid_knn_np.shape[1]}"
                     )
                 meta_k_store = int(knn_init.get("knn_neighbor_k_store", 0) or 0)
-                if int(meta_k_store) != int(required_k_store):
+                if int(meta_k_store) > 0 and int(meta_k_store) < int(required_k_store):
                     raise ValueError(
-                        "knn_init.knn_neighbor_k_store mismatch with runtime requirement: "
+                        "knn_init.knn_neighbor_k_store is smaller than runtime requirement: "
                         f"required={required_k_store} got={meta_k_store}"
                     )
+                sampled_cols = self._sample_knn_neighbor_columns(
+                    available_k_store=int(available_k_store),
+                    required_k_store=int(required_k_store),
+                )
+                if sampled_cols is not None:
+                    bg_knn_np = np.ascontiguousarray(bg_knn_np[:, sampled_cols], dtype=np.int64)
+                    rigid_knn_np = np.ascontiguousarray(rigid_knn_np[:, sampled_cols], dtype=np.int64)
+                else:
+                    bg_knn_np = np.ascontiguousarray(bg_knn_np, dtype=np.int64)
+                    rigid_knn_np = np.ascontiguousarray(rigid_knn_np, dtype=np.int64)
                 bg_knn_batch = bg_knn_np
                 rigid_knn_batch = rigid_knn_np
                 knn_neighbor_k_store_batch = int(required_k_store)
+                self._validate_runtime_dynamic_layout_against_knn_init(
+                    knn_init=knn_init,
+                    runtime_instance_intids=rigid_instance_intids_now.tolist(),
+                    runtime_instance_offsets=rigid_instance_offsets_now,
+                )
+                rigid_knn_row_ids_batch = np.arange(int(rigid_knn_np.shape[0]), dtype=np.int64)
+                rigid_instance_intids_batch = np.ascontiguousarray(rigid_instance_intids_now, dtype=np.int64)
+                rigid_instance_offsets_batch = np.ascontiguousarray(rigid_instance_offsets_now, dtype=np.int64)
 
             knn_init_batch = {
                 "background_avg_dist_by_k": bg_map,
@@ -1652,6 +1797,11 @@ class MultiSceneDatasetV4:
                 knn_init_batch["bg_knn_idx"] = bg_knn_batch
                 knn_init_batch["rigid_knn_idx"] = rigid_knn_batch
                 knn_init_batch["knn_neighbor_k_store"] = int(knn_neighbor_k_store_batch or 0)
+                if rigid_knn_row_ids_batch is not None:
+                    knn_init_batch["rigid_knn_row_ids"] = rigid_knn_row_ids_batch
+                if rigid_instance_intids_batch is not None and rigid_instance_offsets_batch is not None:
+                    knn_init_batch["rigid_instance_intids"] = rigid_instance_intids_batch
+                    knn_init_batch["rigid_instance_offsets"] = rigid_instance_offsets_batch
 
         batch: Dict[str, Any] = {
             "scene_id": torch.tensor([int(scene_id)], dtype=torch.long),
@@ -1681,6 +1831,11 @@ class MultiSceneDatasetV4:
                     "rigid_knn_idx": knn_init_batch["rigid_knn_idx"],
                     "knn_neighbor_k_store": int(knn_init_batch.get("knn_neighbor_k_store", 0)),
                 }
+                if "rigid_knn_row_ids" in knn_init_batch:
+                    batch["knn_struct_neighbors"]["rigid_knn_row_ids"] = knn_init_batch["rigid_knn_row_ids"]
+                if "rigid_instance_intids" in knn_init_batch and "rigid_instance_offsets" in knn_init_batch:
+                    batch["knn_struct_neighbors"]["rigid_instance_intids"] = knn_init_batch["rigid_instance_intids"]
+                    batch["knn_struct_neighbors"]["rigid_instance_offsets"] = knn_init_batch["rigid_instance_offsets"]
 
         if include_test:
             resolved = [tuple(r) for r in (test_image_refs or self._resolve_test_image_refs(sidx))]
@@ -1847,6 +2002,7 @@ class MultiSceneDatasetV4:
         emit_preload_hints: bool,
         warm_next_block_exact: bool,
         warm_next_episode_chain: bool,
+        block_order: str = "block_major",
     ) -> TrainSchedulerV7:
         return TrainSchedulerV7(
             dataset=self,
@@ -1866,6 +2022,7 @@ class MultiSceneDatasetV4:
             emit_preload_hints=emit_preload_hints,
             warm_next_block_exact=warm_next_block_exact,
             warm_next_episode_chain=warm_next_episode_chain,
+            block_order=str(block_order),
         )
 
     # Preload worker hooks

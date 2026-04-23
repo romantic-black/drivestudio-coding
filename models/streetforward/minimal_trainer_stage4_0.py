@@ -468,6 +468,74 @@ class MinimalStreetForwardStage4_0(MinimalStreetForwardStage3_3):
         point_ids = node_state_rigid.point_ids[..., 0]
         return ins_valid[point_ids]
 
+    def _validate_rigid_row_space_metadata(
+        self,
+        *,
+        batch: Dict[str, Any],
+        instance_ids: List[int],
+        point_counts_by_instance: Dict[int, int],
+    ) -> None:
+        payload = batch.get("knn_struct_neighbors")
+        if not isinstance(payload, dict):
+            return
+        intids_raw = payload.get("rigid_instance_intids")
+        offsets_raw = payload.get("rigid_instance_offsets")
+        row_ids_raw = payload.get("rigid_knn_row_ids")
+        if intids_raw is None and offsets_raw is None and row_ids_raw is None:
+            return
+        if intids_raw is None or offsets_raw is None:
+            raise ValueError(
+                "rigid row-space metadata must include both rigid_instance_intids and rigid_instance_offsets."
+            )
+
+        intids = [int(x) for x in np.asarray(intids_raw, dtype=np.int64).reshape(-1).tolist()]
+        offsets = np.asarray(offsets_raw, dtype=np.int64).reshape(-1)
+        if offsets.ndim != 1 or int(offsets.shape[0]) != int(len(intids)) + 1:
+            raise ValueError(
+                "rigid_instance_offsets shape mismatch: "
+                f"expected len={len(intids) + 1}, got {tuple(offsets.shape)}"
+            )
+        if int(offsets[0]) != 0:
+            raise ValueError("rigid_instance_offsets must start at 0")
+        if np.any(offsets[1:] < offsets[:-1]):
+            raise ValueError("rigid_instance_offsets must be non-decreasing")
+
+        expected_intids = [int(x) for x in instance_ids]
+        if intids != expected_intids:
+            raise ValueError(
+                "rigid_instance_intids mismatch between batch metadata and runtime pointcloud order: "
+                f"meta={intids} runtime={expected_intids}"
+            )
+
+        expected_offsets: List[int] = [0]
+        for intid in expected_intids:
+            n = int(point_counts_by_instance.get(intid, 0))
+            if n < 0:
+                raise ValueError(f"dynamic point count must be >= 0 for intid={intid}, got {n}")
+            expected_offsets.append(expected_offsets[-1] + n)
+        expected_offsets_np = np.asarray(expected_offsets, dtype=np.int64)
+        if offsets.shape != expected_offsets_np.shape or not np.array_equal(offsets, expected_offsets_np):
+            raise ValueError(
+                "rigid_instance_offsets mismatch between batch metadata and runtime pointcloud counts: "
+                f"meta={offsets.tolist()} runtime={expected_offsets}"
+            )
+
+        if row_ids_raw is not None:
+            row_ids = np.asarray(row_ids_raw, dtype=np.int64).reshape(-1)
+            total_points = int(expected_offsets[-1])
+            if int(row_ids.shape[0]) != int(total_points):
+                raise ValueError(
+                    "rigid_knn_row_ids length mismatch with runtime rigid point count: "
+                    f"row_ids={row_ids.shape[0]} runtime_points={total_points}"
+                )
+            if total_points > 0 and (
+                np.any(row_ids < 0) or np.any(row_ids >= int(total_points))
+            ):
+                raise ValueError(
+                    "rigid_knn_row_ids out of range for runtime rigid row-space: "
+                    f"expected [0,{total_points}), got min={int(row_ids.min())} max={int(row_ids.max())}"
+                )
+
     def _transform_rigid_to_world(
         self,
         node_state_rigid: NodeStateRigid,
@@ -625,6 +693,7 @@ class MinimalStreetForwardStage4_0(MinimalStreetForwardStage3_3):
             dynamic_colors = []
             dynamic_knn = []
             point_ids = []
+            point_counts_by_instance: Dict[int, int] = {}
             instance_ids = sorted(int(ins_id) for ins_id in dynamic.keys())
             instance_id_map = {ins_id: idx for idx, ins_id in enumerate(instance_ids)}
             for ins_id in instance_ids:
@@ -632,6 +701,7 @@ class MinimalStreetForwardStage4_0(MinimalStreetForwardStage3_3):
                 if instance_pcd is None or len(instance_pcd) == 0:
                     continue
                 n_points = instance_pcd.shape[0]
+                point_counts_by_instance[int(ins_id)] = int(n_points)
                 dynamic_points.append(instance_pcd[:, :3].astype(np.float32))
                 dynamic_colors.append(instance_pcd[:, 3:6].astype(np.float32))
                 if rigid_knn_by_instance is not None:
@@ -657,6 +727,11 @@ class MinimalStreetForwardStage4_0(MinimalStreetForwardStage3_3):
                 d_knn = np.concatenate(dynamic_knn, axis=0).astype(np.float32, copy=False) if dynamic_knn else None
                 point_ids_tensor = torch.tensor(point_ids, dtype=torch.long, device=self.device).unsqueeze(-1)
                 frame_ids = sorted(int(fid) for fid in dynamic_info.keys())
+                self._validate_rigid_row_space_metadata(
+                    batch=batch,
+                    instance_ids=instance_ids,
+                    point_counts_by_instance=point_counts_by_instance,
+                )
                 node_state_rigid = self._init_rigid_node_state_from_pcd(
                     points=d_points,
                     colors=d_colors,

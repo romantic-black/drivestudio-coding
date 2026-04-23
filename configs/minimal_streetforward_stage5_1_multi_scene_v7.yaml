@@ -1,4 +1,4 @@
-output_name: experiment001
+output_name: experiment001_120w
 
 data:
   data_root: "/root/autodl-tmp/nuScenes/"
@@ -91,6 +91,7 @@ scheduler_v3:
   enable: false
   model_node_state:
     sync_with_scheduler: true
+    reset_policy: episode_end
 
 scheduler_v7:
   enable: true
@@ -109,6 +110,8 @@ scheduler_v7:
     fixed_segment_id: null
     segment_order: ascending
     scene_order: shuffle_per_epoch
+  execution:
+    block_order: step_major
   preload:
     emit_hints: true
     warm_next_block_exact: true
@@ -116,10 +119,18 @@ scheduler_v7:
 
 validation_v7:
   eval_enable: true
+  mode: segment_finetune_train
+  block:
+    steps_per_block: 8
+  episode:
+    blocks_per_episode: 3
+  execution:
+    block_order: step_major
+    reset_policy: episode_end
   trigger:
     by: train_episode_interval
-    validate_every_n_episodes: 100
-    run_at_train_start: true
+    validate_every_n_episodes: 200
+    run_at_train_start: false
   episode_selection:
     policy: middle
   render:
@@ -249,8 +260,8 @@ debug:
   validate_stage5_knn: false
 
 eval:
-  enable_psnr: true
-  save_train_views_psnr_below: 12
+  enable_psnr: false
+  save_train_views_psnr_below: null
   run_test_at_end: false
 
 logging:
@@ -258,11 +269,19 @@ logging:
   project: minimal_sf_stage5_1_multi_scene_v7
   log_dir: null
   image_interval_blocks: 96
+  image_trigger:
+    mode: episode_end
+    interval_blocks_equiv: 96
+  train_monitor:
+    enable_heavy_metrics: false
+    include_per_view_metrics: false
+    include_extra_result_metrics: false
+    enable_low_psnr_image_dump: false
   low_psnr_train_images_subdir: train_low_psnr
   enable_jsonl_metrics: true
   use_tensorboard: true
   offset_monitor:
-    enable: true
+    enable: false
     near_radius_m: 5.0
     saturation_tanh_threshold: 0.95
   diagnostics:

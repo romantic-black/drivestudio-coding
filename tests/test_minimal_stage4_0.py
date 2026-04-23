@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from models.streetforward.minimal_trainer_stage4_0 import MinimalStreetForwardStage4_0
@@ -75,3 +76,35 @@ def test_rigid_invalid_instance_filtered():
     assert valid.shape[0] == 1
     assert bool(valid[0]) is False
 
+
+def test_rigid_row_space_metadata_accepts_matching_layout():
+    trainer = MinimalStreetForwardStage4_0.__new__(MinimalStreetForwardStage4_0)
+    batch = {
+        "knn_struct_neighbors": {
+            "rigid_instance_intids": [9, 11],
+            "rigid_instance_offsets": [0, 2, 5],
+            "rigid_knn_row_ids": [0, 1, 2, 3, 4],
+        }
+    }
+    trainer._validate_rigid_row_space_metadata(
+        batch=batch,
+        instance_ids=[9, 11],
+        point_counts_by_instance={9: 2, 11: 3},
+    )
+
+
+def test_rigid_row_space_metadata_rejects_instance_order_mismatch():
+    trainer = MinimalStreetForwardStage4_0.__new__(MinimalStreetForwardStage4_0)
+    batch = {
+        "knn_struct_neighbors": {
+            "rigid_instance_intids": [11, 9],
+            "rigid_instance_offsets": [0, 3, 5],
+            "rigid_knn_row_ids": [0, 1, 2, 3, 4],
+        }
+    }
+    with pytest.raises(ValueError, match="rigid_instance_intids mismatch"):
+        trainer._validate_rigid_row_space_metadata(
+            batch=batch,
+            instance_ids=[9, 11],
+            point_counts_by_instance={9: 2, 11: 3},
+        )

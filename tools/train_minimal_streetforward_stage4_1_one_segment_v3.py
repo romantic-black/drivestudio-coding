@@ -210,13 +210,36 @@ def _build_scheduler_node_sync(
         return None
     U = int(scheduler_info.get("U", 0))
     seg = int(scheduler_info.get("segment_local_step", 0))
-    reset_after_block = any(ev.get("type") == "block_end" for ev in step_events)
+    block_order = str(scheduler_info.get("block_order", "block_major"))
+    default_reset_policy = "episode_end" if block_order == "step_major" else "block_end"
+    reset_policy = str(mns.get("reset_policy", default_reset_policy)).strip()
+    if reset_policy not in ("block_end", "episode_end", "never"):
+        raise ValueError(
+            "scheduler_v3.model_node_state.reset_policy must be one of "
+            "['block_end', 'episode_end', 'never']"
+        )
+    if block_order == "step_major" and reset_policy == "block_end":
+        raise ValueError(
+            "step_major with reset_policy=block_end breaks episode-level no-reset semantics; "
+            "use reset_policy=episode_end or never."
+        )
+    if reset_policy == "block_end":
+        should_reset = any(ev.get("type") == "block_end" for ev in step_events)
+    elif reset_policy == "episode_end":
+        should_reset = any(ev.get("type") == "episode_end" for ev in step_events)
+    else:
+        should_reset = False
     if U < 1:
         raise ValueError(
             "scheduler_v3.model_node_state.sync_with_scheduler requires a positive U "
             "(time_base.state_write_interval_steps); invalid scheduler_info."
         )
-    return {"U": U, "segment_local_step": seg, "reset_after_block": reset_after_block}
+    return {
+        "U": U,
+        "segment_local_step": seg,
+        "reset_after_block": bool(should_reset),
+        "reset_policy": str(reset_policy),
+    }
 
 
 def main() -> None:
@@ -640,4 +663,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

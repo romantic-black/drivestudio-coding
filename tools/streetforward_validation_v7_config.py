@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 @dataclass(frozen=True)
@@ -9,6 +9,11 @@ class ValidationV7Config:
     eval_enable: bool
     validate_every_n_episodes: int
     run_at_train_start: bool
+    mode: str
+    steps_per_block: int
+    blocks_per_episode: Optional[int]
+    block_order: str
+    reset_policy: str
     episode_selection_policy: str
     save_images: bool
     save_dir: str
@@ -63,6 +68,11 @@ def parse_validation_v7_config(cfg: Any) -> ValidationV7Config:
             eval_enable=False,
             validate_every_n_episodes=0,
             run_at_train_start=False,
+            mode="inference_only",
+            steps_per_block=1,
+            blocks_per_episode=None,
+            block_order="block_major",
+            reset_policy="block_end",
             episode_selection_policy="middle",
             save_images=False,
             save_dir="validation/episodes",
@@ -90,6 +100,41 @@ def parse_validation_v7_config(cfg: Any) -> ValidationV7Config:
     if validate_every < 1:
         raise ValueError("validation_v7.trigger.validate_every_n_episodes must be >= 1")
     run_at_train_start = bool(_cfg_get(trigger, "run_at_train_start", False))
+
+    mode = str(_cfg_get(raw, "mode", "inference_only")).strip()
+    if mode not in ("inference_only", "segment_finetune_train"):
+        raise ValueError(
+            "validation_v7.mode must be one of ['inference_only', 'segment_finetune_train']"
+        )
+
+    block = _cfg_get(raw, "block", {}) or {}
+    steps_per_block = int(_cfg_get(block, "steps_per_block", 1))
+    if steps_per_block < 1:
+        raise ValueError("validation_v7.block.steps_per_block must be >= 1")
+
+    episode_cfg = _cfg_get(raw, "episode", {}) or {}
+    blocks_per_episode_raw = _cfg_get(episode_cfg, "blocks_per_episode", None)
+    blocks_per_episode: Optional[int]
+    if blocks_per_episode_raw is None:
+        blocks_per_episode = None
+    else:
+        blocks_per_episode = int(blocks_per_episode_raw)
+        if blocks_per_episode < 1:
+            raise ValueError("validation_v7.episode.blocks_per_episode must be >= 1")
+
+    execution = _cfg_get(raw, "execution", {}) or {}
+    block_order = str(_cfg_get(execution, "block_order", "block_major")).strip()
+    if block_order not in ("block_major", "step_major"):
+        raise ValueError("validation_v7.execution.block_order must be one of ['block_major', 'step_major']")
+    default_reset_policy = "episode_end" if block_order == "step_major" else "block_end"
+    reset_policy = str(_cfg_get(execution, "reset_policy", default_reset_policy)).strip()
+    if reset_policy not in ("block_end", "episode_end", "never"):
+        raise ValueError("validation_v7.execution.reset_policy must be one of ['block_end', 'episode_end', 'never']")
+    if block_order == "step_major" and reset_policy == "block_end":
+        raise ValueError(
+            "validation_v7.execution.reset_policy=block_end is incompatible with execution.block_order=step_major; "
+            "use episode_end or never."
+        )
 
     episode_selection = _cfg_get(raw, "episode_selection", {}) or {}
     policy = str(_cfg_get(episode_selection, "policy", "middle"))
@@ -119,6 +164,11 @@ def parse_validation_v7_config(cfg: Any) -> ValidationV7Config:
         eval_enable=True,
         validate_every_n_episodes=validate_every,
         run_at_train_start=run_at_train_start,
+        mode=mode,
+        steps_per_block=steps_per_block,
+        blocks_per_episode=blocks_per_episode,
+        block_order=block_order,
+        reset_policy=reset_policy,
         episode_selection_policy=policy,
         save_images=save_images,
         save_dir=save_dir,
@@ -128,4 +178,3 @@ def parse_validation_v7_config(cfg: Any) -> ValidationV7Config:
         min_valid_pixels_per_region=min_valid_pixels_per_region,
         require_sky_mask=require_sky_mask,
     )
-

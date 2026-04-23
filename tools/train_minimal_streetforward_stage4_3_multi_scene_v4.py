@@ -20,6 +20,8 @@ scheduler_v4.overlap（见 docs/trainers/TrainScheduler_V4_Overlap_Pointcloud_To
 from __future__ import annotations
 
 import argparse
+import inspect
+import io
 import json
 import logging
 import os
@@ -114,6 +116,42 @@ def _nuscenes_cam_id_suffix(pixel_camera_ids: List[int], cam_slot_idx: int) -> s
     return ""
 
 
+def _save_train_monitor_triplets(
+    *,
+    step: int,
+    pred_rgbs: List[torch.Tensor],
+    gt_images: List[torch.Tensor],
+    raw_batch: Dict[str, Any],
+    log_dir: str,
+    block_idx_global: int,
+    scene_id_fallback: Any,
+    pixel_camera_ids: List[int],
+) -> None:
+    if int(block_idx_global) < 1:
+        return
+    out_dir = os.path.join(log_dir, "images", "train")
+    tgt_meta = raw_batch.get("target") or {}
+    fi_t = tgt_meta.get("frame_indices")
+    ci_t = tgt_meta.get("cam_indices")
+    sc_lab = _scene_folder_label_from_batch(raw_batch, scene_id_fallback)
+    for v in range(len(pred_rgbs)):
+        if fi_t is not None and ci_t is not None and int(fi_t.shape[0]) > v and int(ci_t.shape[0]) > v:
+            f_lab = int(fi_t[v].item())
+            c_lab = int(ci_t[v].item())
+            nusc_suf = _nuscenes_cam_id_suffix(pixel_camera_ids, c_lab)
+            vsuf = f"b{int(block_idx_global):06d}_sc{sc_lab}_v{v}_f{f_lab:05d}_c{c_lab}{nusc_suf}"
+        else:
+            vsuf = f"b{int(block_idx_global):06d}_sc{sc_lab}_view{v}"
+        _save_image_triplet(
+            step,
+            pred_rgbs[v],
+            gt_images[v],
+            out_dir,
+            view_suffix=vsuf,
+            save_error=False,
+        )
+
+
 @dataclass(frozen=True)
 class _BatchRequestValidationV7:
     scene_id: int
@@ -197,6 +235,47 @@ def _compute_masked_lpips(
     return float(lp.item())
 
 
+def _snapshot_train_checkpoint_bytes(model: Any) -> bytes:
+    if not hasattr(model, "optimizer") or model.optimizer is None:
+        raise ValueError("validation segment_finetune_train requires model.optimizer")
+    payload = {
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": model.optimizer.state_dict(),
+    }
+    buffer = io.BytesIO()
+    torch.save(payload, buffer)
+    return buffer.getvalue()
+
+
+def _restore_train_checkpoint_bytes(model: Any, ckpt_bytes: bytes, device: torch.device) -> None:
+    if not hasattr(model, "optimizer") or model.optimizer is None:
+        raise ValueError("validation segment_finetune_train requires model.optimizer")
+    payload = torch.load(io.BytesIO(ckpt_bytes), map_location=device)
+    model.load_state_dict(payload["model_state_dict"], strict=True)
+    model.optimizer.load_state_dict(payload["optimizer_state_dict"])
+
+
+def _iter_episode_block_indices(
+    *,
+    blocks_per_episode: int,
+    steps_per_block: int,
+    block_order: str,
+) -> List[int]:
+    if block_order == "block_major":
+        return [
+            int(b)
+            for b in range(int(blocks_per_episode))
+            for _ in range(int(steps_per_block))
+        ]
+    if block_order == "step_major":
+        return [
+            int(b)
+            for _ in range(int(steps_per_block))
+            for b in range(int(blocks_per_episode))
+        ]
+    raise ValueError(f"unsupported block_order={block_order!r}")
+
+
 def _run_validation_v7_round(
     *,
     cfg: Any,
@@ -224,6 +303,17 @@ def _run_validation_v7_round(
     )
     val_root = os.path.join(cfg.log_dir, str(validation_cfg.save_dir))
     os.makedirs(val_root, exist_ok=True)
+    validation_mode = str(validation_cfg.mode)
+    steps_per_block = int(validation_cfg.steps_per_block)
+    validation_block_order = str(validation_cfg.block_order)
+    use_train_finetune = validation_mode == "segment_finetune_train"
+    if steps_per_block < 1:
+        raise ValueError(f"validation_v7.block.steps_per_block must be >= 1, got {steps_per_block}")
+    if validation_block_order not in ("block_major", "step_major"):
+        raise ValueError(
+            "validation_v7.execution.block_order must be one of ['block_major', 'step_major'], "
+            f"got {validation_block_order!r}"
+        )
 
     infer_policy = RuntimePolicy(
         do_backward=False,
@@ -232,325 +322,407 @@ def _run_validation_v7_round(
         writeback_node_state=True,
         reset_node_state_after_block=False,
     )
-    all_episode_rows: List[Dict[str, Any]] = []
+    train_policy = RuntimePolicy(
+        do_backward=True,
+        do_optimizer_step=True,
+        update_hidden_cache=True,
+        writeback_node_state=True,
+        reset_node_state_after_block=False,
+    )
+    base_ckpt_bytes: Optional[bytes] = None
+    if use_train_finetune:
+        base_ckpt_bytes = _snapshot_train_checkpoint_bytes(model)
+    train_step_supports_runtime_policy = "runtime_policy" in inspect.signature(model.train_step).parameters
+    infer_step_supports_runtime_policy = (
+        "runtime_policy" in inspect.signature(model.inference_step_from_train_batch).parameters
+    )
 
-    for spec in specs:
-        model.reset_node_state()
-        validation_local_step = 0
-        last_minimal: Optional[Dict[str, Any]] = None
-        for block_idx_in_episode, block_frames in enumerate(spec.block_windows):
-            src_frame = int(block_frames[0])
-            source_ref = (int(src_frame), 0)
-            source_refs = [(int(src_frame), int(cam_id)) for cam_id in range(int(spec.num_cams))]
-            target_refs: List[Tuple[int, int]] = []
-            for frame_idx in block_frames:
-                for cam_id in range(int(spec.num_cams)):
-                    target_refs.append((int(frame_idx), int(cam_id)))
-            req = _BatchRequestValidationV7(
-                scene_id=int(spec.scene_id),
-                segment_id=int(spec.segment_id),
-                source_image_ref=source_ref,
-                source_image_refs=source_refs,
-                target_image_refs=target_refs,
-                include_test=False,
-                test_image_refs=None,
+    all_episode_rows: List[Dict[str, Any]] = []
+    try:
+        for spec in specs:
+            if use_train_finetune:
+                _restore_train_checkpoint_bytes(model, base_ckpt_bytes, device)
+
+            model.reset_node_state()
+            validation_local_step = 0
+            last_minimal: Optional[Dict[str, Any]] = None
+            block_payloads: List[Dict[str, Any]] = []
+            for block_idx_in_episode, block_frames in enumerate(spec.block_windows):
+                src_frame = int(block_frames[0])
+                source_ref = (int(src_frame), 0)
+                source_refs = [(int(src_frame), int(cam_id)) for cam_id in range(int(spec.num_cams))]
+                target_refs: List[Tuple[int, int]] = []
+                for frame_idx in block_frames:
+                    for cam_id in range(int(spec.num_cams)):
+                        target_refs.append((int(frame_idx), int(cam_id)))
+                req = _BatchRequestValidationV7(
+                    scene_id=int(spec.scene_id),
+                    segment_id=int(spec.segment_id),
+                    source_image_ref=source_ref,
+                    source_image_refs=source_refs,
+                    target_image_refs=target_refs,
+                    include_test=False,
+                    test_image_refs=None,
+                )
+                raw_batch = dataset.get_segment_batch_from_image_refs(req, enforce_target0_equals_source=True)
+                minimal_batch = convert_batch_to_minimal_format(
+                    raw_batch,
+                    device,
+                    num_targets=int(raw_batch["target"]["image"].shape[0]),
+                    include_source_for_2d=True,
+                    view_selection=None,
+                )
+                block_payloads.append(
+                    {
+                        "block_idx": int(block_idx_in_episode),
+                        "source_frame": int(src_frame),
+                        "target_frames": [int(x) for x in block_frames],
+                        "minimal_batch": minimal_batch,
+                        "losses": [],
+                    }
+                )
+
+            visit_order = _iter_episode_block_indices(
+                blocks_per_episode=int(len(block_payloads)),
+                steps_per_block=int(steps_per_block),
+                block_order=str(validation_block_order),
             )
-            raw_batch = dataset.get_segment_batch_from_image_refs(req, enforce_target0_equals_source=True)
-            minimal_batch = convert_batch_to_minimal_format(
-                raw_batch,
-                device,
-                num_targets=int(raw_batch["target"]["image"].shape[0]),
-                include_source_for_2d=True,
-                view_selection=None,
-            )
-            _ = model.inference_step_from_train_batch(
-                minimal_batch,
-                step=None,
-                scheduler_node_sync={
+            for visit_idx, block_idx_in_episode in enumerate(visit_order):
+                payload = block_payloads[int(block_idx_in_episode)]
+                minimal_batch = payload["minimal_batch"]
+                scheduler_node_sync = {
                     "U": 1,
                     "segment_local_step": int(validation_local_step + 1),
                     "reset_after_block": False,
-                },
-                runtime_policy=infer_policy,
+                }
+                if use_train_finetune:
+                    train_step_kwargs: Dict[str, Any] = {
+                        "batch": minimal_batch,
+                        "step": None,
+                        "profile_phase_timing": False,
+                        "sync_cuda_timing": False,
+                        "scheduler_node_sync": scheduler_node_sync,
+                    }
+                    if train_step_supports_runtime_policy:
+                        train_step_kwargs["runtime_policy"] = train_policy
+                    step_result = model.train_step(**train_step_kwargs)
+                else:
+                    infer_step_kwargs: Dict[str, Any] = {
+                        "batch": minimal_batch,
+                        "step": None,
+                        "scheduler_node_sync": scheduler_node_sync,
+                    }
+                    if infer_step_supports_runtime_policy:
+                        infer_step_kwargs["runtime_policy"] = infer_policy
+                    step_result = model.inference_step_from_train_batch(**infer_step_kwargs)
+                payload["losses"].append(float(step_result.get("loss", 0.0)))
+                validation_local_step += 1
+                last_minimal = minimal_batch
+                logger.info(
+                    "VALIDATION_V7_BLOCK_VISIT mode=%s block_order=%s scene_id=%s segment_id=%s "
+                    "block=%s visit=%s/%s source_frame=%s target_frames=%s loss=%.6f",
+                    validation_mode,
+                    validation_block_order,
+                    int(spec.scene_id),
+                    int(spec.segment_id),
+                    int(block_idx_in_episode),
+                    int(visit_idx + 1),
+                    int(len(visit_order)),
+                    int(payload["source_frame"]),
+                    [int(x) for x in payload["target_frames"]],
+                    float(payload["losses"][-1]),
+                )
+
+            for payload in block_payloads:
+                block_loss_values = [float(x) for x in payload["losses"]]
+                logger.info(
+                    "VALIDATION_V7_BLOCK_SUMMARY mode=%s block_order=%s scene_id=%s segment_id=%s block=%s "
+                    "steps=%s source_frame=%s target_frames=%s mean_loss=%.6f",
+                    validation_mode,
+                    validation_block_order,
+                    int(spec.scene_id),
+                    int(spec.segment_id),
+                    int(payload["block_idx"]),
+                    int(len(block_loss_values)),
+                    int(payload["source_frame"]),
+                    [int(x) for x in payload["target_frames"]],
+                    float(np.mean(block_loss_values)) if block_loss_values else 0.0,
+                )
+
+            if last_minimal is None:
+                continue
+
+            eval_req = _BatchRequestValidationV7(
+                scene_id=int(spec.scene_id),
+                segment_id=int(spec.segment_id),
+                source_image_ref=(int(spec.frame_chain[0]), 0),
+                source_image_refs=[(int(spec.frame_chain[0]), int(cam_id)) for cam_id in range(int(spec.num_cams))],
+                target_image_refs=[(int(r[0]), int(r[1])) for r in spec.eval_image_refs],
+                include_test=False,
+                test_image_refs=None,
             )
-            validation_local_step += 1
-            last_minimal = minimal_batch
+            raw_eval = dataset.get_segment_batch_from_image_refs(eval_req, enforce_target0_equals_source=False)
+            minimal_eval = convert_batch_to_minimal_format(
+                raw_eval,
+                device,
+                num_targets=int(raw_eval["target"]["image"].shape[0]),
+                include_source_for_2d=True,
+                view_selection=None,
+            )
+
+            gs_state = model.export_3dgs_state(
+                last_minimal,
+                include_hidden=True,
+                rigid_export_frame_idx=int(last_minimal["source_frame_idx"]),
+            )
+            scene_state = {
+                "base_batch": minimal_eval,
+                "gs_state": gs_state,
+            }
+            preds = model.render_views_from_scene_state(scene_state, minimal_eval["targets"])
+            gts = [t["gt_image"] for t in minimal_eval["targets"]]
+            if len(preds) != len(gts):
+                raise ValueError(
+                    f"validation render size mismatch: pred={len(preds)} gt={len(gts)} scene={spec.scene_id} seg={spec.segment_id}"
+                )
+
+            expected_views = int((len(spec.frame_chain)) * int(spec.num_cams))
+            if len(preds) != expected_views:
+                raise ValueError(
+                    f"validation expected {(len(spec.frame_chain))}x{spec.num_cams} views={expected_views}, got={len(preds)}"
+                )
+
+            per_view_rows: List[Dict[str, Any]] = []
+            psnr_vals: List[float] = []
+            ssim_vals: List[float] = []
+            lpips_vals: List[float] = []
+            psnr_non_sky_vals: List[float] = []
+            ssim_non_sky_vals: List[float] = []
+            lpips_non_sky_vals: List[float] = []
+            psnr_sky_vals: List[float] = []
+            ssim_sky_vals: List[float] = []
+            sky_coverage_vals: List[float] = []
+
+            seg_dir = os.path.join(
+                val_root,
+                f"scene_{int(spec.scene_id):03d}",
+                f"segment_{int(spec.segment_id):03d}",
+                f"episode_start_{int(spec.episode_start_keyframe_pos):03d}",
+            )
+            render_dir = os.path.join(seg_dir, "renders")
+            os.makedirs(render_dir, exist_ok=True)
+
+            for idx, (pred, gt, tgt) in enumerate(zip(preds, gts, minimal_eval["targets"])):
+                fallback_ref = eval_req.target_image_refs[int(idx)]
+                m = _compute_metrics(
+                    pred_rgb=pred,
+                    gt_rgb=gt,
+                    psnr_metric=psnr_metric,
+                    ssim_metric=ssim_metric,
+                    lpips_metric=lpips_metric,
+                    compute_psnr=True,
+                    compute_heavy=True,
+                )
+                psnr_vals.append(float(m["psnr"]))
+                ssim_vals.append(float(m["ssim"]))
+                lpips_vals.append(float(m["lpips"]))
+                row = {
+                    "index": int(idx),
+                    "frame_idx": int(tgt.get("frame_idx", int(fallback_ref[0]))),
+                    "cam_idx": int(tgt.get("cam_idx", int(fallback_ref[1]))),
+                    "psnr": float(m["psnr"]),
+                    "ssim": float(m["ssim"]),
+                    "lpips": float(m["lpips"]),
+                }
+
+                if bool(validation_cfg.use_sky_mask_regions):
+                    sky_mask = tgt.get("sky_mask")
+                    if sky_mask is None and bool(validation_cfg.require_sky_mask):
+                        raise ValueError(
+                            "validation_v7.metrics.require_sky_mask=true but target missing sky_mask "
+                            f"(scene={int(spec.scene_id)} segment={int(spec.segment_id)} idx={int(idx)})"
+                        )
+                    if sky_mask is not None:
+                        sm = sky_mask.to(device).float()
+                        if sm.dim() == 3:
+                            sm = sm.squeeze(-1)
+                        if sm.shape != gt.shape[:2]:
+                            raise ValueError(
+                                "validation sky_mask shape mismatch: "
+                                f"sky_mask={tuple(sm.shape)} gt_hw={tuple(gt.shape[:2])}"
+                            )
+                        min_valid = int(validation_cfg.min_valid_pixels_per_region)
+                        non_sky = (1.0 - sm).clamp(0.0, 1.0)
+                        sky = sm.clamp(0.0, 1.0)
+                        non_sky_count = int((non_sky > 0.5).sum().item())
+                        sky_count = int((sky > 0.5).sum().item())
+                        row["sky_mask_coverage"] = float(sm.mean().item())
+                        row["non_sky_pixel_count"] = int(non_sky_count)
+                        row["sky_pixel_count"] = int(sky_count)
+                        sky_coverage_vals.append(float(row["sky_mask_coverage"]))
+
+                        if non_sky_count >= min_valid:
+                            psnr_non = _compute_masked_psnr(pred, gt, non_sky)
+                            ssim_non = _compute_masked_ssim(pred, gt, non_sky)
+                            lpips_non = _compute_masked_lpips(pred, gt, non_sky, lpips_metric)
+                            if psnr_non is not None:
+                                row["psnr_non_sky"] = float(psnr_non)
+                                psnr_non_sky_vals.append(float(psnr_non))
+                            if ssim_non is not None:
+                                row["ssim_non_sky"] = float(ssim_non)
+                                ssim_non_sky_vals.append(float(ssim_non))
+                            if lpips_non is not None:
+                                row["lpips_non_sky"] = float(lpips_non)
+                                lpips_non_sky_vals.append(float(lpips_non))
+                        if sky_count >= min_valid:
+                            psnr_s = _compute_masked_psnr(pred, gt, sky)
+                            ssim_s = _compute_masked_ssim(pred, gt, sky)
+                            if psnr_s is not None:
+                                row["psnr_sky"] = float(psnr_s)
+                                psnr_sky_vals.append(float(psnr_s))
+                            if ssim_s is not None:
+                                row["ssim_sky"] = float(ssim_s)
+                                ssim_sky_vals.append(float(ssim_s))
+
+                per_view_rows.append(row)
+                if validation_cfg.save_images:
+                    _save_image_triplet(
+                        int(trigger_step),
+                        pred,
+                        gt,
+                        render_dir,
+                        view_suffix=f"val_sc{int(spec.scene_id):03d}_seg{int(spec.segment_id):03d}_v{idx}",
+                        save_error=False,
+                    )
+
+            episode_row = {
+                "split": "validation_v7",
+                "mode": validation_mode,
+                "block_order": validation_block_order,
+                "trigger_train_episode_counter": int(trigger_train_episode_counter),
+                "trigger_step": int(trigger_step),
+                "scene_id": int(spec.scene_id),
+                "segment_id": int(spec.segment_id),
+                "episode_start_keyframe_pos": int(spec.episode_start_keyframe_pos),
+                "num_views": int(len(per_view_rows)),
+                "psnr_full": float(np.mean(psnr_vals)) if psnr_vals else 0.0,
+                "ssim_full": float(np.mean(ssim_vals)) if ssim_vals else 0.0,
+                "lpips_full": float(np.mean(lpips_vals)) if lpips_vals else 0.0,
+                "psnr_non_sky": _safe_mean(psnr_non_sky_vals),
+                "ssim_non_sky": _safe_mean(ssim_non_sky_vals),
+                "lpips_non_sky": _safe_mean(lpips_non_sky_vals),
+                "psnr_sky": _safe_mean(psnr_sky_vals),
+                "ssim_sky": _safe_mean(ssim_sky_vals),
+                "sky_mask_coverage": _safe_mean(sky_coverage_vals),
+                "num_views_non_sky_metric": int(len(psnr_non_sky_vals)),
+                "num_views_sky_metric": int(len(psnr_sky_vals)),
+                "views_formula": f"({len(spec.frame_chain)})x{int(spec.num_cams)}",
+            }
+            episode_row["psnr"] = float(episode_row["psnr_full"])
+            episode_row["ssim"] = float(episode_row["ssim_full"])
+            episode_row["lpips"] = float(episode_row["lpips_full"])
+            episode_row["metric_scope"] = "full_image"
+            if bool(validation_cfg.use_sky_mask_regions) and int(episode_row["num_views_non_sky_metric"]) > 0:
+                episode_row["psnr"] = float(episode_row["psnr_non_sky"])
+                episode_row["ssim"] = float(episode_row["ssim_non_sky"])
+                episode_row["lpips"] = float(episode_row["lpips_non_sky"])
+                episode_row["metric_scope"] = "non_sky"
+            all_episode_rows.append(episode_row)
+
+            with open(os.path.join(seg_dir, "per_view_metrics.json"), "w", encoding="utf-8") as f:
+                json.dump(per_view_rows, f, indent=2)
+            with open(os.path.join(seg_dir, "summary.json"), "w", encoding="utf-8") as f:
+                json.dump(episode_row, f, indent=2)
+            if metrics_fh is not None:
+                _write_metrics_history(metrics_fh, episode_row)
+            if writer is not None:
+                tb_step = max(int(trigger_step), 0)
+                sid = int(spec.scene_id)
+                seg = int(spec.segment_id)
+                writer.add_scalar(
+                    f"validation_v7/episode/psnr/scene_{sid:03d}_segment_{seg:03d}",
+                    float(episode_row["psnr"]),
+                    tb_step,
+                )
+                writer.add_scalar(
+                    f"validation_v7/episode/ssim/scene_{sid:03d}_segment_{seg:03d}",
+                    float(episode_row["ssim"]),
+                    tb_step,
+                )
+                writer.add_scalar(
+                    f"validation_v7/episode/lpips/scene_{sid:03d}_segment_{seg:03d}",
+                    float(episode_row["lpips"]),
+                    tb_step,
+                )
+                writer.add_scalar(
+                    f"validation_v7/episode/num_views/scene_{sid:03d}_segment_{seg:03d}",
+                    float(episode_row["num_views"]),
+                    tb_step,
+                )
+                if bool(validation_cfg.use_sky_mask_regions):
+                    writer.add_scalar(
+                        f"validation_v7/episode/psnr_non_sky/scene_{sid:03d}_segment_{seg:03d}",
+                        float(episode_row["psnr_non_sky"]),
+                        tb_step,
+                    )
+                    writer.add_scalar(
+                        f"validation_v7/episode/ssim_non_sky/scene_{sid:03d}_segment_{seg:03d}",
+                        float(episode_row["ssim_non_sky"]),
+                        tb_step,
+                    )
+                    writer.add_scalar(
+                        f"validation_v7/episode/lpips_non_sky/scene_{sid:03d}_segment_{seg:03d}",
+                        float(episode_row["lpips_non_sky"]),
+                        tb_step,
+                    )
+                    writer.add_scalar(
+                        f"validation_v7/episode/psnr_sky/scene_{sid:03d}_segment_{seg:03d}",
+                        float(episode_row["psnr_sky"]),
+                        tb_step,
+                    )
+                    writer.add_scalar(
+                        f"validation_v7/episode/ssim_sky/scene_{sid:03d}_segment_{seg:03d}",
+                        float(episode_row["ssim_sky"]),
+                        tb_step,
+                    )
+                    writer.add_scalar(
+                        f"validation_v7/episode/sky_mask_coverage/scene_{sid:03d}_segment_{seg:03d}",
+                        float(episode_row["sky_mask_coverage"]),
+                        tb_step,
+                    )
+                    writer.add_scalar(
+                        f"validation_v7/episode/psnr_full/scene_{sid:03d}_segment_{seg:03d}",
+                        float(episode_row["psnr_full"]),
+                        tb_step,
+                    )
+                    writer.add_scalar(
+                        f"validation_v7/episode/ssim_full/scene_{sid:03d}_segment_{seg:03d}",
+                        float(episode_row["ssim_full"]),
+                        tb_step,
+                    )
+                    writer.add_scalar(
+                        f"validation_v7/episode/lpips_full/scene_{sid:03d}_segment_{seg:03d}",
+                        float(episode_row["lpips_full"]),
+                        tb_step,
+                    )
+
             logger.info(
-                "VALIDATION_V7_BLOCK scene_id=%s segment_id=%s block=%s source_frame=%s target_frames=%s",
+                "VALIDATION_V7_EPISODE_END mode=%s scene_id=%s segment_id=%s episode_start=%s num_views=%s "
+                "metric_scope=%s psnr=%.4f ssim=%.4f lpips=%.4f",
+                validation_mode,
                 int(spec.scene_id),
                 int(spec.segment_id),
-                int(block_idx_in_episode),
-                int(src_frame),
-                [int(x) for x in block_frames],
-            )
-
-        if last_minimal is None:
-            continue
-
-        eval_req = _BatchRequestValidationV7(
-            scene_id=int(spec.scene_id),
-            segment_id=int(spec.segment_id),
-            source_image_ref=(int(spec.frame_chain[0]), 0),
-            source_image_refs=[(int(spec.frame_chain[0]), int(cam_id)) for cam_id in range(int(spec.num_cams))],
-            target_image_refs=[(int(r[0]), int(r[1])) for r in spec.eval_image_refs],
-            include_test=False,
-            test_image_refs=None,
-        )
-        raw_eval = dataset.get_segment_batch_from_image_refs(eval_req, enforce_target0_equals_source=False)
-        minimal_eval = convert_batch_to_minimal_format(
-            raw_eval,
-            device,
-            num_targets=int(raw_eval["target"]["image"].shape[0]),
-            include_source_for_2d=True,
-            view_selection=None,
-        )
-
-        gs_state = model.export_3dgs_state(
-            last_minimal,
-            include_hidden=True,
-            rigid_export_frame_idx=int(last_minimal["source_frame_idx"]),
-        )
-        scene_state = {
-            "base_batch": minimal_eval,
-            "gs_state": gs_state,
-        }
-        preds = model.render_views_from_scene_state(scene_state, minimal_eval["targets"])
-        gts = [t["gt_image"] for t in minimal_eval["targets"]]
-        if len(preds) != len(gts):
-            raise ValueError(
-                f"validation render size mismatch: pred={len(preds)} gt={len(gts)} scene={spec.scene_id} seg={spec.segment_id}"
-            )
-
-        expected_views = int((len(spec.frame_chain)) * int(spec.num_cams))
-        if len(preds) != expected_views:
-            raise ValueError(
-                f"validation expected {(len(spec.frame_chain))}x{spec.num_cams} views={expected_views}, got={len(preds)}"
-            )
-
-        per_view_rows: List[Dict[str, Any]] = []
-        psnr_vals: List[float] = []
-        ssim_vals: List[float] = []
-        lpips_vals: List[float] = []
-        psnr_non_sky_vals: List[float] = []
-        ssim_non_sky_vals: List[float] = []
-        lpips_non_sky_vals: List[float] = []
-        psnr_sky_vals: List[float] = []
-        ssim_sky_vals: List[float] = []
-        sky_coverage_vals: List[float] = []
-
-        seg_dir = os.path.join(
-            val_root,
-            f"scene_{int(spec.scene_id):03d}",
-            f"segment_{int(spec.segment_id):03d}",
-            f"episode_start_{int(spec.episode_start_keyframe_pos):03d}",
-        )
-        render_dir = os.path.join(seg_dir, "renders")
-        os.makedirs(render_dir, exist_ok=True)
-
-        for idx, (pred, gt, tgt) in enumerate(zip(preds, gts, minimal_eval["targets"])):
-            fallback_ref = eval_req.target_image_refs[int(idx)]
-            m = _compute_metrics(
-                pred_rgb=pred,
-                gt_rgb=gt,
-                psnr_metric=psnr_metric,
-                ssim_metric=ssim_metric,
-                lpips_metric=lpips_metric,
-                compute_psnr=True,
-                compute_heavy=True,
-            )
-            psnr_vals.append(float(m["psnr"]))
-            ssim_vals.append(float(m["ssim"]))
-            lpips_vals.append(float(m["lpips"]))
-            row = {
-                "index": int(idx),
-                "frame_idx": int(tgt.get("frame_idx", int(fallback_ref[0]))),
-                "cam_idx": int(tgt.get("cam_idx", int(fallback_ref[1]))),
-                "psnr": float(m["psnr"]),
-                "ssim": float(m["ssim"]),
-                "lpips": float(m["lpips"]),
-            }
-
-            if bool(validation_cfg.use_sky_mask_regions):
-                sky_mask = tgt.get("sky_mask")
-                if sky_mask is None and bool(validation_cfg.require_sky_mask):
-                    raise ValueError(
-                        "validation_v7.metrics.require_sky_mask=true but target missing sky_mask "
-                        f"(scene={int(spec.scene_id)} segment={int(spec.segment_id)} idx={int(idx)})"
-                    )
-                if sky_mask is not None:
-                    sm = sky_mask.to(device).float()
-                    if sm.dim() == 3:
-                        sm = sm.squeeze(-1)
-                    if sm.shape != gt.shape[:2]:
-                        raise ValueError(
-                            "validation sky_mask shape mismatch: "
-                            f"sky_mask={tuple(sm.shape)} gt_hw={tuple(gt.shape[:2])}"
-                        )
-                    min_valid = int(validation_cfg.min_valid_pixels_per_region)
-                    non_sky = (1.0 - sm).clamp(0.0, 1.0)
-                    sky = sm.clamp(0.0, 1.0)
-                    non_sky_count = int((non_sky > 0.5).sum().item())
-                    sky_count = int((sky > 0.5).sum().item())
-                    row["sky_mask_coverage"] = float(sm.mean().item())
-                    row["non_sky_pixel_count"] = int(non_sky_count)
-                    row["sky_pixel_count"] = int(sky_count)
-                    sky_coverage_vals.append(float(row["sky_mask_coverage"]))
-
-                    if non_sky_count >= min_valid:
-                        psnr_non = _compute_masked_psnr(pred, gt, non_sky)
-                        ssim_non = _compute_masked_ssim(pred, gt, non_sky)
-                        lpips_non = _compute_masked_lpips(pred, gt, non_sky, lpips_metric)
-                        if psnr_non is not None:
-                            row["psnr_non_sky"] = float(psnr_non)
-                            psnr_non_sky_vals.append(float(psnr_non))
-                        if ssim_non is not None:
-                            row["ssim_non_sky"] = float(ssim_non)
-                            ssim_non_sky_vals.append(float(ssim_non))
-                        if lpips_non is not None:
-                            row["lpips_non_sky"] = float(lpips_non)
-                            lpips_non_sky_vals.append(float(lpips_non))
-                    if sky_count >= min_valid:
-                        psnr_s = _compute_masked_psnr(pred, gt, sky)
-                        ssim_s = _compute_masked_ssim(pred, gt, sky)
-                        if psnr_s is not None:
-                            row["psnr_sky"] = float(psnr_s)
-                            psnr_sky_vals.append(float(psnr_s))
-                        if ssim_s is not None:
-                            row["ssim_sky"] = float(ssim_s)
-                            ssim_sky_vals.append(float(ssim_s))
-
-            per_view_rows.append(row)
-            if validation_cfg.save_images:
-                _save_image_triplet(
-                    int(trigger_step),
-                    pred,
-                    gt,
-                    render_dir,
-                    view_suffix=f"val_sc{int(spec.scene_id):03d}_seg{int(spec.segment_id):03d}_v{idx}",
-                    save_error=False,
-                )
-
-        episode_row = {
-            "split": "validation_v7",
-            "trigger_train_episode_counter": int(trigger_train_episode_counter),
-            "trigger_step": int(trigger_step),
-            "scene_id": int(spec.scene_id),
-            "segment_id": int(spec.segment_id),
-            "episode_start_keyframe_pos": int(spec.episode_start_keyframe_pos),
-            "num_views": int(len(per_view_rows)),
-            "psnr_full": float(np.mean(psnr_vals)) if psnr_vals else 0.0,
-            "ssim_full": float(np.mean(ssim_vals)) if ssim_vals else 0.0,
-            "lpips_full": float(np.mean(lpips_vals)) if lpips_vals else 0.0,
-            "psnr_non_sky": _safe_mean(psnr_non_sky_vals),
-            "ssim_non_sky": _safe_mean(ssim_non_sky_vals),
-            "lpips_non_sky": _safe_mean(lpips_non_sky_vals),
-            "psnr_sky": _safe_mean(psnr_sky_vals),
-            "ssim_sky": _safe_mean(ssim_sky_vals),
-            "sky_mask_coverage": _safe_mean(sky_coverage_vals),
-            "num_views_non_sky_metric": int(len(psnr_non_sky_vals)),
-            "num_views_sky_metric": int(len(psnr_sky_vals)),
-            "views_formula": f"({len(spec.frame_chain)})x{int(spec.num_cams)}",
-        }
-        episode_row["psnr"] = float(episode_row["psnr_full"])
-        episode_row["ssim"] = float(episode_row["ssim_full"])
-        episode_row["lpips"] = float(episode_row["lpips_full"])
-        episode_row["metric_scope"] = "full_image"
-        if bool(validation_cfg.use_sky_mask_regions) and int(episode_row["num_views_non_sky_metric"]) > 0:
-            episode_row["psnr"] = float(episode_row["psnr_non_sky"])
-            episode_row["ssim"] = float(episode_row["ssim_non_sky"])
-            episode_row["lpips"] = float(episode_row["lpips_non_sky"])
-            episode_row["metric_scope"] = "non_sky"
-        all_episode_rows.append(episode_row)
-
-        with open(os.path.join(seg_dir, "per_view_metrics.json"), "w", encoding="utf-8") as f:
-            json.dump(per_view_rows, f, indent=2)
-        with open(os.path.join(seg_dir, "summary.json"), "w", encoding="utf-8") as f:
-            json.dump(episode_row, f, indent=2)
-        if metrics_fh is not None:
-            _write_metrics_history(metrics_fh, episode_row)
-        if writer is not None:
-            tb_step = max(int(trigger_step), 0)
-            sid = int(spec.scene_id)
-            seg = int(spec.segment_id)
-            writer.add_scalar(
-                f"validation_v7/episode/psnr/scene_{sid:03d}_segment_{seg:03d}",
+                int(spec.episode_start_keyframe_pos),
+                int(episode_row["num_views"]),
+                str(episode_row["metric_scope"]),
                 float(episode_row["psnr"]),
-                tb_step,
-            )
-            writer.add_scalar(
-                f"validation_v7/episode/ssim/scene_{sid:03d}_segment_{seg:03d}",
                 float(episode_row["ssim"]),
-                tb_step,
-            )
-            writer.add_scalar(
-                f"validation_v7/episode/lpips/scene_{sid:03d}_segment_{seg:03d}",
                 float(episode_row["lpips"]),
-                tb_step,
             )
-            writer.add_scalar(
-                f"validation_v7/episode/num_views/scene_{sid:03d}_segment_{seg:03d}",
-                float(episode_row["num_views"]),
-                tb_step,
-            )
-            if bool(validation_cfg.use_sky_mask_regions):
-                writer.add_scalar(
-                    f"validation_v7/episode/psnr_non_sky/scene_{sid:03d}_segment_{seg:03d}",
-                    float(episode_row["psnr_non_sky"]),
-                    tb_step,
-                )
-                writer.add_scalar(
-                    f"validation_v7/episode/ssim_non_sky/scene_{sid:03d}_segment_{seg:03d}",
-                    float(episode_row["ssim_non_sky"]),
-                    tb_step,
-                )
-                writer.add_scalar(
-                    f"validation_v7/episode/lpips_non_sky/scene_{sid:03d}_segment_{seg:03d}",
-                    float(episode_row["lpips_non_sky"]),
-                    tb_step,
-                )
-                writer.add_scalar(
-                    f"validation_v7/episode/psnr_sky/scene_{sid:03d}_segment_{seg:03d}",
-                    float(episode_row["psnr_sky"]),
-                    tb_step,
-                )
-                writer.add_scalar(
-                    f"validation_v7/episode/ssim_sky/scene_{sid:03d}_segment_{seg:03d}",
-                    float(episode_row["ssim_sky"]),
-                    tb_step,
-                )
-                writer.add_scalar(
-                    f"validation_v7/episode/sky_mask_coverage/scene_{sid:03d}_segment_{seg:03d}",
-                    float(episode_row["sky_mask_coverage"]),
-                    tb_step,
-                )
-                writer.add_scalar(
-                    f"validation_v7/episode/psnr_full/scene_{sid:03d}_segment_{seg:03d}",
-                    float(episode_row["psnr_full"]),
-                    tb_step,
-                )
-                writer.add_scalar(
-                    f"validation_v7/episode/ssim_full/scene_{sid:03d}_segment_{seg:03d}",
-                    float(episode_row["ssim_full"]),
-                    tb_step,
-                )
-                writer.add_scalar(
-                    f"validation_v7/episode/lpips_full/scene_{sid:03d}_segment_{seg:03d}",
-                    float(episode_row["lpips_full"]),
-                    tb_step,
-                )
-
-        logger.info(
-            "VALIDATION_V7_EPISODE_END scene_id=%s segment_id=%s episode_start=%s num_views=%s "
-            "metric_scope=%s psnr=%.4f ssim=%.4f lpips=%.4f",
-            int(spec.scene_id),
-            int(spec.segment_id),
-            int(spec.episode_start_keyframe_pos),
-            int(episode_row["num_views"]),
-            str(episode_row["metric_scope"]),
-            float(episode_row["psnr"]),
-            float(episode_row["ssim"]),
-            float(episode_row["lpips"]),
-        )
+    finally:
+        if use_train_finetune and base_ckpt_bytes is not None:
+            _restore_train_checkpoint_bytes(model, base_ckpt_bytes, device)
+            model.train()
 
     if len(all_episode_rows) > 0:
         scene_to_rows: Dict[int, List[Dict[str, Any]]] = {}
@@ -571,6 +743,8 @@ def _run_validation_v7_round(
         }
         global_summary = {
             "split": "validation_v7_global",
+            "mode": validation_mode,
+            "block_order": validation_block_order,
             "trigger_train_episode_counter": int(trigger_train_episode_counter),
             "trigger_step": int(trigger_step),
             "num_episodes": int(len(all_episode_rows)),
@@ -623,7 +797,6 @@ def _run_validation_v7_round(
                 writer.add_scalar("validation_v7/global/psnr_full", float(global_summary["psnr_full"]), tb_step)
                 writer.add_scalar("validation_v7/global/ssim_full", float(global_summary["ssim_full"]), tb_step)
                 writer.add_scalar("validation_v7/global/lpips_full", float(global_summary["lpips_full"]), tb_step)
-            # A second x-axis view to inspect cadence by train episode count.
             writer.add_scalar(
                 "validation_v7/global_by_train_episode/psnr",
                 float(global_summary["psnr"]),
@@ -742,16 +915,29 @@ def main() -> None:
         sv7_ep = cfg.scheduler_v7.get("episode")
         if sv7_ep is None:
             raise ValueError("validation_v7 requires scheduler_v7.episode")
+        validation_blocks_per_episode = (
+            int(validation_v7_cfg.blocks_per_episode)
+            if validation_v7_cfg.blocks_per_episode is not None
+            else int(sv7_ep["blocks_per_episode"])
+        )
+        validation_total_target_frames = int(sv7_ep["total_target_frames"])
         validation_specs = build_validation_episode_specs_v7(
             dataset=dataset,
             eval_scene_ids=[int(x) for x in validation_v7_cfg.eval_scene_ids],
-            blocks_per_episode=int(sv7_ep["blocks_per_episode"]),
-            total_target_frames=int(sv7_ep["total_target_frames"]),
+            blocks_per_episode=int(validation_blocks_per_episode),
+            total_target_frames=int(validation_total_target_frames),
         )
         logger.info(
-            "validation_v7 enabled: eval_scenes=%s specs=%s validate_every_n_episodes=%s run_at_train_start=%s",
+            "validation_v7 enabled: eval_scenes=%s specs=%s mode=%s block_order=%s reset_policy=%s "
+            "steps_per_block=%s blocks_per_episode=%s "
+            "validate_every_n_episodes=%s run_at_train_start=%s",
             [int(x) for x in validation_v7_cfg.eval_scene_ids],
             int(len(validation_specs)),
+            str(validation_v7_cfg.mode),
+            str(validation_v7_cfg.block_order),
+            str(validation_v7_cfg.reset_policy),
+            int(validation_v7_cfg.steps_per_block),
+            int(validation_blocks_per_episode),
             int(validation_v7_cfg.validate_every_n_episodes),
             bool(validation_v7_cfg.run_at_train_start),
         )
@@ -804,16 +990,23 @@ def main() -> None:
 
     sv3_mns = cfg.get("scheduler_v3", {}).get("model_node_state") if cfg.get("scheduler_v3") else None
     if sv3_mns and bool(sv3_mns.get("sync_with_scheduler")):
+        rp = sv3_mns.get("reset_policy", "auto(block_major->block_end, step_major->episode_end)")
         logger.info(
             "scheduler_v3.model_node_state.sync_with_scheduler=true: NodeState write-back when "
-            "segment_local_step %% U == 0; reset_node_state() after each block_end. "
-            "model.update_node_state_interval / reset_node_state_interval are ignored."
+            "segment_local_step %% U == 0; reset_node_state() controlled by reset_policy=%s. "
+            "model.update_node_state_interval / reset_node_state_interval are ignored.",
+            rp,
         )
 
     max_iterations = args.max_steps or cfg.training.get("max_iterations", 1000)
     log_interval = cfg.training.get("log_interval", 50)
     save_every = cfg.training.get("save_checkpoint_freq", 500)
     enable_psnr = bool(cfg.eval.get("enable_psnr", True))
+    train_monitor_cfg = cfg.logging.get("train_monitor") or {}
+    train_monitor_enable_heavy_metrics = bool(train_monitor_cfg.get("enable_heavy_metrics", True))
+    train_monitor_include_per_view_metrics = bool(train_monitor_cfg.get("include_per_view_metrics", True))
+    train_monitor_include_extra_result_metrics = bool(train_monitor_cfg.get("include_extra_result_metrics", True))
+    train_monitor_enable_low_psnr_image_dump = bool(train_monitor_cfg.get("enable_low_psnr_image_dump", True))
     save_train_views_psnr_below: Optional[float]
     _raw_psnr_below = cfg.eval.get("save_train_views_psnr_below", None)
     if _raw_psnr_below is None:
@@ -824,14 +1017,65 @@ def main() -> None:
             raise ValueError("eval.save_train_views_psnr_below must be > 0 when set")
         if not enable_psnr:
             raise ValueError("eval.save_train_views_psnr_below requires eval.enable_psnr=true")
-    enable_jsonl_metrics = bool(cfg.logging.get("enable_jsonl_metrics", True))
-    if "image_interval_blocks" not in cfg.logging:
-        raise ValueError(
-            "logging.image_interval_blocks is required (train images are saved every N scheduler blocks, not every N steps)."
+    if not train_monitor_enable_low_psnr_image_dump and save_train_views_psnr_below is not None:
+        logger.info(
+            "train_monitor.enable_low_psnr_image_dump=false: ignore eval.save_train_views_psnr_below=%.4f",
+            float(save_train_views_psnr_below),
         )
-    image_interval_blocks = int(cfg.logging["image_interval_blocks"])
-    if image_interval_blocks < 1:
-        raise ValueError(f"logging.image_interval_blocks must be >= 1, got {image_interval_blocks}")
+        save_train_views_psnr_below = None
+    if not train_monitor_enable_heavy_metrics and save_train_views_psnr_below is not None:
+        logger.info(
+            "train_monitor.enable_heavy_metrics=false: disable low-PSNR image dump "
+            "(eval.save_train_views_psnr_below=%.4f ignored).",
+            float(save_train_views_psnr_below),
+        )
+        save_train_views_psnr_below = None
+    logger.info(
+        "Train monitor switches: heavy_metrics=%s include_per_view_metrics=%s "
+        "include_extra_result_metrics=%s low_psnr_image_dump=%s",
+        bool(train_monitor_enable_heavy_metrics),
+        bool(train_monitor_include_per_view_metrics),
+        bool(train_monitor_include_extra_result_metrics),
+        bool(train_monitor_enable_low_psnr_image_dump),
+    )
+    enable_jsonl_metrics = bool(cfg.logging.get("enable_jsonl_metrics", True))
+    image_trigger_cfg = cfg.logging.get("image_trigger") or {}
+    if image_trigger_cfg:
+        image_trigger_mode = str(image_trigger_cfg.get("mode", "raw_step_interval")).strip()
+        image_interval_blocks_equiv = int(
+            image_trigger_cfg.get(
+                "interval_blocks_equiv",
+                cfg.logging.get("image_interval_blocks", 1),
+            )
+        )
+    else:
+        if "image_interval_blocks" not in cfg.logging:
+            raise ValueError(
+                "logging.image_interval_blocks is required when logging.image_trigger is unset."
+            )
+        image_trigger_mode = "block_end"
+        image_interval_blocks_equiv = int(cfg.logging["image_interval_blocks"])
+    if image_trigger_mode not in ("block_end", "raw_step_interval", "episode_end"):
+        raise ValueError(
+            "logging.image_trigger.mode must be one of ['block_end', 'raw_step_interval', 'episode_end']"
+        )
+    if image_interval_blocks_equiv < 1:
+        raise ValueError(f"logging image trigger interval must be >= 1, got {image_interval_blocks_equiv}")
+    scheduler_steps_per_block = int(getattr(scheduler, "steps_per_block", 1))
+    if scheduler_steps_per_block < 1:
+        scheduler_steps_per_block = 1
+    image_trigger_interval_steps = int(image_interval_blocks_equiv * scheduler_steps_per_block)
+    logger.info(
+        "Train image trigger: mode=%s interval_blocks_equiv=%s steps_per_block=%s interval_steps=%s",
+        image_trigger_mode,
+        int(image_interval_blocks_equiv),
+        int(scheduler_steps_per_block),
+        int(image_trigger_interval_steps),
+    )
+    if image_trigger_mode == "episode_end":
+        logger.info(
+            "Train image trigger episode_end gate: save when completed_blocks %% interval_blocks_equiv == 0"
+        )
     low_psnr_train_images_subdir: Optional[str] = None
     if save_train_views_psnr_below is not None:
         if "low_psnr_train_images_subdir" not in cfg.logging:
@@ -865,6 +1109,8 @@ def main() -> None:
         "reset_node_state",
     ]
     if bool(validation_v7_cfg.eval_enable):
+        if str(validation_v7_cfg.mode) == "segment_finetune_train":
+            required_validation_methods.append("train_step")
         missing = [m for m in required_validation_methods if not hasattr(model, m)]
         if missing:
             raise ValueError(
@@ -872,6 +1118,11 @@ def main() -> None:
                 f"but {trainer_cls.__name__} is missing: {missing}. "
                 "Disable validation_v7.eval_enable or implement the missing APIs."
             )
+        if str(validation_v7_cfg.mode) == "segment_finetune_train":
+            if not hasattr(model, "optimizer") or model.optimizer is None:
+                raise ValueError(
+                    "validation_v7.mode=segment_finetune_train requires trainer.optimizer to exist."
+                )
     model.train()
     _load_init_checkpoint(
         args.init_checkpoint,
@@ -898,7 +1149,7 @@ def main() -> None:
     peak_mem_reserved_bytes = 0
     diag_window: deque = deque(maxlen=max(diag_cfg.get("window_size", 0), 1))
     minimal_batch: Dict[str, Any] = {}
-    block_accum: Dict[str, Any] = {"loss_sum": 0.0, "count": 0, "start_step": 0, "event": None}
+    block_loss_accum: Dict[int, Dict[str, Any]] = {}
 
     try:
         metrics_fh = _open_metrics_history(cfg.log_dir, enable_jsonl_metrics)
@@ -1004,7 +1255,6 @@ def main() -> None:
                         ev.get("overlap_mode"),
                         extra_bb,
                     )
-                    block_accum = {"loss_sum": 0.0, "count": 0, "start_step": int(step), "event": ev}
 
             tgt = raw_batch.get("target")
             if not isinstance(tgt, dict) or tgt.get("image") is None:
@@ -1056,8 +1306,21 @@ def main() -> None:
             sum_num_gaussians_rigid += int(result.get("num_gaussians_rigid", 0))
             sum_num_gaussians_sky += int(result.get("num_gaussians_sky", 0))
 
-            block_accum["loss_sum"] = float(block_accum.get("loss_sum", 0.0)) + float(loss_val)
-            block_accum["count"] = int(block_accum.get("count", 0)) + 1
+            current_block_idx_global = int(scheduler_info.get("block_idx_global", -1))
+            if current_block_idx_global >= 0:
+                block_acc = block_loss_accum.setdefault(
+                    int(current_block_idx_global),
+                    {
+                        "loss_sum": 0.0,
+                        "loss_count": 0,
+                        "scene_id": int(scheduler_info.get("scene_id", -1)),
+                        "segment_id": int(scheduler_info.get("segment_id", -1)),
+                        "episode_idx_global": int(scheduler_info.get("episode_idx_global", -1)),
+                        "block_idx_in_episode": int(scheduler_info.get("block_idx_in_episode", -1)),
+                    },
+                )
+                block_acc["loss_sum"] = float(block_acc.get("loss_sum", 0.0)) + float(loss_val)
+                block_acc["loss_count"] = int(block_acc.get("loss_count", 0)) + 1
 
             if step % log_interval == 0:
                 logger.info(
@@ -1090,6 +1353,34 @@ def main() -> None:
             if diag_cfg["enable"] and diag_cfg["save_branch_renders"] and step % max(diag_cfg["interval"], 1) == 0:
                 _save_diagnostic_renders(model, minimal_batch, step, cfg.log_dir)
 
+            if image_trigger_mode == "raw_step_interval":
+                scheduler_global_step = int(scheduler_info.get("global_step", step + 1))
+                if scheduler_global_step > 0 and scheduler_global_step % int(image_trigger_interval_steps) == 0:
+                    _save_train_monitor_triplets(
+                        step=int(step),
+                        pred_rgbs=pred_rgbs,
+                        gt_images=gt_images,
+                        raw_batch=raw_batch,
+                        log_dir=str(cfg.log_dir),
+                        block_idx_global=int(scheduler_info.get("block_idx_global", 0)),
+                        scene_id_fallback=scheduler_info.get("scene_id", -1),
+                        pixel_camera_ids=pixel_camera_ids,
+                    )
+            if image_trigger_mode == "episode_end":
+                if any(ev.get("type") == "episode_end" for ev in step_events):
+                    completed_blocks = int(scheduler_info.get("block_idx_global", -1)) + 1
+                    if completed_blocks > 0 and completed_blocks % int(image_interval_blocks_equiv) == 0:
+                        _save_train_monitor_triplets(
+                            step=int(step),
+                            pred_rgbs=pred_rgbs,
+                            gt_images=gt_images,
+                            raw_batch=raw_batch,
+                            log_dir=str(cfg.log_dir),
+                            block_idx_global=int(scheduler_info.get("block_idx_global", 0)),
+                            scene_id_fallback=scheduler_info.get("scene_id", -1),
+                            pixel_camera_ids=pixel_camera_ids,
+                        )
+
             block_end_monitor_ms = 0.0
             for ev in step_events:
                 if ev.get("type") != "block_end":
@@ -1097,32 +1388,23 @@ def main() -> None:
                 block_end_t0 = time.perf_counter()
 
                 block_idx_global = int(ev.get("block_idx_global", 0))
-                if block_idx_global >= 1 and (block_idx_global - 1) % image_interval_blocks == 0:
-                    out_dir = os.path.join(cfg.log_dir, "images", "train")
-                    tgt_meta = raw_batch.get("target") or {}
-                    fi_t = tgt_meta.get("frame_indices")
-                    ci_t = tgt_meta.get("cam_indices")
-                    sc_lab = _scene_folder_label_from_batch(raw_batch, ev.get("scene_id"))
-                    for v in range(num_views):
-                        if fi_t is not None and ci_t is not None and int(fi_t.shape[0]) > v and int(ci_t.shape[0]) > v:
-                            f_lab = int(fi_t[v].item())
-                            c_lab = int(ci_t[v].item())
-                            nusc_suf = _nuscenes_cam_id_suffix(pixel_camera_ids, c_lab)
-                            vsuf = (
-                                f"b{block_idx_global:06d}_sc{sc_lab}_v{v}_f{f_lab:05d}_c{c_lab}{nusc_suf}"
-                            )
-                        else:
-                            vsuf = f"b{block_idx_global:06d}_sc{sc_lab}_view{v}"
-                        _save_image_triplet(
-                            step,
-                            pred_rgbs[v],
-                            gt_images[v],
-                            out_dir,
-                            view_suffix=vsuf,
-                            save_error=False,
+                if image_trigger_mode == "block_end":
+                    if block_idx_global >= 1 and (block_idx_global - 1) % int(image_interval_blocks_equiv) == 0:
+                        _save_train_monitor_triplets(
+                            step=int(step),
+                            pred_rgbs=pred_rgbs,
+                            gt_images=gt_images,
+                            raw_batch=raw_batch,
+                            log_dir=str(cfg.log_dir),
+                            block_idx_global=int(block_idx_global),
+                            scene_id_fallback=ev.get("scene_id", -1),
+                            pixel_camera_ids=pixel_camera_ids,
                         )
 
-                mean_loss = float(block_accum.get("loss_sum", 0.0)) / max(int(block_accum.get("count", 0)), 1)
+                acc = block_loss_accum.pop(int(block_idx_global), None)
+                mean_loss: Optional[float] = None
+                if acc is not None and int(acc.get("loss_count", 0)) > 0:
+                    mean_loss = float(acc["loss_sum"]) / float(acc["loss_count"])
                 mse_vals = [
                     float(
                         torch.mean((torch.clamp(pred_rgbs[v], 0.0, 1.0) - torch.clamp(gt_images[v], 0.0, 1.0)) ** 2).item()
@@ -1133,7 +1415,7 @@ def main() -> None:
 
                 metric_vals: Dict[str, float] = {}
                 metric_scope = "full_image"
-                if enable_psnr:
+                if enable_psnr and train_monitor_enable_heavy_metrics:
                     psnr_full_list: List[float] = []
                     ssim_full_list: List[float] = []
                     lpips_full_list: List[float] = []
@@ -1206,8 +1488,9 @@ def main() -> None:
                         psnr_primary_list.append(psnr_primary)
                         ssim_primary_list.append(ssim_primary)
                         lpips_primary_list.append(lpips_primary)
-                        metric_vals[f"psnr_view{v}"] = float(psnr_primary)
-                        metric_vals[f"psnr_full_view{v}"] = float(psnr_full)
+                        if train_monitor_include_per_view_metrics:
+                            metric_vals[f"psnr_view{v}"] = float(psnr_primary)
+                            metric_vals[f"psnr_full_view{v}"] = float(psnr_full)
 
                     metric_vals["psnr_mean"] = float(np.mean(psnr_primary_list)) if psnr_primary_list else 0.0
                     metric_vals["ssim_mean"] = float(np.mean(ssim_primary_list)) if ssim_primary_list else 0.0
@@ -1222,7 +1505,11 @@ def main() -> None:
                     if train_monitor_use_non_sky_region and non_sky_metric_views > 0:
                         metric_scope = "non_sky"
 
-                    if save_train_views_psnr_below is not None and low_psnr_train_images_subdir is not None:
+                    if (
+                        save_train_views_psnr_below is not None
+                        and low_psnr_train_images_subdir is not None
+                        and train_monitor_enable_low_psnr_image_dump
+                    ):
                         out_low = os.path.join(cfg.log_dir, "images", low_psnr_train_images_subdir)
                         tgt_meta = raw_batch.get("target") or {}
                         fi_t = tgt_meta.get("frame_indices")
@@ -1261,16 +1548,17 @@ def main() -> None:
                     if enable_psnr and "psnr_mean" in metric_vals
                     else "n/a"
                 )
+                mean_loss_log = "n/a" if mean_loss is None else f"{float(mean_loss):.6f}"
                 logger.info(
                     "BLOCK_END global_step=%s scene_id=%s scene_dir=%s segment=%s block_seg=%s block_global=%s "
-                    "mean_loss=%.6f mse=%.6e metric_scope=%s psnr_mean=%s onepass=%d",
+                    "mean_loss=%s mse=%.6e metric_scope=%s psnr_mean=%s onepass=%d",
                     ev.get("global_step"),
                     ev.get("scene_id"),
                     _scene_dir_str(ev.get("scene_id", -1)),
                     ev.get("segment_id"),
                     ev.get("block_idx_in_segment"),
                     ev.get("block_idx_global"),
-                    mean_loss,
+                    mean_loss_log,
                     mse_val,
                     metric_scope,
                     psnr_log,
@@ -1301,7 +1589,7 @@ def main() -> None:
                     "R_steps": int(scheduler_info.get("R_steps", -1)),
                     "T_steps": int(scheduler_info.get("T_steps", -1)),
                     "loss": float(loss_val),
-                    "mean_loss_in_block": float(mean_loss),
+                    "mean_loss_in_block": float(mean_loss) if mean_loss is not None else None,
                     "loss_l1": float(result.get("loss_l1", 0.0)),
                     "loss_ssim": float(result.get("loss_ssim", 0.0)),
                     "loss_mask": float(result.get("loss_mask", 0.0)),
@@ -1348,15 +1636,16 @@ def main() -> None:
                     "node_state_sync_reset": bool(result.get("node_state_sync_reset", False)),
                 }
                 extra_metric_prefixes = ("bg_", "rigid_", "distant_", "scene_", "perf_")
-                for k, v in result.items():
-                    if not k.startswith(extra_metric_prefixes):
-                        continue
-                    if k in row:
-                        continue
-                    if isinstance(v, bool):
-                        row[k] = bool(v)
-                    elif isinstance(v, (int, float)):
-                        row[k] = float(v)
+                if train_monitor_include_extra_result_metrics:
+                    for k, v in result.items():
+                        if not k.startswith(extra_metric_prefixes):
+                            continue
+                        if k in row:
+                            continue
+                        if isinstance(v, bool):
+                            row[k] = bool(v)
+                        elif isinstance(v, (int, float)):
+                            row[k] = float(v)
                 row["loss_mask_ratio"] = float(row["loss_mask"] / max(float(loss_val), 1e-8))
                 row.update(metric_vals)
                 if diag_row:
@@ -1368,7 +1657,8 @@ def main() -> None:
                 _write_metrics_history(metrics_fh, row)
                 if writer is not None:
                     writer.add_scalar("train/loss", float(loss_val), step)
-                    writer.add_scalar("train/mean_loss_in_block", float(mean_loss), step)
+                    if mean_loss is not None:
+                        writer.add_scalar("train/mean_loss_in_block", float(mean_loss), step)
                     writer.add_scalar("train/mse", float(mse_val), step)
                     writer.add_scalar("train/num_bg_update", int(result.get("num_bg_update", 0)), step)
                     writer.add_scalar("train/num_distant_update", int(result.get("num_distant_update", 0)), step)
@@ -1376,11 +1666,12 @@ def main() -> None:
                     writer.add_scalar("train/src_backproject_pass_count", int(result.get("src_backproject_pass_count", 0)), step)
                     for k, v in metric_vals.items():
                         writer.add_scalar(f"train/{k}", float(v), step)
-                    for k, v in result.items():
-                        if not k.startswith(extra_metric_prefixes):
-                            continue
-                        if isinstance(v, (int, float)):
-                            writer.add_scalar(f"train/{k}", float(v), step)
+                    if train_monitor_include_extra_result_metrics:
+                        for k, v in result.items():
+                            if not k.startswith(extra_metric_prefixes):
+                                continue
+                            if isinstance(v, (int, float)):
+                                writer.add_scalar(f"train/{k}", float(v), step)
                     writer.add_scalar("train/perf/step_time_ms", float(step_time_ms), step)
                 block_end_monitor_ms += float((time.perf_counter() - block_end_t0) * 1000.0)
 

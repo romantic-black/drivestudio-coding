@@ -79,8 +79,8 @@ dataset:
     monocular_downscale: 2
     monocular_dynamic_recovery_bbox_expand_xyz_m: [0.5, 0.2, 0.5]
     monocular_dynamic_recovery_max_points_per_instance: 20000
-    near_max_points: 600000
-    distant_max_points: 900000
+    near_max_points: 500000
+    distant_max_points: 1000000
     static_instance_motion:
       enable: true
       traj_length_thresh_m: 0.5
