@@ -39,5 +39,5 @@ def test_stage5_1_fixed_cached_accepts_complete_row_space_metadata() -> None:
     bg_knn_idx, rigid_knn_idx, rigid_knn_row_ids = trainer._get_segment_knn_tensors(batch)
     assert tuple(bg_knn_idx.shape) == (2, 2)
     assert tuple(rigid_knn_idx.shape) == (3, 2)
-    assert rigid_knn_row_ids is not None
-    assert tuple(rigid_knn_row_ids.shape) == (3,)
+    # fixed_cached keeps implicit full-space mapping; explicit row_ids are ignored.
+    assert rigid_knn_row_ids is None

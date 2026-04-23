@@ -219,8 +219,12 @@ class MinimalStreetForwardStage5_1(MinimalStreetForwardStage5_0):
             raise ValueError(f"bg_knn_idx must be [N_bg,K_store], got {tuple(bg_knn_idx.shape)}")
         if rigid_knn_idx.dim() != 2:
             raise ValueError(f"rigid_knn_idx must be [N_rigid,K_store], got {tuple(rigid_knn_idx.shape)}")
+        knn_cfg = getattr(self, "stage5_1_knn_cfg", {}) or {}
+        neighbor_policy = str(knn_cfg.get("neighbor_policy", "")).strip().lower()
         rigid_knn_row_ids = None
-        if "rigid_knn_row_ids" in payload:
+        # Stage5_1 fixed_cached semantics require rigid KNN and node_state_rigid to share
+        # the same full-segment row-space; mapping metadata is ignored on purpose.
+        if "rigid_knn_row_ids" in payload and neighbor_policy != "fixed_cached":
             rigid_knn_row_ids = torch.as_tensor(payload["rigid_knn_row_ids"])
             if rigid_knn_row_ids.dim() != 1:
                 raise ValueError(f"rigid_knn_row_ids must be [M], got {tuple(rigid_knn_row_ids.shape)}")
@@ -351,6 +355,8 @@ class MinimalStreetForwardStage5_1(MinimalStreetForwardStage5_0):
 
         query_global = route.S_in.to(device=device, dtype=torch.long)
         self_row = rigid_global_to_struct[query_global][:, None]
+        knn_dev = rigid_knn_idx.device
+        knn_on_cpu = str(knn_dev.type) == "cpu"
 
         if rigid_knn_row_ids is None:
             if int(rigid_knn_idx.shape[0]) != int(num_rigid):
@@ -359,7 +365,11 @@ class MinimalStreetForwardStage5_1(MinimalStreetForwardStage5_0):
                     f"knn_rows={rigid_knn_idx.shape[0]} num_rigid={num_rigid}. "
                     "This indicates KNN row-space mismatch (e.g. filtered knn table vs full node_state_rigid rows)."
                 )
-            query_knn_rows = query_global.to(device=rigid_knn_idx.device, dtype=torch.long, non_blocking=True)
+            query_knn_rows = query_global.to(
+                device=knn_dev,
+                dtype=torch.long,
+                non_blocking=not knn_on_cpu,
+            ).contiguous()
             query_has_row = torch.ones_like(query_global, dtype=torch.bool, device=device)
         else:
             row_ids = rigid_knn_row_ids.to(device=device, dtype=torch.long, non_blocking=True)
@@ -378,20 +388,33 @@ class MinimalStreetForwardStage5_1(MinimalStreetForwardStage5_0):
                     "rigid_knn_row_ids does not cover all rigid_in query rows. "
                     f"missing={missing} num_queries={int(query_global.shape[0])}."
                 )
-            query_knn_rows = query_knn_rows_raw.to(device=rigid_knn_idx.device, non_blocking=True)
+            query_knn_rows = query_knn_rows_raw.to(
+                device=knn_dev,
+                dtype=torch.long,
+                non_blocking=not knn_on_cpu,
+            ).contiguous()
 
         knn_rows = int(rigid_knn_idx.shape[0])
         if knn_rows <= 0:
             raise RuntimeError("Stage5_1 rigid_knn_idx has zero rows while rigid_in queries are present.")
-        query_row_valid = (query_knn_rows >= 0) & (query_knn_rows < knn_rows)
+        bad_low = query_knn_rows < 0
+        bad_high = query_knn_rows >= knn_rows
+        bad_mask = bad_low | bad_high
+        query_row_valid = ~bad_mask
         query_has_row = query_has_row & query_row_valid.to(device=query_has_row.device)
-        if bool((~query_row_valid).any().item()):
+        if bool(bad_mask.any().item()):
             qmin = int(query_knn_rows.min().item()) if int(query_knn_rows.numel()) > 0 else -1
             qmax = int(query_knn_rows.max().item()) if int(query_knn_rows.numel()) > 0 else -1
-            bad = int((~query_row_valid).sum().item())
+            bad = int(bad_mask.sum().item())
+            bad_low_n = int(bad_low.sum().item())
+            bad_high_n = int(bad_high.sum().item())
+            qgmin = int(query_global.min().item()) if int(query_global.numel()) > 0 else -1
+            qgmax = int(query_global.max().item()) if int(query_global.numel()) > 0 else -1
             raise RuntimeError(
                 "Stage5_1 detected rigid query rows outside knn table range: "
-                f"bad={bad} qmin={qmin} qmax={qmax} knn_rows={knn_rows}."
+                f"bad={bad} bad_low={bad_low_n} bad_high={bad_high_n} "
+                f"qmin={qmin} qmax={qmax} query_global_min={qgmin} query_global_max={qgmax} "
+                f"knn_rows={knn_rows} num_rigid={num_rigid} with_row_ids={rigid_knn_row_ids is not None}."
             )
 
         raw_global_full = rigid_knn_idx[query_knn_rows].to(device=device, non_blocking=True).long()
