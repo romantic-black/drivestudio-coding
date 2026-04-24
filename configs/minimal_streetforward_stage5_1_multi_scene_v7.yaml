@@ -112,6 +112,7 @@ scheduler_v7:
     scene_order: shuffle_per_epoch
   execution:
     block_order: step_major
+    step_major_switch_interval_steps: 1
   preload:
     emit_hints: true
     warm_next_block_exact: true
@@ -124,8 +125,10 @@ validation_v7:
     steps_per_block: 8
   episode:
     blocks_per_episode: 3
+    total_target_frames: 3
   execution:
     block_order: step_major
+    step_major_switch_interval_steps: 1
     reset_policy: episode_end
   trigger:
     by: train_episode_interval
@@ -260,7 +263,7 @@ debug:
   validate_stage5_knn: false
 
 eval:
-  enable_psnr: false
+  enable_psnr: true
   save_train_views_psnr_below: null
   run_test_at_end: false
 

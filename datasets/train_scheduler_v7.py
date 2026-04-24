@@ -53,6 +53,7 @@ def _iter_episode_block_indices(
     blocks_per_episode: int,
     steps_per_block: int,
     block_order: str,
+    step_major_switch_interval_steps: int = 1,
 ) -> List[int]:
     if block_order == "block_major":
         return [
@@ -61,11 +62,15 @@ def _iter_episode_block_indices(
             for _ in range(int(steps_per_block))
         ]
     if block_order == "step_major":
-        return [
-            int(b)
-            for _ in range(int(steps_per_block))
-            for b in range(int(blocks_per_episode))
-        ]
+        switch_every = int(step_major_switch_interval_steps)
+        if switch_every < 1:
+            raise ValueError("step_major_switch_interval_steps must be >= 1")
+        out: List[int] = []
+        for round_base in range(0, int(steps_per_block), int(switch_every)):
+            chunk = int(min(int(switch_every), int(steps_per_block) - int(round_base)))
+            for b in range(int(blocks_per_episode)):
+                out.extend([int(b)] * int(chunk))
+        return out
     raise ValueError(f"unsupported block_order={block_order!r}")
 
 
@@ -91,6 +96,7 @@ class TrainSchedulerV7:
         warm_next_block_exact: bool,
         warm_next_episode_chain: bool,
         block_order: str = "block_major",
+        step_major_switch_interval_steps: int = 1,
     ) -> None:
         if steps_per_block < 1:
             raise ValueError("steps_per_block must be >= 1")
@@ -114,6 +120,8 @@ class TrainSchedulerV7:
             raise ValueError("traversal.scene_order must be ascending or shuffle_per_epoch")
         if block_order not in ("block_major", "step_major"):
             raise ValueError("execution.block_order must be block_major or step_major")
+        if step_major_switch_interval_steps < 1:
+            raise ValueError("execution.step_major_switch_interval_steps must be >= 1")
         if not switch_after_episode:
             raise ValueError("traversal.switch_after_episode must be true for TrainSchedulerV7")
 
@@ -135,9 +143,21 @@ class TrainSchedulerV7:
         self.emit_preload_hints = bool(emit_preload_hints)
         self.warm_next_block_exact = bool(warm_next_block_exact)
         self.warm_next_episode_chain = bool(warm_next_episode_chain)
+        self.step_major_switch_interval_steps = int(step_major_switch_interval_steps)
 
         self.episode_window_keyframes = int(self.blocks_per_episode + self.total_target_frames - 1)
         self.total_episode_steps = int(self.blocks_per_episode * self.steps_per_block)
+        self._episode_block_visit_order = _iter_episode_block_indices(
+            blocks_per_episode=int(self.blocks_per_episode),
+            steps_per_block=int(self.steps_per_block),
+            block_order=str(self.block_order),
+            step_major_switch_interval_steps=int(self.step_major_switch_interval_steps),
+        )
+        if len(self._episode_block_visit_order) != int(self.total_episode_steps):
+            raise ValueError(
+                "internal error: episode visit order length mismatch "
+                f"({len(self._episode_block_visit_order)} != {self.total_episode_steps})"
+            )
         self.U = 1  # Compatibility shim for legacy scheduler-node-sync consumers.
 
         self.epoch_idx = 0
@@ -414,6 +434,7 @@ class TrainSchedulerV7:
                 "steps_per_block": int(self.steps_per_block),
                 "updates_per_block": int(self.steps_per_block),
                 "U": int(self.U),
+                "step_major_switch_interval_steps": int(self.step_major_switch_interval_steps),
                 "scheduler_version": "v7",
             }
         )
@@ -481,7 +502,7 @@ class TrainSchedulerV7:
             "keyframe_window": keyframe_window,
             "frame_chain": frame_chain,
             "block_windows": block_windows,
-            "block_cursor": 0,
+            "block_cursor": int(self._episode_block_visit_order[0]) if self.block_order == "step_major" else 0,
             "block_repeat_step": 0,
             "episode_step_cursor": 0,
             "block_update_counts": [0 for _ in range(int(self.blocks_per_episode))],
@@ -714,7 +735,7 @@ class TrainSchedulerV7:
         item = self._segment_plan_item(int(st["scene_id"]), int(st["segment_id"]))
         episode_step_cursor = int(st.get("episode_step_cursor", 0))
         block_update_counts = [int(x) for x in st.get("block_update_counts", [])]
-        block_visit_round = int(episode_step_cursor // max(self.blocks_per_episode, 1))
+        block_visit_round = int(min(block_update_counts)) if len(block_update_counts) > 0 else 0
         return {
             "epoch_idx": int(self.epoch_idx),
             "global_step": int(self.global_step),
@@ -743,6 +764,7 @@ class TrainSchedulerV7:
             "episode_idx_global": int(st["episode_idx_global"]),
             "block_repeat_step": int(st["block_repeat_step"]),
             "block_order": str(self.block_order),
+            "step_major_switch_interval_steps": int(self.step_major_switch_interval_steps),
             "episode_step_cursor": int(episode_step_cursor),
             "block_update_counts": [int(x) for x in block_update_counts],
             "block_visit_round": int(block_visit_round),
@@ -844,7 +866,7 @@ class TrainSchedulerV7:
             if int(st.get("episode_step_cursor", 0)) >= int(self.total_episode_steps):
                 self._finalize_episode_if_needed()
             else:
-                next_block_idx = int(st["episode_step_cursor"]) % int(self.blocks_per_episode)
+                next_block_idx = int(self._episode_block_visit_order[int(st["episode_step_cursor"])])
                 self._select_block(next_block_idx)
         else:
             if int(st["block_repeat_step"]) >= self.steps_per_block:
@@ -897,6 +919,7 @@ class TrainSchedulerV7:
                 "episode_idx_global": -1,
                 "block_repeat_step": 0,
                 "block_order": str(self.block_order),
+                "step_major_switch_interval_steps": int(self.step_major_switch_interval_steps),
                 "episode_step_cursor": 0,
                 "block_update_counts": [],
                 "block_visit_round": 0,
@@ -934,6 +957,7 @@ class TrainSchedulerV7:
             "episode_idx_global": -1,
             "block_repeat_step": 0,
             "block_order": str(self.block_order),
+            "step_major_switch_interval_steps": int(self.step_major_switch_interval_steps),
             "episode_step_cursor": 0,
             "block_update_counts": [],
             "block_visit_round": 0,

@@ -31,6 +31,7 @@ from datasets.sky_mask_semantics import normalize_sky_mask_to_one_is_sky
 from datasets.streetforward_assets import StreetForwardAssetStore
 from datasets.train_scheduler_v6 import TrainSchedulerV6
 from datasets.train_scheduler_v7 import TrainSchedulerV7
+from datasets.train_scheduler_v8 import TrainSchedulerV8
 
 ImageRef = Tuple[int, int]
 
@@ -2003,6 +2004,7 @@ class MultiSceneDatasetV4:
         warm_next_block_exact: bool,
         warm_next_episode_chain: bool,
         block_order: str = "block_major",
+        step_major_switch_interval_steps: int = 1,
     ) -> TrainSchedulerV7:
         return TrainSchedulerV7(
             dataset=self,
@@ -2023,6 +2025,55 @@ class MultiSceneDatasetV4:
             warm_next_block_exact=warm_next_block_exact,
             warm_next_episode_chain=warm_next_episode_chain,
             block_order=str(block_order),
+            step_major_switch_interval_steps=int(step_major_switch_interval_steps),
+        )
+
+    def create_train_scheduler_v8(
+        self,
+        *,
+        steps_per_block: int,
+        blocks_per_episode: int,
+        total_target_frames: int,
+        include_source_frame: bool,
+        frame_within_keyframe_policy: str,
+        min_keyframes_required_policy: str,
+        traversal_mode: str,
+        switch_after_episode: bool,
+        segment_order: str,
+        scene_order: str,
+        include_test: bool,
+        fixed_scene_id: Optional[int],
+        fixed_segment_id: Optional[int],
+        emit_preload_hints: bool,
+        warm_next_block_exact: bool,
+        warm_next_episode_chain: bool,
+        block_order: str = "block_major",
+        step_major_switch_interval_steps: int = 1,
+        target_policy: str = "visited_episode_frames",
+        reset_policy: str = "episode_end",
+    ) -> TrainSchedulerV8:
+        return TrainSchedulerV8(
+            dataset=self,
+            steps_per_block=steps_per_block,
+            blocks_per_episode=blocks_per_episode,
+            total_target_frames=total_target_frames,
+            include_source_frame=include_source_frame,
+            frame_within_keyframe_policy=frame_within_keyframe_policy,
+            min_keyframes_required_policy=min_keyframes_required_policy,
+            traversal_mode=traversal_mode,
+            switch_after_episode=switch_after_episode,
+            segment_order=segment_order,
+            scene_order=scene_order,
+            include_test=include_test,
+            fixed_scene_id=fixed_scene_id,
+            fixed_segment_id=fixed_segment_id,
+            emit_preload_hints=emit_preload_hints,
+            warm_next_block_exact=warm_next_block_exact,
+            warm_next_episode_chain=warm_next_episode_chain,
+            block_order=str(block_order),
+            step_major_switch_interval_steps=int(step_major_switch_interval_steps),
+            target_policy=str(target_policy),
+            reset_policy=str(reset_policy),
         )
 
     # Preload worker hooks

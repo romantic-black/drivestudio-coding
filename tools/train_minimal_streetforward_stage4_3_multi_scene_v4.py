@@ -260,6 +260,7 @@ def _iter_episode_block_indices(
     blocks_per_episode: int,
     steps_per_block: int,
     block_order: str,
+    step_major_switch_interval_steps: int = 1,
 ) -> List[int]:
     if block_order == "block_major":
         return [
@@ -268,11 +269,15 @@ def _iter_episode_block_indices(
             for _ in range(int(steps_per_block))
         ]
     if block_order == "step_major":
-        return [
-            int(b)
-            for _ in range(int(steps_per_block))
-            for b in range(int(blocks_per_episode))
-        ]
+        switch_every = int(step_major_switch_interval_steps)
+        if switch_every < 1:
+            raise ValueError("step_major_switch_interval_steps must be >= 1")
+        out: List[int] = []
+        for round_base in range(0, int(steps_per_block), int(switch_every)):
+            chunk = int(min(int(switch_every), int(steps_per_block) - int(round_base)))
+            for b in range(int(blocks_per_episode)):
+                out.extend([int(b)] * int(chunk))
+        return out
     raise ValueError(f"unsupported block_order={block_order!r}")
 
 
@@ -306,6 +311,7 @@ def _run_validation_v7_round(
     validation_mode = str(validation_cfg.mode)
     steps_per_block = int(validation_cfg.steps_per_block)
     validation_block_order = str(validation_cfg.block_order)
+    step_major_switch_interval_steps = int(validation_cfg.step_major_switch_interval_steps)
     use_train_finetune = validation_mode == "segment_finetune_train"
     if steps_per_block < 1:
         raise ValueError(f"validation_v7.block.steps_per_block must be >= 1, got {steps_per_block}")
@@ -313,6 +319,11 @@ def _run_validation_v7_round(
         raise ValueError(
             "validation_v7.execution.block_order must be one of ['block_major', 'step_major'], "
             f"got {validation_block_order!r}"
+        )
+    if step_major_switch_interval_steps < 1:
+        raise ValueError(
+            "validation_v7.execution.step_major_switch_interval_steps must be >= 1, "
+            f"got {step_major_switch_interval_steps}"
         )
 
     infer_policy = RuntimePolicy(
@@ -386,6 +397,7 @@ def _run_validation_v7_round(
                 blocks_per_episode=int(len(block_payloads)),
                 steps_per_block=int(steps_per_block),
                 block_order=str(validation_block_order),
+                step_major_switch_interval_steps=int(step_major_switch_interval_steps),
             )
             for visit_idx, block_idx_in_episode in enumerate(visit_order):
                 payload = block_payloads[int(block_idx_in_episode)]
@@ -420,11 +432,12 @@ def _run_validation_v7_round(
                 last_minimal = minimal_batch
                 logger.info(
                     "VALIDATION_V7_BLOCK_VISIT mode=%s block_order=%s scene_id=%s segment_id=%s "
-                    "block=%s visit=%s/%s source_frame=%s target_frames=%s loss=%.6f",
+                    "step_major_switch_interval_steps=%s block=%s visit=%s/%s source_frame=%s target_frames=%s loss=%.6f",
                     validation_mode,
                     validation_block_order,
                     int(spec.scene_id),
                     int(spec.segment_id),
+                    int(step_major_switch_interval_steps),
                     int(block_idx_in_episode),
                     int(visit_idx + 1),
                     int(len(visit_order)),
@@ -437,12 +450,13 @@ def _run_validation_v7_round(
                 block_loss_values = [float(x) for x in payload["losses"]]
                 logger.info(
                     "VALIDATION_V7_BLOCK_SUMMARY mode=%s block_order=%s scene_id=%s segment_id=%s block=%s "
-                    "steps=%s source_frame=%s target_frames=%s mean_loss=%.6f",
+                    "step_major_switch_interval_steps=%s steps=%s source_frame=%s target_frames=%s mean_loss=%.6f",
                     validation_mode,
                     validation_block_order,
                     int(spec.scene_id),
                     int(spec.segment_id),
                     int(payload["block_idx"]),
+                    int(step_major_switch_interval_steps),
                     int(len(block_loss_values)),
                     int(payload["source_frame"]),
                     [int(x) for x in payload["target_frames"]],
@@ -912,15 +926,72 @@ def main() -> None:
     if bool(validation_v7_cfg.eval_enable):
         if cfg.get("scheduler_v7") is None or not bool(cfg.scheduler_v7.get("enable", False)):
             raise ValueError("validation_v7 requires scheduler_v7.enable=true")
+        sv7_block = cfg.scheduler_v7.get("block")
+        if sv7_block is None:
+            raise ValueError("validation_v7 requires scheduler_v7.block")
         sv7_ep = cfg.scheduler_v7.get("episode")
         if sv7_ep is None:
             raise ValueError("validation_v7 requires scheduler_v7.episode")
+        sv7_execution = cfg.scheduler_v7.get("execution") or {}
+        scheduler_steps_per_block = int(sv7_block["steps_per_block"])
+        scheduler_blocks_per_episode = int(sv7_ep["blocks_per_episode"])
+        scheduler_total_target_frames = int(sv7_ep["total_target_frames"])
+        scheduler_block_order = str(sv7_execution.get("block_order", "block_major"))
+        if scheduler_block_order not in ("block_major", "step_major"):
+            raise ValueError(
+                "scheduler_v7.execution.block_order must be one of ['block_major', 'step_major']"
+            )
+        scheduler_step_major_switch_interval_steps = int(sv7_execution.get("step_major_switch_interval_steps", 1))
+        if scheduler_step_major_switch_interval_steps < 1:
+            raise ValueError("scheduler_v7.execution.step_major_switch_interval_steps must be >= 1")
+
         validation_blocks_per_episode = (
             int(validation_v7_cfg.blocks_per_episode)
             if validation_v7_cfg.blocks_per_episode is not None
-            else int(sv7_ep["blocks_per_episode"])
+            else int(scheduler_blocks_per_episode)
         )
-        validation_total_target_frames = int(sv7_ep["total_target_frames"])
+        validation_total_target_frames = (
+            int(validation_v7_cfg.total_target_frames)
+            if validation_v7_cfg.total_target_frames is not None
+            else int(scheduler_total_target_frames)
+        )
+
+        if str(validation_v7_cfg.mode) == "segment_finetune_train":
+            mismatches: List[str] = []
+            if int(validation_v7_cfg.steps_per_block) != int(scheduler_steps_per_block):
+                mismatches.append(
+                    "block.steps_per_block "
+                    f"({int(validation_v7_cfg.steps_per_block)} != {int(scheduler_steps_per_block)})"
+                )
+            if int(validation_blocks_per_episode) != int(scheduler_blocks_per_episode):
+                mismatches.append(
+                    "episode.blocks_per_episode "
+                    f"({int(validation_blocks_per_episode)} != {int(scheduler_blocks_per_episode)})"
+                )
+            if int(validation_total_target_frames) != int(scheduler_total_target_frames):
+                mismatches.append(
+                    "episode.total_target_frames "
+                    f"({int(validation_total_target_frames)} != {int(scheduler_total_target_frames)})"
+                )
+            if str(validation_v7_cfg.block_order) != str(scheduler_block_order):
+                mismatches.append(
+                    "execution.block_order "
+                    f"({str(validation_v7_cfg.block_order)!r} != {str(scheduler_block_order)!r})"
+                )
+            if int(validation_v7_cfg.step_major_switch_interval_steps) != int(
+                scheduler_step_major_switch_interval_steps
+            ):
+                mismatches.append(
+                    "execution.step_major_switch_interval_steps "
+                    f"({int(validation_v7_cfg.step_major_switch_interval_steps)} != "
+                    f"{int(scheduler_step_major_switch_interval_steps)})"
+                )
+            if len(mismatches) > 0:
+                raise ValueError(
+                    "validation_v7.mode=segment_finetune_train requires validation_v7 to match scheduler_v7. "
+                    f"Mismatches: {', '.join(mismatches)}"
+                )
+
         validation_specs = build_validation_episode_specs_v7(
             dataset=dataset,
             eval_scene_ids=[int(x) for x in validation_v7_cfg.eval_scene_ids],
@@ -929,15 +1000,17 @@ def main() -> None:
         )
         logger.info(
             "validation_v7 enabled: eval_scenes=%s specs=%s mode=%s block_order=%s reset_policy=%s "
-            "steps_per_block=%s blocks_per_episode=%s "
+            "step_major_switch_interval_steps=%s steps_per_block=%s blocks_per_episode=%s total_target_frames=%s "
             "validate_every_n_episodes=%s run_at_train_start=%s",
             [int(x) for x in validation_v7_cfg.eval_scene_ids],
             int(len(validation_specs)),
             str(validation_v7_cfg.mode),
             str(validation_v7_cfg.block_order),
             str(validation_v7_cfg.reset_policy),
+            int(validation_v7_cfg.step_major_switch_interval_steps),
             int(validation_v7_cfg.steps_per_block),
             int(validation_blocks_per_episode),
+            int(validation_total_target_frames),
             int(validation_v7_cfg.validate_every_n_episodes),
             bool(validation_v7_cfg.run_at_train_start),
         )

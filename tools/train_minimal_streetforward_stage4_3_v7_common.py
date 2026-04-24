@@ -130,6 +130,9 @@ def build_train_scheduler_v7_from_cfg(cfg: Any, dataset: MultiSceneDatasetV4) ->
     block_order = str(execution.get("block_order", "block_major"))
     if block_order not in ("block_major", "step_major"):
         raise ValueError("scheduler_v7.execution.block_order must be one of ['block_major', 'step_major']")
+    step_major_switch_interval_steps = int(execution.get("step_major_switch_interval_steps", 1))
+    if step_major_switch_interval_steps < 1:
+        raise ValueError("scheduler_v7.execution.step_major_switch_interval_steps must be >= 1")
 
     fixed_scene_id, fixed_segment_id = resolve_fixed_scene_segment_v7(cfg)
     validate_train_scene_for_fixed(cfg, fixed_scene_id)
@@ -153,4 +156,5 @@ def build_train_scheduler_v7_from_cfg(cfg: Any, dataset: MultiSceneDatasetV4) ->
         warm_next_block_exact=bool(preload["warm_next_block_exact"]),
         warm_next_episode_chain=bool(preload["warm_next_episode_chain"]),
         block_order=block_order,
+        step_major_switch_interval_steps=step_major_switch_interval_steps,
     )

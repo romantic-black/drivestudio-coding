@@ -25,7 +25,7 @@ def _base_cfg() -> dict:
             },
             "mode": "inference_only",
             "block": {"steps_per_block": 1},
-            "episode": {"blocks_per_episode": 3},
+            "episode": {"blocks_per_episode": 3, "total_target_frames": 3},
             "execution": {"block_order": "block_major"},
             "episode_selection": {"policy": "middle"},
             "render": {"save_images": True, "save_dir": "validation/episodes"},
@@ -42,7 +42,9 @@ def test_parse_validation_v7_config_success():
     assert cfg.mode == "inference_only"
     assert cfg.steps_per_block == 1
     assert cfg.blocks_per_episode == 3
+    assert cfg.total_target_frames == 3
     assert cfg.block_order == "block_major"
+    assert cfg.step_major_switch_interval_steps == 1
     assert cfg.reset_policy == "block_end"
     assert cfg.use_sky_mask_regions is False
     assert cfg.min_valid_pixels_per_region == 32
@@ -65,7 +67,9 @@ def test_parse_validation_v7_config_disabled_defaults():
     assert cfg.mode == "inference_only"
     assert cfg.steps_per_block == 1
     assert cfg.blocks_per_episode is None
+    assert cfg.total_target_frames is None
     assert cfg.block_order == "block_major"
+    assert cfg.step_major_switch_interval_steps == 1
     assert cfg.reset_policy == "block_end"
     assert cfg.use_sky_mask_regions is False
     assert cfg.min_valid_pixels_per_region == 32
@@ -111,11 +115,14 @@ def test_parse_validation_v7_config_train_mode_success():
     raw["validation_v7"]["block"]["steps_per_block"] = 4
     raw["validation_v7"]["episode"]["blocks_per_episode"] = 5
     raw["validation_v7"]["execution"]["block_order"] = "step_major"
+    raw["validation_v7"]["execution"]["step_major_switch_interval_steps"] = 2
     cfg = parse_validation_v7_config(raw)
     assert cfg.mode == "segment_finetune_train"
     assert cfg.steps_per_block == 4
     assert cfg.blocks_per_episode == 5
+    assert cfg.total_target_frames == 3
     assert cfg.block_order == "step_major"
+    assert cfg.step_major_switch_interval_steps == 2
     assert cfg.reset_policy == "episode_end"
 
 
@@ -156,3 +163,8 @@ def test_parse_validation_v7_config_execution_fast_fail_invalid():
     raw3["validation_v7"]["execution"]["reset_policy"] = "block_end"
     with pytest.raises(ValueError, match="incompatible with execution.block_order=step_major"):
         parse_validation_v7_config(raw3)
+
+    raw4 = _base_cfg()
+    raw4["validation_v7"]["execution"]["step_major_switch_interval_steps"] = 0
+    with pytest.raises(ValueError, match="step_major_switch_interval_steps"):
+        parse_validation_v7_config(raw4)

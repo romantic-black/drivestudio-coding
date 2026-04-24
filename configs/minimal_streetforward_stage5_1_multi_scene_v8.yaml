@@ -1,4 +1,4 @@
-output_name: experiment002_120w
+output_name: experiment001_120w
 
 data:
   data_root: "/root/autodl-tmp/nuScenes/"
@@ -52,10 +52,10 @@ data:
     lidar_percentile: 0.02
   assets:
     root: "/root/autodl-tmp/streetforward_assets_pt120w"
-  scene_asset_cache_max_items: 64
-  segment_static_cache_max_items: 128
-  image_meta_cache_max_items: 8192
-  view_pack_cache_max_items: 4096
+  scene_asset_cache_max_items: 32
+  segment_static_cache_max_items: 64
+  image_meta_cache_max_items: 4096
+  view_pack_cache_max_items: 2048
 
 dataset:
   num_source_keyframes: 1
@@ -93,7 +93,7 @@ scheduler_v3:
     sync_with_scheduler: true
     reset_policy: episode_end
 
-scheduler_v7:
+scheduler_v8:
   enable: true
   block:
     steps_per_block: 8
@@ -101,6 +101,7 @@ scheduler_v7:
     blocks_per_episode: 3
     total_target_frames: 3
     include_source_frame: true
+    target_policy: visited_episode_frames
     frame_within_keyframe_policy: random_once_per_episode
     min_keyframes_required_policy: skip_if_less_than_window
   traversal:
@@ -112,14 +113,14 @@ scheduler_v7:
     scene_order: shuffle_per_epoch
   execution:
     block_order: step_major
-    step_major_switch_interval_steps: 4 
+    step_major_switch_interval_steps: 1
     reset_policy: episode_end
   preload:
     emit_hints: true
     warm_next_block_exact: true
     warm_next_episode_chain: true
 
-validation_v7:
+validation_v8:
   eval_enable: true
   mode: segment_finetune_train
   block:
@@ -127,13 +128,14 @@ validation_v7:
   episode:
     blocks_per_episode: 3
     total_target_frames: 3
+    target_policy: visited_episode_frames
   execution:
     block_order: step_major
-    step_major_switch_interval_steps: 4
+    step_major_switch_interval_steps: 1
     reset_policy: episode_end
   trigger:
     by: train_episode_interval
-    validate_every_n_episodes: 100
+    validate_every_n_episodes: 200
     run_at_train_start: false
   episode_selection:
     policy: middle
@@ -148,7 +150,7 @@ validation_v7:
     require_sky_mask: true
 
 model:
-  stage: "5_0"
+  stage: "5_1"
   scale_init_value: 0.1
   sh_degree: 1
   voxel_size: 0.2
@@ -171,7 +173,7 @@ model:
     update_quat: true
   struct_decoder:
     enable: true
-    type: "xcpe"
+    type: "xcpe_knn_attn"
     scope: "bg_rigid_in"
     output_role: "gru_input"
     point_preserving: true
@@ -192,6 +194,21 @@ model:
       residual_scale_init: 1.0e-3
       norm: "layernorm"
       act: "gelu"
+    knn_attention:
+      enable: true
+      neighbor_policy: "fixed_cached"
+      out_neighbor_policy: "mask_self_fallback"
+      k: 8
+      min_valid_neighbors: 2
+      num_layers: 1
+      attn_dim: 32
+      pos_dim: 16
+      pos_scale: 0.20
+      chunk_size: 32768
+      residual_scale_init: 1.0e-3
+      use_same_branch_flag: true
+      use_support: true
+      use_pos_value: true
     token:
       use_2d_feat: true
       use_support: true
@@ -203,6 +220,7 @@ model:
     future:
       allow_serialized_attention: false
       allow_pooling: false
+      allow_knn_update: false
   branches:
     bg:
       src_backproject_support_min: 1e-2
@@ -244,21 +262,32 @@ training:
   save_checkpoint_freq: 10000
   seed: 42
 
+debug:
+  validate_stage5_knn: false
+
 eval:
   enable_psnr: true
-  save_train_views_psnr_below: 12
+  save_train_views_psnr_below: null
   run_test_at_end: false
 
 logging:
   output_root: /root/autodl-tmp/outputs
-  project: minimal_sf_stage5_0_multi_scene_v7
+  project: minimal_sf_stage5_1_multi_scene_v8
   log_dir: null
   image_interval_blocks: 96
+  image_trigger:
+    mode: episode_end
+    interval_blocks_equiv: 96
+  train_monitor:
+    enable_heavy_metrics: false
+    include_per_view_metrics: false
+    include_extra_result_metrics: false
+    enable_low_psnr_image_dump: false
   low_psnr_train_images_subdir: train_low_psnr
   enable_jsonl_metrics: true
   use_tensorboard: true
   offset_monitor:
-    enable: true
+    enable: false
     near_radius_m: 5.0
     saturation_tanh_threshold: 0.95
   diagnostics:

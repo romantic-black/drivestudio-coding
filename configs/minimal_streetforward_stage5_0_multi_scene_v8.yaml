@@ -93,7 +93,7 @@ scheduler_v3:
     sync_with_scheduler: true
     reset_policy: episode_end
 
-scheduler_v7:
+scheduler_v8:
   enable: true
   block:
     steps_per_block: 8
@@ -101,6 +101,7 @@ scheduler_v7:
     blocks_per_episode: 3
     total_target_frames: 3
     include_source_frame: true
+    target_policy: visited_episode_frames
     frame_within_keyframe_policy: random_once_per_episode
     min_keyframes_required_policy: skip_if_less_than_window
   traversal:
@@ -112,14 +113,14 @@ scheduler_v7:
     scene_order: shuffle_per_epoch
   execution:
     block_order: step_major
-    step_major_switch_interval_steps: 4 
+    step_major_switch_interval_steps: 4
     reset_policy: episode_end
   preload:
     emit_hints: true
     warm_next_block_exact: true
     warm_next_episode_chain: true
 
-validation_v7:
+validation_v8:
   eval_enable: true
   mode: segment_finetune_train
   block:
@@ -127,6 +128,7 @@ validation_v7:
   episode:
     blocks_per_episode: 3
     total_target_frames: 3
+    target_policy: visited_episode_frames
   execution:
     block_order: step_major
     step_major_switch_interval_steps: 4
@@ -251,7 +253,7 @@ eval:
 
 logging:
   output_root: /root/autodl-tmp/outputs
-  project: minimal_sf_stage5_0_multi_scene_v7
+  project: minimal_sf_stage5_0_multi_scene_v8
   log_dir: null
   image_interval_blocks: 96
   low_psnr_train_images_subdir: train_low_psnr
