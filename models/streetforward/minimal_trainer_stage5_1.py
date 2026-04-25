@@ -15,7 +15,7 @@ import torch
 
 from models.streetforward.minimal_trainer_stage4_6 import BgRigidInGRUInputs, MinimalStreetForwardStage4_6, RigidRoute
 from models.streetforward.minimal_trainer_stage5_0 import MinimalStreetForwardStage5_0
-from models.streetforward.node_states import NodeStateBackground, NodeStateRigid
+from models.streetforward.node_states import NodeStateBackground, NodeStateDistant, NodeStateRigid
 from models.streetforward.struct_decoders import StructDecoderInput, StreetForwardXCPEKNNDecoder, cat_param_dict
 
 
@@ -515,7 +515,13 @@ class MinimalStreetForwardStage5_1(MinimalStreetForwardStage5_0):
         feat_2d_rigid_S: Optional[torch.Tensor],
         acc_w_bg: torch.Tensor,
         acc_w_rigid_S: Optional[torch.Tensor],
+        node_state_distant: Optional[NodeStateDistant] = None,
+        feat_2d_distant: Optional[torch.Tensor] = None,
+        acc_w_distant: Optional[torch.Tensor] = None,
     ) -> BgRigidInGRUInputs:
+        _ = node_state_distant
+        _ = feat_2d_distant
+        _ = acc_w_distant
         struct_in = self._build_struct_decoder_input_bg_rigid_in(
             source_frame_idx=source_frame_idx,
             node_state_bg=node_state_bg,

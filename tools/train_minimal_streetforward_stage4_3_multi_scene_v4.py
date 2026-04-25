@@ -152,6 +152,52 @@ def _save_train_monitor_triplets(
         )
 
 
+def _build_scheduler_node_sync_v8_fallback(
+    cfg: Any,
+    scheduler_info: Dict[str, Any],
+    step_events: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    sv8 = cfg.get("scheduler_v8")
+    if sv8 is None:
+        return None
+    execution = sv8.get("execution") if hasattr(sv8, "get") else None
+    block_order = str(scheduler_info.get("block_order", "block_major")).strip()
+    if execution is not None and hasattr(execution, "get"):
+        reset_policy = str(
+            execution.get(
+                "reset_policy",
+                "episode_end" if block_order == "step_major" else "block_end",
+            )
+        ).strip()
+    else:
+        reset_policy = "episode_end" if block_order == "step_major" else "block_end"
+    if reset_policy not in ("block_end", "episode_end", "never"):
+        raise ValueError(
+            "scheduler_v8.execution.reset_policy must be one of ['block_end', 'episode_end', 'never']"
+        )
+    if block_order == "step_major" and reset_policy == "block_end":
+        raise ValueError(
+            "scheduler_v8.execution.reset_policy=block_end is incompatible with execution.block_order=step_major; "
+            "use reset_policy=episode_end or never."
+        )
+    if reset_policy == "block_end":
+        should_reset = any(ev.get("type") == "block_end" for ev in step_events)
+    elif reset_policy == "episode_end":
+        should_reset = any(ev.get("type") == "episode_end" for ev in step_events)
+    else:
+        should_reset = False
+    U = int(scheduler_info.get("U", 1))
+    seg = int(scheduler_info.get("segment_local_step", 0))
+    if U < 1:
+        raise ValueError("scheduler_v8 scheduler_info.U must be >= 1 for model_node_state sync.")
+    return {
+        "U": int(U),
+        "segment_local_step": int(seg),
+        "reset_after_block": bool(should_reset),
+        "reset_policy": str(reset_policy),
+    }
+
+
 @dataclass(frozen=True)
 class _BatchRequestValidationV7:
     scene_id: int
@@ -1223,6 +1269,11 @@ def main() -> None:
     diag_window: deque = deque(maxlen=max(diag_cfg.get("window_size", 0), 1))
     minimal_batch: Dict[str, Any] = {}
     block_loss_accum: Dict[int, Dict[str, Any]] = {}
+    model_cfg = cfg.get("model", {}) if hasattr(cfg, "get") else {}
+    history_cfg = model_cfg.get("history_memory", {}) if hasattr(model_cfg, "get") else {}
+    enable_block_exit_record = bool(str(model_cfg.get("stage", "")) == "5_2") and bool(
+        str(history_cfg.get("record_on", "")) == "block_exit"
+    )
 
     try:
         metrics_fh = _open_metrics_history(cfg.log_dir, enable_jsonl_metrics)
@@ -1266,6 +1317,19 @@ def main() -> None:
                         if train_episode_counter % int(validation_v7_cfg.validate_every_n_episodes) == 0:
                             validation_due_episode_counters.append(int(train_episode_counter))
             scheduler_node_sync = _build_scheduler_node_sync(cfg, scheduler_info, step_events)
+            if scheduler_node_sync is None:
+                scheduler_node_sync = _build_scheduler_node_sync_v8_fallback(cfg, scheduler_info, step_events)
+            defer_node_state_reset_for_block_exit_record = False
+            if (
+                enable_block_exit_record
+                and scheduler_node_sync is not None
+                and bool(scheduler_node_sync.get("reset_after_block", False))
+            ):
+                # Stage5_2 block-exit record pass reads current runtime node states/histories.
+                # Defer scheduler-triggered reset to after record_block_history in this step.
+                scheduler_node_sync = dict(scheduler_node_sync)
+                scheduler_node_sync["reset_after_block"] = False
+                defer_node_state_reset_for_block_exit_record = True
             for ev in step_events:
                 if ev.get("type") == "segment_begin":
                     logger.info(
@@ -1328,6 +1392,21 @@ def main() -> None:
                         ev.get("overlap_mode"),
                         extra_bb,
                     )
+                elif ev.get("type") == "block_exit":
+                    logger.info(
+                        "BLOCK_EXIT global_step=%s scene_id=%s scene_dir=%s segment=%s block_seg=%s block_global=%s "
+                        "source_frame=%s source_image_ref=%s target_refs=%s num_updates_in_block=%s",
+                        ev.get("global_step"),
+                        ev.get("scene_id"),
+                        _scene_dir_str(ev.get("scene_id", -1)),
+                        ev.get("segment_id"),
+                        ev.get("block_idx_in_segment"),
+                        ev.get("block_idx_global"),
+                        ev.get("source_frame_idx"),
+                        ev.get("source_image_ref"),
+                        len(ev.get("target_image_refs") or []),
+                        ev.get("num_updates_in_block"),
+                    )
 
             tgt = raw_batch.get("target")
             if not isinstance(tgt, dict) or tgt.get("image") is None:
@@ -1369,6 +1448,68 @@ def main() -> None:
 
             if result is None:
                 raise ValueError("train_step returned None")
+            if enable_block_exit_record:
+                if not hasattr(model, "record_block_history"):
+                    raise ValueError("Stage5_2 record_on=block_exit requires model.record_block_history.")
+                block_exit_events = [ev for ev in step_events if str(ev.get("type", "")) == "block_exit"]
+                for ev in block_exit_events:
+                    rec_metrics = model.record_block_history(minimal_batch, ev)
+                    logger.info(
+                        "HISTORY_RECORD global_step=%s scene_id=%s scene_dir=%s segment=%s block_global=%s "
+                        "record_views=%s num_views=%s source_refs=%s target_refs=%s "
+                        "bg_s=%.6f bg_e=%.6f distant_s=%.6f distant_e=%.6f rigid_s=%.6f rigid_e=%.6f",
+                        ev.get("global_step"),
+                        ev.get("scene_id"),
+                        _scene_dir_str(ev.get("scene_id", -1)),
+                        ev.get("segment_id"),
+                        ev.get("block_idx_global"),
+                        "source_image_refs"
+                        if float(rec_metrics.get("stage5_2_record_use_source_views", 0.0)) > 0.5
+                        else "target_image_refs",
+                        int(rec_metrics.get("stage5_2_record_num_views", 0.0)),
+                        int(rec_metrics.get("stage5_2_record_num_source_refs", 0.0)),
+                        int(rec_metrics.get("stage5_2_record_num_target_refs", 0.0)),
+                        float(rec_metrics.get("stage5_2_history_bg_support_mean", 0.0)),
+                        float(rec_metrics.get("stage5_2_history_bg_error_mean", 0.0)),
+                        float(rec_metrics.get("stage5_2_history_distant_support_mean", 0.0)),
+                        float(rec_metrics.get("stage5_2_history_distant_error_mean", 0.0)),
+                        float(rec_metrics.get("stage5_2_history_rigid_support_mean", 0.0)),
+                        float(rec_metrics.get("stage5_2_history_rigid_error_mean", 0.0)),
+                    )
+                    if writer is not None:
+                        tb_step = int(ev.get("global_step", step))
+                        writer.add_scalar(
+                            "train/history/bg_support_mean",
+                            float(rec_metrics.get("stage5_2_history_bg_support_mean", 0.0)),
+                            tb_step,
+                        )
+                        writer.add_scalar(
+                            "train/history/bg_error_mean",
+                            float(rec_metrics.get("stage5_2_history_bg_error_mean", 0.0)),
+                            tb_step,
+                        )
+                        writer.add_scalar(
+                            "train/history/distant_support_mean",
+                            float(rec_metrics.get("stage5_2_history_distant_support_mean", 0.0)),
+                            tb_step,
+                        )
+                        writer.add_scalar(
+                            "train/history/distant_error_mean",
+                            float(rec_metrics.get("stage5_2_history_distant_error_mean", 0.0)),
+                            tb_step,
+                        )
+                        writer.add_scalar(
+                            "train/history/rigid_support_mean",
+                            float(rec_metrics.get("stage5_2_history_rigid_support_mean", 0.0)),
+                            tb_step,
+                        )
+                        writer.add_scalar(
+                            "train/history/rigid_error_mean",
+                            float(rec_metrics.get("stage5_2_history_rigid_error_mean", 0.0)),
+                            tb_step,
+                        )
+                if defer_node_state_reset_for_block_exit_record:
+                    model.reset_node_state()
             loss_val = float(result["loss"])
             pred_rgbs = result["pred_rgbs"]
             gt_images = result["gt_images"]

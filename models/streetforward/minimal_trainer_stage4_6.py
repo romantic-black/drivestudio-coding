@@ -397,9 +397,15 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
         feat_2d_rigid_S: Optional[torch.Tensor],
         acc_w_bg: torch.Tensor,
         acc_w_rigid_S: Optional[torch.Tensor],
+        node_state_distant: Optional[NodeStateDistant] = None,
+        feat_2d_distant: Optional[torch.Tensor] = None,
+        acc_w_distant: Optional[torch.Tensor] = None,
     ) -> BgRigidInGRUInputs:
         _ = batch
         _ = source_frame_idx
+        _ = node_state_distant
+        _ = feat_2d_distant
+        _ = acc_w_distant
         _ = acc_w_rigid_S
         feat_3d_bg, feat_3d_rigid_in = self._build_3d_features_bg_plus_rigid_in(
             node_state_bg=node_state_bg,
@@ -774,16 +780,35 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
             batch=batch,
             source_frame_idx=source_frame_idx,
             node_state_bg=node_state_bg,
+            node_state_distant=node_state_distant,
             node_state_rigid=node_state_rigid,
             route=route,
             feat_2d_bg=feat_2d_bg,
+            feat_2d_distant=feat_2d_distant,
             feat_2d_rigid_S=feat_2d_rigid_S,
             acc_w_bg=acc_w_bg,
+            acc_w_distant=acc_w_distant,
             acc_w_rigid_S=acc_w_rigid_S,
         )
         feat_bg_input = bg_rigid_in_inputs.feat_bg_input
         feat_rigid_in_input_all = bg_rigid_in_inputs.feat_rigid_in_input_all
         bg_rigid_in_aux = dict(bg_rigid_in_inputs.aux)
+        stage5_2_full = getattr(self, "_stage5_2_last_full_inputs", None)
+        apply_update_gate_fn = getattr(self, "_apply_update_gate", None)
+        gate_bg = getattr(stage5_2_full, "gate_bg", None) if stage5_2_full is not None else None
+        gate_distant = getattr(stage5_2_full, "gate_distant", None) if stage5_2_full is not None else None
+        gate_rigid_in = getattr(stage5_2_full, "gate_rigid_in", None) if stage5_2_full is not None else None
+        gate_rigid_out = getattr(stage5_2_full, "gate_rigid_out", None) if stage5_2_full is not None else None
+        feat_distant_input_from_struct = (
+            getattr(stage5_2_full, "feat_distant_input", None) if stage5_2_full is not None else None
+        )
+        feat_rigid_out_input_all_from_struct = (
+            getattr(stage5_2_full, "feat_rigid_out_input_all", None) if stage5_2_full is not None else None
+        )
+        eff_gate_bg = None
+        eff_gate_distant = None
+        eff_gate_rigid_in = None
+        eff_gate_rigid_out = None
         mask_src_feat_valid_bg = acc_w_bg > self.bg_src_backproject_support_min
         mask_any_tgt_bg = self._build_any_target_mask_static(
             num_points=num_bg,
@@ -805,6 +830,14 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
             gaussion_decoder=self.gaussion_decoder,
             freeze_quat=self.bg_freeze_quat,
         )
+        if callable(apply_update_gate_fn) and gate_bg is not None:
+            offsets_bg, h_new_bg, eff_gate_bg = apply_update_gate_fn(
+                offsets_bg,
+                h_old=h_old_bg,
+                h_candidate=h_new_bg,
+                gate=gate_bg,
+                mask_update=mask_update_bg,
+            )
         render_params_bg = self._render_params_from_offsets_bg(node_state_bg, offsets_bg)
 
         if num_distant > 0:
@@ -822,7 +855,11 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
         offsets_distant = None
         h_new_distant = None
         if node_state_distant is not None and feat_2d_distant is not None and feat_2d_distant.numel() > 0:
-            feat_distant_input = self.distant_feat_proj(feat_2d_distant)
+            feat_distant_input = (
+                feat_distant_input_from_struct
+                if feat_distant_input_from_struct is not None
+                else self.distant_feat_proj(feat_2d_distant)
+            )
             params_distant = self._build_params_for_embed(node_state_distant, coord_space="world")
             h_old_distant = self._get_or_init_hidden(
                 self.h_cache_distant, key, node_state_distant.means.shape[0], node_state_distant, "distant"
@@ -839,6 +876,14 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
                 gaussion_decoder=self.gaussion_decoder_distant,
                 freeze_quat=self.distant_freeze_quat,
             )
+            if callable(apply_update_gate_fn) and gate_distant is not None:
+                offsets_distant, h_new_distant, eff_gate_distant = apply_update_gate_fn(
+                    offsets_distant,
+                    h_old=h_old_distant,
+                    h_candidate=h_new_distant,
+                    gate=gate_distant,
+                    mask_update=mask_update_distant,
+                )
             render_params_distant = self._render_params_from_offsets_distant(node_state_distant, offsets_distant)
 
         mask_src_feat_valid_rigid = torch.zeros(N_rigid, dtype=torch.bool, device=self.device)
@@ -868,6 +913,8 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
             lookup_S[route.S] = torch.arange(route.S.numel(), device=self.device, dtype=torch.long)
             lookup_S_in = torch.full((N_rigid,), -1, dtype=torch.long, device=self.device)
             lookup_S_in[route.S_in] = torch.arange(route.S_in.numel(), device=self.device, dtype=torch.long)
+            lookup_S_out = torch.full((N_rigid,), -1, dtype=torch.long, device=self.device)
+            lookup_S_out[route.S_out] = torch.arange(route.S_out.numel(), device=self.device, dtype=torch.long)
 
             render_in = None
             render_out = None
@@ -897,6 +944,15 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
                     gaussion_decoder=self.gaussion_decoder,
                     freeze_quat=self.bg_freeze_quat,
                 )
+                if callable(apply_update_gate_fn) and gate_rigid_in is not None:
+                    gate_rigid_in_sel = gate_rigid_in[rows_S_in]
+                    offsets_rigid_in_world, h_new_rigid_in, eff_gate_rigid_in = apply_update_gate_fn(
+                        offsets_rigid_in_world,
+                        h_old=h_old_rigid[U_in],
+                        h_candidate=h_new_rigid_in,
+                        gate=gate_rigid_in_sel,
+                        mask_update=torch.ones(U_in.numel(), dtype=torch.bool, device=self.device),
+                    )
                 render_in = self._render_params_from_routed_offsets_rigid_local(
                     node_state_rigid=node_state_rigid,
                     source_frame_idx=source_frame_idx,
@@ -905,13 +961,19 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
                 )
             if U_out.numel() > 0:
                 rows_S = lookup_S[U_out]
+                rows_S_out = lookup_S_out[U_out]
                 if bool((rows_S < 0).any().item()):
                     raise RuntimeError("Routed rigid update point not present in source visible S.")
+                if bool((rows_S_out < 0).any().item()):
+                    raise RuntimeError("U_out contains rigid point not present in S_out.")
                 if feat_2d_rigid_S is None:
                     raise RuntimeError("Stage4_6 expected rigid source features for U_out path.")
                 rigid_out_acc_w_mean = float(acc_w_rigid_S[rows_S].mean().item()) if acc_w_rigid_S is not None else 0.0
-                feat_2d_U_out = feat_2d_rigid_S[rows_S]
-                feat_rigid_out_input = self.distant_feat_proj(feat_2d_U_out)
+                if feat_rigid_out_input_all_from_struct is not None:
+                    feat_rigid_out_input = feat_rigid_out_input_all_from_struct[rows_S_out]
+                else:
+                    feat_2d_U_out = feat_2d_rigid_S[rows_S]
+                    feat_rigid_out_input = self.distant_feat_proj(feat_2d_U_out)
                 params_rigid_out_world = self._build_rigid_params_for_embed_source_world(
                     node_state_rigid, source_frame_idx, U_out
                 )
@@ -927,6 +989,15 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
                     gaussion_decoder=self.gaussion_decoder_distant,
                     freeze_quat=self.distant_freeze_quat,
                 )
+                if callable(apply_update_gate_fn) and gate_rigid_out is not None:
+                    gate_rigid_out_sel = gate_rigid_out[rows_S_out]
+                    offsets_rigid_out_world, h_new_rigid_out, eff_gate_rigid_out = apply_update_gate_fn(
+                        offsets_rigid_out_world,
+                        h_old=h_old_rigid[U_out],
+                        h_candidate=h_new_rigid_out,
+                        gate=gate_rigid_out_sel,
+                        mask_update=torch.ones(U_out.numel(), dtype=torch.bool, device=self.device),
+                    )
                 render_out = self._render_params_from_routed_offsets_rigid_local(
                     node_state_rigid=node_state_rigid,
                     source_frame_idx=source_frame_idx,
@@ -1179,6 +1250,16 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
         )
         rigid_src_feat_valid = int(mask_src_feat_valid_rigid.sum().item())
         rigid_update_count = int(U_all.numel())
+        if eff_gate_bg is not None:
+            bg_rigid_in_aux["stage5_2_gate_bg_mean"] = float(eff_gate_bg.mean().detach().item())
+        if eff_gate_distant is not None:
+            bg_rigid_in_aux["stage5_2_gate_distant_mean"] = float(eff_gate_distant.mean().detach().item())
+        if eff_gate_rigid_in is not None:
+            bg_rigid_in_aux["stage5_2_gate_rigid_in_mean"] = float(eff_gate_rigid_in.mean().detach().item())
+        if eff_gate_rigid_out is not None:
+            bg_rigid_in_aux["stage5_2_gate_rigid_out_mean"] = float(eff_gate_rigid_out.mean().detach().item())
+        if stage5_2_full is not None and hasattr(self, "_stage5_2_last_full_inputs"):
+            self._stage5_2_last_full_inputs = None
 
         return {
             "loss": loss,

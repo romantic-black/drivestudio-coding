@@ -9,6 +9,8 @@ from .common import (
 )
 from .xcpe_decoder import StreetForwardXCPEDecoder
 from .xcpe_knn_decoder import StreetForwardXCPEKNNDecoder
+from .far_mlp_decoder import FarBranchMLPStructDecoder
+from .routed_near_far_decoder import RoutedNearFarStructDecoder
 
 __all__ = [
     "StructDecoderInput",
@@ -20,4 +22,6 @@ __all__ = [
     "offsets_to_batch_ids",
     "StreetForwardXCPEDecoder",
     "StreetForwardXCPEKNNDecoder",
+    "FarBranchMLPStructDecoder",
+    "RoutedNearFarStructDecoder",
 ]

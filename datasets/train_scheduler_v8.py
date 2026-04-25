@@ -367,6 +367,56 @@ class TrainSchedulerV8(TrainSchedulerV7):
             }
         )
 
+    def _emit_block_exit_for_block(self, st: Dict[str, Any], block_idx: int) -> None:
+        frame_chain = [int(x) for x in st["frame_chain"]]
+        bcur = int(block_idx)
+        if bcur < 0 or bcur >= len(frame_chain):
+            raise ValueError(f"invalid block_idx={block_idx} for block_exit")
+        target_frames = st.get("block_last_target_frame_indices", {}).get(int(bcur))
+        if target_frames is None:
+            target_frames = self._build_target_frames_for_block_v8(
+                frame_chain=frame_chain,
+                block_idx=bcur,
+                visited_block_indices=set(st.get("visited_block_indices", set())),
+                max_target_frames=int(self.total_target_frames),
+            )
+        source_frame = int(frame_chain[bcur])
+        num_cams = int(st["num_cams"])
+        source_image_ref = (int(source_frame), 0)
+        target_image_refs = self._frame_targets_to_image_refs(num_cams, [int(x) for x in target_frames])
+        if self.block_order == "step_major":
+            block_idx_global = int(st["episode_base_block_idx_global"]) + int(bcur)
+            block_idx_in_segment = int(st["episode_base_block_idx_in_segment"]) + int(bcur)
+            num_updates_in_block = int(st["block_update_counts"][bcur])
+        else:
+            block_idx_global = int(st["block_idx_global"])
+            block_idx_in_segment = int(st["block_idx_in_segment"])
+            num_updates_in_block = int(st.get("block_repeat_step", self.steps_per_block))
+        self._emit(
+            {
+                "type": "block_exit",
+                "epoch_idx": int(self.epoch_idx),
+                "global_step": int(self.global_step),
+                "scene_id": int(st["scene_id"]),
+                "segment_id": int(st["segment_id"]),
+                "episode_idx_global": int(st["episode_idx_global"]),
+                "block_idx_in_episode": int(bcur),
+                "block_idx_in_segment": int(block_idx_in_segment),
+                "block_idx_global": int(block_idx_global),
+                "source_frame_idx": int(source_frame),
+                "source_image_ref": tuple(source_image_ref),
+                "target_frame_indices": [int(x) for x in target_frames],
+                "target_image_refs": [tuple(x) for x in target_image_refs],
+                "num_updates_in_block": int(num_updates_in_block),
+                "K_u_nominal": int(self.steps_per_block),
+                "K_u_effective": int(self.steps_per_block),
+                "K_steps_effective": int(self.steps_per_block),
+                "U": int(self.U),
+                "block_order": str(self.block_order),
+                "scheduler_version": "v8",
+            }
+        )
+
     def _aligned_info(self, st: Dict[str, Any]) -> Dict[str, Any]:
         info = dict(super()._aligned_info(st))
         info["scheduler_version"] = "v8"
@@ -388,12 +438,67 @@ class TrainSchedulerV8(TrainSchedulerV7):
         return batch
 
     def next_batch(self) -> Dict[str, Any]:
-        batch = super().next_batch()
-        aligned = dict(batch.get("_scheduler_v7_aligned_info") or batch.get("_scheduler_v4_aligned_info") or {})
-        aligned["scheduler_version"] = "v8"
+        self._ensure_episode_state()
+        st = self.current_episode_state
+        if st is None:
+            raise ValueError("TrainSchedulerV8 internal state is not initialized")
+        batch = self._batch_from_state(st)
+        key = (int(st["scene_id"]), int(st["segment_id"]))
+        rt = self._segment_runtime[key]
+
+        rt["segment_local_step"] = int(rt["segment_local_step"]) + 1
+        current_block_idx = int(st["block_cursor"])
+        if self.block_order == "step_major":
+            st["block_update_counts"][current_block_idx] = int(st["block_update_counts"][current_block_idx]) + 1
+            st["block_repeat_step"] = int(st["block_update_counts"][current_block_idx])
+            st["episode_step_cursor"] = int(st.get("episode_step_cursor", 0)) + 1
+        else:
+            st["block_repeat_step"] = int(st["block_repeat_step"]) + 1
+        self.global_step += 1
+
+        aligned = self._aligned_info(st)
         batch["_scheduler_v4_aligned_info"] = dict(aligned)
         batch["_scheduler_v7_aligned_info"] = dict(aligned)
         batch["_scheduler_v8_aligned_info"] = dict(aligned)
+
+        if self.block_order == "step_major":
+            if (
+                int(st["block_update_counts"][current_block_idx]) >= self.steps_per_block
+                and not bool(st["block_ended"][current_block_idx])
+            ):
+                self._emit_block_end_for_block(st, current_block_idx)
+                st["block_ended"][current_block_idx] = True
+                rt["block_idx_in_segment"] = max(
+                    int(rt["block_idx_in_segment"]),
+                    int(st["episode_base_block_idx_in_segment"]) + int(current_block_idx) + 1,
+                )
+            if int(st.get("episode_step_cursor", 0)) >= int(self.total_episode_steps):
+                # Final step has no "next block" switch, so emit a terminal block_exit
+                # to keep block-exit-triggered record pass complete.
+                self._emit_block_exit_for_block(st, current_block_idx)
+                self._finalize_episode_if_needed()
+            else:
+                next_block_idx = int(self._episode_block_visit_order[int(st["episode_step_cursor"])])
+                if int(next_block_idx) != int(current_block_idx):
+                    self._emit_block_exit_for_block(st, current_block_idx)
+                self._select_block(next_block_idx)
+        else:
+            if int(st["block_repeat_step"]) >= self.steps_per_block:
+                self._emit_block_exit_for_block(st, current_block_idx)
+                self._emit_block_end_for_block(st, current_block_idx)
+                rt["block_idx_in_segment"] = int(rt["block_idx_in_segment"]) + 1
+                st["block_idx_in_segment"] = int(rt["block_idx_in_segment"])
+                st["block_cursor"] = int(st["block_cursor"]) + 1
+                st["block_repeat_step"] = 0
+                if int(st["block_cursor"]) < self.blocks_per_episode:
+                    self._start_block()
+                else:
+                    self._finalize_episode_if_needed()
+
+        if hasattr(self.dataset, "maybe_log_preload_stats"):
+            self.dataset.maybe_log_preload_stats(int(self.global_step))
+        if hasattr(self.dataset, "maybe_log_overlap_stats"):
+            self.dataset.maybe_log_overlap_stats(int(self.global_step))
         return batch
 
     def get_current_info(self) -> Dict[str, Any]:

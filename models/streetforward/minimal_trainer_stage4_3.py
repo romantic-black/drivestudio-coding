@@ -1431,29 +1431,38 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
         source_images = batch.get("source_images") or []
         if len(source_views) == 0 or len(source_images) == 0:
             raise ValueError("batch must contain non-empty source_views/source_images")
-        first_view = source_views[0]
-        first_image = source_images[0]
+        if len(source_views) != len(source_images):
+            raise ValueError(
+                "build_scene_representation_from_source requires len(source_views) == len(source_images), "
+                f"got {len(source_views)} vs {len(source_images)}"
+            )
         source_sky_masks = batch.get("source_sky_mask") or []
         source_egocar_masks = batch.get("source_egocar_mask") or []
         source_viewdirs = batch.get("source_viewdirs") or []
         source_frame_idx = int(batch.get("source_frame_idx", 0))
-        # convert_batch_to_minimal_format builds lightweight View objects (attribute-based),
-        # while some paths may pass dict-like views; support both without branching callers.
-        if isinstance(first_view, dict):
-            source_cam_idx = int(first_view.get("cam_idx", -1))
-        else:
-            source_cam_idx = int(getattr(first_view, "cam_idx", -1))
-        src_target = {
-            "view": first_view,
-            "gt_image": first_image,
-            "frame_idx": source_frame_idx,
-            "cam_idx": source_cam_idx,
-            "sky_mask": source_sky_masks[0] if len(source_sky_masks) > 0 else None,
-            "egocar_mask": source_egocar_masks[0] if len(source_egocar_masks) > 0 else None,
-            "viewdirs": source_viewdirs[0] if len(source_viewdirs) > 0 else None,
-        }
+
+        def _cam_idx_of_view(view_obj: Any) -> int:
+            # convert_batch_to_minimal_format builds lightweight View objects (attribute-based),
+            # while some paths may pass dict-like views; support both without branching callers.
+            if isinstance(view_obj, dict):
+                return int(view_obj.get("cam_idx", -1))
+            return int(getattr(view_obj, "cam_idx", -1))
+
+        infer_targets: List[Dict[str, Any]] = []
+        for i, (view_i, image_i) in enumerate(zip(source_views, source_images)):
+            infer_targets.append(
+                {
+                    "view": view_i,
+                    "gt_image": image_i,
+                    "frame_idx": int(source_frame_idx),
+                    "cam_idx": int(_cam_idx_of_view(view_i)),
+                    "sky_mask": source_sky_masks[i] if i < len(source_sky_masks) else None,
+                    "egocar_mask": source_egocar_masks[i] if i < len(source_egocar_masks) else None,
+                    "viewdirs": source_viewdirs[i] if i < len(source_viewdirs) else None,
+                }
+            )
         infer_batch = dict(batch)
-        infer_batch["targets"] = [src_target]
+        infer_batch["targets"] = infer_targets
         # Ensure runtime states exist for this cache key before building representation.
         self.ensure_runtime_state_from_batch(infer_batch)
         key = self._batch_key(infer_batch)
@@ -1482,7 +1491,7 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
         gs_state = self.export_3dgs_state(
             infer_batch,
             include_hidden=allow_hidden_cache_update,
-            rigid_export_frame_idx=int(src_target["frame_idx"]),
+            rigid_export_frame_idx=int(source_frame_idx),
         )
         if not allow_node_state_writeback:
             self._restore_runtime_state(key, snap)
@@ -1835,6 +1844,17 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
                         denom = sky_bp_calls
                     perf_metrics[f"perf_{k}"] = float(v / denom)
         perf_metrics["perf_2d_call_count"] = perf_calls
+        stage_prefixed_metrics: Dict[str, float] = {}
+        for k, v in out.items():
+            ks = str(k)
+            if not ks.startswith("stage"):
+                continue
+            if torch.is_tensor(v):
+                if int(v.numel()) == 1:
+                    stage_prefixed_metrics[ks] = float(v.item())
+                continue
+            if isinstance(v, (int, float, bool)):
+                stage_prefixed_metrics[ks] = float(v)
 
         return {
             "loss": out["loss"].item() if torch.is_tensor(out["loss"]) else out["loss"],
@@ -1883,6 +1903,7 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
             **grad_norms,
             **timing_ms,
             **perf_metrics,
+            **stage_prefixed_metrics,
             "node_state_sync_update": node_state_sync_update,
             "node_state_sync_reset": node_state_sync_reset,
         }
