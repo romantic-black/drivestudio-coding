@@ -4,6 +4,7 @@ from .alpha_t_extractor_v3 import AlphaTWeightExtractorV3
 from .feature_2d_backprojector import FeatureBackprojector
 from .feature_fusion import FeatureFusion
 from .image_feature_extractor import ImageFeatureExtractor
+from .dinov2_unet_fusion import DINOv2BackboneAdapter, DINOv2UNetFusionExtractor, FusionNeck2D
 
 __all__ = [
     "AlphaTWeightExtractor",
@@ -12,4 +13,7 @@ __all__ = [
     "FeatureBackprojector",
     "FeatureFusion",
     "ImageFeatureExtractor",
+    "DINOv2BackboneAdapter",
+    "FusionNeck2D",
+    "DINOv2UNetFusionExtractor",
 ]

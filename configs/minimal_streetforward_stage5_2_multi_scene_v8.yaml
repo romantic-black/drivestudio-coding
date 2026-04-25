@@ -1,4 +1,4 @@
-output_name: experiment001_120w
+output_name: experiment002_120w
 
 data:
   data_root: "/root/autodl-tmp/nuScenes/"
@@ -7,14 +7,7 @@ data:
   end_timestep: -1
   preload_device: cpu
   sky_mask_semantics: one_is_sky
-  train_scene_ids: [5, 6, 7, 8, 9,14, 16, 24, 32, 40, 99, 107, 115, 123, 131, 139, 147, 155, 163, 171, 179, 195, 214,
-    17, 25, 33, 41, 49, 100, 108, 116, 124, 132, 140, 148, 156, 164, 172, 180, 188, 196, 215,
-    10, 18, 26, 34, 42, 93, 101, 109, 117, 125, 133, 141, 149, 157, 165, 173, 181, 189, 197, 216,
-    11, 19, 27, 35, 43, 94, 102, 110, 118, 126, 134, 142, 150, 158, 166, 174, 182, 190, 198, 217,
-    12, 20, 36, 44, 95, 103, 111, 119, 127, 135, 143, 151, 159, 167, 175, 183, 191, 199, 218,
-    13, 21, 29, 37, 45, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200,
-    22, 30, 38, 46, 97, 105, 113, 121, 129, 137, 145, 153, 161, 169, 177, 185, 193, 201,
-    15, 23, 31, 39, 47, 98, 106, 114, 122, 130, 138, 146, 154, 162, 170, 178, 186, 194]
+  train_scene_ids: [5, 6, 7, ]
   eval_scene_ids: [0, 1, 2, 3, 4]
   preload:
     enable: true
@@ -149,8 +142,28 @@ model:
   sh_degree: 1
   voxel_size: 0.2
   sparseConv_outdim: 32
-  feat_2d_channels: 32
+  feat_2d_channels: 48
   feat_2d_downscale: 1
+  feature_extractor:
+    type: dinov2_unet_fusion
+    dino:
+      model_name: vit_base_patch14_reg4_dinov2
+      pretrained: true
+      freeze: true
+      weights_path: null
+      out_channels: 32
+      intermediate_layers: [4, 8, 11]
+      pad_to_patch_multiple: 14
+    residual_unet:
+      in_channels: 6
+      feat_channels: 32
+      base_channels: 32
+      feature_downscale: 1
+      depth: 4
+      bilinear: true
+    fusion:
+      hidden_channels: 64
+      out_channels: 48
   use_fused_cuda_backproject_v2: true
   use_fused_cuda_backproject_v3: true
   use_fused_cuda_backproject_v4: false
@@ -175,7 +188,7 @@ model:
     include_distant: true
     include_rigid_in: true
     include_rigid_out: true
-    feat_2d_channels: 32
+    feat_2d_channels: 48
     param_embed_dim: 32
     branch_embed_dim: 8
     support_embed_dim: 8
@@ -191,14 +204,14 @@ model:
     near:
       type: "xcpe"
       branches: ["bg", "rigid_in"]
-      channels: 64
+      channels: 96
       voxel_size: 0.20
       sparse_backend: "spconv"
       clamp_grid_coord: false
       xcpe:
-        num_layers: 1
+        num_layers: 2
         kernel_size: 3
-        residual_scale_init: 1.0e-3
+        residual_scale_init: 5.0e-3
         norm: "layernorm"
         act: "gelu"
     far:
@@ -213,11 +226,15 @@ model:
     enable: true
     record_on: "block_exit"
     record_views: "source_image_refs"
-    support_beta_visible: 0.75
-    support_beta_invisible: 0.90
-    error_beta: 0.75
-    update_norm_beta: 0.85
-    error_eps: 1.0e-6
+    support:
+      ema_beta_visible: 0.75
+      ema_beta_invisible: 0.90
+    residual:
+      error_beta: 0.75
+      error_eps: 1.0e-6
+    update:
+      ema_beta: 0.85
+      apply_in_eval: false
   update_gate:
     enable: true
     hidden_dim: 64
