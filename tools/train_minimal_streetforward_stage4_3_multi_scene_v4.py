@@ -1271,7 +1271,8 @@ def main() -> None:
     block_loss_accum: Dict[int, Dict[str, Any]] = {}
     model_cfg = cfg.get("model", {}) if hasattr(cfg, "get") else {}
     history_cfg = model_cfg.get("history_memory", {}) if hasattr(model_cfg, "get") else {}
-    enable_block_exit_record = bool(str(model_cfg.get("stage", "")) == "5_2") and bool(
+    model_stage = str(model_cfg.get("stage", ""))
+    enable_block_exit_record = bool(model_stage in {"5_2", "5_3"}) and bool(
         str(history_cfg.get("record_on", "")) == "block_exit"
     )
 
@@ -1325,7 +1326,7 @@ def main() -> None:
                 and scheduler_node_sync is not None
                 and bool(scheduler_node_sync.get("reset_after_block", False))
             ):
-                # Stage5_2 block-exit record pass reads current runtime node states/histories.
+                # Stage5_2/Stage5_3 block-exit record pass reads current runtime node states/histories.
                 # Defer scheduler-triggered reset to after record_block_history in this step.
                 scheduler_node_sync = dict(scheduler_node_sync)
                 scheduler_node_sync["reset_after_block"] = False
@@ -1450,7 +1451,9 @@ def main() -> None:
                 raise ValueError("train_step returned None")
             if enable_block_exit_record:
                 if not hasattr(model, "record_block_history"):
-                    raise ValueError("Stage5_2 record_on=block_exit requires model.record_block_history.")
+                    raise ValueError(
+                        "Stage5_2/Stage5_3 record_on=block_exit requires model.record_block_history."
+                    )
                 block_exit_events = [ev for ev in step_events if str(ev.get("type", "")) == "block_exit"]
                 for ev in block_exit_events:
                     rec_metrics = model.record_block_history(minimal_batch, ev)

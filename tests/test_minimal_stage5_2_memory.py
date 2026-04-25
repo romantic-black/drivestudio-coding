@@ -7,7 +7,7 @@ import torch
 from omegaconf import OmegaConf
 
 from models.streetforward.minimal_trainer_stage4_6 import MinimalStreetForwardStage4_6, RigidRoute
-from models.streetforward.minimal_trainer_stage5_2 import MinimalStreetForwardStage5_2
+from models.streetforward.minimal_trainer_stage5_3 import MinimalStreetForwardStage5_3
 
 
 def _empty_history(num_rows: int) -> dict[str, torch.Tensor]:
@@ -21,7 +21,7 @@ def _empty_history(num_rows: int) -> dict[str, torch.Tensor]:
 
 
 def test_should_apply_step_update_norm_ema_respects_apply_in_eval_switch():
-    trainer = MinimalStreetForwardStage5_2.__new__(MinimalStreetForwardStage5_2)
+    trainer = MinimalStreetForwardStage5_3.__new__(MinimalStreetForwardStage5_3)
 
     trainer.training = False
     trainer.stage5_2_history_update_apply_in_eval = False
@@ -37,7 +37,7 @@ def test_should_apply_step_update_norm_ema_respects_apply_in_eval_switch():
 
 
 def test_forward_skips_update_norm_ema_in_eval_by_default(monkeypatch):
-    trainer = MinimalStreetForwardStage5_2.__new__(MinimalStreetForwardStage5_2)
+    trainer = MinimalStreetForwardStage5_3.__new__(MinimalStreetForwardStage5_3)
     trainer.training = False
     trainer.stage5_2_history_update_apply_in_eval = False
 
@@ -52,7 +52,7 @@ def test_forward_skips_update_norm_ema_in_eval_by_default(monkeypatch):
         calls["n"] += 1
 
     monkeypatch.setattr(MinimalStreetForwardStage4_6, "forward", _fake_parent_forward)
-    monkeypatch.setattr(MinimalStreetForwardStage5_2, "_apply_step_update_norm_ema_from_out", _fake_apply)
+    monkeypatch.setattr(MinimalStreetForwardStage5_3, "_apply_step_update_norm_ema_from_out", _fake_apply)
 
     out = trainer.forward({})
     assert out["_cache_key"] == (0, 0)
@@ -60,7 +60,7 @@ def test_forward_skips_update_norm_ema_in_eval_by_default(monkeypatch):
 
 
 def test_forward_applies_update_norm_ema_in_eval_when_enabled(monkeypatch):
-    trainer = MinimalStreetForwardStage5_2.__new__(MinimalStreetForwardStage5_2)
+    trainer = MinimalStreetForwardStage5_3.__new__(MinimalStreetForwardStage5_3)
     trainer.training = False
     trainer.stage5_2_history_update_apply_in_eval = True
 
@@ -75,14 +75,14 @@ def test_forward_applies_update_norm_ema_in_eval_when_enabled(monkeypatch):
         calls["n"] += 1
 
     monkeypatch.setattr(MinimalStreetForwardStage4_6, "forward", _fake_parent_forward)
-    monkeypatch.setattr(MinimalStreetForwardStage5_2, "_apply_step_update_norm_ema_from_out", _fake_apply)
+    monkeypatch.setattr(MinimalStreetForwardStage5_3, "_apply_step_update_norm_ema_from_out", _fake_apply)
 
     trainer.forward({})
     assert calls["n"] == 1
 
 
 def test_apply_step_update_norm_ema_updates_written_rows_only():
-    trainer = MinimalStreetForwardStage5_2.__new__(MinimalStreetForwardStage5_2)
+    trainer = MinimalStreetForwardStage5_3.__new__(MinimalStreetForwardStage5_3)
     trainer.stage5_2_update_norm_beta = 0.5
     history = _empty_history(3)
 
@@ -95,7 +95,7 @@ def test_apply_step_update_norm_ema_updates_written_rows_only():
 
 
 def test_commit_block_support_to_history_uses_block_mean_and_visibility_beta():
-    trainer = MinimalStreetForwardStage5_2.__new__(MinimalStreetForwardStage5_2)
+    trainer = MinimalStreetForwardStage5_3.__new__(MinimalStreetForwardStage5_3)
     trainer.device = torch.device("cpu")
     trainer.stage5_2_support_beta_visible = 0.75
     trainer.stage5_2_support_beta_invisible = 0.90
@@ -130,7 +130,7 @@ def test_commit_block_support_to_history_uses_block_mean_and_visibility_beta():
 
 
 def test_apply_residual_history_update_visible_only():
-    trainer = MinimalStreetForwardStage5_2.__new__(MinimalStreetForwardStage5_2)
+    trainer = MinimalStreetForwardStage5_3.__new__(MinimalStreetForwardStage5_3)
     trainer.stage5_2_error_beta = 0.5
     history = _empty_history(2)
 
@@ -145,7 +145,7 @@ def test_apply_residual_history_update_visible_only():
 
 
 def test_accumulate_support_before_update_maps_rigid_rows_to_global_history_rows():
-    trainer = MinimalStreetForwardStage5_2.__new__(MinimalStreetForwardStage5_2)
+    trainer = MinimalStreetForwardStage5_3.__new__(MinimalStreetForwardStage5_3)
     trainer.device = torch.device("cpu")
     trainer.stage5_2_block_support_bg = {}
     trainer.stage5_2_block_support_distant = {}
@@ -188,38 +188,38 @@ def test_accumulate_support_before_update_maps_rigid_rows_to_global_history_rows
 
 
 def test_build_record_targets_rejects_non_source_record_views():
-    trainer = MinimalStreetForwardStage5_2.__new__(MinimalStreetForwardStage5_2)
+    trainer = MinimalStreetForwardStage5_3.__new__(MinimalStreetForwardStage5_3)
     trainer.stage5_2_record_views = "target_image_refs"
     with pytest.raises(ValueError, match="record_views=source_image_refs"):
         trainer._build_record_targets({})
 
 
-def test_validate_stage5_2_config_rejects_legacy_flat_history_keys():
-    cfg = OmegaConf.load(str(Path("configs/minimal_streetforward_stage5_2_multi_scene_v8.yaml")))
+def test_validate_stage5_3_config_rejects_legacy_flat_history_keys():
+    cfg = OmegaConf.load(str(Path("configs/minimal_streetforward_stage5_3_multi_scene_v8.yaml")))
     cfg.model.history_memory.support_beta_visible = 0.75
-    trainer = MinimalStreetForwardStage5_2.__new__(MinimalStreetForwardStage5_2)
+    trainer = MinimalStreetForwardStage5_3.__new__(MinimalStreetForwardStage5_3)
     with pytest.raises(ValueError, match="no longer supports flat history_memory keys"):
-        trainer._validate_stage5_2_config(cfg)
+        trainer._validate_stage5_3_config(cfg)
 
 
-def test_validate_stage5_2_config_requires_feature_extractor_block():
-    cfg = OmegaConf.load(str(Path("configs/minimal_streetforward_stage5_2_multi_scene_v8.yaml")))
+def test_validate_stage5_3_config_requires_feature_extractor_block():
+    cfg = OmegaConf.load(str(Path("configs/minimal_streetforward_stage5_3_multi_scene_v8.yaml")))
     del cfg.model["feature_extractor"]
-    trainer = MinimalStreetForwardStage5_2.__new__(MinimalStreetForwardStage5_2)
+    trainer = MinimalStreetForwardStage5_3.__new__(MinimalStreetForwardStage5_3)
     with pytest.raises(ValueError, match=r"Missing required config: model\.feature_extractor"):
-        trainer._validate_stage5_2_config(cfg)
+        trainer._validate_stage5_3_config(cfg)
 
 
-def test_validate_stage5_2_config_requires_dinov2_unet_fusion_type():
-    cfg = OmegaConf.load(str(Path("configs/minimal_streetforward_stage5_2_multi_scene_v8.yaml")))
+def test_validate_stage5_3_config_requires_dinov2_unet_fusion_type():
+    cfg = OmegaConf.load(str(Path("configs/minimal_streetforward_stage5_3_multi_scene_v8.yaml")))
     cfg.model.feature_extractor.type = "image_feature_extractor"
-    trainer = MinimalStreetForwardStage5_2.__new__(MinimalStreetForwardStage5_2)
+    trainer = MinimalStreetForwardStage5_3.__new__(MinimalStreetForwardStage5_3)
     with pytest.raises(ValueError, match="requires model.feature_extractor.type='dinov2_unet_fusion'"):
-        trainer._validate_stage5_2_config(cfg)
+        trainer._validate_stage5_3_config(cfg)
 
 
-def test_validate_stage5_2_config_allows_missing_dino_freeze_key():
-    cfg = OmegaConf.load(str(Path("configs/minimal_streetforward_stage5_2_multi_scene_v8.yaml")))
+def test_validate_stage5_3_config_allows_missing_dino_freeze_key():
+    cfg = OmegaConf.load(str(Path("configs/minimal_streetforward_stage5_3_multi_scene_v8.yaml")))
     del cfg.model.feature_extractor.dino["freeze"]
-    trainer = MinimalStreetForwardStage5_2.__new__(MinimalStreetForwardStage5_2)
-    trainer._validate_stage5_2_config(cfg)
+    trainer = MinimalStreetForwardStage5_3.__new__(MinimalStreetForwardStage5_3)
+    trainer._validate_stage5_3_config(cfg)

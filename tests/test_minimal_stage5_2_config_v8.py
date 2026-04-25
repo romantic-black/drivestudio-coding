@@ -5,10 +5,29 @@ from pathlib import Path
 from omegaconf import OmegaConf
 
 
-def test_stage5_2_v8_config_has_fusion_memory_switch_and_phase1_xcpe():
-    cfg_path = Path("configs/minimal_streetforward_stage5_2_multi_scene_v8.yaml")
-    cfg = OmegaConf.load(str(cfg_path))
+def test_stage5_2_v8_config_restored_to_legacy_baseline():
+    cfg = OmegaConf.load(str(Path("configs/minimal_streetforward_stage5_2_multi_scene_v8.yaml")))
 
+    assert str(cfg.model.stage) == "5_2"
+    assert int(cfg.model.feat_2d_channels) == 32
+    assert int(cfg.model.struct_decoder.feat_2d_channels) == 32
+
+    assert "feature_extractor" not in cfg.model
+    assert str(cfg.model.history_memory.record_views) == "source_image_refs"
+    assert float(cfg.model.history_memory.support_beta_visible) == 0.75
+    assert float(cfg.model.history_memory.support_beta_invisible) == 0.90
+    assert float(cfg.model.history_memory.error_beta) == 0.75
+    assert float(cfg.model.history_memory.update_norm_beta) == 0.85
+
+    assert int(cfg.model.struct_decoder.near.channels) == 64
+    assert int(cfg.model.struct_decoder.near.xcpe.num_layers) == 1
+    assert float(cfg.model.struct_decoder.near.xcpe.residual_scale_init) == 1.0e-3
+
+
+def test_stage5_3_v8_config_contains_fusion_memory_switch_and_phase1_xcpe():
+    cfg = OmegaConf.load(str(Path("configs/minimal_streetforward_stage5_3_multi_scene_v8.yaml")))
+
+    assert str(cfg.model.stage) == "5_3"
     assert int(cfg.model.feat_2d_channels) == 48
     assert int(cfg.model.struct_decoder.feat_2d_channels) == 48
 
