@@ -36,7 +36,7 @@ def test_stage5_3_v8_config_contains_fusion_memory_switch_and_phase1_xcpe():
     assert bool(cfg.model.feature_extractor.dino.freeze) is True
     assert int(cfg.model.feature_extractor.fusion.out_channels) == 48
 
-    assert bool(cfg.model.history_memory["update"].apply_in_eval) is False
+    assert "apply_in_eval" not in cfg.model.history_memory["update"]
     assert str(cfg.model.history_memory.record_views) == "source_image_refs"
 
     assert int(cfg.model.struct_decoder.near.channels) == 96

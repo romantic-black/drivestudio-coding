@@ -1,4 +1,4 @@
-output_name: experiment001_120w
+output_name: demo_stage5_viewer
 
 data:
   data_root: "/root/autodl-tmp/nuScenes/"
@@ -104,7 +104,7 @@ scheduler_v8:
     fixed_scene_id: null
     fixed_segment_id: null
     segment_order: ascending
-    scene_order: shuffle_per_epoch
+    scene_order: ascending
   execution:
     block_order: step_major
     step_major_switch_interval_steps: 4
@@ -114,63 +114,14 @@ scheduler_v8:
     warm_next_block_exact: true
     warm_next_episode_chain: true
 
-validation_v8:
-  eval_enable: true
-  mode: inference_only  # segment_finetune_train
-  block:
-    steps_per_block: 16
-  episode:
-    blocks_per_episode: 5
-    total_target_frames: 3
-    target_policy: visited_episode_frames
-  execution:
-    block_order: step_major
-    step_major_switch_interval_steps: 4
-    reset_policy: episode_end
-  trigger:
-    by: train_episode_interval
-    validate_every_n_episodes: 100
-    run_at_train_start: false
-  episode_selection:
-    policy: middle
-  render:
-    save_images: true
-    save_dir: validation/episodes
-  cache:
-    persist_across_training: true
-  metrics:
-    use_sky_mask_regions: true
-    min_valid_pixels_per_region: 32
-    require_sky_mask: true
-
 model:
-  stage: "5_3"
+  stage: "5_2"
   scale_init_value: 0.1
   sh_degree: 1
   voxel_size: 0.2
   sparseConv_outdim: 32
   feat_2d_channels: 32
   feat_2d_downscale: 1
-  feature_extractor:
-    type: dinov2_unet_fusion
-    dino:
-      model_name: vit_base_patch14_reg4_dinov2
-      pretrained: true
-      freeze: true
-      weights_path: null
-      out_channels: 32
-      intermediate_layers: [4, 8, 11]
-      pad_to_patch_multiple: 14
-    residual_unet:
-      in_channels: 6
-      feat_channels: 32
-      base_channels: 32
-      feature_downscale: 1
-      depth: 4
-      bilinear: true
-    fusion:
-      hidden_channels: 64
-      out_channels: 32
   use_fused_cuda_backproject_v2: true
   use_fused_cuda_backproject_v3: true
   use_fused_cuda_backproject_v4: false
@@ -216,9 +167,9 @@ model:
       sparse_backend: "spconv"
       clamp_grid_coord: false
       xcpe:
-        num_layers: 2
+        num_layers: 1
         kernel_size: 3
-        residual_scale_init: 5.0e-3
+        residual_scale_init: 1.0e-3
         norm: "layernorm"
         act: "gelu"
     far:
@@ -233,15 +184,11 @@ model:
     enable: true
     record_on: "block_exit"
     record_views: "source_image_refs"
-    support:
-      ema_beta_visible: 0.75
-      ema_beta_invisible: 0.90
-    residual:
-      error_beta: 0.75
-      error_eps: 1.0e-6
-    update:
-      ema_beta: 0.92
-      apply_in_eval: true
+    support_beta_visible: 0.75
+    support_beta_invisible: 0.90
+    error_beta: 0.75
+    update_norm_beta: 0.85
+    error_eps: 1.0e-6
   update_gate:
     enable: true
     hidden_dim: 64
@@ -287,39 +234,58 @@ optimizer:
   weight_decay: 0.0
 
 training:
-  max_iterations: 1000010
+  max_iterations: 100000
   log_interval: 100
   save_checkpoint_freq: 10000
   seed: 42
 
 eval:
   enable_psnr: true
-  save_train_views_psnr_below: null
+  save_train_views_psnr_below: 12
   run_test_at_end: false
 
 logging:
   output_root: /root/autodl-tmp/outputs
-  project: minimal_sf_stage5_3_multi_scene_v8
+  project: minimal_sf_stage5_demo_viewer
   log_dir: null
   image_interval_blocks: 96
-  train_monitor:
-    enable_heavy_metrics: false
-    include_per_view_metrics: false
-    include_extra_result_metrics: false
-    enable_low_psnr_image_dump: false
   low_psnr_train_images_subdir: train_low_psnr
   enable_jsonl_metrics: true
-  use_tensorboard: true
+  use_tensorboard: false
   offset_monitor:
-    enable: true
+    enable: false
     near_radius_m: 5.0
     saturation_tanh_threshold: 0.95
   diagnostics:
     enable: false
     interval: 500
     window_size: 50
-    save_branch_renders: true
+    save_branch_renders: false
   performance:
     enable: false
-    phase_timing: true
+    phase_timing: false
     cuda_memory: false
+
+demo:
+  mode: frozen_recurrent_inference
+  pause_on_start: true
+  step_button_mode: raw_step
+  display_branches: ["bg", "distant"]
+  hide_rigid: true
+  checkpoint:
+    load_mode: network_only
+    strict_network: false
+  inference:
+    update_node_state: true
+    update_hidden_state: true
+    update_history_memory: true
+    record_block_history_on_block_exit: true
+    no_optimizer_step: true
+    no_backward: true
+  viewer:
+    host: "0.0.0.0"
+    port: 8080
+    viewer_res: 1280
+    default_render_mode: rgb
+    default_max_sh_degree: 1
+    default_near_far: [0.01, 200.0]

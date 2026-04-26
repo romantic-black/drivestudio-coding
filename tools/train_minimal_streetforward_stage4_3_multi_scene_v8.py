@@ -115,8 +115,10 @@ def _run_validation_v8_round(
     )
 
     def _collect_metrics_for_step(step_result: Dict[str, Any], minimal_batch: Dict[str, Any]) -> Dict[str, float]:
-        preds = list(step_result.get("pred_rgbs") or [])
-        gts = list(step_result.get("gt_images") or [])
+        preds_raw = list(step_result.get("pred_rgbs") or [])
+        gts_raw = list(step_result.get("gt_images") or [])
+        preds = [p.detach() if torch.is_tensor(p) else p for p in preds_raw]
+        gts = [g.detach() if torch.is_tensor(g) else g for g in gts_raw]
         if len(preds) == 0 or len(preds) != len(gts):
             return {
                 "num_views": float(min(len(preds), len(gts))),
@@ -149,61 +151,62 @@ def _run_validation_v8_round(
         targets = list(minimal_batch.get("targets") or [])
         min_valid = int(validation_cfg.min_valid_pixels_per_region)
 
-        for idx, (pred, gt) in enumerate(zip(preds, gts)):
-            m = base._compute_metrics(
-                pred_rgb=pred,
-                gt_rgb=gt,
-                psnr_metric=psnr_metric,
-                ssim_metric=ssim_metric,
-                lpips_metric=lpips_metric,
-                compute_psnr=True,
-                compute_heavy=True,
-            )
-            psnr_full_vals.append(float(m["psnr"]))
-            ssim_full_vals.append(float(m["ssim"]))
-            lpips_full_vals.append(float(m["lpips"]))
+        with torch.no_grad():
+            for idx, (pred, gt) in enumerate(zip(preds, gts)):
+                m = base._compute_metrics(
+                    pred_rgb=pred,
+                    gt_rgb=gt,
+                    psnr_metric=psnr_metric,
+                    ssim_metric=ssim_metric,
+                    lpips_metric=lpips_metric,
+                    compute_psnr=True,
+                    compute_heavy=True,
+                )
+                psnr_full_vals.append(float(m["psnr"]))
+                ssim_full_vals.append(float(m["ssim"]))
+                lpips_full_vals.append(float(m["lpips"]))
 
-            if not bool(validation_cfg.use_sky_mask_regions):
-                continue
-            tgt = targets[int(idx)] if int(idx) < len(targets) else {}
-            sky_mask = tgt.get("sky_mask")
-            if sky_mask is None and bool(validation_cfg.require_sky_mask):
-                raise ValueError(
-                    "validation_v8.metrics.require_sky_mask=true but target missing sky_mask "
-                    f"(idx={int(idx)})"
-                )
-            if sky_mask is None:
-                continue
-            sm = sky_mask.to(device).float()
-            if sm.dim() == 3:
-                sm = sm.squeeze(-1)
-            if sm.shape != gt.shape[:2]:
-                raise ValueError(
-                    "validation_v8 sky_mask shape mismatch: "
-                    f"sky_mask={tuple(sm.shape)} gt_hw={tuple(gt.shape[:2])}"
-                )
-            non_sky = (1.0 - sm).clamp(0.0, 1.0)
-            sky = sm.clamp(0.0, 1.0)
-            non_sky_count = int((non_sky > 0.5).sum().item())
-            sky_count = int((sky > 0.5).sum().item())
-            sky_coverage_vals.append(float(sm.mean().item()))
-            if non_sky_count >= min_valid:
-                psnr_non = base._compute_masked_psnr(pred, gt, non_sky)
-                ssim_non = base._compute_masked_ssim(pred, gt, non_sky)
-                lpips_non = base._compute_masked_lpips(pred, gt, non_sky, lpips_metric)
-                if psnr_non is not None:
-                    psnr_non_sky_vals.append(float(psnr_non))
-                if ssim_non is not None:
-                    ssim_non_sky_vals.append(float(ssim_non))
-                if lpips_non is not None:
-                    lpips_non_sky_vals.append(float(lpips_non))
-            if sky_count >= min_valid:
-                psnr_sky = base._compute_masked_psnr(pred, gt, sky)
-                ssim_sky = base._compute_masked_ssim(pred, gt, sky)
-                if psnr_sky is not None:
-                    psnr_sky_vals.append(float(psnr_sky))
-                if ssim_sky is not None:
-                    ssim_sky_vals.append(float(ssim_sky))
+                if not bool(validation_cfg.use_sky_mask_regions):
+                    continue
+                tgt = targets[int(idx)] if int(idx) < len(targets) else {}
+                sky_mask = tgt.get("sky_mask")
+                if sky_mask is None and bool(validation_cfg.require_sky_mask):
+                    raise ValueError(
+                        "validation_v8.metrics.require_sky_mask=true but target missing sky_mask "
+                        f"(idx={int(idx)})"
+                    )
+                if sky_mask is None:
+                    continue
+                sm = sky_mask.to(device).float()
+                if sm.dim() == 3:
+                    sm = sm.squeeze(-1)
+                if sm.shape != gt.shape[:2]:
+                    raise ValueError(
+                        "validation_v8 sky_mask shape mismatch: "
+                        f"sky_mask={tuple(sm.shape)} gt_hw={tuple(gt.shape[:2])}"
+                    )
+                non_sky = (1.0 - sm).clamp(0.0, 1.0)
+                sky = sm.clamp(0.0, 1.0)
+                non_sky_count = int((non_sky > 0.5).sum().item())
+                sky_count = int((sky > 0.5).sum().item())
+                sky_coverage_vals.append(float(sm.mean().item()))
+                if non_sky_count >= min_valid:
+                    psnr_non = base._compute_masked_psnr(pred, gt, non_sky)
+                    ssim_non = base._compute_masked_ssim(pred, gt, non_sky)
+                    lpips_non = base._compute_masked_lpips(pred, gt, non_sky, lpips_metric)
+                    if psnr_non is not None:
+                        psnr_non_sky_vals.append(float(psnr_non))
+                    if ssim_non is not None:
+                        ssim_non_sky_vals.append(float(ssim_non))
+                    if lpips_non is not None:
+                        lpips_non_sky_vals.append(float(lpips_non))
+                if sky_count >= min_valid:
+                    psnr_sky = base._compute_masked_psnr(pred, gt, sky)
+                    ssim_sky = base._compute_masked_ssim(pred, gt, sky)
+                    if psnr_sky is not None:
+                        psnr_sky_vals.append(float(psnr_sky))
+                    if ssim_sky is not None:
+                        ssim_sky_vals.append(float(ssim_sky))
 
         out = {
             "num_views": float(len(preds)),
@@ -231,69 +234,138 @@ def _run_validation_v8_round(
         return out
 
     all_episode_rows: List[Dict[str, Any]] = []
-    for spec in specs:
-        if use_train_finetune:
-            base._restore_train_checkpoint_bytes(model, base_ckpt_bytes, device)
-        model.reset_node_state()
-        validation_local_step = 0
-        visit_rows: List[Dict[str, Any]] = []
-        for visit_idx, (block_idx_in_episode, block_frames) in enumerate(
-            zip(spec.block_visit_order, spec.visit_target_windows)
-        ):
-            src_frame = int(block_frames[0])
-            source_ref = (int(src_frame), 0)
-            source_refs = [(int(src_frame), int(cam_id)) for cam_id in range(int(spec.num_cams))]
-            target_refs = [
-                (int(frame_idx), int(cam_id))
-                for frame_idx in block_frames
-                for cam_id in range(int(spec.num_cams))
-            ]
-            req = base._BatchRequestValidationV7(
-                scene_id=int(spec.scene_id),
-                segment_id=int(spec.segment_id),
-                source_image_ref=source_ref,
-                source_image_refs=source_refs,
-                target_image_refs=target_refs,
-                include_test=False,
-                test_image_refs=None,
-            )
-            raw_batch = dataset.get_segment_batch_from_image_refs(req, enforce_target0_equals_source=True)
-            minimal_batch = base.convert_batch_to_minimal_format(
-                raw_batch,
-                device,
-                num_targets=int(raw_batch["target"]["image"].shape[0]),
-                include_source_for_2d=True,
-                view_selection=None,
-            )
-            scheduler_node_sync = {
-                "U": 1,
-                "segment_local_step": int(validation_local_step + 1),
-                "reset_after_block": False,
-            }
+    try:
+        for spec in specs:
             if use_train_finetune:
-                kwargs: Dict[str, Any] = {
-                    "batch": minimal_batch,
-                    "step": None,
-                    "profile_phase_timing": False,
-                    "sync_cuda_timing": False,
-                    "scheduler_node_sync": scheduler_node_sync,
+                base._restore_train_checkpoint_bytes(model, base_ckpt_bytes, device)
+            model.reset_node_state()
+            spec_dir = os.path.join(
+                val_root,
+                f"scene_{int(spec.scene_id):03d}",
+                f"segment_{int(spec.segment_id):03d}",
+                f"episode_start_{int(spec.episode_start_keyframe_pos):03d}",
+            )
+            render_dir = os.path.join(spec_dir, "renders")
+            if bool(validation_cfg.save_images):
+                os.makedirs(render_dir, exist_ok=True)
+            validation_local_step = 0
+            visit_rows: List[Dict[str, Any]] = []
+            for visit_idx, (block_idx_in_episode, block_frames) in enumerate(
+                zip(spec.block_visit_order, spec.visit_target_windows)
+            ):
+                src_frame = int(block_frames[0])
+                source_ref = (int(src_frame), 0)
+                source_refs = [(int(src_frame), int(cam_id)) for cam_id in range(int(spec.num_cams))]
+                target_refs = [
+                    (int(frame_idx), int(cam_id))
+                    for frame_idx in block_frames
+                    for cam_id in range(int(spec.num_cams))
+                ]
+                req = base._BatchRequestValidationV7(
+                    scene_id=int(spec.scene_id),
+                    segment_id=int(spec.segment_id),
+                    source_image_ref=source_ref,
+                    source_image_refs=source_refs,
+                    target_image_refs=target_refs,
+                    include_test=False,
+                    test_image_refs=None,
+                )
+                raw_batch = dataset.get_segment_batch_from_image_refs(req, enforce_target0_equals_source=True)
+                minimal_batch = base.convert_batch_to_minimal_format(
+                    raw_batch,
+                    device,
+                    num_targets=int(raw_batch["target"]["image"].shape[0]),
+                    include_source_for_2d=True,
+                    view_selection=None,
+                )
+                scheduler_node_sync = {
+                    "U": 1,
+                    "segment_local_step": int(validation_local_step + 1),
+                    "reset_after_block": False,
                 }
-                if train_step_supports_runtime_policy:
-                    kwargs["runtime_policy"] = train_policy
-                step_result = model.train_step(**kwargs)
-            else:
-                kwargs = {
-                    "batch": minimal_batch,
-                    "step": None,
-                    "scheduler_node_sync": scheduler_node_sync,
+                if use_train_finetune:
+                    kwargs: Dict[str, Any] = {
+                        "batch": minimal_batch,
+                        "step": None,
+                        "profile_phase_timing": False,
+                        "sync_cuda_timing": False,
+                        "scheduler_node_sync": scheduler_node_sync,
+                    }
+                    if train_step_supports_runtime_policy:
+                        kwargs["runtime_policy"] = train_policy
+                    step_result = model.train_step(**kwargs)
+                else:
+                    kwargs = {
+                        "batch": minimal_batch,
+                        "step": None,
+                        "scheduler_node_sync": scheduler_node_sync,
+                    }
+                    if infer_step_supports_runtime_policy:
+                        kwargs["runtime_policy"] = infer_policy
+                    step_result = model.inference_step_from_train_batch(**kwargs)
+                validation_local_step += 1
+                visit_metrics = _collect_metrics_for_step(step_result, minimal_batch)
+                if bool(validation_cfg.save_images):
+                    preds = [p.detach() if torch.is_tensor(p) else p for p in list(step_result.get("pred_rgbs") or [])]
+                    gts = [g.detach() if torch.is_tensor(g) else g for g in list(step_result.get("gt_images") or [])]
+                    num_dump = min(len(preds), len(gts))
+                    for view_idx in range(num_dump):
+                        base._save_image_triplet(
+                            int(trigger_step),
+                            preds[view_idx],
+                            gts[view_idx],
+                            render_dir,
+                            view_suffix=(
+                                f"val_v8_sc{int(spec.scene_id):03d}_seg{int(spec.segment_id):03d}"
+                                f"_visit{int(visit_idx + 1):03d}_view{int(view_idx):03d}"
+                            ),
+                            save_error=False,
+                        )
+                visit_row = {
+                    "split": "validation_v8_visit",
+                    "mode": validation_mode,
+                    "block_order": str(validation_cfg.block_order),
+                    "trigger_train_episode_counter": int(trigger_train_episode_counter),
+                    "trigger_step": int(trigger_step),
+                    "scene_id": int(spec.scene_id),
+                    "segment_id": int(spec.segment_id),
+                    "episode_start_keyframe_pos": int(spec.episode_start_keyframe_pos),
+                    "visit_idx": int(visit_idx + 1),
+                    "num_visits_total": int(len(spec.block_visit_order)),
+                    "block_idx_in_episode": int(block_idx_in_episode),
+                    "source_frame": int(src_frame),
+                    "target_frames": [int(x) for x in block_frames],
+                    "loss": float(step_result.get("loss", 0.0)),
+                    **visit_metrics,
                 }
-                if infer_step_supports_runtime_policy:
-                    kwargs["runtime_policy"] = infer_policy
-                step_result = model.inference_step_from_train_batch(**kwargs)
-            validation_local_step += 1
-            visit_metrics = _collect_metrics_for_step(step_result, minimal_batch)
-            visit_row = {
-                "split": "validation_v8_visit",
+                visit_rows.append(visit_row)
+                if metrics_fh is not None:
+                    base._write_metrics_history(metrics_fh, visit_row)
+                if writer is not None:
+                    tb_step = max(int(trigger_step), 0)
+                    writer.add_scalar("validation_v8/visit/loss", float(visit_row["loss"]), tb_step)
+                    writer.add_scalar("validation_v8/visit/psnr", float(visit_row["psnr"]), tb_step)
+                    writer.add_scalar("validation_v8/visit/ssim", float(visit_row["ssim"]), tb_step)
+                    writer.add_scalar("validation_v8/visit/lpips", float(visit_row["lpips"]), tb_step)
+                base.logger.info(
+                    "VALIDATION_V8_BLOCK_VISIT mode=%s block_order=%s scene_id=%s segment_id=%s "
+                    "block=%s visit=%s/%s source_frame=%s target_frames=%s loss=%.6f",
+                    validation_mode,
+                    str(validation_cfg.block_order),
+                    int(spec.scene_id),
+                    int(spec.segment_id),
+                    int(block_idx_in_episode),
+                    int(visit_idx + 1),
+                    int(len(spec.block_visit_order)),
+                    int(src_frame),
+                    [int(x) for x in block_frames],
+                    float(step_result.get("loss", 0.0)),
+                )
+            if not visit_rows:
+                continue
+
+            episode_row = {
+                "split": "validation_v8",
                 "mode": validation_mode,
                 "block_order": str(validation_cfg.block_order),
                 "trigger_train_episode_counter": int(trigger_train_episode_counter),
@@ -301,107 +373,62 @@ def _run_validation_v8_round(
                 "scene_id": int(spec.scene_id),
                 "segment_id": int(spec.segment_id),
                 "episode_start_keyframe_pos": int(spec.episode_start_keyframe_pos),
-                "visit_idx": int(visit_idx + 1),
-                "num_visits_total": int(len(spec.block_visit_order)),
-                "block_idx_in_episode": int(block_idx_in_episode),
-                "source_frame": int(src_frame),
-                "target_frames": [int(x) for x in block_frames],
-                "loss": float(step_result.get("loss", 0.0)),
-                **visit_metrics,
+                "num_visits": int(len(visit_rows)),
+                "num_views": float(np.mean([float(r["num_views"]) for r in visit_rows])),
+                "loss": float(np.mean([float(r["loss"]) for r in visit_rows])),
+                "psnr": float(np.mean([float(r["psnr"]) for r in visit_rows])),
+                "ssim": float(np.mean([float(r["ssim"]) for r in visit_rows])),
+                "lpips": float(np.mean([float(r["lpips"]) for r in visit_rows])),
+                "psnr_full": float(np.mean([float(r["psnr_full"]) for r in visit_rows])),
+                "ssim_full": float(np.mean([float(r["ssim_full"]) for r in visit_rows])),
+                "lpips_full": float(np.mean([float(r["lpips_full"]) for r in visit_rows])),
+                "psnr_non_sky": float(np.mean([float(r["psnr_non_sky"]) for r in visit_rows])),
+                "ssim_non_sky": float(np.mean([float(r["ssim_non_sky"]) for r in visit_rows])),
+                "lpips_non_sky": float(np.mean([float(r["lpips_non_sky"]) for r in visit_rows])),
+                "psnr_sky": float(np.mean([float(r["psnr_sky"]) for r in visit_rows])),
+                "ssim_sky": float(np.mean([float(r["ssim_sky"]) for r in visit_rows])),
+                "sky_mask_coverage": float(np.mean([float(r["sky_mask_coverage"]) for r in visit_rows])),
+                "metric_scope": (
+                    "non_sky"
+                    if bool(validation_cfg.use_sky_mask_regions)
+                    and any(str(r.get("metric_scope", "")) == "non_sky" for r in visit_rows)
+                    else "full_image"
+                ),
             }
-            visit_rows.append(visit_row)
+            all_episode_rows.append(episode_row)
             if metrics_fh is not None:
-                base._write_metrics_history(metrics_fh, visit_row)
+                base._write_metrics_history(metrics_fh, episode_row)
             if writer is not None:
                 tb_step = max(int(trigger_step), 0)
-                writer.add_scalar("validation_v8/visit/loss", float(visit_row["loss"]), tb_step)
-                writer.add_scalar("validation_v8/visit/psnr", float(visit_row["psnr"]), tb_step)
-                writer.add_scalar("validation_v8/visit/ssim", float(visit_row["ssim"]), tb_step)
-                writer.add_scalar("validation_v8/visit/lpips", float(visit_row["lpips"]), tb_step)
-            base.logger.info(
-                "VALIDATION_V8_BLOCK_VISIT mode=%s block_order=%s scene_id=%s segment_id=%s "
-                "block=%s visit=%s/%s source_frame=%s target_frames=%s loss=%.6f",
-                validation_mode,
-                str(validation_cfg.block_order),
-                int(spec.scene_id),
-                int(spec.segment_id),
-                int(block_idx_in_episode),
-                int(visit_idx + 1),
-                int(len(spec.block_visit_order)),
-                int(src_frame),
-                [int(x) for x in block_frames],
-                float(step_result.get("loss", 0.0)),
-            )
-        if not visit_rows:
-            continue
-
-        episode_row = {
-            "split": "validation_v8",
-            "mode": validation_mode,
-            "block_order": str(validation_cfg.block_order),
-            "trigger_train_episode_counter": int(trigger_train_episode_counter),
-            "trigger_step": int(trigger_step),
-            "scene_id": int(spec.scene_id),
-            "segment_id": int(spec.segment_id),
-            "episode_start_keyframe_pos": int(spec.episode_start_keyframe_pos),
-            "num_visits": int(len(visit_rows)),
-            "num_views": float(np.mean([float(r["num_views"]) for r in visit_rows])),
-            "loss": float(np.mean([float(r["loss"]) for r in visit_rows])),
-            "psnr": float(np.mean([float(r["psnr"]) for r in visit_rows])),
-            "ssim": float(np.mean([float(r["ssim"]) for r in visit_rows])),
-            "lpips": float(np.mean([float(r["lpips"]) for r in visit_rows])),
-            "psnr_full": float(np.mean([float(r["psnr_full"]) for r in visit_rows])),
-            "ssim_full": float(np.mean([float(r["ssim_full"]) for r in visit_rows])),
-            "lpips_full": float(np.mean([float(r["lpips_full"]) for r in visit_rows])),
-            "psnr_non_sky": float(np.mean([float(r["psnr_non_sky"]) for r in visit_rows])),
-            "ssim_non_sky": float(np.mean([float(r["ssim_non_sky"]) for r in visit_rows])),
-            "lpips_non_sky": float(np.mean([float(r["lpips_non_sky"]) for r in visit_rows])),
-            "psnr_sky": float(np.mean([float(r["psnr_sky"]) for r in visit_rows])),
-            "ssim_sky": float(np.mean([float(r["ssim_sky"]) for r in visit_rows])),
-            "sky_mask_coverage": float(np.mean([float(r["sky_mask_coverage"]) for r in visit_rows])),
-            "metric_scope": (
-                "non_sky"
-                if bool(validation_cfg.use_sky_mask_regions)
-                and any(str(r.get("metric_scope", "")) == "non_sky" for r in visit_rows)
-                else "full_image"
-            ),
-        }
-        all_episode_rows.append(episode_row)
-        if metrics_fh is not None:
-            base._write_metrics_history(metrics_fh, episode_row)
-        if writer is not None:
-            tb_step = max(int(trigger_step), 0)
-            sid = int(spec.scene_id)
-            seg = int(spec.segment_id)
-            writer.add_scalar(
-                f"validation_v8/episode/psnr/scene_{sid:03d}_segment_{seg:03d}",
-                float(episode_row["psnr"]),
-                tb_step,
-            )
-            writer.add_scalar(
-                f"validation_v8/episode/ssim/scene_{sid:03d}_segment_{seg:03d}",
-                float(episode_row["ssim"]),
-                tb_step,
-            )
-            writer.add_scalar(
-                f"validation_v8/episode/lpips/scene_{sid:03d}_segment_{seg:03d}",
-                float(episode_row["lpips"]),
-                tb_step,
-            )
-            writer.add_scalar(
-                f"validation_v8/episode/loss/scene_{sid:03d}_segment_{seg:03d}",
-                float(episode_row["loss"]),
-                tb_step,
-            )
-        spec_dir = os.path.join(
-            val_root,
-            f"scene_{int(spec.scene_id):03d}",
-            f"segment_{int(spec.segment_id):03d}",
-            f"episode_start_{int(spec.episode_start_keyframe_pos):03d}",
-        )
-        os.makedirs(spec_dir, exist_ok=True)
-        with open(os.path.join(spec_dir, "summary_v8.json"), "w", encoding="utf-8") as f:
-            json.dump(episode_row, f, indent=2)
+                sid = int(spec.scene_id)
+                seg = int(spec.segment_id)
+                writer.add_scalar(
+                    f"validation_v8/episode/psnr/scene_{sid:03d}_segment_{seg:03d}",
+                    float(episode_row["psnr"]),
+                    tb_step,
+                )
+                writer.add_scalar(
+                    f"validation_v8/episode/ssim/scene_{sid:03d}_segment_{seg:03d}",
+                    float(episode_row["ssim"]),
+                    tb_step,
+                )
+                writer.add_scalar(
+                    f"validation_v8/episode/lpips/scene_{sid:03d}_segment_{seg:03d}",
+                    float(episode_row["lpips"]),
+                    tb_step,
+                )
+                writer.add_scalar(
+                    f"validation_v8/episode/loss/scene_{sid:03d}_segment_{seg:03d}",
+                    float(episode_row["loss"]),
+                    tb_step,
+                )
+            os.makedirs(spec_dir, exist_ok=True)
+            with open(os.path.join(spec_dir, "summary_v8.json"), "w", encoding="utf-8") as f:
+                json.dump(episode_row, f, indent=2)
+    finally:
+        if use_train_finetune and base_ckpt_bytes is not None:
+            base._restore_train_checkpoint_bytes(model, base_ckpt_bytes, device)
+            model.train()
 
     if len(all_episode_rows) > 0:
         global_row = {
@@ -445,6 +472,9 @@ def _run_validation_v8_round(
             writer.add_scalar("validation_v8/global/psnr", float(global_row["psnr"]), tb_step)
             writer.add_scalar("validation_v8/global/ssim", float(global_row["ssim"]), tb_step)
             writer.add_scalar("validation_v8/global/lpips", float(global_row["lpips"]), tb_step)
+
+    # Keep validation runtime state isolated from subsequent training iterations.
+    model.reset_node_state()
 
 
 def _setup_v8(args: Any) -> Any:

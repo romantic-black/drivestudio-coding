@@ -1622,9 +1622,14 @@ def main() -> None:
                 mean_loss: Optional[float] = None
                 if acc is not None and int(acc.get("loss_count", 0)) > 0:
                     mean_loss = float(acc["loss_sum"]) / float(acc["loss_count"])
+                # Monitoring metrics are logging-only; detach to avoid extra autograd graph/memory.
+                pred_rgbs_eval = [p.detach() for p in pred_rgbs]
+                gt_images_eval = [g.detach() for g in gt_images]
                 mse_vals = [
                     float(
-                        torch.mean((torch.clamp(pred_rgbs[v], 0.0, 1.0) - torch.clamp(gt_images[v], 0.0, 1.0)) ** 2).item()
+                        torch.mean(
+                            (torch.clamp(pred_rgbs_eval[v], 0.0, 1.0) - torch.clamp(gt_images_eval[v], 0.0, 1.0)) ** 2
+                        ).item()
                     )
                     for v in range(num_views)
                 ]
@@ -1643,71 +1648,72 @@ def main() -> None:
                     ssim_non_sky_list: List[float] = []
                     lpips_non_sky_list: List[float] = []
                     non_sky_metric_views = 0
-                    for v in range(num_views):
-                        v_vals = _compute_metrics(
-                            pred_rgb=pred_rgbs[v],
-                            gt_rgb=gt_images[v],
-                            psnr_metric=psnr_metric,
-                            ssim_metric=ssim_metric,
-                            lpips_metric=lpips_metric,
-                            compute_psnr=True,
-                            compute_heavy=True,
-                        )
-                        psnr_full = float(v_vals["psnr"])
-                        ssim_full = float(v_vals["ssim"])
-                        lpips_full = float(v_vals["lpips"])
-                        psnr_full_list.append(psnr_full)
-                        ssim_full_list.append(ssim_full)
-                        lpips_full_list.append(lpips_full)
+                    with torch.no_grad():
+                        for v in range(num_views):
+                            v_vals = _compute_metrics(
+                                pred_rgb=pred_rgbs_eval[v],
+                                gt_rgb=gt_images_eval[v],
+                                psnr_metric=psnr_metric,
+                                ssim_metric=ssim_metric,
+                                lpips_metric=lpips_metric,
+                                compute_psnr=True,
+                                compute_heavy=True,
+                            )
+                            psnr_full = float(v_vals["psnr"])
+                            ssim_full = float(v_vals["ssim"])
+                            lpips_full = float(v_vals["lpips"])
+                            psnr_full_list.append(psnr_full)
+                            ssim_full_list.append(ssim_full)
+                            lpips_full_list.append(lpips_full)
 
-                        psnr_primary = psnr_full
-                        ssim_primary = ssim_full
-                        lpips_primary = lpips_full
-                        if train_monitor_use_non_sky_region:
-                            tgt_view = minimal_batch["targets"][v]
-                            sky_mask = tgt_view.get("sky_mask")
-                            if sky_mask is None and train_monitor_require_sky_mask:
-                                raise ValueError(
-                                    "train monitor non-sky metrics require target['sky_mask'] "
-                                    f"(view={int(v)}, scene={int(minimal_batch.get('scene_id', -1))}, "
-                                    f"segment={int(minimal_batch.get('segment_id', -1))})."
-                                )
-                            if sky_mask is not None:
-                                sm = sky_mask.to(device).float()
-                                if sm.dim() == 3:
-                                    sm = sm.squeeze(-1)
-                                if sm.shape != gt_images[v].shape[:2]:
+                            psnr_primary = psnr_full
+                            ssim_primary = ssim_full
+                            lpips_primary = lpips_full
+                            if train_monitor_use_non_sky_region:
+                                tgt_view = minimal_batch["targets"][v]
+                                sky_mask = tgt_view.get("sky_mask")
+                                if sky_mask is None and train_monitor_require_sky_mask:
                                     raise ValueError(
-                                        "train monitor sky_mask shape mismatch: "
-                                        f"sky_mask={tuple(sm.shape)} gt_hw={tuple(gt_images[v].shape[:2])}"
+                                        "train monitor non-sky metrics require target['sky_mask'] "
+                                        f"(view={int(v)}, scene={int(minimal_batch.get('scene_id', -1))}, "
+                                        f"segment={int(minimal_batch.get('segment_id', -1))})."
                                     )
-                                non_sky_mask = (1.0 - sm).clamp(0.0, 1.0)
-                                if int((non_sky_mask > 0.5).sum().item()) >= train_monitor_min_valid_pixels:
-                                    psnr_non = _compute_masked_psnr(pred_rgbs[v], gt_images[v], non_sky_mask)
-                                    ssim_non = _compute_masked_ssim(pred_rgbs[v], gt_images[v], non_sky_mask)
-                                    lpips_non = _compute_masked_lpips(
-                                        pred_rgbs[v],
-                                        gt_images[v],
-                                        non_sky_mask,
-                                        lpips_metric,
-                                    )
-                                    if psnr_non is not None:
-                                        psnr_primary = float(psnr_non)
-                                        psnr_non_sky_list.append(float(psnr_non))
-                                    if ssim_non is not None:
-                                        ssim_primary = float(ssim_non)
-                                        ssim_non_sky_list.append(float(ssim_non))
-                                    if lpips_non is not None:
-                                        lpips_primary = float(lpips_non)
-                                        lpips_non_sky_list.append(float(lpips_non))
-                                    non_sky_metric_views += 1
+                                if sky_mask is not None:
+                                    sm = sky_mask.to(device).float()
+                                    if sm.dim() == 3:
+                                        sm = sm.squeeze(-1)
+                                    if sm.shape != gt_images_eval[v].shape[:2]:
+                                        raise ValueError(
+                                            "train monitor sky_mask shape mismatch: "
+                                            f"sky_mask={tuple(sm.shape)} gt_hw={tuple(gt_images_eval[v].shape[:2])}"
+                                        )
+                                    non_sky_mask = (1.0 - sm).clamp(0.0, 1.0)
+                                    if int((non_sky_mask > 0.5).sum().item()) >= train_monitor_min_valid_pixels:
+                                        psnr_non = _compute_masked_psnr(pred_rgbs_eval[v], gt_images_eval[v], non_sky_mask)
+                                        ssim_non = _compute_masked_ssim(pred_rgbs_eval[v], gt_images_eval[v], non_sky_mask)
+                                        lpips_non = _compute_masked_lpips(
+                                            pred_rgbs_eval[v],
+                                            gt_images_eval[v],
+                                            non_sky_mask,
+                                            lpips_metric,
+                                        )
+                                        if psnr_non is not None:
+                                            psnr_primary = float(psnr_non)
+                                            psnr_non_sky_list.append(float(psnr_non))
+                                        if ssim_non is not None:
+                                            ssim_primary = float(ssim_non)
+                                            ssim_non_sky_list.append(float(ssim_non))
+                                        if lpips_non is not None:
+                                            lpips_primary = float(lpips_non)
+                                            lpips_non_sky_list.append(float(lpips_non))
+                                        non_sky_metric_views += 1
 
-                        psnr_primary_list.append(psnr_primary)
-                        ssim_primary_list.append(ssim_primary)
-                        lpips_primary_list.append(lpips_primary)
-                        if train_monitor_include_per_view_metrics:
-                            metric_vals[f"psnr_view{v}"] = float(psnr_primary)
-                            metric_vals[f"psnr_full_view{v}"] = float(psnr_full)
+                            psnr_primary_list.append(psnr_primary)
+                            ssim_primary_list.append(ssim_primary)
+                            lpips_primary_list.append(lpips_primary)
+                            if train_monitor_include_per_view_metrics:
+                                metric_vals[f"psnr_view{v}"] = float(psnr_primary)
+                                metric_vals[f"psnr_full_view{v}"] = float(psnr_full)
 
                     metric_vals["psnr_mean"] = float(np.mean(psnr_primary_list)) if psnr_primary_list else 0.0
                     metric_vals["ssim_mean"] = float(np.mean(ssim_primary_list)) if ssim_primary_list else 0.0
@@ -1753,8 +1759,8 @@ def main() -> None:
                                     )
                                 _save_image_triplet(
                                     step,
-                                    pred_rgbs[v],
-                                    gt_images[v],
+                                    pred_rgbs_eval[v],
+                                    gt_images_eval[v],
                                     out_low,
                                     view_suffix=vsuf,
                                     save_error=False,

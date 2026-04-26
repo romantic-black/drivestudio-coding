@@ -8,7 +8,7 @@ Minimal StreetForward Stage 5.2:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -1159,6 +1159,50 @@ class MinimalStreetForwardStage5_2(MinimalStreetForwardStage4_6):
             "stage5_2_history_rigid_support_mean": float(hist_rigid["support_ema"].mean().item()) if hist_rigid["support_ema"].numel() > 0 else 0.0,
             "stage5_2_history_rigid_error_mean": float(hist_rigid["error_ema"].mean().item()) if hist_rigid["error_ema"].numel() > 0 else 0.0,
             **({"stage5_2_block_exit_block_idx_global": float(event.get("block_idx_global", -1))} if isinstance(event, dict) else {}),
+        }
+
+    @torch.no_grad()
+    def demo_infer_step(
+        self,
+        batch: Dict[str, Any],
+        *,
+        scheduler_events: Optional[List[Dict[str, Any]]] = None,
+        update_node_state: bool = True,
+        update_hidden_state: bool = True,
+        update_history_memory: bool = True,
+    ) -> Dict[str, Any]:
+        del scheduler_events
+        prev_mode = self.training
+        self.eval()
+        out = self.forward(batch)
+        if update_history_memory:
+            self._update_last_step_update_norm_from_out(out)
+        if update_hidden_state and "_cache_key" in out:
+            key = out["_cache_key"]
+            if out.get("_h_new_bg") is not None:
+                self.h_cache_bg[key] = out["_h_new_bg"].detach()
+            if out.get("_h_new_distant") is not None:
+                self.h_cache_distant[key] = out["_h_new_distant"].detach()
+            if out.get("_h_new_rigid") is not None:
+                self.h_cache_rigid[key] = out["_h_new_rigid"].detach()
+        if update_node_state:
+            self._writeback_node_states_from_out(out)
+        if prev_mode:
+            self.train()
+        loss_val = out.get("loss")
+        return {
+            "loss": loss_val.item() if torch.is_tensor(loss_val) else float(loss_val) if loss_val is not None else 0.0,
+            "pred_rgbs": out.get("pred_rgbs"),
+            "gt_images": out.get("gt_images"),
+            "pred_rgb": out.get("pred_rgb"),
+            "gt_image": out.get("gt_image"),
+            "num_targets": len(batch.get("targets", [])),
+            "num_source_views": len(batch.get("source_views", [])),
+            "num_bg_update": int(out.get("_num_bg_update", 0)),
+            "num_distant_update": int(out.get("_num_distant_update", 0)),
+            "num_rigid_update": int(out.get("_num_rigid_update", 0)),
+            "rigid_writeback_count": int(out.get("rigid_writeback_count", 0)),
+            "stage5_2_demo_history_update_enabled": 1.0 if update_history_memory else 0.0,
         }
 
 
