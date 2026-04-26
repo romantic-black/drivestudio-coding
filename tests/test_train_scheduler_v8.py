@@ -194,3 +194,55 @@ def test_v8_block_begin_additional_chain_hint_uses_episode_chain_scope():
     events = sch.pop_events()
     scopes = [str(e.get("hint_scope")) for e in events if e.get("type") == "preload_hint"]
     assert "episode_chain_exact" in scopes
+
+
+def test_v8_production_state_dict_requires_episode_boundary():
+    ds = _make_mock_dataset()
+    sch = _build_scheduler(ds, steps_per_block=2, block_order="step_major", step_major_switch_interval_steps=1)
+    sch.next_batch()
+    assert sch.is_at_episode_boundary() is False
+    with pytest.raises(ValueError, match="episode boundary"):
+        sch.production_state_dict()
+
+
+def test_v8_load_production_state_rejects_mid_episode_payload():
+    ds = _make_mock_dataset()
+    sch = _build_scheduler(ds)
+    with pytest.raises(ValueError, match="mid-episode"):
+        sch.load_production_state_dict(
+            {
+                "epoch_idx": 1,
+                "global_step": 0,
+                "block_idx_global": 0,
+                "episode_idx_global": 0,
+                "plan_cursor": 0,
+                "epoch_plan": [],
+                "episode_cursor_plan": [],
+                "segment_runtime": [],
+                "current_episode_state": {"dummy": 1},
+            }
+        )
+
+
+def test_v8_production_state_roundtrip_starts_from_next_episode():
+    ds = _make_mock_dataset()
+    sch = _build_scheduler(ds, steps_per_block=2, block_order="step_major", step_major_switch_interval_steps=1)
+    total_steps = int(sch.steps_per_block * sch.blocks_per_episode)
+    for _ in range(total_steps):
+        sch.next_batch()
+    assert sch.is_at_episode_boundary() is True
+    state = sch.production_state_dict()
+
+    ds2 = _make_mock_dataset()
+    sch2 = _build_scheduler(ds2, steps_per_block=2, block_order="step_major", step_major_switch_interval_steps=1)
+    sch2.load_production_state_dict(state)
+    assert sch2.is_at_episode_boundary() is True
+    assert int(sch2.global_step) == int(sch.global_step)
+    assert int(sch2.plan_cursor) == int(sch.plan_cursor)
+
+    b1 = sch.next_batch()
+    b2 = sch2.next_batch()
+    i1 = b1["_scheduler_v8_aligned_info"]
+    i2 = b2["_scheduler_v8_aligned_info"]
+    assert int(i1["source_frame_idx"]) == int(i2["source_frame_idx"])
+    assert [int(x) for x in i1["target_frame_indices"]] == [int(x) for x in i2["target_frame_indices"]]

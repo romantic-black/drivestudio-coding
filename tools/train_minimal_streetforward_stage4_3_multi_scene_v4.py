@@ -70,6 +70,11 @@ from tools.train_minimal_streetforward_stage4_3_v4_common import (
     resolve_fixed_scene_segment,
 )
 from tools.upload_to_vika import upload_experiment_summary
+from tools.streetforward_checkpointing import (
+    _prune_keep_last_k,
+    load_stage5_3_production_lightweight_checkpoint,
+    save_stage5_3_production_lightweight_checkpoint,
+)
 from utils.minimal_batch_view_selection import parse_view_selection
 from utils.streetforward_baseline import set_deterministic_seed
 
@@ -1117,9 +1122,37 @@ def main() -> None:
             rp,
         )
 
-    max_iterations = args.max_steps or cfg.training.get("max_iterations", 1000)
+    max_iterations = int(args.max_steps or cfg.training.get("max_iterations", 1000))
+    start_step = 0
     log_interval = cfg.training.get("log_interval", 50)
     save_every = cfg.training.get("save_checkpoint_freq", 500)
+    checkpoint_cfg = cfg.get("checkpoint") if hasattr(cfg, "get") else None
+    use_lightweight_ckpt = bool(checkpoint_cfg is not None and str(checkpoint_cfg.get("type", "")) == "lightweight")
+    lightweight_save_every_n_episodes = 0
+    lightweight_keep_last_k = 0
+    lightweight_resume_path: Optional[str] = None
+    lightweight_save_at = "episode_end"
+    if use_lightweight_ckpt:
+        lightweight_save_at = str(checkpoint_cfg.get("save_at", "episode_end"))
+        if lightweight_save_at != "episode_end":
+            raise ValueError("checkpoint.save_at must be episode_end for lightweight checkpoints.")
+        if bool(checkpoint_cfg.get("allow_mid_episode_save", False)):
+            raise ValueError("lightweight checkpoint does not allow mid-episode save.")
+        if bool(checkpoint_cfg.get("allow_mid_block_save", False)):
+            raise ValueError("lightweight checkpoint does not allow mid-block save.")
+        lightweight_save_every_n_episodes = int(checkpoint_cfg.get("save_every_n_episodes", 0))
+        if lightweight_save_every_n_episodes < 1:
+            raise ValueError("checkpoint.save_every_n_episodes must be >= 1 for lightweight checkpoints.")
+        lightweight_keep_last_k = int(checkpoint_cfg.get("keep_last_k", 0))
+        lightweight_resume_path_raw = checkpoint_cfg.get("resume")
+        if lightweight_resume_path_raw is not None:
+            lightweight_resume_path = str(lightweight_resume_path_raw)
+        if not hasattr(scheduler, "is_at_episode_boundary"):
+            raise ValueError("lightweight checkpoint requires train scheduler is_at_episode_boundary().")
+        if not hasattr(scheduler, "production_state_dict") or not hasattr(scheduler, "load_production_state_dict"):
+            raise ValueError("lightweight checkpoint requires scheduler production state APIs.")
+        if args.init_checkpoint:
+            raise ValueError("--init_checkpoint cannot be used together with checkpoint.type=lightweight.")
     enable_psnr = bool(cfg.eval.get("enable_psnr", True))
     train_monitor_cfg = cfg.logging.get("train_monitor") or {}
     train_monitor_enable_heavy_metrics = bool(train_monitor_cfg.get("enable_heavy_metrics", True))
@@ -1249,6 +1282,36 @@ def main() -> None:
         device,
         weights_only=bool(args.init_weights_only),
     )
+    if use_lightweight_ckpt and lightweight_resume_path:
+        resumed = load_stage5_3_production_lightweight_checkpoint(
+            lightweight_resume_path,
+            model=model,
+            optimizer=model.optimizer,
+            lr_scheduler=model.lr_scheduler,
+            grad_scaler=model.grad_scaler,
+            train_scheduler=scheduler,
+            strict=True,
+        )
+        logger.info(
+            "Loaded lightweight checkpoint from %s (global_step=%s epoch_idx=%s).",
+            lightweight_resume_path,
+            int(resumed["global_step"]),
+            int(resumed["epoch_idx"]),
+        )
+        start_step = int(resumed["global_step"])
+        if start_step < 0:
+            raise ValueError(f"Invalid resume global_step={start_step}, expected >= 0.")
+        if start_step > int(max_iterations):
+            raise ValueError(
+                f"Resume global_step={start_step} exceeds max_iterations={int(max_iterations)}."
+            )
+        train_episode_counter = int(getattr(scheduler, "_episode_idx_global", train_episode_counter))
+        logger.info(
+            "Resume cursor set: start_step=%s train_episode_counter=%s scheduler_global_step=%s",
+            int(start_step),
+            int(train_episode_counter),
+            int(getattr(scheduler, "global_step", -1)),
+        )
 
     psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
     ssim_metric = SSIM(data_range=1.0, size_average=True, channel=3).to(device)
@@ -1299,7 +1362,7 @@ def main() -> None:
                 writer=writer,
             )
 
-        for step in range(max_iterations):
+        for step in range(int(start_step), int(max_iterations)):
             iter_t0 = time.perf_counter()
             fetch_t0 = time.perf_counter()
             raw_batch = scheduler.next_batch()
@@ -1311,8 +1374,10 @@ def main() -> None:
 
             step_events = scheduler.pop_events()
             validation_due_episode_counters: List[int] = []
+            saw_episode_end = False
             for ev in step_events:
                 if ev.get("type") == "episode_end":
+                    saw_episode_end = True
                     train_episode_counter += 1
                     if bool(validation_v7_cfg.eval_enable):
                         if train_episode_counter % int(validation_v7_cfg.validate_every_n_episodes) == 0:
@@ -1920,7 +1985,39 @@ def main() -> None:
                 validation_ms = float((time.perf_counter() - val_t0) * 1000.0)
 
             checkpoint_ms = 0.0
-            if save_every and step > 0 and step % save_every == 0:
+            if use_lightweight_ckpt:
+                should_save_lightweight = (
+                    bool(saw_episode_end)
+                    and int(train_episode_counter) > 0
+                    and int(train_episode_counter) % int(lightweight_save_every_n_episodes) == 0
+                )
+                if should_save_lightweight:
+                    ckpt_t0 = time.perf_counter()
+                    scheduler_step = int(getattr(scheduler, "global_step", scheduler_info.get("global_step", step + 1)))
+                    ckpt_path = os.path.join(
+                        cfg.log_dir,
+                        "checkpoints",
+                        f"{CKPT_PREFIX}_ep{int(train_episode_counter):06d}_g{int(scheduler_step):08d}.pt",
+                    )
+                    save_stage5_3_production_lightweight_checkpoint(
+                        ckpt_path,
+                        model=model,
+                        optimizer=model.optimizer,
+                        lr_scheduler=model.lr_scheduler,
+                        grad_scaler=model.grad_scaler,
+                        train_scheduler=scheduler,
+                        global_step=scheduler_step,
+                        epoch_idx=int(getattr(scheduler, "epoch_idx", -1)),
+                        cfg=cfg,
+                    )
+                    _prune_keep_last_k(
+                        checkpoint_dir=os.path.join(cfg.log_dir, "checkpoints"),
+                        prefix=CKPT_PREFIX,
+                        keep_last_k=int(lightweight_keep_last_k),
+                    )
+                    logger.info("Saved lightweight checkpoint to %s", ckpt_path)
+                    checkpoint_ms = float((time.perf_counter() - ckpt_t0) * 1000.0)
+            elif save_every and step > 0 and step % save_every == 0:
                 ckpt_t0 = time.perf_counter()
                 ckpt_path = os.path.join(cfg.log_dir, "checkpoints", f"{CKPT_PREFIX}_step{step}.pt")
                 torch.save(
@@ -1992,11 +2089,30 @@ def main() -> None:
             dataset.shutdown_preload()
 
     final_ckpt = os.path.join(cfg.log_dir, "checkpoints", f"{CKPT_PREFIX}_final.pt")
-    torch.save(
-        {"step": max_iterations - 1, "model_state_dict": model.state_dict(), "optimizer_state_dict": model.optimizer.state_dict()},
-        final_ckpt,
-    )
-    logger.info("Saved final checkpoint to %s", final_ckpt)
+    if use_lightweight_ckpt:
+        if not bool(scheduler.is_at_episode_boundary()):
+            logger.warning(
+                "Skip final lightweight checkpoint because scheduler is not at episode boundary (mid-episode state not allowed)."
+            )
+        else:
+            save_stage5_3_production_lightweight_checkpoint(
+                final_ckpt,
+                model=model,
+                optimizer=model.optimizer,
+                lr_scheduler=model.lr_scheduler,
+                grad_scaler=model.grad_scaler,
+                train_scheduler=scheduler,
+                global_step=int(getattr(scheduler, "global_step", max_iterations - 1)),
+                epoch_idx=int(getattr(scheduler, "epoch_idx", -1)),
+                cfg=cfg,
+            )
+            logger.info("Saved final lightweight checkpoint to %s", final_ckpt)
+    else:
+        torch.save(
+            {"step": max_iterations - 1, "model_state_dict": model.state_dict(), "optimizer_state_dict": model.optimizer.state_dict()},
+            final_ckpt,
+        )
+        logger.info("Saved final checkpoint to %s", final_ckpt)
 
 
 if __name__ == "__main__":

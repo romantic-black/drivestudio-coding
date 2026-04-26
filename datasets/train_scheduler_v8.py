@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from datasets.train_scheduler_v7 import SegmentIndexLike, TrainSchedulerDatasetV7, TrainSchedulerV7
 
@@ -500,6 +500,104 @@ class TrainSchedulerV8(TrainSchedulerV7):
         if hasattr(self.dataset, "maybe_log_overlap_stats"):
             self.dataset.maybe_log_overlap_stats(int(self.global_step))
         return batch
+
+    @staticmethod
+    def _serialize_episode_plan(plan: EpisodePlanV8) -> Dict[str, Any]:
+        return {
+            "scene_id": int(plan.scene_id),
+            "segment_id": int(plan.segment_id),
+            "episode_start_keyframe_pos": int(plan.episode_start_keyframe_pos),
+            "keyframe_window": [int(x) for x in plan.keyframe_window],
+            "frame_chain": [int(x) for x in plan.frame_chain],
+            "num_cams": int(plan.num_cams),
+        }
+
+    @staticmethod
+    def _deserialize_episode_plan(payload: Dict[str, Any]) -> EpisodePlanV8:
+        return EpisodePlanV8(
+            scene_id=int(payload["scene_id"]),
+            segment_id=int(payload["segment_id"]),
+            episode_start_keyframe_pos=int(payload["episode_start_keyframe_pos"]),
+            keyframe_window=[int(x) for x in list(payload["keyframe_window"])],
+            frame_chain=[int(x) for x in list(payload["frame_chain"])],
+            num_cams=int(payload["num_cams"]),
+        )
+
+    def is_at_episode_boundary(self) -> bool:
+        return self.current_episode_state is None
+
+    def production_state_dict(self) -> Dict[str, Any]:
+        if self.current_episode_state is not None:
+            raise ValueError(
+                "TrainSchedulerV8 production_state_dict requires episode boundary (current_episode_state must be None)."
+            )
+        segment_runtime = []
+        for key, runtime in self._segment_runtime.items():
+            scene_id, segment_id = key
+            segment_runtime.append(
+                {
+                    "scene_id": int(scene_id),
+                    "segment_id": int(segment_id),
+                    "runtime": {
+                        "segment_local_step": int(runtime["segment_local_step"]),
+                        "block_idx_in_segment": int(runtime["block_idx_in_segment"]),
+                        "episodes_total": int(runtime["episodes_total"]),
+                        "episodes_started": int(runtime["episodes_started"]),
+                        "episodes_completed": int(runtime["episodes_completed"]),
+                        "segment_begun": bool(runtime["segment_begun"]),
+                        "segment_ended": bool(runtime["segment_ended"]),
+                    },
+                }
+            )
+        return {
+            "version": "v8_lightweight_episode_boundary",
+            "epoch_idx": int(self.epoch_idx),
+            "global_step": int(self.global_step),
+            "block_idx_global": int(self._block_idx_global),
+            "episode_idx_global": int(self._episode_idx_global),
+            "plan_cursor": int(self.plan_cursor),
+            "epoch_plan": [dict(item) for item in self.epoch_plan],
+            "episode_cursor_plan": [self._serialize_episode_plan(p) for p in self.episode_cursor_plan],
+            "segment_runtime": segment_runtime,
+            "current_episode_state": None,
+        }
+
+    def load_production_state_dict(self, state: Dict[str, Any]) -> None:
+        if not isinstance(state, dict):
+            raise ValueError("load_production_state_dict expects dict payload.")
+        if state.get("current_episode_state", None) is not None:
+            raise ValueError("Production resume rejects mid-episode scheduler state.")
+        self.epoch_idx = int(state["epoch_idx"])
+        self.global_step = int(state["global_step"])
+        self._block_idx_global = int(state["block_idx_global"])
+        self._episode_idx_global = int(state["episode_idx_global"])
+        self.plan_cursor = int(state["plan_cursor"])
+        self.epoch_plan = [dict(item) for item in list(state["epoch_plan"])]
+        self.episode_cursor_plan = [
+            self._deserialize_episode_plan(item) for item in list(state["episode_cursor_plan"])
+        ]
+        seg_runtime_payload = list(state["segment_runtime"])
+        segment_runtime: Dict[Tuple[int, int], Dict[str, Any]] = {}
+        for item in seg_runtime_payload:
+            scene_id = int(item["scene_id"])
+            segment_id = int(item["segment_id"])
+            rt = dict(item["runtime"])
+            segment_runtime[(scene_id, segment_id)] = {
+                "segment_local_step": int(rt["segment_local_step"]),
+                "block_idx_in_segment": int(rt["block_idx_in_segment"]),
+                "episodes_total": int(rt["episodes_total"]),
+                "episodes_started": int(rt["episodes_started"]),
+                "episodes_completed": int(rt["episodes_completed"]),
+                "segment_begun": bool(rt["segment_begun"]),
+                "segment_ended": bool(rt["segment_ended"]),
+            }
+        self._segment_runtime = segment_runtime
+        self.current_episode_state = None
+        self._pending_events = []
+        if self.plan_cursor < 0 or self.plan_cursor > len(self.episode_cursor_plan):
+            raise ValueError(
+                f"Invalid plan_cursor={self.plan_cursor} for len(episode_cursor_plan)={len(self.episode_cursor_plan)}"
+            )
 
     def get_current_info(self) -> Dict[str, Any]:
         out = dict(super().get_current_info())
