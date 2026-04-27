@@ -288,6 +288,8 @@ def _snapshot_train_checkpoint_bytes(model: Any) -> bytes:
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": model.optimizer.state_dict(),
     }
+    if hasattr(model, "build_light_checkpoint_extra"):
+        payload.update(model.build_light_checkpoint_extra(step=int(getattr(model.optimizer, "global_step", 0))))
     buffer = io.BytesIO()
     torch.save(payload, buffer)
     return buffer.getvalue()
@@ -298,7 +300,12 @@ def _restore_train_checkpoint_bytes(model: Any, ckpt_bytes: bytes, device: torch
         raise ValueError("validation segment_finetune_train requires model.optimizer")
     payload = torch.load(io.BytesIO(ckpt_bytes), map_location=device)
     model.load_state_dict(payload["model_state_dict"], strict=True)
-    model.optimizer.load_state_dict(payload["optimizer_state_dict"])
+    if hasattr(model, "load_optimizer_state_from_checkpoint"):
+        loaded = bool(model.load_optimizer_state_from_checkpoint(payload))
+        if not loaded and payload.get("optimizer_state_dict") is not None:
+            logger.warning("Skipped optimizer restore in _restore_train_checkpoint_bytes due to signature mismatch.")
+    else:
+        model.optimizer.load_state_dict(payload["optimizer_state_dict"])
 
 
 def _iter_episode_block_indices(
@@ -1923,8 +1930,15 @@ def main() -> None:
             if save_every and step > 0 and step % save_every == 0:
                 ckpt_t0 = time.perf_counter()
                 ckpt_path = os.path.join(cfg.log_dir, "checkpoints", f"{CKPT_PREFIX}_step{step}.pt")
+                ckpt_payload = {
+                    "step": step,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": model.optimizer.state_dict(),
+                }
+                if hasattr(model, "build_light_checkpoint_extra"):
+                    ckpt_payload.update(model.build_light_checkpoint_extra(step=int(step)))
                 torch.save(
-                    {"step": step, "model_state_dict": model.state_dict(), "optimizer_state_dict": model.optimizer.state_dict()},
+                    ckpt_payload,
                     ckpt_path,
                 )
                 logger.info("Saved checkpoint to %s", ckpt_path)
@@ -1992,8 +2006,15 @@ def main() -> None:
             dataset.shutdown_preload()
 
     final_ckpt = os.path.join(cfg.log_dir, "checkpoints", f"{CKPT_PREFIX}_final.pt")
+    final_payload = {
+        "step": max_iterations - 1,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": model.optimizer.state_dict(),
+    }
+    if hasattr(model, "build_light_checkpoint_extra"):
+        final_payload.update(model.build_light_checkpoint_extra(step=int(max_iterations - 1)))
     torch.save(
-        {"step": max_iterations - 1, "model_state_dict": model.state_dict(), "optimizer_state_dict": model.optimizer.state_dict()},
+        final_payload,
         final_ckpt,
     )
     logger.info("Saved final checkpoint to %s", final_ckpt)

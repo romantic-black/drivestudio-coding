@@ -102,7 +102,15 @@ def _load_init_checkpoint(
     if not weights_only:
         od = ckpt.get("optimizer_state_dict")
         if od is not None:
-            model.optimizer.load_state_dict(od)
+            if hasattr(model, "load_optimizer_state_from_checkpoint"):
+                loaded = bool(model.load_optimizer_state_from_checkpoint(ckpt))
+                if not loaded:
+                    logger.warning(
+                        "Skipped optimizer restore from %s due to signature mismatch; using rebuilt optimizer.",
+                        path,
+                    )
+            else:
+                model.optimizer.load_state_dict(od)
     logger.info(
         "Loaded init_checkpoint from %s (saved_step=%s, weights_only=%s)",
         path,

@@ -1,4 +1,4 @@
-output_name: experiment002_120w
+output_name: experiment002_120w_adamw_warmcos
 
 data:
   data_root: "/root/autodl-tmp/nuScenes/"
@@ -145,6 +145,7 @@ validation_v8:
 
 model:
   stage: "5_3"
+  production_training: true
   scale_init_value: 0.1
   sh_degree: 1
   voxel_size: 0.2
@@ -273,6 +274,9 @@ model:
       init: {scale_init: {mode: knn, isotropic_log_value: -2.90, knn_k: 8, knn_log_scale_bias: -1.5}, opacity_init: 0.2}
       eta: {means: 0.5, scales: 0.8, opacity: 0.8, sh_dc: 0.8, sh_rest: 0.5}
 
+training_recipe:
+  name: stage5_3_adamw_warmcos_v1
+
 losses:
   photometric:
     exclude_sky_region: true
@@ -282,15 +286,108 @@ losses:
   opacity_entropy: {w: 0.0}
 
 optimizer:
+  type: adamw
   lr: 1.0e-4
-  eps: 1.0e-15
-  weight_decay: 0.0
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 1.0e-4
+  filter_frozen: true
+  no_weight_decay:
+    enable: true
+    name_keywords:
+      - ".bias"
+      - "bias"
+      - "norm"
+      - "Norm"
+      - "ln"
+      - "LayerNorm"
+      - "embedding"
+      - "Embedding"
+    ndim_leq: 1
+  groups:
+    dino:
+      match:
+        prefixes:
+          - "image_feature_extractor.dino"
+          - "image_feature_extractor.dino_backbone"
+      lr: 0.0
+      weight_decay: 0.0
+    residual_unet:
+      match:
+        prefixes:
+          - "image_feature_extractor.residual"
+          - "image_feature_extractor.residual_unet"
+      lr: 1.0e-4
+      weight_decay: 1.0e-4
+    fusion_neck:
+      match:
+        prefixes:
+          - "image_feature_extractor.fusion"
+          - "image_feature_extractor.fusion_neck"
+      lr: 1.5e-4
+      weight_decay: 1.0e-4
+    struct_near_xcpe:
+      match:
+        prefixes:
+          - "struct_decoder.near_decoder"
+      lr: 1.5e-4
+      weight_decay: 1.0e-4
+    struct_far_mlp:
+      match:
+        prefixes:
+          - "struct_decoder.far_decoder"
+      lr: 1.0e-4
+      weight_decay: 1.0e-4
+    gate_history:
+      match:
+        prefixes:
+          - "stage5_2_history_proj"
+          - "stage5_2_gate_branch_embed"
+          - "stage5_2_gate_mlp"
+      lr: 5.0e-5
+      weight_decay: 0.0
+    recurrent_update:
+      match:
+        contains:
+          - "offset_gru"
+          - "mlp_offset"
+          - "mlp_conv"
+          - "mlp_opacity"
+          - "gaussion_decoder"
+          - "gaussian_decoder"
+      lr: 8.0e-5
+      weight_decay: 5.0e-5
+    default:
+      lr: 1.0e-4
+      weight_decay: 1.0e-4
+
+lr_scheduler:
+  enable: true
+  type: warmup_cosine
+  interval: step
+  warmup_steps: 3000
+  total_steps: ${training.max_iterations}
+  min_lr_ratio: 0.05
+  warmup_start_ratio: 0.05
 
 training:
   max_iterations: 10000010
   log_interval: 100
   save_checkpoint_freq: 10000
   seed: 41
+  amp:
+    enable: false
+    dtype: fp16
+  grad_clip:
+    enable: true
+    max_norm: 1.0
+    norm_type: 2.0
+  bad_step:
+    policy: fast_fail
+    fail_on_nonfinite_loss: true
+    fail_on_nonfinite_grad: true
+    fail_on_amp_overflow: false
+    fail_on_grad_norm_gt: 100.0
 
 eval:
   enable_psnr: true
@@ -299,7 +396,7 @@ eval:
 
 logging:
   output_root: /root/autodl-tmp/outputs
-  project: minimal_sf_stage5_3_multi_scene_v8
+  project: minimal_sf_stage5_3_multi_scene_v8_adamw_warmcos
   log_dir: null
   image_interval_blocks: 96
   train_monitor:
