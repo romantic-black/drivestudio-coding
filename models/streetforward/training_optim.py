@@ -123,13 +123,24 @@ def _use_no_weight_decay(name: str, p: torch.nn.Parameter, cfg: _NoDecayCfg) -> 
     return any(kw in name for kw in cfg.name_keywords)
 
 
+def _prefix_match(name: str, prefix: str) -> bool:
+    p = str(prefix).strip()
+    if not p:
+        return False
+    if name == p:
+        return True
+    if p.endswith("."):
+        return name.startswith(p)
+    return name.startswith(p + ".")
+
+
 def _match_group(name: str, match_cfg: Any) -> bool:
     if match_cfg is None:
         return False
     prefixes = list(_cfg_get(match_cfg, "prefixes", []))
     contains = list(_cfg_get(match_cfg, "contains", []))
     for p in prefixes:
-        if name.startswith(str(p)):
+        if _prefix_match(name, str(p)):
             return True
     for c in contains:
         if str(c) in name:
@@ -250,7 +261,7 @@ def build_streetforward_optimizer(
             num_trainable += int(p.numel())
         else:
             num_frozen += int(p.numel())
-            if dino_prefixes and any(name.startswith(px) for px in dino_prefixes):
+            if dino_prefixes and any(_prefix_match(name, px) for px in dino_prefixes):
                 frozen_dino_count += int(p.numel())
 
         if filter_frozen and not p.requires_grad:

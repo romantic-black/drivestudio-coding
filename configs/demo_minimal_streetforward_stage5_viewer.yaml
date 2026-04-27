@@ -7,17 +7,10 @@ data:
   end_timestep: -1
   preload_device: cpu
   sky_mask_semantics: one_is_sky
-  train_scene_ids: [5, 6, 7, 8, 9,14, 16, 24, 32, 40, 99, 107, 115, 123, 131, 139, 147, 155, 163, 171, 179, 195, 214,
-    17, 25, 33, 41, 49, 100, 108, 116, 124, 132, 140, 148, 156, 164, 172, 180, 188, 196, 215,
-    10, 18, 26, 34, 42, 93, 101, 109, 117, 125, 133, 141, 149, 157, 165, 173, 181, 189, 197, 216,
-    11, 19, 27, 35, 43, 94, 102, 110, 118, 126, 134, 142, 150, 158, 166, 174, 182, 190, 198, 217,
-    12, 20, 36, 44, 95, 103, 111, 119, 127, 135, 143, 151, 159, 167, 175, 183, 191, 199, 218,
-    13, 21, 29, 37, 45, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200,
-    22, 30, 38, 46, 97, 105, 113, 121, 129, 137, 145, 153, 161, 169, 177, 185, 193, 201,
-    15, 23, 31, 39, 47, 98, 106, 114, 122, 130, 138, 146, 154, 162, 170, 178, 186, 194]
-  eval_scene_ids: [0, 1, 2, 3, 4]
+  train_scene_ids: [0, 1, 2, 3, 4]
+  eval_scene_ids: []
   preload:
-    enable: true
+    enable: false
     num_workers: 1
     max_pending_tasks: 64
     dedupe_tasks: true
@@ -88,7 +81,7 @@ dataset:
       traj_length_thresh_m: 0.5
 
 scheduler_v8:
-  enable: true
+  enable: false
   block:
     steps_per_block: 8
   episode:
@@ -122,6 +115,26 @@ model:
   sparseConv_outdim: 32
   feat_2d_channels: 32
   feat_2d_downscale: 1
+  feature_extractor:
+    type: dinov2_unet_fusion
+    dino:
+      model_name: vit_base_patch14_reg4_dinov2
+      pretrained: true
+      freeze: true
+      weights_path: null
+      out_channels: 32
+      intermediate_layers: [4, 8, 11]
+      pad_to_patch_multiple: 14
+    residual_unet:
+      in_channels: 6
+      feat_channels: 32
+      base_channels: 32
+      feature_downscale: 1
+      depth: 4
+      bilinear: true
+    fusion:
+      hidden_channels: 64
+      out_channels: 32
   use_fused_cuda_backproject_v2: true
   use_fused_cuda_backproject_v3: true
   use_fused_cuda_backproject_v4: false
@@ -184,11 +197,15 @@ model:
     enable: true
     record_on: "block_exit"
     record_views: "source_image_refs"
-    support_beta_visible: 0.75
-    support_beta_invisible: 0.90
-    error_beta: 0.75
-    update_norm_beta: 0.85
-    error_eps: 1.0e-6
+    support:
+      ema_beta_visible: 0.75
+      ema_beta_invisible: 0.90
+    residual:
+      error_beta: 0.75
+      error_eps: 1.0e-6
+    update:
+      ema_beta: 0.85
+      apply_in_eval: true
   update_gate:
     enable: true
     hidden_dim: 64
@@ -237,7 +254,7 @@ training:
   max_iterations: 100000
   log_interval: 100
   save_checkpoint_freq: 10000
-  seed: 42
+  seed: 41
 
 eval:
   enable_psnr: true
@@ -267,11 +284,34 @@ logging:
     cuda_memory: false
 
 demo:
-  mode: frozen_recurrent_inference
+  mode: segment_finetune_train
+  scheduler:
+    type: demo_v1
+    disable_preload: true
+    initial_scene_id: null
+    initial_segment_id: null
+    episode:
+      blocks_per_episode: 5
+      total_target_frames: 3
+      frame_within_keyframe_policy: first
+      episode_start_policy: first
+    traversal:
+      scene_order: ascending
+      segment_order: ascending
+      wrap_scene: true
+      wrap_segment: true
+      wrap_block: true
+    target:
+      include_source_frame: true
+      use_entered_blocks_for_target: true
+      max_target_frames: 3
+    events:
+      emit_manual_block_events: true
+      emit_scope_change_events: true
   pause_on_start: true
   step_button_mode: raw_step
-  display_branches: ["bg", "distant"]
-  hide_rigid: true
+  display_branches: ["bg", "distant", "rigid"]
+  hide_rigid: false
   checkpoint:
     load_mode: network_only
     strict_network: false
@@ -280,11 +320,17 @@ demo:
     update_hidden_state: true
     update_history_memory: true
     record_block_history_on_block_exit: true
-    no_optimizer_step: true
-    no_backward: true
+  train_infer:
+    state_write_interval_steps: 1
+    reset_node_state_after_block: false
   viewer:
     host: "0.0.0.0"
     port: 8080
+    align_gaussians_to_nerfview: true
+    coord_align_mode: gaussian
+    show_bg: true
+    show_distant: true
+    show_rigid: true
     viewer_res: 1280
     default_render_mode: rgb
     default_max_sh_degree: 1

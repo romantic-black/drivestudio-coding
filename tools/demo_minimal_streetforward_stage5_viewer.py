@@ -17,9 +17,9 @@ from tools.streetforward_stage5_viewer import StreetForwardStage5Viewer
 from tools.train_minimal_streetforward_stage1_1 import setup
 from tools.train_minimal_streetforward_stage4_1_one_segment_v3 import _normalize_omp_num_threads
 from tools.train_minimal_streetforward_stage4_3_v8_common import (
-    build_multi_scene_dataset_v4,
-    build_train_scheduler_v8_from_cfg,
+    build_multi_scene_dataset_v4_for_demo,
 )
+from tools.streetforward_stage5_demo_scheduler import build_stage5_demo_scheduler_from_cfg
 
 logger = logging.getLogger(__name__)
 _normalize_omp_num_threads()
@@ -37,23 +37,22 @@ def _select_trainer(stage: str):
 
 
 def _patch_cfg_for_demo(cfg: Any, args: argparse.Namespace) -> None:
-    if cfg.get("scheduler_v8") is None or bool(cfg.scheduler_v8.get("enable")) is not True:
-        raise ValueError("Demo requires scheduler_v8.enable=true.")
-    target_policy = str(cfg.scheduler_v8.episode.get("target_policy", ""))
-    reset_policy = str(cfg.scheduler_v8.execution.get("reset_policy", ""))
-    if target_policy != "visited_episode_frames":
-        raise ValueError("Demo requires scheduler_v8.episode.target_policy=visited_episode_frames.")
-    if reset_policy != "episode_end":
-        raise ValueError("Demo requires scheduler_v8.execution.reset_policy=episode_end.")
-
     cfg.model.stage = str(args.stage)
-    cfg.scheduler_v8.traversal.fixed_scene_id = int(args.scene_id)
-    if args.segment_id is None:
-        cfg.scheduler_v8.traversal.fixed_segment_id = None
-    else:
-        cfg.scheduler_v8.traversal.fixed_segment_id = int(args.segment_id)
-    if int(args.scene_id) not in [int(x) for x in cfg.data.train_scene_ids]:
-        cfg.data.train_scene_ids.append(int(args.scene_id))
+    if cfg.get("scheduler_v8") is not None:
+        cfg.scheduler_v8.enable = False
+    if cfg.get("data") is not None:
+        if cfg.data.get("preload") is None:
+            cfg.data.preload = {}
+        cfg.data.preload.enable = False
+    if cfg.get("demo") is None:
+        cfg.demo = {}
+    if cfg.demo.get("scheduler") is None:
+        cfg.demo.scheduler = {}
+    cfg.demo.scheduler.initial_scene_id = None if args.scene_id is None else int(args.scene_id)
+    cfg.demo.scheduler.initial_segment_id = None if args.segment_id is None else int(args.segment_id)
+    if args.scene_id is not None:
+        cfg.data.train_scene_ids = [int(args.scene_id)]
+        cfg.data.eval_scene_ids = []
 
 
 def _checkpoint_network_only_filter(state_dict: Dict[str, Any]) -> Dict[str, Any]:
@@ -110,7 +109,7 @@ def main() -> None:
     )
     parser.add_argument("--stage", type=str, default="5_2", help="Stage trainer variant: 5_0 / 5_2 / 5_3.")
     parser.add_argument("--ckpt", type=str, default="", help="Checkpoint path.")
-    parser.add_argument("--scene_id", type=int, required=True, help="Fixed scene id for demo traversal.")
+    parser.add_argument("--scene_id", type=int, default=None, help="Initial scene id for demo traversal.")
     parser.add_argument("--segment_id", type=int, default=None, help="Fixed segment id (optional).")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Viewer host.")
     parser.add_argument("--port", type=int, default=8080, help="Viewer port.")
@@ -129,15 +128,34 @@ def main() -> None:
         raise ValueError("Stage5 demo currently requires CUDA device because gsplat rasterization is CUDA-only.")
     logger.info("Stage5 demo device=%s stage=%s", device, args.stage)
 
-    dataset = build_multi_scene_dataset_v4(cfg, device)
+    dataset = build_multi_scene_dataset_v4_for_demo(cfg, device)
+    if getattr(dataset, "_preload_manager", None) is not None:
+        raise RuntimeError("Demo dataset must disable preload, but _preload_manager is not None.")
+    if getattr(dataset, "_preload_rtcfg", None) is not None:
+        raise RuntimeError("Demo dataset must disable preload, but _preload_rtcfg is not None.")
+    logger.info(
+        "Demo preload check: cfg.data.preload.enable=%s preload_manager=%s preload_rtcfg=%s",
+        bool((cfg.get("data") or {}).get("preload", {}).get("enable", False)),
+        "none" if getattr(dataset, "_preload_manager", None) is None else "present",
+        "none" if getattr(dataset, "_preload_rtcfg", None) is None else "present",
+    )
     dataset.initialize()
-    scheduler = build_train_scheduler_v8_from_cfg(cfg, dataset)
+    scheduler = build_stage5_demo_scheduler_from_cfg(cfg, dataset)
     trainer_cls = _select_trainer(args.stage)
     trainer = trainer_cls(config=cfg, device=device).to(device)
     _load_checkpoint(trainer, args.ckpt, mode=str(args.ckpt_load_mode))
-    for p in trainer.parameters():
-        p.requires_grad_(False)
-    trainer.eval()
+    demo_cfg = cfg.get("demo") or {}
+    demo_mode = str(demo_cfg.get("mode", "frozen_recurrent_inference")).strip().lower()
+    if demo_mode in ("segment_finetune_train", "validation_v8_segment_finetune_train"):
+        for p in trainer.parameters():
+            p.requires_grad_(True)
+        trainer.train()
+        logger.info("Stage5 demo mode=%s (train+infer path enabled)", demo_mode)
+    else:
+        for p in trainer.parameters():
+            p.requires_grad_(False)
+        trainer.eval()
+        logger.info("Stage5 demo mode=%s (frozen infer path enabled)", demo_mode)
 
     controller = Stage5DemoController(
         cfg=cfg,
@@ -173,4 +191,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

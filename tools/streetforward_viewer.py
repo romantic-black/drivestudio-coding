@@ -171,6 +171,18 @@ class StreetForwardViewer(Viewer):
         )
         return verts, faces
 
+    @staticmethod
+    def _infer_sh_degree(colors: torch.Tensor) -> Optional[int]:
+        if int(colors.dim()) < 3 or int(colors.shape[-1]) != 3:
+            return None
+        num_coeff = int(colors.shape[-2])
+        if num_coeff <= 0:
+            return None
+        sh_degree = 0
+        while (sh_degree + 2) * (sh_degree + 2) <= num_coeff:
+            sh_degree += 1
+        return int(sh_degree)
+
     def _update_segment_aabb_visual(self) -> None:
         show = bool(self._training_tab_handles.get("show_segment_aabb").value) if self._training_tab_handles else False
         snap = self.controller.display.current_snapshot
@@ -247,6 +259,7 @@ class StreetForwardViewer(Viewer):
         quats = torch.cat(quats_list, dim=0)
         opacities = torch.cat(opacities_list, dim=0)
         colors = torch.cat(colors_list, dim=0)
+        sh_degree = self._infer_sh_degree(colors)
 
         c2w = torch.from_numpy(camera_state.c2w).float().to(device)
         k = torch.from_numpy(camera_state.get_K(img_wh)).float().to(device)
@@ -260,6 +273,7 @@ class StreetForwardViewer(Viewer):
             Ks=k[None, ...],
             width=int(w),
             height=int(h),
+            sh_degree=sh_degree,
             packed=False,
             rasterize_mode="antialiased",
         )
@@ -287,4 +301,3 @@ class StreetForwardViewer(Viewer):
         self._training_tab_handles["num_distant_update"].value = int(stats.get("num_distant_update", 0))
         self._training_tab_handles["num_sky_update"].value = int(stats.get("num_sky_update", 0))
         self._training_tab_handles["num_rigid_update"].value = int(stats.get("num_rigid_update", 0))
-

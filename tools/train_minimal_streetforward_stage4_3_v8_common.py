@@ -23,6 +23,20 @@ def build_multi_scene_dataset_v4(cfg: Any, device: torch.device) -> MultiSceneDa
     )
 
 
+def build_multi_scene_dataset_v4_for_demo(cfg: Any, device: torch.device) -> MultiSceneDatasetV4:
+    knn_requirements = _extract_knn_requirements_from_cfg(cfg)
+    dataset = MultiSceneDatasetV4(
+        dataset_cfg=cfg.dataset,
+        data_cfg=cfg.data,
+        device=device,
+        preload_cfg={"enable": False},
+        knn_requirements=knn_requirements,
+    )
+    if getattr(dataset, "_preload_manager", None) is not None:
+        raise ValueError("Demo dataset must not create preload manager.")
+    return dataset
+
+
 def _null_int(x: Any) -> Optional[int]:
     if x is None:
         return None

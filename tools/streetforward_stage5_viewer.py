@@ -18,6 +18,10 @@ class StreetForwardStage5Viewer(Viewer):
     ) -> None:
         self.controller = controller
         self._demo_tab_handles: Dict[str, Any] = {}
+        self._suspend_scope_callbacks = False
+        # nerfview.Viewer expects this attribute in training mode while
+        # populating the rendering tab (used as extra disable-able handles).
+        self._training_tab_handles: Dict[str, Any] = {}
         super().__init__(
             server=server,
             render_fn=self._render_from_state,
@@ -29,13 +33,34 @@ class StreetForwardStage5Viewer(Viewer):
 
     def _init_training_tab(self):
         self._demo_tab_handles = {}
+        self._training_tab_handles = {}
         self._demo_folder = self.server.gui.add_folder("Inference")
 
     def _populate_training_tab(self):
+        viewer_cfg = self.controller.cfg.get("demo", {}).get("viewer", {}) or {}
+        scene_options = tuple(str(x) for x in self.controller.list_scene_ids())
+        if len(scene_options) == 0:
+            scene_options = ("-1",)
+        initial_scene = int(scene_options[0])
+        segment_options = tuple(str(x) for x in self.controller.list_segment_ids(initial_scene))
+        if len(segment_options) == 0:
+            segment_options = ("-1",)
+        initial_stats = self.controller.display.last_stats or {}
+        initial_source_frame = int(initial_stats.get("source_frame_idx", -1))
         with self._demo_folder:
             stage_text = self.server.gui.add_text("Stage", initial_value="", disabled=True)
             scene_id = self.server.gui.add_number("Scene ID", initial_value=-1, disabled=True)
             segment_id = self.server.gui.add_number("Segment ID", initial_value=-1, disabled=True)
+            scene_select = self.server.gui.add_dropdown(
+                "Scene",
+                options=scene_options,
+                initial_value=scene_options[0],
+            )
+            segment_select = self.server.gui.add_dropdown(
+                "Segment",
+                options=segment_options,
+                initial_value=segment_options[0],
+            )
             global_step = self.server.gui.add_number("Global Step", initial_value=0, disabled=True)
             block_global = self.server.gui.add_number("Block Global", initial_value=-1, disabled=True)
             segment_step = self.server.gui.add_number("Segment Step", initial_value=-1, disabled=True)
@@ -46,12 +71,59 @@ class StreetForwardStage5Viewer(Viewer):
             num_distant_update = self.server.gui.add_number("num_distant_update", initial_value=0, disabled=True)
             num_rigid_update = self.server.gui.add_number("num_rigid_update", initial_value=0, disabled=True)
             loss_val = self.server.gui.add_number("loss", initial_value=0.0, disabled=True)
+            trained_steps_total = self.server.gui.add_number("Trained Steps Total", initial_value=0, disabled=True)
+            trained_steps_since_reset = self.server.gui.add_number(
+                "Trained Steps Since Param Reset",
+                initial_value=0,
+                disabled=True,
+            )
 
+            prev_scene = self.server.gui.add_button("Prev Scene")
+            next_scene = self.server.gui.add_button("Next Scene")
+            prev_segment = self.server.gui.add_button("Prev Segment")
+            next_segment = self.server.gui.add_button("Next Segment")
+            prev_block = self.server.gui.add_button("Prev Block")
             next_step = self.server.gui.add_button("Next Step", color="blue")
             next_block = self.server.gui.add_button("Next Block")
-            reset_state = self.server.gui.add_button("Reset Scene State")
+            reset_state = self.server.gui.add_button("Reset Current Segment State")
+            reset_all_state = self.server.gui.add_button("Reset All Demo State")
+            next_episode_reset = self.server.gui.add_button("Next Episode + Reset Segment")
+            reset_train_params = self.server.gui.add_button("Reset Training Parameters")
             refresh_only = self.server.gui.add_button("Refresh Panel")
-            show_distant = self.server.gui.add_checkbox("Show Distant", initial_value=True)
+            show_bg = self.server.gui.add_checkbox("Show BG", initial_value=bool(viewer_cfg.get("show_bg", True)))
+            show_distant = self.server.gui.add_checkbox(
+                "Show Distant",
+                initial_value=bool(viewer_cfg.get("show_distant", True)),
+            )
+            show_rigid = self.server.gui.add_checkbox(
+                "Show Rigid",
+                initial_value=bool(viewer_cfg.get("show_rigid", False)),
+            )
+            rigid_frame = self.server.gui.add_number("Rigid Frame", initial_value=int(initial_source_frame))
+            lock_rigid_frame = self.server.gui.add_checkbox("Lock Rigid Frame", initial_value=False)
+
+            def _refresh_scope_dropdowns_from_stats() -> None:
+                stats = self.controller.display.last_stats or {}
+                cur_scene = int(stats.get("scene_id", -1))
+                cur_segment = int(stats.get("segment_id", -1))
+                scenes = tuple(str(x) for x in self.controller.list_scene_ids())
+                if len(scenes) == 0:
+                    scenes = ("-1",)
+                segments = tuple(str(x) for x in self.controller.list_segment_ids(cur_scene))
+                if len(segments) == 0:
+                    segments = ("-1",)
+                self._suspend_scope_callbacks = True
+                scene_select.options = scenes
+                if str(cur_scene) in scenes:
+                    scene_select.value = str(cur_scene)
+                else:
+                    scene_select.value = scenes[0]
+                segment_select.options = segments
+                if str(cur_segment) in segments:
+                    segment_select.value = str(cur_segment)
+                else:
+                    segment_select.value = segments[0]
+                self._suspend_scope_callbacks = False
 
             @next_step.on_click
             def _(_) -> None:
@@ -60,47 +132,160 @@ class StreetForwardStage5Viewer(Viewer):
                 next_step.disabled = True
                 next_block.disabled = True
                 try:
-                    self.controller.step_once()
+                    self.controller.step_current_block_once()
                     self.rerender(None)
+                    _refresh_scope_dropdowns_from_stats()
                     self.refresh_panel_state()
                 finally:
                     next_step.disabled = False
                     next_block.disabled = False
+
+            @prev_block.on_click
+            def _(_) -> None:
+                if self.controller.busy:
+                    return
+                self.controller.prev_block()
+                self.rerender(None)
+                _refresh_scope_dropdowns_from_stats()
+                self.refresh_panel_state()
 
             @next_block.on_click
             def _(_) -> None:
                 if self.controller.busy:
                     return
-                next_step.disabled = True
-                next_block.disabled = True
-                try:
-                    self.controller.step_block()
-                    self.rerender(None)
-                    self.refresh_panel_state()
-                finally:
-                    next_step.disabled = False
-                    next_block.disabled = False
+                self.controller.next_block()
+                self.rerender(None)
+                _refresh_scope_dropdowns_from_stats()
+                self.refresh_panel_state()
+
+            @prev_scene.on_click
+            def _(_) -> None:
+                if self.controller.busy:
+                    return
+                self.controller.prev_scene()
+                self.rerender(None)
+                _refresh_scope_dropdowns_from_stats()
+                self.refresh_panel_state()
+
+            @next_scene.on_click
+            def _(_) -> None:
+                if self.controller.busy:
+                    return
+                self.controller.next_scene()
+                self.rerender(None)
+                _refresh_scope_dropdowns_from_stats()
+                self.refresh_panel_state()
+
+            @prev_segment.on_click
+            def _(_) -> None:
+                if self.controller.busy:
+                    return
+                self.controller.prev_segment()
+                self.rerender(None)
+                _refresh_scope_dropdowns_from_stats()
+                self.refresh_panel_state()
+
+            @next_segment.on_click
+            def _(_) -> None:
+                if self.controller.busy:
+                    return
+                self.controller.next_segment()
+                self.rerender(None)
+                _refresh_scope_dropdowns_from_stats()
+                self.refresh_panel_state()
+
+            @scene_select.on_update
+            def _(_) -> None:
+                if self.controller.busy or self._suspend_scope_callbacks:
+                    return
+                scene_val = int(scene_select.value)
+                segments = self.controller.list_segment_ids(scene_val)
+                target_segment = int(segments[0]) if len(segments) > 0 else -1
+                if target_segment < 0:
+                    return
+                self.controller.set_scope(scene_val, target_segment)
+                self.rerender(None)
+                _refresh_scope_dropdowns_from_stats()
+                self.refresh_panel_state()
+
+            @segment_select.on_update
+            def _(_) -> None:
+                if self.controller.busy or self._suspend_scope_callbacks:
+                    return
+                scene_val = int(scene_select.value)
+                segment_val = int(segment_select.value)
+                self.controller.set_scope(scene_val, segment_val)
+                self.rerender(None)
+                _refresh_scope_dropdowns_from_stats()
+                self.refresh_panel_state()
 
             @reset_state.on_click
             def _(_) -> None:
                 if self.controller.busy:
                     return
-                self.controller.reset_current_scene_state()
+                self.controller.reset_current_segment_state()
+                self.rerender(None)
+                self.refresh_panel_state()
+
+            @reset_all_state.on_click
+            def _(_) -> None:
+                if self.controller.busy:
+                    return
+                self.controller.reset_all_demo_state()
+                self.rerender(None)
+                self.refresh_panel_state()
+
+            @next_episode_reset.on_click
+            def _(_) -> None:
+                if self.controller.busy:
+                    return
+                self.controller.new_episode_and_reset_segment_state()
+                self.rerender(None)
+                _refresh_scope_dropdowns_from_stats()
+                self.refresh_panel_state()
+
+            @reset_train_params.on_click
+            def _(_) -> None:
+                if self.controller.busy:
+                    return
+                self.controller.reset_training_parameters()
                 self.rerender(None)
                 self.refresh_panel_state()
 
             @refresh_only.on_click
             def _(_) -> None:
+                _refresh_scope_dropdowns_from_stats()
                 self.refresh_panel_state()
 
             @show_distant.on_update
             def _(_) -> None:
                 self.rerender(None)
 
-        self._demo_tab_handles = {
+            @show_bg.on_update
+            def _(_) -> None:
+                self.rerender(None)
+
+            @show_rigid.on_update
+            def _(_) -> None:
+                self.rerender(None)
+
+            @rigid_frame.on_update
+            def _(_) -> None:
+                self.rerender(None)
+
+            @lock_rigid_frame.on_update
+            def _(_) -> None:
+                if not bool(lock_rigid_frame.value):
+                    stats = self.controller.display.last_stats or {}
+                    rigid_frame.value = int(stats.get("source_frame_idx", -1))
+                self.rerender(None)
+
+        handles = {
             "stage_text": stage_text,
             "scene_id": scene_id,
             "segment_id": segment_id,
+            "scene_select": scene_select,
+            "segment_select": segment_select,
             "global_step": global_step,
             "block_global": block_global,
             "segment_step": segment_step,
@@ -111,15 +296,34 @@ class StreetForwardStage5Viewer(Viewer):
             "num_distant_update": num_distant_update,
             "num_rigid_update": num_rigid_update,
             "loss": loss_val,
+            "trained_steps_total": trained_steps_total,
+            "trained_steps_since_reset": trained_steps_since_reset,
+            "show_bg": show_bg,
             "show_distant": show_distant,
+            "show_rigid": show_rigid,
+            "rigid_frame": rigid_frame,
+            "lock_rigid_frame": lock_rigid_frame,
         }
+        self._demo_tab_handles = handles
+        self._training_tab_handles = handles
 
     def _render_from_state(self, camera_state: CameraState, img_wh: Tuple[int, int]) -> np.ndarray:
         if not self._demo_tab_handles:
             w, h = img_wh
             return np.zeros((h, w, 3), dtype=np.uint8)
+        show_bg = bool(self._demo_tab_handles["show_bg"].value)
         show_distant = bool(self._demo_tab_handles["show_distant"].value)
-        return self.controller.render(camera_state, img_wh, show_distant=show_distant)
+        show_rigid = bool(self._demo_tab_handles["show_rigid"].value)
+        rigid_frame_value = int(self._demo_tab_handles["rigid_frame"].value)
+        rigid_frame_idx = rigid_frame_value if rigid_frame_value >= 0 else None
+        return self.controller.render(
+            camera_state,
+            img_wh,
+            show_bg=show_bg,
+            show_distant=show_distant,
+            show_rigid=show_rigid,
+            rigid_frame_idx=rigid_frame_idx,
+        )
 
     def refresh_panel_state(self) -> None:
         if not self._demo_tab_handles:
@@ -138,4 +342,30 @@ class StreetForwardStage5Viewer(Viewer):
         self._demo_tab_handles["num_distant_update"].value = int(stats.get("num_distant_update", 0))
         self._demo_tab_handles["num_rigid_update"].value = int(stats.get("num_rigid_update", 0))
         self._demo_tab_handles["loss"].value = float(stats.get("loss", 0.0))
-
+        self._demo_tab_handles["trained_steps_total"].value = int(stats.get("trained_steps_total", 0))
+        self._demo_tab_handles["trained_steps_since_reset"].value = int(
+            stats.get("trained_steps_since_param_reset", 0)
+        )
+        if (
+            "rigid_frame" in self._demo_tab_handles
+            and "lock_rigid_frame" in self._demo_tab_handles
+            and not bool(self._demo_tab_handles["lock_rigid_frame"].value)
+        ):
+            self._demo_tab_handles["rigid_frame"].value = int(stats.get("source_frame_idx", -1))
+        scene_val = int(stats.get("scene_id", -1))
+        segment_val = int(stats.get("segment_id", -1))
+        if "scene_select" in self._demo_tab_handles and "segment_select" in self._demo_tab_handles:
+            scenes = tuple(str(x) for x in self.controller.list_scene_ids())
+            if len(scenes) == 0:
+                scenes = ("-1",)
+            segments = tuple(str(x) for x in self.controller.list_segment_ids(scene_val))
+            if len(segments) == 0:
+                segments = ("-1",)
+            self._suspend_scope_callbacks = True
+            self._demo_tab_handles["scene_select"].options = scenes
+            self._demo_tab_handles["scene_select"].value = str(scene_val) if str(scene_val) in scenes else scenes[0]
+            self._demo_tab_handles["segment_select"].options = segments
+            self._demo_tab_handles["segment_select"].value = (
+                str(segment_val) if str(segment_val) in segments else segments[0]
+            )
+            self._suspend_scope_callbacks = False
