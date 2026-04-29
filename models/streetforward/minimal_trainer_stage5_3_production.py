@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import math
 import logging
-from typing import Any, Dict, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -96,6 +97,7 @@ class MinimalStreetForwardStage5_3_Production(MinimalStreetForwardStage5_3):
     def __init__(self, config, device: torch.device, **kwargs):
         self._validate_production_config(config)
         super().__init__(config=config, device=device, **kwargs)
+        self._bound_dataset = None
         self._log_optimizer_groups_once()
 
     def _validate_production_config(self, config) -> None:
@@ -290,6 +292,178 @@ class MinimalStreetForwardStage5_3_Production(MinimalStreetForwardStage5_3):
             lr_step_restored = True
         self._log_resume_restore_flags(optimizer_restored=optimizer_restored, lr_step_restored=lr_step_restored)
         return True
+
+    def reset_for_segment_eval(self, batch: Dict[str, Any]) -> None:
+        _ = batch
+        self.reset_node_state()
+
+    @staticmethod
+    def _clone_tensor_dict_dict(cache: Dict[Tuple[int, int], Dict[str, torch.Tensor]]) -> Dict[Tuple[int, int], Dict[str, torch.Tensor]]:
+        out: Dict[Tuple[int, int], Dict[str, torch.Tensor]] = {}
+        for key, val in cache.items():
+            out[(int(key[0]), int(key[1]))] = {
+                str(k): v.detach().clone() for k, v in val.items()
+            }
+        return out
+
+    @staticmethod
+    def _clone_tensor_cache(cache: Dict[Tuple[int, int], torch.Tensor]) -> Dict[Tuple[int, int], torch.Tensor]:
+        out: Dict[Tuple[int, int], torch.Tensor] = {}
+        for key, val in cache.items():
+            out[(int(key[0]), int(key[1]))] = val.detach().clone()
+        return out
+
+    def _snapshot_eval_runtime(self) -> Dict[str, Any]:
+        return {
+            "history_bg": self._clone_tensor_dict_dict(self.stage5_2_history_bg),
+            "history_distant": self._clone_tensor_dict_dict(self.stage5_2_history_distant),
+            "history_rigid": self._clone_tensor_dict_dict(self.stage5_2_history_rigid),
+            "view_bg": self._clone_tensor_cache(self.stage5_3_last_view_bg),
+            "view_distant": self._clone_tensor_cache(self.stage5_3_last_view_distant),
+            "view_rigid": self._clone_tensor_cache(self.stage5_3_last_view_rigid),
+            "support_bg": self._clone_tensor_dict_dict(self.stage5_2_block_support_bg),
+            "support_distant": self._clone_tensor_dict_dict(self.stage5_2_block_support_distant),
+            "support_rigid": self._clone_tensor_dict_dict(self.stage5_2_block_support_rigid),
+            "last_full_inputs": self._stage5_2_last_full_inputs,
+        }
+
+    def _restore_eval_runtime(self, snap: Dict[str, Any]) -> None:
+        self.stage5_2_history_bg = self._clone_tensor_dict_dict(snap["history_bg"])
+        self.stage5_2_history_distant = self._clone_tensor_dict_dict(snap["history_distant"])
+        self.stage5_2_history_rigid = self._clone_tensor_dict_dict(snap["history_rigid"])
+        self.stage5_3_last_view_bg = self._clone_tensor_cache(snap["view_bg"])
+        self.stage5_3_last_view_distant = self._clone_tensor_cache(snap["view_distant"])
+        self.stage5_3_last_view_rigid = self._clone_tensor_cache(snap["view_rigid"])
+        self.stage5_2_block_support_bg = self._clone_tensor_dict_dict(snap["support_bg"])
+        self.stage5_2_block_support_distant = self._clone_tensor_dict_dict(snap["support_distant"])
+        self.stage5_2_block_support_rigid = self._clone_tensor_dict_dict(snap["support_rigid"])
+        self._stage5_2_last_full_inputs = snap["last_full_inputs"]
+
+    @torch.no_grad()
+    def eval_sparse_update_step(
+        self,
+        batch: Dict[str, Any],
+        *,
+        local_iter: int,
+        num_local_iters: int,
+    ) -> Dict[str, Any]:
+        _ = (local_iter, num_local_iters)
+        out = self.demo_infer_step(
+            batch,
+            scheduler_events=None,
+            update_node_state=True,
+            update_hidden_state=True,
+            update_history_memory=False,
+            update_view_transient=True,
+        )
+        return {
+            "loss": float(out.get("loss", 0.0)),
+            "num_targets": int(out.get("num_targets", 0)),
+            "num_source_views": int(out.get("num_source_views", 0)),
+            "num_bg_update": int(out.get("num_bg_update", 0)),
+            "num_distant_update": int(out.get("num_distant_update", 0)),
+            "num_rigid_update": int(out.get("num_rigid_update", 0)),
+            "rigid_writeback_count": int(out.get("rigid_writeback_count", 0)),
+        }
+
+    @torch.no_grad()
+    def eval_sparse_record_history(self, batch: Dict[str, Any]) -> None:
+        self.record_block_history(batch)
+
+    @torch.no_grad()
+    def eval_sparse_render_frames(
+        self,
+        *,
+        scene_id: int,
+        segment_id: int,
+        image_refs: List[Tuple[int, int]],
+        camera_ids: List[int],
+        save_dir: Optional[Path] = None,
+    ) -> Dict[str, Any]:
+        _ = camera_ids
+        if len(image_refs) == 0:
+            raise ValueError("eval_sparse_render_frames requires non-empty image_refs")
+
+        source_ref = (int(image_refs[0][0]), int(image_refs[0][1]))
+        eval_refs = [(int(x[0]), int(x[1])) for x in image_refs]
+        # Import here to avoid circular import overhead at module load.
+        from datasets.multi_scene_dataset_v4 import BatchRequestV4
+        from tools.train_minimal_streetforward_stage1_1 import convert_batch_to_minimal_format
+
+        dataset = self._bound_dataset
+        if dataset is None:
+            raise ValueError(
+                "eval_sparse_render_frames requires a bound dataset. "
+                "Call model.bind_eval_dataset(dataset) before rendering."
+            )
+        raw = dataset.get_segment_batch_from_image_refs(
+            BatchRequestV4(
+                scene_id=int(scene_id),
+                segment_id=int(segment_id),
+                source_image_ref=source_ref,
+                source_image_refs=[source_ref],
+                target_image_refs=eval_refs,
+                include_test=False,
+            ),
+            enforce_target0_equals_source=False,
+        )
+        batch = convert_batch_to_minimal_format(
+            raw,
+            self.device,
+            num_targets=None,
+            include_source_for_2d=True,
+        )
+
+        prev_mode = self.training
+        runtime_snap = self._snapshot_eval_runtime()
+        self.eval()
+        try:
+            out = self.demo_infer_step(
+                batch,
+                scheduler_events=None,
+                update_node_state=False,
+                update_hidden_state=False,
+                update_history_memory=False,
+                update_view_transient=False,
+            )
+        finally:
+            self._restore_eval_runtime(runtime_snap)
+            if prev_mode:
+                self.train()
+
+        pred_rgbs = out.get("pred_rgbs")
+        gt_images = out.get("gt_images")
+        targets = list(batch.get("targets", []))
+
+        render_rows: List[Dict[str, Any]] = []
+        for i in range(int(len(targets))):
+            frame_idx = int(targets[i].get("frame_idx"))
+            cam_idx = int(targets[i].get("cam_idx"))
+            row: Dict[str, Any] = {
+                "frame_idx": int(frame_idx),
+                "cam_idx": int(cam_idx),
+            }
+            if isinstance(pred_rgbs, list) and i < len(pred_rgbs):
+                row["pred_rgb"] = pred_rgbs[i].detach()
+            if isinstance(gt_images, list) and i < len(gt_images):
+                row["gt_image"] = gt_images[i].detach()
+            if "sky_mask" in targets[i]:
+                row["sky_mask"] = targets[i]["sky_mask"]
+            render_rows.append(row)
+
+        if save_dir is not None:
+            save_dir.mkdir(parents=True, exist_ok=True)
+
+        return {
+            "rows": render_rows,
+            "num_images": int(len(render_rows)),
+            "scene_id": int(scene_id),
+            "segment_id": int(segment_id),
+            "save_dir": str(save_dir) if save_dir is not None else None,
+        }
+
+    def bind_eval_dataset(self, dataset: Any) -> None:
+        self._bound_dataset = dataset
 
 
 __all__ = ["MinimalStreetForwardStage5_3_Production"]

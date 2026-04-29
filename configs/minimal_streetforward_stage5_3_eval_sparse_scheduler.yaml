@@ -1,0 +1,64 @@
+base_config_file: "configs/minimal_streetforward_stage5_3_multi_scene_v8_adamw_warmcos.yaml"
+
+eval_sparse_scheduler:
+  enable: true
+  participate_in_training: false
+  data_mode: segment_finetune_train
+
+  protocol:
+    sequence_length: 20
+    input_offsets: [0, 5, 10, 15]
+    eval_offsets: all
+    camera_ids: [0, 1, 2]
+    camera_names: ["front", "front_left", "front_right"]
+
+  episode_selection:
+    scene_ids: ${data.eval_scene_ids}
+    segment_policy: all
+    window_policy: middle_per_segment
+    stride: 20
+    max_episodes_per_scene: null
+    max_total_episodes: null
+    require_full_window: true
+
+  update:
+    steps_per_input: 8
+    target_policy: source_plus_recent_history
+    total_target_frames: 3
+    include_source_frame: true
+    history_order: recent_first
+    allow_future_input_targets: false
+    source_camera_policy: protocol_cams
+    target_camera_policy: protocol_cams
+    use_no_grad: true
+    use_eval_mode: true
+    record_history: true
+    record_history_on: block_exit
+
+  render:
+    eval_all_20_frames: true
+    save_images: true
+    save_dir: eval_sparse_scheduler
+    save_input_reconstruction: true
+    save_nvs: true
+    image_format: png
+
+  metrics:
+    rgb_range: [0.0, 1.0]
+    use_sky_mask_regions: true
+    require_sky_mask: true
+    min_valid_pixels_per_region: 32
+    aggregate: mean_per_image_psnr
+    report:
+      - all
+      - input_reconstruction
+      - nvs_intermediate
+      - per_camera
+      - per_offset
+
+  logging:
+    log_interval_episodes: 1
+    jsonl: true
+    tensorboard: false
+    print_per_episode_summary: true
+
