@@ -117,12 +117,10 @@ class MinimalStreetForwardStage5_3_Production(MinimalStreetForwardStage5_3):
         if bool(self._require_key(lr_cfg, "enable", "lr_scheduler")) is not True:
             raise ValueError("Stage5_3_Production requires lr_scheduler.enable=true.")
         lr_type = str(self._require_key(lr_cfg, "type", "lr_scheduler")).strip().lower()
-        if lr_type != "warmup_cosine":
-            raise ValueError("Stage5_3_Production requires lr_scheduler.type=warmup_cosine.")
-        _ = int(self._require_key(lr_cfg, "warmup_steps", "lr_scheduler"))
+        if lr_type != "cosine":
+            raise ValueError("Stage5_3_Production requires lr_scheduler.type=cosine.")
         _ = int(self._require_key(lr_cfg, "total_steps", "lr_scheduler"))
         _ = float(self._require_key(lr_cfg, "min_lr_ratio", "lr_scheduler"))
-        _ = float(self._require_key(lr_cfg, "warmup_start_ratio", "lr_scheduler"))
         train_cfg = self._require_key(config, "training", "config")
         amp_cfg = train_cfg.get("amp") if hasattr(train_cfg, "get") else None
         if amp_cfg is not None and bool(amp_cfg.get("enable", False)):

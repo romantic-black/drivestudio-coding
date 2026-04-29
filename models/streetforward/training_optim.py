@@ -369,12 +369,20 @@ def build_streetforward_lr_scheduler(
     if not enable:
         return None
     sched_type = str(_cfg_get(lr_cfg, "type", "")).strip().lower()
-    if strict and sched_type != "warmup_cosine":
-        raise ValueError("production requires lr_scheduler.type=warmup_cosine")
-    if sched_type != "warmup_cosine":
+    if strict and sched_type not in ("cosine", "warmup_cosine"):
+        raise ValueError("production requires lr_scheduler.type in {'cosine', 'warmup_cosine'}")
+    if sched_type == "warmup_cosine":
+        _ = _cfg_get(lr_cfg, "warmup_steps")
+        _ = _cfg_get(lr_cfg, "total_steps")
+        _ = _cfg_get(lr_cfg, "min_lr_ratio")
+        _ = _cfg_get(lr_cfg, "warmup_start_ratio")
+        sched_cfg = lr_cfg
+    elif sched_type == "cosine":
+        _ = _cfg_get(lr_cfg, "total_steps")
+        _ = _cfg_get(lr_cfg, "min_lr_ratio")
+        sched_cfg = _as_dict(lr_cfg)
+        sched_cfg["warmup_steps"] = 0
+        sched_cfg["warmup_start_ratio"] = 1.0
+    else:
         raise ValueError(f"unsupported lr_scheduler.type={sched_type!r}")
-    _ = _cfg_get(lr_cfg, "warmup_steps")
-    _ = _cfg_get(lr_cfg, "total_steps")
-    _ = _cfg_get(lr_cfg, "min_lr_ratio")
-    _ = _cfg_get(lr_cfg, "warmup_start_ratio")
-    return StreetForwardWarmupCosineLR(optimizer=optimizer, cfg=lr_cfg, start_step=start_step)
+    return StreetForwardWarmupCosineLR(optimizer=optimizer, cfg=sched_cfg, start_step=start_step)

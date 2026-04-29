@@ -325,13 +325,6 @@ model:
         quat: 0.0
         opacity: 0.3
         sh: 0.5
-    warmup:
-      enable: false
-      means_steps: 5000
-      scales_steps: 8000
-      quat_steps: 8000
-      opacity_steps: 2000
-      sh_steps: 1000
   branches:
     bg:
       src_backproject_support_min: 1e-2
@@ -457,12 +450,10 @@ optimizer:
 
 lr_scheduler:
   enable: true
-  type: warmup_cosine
+  type: cosine
   interval: step
-  warmup_steps: 0
   total_steps: ${training.max_iterations}
   min_lr_ratio: 0.05
-  warmup_start_ratio: 1.0
 
 training:
   max_iterations: 2000010

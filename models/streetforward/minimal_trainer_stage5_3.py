@@ -213,14 +213,6 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
             branch_cfg = self._require_key(branch_bias_cfg, branch_name, "model.update_gate.branch_bias")
             for attr_name in attr_names:
                 _ = self._require_key(branch_cfg, attr_name, f"model.update_gate.branch_bias.{branch_name}")
-        warmup_cfg = self._require_key(gate_cfg, "warmup", "model.update_gate")
-        _ = self._require_key(warmup_cfg, "enable", "model.update_gate.warmup")
-        _ = self._require_key(warmup_cfg, "means_steps", "model.update_gate.warmup")
-        _ = self._require_key(warmup_cfg, "scales_steps", "model.update_gate.warmup")
-        _ = self._require_key(warmup_cfg, "quat_steps", "model.update_gate.warmup")
-        _ = self._require_key(warmup_cfg, "opacity_steps", "model.update_gate.warmup")
-        _ = self._require_key(warmup_cfg, "sh_steps", "model.update_gate.warmup")
-
         scheduler_cfg = self._require_key(config, "scheduler_v8", "config")
         episode_cfg = self._require_key(scheduler_cfg, "episode", "scheduler_v8")
         execution_cfg = self._require_key(scheduler_cfg, "execution", "scheduler_v8")
@@ -303,7 +295,7 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
             use_branch_embed=bool(token_cfg.get("use_branch_embed", True)),
             use_param_embed=bool(token_cfg.get("use_param_embed", True)),
             zero_invalid_2d_feat=bool(token_cfg.get("zero_invalid_2d_feat", True)),
-            history_dim=int(hist_embed_dim),
+            history_dim=0,
         ).to(self.device)
         self.struct_decoder = RoutedNearFarStructDecoder(
             near_decoder=near_decoder,
@@ -375,7 +367,6 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
         hidden_gate_cfg = self._require_key(gate_cfg, "hidden_gate", "model.update_gate")
         hidden_weights_cfg = self._require_key(hidden_gate_cfg, "weights", "model.update_gate.hidden_gate")
         branch_bias_cfg = self._require_key(gate_cfg, "branch_bias", "model.update_gate")
-        warmup_cfg = self._require_key(gate_cfg, "warmup", "model.update_gate")
         attr_order = ("means", "scales", "quat", "opacity", "sh")
         self.stage5_3_attr_min_gate = torch.tensor(
             [float(self._require_key(min_gate_cfg, k, "model.update_gate.min_gate")) for k in attr_order],
@@ -389,18 +380,6 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
         )
         self.stage5_3_hidden_gate_weights = torch.tensor(
             [float(self._require_key(hidden_weights_cfg, k, "model.update_gate.hidden_gate.weights")) for k in attr_order],
-            device=self.device,
-            dtype=torch.float32,
-        )
-        self.stage5_3_gate_warmup_enable = bool(self._require_key(warmup_cfg, "enable", "model.update_gate.warmup"))
-        self.stage5_3_gate_warmup_steps = torch.tensor(
-            [
-                float(self._require_key(warmup_cfg, "means_steps", "model.update_gate.warmup")),
-                float(self._require_key(warmup_cfg, "scales_steps", "model.update_gate.warmup")),
-                float(self._require_key(warmup_cfg, "quat_steps", "model.update_gate.warmup")),
-                float(self._require_key(warmup_cfg, "opacity_steps", "model.update_gate.warmup")),
-                float(self._require_key(warmup_cfg, "sh_steps", "model.update_gate.warmup")),
-            ],
             device=self.device,
             dtype=torch.float32,
         )
@@ -823,18 +802,6 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
             1, self.stage5_3_gate_num_attrs
         )
         gate = min_gate + (1.0 - min_gate) * gate_raw
-        if bool(self.stage5_3_gate_warmup_enable):
-            if self.training:
-                step = float(max(int(getattr(self, "global_step", 0)), 0))
-                warm = torch.clamp(
-                    torch.tensor(step, device=gate.device, dtype=gate.dtype)
-                    / self.stage5_3_gate_warmup_steps.to(device=gate.device, dtype=gate.dtype).clamp_min(1.0),
-                    min=0.0,
-                    max=1.0,
-                ).view(1, self.stage5_3_gate_num_attrs)
-            else:
-                warm = torch.ones((1, self.stage5_3_gate_num_attrs), device=gate.device, dtype=gate.dtype)
-            gate = gate * warm
         g_means = gate[:, self.GATE_MEANS : self.GATE_MEANS + 1]
         g_scales = gate[:, self.GATE_SCALES : self.GATE_SCALES + 1]
         g_quat = gate[:, self.GATE_QUAT : self.GATE_QUAT + 1]
@@ -948,7 +915,6 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
         feat_2d_rigid_S: Optional[torch.Tensor],
         acc_w_distant: Optional[torch.Tensor],
         acc_w_rigid_S: Optional[torch.Tensor],
-        history_embed: Optional[torch.Tensor] = None,
     ) -> StructDecoderInput:
         num_distant = int(node_state_distant.means.shape[0]) if node_state_distant is not None else 0
         num_rigid_out = int(route.S_out.numel())
@@ -1027,8 +993,6 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
             "branch_0": "distant",
             "branch_1": "rigid_out",
         }
-        if history_embed is not None:
-            meta["history_embed"] = history_embed
 
         return StructDecoderInput(
             feat_2d=torch.cat(feat_2d_parts, dim=0),
@@ -1127,38 +1091,6 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
         feat_bg_input = near_out.feat[:num_bg]
         feat_rigid_in_input_all = near_out.feat[num_bg : num_bg + num_rigid_in] if num_rigid_in > 0 else None
 
-        far_history_embed = None
-        if num_distant_total + int(route.S_out.numel()) > 0:
-            far_hist_parts = []
-            if num_distant_total > 0:
-                if acc_w_distant is None:
-                    raise RuntimeError("Stage5_3 far history embed requires acc_w_distant when distant branch is active.")
-                far_hist_parts.append(
-                    self._build_history_embed(
-                        history=history_distant,
-                        view_transient=None,
-                        acc_w=acc_w_distant,
-                        support_min=self.stage5_2_distant_visible_min,
-                        dtype=feat_2d_distant.dtype if feat_2d_distant is not None else node_state_bg.means.dtype,
-                    )
-                )
-            num_rigid_out_total = int(route.S_out.numel())
-            if num_rigid_out_total > 0:
-                if acc_w_rigid_S is None:
-                    raise RuntimeError("Stage5_3 far history embed requires acc_w_rigid_S when rigid_out branch is active.")
-                rows_rigid_out_in_S = torch.nonzero(~route.inside_mask_S, as_tuple=False).squeeze(1)
-                far_hist_parts.append(
-                    self._build_history_embed(
-                        history=self._slice_history(history_rigid, route.S_out),
-                        view_transient=None,
-                        acc_w=acc_w_rigid_S[rows_rigid_out_in_S],
-                        support_min=self.stage5_2_rigid_visible_min,
-                        dtype=feat_2d_rigid_S.dtype if feat_2d_rigid_S is not None else node_state_bg.means.dtype,
-                    )
-                )
-            if len(far_hist_parts) > 0:
-                far_history_embed = torch.cat(far_hist_parts, dim=0)
-
         far_in = self._build_struct_decoder_input_far(
             source_frame_idx=source_frame_idx,
             node_state_distant=node_state_distant,
@@ -1168,7 +1100,6 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
             feat_2d_rigid_S=feat_2d_rigid_S,
             acc_w_distant=acc_w_distant,
             acc_w_rigid_S=acc_w_rigid_S,
-            history_embed=far_history_embed,
         )
         feat_distant_input = None
         feat_rigid_out_input_all = None
