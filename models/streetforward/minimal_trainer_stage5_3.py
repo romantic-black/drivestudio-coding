@@ -1340,11 +1340,18 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
             frame_idx = int(tgt["frame_idx"])
             view = tgt["view"]
             gt_image = tgt["gt_image"]
+            sky_mask = tgt.get("sky_mask")
+            egocar_mask = tgt.get("egocar_mask")
             if gt_image.dim() == 4:
                 gt_image = gt_image.squeeze(0)
             gt_image = gt_image.to(self.device)
             height = int(gt_image.shape[0])
             width = int(gt_image.shape[1])
+            source_pair_valid_mask = self._build_source_pair_valid_mask(
+                source_images=[gt_image],
+                source_sky_masks=[sky_mask],
+                source_egocar_masks=[egocar_mask],
+            )
 
             rigid_idx = torch.zeros((0,), dtype=torch.long, device=self.device)
             if node_state_rigid is not None:
@@ -1408,7 +1415,7 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
                 gaussians_scene=gaussians_scene,
                 source_views=[view],
                 features_2d=residual.unsqueeze(0),
-                source_pair_valid_mask=torch.ones((1, height, width), dtype=torch.float32, device=self.device),
+                source_pair_valid_mask=source_pair_valid_mask,
                 height=height,
                 width=width,
                 backprojector_override=self.stage5_2_record_backprojector,
@@ -1469,6 +1476,7 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
             raise ValueError("Stage5_3 requires record_views=source_image_refs.")
         source_views = list(batch.get("source_views", []))
         source_images = list(batch.get("source_images", []))
+        source_sky_masks, source_egocar_masks = self._get_source_masks_from_batch(batch)
         if len(source_views) == 0 or len(source_images) == 0:
             raise ValueError(
                 "Stage5_3 record_views=source_image_refs requires non-empty "
@@ -1477,6 +1485,14 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
         if len(source_views) != len(source_images):
             raise ValueError(
                 "Stage5_3 source record mismatch: len(source_views) != len(source_images)."
+            )
+        if source_sky_masks is not None and len(source_sky_masks) != len(source_images):
+            raise ValueError(
+                "Stage5_3 source record mismatch: len(source_sky_masks) != len(source_images)."
+            )
+        if source_egocar_masks is not None and len(source_egocar_masks) != len(source_images):
+            raise ValueError(
+                "Stage5_3 source record mismatch: len(source_egocar_masks) != len(source_images)."
             )
         request_meta = batch.get("request_meta") or {}
         source_refs = request_meta.get("source_image_refs") or []
@@ -1502,6 +1518,8 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
                     "frame_idx": int(frame_idx_i),
                     "view": view,
                     "gt_image": gt_image,
+                    "sky_mask": source_sky_masks[i] if source_sky_masks is not None else None,
+                    "egocar_mask": source_egocar_masks[i] if source_egocar_masks is not None else None,
                 }
             )
         return out
