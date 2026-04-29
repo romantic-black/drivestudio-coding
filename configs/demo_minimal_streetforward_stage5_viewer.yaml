@@ -52,7 +52,7 @@ data:
 
 dataset:
   num_source_keyframes: 1
-  num_target_keyframes: 3
+  num_target_keyframes: 4
   segment_overlap_ratio: 0.2
   min_keyframes_per_scene: 2
   min_keyframes_per_segment: 2
@@ -106,9 +106,21 @@ scheduler_v8:
     emit_hints: true
     warm_next_block_exact: true
     warm_next_episode_chain: true
+  near_random_supervision:
+    enable: true
+    frames_per_block: 1
+    same_keyframe_only: true
+    insufficient_policy: skip
+    add_to_source_image_refs: false
+    add_to_history_record_views: false
+    sample_once_per_block: true
+    exclude_source_frame: true
+    exclude_existing_target_frames: true
+    camera_policy: all_cams
+    role_name: near_random
 
 model:
-  stage: "5_2"
+  stage: "5_3"
   scale_init_value: 0.1
   sh_degree: 1
   voxel_size: 0.2
@@ -198,23 +210,89 @@ model:
     record_on: "block_exit"
     record_views: "source_image_refs"
     support:
-      ema_beta_visible: 0.75
-      ema_beta_invisible: 0.90
+      fast_ema_beta_visible: 0.35
+      fast_ema_beta_invisible: 0.60
+      slow_ema_beta_visible: 0.75
+      slow_ema_beta_invisible: 0.90
     residual:
-      error_beta: 0.75
+      fast_error_beta: 0.35
+      slow_error_beta: 0.75
       error_eps: 1.0e-6
     update:
-      ema_beta: 0.85
+      fast_ema_beta: 0.45
+      slow_ema_beta: 0.92
       apply_in_eval: true
+  view_transient:
+    enable: true
+    source: ego_to_point
+    input_to_gate: true
+    input_to_struct_decoder: false
+    use_delta_xyz: true
+    use_delta_norm: true
+    use_angle_delta: false
+    use_initialized_flag: false
+    detach: true
+    update_in_train: true
+    update_in_eval: true
   update_gate:
     enable: true
+    type: attribute_5
     hidden_dim: 64
-    min_gate: 0.05
-    init_bias: 2.0
-    warmup_steps: 1000
     require_initialized_in_input: true
     include_visible_now: true
     bind_with_mask_update: true
+    min_gate:
+      means: 0.0
+      scales: 0.0
+      quat: 0.0
+      opacity: 0.0
+      sh: 0.0
+    init_bias:
+      means: -1.40
+      scales: -1.70
+      quat: -2.00
+      opacity: -0.40
+      sh: 0.40
+    branch_bias:
+      bg:
+        means: 0.0
+        scales: 0.0
+        quat: -0.2
+        opacity: 0.0
+        sh: 0.1
+      distant:
+        means: -1.0
+        scales: -0.3
+        quat: -1.0
+        opacity: 0.0
+        sh: 0.0
+      rigid_in:
+        means: -0.2
+        scales: -0.2
+        quat: -0.3
+        opacity: 0.1
+        sh: 0.2
+      rigid_out:
+        means: -0.8
+        scales: -0.3
+        quat: -0.8
+        opacity: 0.0
+        sh: 0.0
+    hidden_gate:
+      mode: weighted_sum
+      weights:
+        means: 0.2
+        scales: 0.0
+        quat: 0.0
+        opacity: 0.3
+        sh: 0.5
+    warmup:
+      enable: true
+      means_steps: 5000
+      scales_steps: 8000
+      quat_steps: 8000
+      opacity_steps: 2000
+      sh_steps: 1000
   branches:
     bg:
       src_backproject_support_min: 1e-2
@@ -244,6 +322,25 @@ losses:
   ssim: {w: 0.05}
   mask: {w: 0.02, opacity_loss_type: bce, require_sky_mask: true}
   opacity_entropy: {w: 0.0}
+  target_view_weights:
+    enable: true
+    normalize_by_weight_sum: true
+    source:
+      weight: 1.0
+    visited:
+      weight: 0.7
+    near_random:
+      weight: 0.3
+      schedule:
+        enable: true
+        type: warmup_linear
+        start_weight: 0.3
+        end_weight: 0.5
+        warmup_steps: 20000
+
+validation_v8:
+  near_random_supervision:
+    enable: false
 
 optimizer:
   lr: 1.0e-4
@@ -319,6 +416,7 @@ demo:
     update_node_state: true
     update_hidden_state: true
     update_history_memory: true
+    update_view_transient: true
     record_block_history_on_block_exit: true
   train_infer:
     state_write_interval_steps: 1

@@ -68,6 +68,7 @@ class Stage5DemoController:
         self.update_node_state = bool(infer_cfg.get("update_node_state", True))
         self.update_hidden_state = bool(infer_cfg.get("update_hidden_state", True))
         self.update_history_memory = bool(infer_cfg.get("update_history_memory", True))
+        self.update_view_transient = bool(infer_cfg.get("update_view_transient", True))
         self.record_block_history_on_block_exit = bool(infer_cfg.get("record_block_history_on_block_exit", True))
         self.no_optimizer_step = bool(infer_cfg.get("no_optimizer_step", False))
         self.no_backward = bool(infer_cfg.get("no_backward", False))
@@ -281,6 +282,7 @@ class Stage5DemoController:
                     update_node_state=self.update_node_state,
                     update_hidden_state=self.update_hidden_state,
                     update_history_memory=self.update_history_memory,
+                    update_view_transient=self.update_view_transient,
                 )
             if hasattr(self.scheduler, "mark_current_block_updated"):
                 self.scheduler.mark_current_block_updated()

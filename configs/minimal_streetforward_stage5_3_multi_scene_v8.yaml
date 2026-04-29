@@ -234,23 +234,89 @@ model:
     record_on: "block_exit"
     record_views: "source_image_refs"
     support:
-      ema_beta_visible: 0.75
-      ema_beta_invisible: 0.90
+      fast_ema_beta_visible: 0.35
+      fast_ema_beta_invisible: 0.60
+      slow_ema_beta_visible: 0.75
+      slow_ema_beta_invisible: 0.90
     residual:
-      error_beta: 0.75
+      fast_error_beta: 0.35
+      slow_error_beta: 0.75
       error_eps: 1.0e-6
     update:
-      ema_beta: 0.92
+      fast_ema_beta: 0.45
+      slow_ema_beta: 0.92
       apply_in_eval: true
+  view_transient:
+    enable: true
+    source: ego_to_point
+    input_to_gate: true
+    input_to_struct_decoder: false
+    use_delta_xyz: true
+    use_delta_norm: true
+    use_angle_delta: false
+    use_initialized_flag: false
+    detach: true
+    update_in_train: true
+    update_in_eval: true
   update_gate:
     enable: true
+    type: attribute_5
     hidden_dim: 64
-    min_gate: 0.05
-    init_bias: 2.0
-    warmup_steps: 1000
     require_initialized_in_input: true
     include_visible_now: true
     bind_with_mask_update: true
+    min_gate:
+      means: 0.0
+      scales: 0.0
+      quat: 0.0
+      opacity: 0.0
+      sh: 0.0
+    init_bias:
+      means: -1.40
+      scales: -1.70
+      quat: -2.00
+      opacity: -0.40
+      sh: 0.40
+    branch_bias:
+      bg:
+        means: 0.0
+        scales: 0.0
+        quat: -0.2
+        opacity: 0.0
+        sh: 0.1
+      distant:
+        means: -1.0
+        scales: -0.3
+        quat: -1.0
+        opacity: 0.0
+        sh: 0.0
+      rigid_in:
+        means: -0.2
+        scales: -0.2
+        quat: -0.3
+        opacity: 0.1
+        sh: 0.2
+      rigid_out:
+        means: -0.8
+        scales: -0.3
+        quat: -0.8
+        opacity: 0.0
+        sh: 0.0
+    hidden_gate:
+      mode: weighted_sum
+      weights:
+        means: 0.2
+        scales: 0.0
+        quat: 0.0
+        opacity: 0.3
+        sh: 0.5
+    warmup:
+      enable: true
+      means_steps: 5000
+      scales_steps: 8000
+      quat_steps: 8000
+      opacity_steps: 2000
+      sh_steps: 1000
   branches:
     bg:
       src_backproject_support_min: 1e-2

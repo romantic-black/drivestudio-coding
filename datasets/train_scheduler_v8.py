@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import random
 from typing import Any, Dict, List, Optional, Set
 
 from datasets.train_scheduler_v7 import SegmentIndexLike, TrainSchedulerDatasetV7, TrainSchedulerV7
@@ -41,6 +42,7 @@ class TrainSchedulerV8(TrainSchedulerV7):
         step_major_switch_interval_steps: int = 1,
         target_policy: str = "visited_episode_frames",
         reset_policy: str = "episode_end",
+        near_random_supervision_cfg: Optional[Any] = None,
     ) -> None:
         if total_target_frames < 1:
             raise ValueError("scheduler_v8.episode.total_target_frames must be >= 1")
@@ -60,6 +62,25 @@ class TrainSchedulerV8(TrainSchedulerV7):
         self._skip_next_start_new_epoch = True
         self.target_policy = str(target_policy)
         self.reset_policy = str(reset_policy)
+        self.near_random_cfg = near_random_supervision_cfg or {}
+        self.near_random_enable = bool(self._cfg_get(self.near_random_cfg, "enable", False))
+        self.near_random_frames_per_block = int(self._cfg_get(self.near_random_cfg, "frames_per_block", 1))
+        self.near_random_same_keyframe_only = bool(self._cfg_get(self.near_random_cfg, "same_keyframe_only", True))
+        self.near_random_insufficient_policy = str(self._cfg_get(self.near_random_cfg, "insufficient_policy", "skip"))
+        self.near_random_exclude_source = bool(self._cfg_get(self.near_random_cfg, "exclude_source_frame", True))
+        self.near_random_exclude_existing = bool(self._cfg_get(self.near_random_cfg, "exclude_existing_target_frames", True))
+        self.near_random_sample_once_per_block = bool(self._cfg_get(self.near_random_cfg, "sample_once_per_block", True))
+        self.near_random_camera_policy = str(self._cfg_get(self.near_random_cfg, "camera_policy", "all_cams"))
+        self.near_random_role_name = str(self._cfg_get(self.near_random_cfg, "role_name", "near_random"))
+        if self.near_random_enable:
+            if self.near_random_frames_per_block < 1:
+                raise ValueError("near_random_supervision.frames_per_block must be >= 1")
+            if not self.near_random_same_keyframe_only:
+                raise ValueError("v1 only supports near_random_supervision.same_keyframe_only=true")
+            if self.near_random_insufficient_policy != "skip":
+                raise ValueError("v1 only supports near_random_supervision.insufficient_policy=skip")
+            if self.near_random_camera_policy != "all_cams":
+                raise ValueError("v1 only supports near_random_supervision.camera_policy=all_cams")
         super().__init__(
             dataset=dataset,
             steps_per_block=steps_per_block,
@@ -83,6 +104,28 @@ class TrainSchedulerV8(TrainSchedulerV7):
         )
         self.episode_window_keyframes = int(self.blocks_per_episode)
         self.start_new_epoch()
+
+    @staticmethod
+    def _cfg_get(node: Any, key: str, default: Any) -> Any:
+        if node is None:
+            return default
+        if isinstance(node, dict):
+            return node.get(key, default)
+        if hasattr(node, "get"):
+            out = node.get(key, default)
+            return default if out is None else out
+        if hasattr(node, key):
+            out = getattr(node, key)
+            return default if out is None else out
+        return default
+
+    @staticmethod
+    def _sample_no_replace(candidates: List[int], k: int) -> List[int]:
+        if int(k) < 0:
+            raise ValueError("k must be >= 0")
+        if int(k) > len(candidates):
+            raise ValueError(f"cannot sample {int(k)} without replacement from {len(candidates)} candidates")
+        return [int(x) for x in random.sample(list(candidates), int(k))]
 
     def start_new_epoch(self) -> None:
         if bool(getattr(self, "_skip_next_start_new_epoch", False)):
@@ -159,12 +202,22 @@ class TrainSchedulerV8(TrainSchedulerV7):
             "block_first_visit_order": {},
             "block_first_target_frame_indices": {},
             "block_last_target_frame_indices": {},
+            "block_near_random_frame_indices": {},
+            "block_target_frame_roles": {},
+            "block_target_image_roles": {},
+            "block_target_image_loss_base_weights": {},
+            "near_random_attempted_blocks": 0,
+            "near_random_sampled_blocks": 0,
+            "near_random_skipped_blocks": 0,
+            "near_random_candidate_frames_sum": 0.0,
             "current_source_frame_idx": -1,
             "current_target_frame_indices": [],
+            "current_target_frame_roles": [],
             "source_keyframe_idx": -1,
             "source_image_ref": (-1, -1),
             "source_image_refs": [],
             "target_image_refs": [],
+            "target_image_roles": [],
             "num_cams": int(plan.num_cams),
             "episode_base_block_idx_global": int(episode_base_block_idx_global),
             "episode_base_block_idx_in_segment": int(episode_base_block_idx_in_segment),
@@ -243,29 +296,62 @@ class TrainSchedulerV8(TrainSchedulerV7):
         if bcur < 0 or bcur >= len(frame_chain):
             raise ValueError(f"invalid block_idx={bcur} for episode")
 
-        target_frames = self._build_target_frames_for_block_v8(
+        base_target_frames = self._build_target_frames_for_block_v8(
             frame_chain=frame_chain,
             block_idx=bcur,
             visited_block_indices=set(st["visited_block_indices"]),
             max_target_frames=int(self.total_target_frames),
         )
         source_frame = int(frame_chain[bcur])
+        base_roles = ["source"] + ["visited" for _ in base_target_frames[1:]]
         num_cams = int(st["num_cams"])
         self._set_current_scheduler_scope(int(st["scene_id"]), int(st["segment_id"]))
         sidx = self.dataset.get_segment_index(int(st["scene_id"]), int(st["segment_id"]))
         source_keyframe_idx = int(sidx.frame_to_keyframe[int(source_frame)])
+        near_random_frames: List[int] = []
+        if self.near_random_enable:
+            if self.near_random_sample_once_per_block and int(bcur) in st["block_near_random_frame_indices"]:
+                near_random_frames = [int(x) for x in st["block_near_random_frame_indices"][int(bcur)]]
+            else:
+                near_random_frames, num_candidates = self._sample_near_random_frames_for_block(
+                    sidx=sidx,
+                    source_keyframe_idx=int(source_keyframe_idx),
+                    source_frame=int(source_frame),
+                    existing_target_frames=[int(x) for x in base_target_frames],
+                    num_frames=int(self.near_random_frames_per_block),
+                )
+                st["block_near_random_frame_indices"][int(bcur)] = [int(x) for x in near_random_frames]
+                st["near_random_attempted_blocks"] = int(st.get("near_random_attempted_blocks", 0)) + 1
+                st["near_random_candidate_frames_sum"] = float(st.get("near_random_candidate_frames_sum", 0.0)) + float(
+                    num_candidates
+                )
+                if len(near_random_frames) > 0:
+                    st["near_random_sampled_blocks"] = int(st.get("near_random_sampled_blocks", 0)) + 1
+                else:
+                    st["near_random_skipped_blocks"] = int(st.get("near_random_skipped_blocks", 0)) + 1
+        target_frames = [int(x) for x in base_target_frames] + [int(x) for x in near_random_frames]
+        target_frame_roles = [str(x) for x in base_roles] + [str(self.near_random_role_name) for _ in near_random_frames]
         source_image_ref = (int(source_frame), 0)
         source_image_refs = self._frame_targets_to_image_refs(num_cams, [int(source_frame)])
         target_image_refs = self._frame_targets_to_image_refs(num_cams, target_frames)
+        target_image_roles = self._frame_roles_to_image_roles(
+            num_cams=num_cams,
+            target_frames=[int(x) for x in target_frames],
+            target_frame_roles=[str(x) for x in target_frame_roles],
+        )
 
         st["block_cursor"] = int(bcur)
         st["current_source_frame_idx"] = int(source_frame)
         st["current_target_frame_indices"] = [int(x) for x in target_frames]
+        st["current_target_frame_roles"] = [str(x) for x in target_frame_roles]
         st["source_keyframe_idx"] = int(source_keyframe_idx)
         st["source_image_ref"] = tuple(source_image_ref)
         st["source_image_refs"] = [tuple(x) for x in source_image_refs]
         st["target_image_refs"] = [tuple(x) for x in target_image_refs]
+        st["target_image_roles"] = [str(x) for x in target_image_roles]
         st["block_last_target_frame_indices"][int(bcur)] = [int(x) for x in target_frames]
+        st["block_target_frame_roles"][int(bcur)] = [str(x) for x in target_frame_roles]
+        st["block_target_image_roles"][int(bcur)] = [str(x) for x in target_image_roles]
         if int(bcur) not in st["visited_block_indices"]:
             st["visited_block_indices"].add(int(bcur))
             st["block_first_visit_order"][int(bcur)] = int(st.get("episode_step_cursor", 0))
@@ -283,6 +369,51 @@ class TrainSchedulerV8(TrainSchedulerV7):
             st["block_idx_global"] = int(self._block_idx_global)
             self._emit_block_begin_for_current_state()
             self._block_idx_global += 1
+
+    def _sample_near_random_frames_for_block(
+        self,
+        *,
+        sidx: SegmentIndexLike,
+        source_keyframe_idx: int,
+        source_frame: int,
+        existing_target_frames: List[int],
+        num_frames: int,
+    ) -> tuple[List[int], int]:
+        if int(num_frames) <= 0:
+            return [], 0
+        if not self.near_random_same_keyframe_only:
+            raise ValueError("v1 only supports same_keyframe_only=true")
+        frames = [int(x) for x in list(sidx.keyframe_to_frames[int(source_keyframe_idx)])]
+        existing = set(int(x) for x in existing_target_frames)
+        candidates: List[int] = []
+        for f in frames:
+            if self.near_random_exclude_source and int(f) == int(source_frame):
+                continue
+            if self.near_random_exclude_existing and int(f) in existing:
+                continue
+            candidates.append(int(f))
+        if len(candidates) == 0:
+            return [], 0
+        if len(candidates) < int(num_frames):
+            if self.near_random_insufficient_policy != "skip":
+                raise ValueError(f"unsupported near_random insufficient_policy={self.near_random_insufficient_policy!r}")
+            return [], int(len(candidates))
+        return [int(x) for x in self._sample_no_replace(candidates, int(num_frames))], int(len(candidates))
+
+    @staticmethod
+    def _frame_roles_to_image_roles(
+        *,
+        num_cams: int,
+        target_frames: List[int],
+        target_frame_roles: List[str],
+    ) -> List[str]:
+        if len(target_frames) != len(target_frame_roles):
+            raise ValueError("target_frames and target_frame_roles length mismatch")
+        out: List[str] = []
+        for role in target_frame_roles:
+            for _ in range(int(num_cams)):
+                out.append(str(role))
+        return out
 
     def _emit_block_begin_for_current_state(self) -> None:
         # V7 block-begin preload assumes `block_windows` exists, but V8 replaces it
@@ -443,6 +574,31 @@ class TrainSchedulerV8(TrainSchedulerV7):
         if st is None:
             raise ValueError("TrainSchedulerV8 internal state is not initialized")
         batch = self._batch_from_state(st)
+        request_meta = dict(batch.get("request_meta") or {})
+        request_meta["target_frame_roles"] = list(st.get("current_target_frame_roles", []))
+        request_meta["target_image_roles"] = list(st.get("target_image_roles", []))
+        request_meta["near_random_frame_indices"] = list(
+            st.get("block_near_random_frame_indices", {}).get(int(st["block_cursor"]), [])
+        )
+        request_meta["near_random_supervision_enable"] = bool(self.near_random_enable)
+        attempted = int(st.get("near_random_attempted_blocks", 0))
+        skipped = int(st.get("near_random_skipped_blocks", 0))
+        sampled = int(st.get("near_random_sampled_blocks", 0))
+        candidate_sum = float(st.get("near_random_candidate_frames_sum", 0.0))
+        request_meta["scheduler/near_random/enabled"] = float(1.0 if self.near_random_enable else 0.0)
+        request_meta["scheduler/near_random/num_frames"] = float(len(request_meta["near_random_frame_indices"]))
+        request_meta["scheduler/near_random/skip_ratio"] = float(skipped / max(attempted, 1))
+        request_meta["scheduler/near_random/num_candidate_frames_mean"] = float(candidate_sum / max(attempted, 1))
+        request_meta["scheduler/near_random/sampled_blocks"] = float(sampled)
+        if request_meta.get("source_image_refs") is None:
+            request_meta["source_image_refs"] = list(st.get("source_image_refs", []))
+        if request_meta.get("target_image_refs") is None:
+            request_meta["target_image_refs"] = list(st.get("target_image_refs", []))
+        target_refs = request_meta.get("target_image_refs") or batch.get("target_image_refs") or []
+        roles = request_meta.get("target_image_roles") or []
+        if len(target_refs) != len(roles):
+            raise ValueError(f"target_image_refs/target_image_roles mismatch: {len(target_refs)} vs {len(roles)}")
+        batch["request_meta"] = request_meta
         key = (int(st["scene_id"]), int(st["segment_id"]))
         rt = self._segment_runtime[key]
 

@@ -1,4 +1,4 @@
-output_name: experiment003_120w_adamw_warmcos
+output_name: experiment001_120w
 
 data:
   data_root: "/root/autodl-tmp/nuScenes/"
@@ -7,7 +7,14 @@ data:
   end_timestep: -1
   preload_device: cpu
   sky_mask_semantics: one_is_sky
-  train_scene_ids: [5, 6, 7,]
+  train_scene_ids: [5, 6, 7, 8, 9,14, 16, 24, 32, 40, 99, 107, 115, 123, 131, 139, 147, 155, 163, 171, 179, 195, 214,
+    17, 25, 33, 41, 49, 100, 108, 116, 124, 132, 140, 148, 156, 164, 172, 180, 188, 196, 215,
+    10, 18, 26, 34, 42, 93, 101, 109, 117, 125, 133, 141, 149, 157, 165, 173, 181, 189, 197, 216,
+    11, 19, 27, 35, 43, 94, 102, 110, 118, 126, 134, 142, 150, 158, 166, 174, 182, 190, 198, 217,
+    12, 20, 36, 44, 95, 103, 111, 119, 127, 135, 143, 151, 159, 167, 175, 183, 191, 199, 218,
+    13, 21, 29, 37, 45, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200,
+    22, 30, 38, 46, 97, 105, 113, 121, 129, 137, 145, 153, 161, 169, 177, 185, 193, 201,
+    15, 23, 31, 39, 47, 98, 106, 114, 122, 130, 138, 146, 154, 162, 170, 178, 186, 194]
   eval_scene_ids: [0, 1, 2, 3, 4]
   preload:
     enable: true
@@ -106,6 +113,18 @@ scheduler_v8:
     emit_hints: true
     warm_next_block_exact: true
     warm_next_episode_chain: true
+  near_random_supervision:
+    enable: true
+    frames_per_block: 1
+    same_keyframe_only: true
+    insufficient_policy: skip
+    add_to_source_image_refs: false
+    add_to_history_record_views: false
+    sample_once_per_block: true
+    exclude_source_frame: true
+    exclude_existing_target_frames: true
+    camera_policy: all_cams
+    role_name: near_random
 
 validation_v8:
   eval_enable: false
@@ -135,6 +154,8 @@ validation_v8:
     use_sky_mask_regions: true
     min_valid_pixels_per_region: 32
     require_sky_mask: true
+  near_random_supervision:
+    enable: false
 
 model:
   stage: "5_3"
@@ -228,30 +249,96 @@ model:
     record_on: "block_exit"
     record_views: "source_image_refs"
     support:
-      ema_beta_visible: 0.75
-      ema_beta_invisible: 0.90
+      fast_ema_beta_visible: 0.35
+      fast_ema_beta_invisible: 0.60
+      slow_ema_beta_visible: 0.90
+      slow_ema_beta_invisible: 0.95
     residual:
-      error_beta: 0.75
+      fast_error_beta: 0.35
+      slow_error_beta: 0.9
       error_eps: 1.0e-6
     update:
-      ema_beta: 0.92
+      fast_ema_beta: 0.45
+      slow_ema_beta: 0.92
       apply_in_eval: true
+  view_transient:
+    enable: true
+    source: ego_to_point
+    input_to_gate: true
+    input_to_struct_decoder: false
+    use_delta_xyz: true
+    use_delta_norm: true
+    use_angle_delta: false
+    use_initialized_flag: false
+    detach: true
+    update_in_train: true
+    update_in_eval: true
   update_gate:
     enable: true
+    type: attribute_5
     hidden_dim: 64
-    min_gate: 0.0
-    init_bias: 0.0
-    warmup_steps: 1000
     require_initialized_in_input: true
     include_visible_now: true
     bind_with_mask_update: true
+    min_gate:
+      means: 0.03
+      scales: 0.03
+      quat: 0.01
+      opacity: 0.05
+      sh: 0.05
+    init_bias:
+      means: -1.40
+      scales: -1.70
+      quat: -2.00
+      opacity: -0.40
+      sh: 0.40
+    branch_bias:
+      bg:
+        means: 0.0
+        scales: 0.0
+        quat: -0.2
+        opacity: 0.0
+        sh: 0.1
+      distant:
+        means: -1.0
+        scales: -0.3
+        quat: -1.0
+        opacity: 0.0
+        sh: 0.0
+      rigid_in:
+        means: -0.2
+        scales: -0.2
+        quat: -0.3
+        opacity: 0.1
+        sh: 0.2
+      rigid_out:
+        means: -0.8
+        scales: -0.3
+        quat: -0.8
+        opacity: 0.0
+        sh: 0.0
+    hidden_gate:
+      mode: weighted_sum
+      weights:
+        means: 0.2
+        scales: 0.0
+        quat: 0.0
+        opacity: 0.3
+        sh: 0.5
+    warmup:
+      enable: false
+      means_steps: 5000
+      scales_steps: 8000
+      quat_steps: 8000
+      opacity_steps: 2000
+      sh_steps: 1000
   branches:
     bg:
       src_backproject_support_min: 1e-2
       enable_selective_update: false
       freeze_means: false
       init: {scale_init: {mode: knn, isotropic_log_value: -2.30, knn_k: 8, knn_log_scale_bias: -1.3}, opacity_init: 0.1}
-      limits: {offset_max: 0.1, scale_max: 0.1, omega_max: 0.1, opacity_max: 0.1, sh_dc_max: 0.1, sh_rest_max: 0.05}
+      limits: {offset_max: 0.1, scale_max: 0.1, omega_max: 0.1, opacity_max: 0.15, sh_dc_max: 0.15, sh_rest_max: 0.08}
       eta: {means: 1.0, scales: 1.0, opacity: 1.0, sh_dc: 1.0, sh_rest: 1.0}
       mlp: {hidden_dim: 64, use_3d_feat: true, use_2d_feat: true}
     distant:
@@ -259,13 +346,13 @@ model:
       enable_selective_update: false
       freeze_means: true
       init: {scale_init: {mode: isotropic, isotropic_log_value: -1.90, knn_k: 8, knn_log_scale_bias: -1.5}, opacity_init: 0.05}
-      limits: {offset_max: 0.02, scale_max: 0.08, omega_max: 0.01, opacity_max: 0.05, sh_dc_max: 0.08, sh_rest_max: 0.015}
-      eta: {means: 0.2, scales: 0.7, opacity: 0.5, sh_dc: 0.8, sh_rest: 0.4}
+      limits: {offset_max: 0.02, scale_max: 0.08, omega_max: 0.01, opacity_max: 0.08, sh_dc_max: 0.12, sh_rest_max: 0.03}
+      eta: {means: 0.2, scales: 0.7, opacity: 0.8, sh_dc: 1.0, sh_rest: 0.6}
       mlp: {hidden_dim: 64, use_3d_feat: false, use_2d_feat: true, freeze_quat: true}
     rigid:
       src_backproject_support_min: 1e-2
       init: {scale_init: {mode: knn, isotropic_log_value: -2.90, knn_k: 8, knn_log_scale_bias: -1.5}, opacity_init: 0.2}
-      eta: {means: 0.5, scales: 0.8, opacity: 0.8, sh_dc: 0.8, sh_rest: 0.5}
+      eta: {means: 0.5, scales: 0.8, opacity: 1.0, sh_dc: 1.0, sh_rest: 0.6}
 
 training_recipe:
   name: stage5_3_adamw_warmcos_v1
@@ -277,6 +364,21 @@ losses:
   ssim: {w: 0.05}
   mask: {w: 0.02, opacity_loss_type: bce, require_sky_mask: true}
   opacity_entropy: {w: 0.0}
+  target_view_weights:
+    enable: true
+    normalize_by_weight_sum: true
+    source:
+      weight: 1.0
+    visited:
+      weight: 0.7
+    near_random:
+      weight: 0.3
+      schedule:
+        enable: false
+        type: warmup_linear
+        start_weight: 0.3
+        end_weight: 0.5
+        warmup_steps: 20000
 
 optimizer:
   type: adamw
@@ -357,13 +459,13 @@ lr_scheduler:
   enable: true
   type: warmup_cosine
   interval: step
-  warmup_steps: 3000
+  warmup_steps: 0
   total_steps: ${training.max_iterations}
   min_lr_ratio: 0.05
-  warmup_start_ratio: 0.05
+  warmup_start_ratio: 1.0
 
 training:
-  max_iterations: 10000010
+  max_iterations: 2000010
   log_interval: 100
   save_checkpoint_freq: 10000
   seed: 41
@@ -393,11 +495,12 @@ logging:
   image_interval_blocks: 96
   train_monitor:
     enable_heavy_metrics: false
-    include_per_view_metrics: false
+    include_per_view_metrics: true
     include_extra_result_metrics: false
     enable_low_psnr_image_dump: false
   low_psnr_train_images_subdir: train_low_psnr
   enable_jsonl_metrics: true
+  metrics_history_append: false
   use_tensorboard: true
   offset_monitor:
     enable: true

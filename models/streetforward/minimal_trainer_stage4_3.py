@@ -1666,6 +1666,10 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
         )
         if policy.do_backward or policy.do_optimizer_step:
             raise ValueError("inference_step_from_train_batch requires do_backward=false and do_optimizer_step=false")
+        if step is not None:
+            self.global_step = int(step)
+        elif not hasattr(self, "global_step"):
+            self.global_step = 0
 
         self.train()
         self._perf_acc = {}
@@ -1723,6 +1727,10 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
         policy = runtime_policy or self._default_runtime_policy()
         if policy.do_optimizer_step and not policy.do_backward:
             raise ValueError("RuntimePolicy invalid: do_optimizer_step=true requires do_backward=true")
+        if step is not None:
+            self.global_step = int(step)
+        elif not hasattr(self, "global_step"):
+            self.global_step = 0
         self.train()
         self._perf_acc = {}
         node_state_sync_update = False
@@ -1770,6 +1778,8 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
             timing_ms["backward_ms"] = float((t2 - t1) * 1000.0)
         if policy.do_optimizer_step:
             self.optimizer.step()
+            if step is None:
+                self.global_step = int(getattr(self, "global_step", 0)) + 1
         t3 = time.perf_counter()
         if profile_phase_timing:
             if sync_cuda_timing and torch.cuda.is_available():

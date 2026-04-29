@@ -1165,6 +1165,7 @@ def main() -> None:
         bool(train_monitor_enable_low_psnr_image_dump),
     )
     enable_jsonl_metrics = bool(cfg.logging.get("enable_jsonl_metrics", True))
+    metrics_history_append = bool(cfg.logging.get("metrics_history_append", True))
     image_trigger_cfg = cfg.logging.get("image_trigger") or {}
     if image_trigger_cfg:
         image_trigger_mode = str(image_trigger_cfg.get("mode", "raw_step_interval")).strip()
@@ -1284,7 +1285,11 @@ def main() -> None:
     )
 
     try:
-        metrics_fh = _open_metrics_history(cfg.log_dir, enable_jsonl_metrics)
+        metrics_fh = _open_metrics_history(
+            cfg.log_dir,
+            enable_jsonl_metrics,
+            append=metrics_history_append,
+        )
         if use_tensorboard and SummaryWriter is not None:
             tb_dir = os.path.join(cfg.log_dir, "tb")
             os.makedirs(tb_dir, exist_ok=True)
@@ -1632,7 +1637,7 @@ def main() -> None:
                 # Monitoring metrics are logging-only; detach to avoid extra autograd graph/memory.
                 pred_rgbs_eval = [p.detach() for p in pred_rgbs]
                 gt_images_eval = [g.detach() for g in gt_images]
-                mse_vals = [
+                mse_full_vals = [
                     float(
                         torch.mean(
                             (torch.clamp(pred_rgbs_eval[v], 0.0, 1.0) - torch.clamp(gt_images_eval[v], 0.0, 1.0)) ** 2
@@ -1640,10 +1645,62 @@ def main() -> None:
                     )
                     for v in range(num_views)
                 ]
-                mse_val = float(np.mean(mse_vals))
+                mse_full_val = float(np.mean(mse_full_vals))
+                mse_primary_vals = list(mse_full_vals)
+                mse_non_sky_vals: List[float] = []
 
                 metric_vals: Dict[str, float] = {}
                 metric_scope = "full_image"
+                non_sky_metric_views_light = 0
+                if train_monitor_use_non_sky_region:
+                    for v in range(num_views):
+                        tgt_view = minimal_batch["targets"][v]
+                        sky_mask = tgt_view.get("sky_mask")
+                        if sky_mask is None and train_monitor_require_sky_mask:
+                            raise ValueError(
+                                "train monitor non-sky metrics require target['sky_mask'] "
+                                f"(view={int(v)}, scene={int(minimal_batch.get('scene_id', -1))}, "
+                                f"segment={int(minimal_batch.get('segment_id', -1))})."
+                            )
+                        if sky_mask is None:
+                            continue
+                        sm = sky_mask.to(device).float()
+                        if sm.dim() == 3:
+                            sm = sm.squeeze(-1)
+                        if sm.shape != gt_images_eval[v].shape[:2]:
+                            raise ValueError(
+                                "train monitor sky_mask shape mismatch: "
+                                f"sky_mask={tuple(sm.shape)} gt_hw={tuple(gt_images_eval[v].shape[:2])}"
+                            )
+                        non_sky_mask = (1.0 - sm).clamp(0.0, 1.0)
+                        if int((non_sky_mask > 0.5).sum().item()) < train_monitor_min_valid_pixels:
+                            continue
+                        pred_c = torch.clamp(pred_rgbs_eval[v], 0.0, 1.0)
+                        gt_c = torch.clamp(gt_images_eval[v], 0.0, 1.0)
+                        w3 = non_sky_mask.unsqueeze(-1)
+                        denom = float((non_sky_mask.sum() * 3.0).item())
+                        if denom <= 0.0:
+                            continue
+                        mse_non_sky = float((((pred_c - gt_c) ** 2) * w3).sum().item() / denom)
+                        mse_primary_vals[v] = mse_non_sky
+                        mse_non_sky_vals.append(mse_non_sky)
+                        non_sky_metric_views_light += 1
+                    if non_sky_metric_views_light > 0:
+                        metric_scope = "non_sky"
+
+                mse_val = float(np.mean(mse_primary_vals))
+                if enable_psnr:
+                    psnr_light_list = [float(-10.0 * np.log10(max(float(m), 1.0e-12))) for m in mse_primary_vals]
+                    metric_vals["psnr_mean"] = float(np.mean(psnr_light_list)) if psnr_light_list else 0.0
+                    if train_monitor_include_per_view_metrics:
+                        for v, psnr_v in enumerate(psnr_light_list):
+                            metric_vals[f"psnr_view{v}"] = float(psnr_v)
+                    if train_monitor_use_non_sky_region:
+                        psnr_full_light = [float(-10.0 * np.log10(max(float(m), 1.0e-12))) for m in mse_full_vals]
+                        metric_vals["psnr_full_mean"] = float(np.mean(psnr_full_light)) if psnr_full_light else 0.0
+                        metric_vals["mse_full_mean"] = float(mse_full_val)
+                        metric_vals["mse_non_sky_mean"] = _safe_mean(mse_non_sky_vals)
+                        metric_vals["num_views_non_sky_metric"] = float(non_sky_metric_views_light)
                 if enable_psnr and train_monitor_enable_heavy_metrics:
                     psnr_full_list: List[float] = []
                     ssim_full_list: List[float] = []
@@ -1876,6 +1933,18 @@ def main() -> None:
                             row[k] = bool(v)
                         elif isinstance(v, (int, float)):
                             row[k] = float(v)
+                # Always persist optimizer/lr/loss namespace scalars for run diagnosis,
+                # independent of include_extra_result_metrics.
+                always_scalar_prefixes = ("optimizer/", "lr/", "loss/")
+                for k, v in result.items():
+                    if k.startswith("_") or k in row:
+                        continue
+                    if not any(k.startswith(pf) for pf in always_scalar_prefixes):
+                        continue
+                    if isinstance(v, bool):
+                        row[k] = bool(v)
+                    elif isinstance(v, (int, float)):
+                        row[k] = float(v)
                 row["loss_mask_ratio"] = float(row["loss_mask"] / max(float(loss_val), 1e-8))
                 row.update(metric_vals)
                 if diag_row:

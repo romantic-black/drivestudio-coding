@@ -51,11 +51,14 @@ CKPT_PREFIX = "minimal_sf_stage1_1"
 def _open_metrics_history(
     log_dir: str,
     enable_jsonl: bool,
+    *,
+    append: bool = True,
 ) -> Optional[TextIO]:
     if not enable_jsonl:
         return None
     metrics_path = os.path.join(log_dir, "metrics_history.jsonl")
-    return open(metrics_path, "a", encoding="utf-8")
+    mode = "a" if append else "w"
+    return open(metrics_path, mode, encoding="utf-8")
 
 
 def _write_metrics_history(
@@ -167,11 +170,15 @@ def _build_minimal_source_stack_from_dataset_source(
     src_vd = source_data.get("viewdirs")
     src_ego = source_data.get("egocar_mask")
     if src_sky is not None and src_sky.shape[0] >= n:
-        out["source_sky_mask"] = [src_sky[i].to(device) for i in range(n)]
+        src_sky_list = [src_sky[i].to(device) for i in range(n)]
+        out["source_sky_masks"] = src_sky_list
+        out["source_sky_mask"] = src_sky_list
     if src_vd is not None and src_vd.shape[0] >= n:
         out["source_viewdirs"] = [src_vd[i].to(device) for i in range(n)]
     if src_ego is not None and src_ego.shape[0] >= n:
-        out["source_egocar_mask"] = [src_ego[i].to(device) for i in range(n)]
+        src_ego_list = [src_ego[i].to(device) for i in range(n)]
+        out["source_egocar_masks"] = src_ego_list
+        out["source_egocar_mask"] = src_ego_list
     return out
 
 
@@ -214,6 +221,16 @@ def convert_batch_to_minimal_format(
         raise ValueError("batch must contain 'pointcloud'")
     knn_init_batch = batch.get("knn_init")
     knn_struct_neighbors_batch = batch.get("knn_struct_neighbors")
+    request_meta_batch = batch.get("request_meta")
+    passthrough: Dict[str, Any] = {}
+    if request_meta_batch is not None:
+        if isinstance(request_meta_batch, dict):
+            passthrough["request_meta"] = dict(request_meta_batch)
+        else:
+            passthrough["request_meta"] = request_meta_batch
+    for k in ("_scheduler_v4_aligned_info", "_scheduler_v7_aligned_info", "_scheduler_v8_aligned_info"):
+        if batch.get(k) is not None:
+            passthrough[k] = batch.get(k)
     if isinstance(pointcloud, dict):
         # Keep all available branches (background/dynamic/...) so downstream
         # trainers (e.g. stage4 rigid) can access dynamic pointclouds.
@@ -297,9 +314,12 @@ def convert_batch_to_minimal_format(
                     if isinstance(knn_struct_neighbors_batch, dict)
                     else {}
                 ),
+                **({"source_sky_masks": source_sky_masks} if source_sky_masks else {}),
                 **({"source_sky_mask": source_sky_masks} if source_sky_masks else {}),
                 **({"source_viewdirs": source_viewdirs} if source_viewdirs else {}),
+                **({"source_egocar_masks": source_egocar_masks} if source_egocar_masks else {}),
                 **({"source_egocar_mask": source_egocar_masks} if source_egocar_masks else {}),
+                **passthrough,
             }
         targets_minimal = build_explicit_targets_only(batch, device, explicit)
         if test_frame_indices:
@@ -319,6 +339,7 @@ def convert_batch_to_minimal_format(
                 if isinstance(knn_struct_neighbors_batch, dict)
                 else {}
             ),
+            **passthrough,
         }
 
     target_data = batch.get("target", batch.get("targets"))
@@ -425,6 +446,7 @@ def convert_batch_to_minimal_format(
         result["knn_init"] = knn_init_batch
     if isinstance(knn_struct_neighbors_batch, dict):
         result["knn_struct_neighbors"] = knn_struct_neighbors_batch
+    result.update(passthrough)
     if include_source_for_2d:
         source_data = batch.get("source")
         if isinstance(source_data, dict) and source_data.get("image") is not None:
@@ -450,11 +472,15 @@ def convert_batch_to_minimal_format(
                 src_vd = source_data.get("viewdirs")
                 src_ego = source_data.get("egocar_mask")
                 if src_sky is not None and src_sky.shape[0] > 0:
-                    result["source_sky_mask"] = [src_sky[0].to(device)]
+                    src_sky_list = [src_sky[0].to(device)]
+                    result["source_sky_masks"] = src_sky_list
+                    result["source_sky_mask"] = src_sky_list
                 if src_vd is not None and src_vd.shape[0] > 0:
                     result["source_viewdirs"] = [src_vd[0].to(device)]
                 if src_ego is not None and src_ego.shape[0] > 0:
-                    result["source_egocar_mask"] = [src_ego[0].to(device)]
+                    src_ego_list = [src_ego[0].to(device)]
+                    result["source_egocar_masks"] = src_ego_list
+                    result["source_egocar_mask"] = src_ego_list
     return result
 
 
@@ -488,6 +514,8 @@ def setup(args: argparse.Namespace):
         cfg.logging.image_interval = 50
     if "enable_jsonl_metrics" not in cfg.logging:
         cfg.logging.enable_jsonl_metrics = True
+    if "metrics_history_append" not in cfg.logging:
+        cfg.logging.metrics_history_append = True
     if "use_tensorboard" not in cfg.logging:
         cfg.logging.use_tensorboard = False
 
@@ -584,6 +612,7 @@ def main():
     enable_psnr = bool(cfg.eval.get("enable_psnr", True))
     run_test_at_end = bool(cfg.eval.get("run_test_at_end", True))
     enable_jsonl_metrics = bool(cfg.logging.get("enable_jsonl_metrics", True))
+    metrics_history_append = bool(cfg.logging.get("metrics_history_append", True))
     image_interval = int(cfg.logging.get("image_interval", 50))
     use_tensorboard = bool(cfg.logging.get("use_tensorboard", False))
 
@@ -597,7 +626,11 @@ def main():
     peak_mem_bytes = 0
     peak_mem_reserved_bytes = 0
     try:
-        metrics_fh = _open_metrics_history(cfg.log_dir, enable_jsonl_metrics)
+        metrics_fh = _open_metrics_history(
+            cfg.log_dir,
+            enable_jsonl_metrics,
+            append=metrics_history_append,
+        )
 
         if use_tensorboard and SummaryWriter is not None:
             tb_dir = os.path.join(cfg.log_dir, "tb")

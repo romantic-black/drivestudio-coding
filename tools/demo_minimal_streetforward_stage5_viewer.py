@@ -107,7 +107,7 @@ def main() -> None:
         default="configs/demo_minimal_streetforward_stage5_viewer.yaml",
         help="Path to demo config YAML.",
     )
-    parser.add_argument("--stage", type=str, default="5_2", help="Stage trainer variant: 5_0 / 5_2 / 5_3.")
+    parser.add_argument("--stage", type=str, default="5_3", help="Stage trainer variant: 5_0 / 5_2 / 5_3.")
     parser.add_argument("--ckpt", type=str, default="", help="Checkpoint path.")
     parser.add_argument("--scene_id", type=int, default=None, help="Initial scene id for demo traversal.")
     parser.add_argument("--segment_id", type=int, default=None, help="Fixed segment id (optional).")

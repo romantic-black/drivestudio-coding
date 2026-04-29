@@ -2051,6 +2051,7 @@ class MultiSceneDatasetV4:
         step_major_switch_interval_steps: int = 1,
         target_policy: str = "visited_episode_frames",
         reset_policy: str = "episode_end",
+        near_random_supervision_cfg: Optional[Any] = None,
     ) -> TrainSchedulerV8:
         return TrainSchedulerV8(
             dataset=self,
@@ -2074,6 +2075,7 @@ class MultiSceneDatasetV4:
             step_major_switch_interval_steps=int(step_major_switch_interval_steps),
             target_policy=str(target_policy),
             reset_policy=str(reset_policy),
+            near_random_supervision_cfg=near_random_supervision_cfg,
         )
 
     # Preload worker hooks

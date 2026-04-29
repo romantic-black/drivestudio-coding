@@ -53,7 +53,7 @@ data:
     lidar_downsample_factor: 1
     lidar_percentile: 0.02
   assets:
-    root: "/root/autodl-tmp/streetforward_assets_pt80w_40w"
+    root: "/root/autodl-tmp/streetforward_assets_pt60w_40w"
 
 dataset:
   num_source_keyframes: 1
@@ -79,7 +79,7 @@ dataset:
     monocular_downscale: 1
     monocular_dynamic_recovery_bbox_expand_xyz_m: [0.5, 0.2, 0.5]
     monocular_dynamic_recovery_max_points_per_instance: 20000
-    near_max_points: 800000
+    near_max_points: 600000
     distant_max_points: 400000
     static_instance_motion:
       enable: true

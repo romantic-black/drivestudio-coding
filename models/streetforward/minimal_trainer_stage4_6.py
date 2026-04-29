@@ -170,6 +170,7 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
         self.rigid_routed_cfg = self._parse_rigid_routed_cfg(config)
         self._debug_check_rigid_roundtrip = bool(config.get("debug", {}).get("rigid_roundtrip_check", False))
         self._warned_source_mask_legacy_keys = False
+        self._target_view_weight_cfg = self._parse_target_view_weight_cfg(config)
 
     def _validate_stage4_6_config(self, config) -> None:
         model_cfg = self._require_key(config, "model", "config")
@@ -208,6 +209,86 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
             "update_means": update_means,
             "update_quat": update_quat,
         }
+
+    def _parse_target_view_weight_cfg(self, config) -> Dict[str, Any]:
+        losses_cfg = config.get("losses", {}) if hasattr(config, "get") else {}
+        tvw_cfg = losses_cfg.get("target_view_weights", {}) if hasattr(losses_cfg, "get") else {}
+        source_cfg = tvw_cfg.get("source", {}) if hasattr(tvw_cfg, "get") else {}
+        visited_cfg = tvw_cfg.get("visited", {}) if hasattr(tvw_cfg, "get") else {}
+        near_cfg = tvw_cfg.get("near_random", {}) if hasattr(tvw_cfg, "get") else {}
+        sched_cfg = near_cfg.get("schedule", {}) if hasattr(near_cfg, "get") else {}
+        return {
+            "enable": bool(tvw_cfg.get("enable", False)),
+            "normalize_by_weight_sum": bool(tvw_cfg.get("normalize_by_weight_sum", True)),
+            "source_weight": float(source_cfg.get("weight", 1.0)),
+            "visited_weight": float(visited_cfg.get("weight", 1.0)),
+            "near_random_weight": float(near_cfg.get("weight", 1.0)),
+            "near_random_schedule_enable": bool(sched_cfg.get("enable", False)),
+            "near_random_schedule_type": str(sched_cfg.get("type", "warmup_linear")),
+            "near_random_start_weight": float(sched_cfg.get("start_weight", near_cfg.get("weight", 1.0))),
+            "near_random_end_weight": float(sched_cfg.get("end_weight", near_cfg.get("weight", 1.0))),
+            "near_random_warmup_steps": int(sched_cfg.get("warmup_steps", 0)),
+        }
+
+    def _current_loss_step(self, batch: Dict[str, Any]) -> int:
+        opt = getattr(self, "optimizer", None)
+        if opt is not None and hasattr(opt, "global_step"):
+            return int(getattr(opt, "global_step"))
+        if hasattr(self, "global_step"):
+            return int(getattr(self, "global_step"))
+        aligned = batch.get("_scheduler_v8_aligned_info") or {}
+        return int(aligned.get("global_step", 0))
+
+    @staticmethod
+    def _warmup_linear_value(step: int, *, start_value: float, end_value: float, warmup_steps: int) -> float:
+        if warmup_steps <= 0:
+            return float(end_value)
+        t = min(1.0, max(0.0, float(step) / float(warmup_steps)))
+        return float(start_value) + t * (float(end_value) - float(start_value))
+
+    def _near_random_loss_weight(self, step: int) -> float:
+        cfg = self._target_view_weight_cfg
+        base = float(cfg["near_random_weight"])
+        if not bool(cfg["near_random_schedule_enable"]):
+            return base
+        sched_type = str(cfg["near_random_schedule_type"])
+        if sched_type != "warmup_linear":
+            raise ValueError(f"unsupported near_random weight schedule type: {sched_type!r}")
+        return self._warmup_linear_value(
+            int(step),
+            start_value=float(cfg["near_random_start_weight"]),
+            end_value=float(cfg["near_random_end_weight"]),
+            warmup_steps=int(cfg["near_random_warmup_steps"]),
+        )
+
+    def _target_role_weight(self, role: str, step: int) -> float:
+        cfg = self._target_view_weight_cfg
+        if role == "source":
+            return float(cfg["source_weight"])
+        if role == "visited":
+            return float(cfg["visited_weight"])
+        if role == "near_random":
+            return float(self._near_random_loss_weight(int(step)))
+        raise ValueError(f"unknown target role: {role}")
+
+    def _build_target_view_weights(
+        self,
+        batch: Dict[str, Any],
+        *,
+        step: int,
+        num_targets: int,
+    ) -> Tuple[torch.Tensor, List[str]]:
+        cfg = self._target_view_weight_cfg
+        if not bool(cfg["enable"]):
+            return torch.ones((int(num_targets),), dtype=torch.float32, device=self.device), ["source"] * int(num_targets)
+        meta = batch.get("request_meta") or {}
+        roles = [str(x) for x in list(meta.get("target_image_roles") or [])]
+        if len(roles) == 0:
+            return torch.ones((int(num_targets),), dtype=torch.float32, device=self.device), ["source"] * int(num_targets)
+        if len(roles) != int(num_targets):
+            raise ValueError(f"target_image_roles length mismatch with targets: {len(roles)} vs {int(num_targets)}")
+        vals = [float(self._target_role_weight(role, int(step))) for role in roles]
+        return torch.tensor(vals, dtype=torch.float32, device=self.device), roles
 
     def _get_source_masks_from_batch(
         self,
@@ -809,6 +890,13 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
         eff_gate_distant = None
         eff_gate_rigid_in = None
         eff_gate_rigid_out = None
+
+        def _select_gate_rows(gate_obj, rows):
+            if gate_obj is None:
+                return None
+            if hasattr(gate_obj, "select_rows"):
+                return gate_obj.select_rows(rows)
+            return gate_obj[rows]
         mask_src_feat_valid_bg = acc_w_bg > self.bg_src_backproject_support_min
         mask_any_tgt_bg = self._build_any_target_mask_static(
             num_points=num_bg,
@@ -838,6 +926,11 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
                 gate=gate_bg,
                 mask_update=mask_update_bg,
             )
+        bg_rigid_in_aux["stage5_3_applied_delta_bg_means_abs"] = float(offsets_bg["offset_pos"].abs().mean().detach().item())
+        bg_rigid_in_aux["stage5_3_applied_delta_bg_opacity_abs"] = float(
+            offsets_bg["offset_opacity"].abs().mean().detach().item()
+        )
+        bg_rigid_in_aux["stage5_3_applied_delta_bg_sh_abs"] = float(offsets_bg["offset_sh"].abs().mean().detach().item())
         render_params_bg = self._render_params_from_offsets_bg(node_state_bg, offsets_bg)
 
         if num_distant > 0:
@@ -884,6 +977,15 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
                     gate=gate_distant,
                     mask_update=mask_update_distant,
                 )
+            bg_rigid_in_aux["stage5_3_applied_delta_distant_means_abs"] = float(
+                offsets_distant["offset_pos"].abs().mean().detach().item()
+            )
+            bg_rigid_in_aux["stage5_3_applied_delta_distant_opacity_abs"] = float(
+                offsets_distant["offset_opacity"].abs().mean().detach().item()
+            )
+            bg_rigid_in_aux["stage5_3_applied_delta_distant_sh_abs"] = float(
+                offsets_distant["offset_sh"].abs().mean().detach().item()
+            )
             render_params_distant = self._render_params_from_offsets_distant(node_state_distant, offsets_distant)
 
         mask_src_feat_valid_rigid = torch.zeros(N_rigid, dtype=torch.bool, device=self.device)
@@ -945,7 +1047,7 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
                     freeze_quat=self.bg_freeze_quat,
                 )
                 if callable(apply_update_gate_fn) and gate_rigid_in is not None:
-                    gate_rigid_in_sel = gate_rigid_in[rows_S_in]
+                    gate_rigid_in_sel = _select_gate_rows(gate_rigid_in, rows_S_in)
                     offsets_rigid_in_world, h_new_rigid_in, eff_gate_rigid_in = apply_update_gate_fn(
                         offsets_rigid_in_world,
                         h_old=h_old_rigid[U_in],
@@ -990,7 +1092,7 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
                     freeze_quat=self.distant_freeze_quat,
                 )
                 if callable(apply_update_gate_fn) and gate_rigid_out is not None:
-                    gate_rigid_out_sel = gate_rigid_out[rows_S_out]
+                    gate_rigid_out_sel = _select_gate_rows(gate_rigid_out, rows_S_out)
                     offsets_rigid_out_world, h_new_rigid_out, eff_gate_rigid_out = apply_update_gate_fn(
                         offsets_rigid_out_world,
                         h_old=h_old_rigid[U_out],
@@ -1163,21 +1265,36 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
             gt_images_t.append(gt)
             opacities_t.append(acc)
 
-        loss_l1_list: List[torch.Tensor] = []
-        loss_ssim_list: List[torch.Tensor] = []
-        loss_mask_list: List[torch.Tensor] = []
-        loss_entropy_list: List[torch.Tensor] = []
-        frame_losses: List[torch.Tensor] = []
+        current_loss_step = self._current_loss_step(batch)
+        target_view_weights, target_view_roles = self._build_target_view_weights(
+            batch,
+            step=current_loss_step,
+            num_targets=len(targets),
+        )
+        normalize_by_weight_sum = bool(self._target_view_weight_cfg["normalize_by_weight_sum"])
+        weight_eps = 1e-8
+        zero = torch.zeros((), device=self.device, dtype=torch.float32)
+        weighted_l1_sum = zero.clone()
+        weighted_ssim_sum = zero.clone()
+        weighted_mask_sum = zero.clone()
+        weighted_entropy_sum = zero.clone()
+        total_weight_sum = zero.clone()
+        frame_loss_num: Dict[int, torch.Tensor] = {}
+        frame_loss_den: Dict[int, torch.Tensor] = {}
         frame_loss_map: Dict[int, float] = {}
         eff_frames = 0
         views_no_non_sky = 0
+        role_rgb_num: Dict[str, torch.Tensor] = {}
+        role_rgb_den: Dict[str, torch.Tensor] = {}
+        role_counts: Dict[str, int] = {}
         for F in sorted_frames:
             group = by_frame[F]
-            view_losses: List[torch.Tensor] = []
             for orig_i, t in group:
                 pred_rgb = pred_rgbs_t[orig_i]
                 gt_image = gt_images_t[orig_i]
                 opacity = opacities_t[orig_i].to(self.device).float()
+                view_weight = target_view_weights[orig_i]
+                role = str(target_view_roles[orig_i]) if orig_i < len(target_view_roles) else "source"
                 if opacity.dim() == 3 and opacity.shape[-1] == 1:
                     opacity = opacity.squeeze(-1)
                 h, w = gt_image.shape[0], gt_image.shape[1]
@@ -1216,21 +1333,36 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
                 p = opacity.clamp(1e-6, 1.0 - 1e-6)
                 entropy_i = self.loss_w_opacity_entropy * self._masked_mean(-p * torch.log(p), valid_loss_mask)
                 total_i = l1_i + ssim_i + mask_i + entropy_i
-                loss_l1_list.append(l1_i)
-                loss_ssim_list.append(ssim_i)
-                loss_mask_list.append(mask_i)
-                loss_entropy_list.append(entropy_i)
-                view_losses.append(total_i)
-            if view_losses:
-                frame_loss = torch.stack(view_losses).mean()
-                frame_losses.append(frame_loss)
-                frame_loss_map[int(F)] = float(frame_loss.detach().item())
-                eff_frames += 1
-        loss = torch.stack(frame_losses).mean() if frame_losses else render_params_bg["means_r"].sum() * 0.0
-        l1_mean = torch.stack(loss_l1_list).mean() if loss_l1_list else loss * 0.0
-        ssim_mean = torch.stack(loss_ssim_list).mean() if loss_ssim_list else loss * 0.0
-        mask_mean = torch.stack(loss_mask_list).mean() if loss_mask_list else loss * 0.0
-        entropy_mean = torch.stack(loss_entropy_list).mean() if loss_entropy_list else loss * 0.0
+                weighted_l1_sum = weighted_l1_sum + l1_i * view_weight
+                weighted_ssim_sum = weighted_ssim_sum + ssim_i * view_weight
+                weighted_mask_sum = weighted_mask_sum + mask_i * view_weight
+                weighted_entropy_sum = weighted_entropy_sum + entropy_i * view_weight
+                total_weight_sum = total_weight_sum + view_weight
+                if int(F) not in frame_loss_num:
+                    frame_loss_num[int(F)] = total_i * view_weight
+                    frame_loss_den[int(F)] = view_weight
+                else:
+                    frame_loss_num[int(F)] = frame_loss_num[int(F)] + (total_i * view_weight)
+                    frame_loss_den[int(F)] = frame_loss_den[int(F)] + view_weight
+                role_rgb_num[role] = role_rgb_num.get(role, zero.clone()) + (l1_i * view_weight)
+                role_rgb_den[role] = role_rgb_den.get(role, zero.clone()) + view_weight
+                role_counts[role] = int(role_counts.get(role, 0)) + 1
+        if normalize_by_weight_sum:
+            denom = torch.clamp(total_weight_sum, min=weight_eps)
+        else:
+            denom = torch.clamp(
+                torch.tensor(float(sum(int(v) for v in role_counts.values())), dtype=torch.float32, device=self.device),
+                min=1.0,
+            )
+        loss = (weighted_l1_sum + weighted_ssim_sum + weighted_mask_sum + weighted_entropy_sum) / denom
+        l1_mean = weighted_l1_sum / denom
+        ssim_mean = weighted_ssim_sum / denom
+        mask_mean = weighted_mask_sum / denom
+        entropy_mean = weighted_entropy_sum / denom
+        for fidx, num in frame_loss_num.items():
+            den = torch.clamp(frame_loss_den[fidx], min=weight_eps)
+            frame_loss_map[int(fidx)] = float((num / den).detach().item())
+        eff_frames = int(len(frame_loss_num))
         offsets_rigid_for_stats = None
         if offsets_rigid_in_world is not None and offsets_rigid_out_world is not None:
             offsets_rigid_for_stats = {
@@ -1250,14 +1382,52 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
         )
         rigid_src_feat_valid = int(mask_src_feat_valid_rigid.sum().item())
         rigid_update_count = int(U_all.numel())
+        gate_attr_keys = ("means", "scales", "quat", "opacity", "sh", "hidden")
+
+        def _gate_mean(gate_eff, key: str) -> Optional[float]:
+            if gate_eff is None:
+                return None
+            if isinstance(gate_eff, dict):
+                v = gate_eff.get(key)
+                if v is None or not torch.is_tensor(v) or int(v.numel()) == 0:
+                    return None
+                return float(v.mean().detach().item())
+            if torch.is_tensor(gate_eff) and int(gate_eff.numel()) > 0:
+                return float(gate_eff.mean().detach().item())
+            return None
+
         if eff_gate_bg is not None:
-            bg_rigid_in_aux["stage5_2_gate_bg_mean"] = float(eff_gate_bg.mean().detach().item())
+            for k in gate_attr_keys:
+                mv = _gate_mean(eff_gate_bg, k)
+                if mv is not None:
+                    bg_rigid_in_aux[f"stage5_3_gate_bg_{k}_mean"] = mv
+            hidden_mv = _gate_mean(eff_gate_bg, "hidden")
+            if hidden_mv is not None:
+                bg_rigid_in_aux["stage5_2_gate_bg_mean"] = hidden_mv
         if eff_gate_distant is not None:
-            bg_rigid_in_aux["stage5_2_gate_distant_mean"] = float(eff_gate_distant.mean().detach().item())
+            for k in gate_attr_keys:
+                mv = _gate_mean(eff_gate_distant, k)
+                if mv is not None:
+                    bg_rigid_in_aux[f"stage5_3_gate_distant_{k}_mean"] = mv
+            hidden_mv = _gate_mean(eff_gate_distant, "hidden")
+            if hidden_mv is not None:
+                bg_rigid_in_aux["stage5_2_gate_distant_mean"] = hidden_mv
         if eff_gate_rigid_in is not None:
-            bg_rigid_in_aux["stage5_2_gate_rigid_in_mean"] = float(eff_gate_rigid_in.mean().detach().item())
+            for k in gate_attr_keys:
+                mv = _gate_mean(eff_gate_rigid_in, k)
+                if mv is not None:
+                    bg_rigid_in_aux[f"stage5_3_gate_rigid_in_{k}_mean"] = mv
+            hidden_mv = _gate_mean(eff_gate_rigid_in, "hidden")
+            if hidden_mv is not None:
+                bg_rigid_in_aux["stage5_2_gate_rigid_in_mean"] = hidden_mv
         if eff_gate_rigid_out is not None:
-            bg_rigid_in_aux["stage5_2_gate_rigid_out_mean"] = float(eff_gate_rigid_out.mean().detach().item())
+            for k in gate_attr_keys:
+                mv = _gate_mean(eff_gate_rigid_out, k)
+                if mv is not None:
+                    bg_rigid_in_aux[f"stage5_3_gate_rigid_out_{k}_mean"] = mv
+            hidden_mv = _gate_mean(eff_gate_rigid_out, "hidden")
+            if hidden_mv is not None:
+                bg_rigid_in_aux["stage5_2_gate_rigid_out_mean"] = hidden_mv
         if stage5_2_full is not None and hasattr(self, "_stage5_2_last_full_inputs"):
             self._stage5_2_last_full_inputs = None
 
@@ -1305,6 +1475,24 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
             "_src_backproject_pass_count": src_backproject_pass_count,
             "_cache_key": key,
             "_num_views_no_non_sky_supervision": int(views_no_non_sky),
+            "loss/target_weight/source": float(self._target_role_weight("source", current_loss_step)),
+            "loss/target_weight/visited": float(self._target_role_weight("visited", current_loss_step)),
+            "loss/target_weight/near_random": float(self._target_role_weight("near_random", current_loss_step)),
+            "loss/rgb/source": float(
+                (role_rgb_num["source"] / torch.clamp(role_rgb_den["source"], min=weight_eps)).detach().item()
+            )
+            if "source" in role_rgb_num
+            else 0.0,
+            "loss/rgb/visited": float(
+                (role_rgb_num["visited"] / torch.clamp(role_rgb_den["visited"], min=weight_eps)).detach().item()
+            )
+            if "visited" in role_rgb_num
+            else 0.0,
+            "loss/rgb/near_random": float(
+                (role_rgb_num["near_random"] / torch.clamp(role_rgb_den["near_random"], min=weight_eps)).detach().item()
+            )
+            if "near_random" in role_rgb_num
+            else 0.0,
             "pred_rgbs": pred_rgbs_t,
             "gt_images": gt_images_t,
             "pred_rgb": pred_rgbs_t[0],

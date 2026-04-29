@@ -26,21 +26,46 @@ from models.streetforward.struct_decoders import (
 
 
 @dataclass
+class AttributeGate:
+    means: torch.Tensor
+    scales: torch.Tensor
+    quat: torch.Tensor
+    opacity: torch.Tensor
+    sh: torch.Tensor
+    hidden: torch.Tensor
+
+    def select_rows(self, idx: torch.Tensor) -> "AttributeGate":
+        return AttributeGate(
+            means=self.means[idx],
+            scales=self.scales[idx],
+            quat=self.quat[idx],
+            opacity=self.opacity[idx],
+            sh=self.sh[idx],
+            hidden=self.hidden[idx],
+        )
+
+
+@dataclass
 class FullRoutedGRUInputs:
     feat_bg_input: torch.Tensor
     feat_distant_input: Optional[torch.Tensor]
     feat_rigid_in_input_all: Optional[torch.Tensor]
     feat_rigid_out_input_all: Optional[torch.Tensor]
-    gate_bg: Optional[torch.Tensor]
-    gate_distant: Optional[torch.Tensor]
-    gate_rigid_in: Optional[torch.Tensor]
-    gate_rigid_out: Optional[torch.Tensor]
+    gate_bg: Optional[AttributeGate]
+    gate_distant: Optional[AttributeGate]
+    gate_rigid_in: Optional[AttributeGate]
+    gate_rigid_out: Optional[AttributeGate]
     aux: Dict[str, Any]
 
 
 class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
     FAR_LOCAL_BRANCH_DISTANT = 0
     FAR_LOCAL_BRANCH_RIGID_OUT = 1
+    GATE_MEANS = 0
+    GATE_SCALES = 1
+    GATE_QUAT = 2
+    GATE_OPACITY = 3
+    GATE_SH = 4
 
     def __init__(self, config, device: torch.device, **kwargs):
         self._validate_stage5_3_config(config)
@@ -113,17 +138,25 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
         support_cfg = self._require_key(history_cfg, "support", "model.history_memory")
         residual_cfg = self._require_key(history_cfg, "residual", "model.history_memory")
         update_cfg = self._require_key(history_cfg, "update", "model.history_memory")
-        _ = self._require_key(support_cfg, "ema_beta_visible", "model.history_memory.support")
-        _ = self._require_key(support_cfg, "ema_beta_invisible", "model.history_memory.support")
-        _ = self._require_key(residual_cfg, "error_beta", "model.history_memory.residual")
+        _ = self._require_key(support_cfg, "fast_ema_beta_visible", "model.history_memory.support")
+        _ = self._require_key(support_cfg, "fast_ema_beta_invisible", "model.history_memory.support")
+        _ = self._require_key(support_cfg, "slow_ema_beta_visible", "model.history_memory.support")
+        _ = self._require_key(support_cfg, "slow_ema_beta_invisible", "model.history_memory.support")
+        _ = self._require_key(residual_cfg, "fast_error_beta", "model.history_memory.residual")
+        _ = self._require_key(residual_cfg, "slow_error_beta", "model.history_memory.residual")
         _ = self._require_key(residual_cfg, "error_eps", "model.history_memory.residual")
-        _ = self._require_key(update_cfg, "ema_beta", "model.history_memory.update")
+        _ = self._require_key(update_cfg, "fast_ema_beta", "model.history_memory.update")
+        _ = self._require_key(update_cfg, "slow_ema_beta", "model.history_memory.update")
+        _ = self._require_key(update_cfg, "apply_in_eval", "model.history_memory.update")
         legacy_flat_history_keys = (
             "support_beta_visible",
             "support_beta_invisible",
             "error_beta",
             "update_norm_beta",
             "error_eps",
+            "ema_beta_visible",
+            "ema_beta_invisible",
+            "ema_beta",
         )
         for legacy_key in legacy_flat_history_keys:
             if hasattr(history_cfg, "get") and history_cfg.get(legacy_key, None) is not None:
@@ -131,6 +164,26 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
                     "Stage5_3 no longer supports flat history_memory keys. "
                     "Use nested keys under history_memory.support/residual/update."
                 )
+        view_cfg = self._require_key(model_cfg, "view_transient", "model")
+        if not bool(self._require_key(view_cfg, "enable", "model.view_transient")):
+            raise ValueError("Stage5_3 requires view_transient.enable=true.")
+        if str(self._require_key(view_cfg, "source", "model.view_transient")) != "ego_to_point":
+            raise ValueError("Stage5_3 requires view_transient.source=ego_to_point.")
+        if not bool(self._require_key(view_cfg, "input_to_gate", "model.view_transient")):
+            raise ValueError("Stage5_3 requires view_transient.input_to_gate=true.")
+        if bool(self._require_key(view_cfg, "input_to_struct_decoder", "model.view_transient")):
+            raise ValueError("Stage5_3 requires view_transient.input_to_struct_decoder=false.")
+        if not bool(self._require_key(view_cfg, "use_delta_xyz", "model.view_transient")):
+            raise ValueError("Stage5_3 requires view_transient.use_delta_xyz=true.")
+        if not bool(self._require_key(view_cfg, "use_delta_norm", "model.view_transient")):
+            raise ValueError("Stage5_3 requires view_transient.use_delta_norm=true.")
+        if bool(self._require_key(view_cfg, "use_angle_delta", "model.view_transient")):
+            raise ValueError("Stage5_3 requires view_transient.use_angle_delta=false.")
+        if bool(self._require_key(view_cfg, "use_initialized_flag", "model.view_transient")):
+            raise ValueError("Stage5_3 requires view_transient.use_initialized_flag=false.")
+        _ = self._require_key(view_cfg, "detach", "model.view_transient")
+        _ = self._require_key(view_cfg, "update_in_train", "model.view_transient")
+        _ = self._require_key(view_cfg, "update_in_eval", "model.view_transient")
 
         gate_cfg = self._require_key(model_cfg, "update_gate", "model")
         if not bool(self._require_key(gate_cfg, "enable", "model.update_gate")):
@@ -139,6 +192,34 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
             raise ValueError("Stage5_3 requires update_gate.bind_with_mask_update=true.")
         if not bool(self._require_key(gate_cfg, "require_initialized_in_input", "model.update_gate")):
             raise ValueError("Stage5_3 requires update_gate.require_initialized_in_input=true.")
+        gate_type = str(self._require_key(gate_cfg, "type", "model.update_gate"))
+        if gate_type != "attribute_5":
+            raise ValueError("Stage5_3 requires model.update_gate.type='attribute_5'.")
+        attr_names = ("means", "scales", "quat", "opacity", "sh")
+        min_gate_cfg = self._require_key(gate_cfg, "min_gate", "model.update_gate")
+        init_bias_cfg = self._require_key(gate_cfg, "init_bias", "model.update_gate")
+        for attr_name in attr_names:
+            _ = self._require_key(min_gate_cfg, attr_name, "model.update_gate.min_gate")
+            _ = self._require_key(init_bias_cfg, attr_name, "model.update_gate.init_bias")
+        hidden_gate_cfg = self._require_key(gate_cfg, "hidden_gate", "model.update_gate")
+        hidden_mode = str(self._require_key(hidden_gate_cfg, "mode", "model.update_gate.hidden_gate"))
+        if hidden_mode != "weighted_sum":
+            raise ValueError("Stage5_3 requires model.update_gate.hidden_gate.mode='weighted_sum'.")
+        hidden_weights = self._require_key(hidden_gate_cfg, "weights", "model.update_gate.hidden_gate")
+        for attr_name in attr_names:
+            _ = self._require_key(hidden_weights, attr_name, "model.update_gate.hidden_gate.weights")
+        branch_bias_cfg = self._require_key(gate_cfg, "branch_bias", "model.update_gate")
+        for branch_name in ("bg", "distant", "rigid_in", "rigid_out"):
+            branch_cfg = self._require_key(branch_bias_cfg, branch_name, "model.update_gate.branch_bias")
+            for attr_name in attr_names:
+                _ = self._require_key(branch_cfg, attr_name, f"model.update_gate.branch_bias.{branch_name}")
+        warmup_cfg = self._require_key(gate_cfg, "warmup", "model.update_gate")
+        _ = self._require_key(warmup_cfg, "enable", "model.update_gate.warmup")
+        _ = self._require_key(warmup_cfg, "means_steps", "model.update_gate.warmup")
+        _ = self._require_key(warmup_cfg, "scales_steps", "model.update_gate.warmup")
+        _ = self._require_key(warmup_cfg, "quat_steps", "model.update_gate.warmup")
+        _ = self._require_key(warmup_cfg, "opacity_steps", "model.update_gate.warmup")
+        _ = self._require_key(warmup_cfg, "sh_steps", "model.update_gate.warmup")
 
         scheduler_cfg = self._require_key(config, "scheduler_v8", "config")
         episode_cfg = self._require_key(scheduler_cfg, "episode", "scheduler_v8")
@@ -277,8 +358,9 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
 
         gate_hidden_dim = int(self._require_key(gate_cfg, "hidden_dim", "model.update_gate"))
         branch_embed_dim = int(self._require_key(struct_cfg, "branch_embed_dim", "model.struct_decoder"))
+        self.stage5_3_gate_num_attrs = 5
         self.stage5_2_history_proj = nn.Sequential(
-            nn.Linear(5, hist_embed_dim),
+            nn.Linear(12, hist_embed_dim),
             nn.GELU(),
             nn.LayerNorm(hist_embed_dim),
         ).to(self.device)
@@ -286,28 +368,89 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
         self.stage5_2_gate_mlp = nn.Sequential(
             nn.Linear(self.fused_in_dim + self.offset_gru_hidden_dim + self.param_embed_dim + hist_embed_dim + branch_embed_dim, gate_hidden_dim),
             nn.GELU(),
-            nn.Linear(gate_hidden_dim, 1),
+            nn.Linear(gate_hidden_dim, self.stage5_3_gate_num_attrs),
         ).to(self.device)
-        self.stage5_2_gate_min = float(self._require_key(gate_cfg, "min_gate", "model.update_gate"))
-        self.stage5_2_gate_init_bias = float(self._require_key(gate_cfg, "init_bias", "model.update_gate"))
+        min_gate_cfg = self._require_key(gate_cfg, "min_gate", "model.update_gate")
+        init_bias_cfg = self._require_key(gate_cfg, "init_bias", "model.update_gate")
+        hidden_gate_cfg = self._require_key(gate_cfg, "hidden_gate", "model.update_gate")
+        hidden_weights_cfg = self._require_key(hidden_gate_cfg, "weights", "model.update_gate.hidden_gate")
+        branch_bias_cfg = self._require_key(gate_cfg, "branch_bias", "model.update_gate")
+        warmup_cfg = self._require_key(gate_cfg, "warmup", "model.update_gate")
+        attr_order = ("means", "scales", "quat", "opacity", "sh")
+        self.stage5_3_attr_min_gate = torch.tensor(
+            [float(self._require_key(min_gate_cfg, k, "model.update_gate.min_gate")) for k in attr_order],
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self.stage5_3_attr_init_bias = torch.tensor(
+            [float(self._require_key(init_bias_cfg, k, "model.update_gate.init_bias")) for k in attr_order],
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self.stage5_3_hidden_gate_weights = torch.tensor(
+            [float(self._require_key(hidden_weights_cfg, k, "model.update_gate.hidden_gate.weights")) for k in attr_order],
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self.stage5_3_gate_warmup_enable = bool(self._require_key(warmup_cfg, "enable", "model.update_gate.warmup"))
+        self.stage5_3_gate_warmup_steps = torch.tensor(
+            [
+                float(self._require_key(warmup_cfg, "means_steps", "model.update_gate.warmup")),
+                float(self._require_key(warmup_cfg, "scales_steps", "model.update_gate.warmup")),
+                float(self._require_key(warmup_cfg, "quat_steps", "model.update_gate.warmup")),
+                float(self._require_key(warmup_cfg, "opacity_steps", "model.update_gate.warmup")),
+                float(self._require_key(warmup_cfg, "sh_steps", "model.update_gate.warmup")),
+            ],
+            device=self.device,
+            dtype=torch.float32,
+        )
+        # Branch order follows gate branch_id: 0=bg, 1=rigid_in, 2=distant, 3=rigid_out.
+        self.stage5_3_branch_bias_table = torch.tensor(
+            [
+                [float(self._require_key(self._require_key(branch_bias_cfg, "bg", "model.update_gate.branch_bias"), k, "model.update_gate.branch_bias.bg")) for k in attr_order],
+                [float(self._require_key(self._require_key(branch_bias_cfg, "rigid_in", "model.update_gate.branch_bias"), k, "model.update_gate.branch_bias.rigid_in")) for k in attr_order],
+                [float(self._require_key(self._require_key(branch_bias_cfg, "distant", "model.update_gate.branch_bias"), k, "model.update_gate.branch_bias.distant")) for k in attr_order],
+                [float(self._require_key(self._require_key(branch_bias_cfg, "rigid_out", "model.update_gate.branch_bias"), k, "model.update_gate.branch_bias.rigid_out")) for k in attr_order],
+            ],
+            device=self.device,
+            dtype=torch.float32,
+        )
         with torch.no_grad():
             last = self.stage5_2_gate_mlp[-1]
             if isinstance(last, nn.Linear):
-                last.bias.fill_(self.stage5_2_gate_init_bias)
+                last.bias.copy_(self.stage5_3_attr_init_bias.to(device=last.bias.device, dtype=last.bias.dtype))
 
         support_cfg = self._require_key(history_cfg, "support", "model.history_memory")
         residual_cfg = self._require_key(history_cfg, "residual", "model.history_memory")
         update_cfg = self._require_key(history_cfg, "update", "model.history_memory")
-        self.stage5_2_support_beta_visible = float(
-            self._require_key(support_cfg, "ema_beta_visible", "model.history_memory.support")
+        self.stage5_3_support_fast_beta_visible = float(
+            self._require_key(support_cfg, "fast_ema_beta_visible", "model.history_memory.support")
         )
-        self.stage5_2_support_beta_invisible = float(
-            self._require_key(support_cfg, "ema_beta_invisible", "model.history_memory.support")
+        self.stage5_3_support_fast_beta_invisible = float(
+            self._require_key(support_cfg, "fast_ema_beta_invisible", "model.history_memory.support")
         )
-        self.stage5_2_error_beta = float(self._require_key(residual_cfg, "error_beta", "model.history_memory.residual"))
-        self.stage5_2_update_norm_beta = float(self._require_key(update_cfg, "ema_beta", "model.history_memory.update"))
+        self.stage5_3_support_slow_beta_visible = float(
+            self._require_key(support_cfg, "slow_ema_beta_visible", "model.history_memory.support")
+        )
+        self.stage5_3_support_slow_beta_invisible = float(
+            self._require_key(support_cfg, "slow_ema_beta_invisible", "model.history_memory.support")
+        )
+        self.stage5_3_error_fast_beta = float(
+            self._require_key(residual_cfg, "fast_error_beta", "model.history_memory.residual")
+        )
+        self.stage5_3_error_slow_beta = float(
+            self._require_key(residual_cfg, "slow_error_beta", "model.history_memory.residual")
+        )
+        self.stage5_3_update_norm_fast_beta = float(
+            self._require_key(update_cfg, "fast_ema_beta", "model.history_memory.update")
+        )
+        self.stage5_3_update_norm_slow_beta = float(
+            self._require_key(update_cfg, "slow_ema_beta", "model.history_memory.update")
+        )
         self.stage5_2_error_eps = float(self._require_key(residual_cfg, "error_eps", "model.history_memory.residual"))
-        self.stage5_2_history_update_apply_in_eval = bool(update_cfg.get("apply_in_eval", True))
+        self.stage5_2_history_update_apply_in_eval = bool(
+            self._require_key(update_cfg, "apply_in_eval", "model.history_memory.update")
+        )
         self.stage5_2_record_views = str(self._require_key(history_cfg, "record_views", "model.history_memory"))
         self.stage5_2_record_backprojector = FeatureBackprojector(
             eps=getattr(self.feature_backprojector, "eps", 1e-8),
@@ -320,6 +463,32 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
         self.stage5_2_history_bg: Dict[Tuple[int, int], Dict[str, torch.Tensor]] = {}
         self.stage5_2_history_distant: Dict[Tuple[int, int], Dict[str, torch.Tensor]] = {}
         self.stage5_2_history_rigid: Dict[Tuple[int, int], Dict[str, torch.Tensor]] = {}
+        view_cfg = self._require_key(model_cfg, "view_transient", "model")
+        self.stage5_3_view_transient_enable = bool(self._require_key(view_cfg, "enable", "model.view_transient"))
+        self.stage5_3_view_input_to_gate = bool(self._require_key(view_cfg, "input_to_gate", "model.view_transient"))
+        self.stage5_3_view_input_to_struct_decoder = bool(
+            self._require_key(view_cfg, "input_to_struct_decoder", "model.view_transient")
+        )
+        self.stage5_3_view_use_delta_xyz = bool(self._require_key(view_cfg, "use_delta_xyz", "model.view_transient"))
+        self.stage5_3_view_use_delta_norm = bool(self._require_key(view_cfg, "use_delta_norm", "model.view_transient"))
+        self.stage5_3_view_use_angle_delta = bool(
+            self._require_key(view_cfg, "use_angle_delta", "model.view_transient")
+        )
+        self.stage5_3_view_use_initialized_flag = bool(
+            self._require_key(view_cfg, "use_initialized_flag", "model.view_transient")
+        )
+        self.stage5_3_view_detach = bool(self._require_key(view_cfg, "detach", "model.view_transient"))
+        self.stage5_3_view_update_in_train = bool(
+            self._require_key(view_cfg, "update_in_train", "model.view_transient")
+        )
+        self.stage5_3_view_update_in_eval = bool(
+            self._require_key(view_cfg, "update_in_eval", "model.view_transient")
+        )
+        self.stage5_3_last_view_bg: Dict[Tuple[int, int], torch.Tensor] = {}
+        self.stage5_3_last_view_distant: Dict[Tuple[int, int], torch.Tensor] = {}
+        self.stage5_3_last_view_rigid: Dict[Tuple[int, int], torch.Tensor] = {}
+        self._stage5_3_force_update_history_memory: Optional[bool] = None
+        self._stage5_3_force_update_view_transient: Optional[bool] = None
         self.stage5_2_block_support_bg: Dict[Tuple[int, int], Dict[str, torch.Tensor]] = {}
         self.stage5_2_block_support_distant: Dict[Tuple[int, int], Dict[str, torch.Tensor]] = {}
         self.stage5_2_block_support_rigid: Dict[Tuple[int, int], Dict[str, torch.Tensor]] = {}
@@ -336,17 +505,161 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
         num_points: int,
     ) -> Dict[str, torch.Tensor]:
         cur = cache.get(key)
-        if cur is not None and int(cur["support_ema"].shape[0]) == int(num_points):
+        required = (
+            "support_fast",
+            "error_fast",
+            "update_norm_fast",
+            "support_slow",
+            "error_slow",
+            "update_norm_slow",
+            "initialized",
+        )
+        if cur is not None and all(k in cur for k in required) and int(cur["support_fast"].shape[0]) == int(num_points):
             return cur
         z = torch.zeros((int(num_points), 1), dtype=torch.float32, device=self.device)
         cur = {
-            "support_ema": z.clone(),
-            "error_ema": z.clone(),
-            "update_norm_ema": z.clone(),
+            "support_fast": z.clone(),
+            "error_fast": z.clone(),
+            "update_norm_fast": z.clone(),
+            "support_slow": z.clone(),
+            "error_slow": z.clone(),
+            "update_norm_slow": z.clone(),
             "initialized": z.clone(),
         }
         cache[key] = cur
         return cur
+
+    @staticmethod
+    def _extract_c2w(view: Any) -> torch.Tensor:
+        c2w = view.camtoworlds if hasattr(view, "camtoworlds") else view["camtoworlds"]
+        return c2w if c2w.dim() == 2 else c2w[0]
+
+    def _extract_source_ego_world(self, batch: Dict[str, Any]) -> torch.Tensor:
+        if batch.get("source_ego_world") is not None:
+            ego = batch["source_ego_world"]
+            return ego.to(device=self.device, dtype=torch.float32).view(3)
+        if batch.get("source_ego_to_world") is not None:
+            c2w = batch["source_ego_to_world"].to(device=self.device, dtype=torch.float32)
+            return c2w[:3, 3]
+        source_views = list(batch.get("source_views", []))
+        if len(source_views) == 0:
+            raise KeyError("Stage5_3 view_transient requires source_views or source_ego_world in batch.")
+        c2w0 = self._extract_c2w(source_views[0]).to(device=self.device, dtype=torch.float32)
+        return c2w0[:3, 3]
+
+    def _compute_view_dir_from_ego(
+        self,
+        points_world: torch.Tensor,
+        ego_world: torch.Tensor,
+        eps: float = 1.0e-6,
+    ) -> torch.Tensor:
+        vec = points_world.to(dtype=torch.float32) - ego_world.view(1, 3).to(dtype=torch.float32)
+        return vec / vec.norm(dim=-1, keepdim=True).clamp_min(float(eps))
+
+    def _get_or_init_last_view_dir(
+        self,
+        cache: Dict[Tuple[int, int], torch.Tensor],
+        key: Tuple[int, int],
+        num_points: int,
+    ) -> torch.Tensor:
+        cur = cache.get(key)
+        if cur is not None and int(cur.shape[0]) == int(num_points):
+            return cur
+        cur = torch.zeros((int(num_points), 3), dtype=torch.float32, device=self.device)
+        cache[key] = cur
+        return cur
+
+    def _compute_view_transient(
+        self,
+        *,
+        cache: Dict[Tuple[int, int], torch.Tensor],
+        key: Tuple[int, int],
+        points_world: torch.Tensor,
+        ego_world: torch.Tensor,
+        update_last: bool,
+    ) -> Dict[str, torch.Tensor]:
+        n = int(points_world.shape[0])
+        last_dir = self._get_or_init_last_view_dir(cache, key, n)
+        cur_dir = self._compute_view_dir_from_ego(points_world, ego_world)
+        if bool(self.stage5_3_view_detach):
+            cur_dir = cur_dir.detach()
+        last_dir_t = last_dir.to(dtype=cur_dir.dtype)
+        view_delta = cur_dir - last_dir_t
+        view_delta_norm = torch.norm(view_delta, dim=-1, keepdim=True)
+        if update_last:
+            cache[key] = cur_dir.detach()
+        return {
+            "view_delta": view_delta,
+            "view_delta_norm": view_delta_norm,
+        }
+
+    def _compute_view_transient_indexed(
+        self,
+        *,
+        cache: Dict[Tuple[int, int], torch.Tensor],
+        key: Tuple[int, int],
+        num_points: int,
+        indices: torch.Tensor,
+        points_world: torch.Tensor,
+        ego_world: torch.Tensor,
+        update_last: bool,
+    ) -> Dict[str, torch.Tensor]:
+        last_full = self._get_or_init_last_view_dir(cache, key, num_points)
+        if int(indices.numel()) == 0:
+            z3 = torch.zeros((0, 3), dtype=torch.float32, device=self.device)
+            z1 = torch.zeros((0, 1), dtype=torch.float32, device=self.device)
+            return {
+                "view_delta": z3,
+                "view_delta_norm": z1,
+            }
+        cur_dir = self._compute_view_dir_from_ego(points_world, ego_world)
+        if bool(self.stage5_3_view_detach):
+            cur_dir = cur_dir.detach()
+        last_dir = last_full[indices].to(dtype=cur_dir.dtype)
+        view_delta = cur_dir - last_dir
+        view_delta_norm = torch.norm(view_delta, dim=-1, keepdim=True)
+        if update_last:
+            new_full = last_full.clone()
+            new_full[indices] = cur_dir.detach()
+            cache[key] = new_full
+        return {
+            "view_delta": view_delta,
+            "view_delta_norm": view_delta_norm,
+        }
+
+    def _should_update_view_transient(self) -> bool:
+        forced = self._stage5_3_force_update_view_transient
+        if forced is not None:
+            return bool(forced)
+        if not bool(self.stage5_3_view_transient_enable):
+            return False
+        if self.training:
+            return bool(self.stage5_3_view_update_in_train)
+        return bool(self.stage5_3_view_update_in_eval)
+
+    @staticmethod
+    def _slice_history(history: Dict[str, torch.Tensor], idx: torch.Tensor) -> Dict[str, torch.Tensor]:
+        return {
+            "support_fast": history["support_fast"][idx],
+            "error_fast": history["error_fast"][idx],
+            "update_norm_fast": history["update_norm_fast"][idx],
+            "support_slow": history["support_slow"][idx],
+            "error_slow": history["error_slow"][idx],
+            "update_norm_slow": history["update_norm_slow"][idx],
+            "initialized": history["initialized"][idx],
+        }
+
+    @staticmethod
+    def _slice_view_transient(
+        view_transient: Optional[Dict[str, torch.Tensor]],
+        idx: torch.Tensor,
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        if view_transient is None:
+            return None
+        return {
+            "view_delta": view_transient["view_delta"][idx],
+            "view_delta_norm": view_transient["view_delta_norm"][idx],
+        }
 
     def _get_or_init_block_support_acc(
         self,
@@ -413,13 +726,21 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
         support_cur: torch.Tensor,
         support_min: float,
     ) -> None:
-        sv = float(self.stage5_2_support_beta_visible)
-        si = float(self.stage5_2_support_beta_invisible)
-        vis = (support_cur.squeeze(-1) > float(support_min)).unsqueeze(-1).to(dtype=history["support_ema"].dtype)
-        history["support_ema"] = torch.where(
+        fv = float(self.stage5_3_support_fast_beta_visible)
+        fi = float(self.stage5_3_support_fast_beta_invisible)
+        sv = float(self.stage5_3_support_slow_beta_visible)
+        si = float(self.stage5_3_support_slow_beta_invisible)
+        vis = (support_cur.squeeze(-1) > float(support_min)).unsqueeze(-1).to(dtype=history["support_fast"].dtype)
+        support_cur = support_cur.to(dtype=history["support_fast"].dtype)
+        history["support_fast"] = torch.where(
             vis > 0,
-            sv * history["support_ema"] + (1.0 - sv) * support_cur.to(dtype=history["support_ema"].dtype),
-            si * history["support_ema"] + (1.0 - si) * support_cur.to(dtype=history["support_ema"].dtype),
+            fv * history["support_fast"] + (1.0 - fv) * support_cur,
+            fi * history["support_fast"] + (1.0 - fi) * support_cur,
+        )
+        history["support_slow"] = torch.where(
+            vis > 0,
+            sv * history["support_slow"] + (1.0 - sv) * support_cur,
+            si * history["support_slow"] + (1.0 - si) * support_cur,
         )
         history["initialized"] = torch.maximum(history["initialized"], vis.to(dtype=history["initialized"].dtype))
 
@@ -432,7 +753,7 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
         history_rigid: Dict[str, torch.Tensor],
     ) -> None:
         acc_bg = self.stage5_2_block_support_bg.get(key)
-        if acc_bg is not None and int(acc_bg["sum"].shape[0]) == int(history_bg["support_ema"].shape[0]):
+        if acc_bg is not None and int(acc_bg["sum"].shape[0]) == int(history_bg["support_fast"].shape[0]):
             support_bg = acc_bg["sum"] / acc_bg["count"].clamp(min=1.0)
             self._apply_support_ema_update(
                 history=history_bg,
@@ -441,7 +762,7 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
             )
 
         acc_distant = self.stage5_2_block_support_distant.get(key)
-        if acc_distant is not None and int(acc_distant["sum"].shape[0]) == int(history_distant["support_ema"].shape[0]):
+        if acc_distant is not None and int(acc_distant["sum"].shape[0]) == int(history_distant["support_fast"].shape[0]):
             support_distant = acc_distant["sum"] / acc_distant["count"].clamp(min=1.0)
             self._apply_support_ema_update(
                 history=history_distant,
@@ -450,7 +771,7 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
             )
 
         acc_rigid = self.stage5_2_block_support_rigid.get(key)
-        if acc_rigid is not None and int(acc_rigid["sum"].shape[0]) == int(history_rigid["support_ema"].shape[0]):
+        if acc_rigid is not None and int(acc_rigid["sum"].shape[0]) == int(history_rigid["support_fast"].shape[0]):
             support_rigid = acc_rigid["sum"] / acc_rigid["count"].clamp(min=1.0)
             self._apply_support_ema_update(
                 history=history_rigid,
@@ -470,18 +791,21 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
         h_old: Optional[torch.Tensor],
         params_for_embed: Optional[Dict[str, torch.Tensor]],
         history: Optional[Dict[str, torch.Tensor]],
+        view_transient: Optional[Dict[str, torch.Tensor]],
         acc_w: Optional[torch.Tensor],
         support_min: float,
         branch_id: int,
-    ) -> Optional[torch.Tensor]:
+    ) -> Optional[AttributeGate]:
         if feat is None or h_old is None or params_for_embed is None or history is None or acc_w is None:
             return None
         if int(feat.shape[0]) == 0:
-            return feat.new_zeros((0, 1))
+            z = feat.new_zeros((0, 1))
+            return AttributeGate(means=z, scales=z, quat=z, opacity=z, sh=z, hidden=z)
         param_vec = self._normalize_params_for_embed(params_for_embed)
         param_embed = self.param_embed_norm(self.mlp_params_embed(param_vec))
         history_embed = self._build_history_embed(
             history=history,
+            view_transient=view_transient,
             acc_w=acc_w,
             support_min=support_min,
             dtype=feat.dtype,
@@ -490,28 +814,82 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
             torch.full((feat.shape[0],), int(branch_id), device=feat.device, dtype=torch.long)
         )
         gate_logits = self.stage5_2_gate_mlp(torch.cat([feat, h_old, param_embed, history_embed, branch_embed], dim=-1))
-        gate = torch.sigmoid(gate_logits)
-        return self.stage5_2_gate_min + (1.0 - self.stage5_2_gate_min) * gate
+        gate_logits = gate_logits + self.stage5_3_branch_bias_table[int(branch_id)].to(
+            device=gate_logits.device,
+            dtype=gate_logits.dtype,
+        ).view(1, self.stage5_3_gate_num_attrs)
+        gate_raw = torch.sigmoid(gate_logits)
+        min_gate = self.stage5_3_attr_min_gate.to(device=gate_raw.device, dtype=gate_raw.dtype).view(
+            1, self.stage5_3_gate_num_attrs
+        )
+        gate = min_gate + (1.0 - min_gate) * gate_raw
+        if bool(self.stage5_3_gate_warmup_enable):
+            if self.training:
+                step = float(max(int(getattr(self, "global_step", 0)), 0))
+                warm = torch.clamp(
+                    torch.tensor(step, device=gate.device, dtype=gate.dtype)
+                    / self.stage5_3_gate_warmup_steps.to(device=gate.device, dtype=gate.dtype).clamp_min(1.0),
+                    min=0.0,
+                    max=1.0,
+                ).view(1, self.stage5_3_gate_num_attrs)
+            else:
+                warm = torch.ones((1, self.stage5_3_gate_num_attrs), device=gate.device, dtype=gate.dtype)
+            gate = gate * warm
+        g_means = gate[:, self.GATE_MEANS : self.GATE_MEANS + 1]
+        g_scales = gate[:, self.GATE_SCALES : self.GATE_SCALES + 1]
+        g_quat = gate[:, self.GATE_QUAT : self.GATE_QUAT + 1]
+        g_opacity = gate[:, self.GATE_OPACITY : self.GATE_OPACITY + 1]
+        g_sh = gate[:, self.GATE_SH : self.GATE_SH + 1]
+        hidden_weights = self.stage5_3_hidden_gate_weights.to(device=gate.device, dtype=gate.dtype)
+        g_hidden = (
+            hidden_weights[self.GATE_MEANS] * g_means
+            + hidden_weights[self.GATE_SCALES] * g_scales
+            + hidden_weights[self.GATE_QUAT] * g_quat
+            + hidden_weights[self.GATE_OPACITY] * g_opacity
+            + hidden_weights[self.GATE_SH] * g_sh
+        )
+        return AttributeGate(
+            means=g_means,
+            scales=g_scales,
+            quat=g_quat,
+            opacity=g_opacity,
+            sh=g_sh,
+            hidden=g_hidden,
+        )
 
     def _build_history_embed(
         self,
         *,
         history: Dict[str, torch.Tensor],
+        view_transient: Optional[Dict[str, torch.Tensor]],
         acc_w: torch.Tensor,
         support_min: float,
         dtype: torch.dtype,
     ) -> torch.Tensor:
+        n = int(acc_w.shape[0])
         visible_now = (acc_w > float(support_min)).to(dtype=dtype).unsqueeze(-1)
+        if view_transient is None:
+            view_transient = {
+                "view_delta": torch.zeros((n, 3), dtype=dtype, device=acc_w.device),
+                "view_delta_norm": torch.zeros((n, 1), dtype=dtype, device=acc_w.device),
+            }
         history_raw = torch.cat(
             [
-                history["support_ema"].to(dtype=dtype),
-                history["error_ema"].to(dtype=dtype),
-                history["update_norm_ema"].to(dtype=dtype),
+                history["support_fast"].to(dtype=dtype),
+                history["error_fast"].to(dtype=dtype),
+                history["update_norm_fast"].to(dtype=dtype),
+                history["support_slow"].to(dtype=dtype),
+                history["error_slow"].to(dtype=dtype),
+                history["update_norm_slow"].to(dtype=dtype),
                 history["initialized"].to(dtype=dtype),
                 visible_now,
+                view_transient["view_delta"].to(dtype=dtype),
+                view_transient["view_delta_norm"].to(dtype=dtype),
             ],
             dim=-1,
         )
+        if int(history_raw.shape[-1]) != 12:
+            raise RuntimeError(f"Stage5_3 history_raw dim mismatch: expected 12, got {history_raw.shape[-1]}.")
         return self.stage5_2_history_proj(history_raw)
 
     def _build_struct_decoder_input_near(
@@ -686,6 +1064,37 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
         history_bg = self._get_or_init_history(self.stage5_2_history_bg, key, num_bg_total)
         history_distant = self._get_or_init_history(self.stage5_2_history_distant, key, num_distant_total)
         history_rigid = self._get_or_init_history(self.stage5_2_history_rigid, key, num_rigid_total)
+        ego_world = self._extract_source_ego_world(batch)
+        update_view = self._should_update_view_transient()
+        view_bg = None
+        view_distant = None
+        view_rigid_S = None
+        if bool(self.stage5_3_view_transient_enable) and bool(self.stage5_3_view_input_to_gate):
+            view_bg = self._compute_view_transient(
+                cache=self.stage5_3_last_view_bg,
+                key=key,
+                points_world=node_state_bg.means,
+                ego_world=ego_world,
+                update_last=update_view,
+            )
+            if node_state_distant is not None and num_distant_total > 0:
+                view_distant = self._compute_view_transient(
+                    cache=self.stage5_3_last_view_distant,
+                    key=key,
+                    points_world=node_state_distant.means,
+                    ego_world=ego_world,
+                    update_last=update_view,
+                )
+            if node_state_rigid is not None and num_rigid_total > 0:
+                view_rigid_S = self._compute_view_transient_indexed(
+                    cache=self.stage5_3_last_view_rigid,
+                    key=key,
+                    num_points=num_rigid_total,
+                    indices=route.S,
+                    points_world=route.means_world_S,
+                    ego_world=ego_world,
+                    update_last=update_view,
+                )
         self._accumulate_support_before_update(
             key=key,
             num_bg_total=num_bg_total,
@@ -727,6 +1136,7 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
                 far_hist_parts.append(
                     self._build_history_embed(
                         history=history_distant,
+                        view_transient=None,
                         acc_w=acc_w_distant,
                         support_min=self.stage5_2_distant_visible_min,
                         dtype=feat_2d_distant.dtype if feat_2d_distant is not None else node_state_bg.means.dtype,
@@ -739,12 +1149,8 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
                 rows_rigid_out_in_S = torch.nonzero(~route.inside_mask_S, as_tuple=False).squeeze(1)
                 far_hist_parts.append(
                     self._build_history_embed(
-                        history={
-                            "support_ema": history_rigid["support_ema"][route.S_out],
-                            "error_ema": history_rigid["error_ema"][route.S_out],
-                            "update_norm_ema": history_rigid["update_norm_ema"][route.S_out],
-                            "initialized": history_rigid["initialized"][route.S_out],
-                        },
+                        history=self._slice_history(history_rigid, route.S_out),
+                        view_transient=None,
                         acc_w=acc_w_rigid_S[rows_rigid_out_in_S],
                         support_min=self.stage5_2_rigid_visible_min,
                         dtype=feat_2d_rigid_S.dtype if feat_2d_rigid_S is not None else node_state_bg.means.dtype,
@@ -786,6 +1192,7 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
             h_old=h_old_bg,
             params_for_embed=params_bg,
             history=history_bg,
+            view_transient=view_bg,
             acc_w=acc_w_bg,
             support_min=self.stage5_2_bg_visible_min,
             branch_id=0,
@@ -806,6 +1213,7 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
                 h_old=h_old_distant,
                 params_for_embed=params_distant,
                 history=history_distant,
+                view_transient=view_distant,
                 acc_w=acc_w_distant,
                 support_min=self.stage5_2_distant_visible_min,
                 branch_id=2,
@@ -829,12 +1237,8 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
                     feat=feat_rigid_in_input_all,
                     h_old=h_old_rigid[route.S_in],
                     params_for_embed=params_rigid_in,
-                    history={
-                        "support_ema": history_rigid["support_ema"][route.S_in],
-                        "error_ema": history_rigid["error_ema"][route.S_in],
-                        "update_norm_ema": history_rigid["update_norm_ema"][route.S_in],
-                        "initialized": history_rigid["initialized"][route.S_in],
-                    },
+                    history=self._slice_history(history_rigid, route.S_in),
+                    view_transient=self._slice_view_transient(view_rigid_S, rows_rigid_in_in_S),
                     acc_w=acc_w_rigid_in,
                     support_min=self.stage5_2_rigid_visible_min,
                     branch_id=1,
@@ -847,12 +1251,8 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
                     feat=feat_rigid_out_input_all,
                     h_old=h_old_rigid[route.S_out],
                     params_for_embed=params_rigid_out,
-                    history={
-                        "support_ema": history_rigid["support_ema"][route.S_out],
-                        "error_ema": history_rigid["error_ema"][route.S_out],
-                        "update_norm_ema": history_rigid["update_norm_ema"][route.S_out],
-                        "initialized": history_rigid["initialized"][route.S_out],
-                    },
+                    history=self._slice_history(history_rigid, route.S_out),
+                    view_transient=self._slice_view_transient(view_rigid_S, rows_rigid_out_in_S),
                     acc_w=acc_w_rigid_out,
                     support_min=self.stage5_2_rigid_visible_min,
                     branch_id=3,
@@ -866,6 +1266,15 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
                 "stage5_2_near_num_rigid_in": float(num_rigid_in),
                 "stage5_2_far_num_distant": float(int(node_state_distant.means.shape[0]) if node_state_distant is not None else 0),
                 "stage5_2_far_num_rigid_out": float(int(route.S_out.numel())),
+                "stage5_3_view_bg_delta_norm_mean": float(view_bg["view_delta_norm"].mean().item())
+                if view_bg is not None and view_bg["view_delta_norm"].numel() > 0
+                else 0.0,
+                "stage5_3_view_distant_delta_norm_mean": float(view_distant["view_delta_norm"].mean().item())
+                if view_distant is not None and view_distant["view_delta_norm"].numel() > 0
+                else 0.0,
+                "stage5_3_view_rigid_delta_norm_mean": float(view_rigid_S["view_delta_norm"].mean().item())
+                if view_rigid_S is not None and view_rigid_S["view_delta_norm"].numel() > 0
+                else 0.0,
             }
         )
         return FullRoutedGRUInputs(
@@ -925,31 +1334,49 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
         *,
         h_old: torch.Tensor,
         h_candidate: torch.Tensor,
-        gate: Optional[torch.Tensor],
+        gate: Optional[AttributeGate],
         mask_update: Optional[torch.Tensor],
-    ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, Optional[Dict[str, torch.Tensor]]]:
         if gate is None:
             return offsets, h_candidate, None
         dtype = h_old.dtype
         device = h_old.device
-        eff = gate.to(device=device, dtype=dtype)
-        if mask_update is not None:
-            eff = eff * mask_update.to(device=device, dtype=dtype).unsqueeze(-1)
+
+        def _eff(x: torch.Tensor) -> torch.Tensor:
+            y = x.to(device=device, dtype=dtype)
+            if mask_update is not None:
+                y = y * mask_update.to(device=device, dtype=dtype).unsqueeze(-1)
+            return y
+
+        g_means = _eff(gate.means)
+        g_scales = _eff(gate.scales)
+        g_quat = _eff(gate.quat)
+        g_opacity = _eff(gate.opacity)
+        g_sh = _eff(gate.sh)
+        g_hidden = _eff(gate.hidden)
         offsets_g = dict(offsets)
         quat_identity = torch.zeros_like(offsets_g["offset_quat"])
         quat_identity[:, 0] = 1.0
-        offsets_g["offset_pos"] = offsets_g["offset_pos"] * eff
-        offsets_g["offset_scales"] = offsets_g["offset_scales"] * eff
-        offsets_g["offset_opacity"] = offsets_g["offset_opacity"] * eff
-        offsets_g["offset_sh"] = offsets_g["offset_sh"] * eff
-        quat_mix = quat_identity * (1.0 - eff.expand_as(offsets_g["offset_quat"])) + offsets_g["offset_quat"] * eff.expand_as(offsets_g["offset_quat"])
+        offsets_g["offset_pos"] = offsets_g["offset_pos"] * g_means
+        offsets_g["offset_scales"] = offsets_g["offset_scales"] * g_scales
+        offsets_g["offset_opacity"] = offsets_g["offset_opacity"] * g_opacity
+        offsets_g["offset_sh"] = offsets_g["offset_sh"] * g_sh
+        quat_mix = quat_identity * (1.0 - g_quat.expand_as(offsets_g["offset_quat"])) + offsets_g["offset_quat"] * g_quat.expand_as(offsets_g["offset_quat"])
         offsets_g["offset_quat"] = quat_mix / torch.clamp(torch.norm(quat_mix, dim=-1, keepdim=True), min=1e-8)
-        h_new = (1.0 - eff) * h_old + eff * h_candidate
+        h_new = (1.0 - g_hidden) * h_old + g_hidden * h_candidate
         if mask_update is not None:
             m = mask_update.bool()
             if bool((~m).any().item()):
                 if not torch.allclose(h_new[~m], h_old[~m]):
                     raise RuntimeError("Stage5_3 gate invariant failed: mask_update=false hidden changed.")
+        eff = {
+            "means": g_means,
+            "scales": g_scales,
+            "quat": g_quat,
+            "opacity": g_opacity,
+            "sh": g_sh,
+            "hidden": g_hidden,
+        }
         return offsets_g, h_new, eff
 
     def _compute_record_support_error_all_branches_once_routed(
@@ -1155,12 +1582,19 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
         error_cur: torch.Tensor,
         visible_mask: torch.Tensor,
     ) -> None:
-        eb = float(self.stage5_2_error_beta)
-        vis = visible_mask.unsqueeze(-1).to(dtype=history["error_ema"].dtype)
-        history["error_ema"] = torch.where(
+        ef = float(self.stage5_3_error_fast_beta)
+        es = float(self.stage5_3_error_slow_beta)
+        vis = visible_mask.unsqueeze(-1).to(dtype=history["error_fast"].dtype)
+        error_cur = error_cur.to(dtype=history["error_fast"].dtype)
+        history["error_fast"] = torch.where(
             vis > 0,
-            eb * history["error_ema"] + (1.0 - eb) * error_cur.to(dtype=history["error_ema"].dtype),
-            history["error_ema"],
+            ef * history["error_fast"] + (1.0 - ef) * error_cur,
+            history["error_fast"],
+        )
+        history["error_slow"] = torch.where(
+            vis > 0,
+            es * history["error_slow"] + (1.0 - es) * error_cur,
+            history["error_slow"],
         )
         history["initialized"] = torch.maximum(history["initialized"], vis.to(dtype=history["initialized"].dtype))
 
@@ -1170,13 +1604,19 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
         history: Dict[str, torch.Tensor],
         update_norm_cur: torch.Tensor,
     ) -> None:
-        ub = float(self.stage5_2_update_norm_beta)
-        update_norm_cur = update_norm_cur.to(dtype=history["update_norm_ema"].dtype)
-        written_mask = (update_norm_cur.squeeze(-1) > 0).unsqueeze(-1).to(dtype=history["update_norm_ema"].dtype)
-        history["update_norm_ema"] = torch.where(
+        uf = float(self.stage5_3_update_norm_fast_beta)
+        us = float(self.stage5_3_update_norm_slow_beta)
+        update_norm_cur = update_norm_cur.to(dtype=history["update_norm_fast"].dtype)
+        written_mask = (update_norm_cur.squeeze(-1) > 0).unsqueeze(-1).to(dtype=history["update_norm_fast"].dtype)
+        history["update_norm_fast"] = torch.where(
             written_mask > 0,
-            ub * history["update_norm_ema"] + (1.0 - ub) * update_norm_cur,
-            history["update_norm_ema"],
+            uf * history["update_norm_fast"] + (1.0 - uf) * update_norm_cur,
+            history["update_norm_fast"],
+        )
+        history["update_norm_slow"] = torch.where(
+            written_mask > 0,
+            us * history["update_norm_slow"] + (1.0 - us) * update_norm_cur,
+            history["update_norm_slow"],
         )
 
     def _apply_step_update_norm_ema_from_out(self, out: Dict[str, Any]) -> None:
@@ -1241,6 +1681,9 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
         self._apply_step_update_norm_ema(history=hist_rigid, update_norm_cur=upd_rigid)
 
     def _should_apply_step_update_norm_ema(self) -> bool:
+        forced = getattr(self, "_stage5_3_force_update_history_memory", None)
+        if forced is not None:
+            return bool(forced)
         return bool(self.training) or bool(self.stage5_2_history_update_apply_in_eval)
 
     def forward(self, batch: Dict) -> Dict[str, Any]:
@@ -1254,10 +1697,15 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
         self.stage5_2_history_bg.clear()
         self.stage5_2_history_distant.clear()
         self.stage5_2_history_rigid.clear()
+        self.stage5_3_last_view_bg.clear()
+        self.stage5_3_last_view_distant.clear()
+        self.stage5_3_last_view_rigid.clear()
         self.stage5_2_block_support_bg.clear()
         self.stage5_2_block_support_distant.clear()
         self.stage5_2_block_support_rigid.clear()
         self._stage5_2_last_full_inputs = None
+        self._stage5_3_force_update_history_memory = None
+        self._stage5_3_force_update_view_transient = None
 
     @torch.no_grad()
     def record_block_history(self, batch: Dict[str, Any], event: Optional[Dict[str, Any]] = None) -> Dict[str, float]:
@@ -1337,18 +1785,71 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
             num_source_refs = 1.0 if request_meta.get("source_image_ref") is not None else 0.0
         else:
             num_source_refs = float(len(source_refs))
+        bg_support_fast = float(hist_bg["support_fast"].mean().item()) if hist_bg["support_fast"].numel() > 0 else 0.0
+        bg_support_slow = float(hist_bg["support_slow"].mean().item()) if hist_bg["support_slow"].numel() > 0 else 0.0
+        bg_error_fast = float(hist_bg["error_fast"].mean().item()) if hist_bg["error_fast"].numel() > 0 else 0.0
+        bg_error_slow = float(hist_bg["error_slow"].mean().item()) if hist_bg["error_slow"].numel() > 0 else 0.0
+        bg_update_fast = float(hist_bg["update_norm_fast"].mean().item()) if hist_bg["update_norm_fast"].numel() > 0 else 0.0
+        bg_update_slow = float(hist_bg["update_norm_slow"].mean().item()) if hist_bg["update_norm_slow"].numel() > 0 else 0.0
+        distant_support_fast = (
+            float(hist_dist["support_fast"].mean().item()) if hist_dist["support_fast"].numel() > 0 else 0.0
+        )
+        distant_support_slow = (
+            float(hist_dist["support_slow"].mean().item()) if hist_dist["support_slow"].numel() > 0 else 0.0
+        )
+        distant_error_fast = float(hist_dist["error_fast"].mean().item()) if hist_dist["error_fast"].numel() > 0 else 0.0
+        distant_error_slow = float(hist_dist["error_slow"].mean().item()) if hist_dist["error_slow"].numel() > 0 else 0.0
+        distant_update_fast = (
+            float(hist_dist["update_norm_fast"].mean().item()) if hist_dist["update_norm_fast"].numel() > 0 else 0.0
+        )
+        distant_update_slow = (
+            float(hist_dist["update_norm_slow"].mean().item()) if hist_dist["update_norm_slow"].numel() > 0 else 0.0
+        )
+        rigid_support_fast = (
+            float(hist_rigid["support_fast"].mean().item()) if hist_rigid["support_fast"].numel() > 0 else 0.0
+        )
+        rigid_support_slow = (
+            float(hist_rigid["support_slow"].mean().item()) if hist_rigid["support_slow"].numel() > 0 else 0.0
+        )
+        rigid_error_fast = float(hist_rigid["error_fast"].mean().item()) if hist_rigid["error_fast"].numel() > 0 else 0.0
+        rigid_error_slow = float(hist_rigid["error_slow"].mean().item()) if hist_rigid["error_slow"].numel() > 0 else 0.0
+        rigid_update_fast = (
+            float(hist_rigid["update_norm_fast"].mean().item()) if hist_rigid["update_norm_fast"].numel() > 0 else 0.0
+        )
+        rigid_update_slow = (
+            float(hist_rigid["update_norm_slow"].mean().item()) if hist_rigid["update_norm_slow"].numel() > 0 else 0.0
+        )
         return {
             "stage5_2_record_pass_count": 1.0,
             "stage5_2_record_num_views": float(len(record_targets)),
             "stage5_2_record_num_target_refs": float(len(request_meta.get("target_image_refs") or [])),
             "stage5_2_record_num_source_refs": float(num_source_refs),
             "stage5_2_record_use_source_views": 1.0 if str(self.stage5_2_record_views) == "source_image_refs" else 0.0,
-            "stage5_2_history_bg_support_mean": float(hist_bg["support_ema"].mean().item()) if hist_bg["support_ema"].numel() > 0 else 0.0,
-            "stage5_2_history_bg_error_mean": float(hist_bg["error_ema"].mean().item()) if hist_bg["error_ema"].numel() > 0 else 0.0,
-            "stage5_2_history_distant_support_mean": float(hist_dist["support_ema"].mean().item()) if hist_dist["support_ema"].numel() > 0 else 0.0,
-            "stage5_2_history_distant_error_mean": float(hist_dist["error_ema"].mean().item()) if hist_dist["error_ema"].numel() > 0 else 0.0,
-            "stage5_2_history_rigid_support_mean": float(hist_rigid["support_ema"].mean().item()) if hist_rigid["support_ema"].numel() > 0 else 0.0,
-            "stage5_2_history_rigid_error_mean": float(hist_rigid["error_ema"].mean().item()) if hist_rigid["error_ema"].numel() > 0 else 0.0,
+            "stage5_3_history_bg_support_fast_mean": bg_support_fast,
+            "stage5_3_history_bg_support_slow_mean": bg_support_slow,
+            "stage5_3_history_bg_error_fast_mean": bg_error_fast,
+            "stage5_3_history_bg_error_slow_mean": bg_error_slow,
+            "stage5_3_history_bg_update_fast_mean": bg_update_fast,
+            "stage5_3_history_bg_update_slow_mean": bg_update_slow,
+            "stage5_3_history_distant_support_fast_mean": distant_support_fast,
+            "stage5_3_history_distant_support_slow_mean": distant_support_slow,
+            "stage5_3_history_distant_error_fast_mean": distant_error_fast,
+            "stage5_3_history_distant_error_slow_mean": distant_error_slow,
+            "stage5_3_history_distant_update_fast_mean": distant_update_fast,
+            "stage5_3_history_distant_update_slow_mean": distant_update_slow,
+            "stage5_3_history_rigid_support_fast_mean": rigid_support_fast,
+            "stage5_3_history_rigid_support_slow_mean": rigid_support_slow,
+            "stage5_3_history_rigid_error_fast_mean": rigid_error_fast,
+            "stage5_3_history_rigid_error_slow_mean": rigid_error_slow,
+            "stage5_3_history_rigid_update_fast_mean": rigid_update_fast,
+            "stage5_3_history_rigid_update_slow_mean": rigid_update_slow,
+            # Backward-compatible aliases for existing stage4_3 monitor logs.
+            "stage5_2_history_bg_support_mean": bg_support_fast,
+            "stage5_2_history_bg_error_mean": bg_error_fast,
+            "stage5_2_history_distant_support_mean": distant_support_fast,
+            "stage5_2_history_distant_error_mean": distant_error_fast,
+            "stage5_2_history_rigid_support_mean": rigid_support_fast,
+            "stage5_2_history_rigid_error_mean": rigid_error_fast,
             **({"stage5_2_block_exit_block_idx_global": float(event.get("block_idx_global", -1))} if isinstance(event, dict) else {}),
         }
 
@@ -1361,13 +1862,22 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
         update_node_state: bool = True,
         update_hidden_state: bool = True,
         update_history_memory: bool = True,
+        update_view_transient: bool = True,
     ) -> Dict[str, Any]:
         del scheduler_events
         prev_mode = self.training
         self.eval()
-        out = self.forward(batch)
-        if update_history_memory and not self._should_apply_step_update_norm_ema():
-            self._apply_step_update_norm_ema_from_out(out)
+        prev_update_hist = self._stage5_3_force_update_history_memory
+        prev_update_view = self._stage5_3_force_update_view_transient
+        self._stage5_3_force_update_history_memory = bool(update_history_memory)
+        self._stage5_3_force_update_view_transient = bool(update_view_transient)
+        try:
+            out = self.forward(batch)
+        finally:
+            self._stage5_3_force_update_history_memory = prev_update_hist
+            self._stage5_3_force_update_view_transient = prev_update_view
+            if prev_mode:
+                self.train()
         if update_hidden_state and "_cache_key" in out:
             key = out["_cache_key"]
             if out.get("_h_new_bg") is not None:
@@ -1378,8 +1888,6 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
                 self.h_cache_rigid[key] = out["_h_new_rigid"].detach()
         if update_node_state:
             self._writeback_node_states_from_out(out)
-        if prev_mode:
-            self.train()
         loss_val = out.get("loss")
         return {
             "loss": loss_val.item() if torch.is_tensor(loss_val) else float(loss_val) if loss_val is not None else 0.0,
@@ -1394,6 +1902,7 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
             "num_rigid_update": int(out.get("_num_rigid_update", 0)),
             "rigid_writeback_count": int(out.get("rigid_writeback_count", 0)),
             "stage5_3_demo_history_update_enabled": 1.0 if update_history_memory else 0.0,
+            "stage5_3_demo_view_transient_update_enabled": 1.0 if update_view_transient else 0.0,
         }
 
 
