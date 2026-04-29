@@ -171,6 +171,7 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
         self._debug_check_rigid_roundtrip = bool(config.get("debug", {}).get("rigid_roundtrip_check", False))
         self._warned_source_mask_legacy_keys = False
         self._target_view_weight_cfg = self._parse_target_view_weight_cfg(config)
+        self._state_weight_cfg = self._parse_state_weight_cfg(config)
 
     def _validate_stage4_6_config(self, config) -> None:
         model_cfg = self._require_key(config, "model", "config")
@@ -229,6 +230,49 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
             "near_random_end_weight": float(sched_cfg.get("end_weight", near_cfg.get("weight", 1.0))),
             "near_random_warmup_steps": int(sched_cfg.get("warmup_steps", 0)),
         }
+
+    def _parse_state_weight_cfg(self, config) -> Dict[str, Any]:
+        losses_cfg = config.get("losses", {}) if hasattr(config, "get") else {}
+        state_cfg = losses_cfg.get("w_state", {}) if hasattr(losses_cfg, "get") else {}
+        enable = bool(state_cfg.get("enable", False))
+        cfg: Dict[str, Any] = {"enable": enable}
+        if not enable:
+            return cfg
+        cfg["tau"] = float(self._require_key(state_cfg, "tau", "losses.w_state"))
+        cfg["eps"] = float(self._require_key(state_cfg, "eps", "losses.w_state"))
+        cfg["w_min"] = float(self._require_key(state_cfg, "w_min", "losses.w_state"))
+        cfg["reduce"] = str(self._require_key(state_cfg, "reduce", "losses.w_state"))
+        if cfg["reduce"] != "mean":
+            raise ValueError(f"losses.w_state.reduce must be 'mean', got {cfg['reduce']!r}")
+        if cfg["eps"] <= 0.0:
+            raise ValueError(f"losses.w_state.eps must be > 0, got {cfg['eps']}.")
+        if cfg["tau"] <= 0.0:
+            raise ValueError(f"losses.w_state.tau must be > 0, got {cfg['tau']}.")
+        if cfg["w_min"] < 0.0 or cfg["w_min"] > 1.0:
+            raise ValueError(f"losses.w_state.w_min must be in [0,1], got {cfg['w_min']}.")
+        return cfg
+
+    def _compute_state_weight_from_source_pre_loss(
+        self,
+        source_pre_loss_l1: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        one = torch.ones((), device=self.device, dtype=torch.float32)
+        cfg = self._state_weight_cfg
+        if not bool(cfg.get("enable", False)):
+            return one, None
+        if source_pre_loss_l1 is None:
+            raise ValueError(
+                "losses.w_state.enable=true requires valid source pre-loss, "
+                "but source_pre_loss_l1 is unavailable (likely no valid non-ego non-sky pixels in source views)."
+            )
+        l_pre = source_pre_loss_l1.detach().to(device=self.device, dtype=torch.float32).reshape(())
+        if not bool(torch.isfinite(l_pre).item()):
+            raise ValueError(f"source_pre_loss_l1 must be finite, got {float(l_pre.detach().item())}.")
+        tau = float(cfg["tau"])
+        eps = float(cfg["eps"])
+        w_min = float(cfg["w_min"])
+        w_state = torch.clamp(torch.tensor(tau, device=self.device, dtype=torch.float32) / (l_pre + eps), min=w_min, max=1.0)
+        return w_state, l_pre
 
     def _current_loss_step(self, batch: Dict[str, Any]) -> int:
         opt = getattr(self, "optimizer", None)
@@ -427,12 +471,6 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
         start += num_distant
         feat_2d_rigid_S = feat_2d_all[start : start + num_rigid_S] if num_rigid_S > 0 else None
         acc_w_rigid_S = acc_w_all[start : start + num_rigid_S] if num_rigid_S > 0 else None
-        merge_debug_stats_as_perf_floats(
-            self._perf_acc,
-            "2d_bp_scene_",
-            {"pairs_total": float(num_bg + num_distant + num_rigid_S), "pairs_after_mask": float(num_bg + num_distant + num_rigid_S)},
-        )
-        self._perf_acc["2d_bp_scene_call_count"] = float(self._perf_acc.get("2d_bp_scene_call_count", 0.0) + 1.0)
         return {
             "num_bg": num_bg,
             "num_distant": num_distant,
@@ -442,6 +480,7 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
             "acc_w_bg": acc_w_bg,
             "acc_w_distant": acc_w_distant,
             "acc_w_rigid_S": acc_w_rigid_S,
+            "source_pre_loss_l1": cnn_inputs.get("source_pre_loss_l1"),
             "src_backproject_pass_count": 1,
         }
 
@@ -855,6 +894,7 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
         acc_w_bg = one_pass["acc_w_bg"]
         acc_w_distant = one_pass["acc_w_distant"]
         acc_w_rigid_S = one_pass["acc_w_rigid_S"]
+        source_pre_loss_l1 = one_pass.get("source_pre_loss_l1")
         src_backproject_pass_count = int(one_pass.get("src_backproject_pass_count", 0))
 
         bg_rigid_in_inputs = self._compute_bg_rigid_in_gru_inputs(
@@ -1354,7 +1394,10 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
                 torch.tensor(float(sum(int(v) for v in role_counts.values())), dtype=torch.float32, device=self.device),
                 min=1.0,
             )
-        loss = (weighted_l1_sum + weighted_ssim_sum + weighted_mask_sum + weighted_entropy_sum) / denom
+        photometric_sum = weighted_l1_sum + weighted_ssim_sum
+        aux_sum = weighted_mask_sum + weighted_entropy_sum
+        w_state, source_pre_l1_value = self._compute_state_weight_from_source_pre_loss(source_pre_loss_l1)
+        loss = (w_state * photometric_sum + aux_sum) / denom
         l1_mean = weighted_l1_sum / denom
         ssim_mean = weighted_ssim_sum / denom
         mask_mean = weighted_mask_sum / denom
@@ -1478,6 +1521,8 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
             "loss/target_weight/source": float(self._target_role_weight("source", current_loss_step)),
             "loss/target_weight/visited": float(self._target_role_weight("visited", current_loss_step)),
             "loss/target_weight/near_random": float(self._target_role_weight("near_random", current_loss_step)),
+            "loss/w_state": float(w_state.detach().item()),
+            "loss/pre_src_l1": float(source_pre_l1_value.detach().item()) if source_pre_l1_value is not None else 0.0,
             "loss/rgb/source": float(
                 (role_rgb_num["source"] / torch.clamp(role_rgb_den["source"], min=weight_eps)).detach().item()
             )

@@ -133,6 +133,40 @@ class MinimalStreetForwardStage4_5(MinimalStreetForwardStage4_2):
             valid_masks.append(valid)
         return torch.stack(valid_masks, dim=0)
 
+    def _compute_source_pre_loss_l1(
+        self,
+        source_render_rgb_batch: torch.Tensor,
+        source_gt_rgb_batch: torch.Tensor,
+        source_pair_valid_mask: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        with torch.no_grad():
+            pred = source_render_rgb_batch.detach().to(device=self.device, dtype=torch.float32)
+            gt = source_gt_rgb_batch.detach().to(device=self.device, dtype=torch.float32)
+            valid = source_pair_valid_mask.detach().to(device=self.device, dtype=torch.float32)
+            if pred.shape != gt.shape:
+                raise ValueError(
+                    f"source pre-loss shape mismatch: pred {tuple(pred.shape)} vs gt {tuple(gt.shape)}"
+                )
+            if pred.dim() != 4 or pred.shape[-1] != 3:
+                raise ValueError(f"source pre-loss expects [V,H,W,3], got {tuple(pred.shape)}")
+            if valid.dim() != 3 or valid.shape != pred.shape[:3]:
+                raise ValueError(
+                    "source pre-loss valid mask shape mismatch. "
+                    f"got {tuple(valid.shape)} expected {tuple(pred.shape[:3])}"
+                )
+            valid_pixels_per_view = valid.sum(dim=(1, 2))
+            valid_view_mask = valid_pixels_per_view > 0
+            if not bool(valid_view_mask.any().item()):
+                return None
+            pred_valid = pred[valid_view_mask]
+            gt_valid = gt[valid_view_mask]
+            valid_valid = valid[valid_view_mask]
+            valid_pixels_valid = valid_pixels_per_view[valid_view_mask]
+            per_view_l1 = (torch.abs(pred_valid - gt_valid) * valid_valid.unsqueeze(-1)).sum(dim=(1, 2, 3)) / (
+                valid_pixels_valid * 3.0
+            )
+            return per_view_l1.mean().to(device=self.device, dtype=torch.float32)
+
     def _render_source_scene_only_for_cnn(
         self,
         gaussians_scene: Dict[str, torch.Tensor],
@@ -185,9 +219,15 @@ class MinimalStreetForwardStage4_5(MinimalStreetForwardStage4_2):
             source_sky_masks=source_sky_masks,
             source_egocar_masks=source_egocar_masks,
         )
+        source_pre_loss_l1 = self._compute_source_pre_loss_l1(
+            source_render_rgb_batch=scene_rgb_batch,
+            source_gt_rgb_batch=image_batch,
+            source_pair_valid_mask=source_pair_valid_mask,
+        )
         return {
             "features_2d": features_2d,
             "source_pair_valid_mask": source_pair_valid_mask,
+            "source_pre_loss_l1": source_pre_loss_l1,
         }
 
     def _backproject_scene_features_multi_camera(

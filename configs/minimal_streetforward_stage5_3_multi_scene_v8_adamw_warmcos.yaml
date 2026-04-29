@@ -357,6 +357,12 @@ losses:
   ssim: {w: 0.05}
   mask: {w: 0.02, opacity_loss_type: bce, require_sky_mask: true}
   opacity_entropy: {w: 0.0}
+  w_state:
+    enable: true
+    tau: 0.08
+    eps: 1.0e-4
+    w_min: 0.25
+    reduce: mean
   target_view_weights:
     enable: true
     normalize_by_weight_sum: true
