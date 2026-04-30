@@ -12,6 +12,13 @@ import viser
 from models.streetforward.minimal_trainer_stage5_0 import MinimalStreetForwardStage5_0
 from models.streetforward.minimal_trainer_stage5_2 import MinimalStreetForwardStage5_2
 from models.streetforward.minimal_trainer_stage5_3 import MinimalStreetForwardStage5_3
+from models.streetforward.minimal_trainer_stage5_3_production import (
+    MinimalStreetForwardStage5_3_Production,
+)
+from models.streetforward.minimal_trainer_stage5_4 import MinimalStreetForwardStage5_4
+from models.streetforward.minimal_trainer_stage5_4_production import (
+    MinimalStreetForwardStage5_4_Production,
+)
 from tools.streetforward_stage5_demo_controller import Stage5DemoController
 from tools.streetforward_stage5_viewer import StreetForwardStage5Viewer
 from tools.train_minimal_streetforward_stage1_1 import setup
@@ -25,15 +32,23 @@ logger = logging.getLogger(__name__)
 _normalize_omp_num_threads()
 
 
-def _select_trainer(stage: str):
+def _select_trainer(stage: str, cfg: Any):
     stage_norm = str(stage).strip()
+    model_cfg = cfg.get("model") if cfg is not None else None
+    use_production = bool(model_cfg.get("production_training", False)) if model_cfg is not None else False
     if stage_norm == "5_0":
         return MinimalStreetForwardStage5_0
     if stage_norm == "5_2":
         return MinimalStreetForwardStage5_2
     if stage_norm == "5_3":
+        if use_production:
+            return MinimalStreetForwardStage5_3_Production
         return MinimalStreetForwardStage5_3
-    raise ValueError(f"Unsupported stage={stage_norm!r}, expected one of: 5_0, 5_2, 5_3")
+    if stage_norm == "5_4":
+        if use_production:
+            return MinimalStreetForwardStage5_4_Production
+        return MinimalStreetForwardStage5_4
+    raise ValueError(f"Unsupported stage={stage_norm!r}, expected one of: 5_0, 5_2, 5_3, 5_4")
 
 
 def _patch_cfg_for_demo(cfg: Any, args: argparse.Namespace) -> None:
@@ -107,7 +122,7 @@ def main() -> None:
         default="configs/demo_minimal_streetforward_stage5_viewer.yaml",
         help="Path to demo config YAML.",
     )
-    parser.add_argument("--stage", type=str, default="5_3", help="Stage trainer variant: 5_0 / 5_2 / 5_3.")
+    parser.add_argument("--stage", type=str, default="5_3", help="Stage trainer variant: 5_0 / 5_2 / 5_3 / 5_4.")
     parser.add_argument("--ckpt", type=str, default="", help="Checkpoint path.")
     parser.add_argument("--scene_id", type=int, default=None, help="Initial scene id for demo traversal.")
     parser.add_argument("--segment_id", type=int, default=None, help="Fixed segment id (optional).")
@@ -141,7 +156,7 @@ def main() -> None:
     )
     dataset.initialize()
     scheduler = build_stage5_demo_scheduler_from_cfg(cfg, dataset)
-    trainer_cls = _select_trainer(args.stage)
+    trainer_cls = _select_trainer(args.stage, cfg)
     trainer = trainer_cls(config=cfg, device=device).to(device)
     _load_checkpoint(trainer, args.ckpt, mode=str(args.ckpt_load_mode))
     demo_cfg = cfg.get("demo") or {}

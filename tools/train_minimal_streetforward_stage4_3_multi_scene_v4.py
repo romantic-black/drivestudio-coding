@@ -900,7 +900,12 @@ def main() -> None:
         help="Path to config YAML.",
     )
     parser.add_argument("--max_steps", type=int, default=0)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Optional seed override. If unset, use training.seed from config (fallback: 42).",
+    )
     parser.add_argument(
         "--init_checkpoint",
         type=str,
@@ -927,8 +932,24 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("RUN start time=%s device=%s", current_time, device)
 
-    set_deterministic_seed(args.seed)
-    logger.info("Seed: %s", args.seed)
+    train_cfg_for_seed = cfg.get("training") or {}
+    cfg_seed_raw = train_cfg_for_seed.get("seed")
+    if args.seed is not None:
+        resolved_seed = int(args.seed)
+        if cfg_seed_raw is not None and int(cfg_seed_raw) != resolved_seed:
+            logger.info(
+                "Seed override: CLI --seed=%s overrides training.seed=%s",
+                resolved_seed,
+                int(cfg_seed_raw),
+            )
+    elif cfg_seed_raw is not None:
+        resolved_seed = int(cfg_seed_raw)
+    else:
+        resolved_seed = 42
+        logger.warning("No seed provided by CLI or config.training.seed; fallback to 42.")
+
+    set_deterministic_seed(resolved_seed)
+    logger.info("Seed: %s", resolved_seed)
     validation_v7_cfg = parse_validation_v7_config(cfg)
     losses_cfg = cfg.get("losses") or {}
     photometric_cfg = losses_cfg.get("photometric", {}) or {}

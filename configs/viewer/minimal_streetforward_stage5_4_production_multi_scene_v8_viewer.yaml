@@ -1,4 +1,4 @@
-output_name: experiment001_60w_40w
+output_name: demo_stage5_4_production_viewer
 
 data:
   data_root: "/root/autodl-tmp/nuScenes/"
@@ -498,7 +498,7 @@ eval:
 
 logging:
   output_root: /root/autodl-tmp/outputs
-  project: minimal_sf_stage5_4_multi_scene_v8_adamw_warmcos
+  project: minimal_sf_stage5_4_multi_scene_v8_adamw_warmcos_viewer
   log_dir: null
   image_interval_blocks: 96
   train_monitor:
@@ -523,3 +523,57 @@ logging:
     enable: false
     phase_timing: false
     cuda_memory: false
+
+demo:
+  mode: segment_finetune_train
+  scheduler:
+    type: demo_v1
+    disable_preload: true
+    initial_scene_id: null
+    initial_segment_id: null
+    episode:
+      blocks_per_episode: 5
+      total_target_frames: 3
+      frame_within_keyframe_policy: first
+      episode_start_policy: first
+    traversal:
+      scene_order: ascending
+      segment_order: ascending
+      wrap_scene: true
+      wrap_segment: true
+      wrap_block: true
+    target:
+      include_source_frame: true
+      use_entered_blocks_for_target: true
+      max_target_frames: 3
+    events:
+      emit_manual_block_events: true
+      emit_scope_change_events: true
+  pause_on_start: true
+  step_button_mode: raw_step
+  display_branches: ["bg", "distant", "rigid"]
+  hide_rigid: false
+  checkpoint:
+    load_mode: network_only
+    strict_network: false
+  inference:
+    update_node_state: true
+    update_hidden_state: true
+    update_history_memory: true
+    update_view_transient: true
+    record_block_history_on_block_exit: true
+  train_infer:
+    state_write_interval_steps: 1
+    reset_node_state_after_block: false
+  viewer:
+    host: "0.0.0.0"
+    port: 8080
+    align_gaussians_to_nerfview: true
+    coord_align_mode: gaussian
+    show_bg: true
+    show_distant: true
+    show_rigid: true
+    viewer_res: 1280
+    default_render_mode: rgb
+    default_max_sh_degree: 1
+    default_near_far: [0.01, 200.0]
