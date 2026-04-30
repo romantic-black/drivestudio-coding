@@ -510,7 +510,7 @@ logging:
     cuda_memory: false
 
 demo:
-  mode: segment_finetune_train
+  mode: frozen_recurrent_inference
   scheduler:
     type: demo_v1
     disable_preload: true

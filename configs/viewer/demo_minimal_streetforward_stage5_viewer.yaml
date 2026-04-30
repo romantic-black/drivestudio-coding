@@ -205,6 +205,8 @@ model:
       num_layers: 2
       norm: "layernorm"
       act: "gelu"
+      history_embed:
+        enable: true
   history_memory:
     enable: true
     record_on: "block_exit"
