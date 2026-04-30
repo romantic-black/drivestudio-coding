@@ -1451,6 +1451,10 @@ class MultiSceneDatasetV4:
         for fidx in sorted(set(int(x) for x in frame_indices)):
             row = frame_to_row.get(int(fidx))
             if row is None:
+                # Some frames in a training window can be absent from asset dynamic_tracks
+                # (e.g. no annotated dynamic pose at that frame). Keep an explicit empty
+                # frame entry so downstream rigid frame-index resolution remains stable.
+                out[int(fidx)] = {"instances": {}}
                 continue
             inst: Dict[int, Dict[str, Any]] = {}
             for col, intid in enumerate(intids.tolist()):
@@ -1462,8 +1466,6 @@ class MultiSceneDatasetV4:
                 }
             out[int(fidx)] = {"instances": inst}
         if not out:
-            return None
-        if not any(len(v.get("instances", {})) > 0 for v in out.values()):
             return None
         return out
 
