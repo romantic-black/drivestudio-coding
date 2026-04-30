@@ -39,11 +39,18 @@ class MinimalStreetForwardStage4_5(MinimalStreetForwardStage4_2):
     def __init__(self, config, device: torch.device, **kwargs):
         super().__init__(config, device, **kwargs)
         model_cfg = config.model
+        stage_name = str(model_cfg.get("stage", "")).strip().lower()
         self.use_fused_cuda_backproject_v4 = bool(model_cfg.get("use_fused_cuda_backproject_v4", False))
         self.fused_cuda_backproject_v4_force_fallback = bool(
             model_cfg.get("fused_cuda_backproject_v4_force_fallback", False)
         )
-        if self.use_fused_cuda_backproject_v4 and not self.fused_cuda_backproject_v4_force_fallback:
+        # Stage5_4 owns the v4 fused observation path and reuses this parent init chain.
+        allow_v4_direct_path = stage_name == "5_4"
+        if (
+            self.use_fused_cuda_backproject_v4
+            and not self.fused_cuda_backproject_v4_force_fallback
+            and not allow_v4_direct_path
+        ):
             raise ValueError(
                 "Stage4.5 does not implement fused_cuda_backproject_v4 yet. "
                 "Set model.use_fused_cuda_backproject_v4=false or model.fused_cuda_backproject_v4_force_fallback=true."

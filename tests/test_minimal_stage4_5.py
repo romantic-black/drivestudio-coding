@@ -237,3 +237,63 @@ def test_stage4_5_requires_fused_v3_enabled(monkeypatch):
 
     with pytest.raises(ValueError, match="use_fused_cuda_backproject_v3=true"):
         MinimalStreetForwardStage4_5(config=_Cfg(), device=torch.device("cpu"))
+
+
+def test_stage4_5_rejects_direct_v4_path_for_non_stage5_4(monkeypatch):
+    def _fake_super_init(self, config, device, **kwargs):
+        del device, kwargs
+        self.renderer = object()
+        self.sh_degree = 1
+        self.config = config
+
+    class _Cfg:
+        def __init__(self):
+            self.model = {
+                "stage": "4_5",
+                "use_fused_cuda_backproject_v4": True,
+                "fused_cuda_backproject_v4_force_fallback": False,
+                "use_fused_cuda_backproject_v3": True,
+            }
+            self._losses = {
+                "photometric": {"exclude_sky_region": True},
+                "mask": {"require_sky_mask": True},
+            }
+
+        def get(self, key: str, default=None):
+            if key == "losses":
+                return self._losses
+            return default
+
+    monkeypatch.setattr(MinimalStreetForwardStage4_2, "__init__", _fake_super_init)
+    with pytest.raises(ValueError, match="does not implement fused_cuda_backproject_v4 yet"):
+        MinimalStreetForwardStage4_5(config=_Cfg(), device=torch.device("cpu"))
+
+
+def test_stage4_5_allows_stage5_4_to_enable_direct_v4_path(monkeypatch):
+    def _fake_super_init(self, config, device, **kwargs):
+        del device, kwargs
+        self.renderer = object()
+        self.sh_degree = 1
+        self.config = config
+
+    class _Cfg:
+        def __init__(self):
+            self.model = {
+                "stage": "5_4",
+                "use_fused_cuda_backproject_v4": True,
+                "fused_cuda_backproject_v4_force_fallback": False,
+                "use_fused_cuda_backproject_v3": True,
+            }
+            self._losses = {
+                "photometric": {"exclude_sky_region": True},
+                "mask": {"require_sky_mask": True},
+            }
+
+        def get(self, key: str, default=None):
+            if key == "losses":
+                return self._losses
+            return default
+
+    monkeypatch.setattr(MinimalStreetForwardStage4_2, "__init__", _fake_super_init)
+    trainer = MinimalStreetForwardStage4_5(config=_Cfg(), device=torch.device("cpu"))
+    assert trainer.use_fused_cuda_backproject_v4 is True

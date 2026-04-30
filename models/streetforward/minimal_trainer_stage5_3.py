@@ -73,6 +73,20 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
         self._init_stage5_3_modules(config)
         self._rebuild_optimizer_after_stage5_modules()
 
+    @staticmethod
+    def _cfg_get_default(node: Any, key: str, default: Any) -> Any:
+        if node is None:
+            return default
+        if isinstance(node, dict):
+            return node.get(key, default)
+        if hasattr(node, "get"):
+            out = node.get(key, default)
+            return default if out is None else out
+        if hasattr(node, key):
+            out = getattr(node, key)
+            return default if out is None else out
+        return default
+
     def _validate_stage5_3_config(self, config) -> None:
         self._validate_stage4_6_config(config)
         model_cfg = self._require_key(config, "model", "config")
@@ -124,6 +138,18 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
         far_branches = list(self._require_key(far_cfg, "branches", "model.struct_decoder.far"))
         if [str(x) for x in far_branches] != ["distant", "rigid_out"]:
             raise ValueError("Stage5_3 requires far.branches == ['distant', 'rigid_out'].")
+        far_history_cfg = self._cfg_get_default(far_cfg, "history_embed", None)
+        if far_history_cfg is None:
+            far_history_enable = bool(self._cfg_get_default(far_cfg, "history_embed_enable", False))
+        else:
+            far_history_enable = bool(self._cfg_get_default(far_history_cfg, "enable", False))
+        if far_history_enable:
+            hist_embed_dim = int(self._require_key(struct_cfg, "history_embed_dim", "model.struct_decoder"))
+            if hist_embed_dim <= 0:
+                raise ValueError(
+                    "Stage5_3 requires model.struct_decoder.history_embed_dim > 0 when "
+                    "model.struct_decoder.far.history_embed.enable=true."
+                )
         if bool(near_cfg.get("clamp_grid_coord", False)):
             raise ValueError("Stage5_3 near xCPE does not support clamp_grid_coord=true.")
 
@@ -254,6 +280,11 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
 
         out_dim = int(self.fused_in_dim)
         hist_embed_dim = int(self._require_key(struct_cfg, "history_embed_dim", "model.struct_decoder"))
+        far_history_cfg = self._cfg_get_default(far_cfg, "history_embed", None)
+        if far_history_cfg is None:
+            self.stage5_3_far_history_embed_enable = bool(self._cfg_get_default(far_cfg, "history_embed_enable", False))
+        else:
+            self.stage5_3_far_history_embed_enable = bool(self._cfg_get_default(far_history_cfg, "enable", False))
         near_decoder = StreetForwardXCPEDecoder(
             feat_2d_channels=feat_2d_channels_cfg,
             out_channels=out_dim,
@@ -295,7 +326,7 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
             use_branch_embed=bool(token_cfg.get("use_branch_embed", True)),
             use_param_embed=bool(token_cfg.get("use_param_embed", True)),
             zero_invalid_2d_feat=bool(token_cfg.get("zero_invalid_2d_feat", True)),
-            history_dim=0,
+            history_dim=(int(hist_embed_dim) if bool(self.stage5_3_far_history_embed_enable) else 0),
         ).to(self.device)
         self.struct_decoder = RoutedNearFarStructDecoder(
             near_decoder=near_decoder,
@@ -915,6 +946,7 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
         feat_2d_rigid_S: Optional[torch.Tensor],
         acc_w_distant: Optional[torch.Tensor],
         acc_w_rigid_S: Optional[torch.Tensor],
+        history_embed: Optional[torch.Tensor] = None,
     ) -> StructDecoderInput:
         num_distant = int(node_state_distant.means.shape[0]) if node_state_distant is not None else 0
         num_rigid_out = int(route.S_out.numel())
@@ -993,6 +1025,8 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
             "branch_0": "distant",
             "branch_1": "rigid_out",
         }
+        if history_embed is not None:
+            meta["history_embed"] = history_embed
 
         return StructDecoderInput(
             feat_2d=torch.cat(feat_2d_parts, dim=0),
@@ -1091,6 +1125,38 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
         feat_bg_input = near_out.feat[:num_bg]
         feat_rigid_in_input_all = near_out.feat[num_bg : num_bg + num_rigid_in] if num_rigid_in > 0 else None
 
+        far_history_embed = None
+        if bool(self.stage5_3_far_history_embed_enable) and (num_distant_total + int(route.S_out.numel()) > 0):
+            far_hist_parts = []
+            if num_distant_total > 0:
+                if acc_w_distant is None:
+                    raise RuntimeError("Stage5_3 far history embed requires acc_w_distant when distant branch is active.")
+                far_hist_parts.append(
+                    self._build_history_embed(
+                        history=history_distant,
+                        view_transient=None,
+                        acc_w=acc_w_distant,
+                        support_min=self.stage5_2_distant_visible_min,
+                        dtype=feat_2d_distant.dtype if feat_2d_distant is not None else node_state_bg.means.dtype,
+                    )
+                )
+            num_rigid_out_total = int(route.S_out.numel())
+            if num_rigid_out_total > 0:
+                if acc_w_rigid_S is None:
+                    raise RuntimeError("Stage5_3 far history embed requires acc_w_rigid_S when rigid_out branch is active.")
+                rows_rigid_out_in_S = torch.nonzero(~route.inside_mask_S, as_tuple=False).squeeze(1)
+                far_hist_parts.append(
+                    self._build_history_embed(
+                        history=self._slice_history(history_rigid, route.S_out),
+                        view_transient=None,
+                        acc_w=acc_w_rigid_S[rows_rigid_out_in_S],
+                        support_min=self.stage5_2_rigid_visible_min,
+                        dtype=feat_2d_rigid_S.dtype if feat_2d_rigid_S is not None else node_state_bg.means.dtype,
+                    )
+                )
+            if len(far_hist_parts) > 0:
+                far_history_embed = torch.cat(far_hist_parts, dim=0)
+
         far_in = self._build_struct_decoder_input_far(
             source_frame_idx=source_frame_idx,
             node_state_distant=node_state_distant,
@@ -1100,6 +1166,7 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
             feat_2d_rigid_S=feat_2d_rigid_S,
             acc_w_distant=acc_w_distant,
             acc_w_rigid_S=acc_w_rigid_S,
+            history_embed=far_history_embed,
         )
         feat_distant_input = None
         feat_rigid_out_input_all = None

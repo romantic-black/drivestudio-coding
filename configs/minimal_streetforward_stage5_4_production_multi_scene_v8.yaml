@@ -1,0 +1,82 @@
+# Stage5_4 production config (v8 scheduler).
+# This file is intentionally aligned with stage5_3 production recipe and
+# only overrides Stage5_4-specific switches.
+#
+# If you need full parity with the previous recipe, start from:
+# configs/minimal_streetforward_stage5_3_multi_scene_v8_adamw_warmcos.yaml
+# and keep the same training/data sections.
+
+output_name: experiment002_60w_40w_stage5_4
+
+model:
+  stage: "5_4"
+  production_training: true
+  backprojector_version: "v4"
+  # Keep v3 flags for Stage4.5 compatibility checks during legacy init chain.
+  use_fused_cuda_backproject_v2: true
+  use_fused_cuda_backproject_v3: true
+  use_fused_cuda_backproject_v4: true
+  fused_cuda_backproject_v4_force_fallback: false
+
+current_observation:
+  enable: true
+  dim: 2
+  rho_source: feature
+  eps: 1.0e-6
+  input_to_struct_decoder: true
+  input_to_far_mlp: true
+  input_to_gru: true
+  input_to_history_gate: true
+  record_to_history_memory: false
+  debug:
+    log_stats: true
+    log_interval_steps: 50
+
+training_recipe:
+  name: stage5_4_adamw_warmcos_v1
+
+optimizer:
+  type: adamw
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 1.0e-4
+  filter_frozen: true
+  no_weight_decay:
+    enable: true
+    name_keywords: [".bias", "bias", "norm", "Norm", "ln", "LayerNorm", "embedding", "Embedding"]
+    ndim_leq: 1
+  groups:
+    default:
+      lr: 1.0e-4
+      weight_decay: 1.0e-4
+
+lr_scheduler:
+  enable: true
+  type: cosine
+  interval: step
+  total_steps: ${training.max_iterations}
+  min_lr_ratio: 0.05
+
+training:
+  max_iterations: 3000010
+  log_interval: 100
+  save_checkpoint_freq: 10000
+  seed: 41
+  amp:
+    enable: false
+    dtype: fp16
+  grad_clip:
+    enable: true
+    max_norm: 1.0
+    norm_type: 2.0
+  bad_step:
+    policy: fast_fail
+    fail_on_nonfinite_loss: true
+    fail_on_nonfinite_grad: true
+    fail_on_amp_overflow: false
+    fail_on_grad_norm_gt: 100.0
+
+logging:
+  output_root: /root/autodl-tmp/outputs
+  project: minimal_sf_stage5_4_multi_scene_v8_adamw_warmcos

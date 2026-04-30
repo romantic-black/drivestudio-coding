@@ -229,6 +229,8 @@ model:
       num_layers: 2
       norm: "layernorm"
       act: "gelu"
+      history_embed:
+        enable: false
   history_memory:
     enable: true
     record_on: "block_exit"
