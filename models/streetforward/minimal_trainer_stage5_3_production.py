@@ -465,6 +465,8 @@ class MinimalStreetForwardStage5_3_Production(MinimalStreetForwardStage5_3):
                 row["gt_image"] = gt_images[i].detach()
             if "sky_mask" in targets[i]:
                 row["sky_mask"] = targets[i]["sky_mask"]
+            if "egocar_mask" in targets[i]:
+                row["egocar_mask"] = targets[i]["egocar_mask"]
             render_rows.append(row)
 
         if save_dir is not None:

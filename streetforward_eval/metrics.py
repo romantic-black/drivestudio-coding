@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import logging
 import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -9,6 +10,8 @@ import torch
 
 from .episode_builder import TestEpisodeSpec, classify_eval_frame
 from .protocols import TestProtocolSpec
+
+logger = logging.getLogger(__name__)
 
 
 def _safe_float(v: Optional[float]) -> float:
@@ -74,9 +77,8 @@ def _masked_metrics(
             raise ValueError("primary_mask requires non_sky but sky_mask is missing")
         valid = valid * (1.0 - (sky_mask > 0.5).float())
     if use_non_ego:
-        if egocar_mask is None:
-            raise ValueError("primary_mask requires non_ego but egocar_mask is missing")
-        valid = valid * (1.0 - (egocar_mask > 0.5).float())
+        if egocar_mask is not None:
+            valid = valid * (1.0 - (egocar_mask > 0.5).float())
 
     valid_count = int((valid > 0.5).sum().item())
     if valid_count < int(min_valid_pixels):
@@ -130,6 +132,7 @@ class MetricAccumulator:
             )
         self.iter_rows: List[Dict[str, Any]] = []
         self.episode_rows: Dict[str, List[Dict[str, Any]]] = {}
+        self._warned_missing_egocar_for_cam: set[int] = set()
 
     def _build_row(
         self,
@@ -164,6 +167,15 @@ class MetricAccumulator:
         ego_mask = view_row.get("egocar_mask")
         sky_t = _to_hw_mask(sky_mask)
         ego_t = _to_hw_mask(ego_mask)
+        if "non_ego" in str(self.protocol.metric_primary_mask) and ego_t is None:
+            if int(cam_id) not in self._warned_missing_egocar_for_cam:
+                self._warned_missing_egocar_for_cam.add(int(cam_id))
+                logger.warning(
+                    "egocar_mask is missing for cam_id=%d (cam_name=%s); "
+                    "non_ego suppression is disabled for this camera in metrics.",
+                    int(cam_id),
+                    str(cam_name),
+                )
         vals = _masked_metrics(
             pred=pred_t,
             gt=gt_t,

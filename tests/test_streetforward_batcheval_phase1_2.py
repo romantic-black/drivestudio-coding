@@ -371,3 +371,67 @@ def test_runner_renders_final_even_when_each_iter_disabled(monkeypatch: pytest.M
     assert model.update_calls == 3
     assert model.render_calls == 1
     assert out["final_iter"] == 3
+
+
+def test_metrics_non_ego_mask_missing_does_not_crash(tmp_path: Path) -> None:
+    protocol = TestProtocolSpec(
+        name="exp1_single_frame",
+        data_mode="segment_finetune_train",
+        sequence_length=1,
+        input_offsets=[0],
+        eval_offsets=[0],
+        camera_ids=[0],
+        camera_names=["front_left"],
+        steps_per_input=1,
+        save_pre_update=False,
+        save_each_iter_views=False,
+        metric_primary_mask="non_sky_non_ego",
+        report_full_image=True,
+    )
+    spec = TestEpisodeSpec(
+        exp_name="exp1_single_frame",
+        scene_id=1,
+        segment_id=2,
+        episode_idx=0,
+        sequence_start_pos=0,
+        frame_offsets=[0],
+        frame_ids=[100],
+        input_offsets=[0],
+        eval_offsets=[0],
+        input_frame_ids=[100],
+        eval_frame_ids=[100],
+        camera_ids=[0],
+        camera_names=["front_left"],
+        input_image_refs=[(100, 0)],
+        eval_image_refs=[(100, 0)],
+        episode_uid="scene001_seg002_start000000",
+    )
+    metric_acc = MetricAccumulator(
+        output_dir=tmp_path / "metrics",
+        protocol=protocol,
+        min_valid_pixels=1,
+        compute_ssim=False,
+        compute_lpips=False,
+    )
+    img = torch.full((4, 4, 3), 0.5, dtype=torch.float32)
+    render_rows: List[Dict[str, Any]] = [
+        {
+            "frame_idx": 100,
+            "cam_idx": 0,
+            "pred_rgb": img,
+            "gt_image": img.clone(),
+            "sky_mask": torch.zeros((4, 4), dtype=torch.float32),
+            # egocar_mask intentionally missing.
+        }
+    ]
+    rows = metric_acc.add_iteration_rows(
+        spec=spec,
+        global_iter=1,
+        is_pre_update=False,
+        input_index=0,
+        input_frame_id=100,
+        local_step=1,
+        render_rows=render_rows,
+    )
+    assert len(rows) == 1
+    assert float(rows[0]["psnr"]) > 30.0
