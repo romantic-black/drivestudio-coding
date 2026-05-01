@@ -9,6 +9,21 @@ from nerfview import CameraState, Viewer
 
 
 class StreetForwardStage5Viewer(Viewer):
+    @staticmethod
+    def _axis_to_unit_vec(axis: str) -> np.ndarray:
+        amap = {
+            "+x": np.array([1.0, 0.0, 0.0], dtype=np.float64),
+            "-x": np.array([-1.0, 0.0, 0.0], dtype=np.float64),
+            "+y": np.array([0.0, 1.0, 0.0], dtype=np.float64),
+            "-y": np.array([0.0, -1.0, 0.0], dtype=np.float64),
+            "+z": np.array([0.0, 0.0, 1.0], dtype=np.float64),
+            "-z": np.array([0.0, 0.0, -1.0], dtype=np.float64),
+        }
+        key = str(axis).strip().lower()
+        if key not in amap:
+            raise ValueError("demo.viewer.*_up_direction must be one of: +x, -x, +y, -y, +z, -z")
+        return amap[key]
+
     def __init__(
         self,
         *,
@@ -19,6 +34,34 @@ class StreetForwardStage5Viewer(Viewer):
         self.controller = controller
         self._demo_tab_handles: Dict[str, Any] = {}
         self._suspend_scope_callbacks = False
+        viewer_cfg = (self.controller.cfg.get("demo", {}) or {}).get("viewer", {}) or {}
+        scene_up_axis = str(viewer_cfg.get("scene_up_direction", "+y")).strip().lower()
+        camera_up_axis = str(viewer_cfg.get("camera_up_direction", scene_up_axis)).strip().lower()
+        self._camera_up_lock_enable = bool(viewer_cfg.get("lock_camera_up_direction", True))
+        self._camera_up_lock_cos_threshold = float(viewer_cfg.get("camera_up_lock_cos_threshold", 0.9995))
+        self._camera_up_lock_cos_threshold = float(np.clip(self._camera_up_lock_cos_threshold, -1.0, 1.0))
+        self._camera_up_world = self._axis_to_unit_vec(camera_up_axis)
+        self._scene_up_axis = scene_up_axis
+        # Keep scene up and initial camera up explicit to stabilize orbit semantics
+        # (horizontal drag -> yaw around a fixed up axis).
+        server.scene.set_up_direction(self._scene_up_axis)
+        server.initial_camera.up = tuple(float(x) for x in self._camera_up_world.tolist())
+        if self._camera_up_lock_enable:
+            up_target = self._camera_up_world.copy()
+            cos_thr = float(self._camera_up_lock_cos_threshold)
+
+            def _on_client_connect(client: viser.ClientHandle) -> None:
+                @client.camera.on_update
+                def _lock_camera_up(cam: Any) -> None:
+                    up = np.asarray(cam.up_direction, dtype=np.float64)
+                    n = float(np.linalg.norm(up))
+                    if n <= 1e-8:
+                        return
+                    up = up / n
+                    if float(np.dot(up, up_target)) < cos_thr:
+                        cam.up_direction = up_target
+
+            server.on_client_connect(_on_client_connect)
         # nerfview.Viewer expects this attribute in training mode while
         # populating the rendering tab (used as extra disable-able handles).
         self._training_tab_handles: Dict[str, Any] = {}

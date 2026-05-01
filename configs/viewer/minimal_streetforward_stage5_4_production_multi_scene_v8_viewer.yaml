@@ -31,8 +31,8 @@ data:
     stats_log_interval_steps: 0
   pixel_source:
     type: datasets.nuscenes.nuscenes_sourceloader.NuScenesPixelSource
-    cameras: [0, 1, 2, 3, 4, 5]
-    downscale_when_loading: [3, 3, 3, 3, 3, 3]
+    cameras: [0]
+    downscale_when_loading: [3]
     downscale: 1
     undistort: false
     load_sky_mask: true
@@ -284,11 +284,11 @@ model:
     include_visible_now: true
     bind_with_mask_update: true
     min_gate:
-      means: 0.03
-      scales: 0.03
-      quat: 0.01
-      opacity: 0.05
-      sh: 0.05
+      means: 0.00
+      scales: 0.00
+      quat: 0.00
+      opacity: 0.00
+      sh: 0.00
     init_bias:
       means: -1.40
       scales: -1.70
@@ -570,6 +570,10 @@ demo:
     port: 8080
     align_gaussians_to_nerfview: true
     coord_align_mode: gaussian
+    scene_up_direction: "+y"
+    camera_up_direction: "+y"
+    lock_camera_up_direction: true
+    camera_up_lock_cos_threshold: 0.9995
     show_bg: true
     show_distant: true
     show_rigid: true
