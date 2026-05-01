@@ -374,6 +374,38 @@ def test_v4_requires_explicit_cache_limits(tmp_path):
         )
 
 
+def test_v4_runtime_cap_helper_downsamples_without_knn():
+    ds = MultiSceneDatasetV4.__new__(MultiSceneDatasetV4)
+    ds._runtime_pointcloud_cfg = {
+        "near_max_points": 3,
+        "distant_max_points": 2,
+        "monocular_dynamic_recovery_max_points_per_instance": 2,
+    }
+    ds.segment_aabb = torch.tensor([[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]], dtype=torch.float32)
+
+    near = np.zeros((5, 6), dtype=np.float32)
+    distant = np.zeros((4, 6), dtype=np.float32)
+    distant[:, 0] = 3.0
+    pointcloud = {
+        "background": np.concatenate([near, distant], axis=0),
+        "dynamic": {
+            9: np.ones((4, 6), dtype=np.float32),
+            10: np.ones((1, 6), dtype=np.float32),
+        },
+    }
+
+    out = ds._apply_runtime_pointcloud_caps(
+        pointcloud=pointcloud,
+        scene_id=1,
+        segment_id=0,
+        context="test",
+    )
+
+    assert int(out["background"].shape[0]) == 5
+    assert int(out["dynamic"][9].shape[0]) == 2
+    assert int(out["dynamic"][10].shape[0]) == 1
+
+
 def test_v4_runtime_cap_mismatch_random_downsamples(tmp_path):
     inside_pts = np.zeros((60, 6), dtype=np.float32)
     outside_pts = np.zeros((80, 6), dtype=np.float32)

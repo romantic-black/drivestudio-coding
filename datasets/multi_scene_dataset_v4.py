@@ -288,6 +288,114 @@ class MultiSceneDatasetV4:
             return "fixed_cached" if self._knn_requirements.fixed_neighbor_enabled else "unknown"
         return ",".join(self._knn_requirements.required_branches)
 
+    @staticmethod
+    def _stride_keep_indices(num_points: int, max_count: Optional[int]) -> np.ndarray:
+        n = int(num_points)
+        if n <= 0:
+            return np.zeros((0,), dtype=np.int64)
+        if max_count is None or int(max_count) <= 0 or n <= int(max_count):
+            return np.arange(n, dtype=np.int64)
+        step = max(1, n // int(max_count))
+        idx = np.arange(0, n, step, dtype=np.int64)
+        if int(idx.shape[0]) > int(max_count):
+            idx = idx[: int(max_count)]
+        return idx
+
+    def _runtime_cap_or_none(self, key: str) -> Optional[int]:
+        runtime_pc = self._runtime_pointcloud_cfg
+        if not isinstance(runtime_pc, dict):
+            return None
+        return _cap_int_or_none(runtime_pc, key)
+
+    def _apply_runtime_pointcloud_caps(
+        self,
+        *,
+        pointcloud: Dict[str, Any],
+        scene_id: int,
+        segment_id: int,
+        context: str,
+    ) -> Dict[str, Any]:
+        near_cap = self._runtime_cap_or_none("near_max_points")
+        distant_cap = self._runtime_cap_or_none("distant_max_points")
+        dynamic_cap = self._runtime_cap_or_none("monocular_dynamic_recovery_max_points_per_instance")
+        if near_cap is None and distant_cap is None and dynamic_cap is None:
+            return pointcloud
+
+        background = np.asarray(
+            pointcloud.get("background", np.zeros((0, 6), dtype=np.float32)),
+            dtype=np.float32,
+        )
+        if background.ndim != 2 or background.shape[1] < 3:
+            raise ValueError(
+                "pointcloud.background must have shape [N,>=3] for runtime cap downsample, "
+                f"got {tuple(background.shape)} (context={context} scene_id={int(scene_id)} segment_id={int(segment_id)})"
+            )
+
+        xyz = np.asarray(background[:, :3], dtype=np.float32)
+        crop_min = self.segment_aabb[0].detach().cpu().numpy()
+        crop_max = self.segment_aabb[1].detach().cpu().numpy()
+        in_crop = ((xyz >= crop_min[None, :]) & (xyz <= crop_max[None, :])).all(axis=1)
+        near_idx = np.nonzero(in_crop)[0].astype(np.int64, copy=False)
+        distant_idx = np.nonzero(~in_crop)[0].astype(np.int64, copy=False)
+        near_keep = self._stride_keep_indices(int(near_idx.shape[0]), near_cap)
+        distant_keep = self._stride_keep_indices(int(distant_idx.shape[0]), distant_cap)
+        keep_bg_idx = np.concatenate([near_idx[near_keep], distant_idx[distant_keep]], axis=0)
+        background_after = np.ascontiguousarray(background[keep_bg_idx], dtype=np.float32)
+
+        dynamic_raw = pointcloud.get("dynamic", {})
+        dynamic_after: Any = dynamic_raw
+        dynamic_before_total = 0
+        dynamic_after_total = 0
+        if isinstance(dynamic_raw, dict):
+            dyn_out: Dict[int, np.ndarray] = {}
+            for intid_raw in sorted(dynamic_raw.keys(), key=lambda x: int(x)):
+                intid = int(intid_raw)
+                pts = np.asarray(dynamic_raw[intid_raw], dtype=np.float32)
+                if pts.ndim != 2 or pts.shape[1] < 3:
+                    raise ValueError(
+                        f"pointcloud.dynamic[{intid}] must have shape [N,>=3] for runtime cap downsample, "
+                        f"got {tuple(pts.shape)} (context={context} scene_id={int(scene_id)} segment_id={int(segment_id)})"
+                    )
+                keep_dyn = self._stride_keep_indices(int(pts.shape[0]), dynamic_cap)
+                pts_after = np.ascontiguousarray(pts[keep_dyn], dtype=np.float32)
+                dyn_out[intid] = pts_after
+                dynamic_before_total += int(pts.shape[0])
+                dynamic_after_total += int(pts_after.shape[0])
+            dynamic_after = dyn_out
+        elif dynamic_raw is None:
+            dynamic_before_total = 0
+            dynamic_after_total = 0
+
+        if (
+            int(background_after.shape[0]) != int(background.shape[0])
+            or dynamic_before_total != dynamic_after_total
+        ):
+            logger.info(
+                "Runtime pointcloud caps applied (KNN init disabled): "
+                "context=%s scene_id=%d segment_id=%d "
+                "near_before=%d near_after=%d near_cap=%s "
+                "distant_before=%d distant_after=%d distant_cap=%s "
+                "dynamic_before=%d dynamic_after=%d dynamic_cap=%s",
+                context,
+                int(scene_id),
+                int(segment_id),
+                int(near_idx.shape[0]),
+                int(near_keep.shape[0]),
+                str(near_cap),
+                int(distant_idx.shape[0]),
+                int(distant_keep.shape[0]),
+                str(distant_cap),
+                int(dynamic_before_total),
+                int(dynamic_after_total),
+                str(dynamic_cap),
+            )
+
+        out = dict(pointcloud)
+        out["background"] = background_after
+        if isinstance(dynamic_raw, dict):
+            out["dynamic"] = dynamic_after
+        return out
+
     def _assert_knn_runtime_caps_match(
         self,
         *,
@@ -296,6 +404,8 @@ class MultiSceneDatasetV4:
         segment_id: int,
         context: str,
     ) -> None:
+        if not self._knn_requirements.enabled:
+            return
         runtime_pc = self._runtime_pointcloud_cfg
         if not isinstance(runtime_pc, dict):
             return
@@ -868,6 +978,13 @@ class MultiSceneDatasetV4:
                     pointcloud=pointcloud,
                     dynamic_tracks=dynamic_tracks,
                 )
+            if not self._knn_requirements.enabled:
+                pointcloud = self._apply_runtime_pointcloud_caps(
+                    pointcloud=pointcloud,
+                    scene_id=int(scene_id),
+                    segment_id=int(segment_id),
+                    context="_resolve_segment_bundle/runtime_caps_no_knn_init",
+                )
             if self._knn_requirements.enabled:
                 if not isinstance(knn_init, dict):
                     raise ValueError(
@@ -914,7 +1031,7 @@ class MultiSceneDatasetV4:
                     context="_resolve_segment_bundle/strict_runtime_caps",
                 )
 
-            if knn_init is not None:
+            if self._knn_requirements.enabled and knn_init is not None:
                 bg_knn_map = knn_init.get("background_avg_dist_by_k", {})
                 if isinstance(bg_knn_map, dict) and len(bg_knn_map) > 0:
                     any_bg_knn = next(iter(bg_knn_map.values()))
@@ -937,7 +1054,7 @@ class MultiSceneDatasetV4:
                 segment_pose=segment_pose,
                 pointcloud=pointcloud,
                 dynamic_tracks=dynamic_tracks,
-                knn_init=knn_init,
+                knn_init=knn_init if self._knn_requirements.enabled else None,
             )
             with self._lock:
                 cached = self._cache_set(
@@ -1646,7 +1763,7 @@ class MultiSceneDatasetV4:
                 }
 
         knn_init_batch: Optional[Dict[str, Any]] = None
-        if knn_init is not None:
+        if self._knn_requirements.enabled and knn_init is not None:
             bg_map_raw = knn_init.get("background_avg_dist_by_k", {})
             if not isinstance(bg_map_raw, dict):
                 raise ValueError("knn_init.background_avg_dist_by_k must be a dict")

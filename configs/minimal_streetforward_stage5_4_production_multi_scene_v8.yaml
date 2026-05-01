@@ -1,4 +1,4 @@
-output_name: experiment001_60w_40w
+output_name: experiment001_60w_40w_12block
 
 data:
   data_root: "/root/autodl-tmp/nuScenes/"
@@ -90,7 +90,7 @@ dataset:
 scheduler_v8:
   enable: true
   block:
-    steps_per_block: 8
+    steps_per_block: 12
   episode:
     blocks_per_episode: 5
     total_target_frames: 3

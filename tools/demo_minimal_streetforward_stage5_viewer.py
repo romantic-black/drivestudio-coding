@@ -75,8 +75,14 @@ def _checkpoint_network_only_filter(state_dict: Dict[str, Any]) -> Dict[str, Any
         "optimizer",
         "node_states_",
         "h_cache_",
-        "stage5_2_history_",
-        "stage5_2_block_support_",
+        # Keep trainable module params such as stage5_2_history_proj.*.
+        # Only drop runtime caches/checkpoint-only state buckets.
+        "stage5_2_history_bg",
+        "stage5_2_history_distant",
+        "stage5_2_history_rigid",
+        "stage5_2_block_support_bg",
+        "stage5_2_block_support_distant",
+        "stage5_2_block_support_rigid",
     )
     out: Dict[str, Any] = {}
     for key, value in state_dict.items():

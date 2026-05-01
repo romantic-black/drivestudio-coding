@@ -23,8 +23,14 @@ class DemoBlockState:
     updated_block_counts: Dict[int, int]
     current_source_frame_idx: int
     current_target_frame_indices: List[int]
+    current_target_frame_roles: List[str]
     source_image_refs: List[ImageRef]
     target_image_refs: List[ImageRef]
+    near_random_frame_indices_by_block: Dict[int, List[int]]
+    near_random_attempted_blocks: int
+    near_random_sampled_blocks: int
+    near_random_skipped_blocks: int
+    near_random_candidate_frames_sum: float
 
 
 class Stage5DemoScheduler:
@@ -58,6 +64,20 @@ class Stage5DemoScheduler:
 
         self.emit_manual_block_events = bool(event_cfg.get("emit_manual_block_events", True))
         self.emit_scope_change_events = bool(event_cfg.get("emit_scope_change_events", True))
+        sv8_cfg = cfg.get("scheduler_v8") or {}
+        near_random_cfg = scheduler_cfg.get("near_random_supervision")
+        if near_random_cfg is None:
+            near_random_cfg = sv8_cfg.get("near_random_supervision") or {}
+        self.near_random_cfg = near_random_cfg or {}
+        self.near_random_enable = bool(self._cfg_get(self.near_random_cfg, "enable", False))
+        self.near_random_frames_per_block = int(self._cfg_get(self.near_random_cfg, "frames_per_block", 1))
+        self.near_random_same_keyframe_only = bool(self._cfg_get(self.near_random_cfg, "same_keyframe_only", True))
+        self.near_random_insufficient_policy = str(self._cfg_get(self.near_random_cfg, "insufficient_policy", "skip"))
+        self.near_random_exclude_source = bool(self._cfg_get(self.near_random_cfg, "exclude_source_frame", True))
+        self.near_random_exclude_existing = bool(self._cfg_get(self.near_random_cfg, "exclude_existing_target_frames", True))
+        self.near_random_sample_once_per_block = bool(self._cfg_get(self.near_random_cfg, "sample_once_per_block", True))
+        self.near_random_camera_policy = str(self._cfg_get(self.near_random_cfg, "camera_policy", "all_cams"))
+        self.near_random_role_name = str(self._cfg_get(self.near_random_cfg, "role_name", "near_random"))
         if self.blocks_per_episode < 1:
             raise ValueError("demo.scheduler.episode.blocks_per_episode must be >= 1")
         if self.total_target_frames < 1:
@@ -71,6 +91,15 @@ class Stage5DemoScheduler:
             )
         if not self.include_source_frame:
             raise ValueError("demo.scheduler.target.include_source_frame must be true")
+        if self.near_random_enable:
+            if self.near_random_frames_per_block < 1:
+                raise ValueError("near_random_supervision.frames_per_block must be >= 1")
+            if not self.near_random_same_keyframe_only:
+                raise ValueError("v1 only supports near_random_supervision.same_keyframe_only=true")
+            if self.near_random_insufficient_policy != "skip":
+                raise ValueError("v1 only supports near_random_supervision.insufficient_policy=skip")
+            if self.near_random_camera_policy != "all_cams":
+                raise ValueError("v1 only supports near_random_supervision.camera_policy=all_cams")
 
         self._scene_ids = self._ordered_scene_ids()
         if len(self._scene_ids) == 0:
@@ -90,6 +119,20 @@ class Stage5DemoScheduler:
         self._episode_resample_cursor_by_scope: Dict[Tuple[int, int], int] = {}
         self._block_state: Optional[DemoBlockState] = None
         self._build_episode_state(scene_id=self.scene_id, segment_id=self.segment_id, reason="init")
+
+    @staticmethod
+    def _cfg_get(node: Any, key: str, default: Any) -> Any:
+        if node is None:
+            return default
+        if isinstance(node, dict):
+            return node.get(key, default)
+        if hasattr(node, "get"):
+            out = node.get(key, default)
+            return default if out is None else out
+        if hasattr(node, key):
+            out = getattr(node, key)
+            return default if out is None else out
+        return default
 
     def _ordered_scene_ids(self) -> List[int]:
         ids = [int(x) for x in self.dataset.list_training_scene_ids()]
@@ -136,7 +179,7 @@ class Stage5DemoScheduler:
         policy = str(self.frame_within_keyframe_policy)
         if policy == "first":
             return int(frames[0])
-        if policy == "middle":
+        if policy in ("middle", "middle_frame"):
             return int(frames[len(frames) // 2])
         if policy == "random_once_per_episode":
             return int(frames[self._rng.randrange(len(frames))])
@@ -144,6 +187,14 @@ class Stage5DemoScheduler:
             "demo.scheduler.episode.frame_within_keyframe_policy must be one of: "
             "first, middle, random_once_per_episode"
         )
+
+    @staticmethod
+    def _sample_no_replace(rng: random.Random, candidates: List[int], k: int) -> List[int]:
+        if int(k) < 0:
+            raise ValueError("k must be >= 0")
+        if int(k) > len(candidates):
+            raise ValueError(f"cannot sample {int(k)} without replacement from {len(candidates)} candidates")
+        return [int(x) for x in rng.sample(list(candidates), int(k))]
 
     def _episode_start_keyframe_pos(self, num_keyframes: int) -> int:
         max_start = self._max_episode_start_pos(num_keyframes)
@@ -214,19 +265,75 @@ class Stage5DemoScheduler:
         source_frame = int(st.frame_chain[int(st.block_idx_in_episode)])
         source_image_refs = self._frame_targets_to_image_refs(self._num_cams, [source_frame])
         visited = self._target_visited_indices(st)
-        target_frames = self._build_target_frames_for_block(
+        base_target_frames = self._build_target_frames_for_block(
             frame_chain=st.frame_chain,
             block_idx=int(st.block_idx_in_episode),
             visited_block_indices=visited,
             max_target_frames=int(self.max_target_frames),
         )
+        base_roles = ["source"] + ["visited" for _ in base_target_frames[1:]]
+        near_random_frames: List[int] = []
+        if self.near_random_enable:
+            sidx = self.dataset.get_segment_index(int(st.scene_id), int(st.segment_id))
+            source_keyframe_idx = int(sidx.frame_to_keyframe[int(source_frame)])
+            bidx = int(st.block_idx_in_episode)
+            if self.near_random_sample_once_per_block and bidx in st.near_random_frame_indices_by_block:
+                near_random_frames = [int(x) for x in st.near_random_frame_indices_by_block[bidx]]
+            else:
+                near_random_frames, num_candidates = self._sample_near_random_frames_for_block(
+                    sidx=sidx,
+                    source_keyframe_idx=int(source_keyframe_idx),
+                    source_frame=int(source_frame),
+                    existing_target_frames=[int(x) for x in base_target_frames],
+                    num_frames=int(self.near_random_frames_per_block),
+                )
+                st.near_random_frame_indices_by_block[bidx] = [int(x) for x in near_random_frames]
+                st.near_random_attempted_blocks = int(st.near_random_attempted_blocks) + 1
+                st.near_random_candidate_frames_sum = float(st.near_random_candidate_frames_sum) + float(num_candidates)
+                if len(near_random_frames) > 0:
+                    st.near_random_sampled_blocks = int(st.near_random_sampled_blocks) + 1
+                else:
+                    st.near_random_skipped_blocks = int(st.near_random_skipped_blocks) + 1
+        target_frames = [int(x) for x in base_target_frames] + [int(x) for x in near_random_frames]
+        target_roles = [str(x) for x in base_roles] + [str(self.near_random_role_name) for _ in near_random_frames]
         target_image_refs = self._frame_targets_to_image_refs(self._num_cams, target_frames)
 
         st.current_source_frame_idx = int(source_frame)
         st.current_target_frame_indices = [int(x) for x in target_frames]
+        st.current_target_frame_roles = [str(x) for x in target_roles]
         st.source_image_refs = [(int(x[0]), int(x[1])) for x in source_image_refs]
         st.target_image_refs = [(int(x[0]), int(x[1])) for x in target_image_refs]
         st.visited_block_indices.add(int(st.block_idx_in_episode))
+
+    def _sample_near_random_frames_for_block(
+        self,
+        *,
+        sidx: Any,
+        source_keyframe_idx: int,
+        source_frame: int,
+        existing_target_frames: List[int],
+        num_frames: int,
+    ) -> Tuple[List[int], int]:
+        if int(num_frames) <= 0:
+            return [], 0
+        if not self.near_random_same_keyframe_only:
+            raise ValueError("v1 only supports same_keyframe_only=true")
+        frames = [int(x) for x in list(sidx.keyframe_to_frames[int(source_keyframe_idx)])]
+        existing = set(int(x) for x in existing_target_frames)
+        candidates: List[int] = []
+        for f in frames:
+            if self.near_random_exclude_source and int(f) == int(source_frame):
+                continue
+            if self.near_random_exclude_existing and int(f) in existing:
+                continue
+            candidates.append(int(f))
+        if len(candidates) == 0:
+            return [], 0
+        if len(candidates) < int(num_frames):
+            if self.near_random_insufficient_policy != "skip":
+                raise ValueError(f"unsupported near_random insufficient_policy={self.near_random_insufficient_policy!r}")
+            return [], int(len(candidates))
+        return [int(x) for x in self._sample_no_replace(self._rng, candidates, int(num_frames))], int(len(candidates))
 
     def _build_episode_state(
         self,
@@ -265,8 +372,14 @@ class Stage5DemoScheduler:
             updated_block_counts={},
             current_source_frame_idx=-1,
             current_target_frame_indices=[],
+            current_target_frame_roles=[],
             source_image_refs=[],
             target_image_refs=[],
+            near_random_frame_indices_by_block={},
+            near_random_attempted_blocks=0,
+            near_random_sampled_blocks=0,
+            near_random_skipped_blocks=0,
+            near_random_candidate_frames_sum=0.0,
         )
         self._refresh_block_materialization(st)
         self._block_state = st
@@ -508,6 +621,35 @@ class Stage5DemoScheduler:
             include_test=bool(self.include_test),
         )
         batch = self.dataset.get_segment_batch_from_image_refs(req, enforce_target0_equals_source=True)
+        # Keep request_meta shape close to TrainSchedulerV8 so target-view weighting
+        # in train_step does not silently fall back to all-source weighting.
+        request_meta = dict(batch.get("request_meta") or {})
+        target_frame_roles = [str(x) for x in st.current_target_frame_roles]
+        if len(target_frame_roles) != len(st.current_target_frame_indices):
+            target_frames = [int(x) for x in st.current_target_frame_indices]
+            target_frame_roles = ["source"] + ["visited" for _ in target_frames[1:]]
+        target_image_roles: List[str] = []
+        for role in target_frame_roles:
+            for _ in range(int(self._num_cams)):
+                target_image_roles.append(str(role))
+        bidx = int(st.block_idx_in_episode)
+        near_random_frame_indices = [int(x) for x in st.near_random_frame_indices_by_block.get(bidx, [])]
+        attempted = int(st.near_random_attempted_blocks)
+        skipped = int(st.near_random_skipped_blocks)
+        sampled = int(st.near_random_sampled_blocks)
+        candidate_sum = float(st.near_random_candidate_frames_sum)
+        request_meta["source_image_refs"] = [(int(x[0]), int(x[1])) for x in st.source_image_refs]
+        request_meta["target_image_refs"] = [(int(x[0]), int(x[1])) for x in st.target_image_refs]
+        request_meta["target_frame_roles"] = [str(x) for x in target_frame_roles]
+        request_meta["target_image_roles"] = [str(x) for x in target_image_roles]
+        request_meta["near_random_frame_indices"] = [int(x) for x in near_random_frame_indices]
+        request_meta["near_random_supervision_enable"] = bool(self.near_random_enable)
+        request_meta["scheduler/near_random/enabled"] = float(1.0 if self.near_random_enable else 0.0)
+        request_meta["scheduler/near_random/num_frames"] = float(len(near_random_frame_indices))
+        request_meta["scheduler/near_random/skip_ratio"] = float(skipped / max(attempted, 1))
+        request_meta["scheduler/near_random/num_candidate_frames_mean"] = float(candidate_sum / max(attempted, 1))
+        request_meta["scheduler/near_random/sampled_blocks"] = float(sampled)
+        batch["request_meta"] = request_meta
         info = self.get_current_info()
         batch["_scheduler_v4_aligned_info"] = dict(info)
         batch["_scheduler_v7_aligned_info"] = dict(info)
@@ -536,6 +678,7 @@ class Stage5DemoScheduler:
                 "segment_local_step": int(self._segment_local_step),
                 "source_frame_idx": -1,
                 "target_frame_indices": [],
+                "target_frame_roles": [],
                 "source_image_refs": [],
                 "target_image_refs": [],
                 "visited_block_indices": [],
@@ -558,6 +701,7 @@ class Stage5DemoScheduler:
             "segment_local_step": int(self._segment_local_step),
             "source_frame_idx": int(st.current_source_frame_idx),
             "target_frame_indices": [int(x) for x in st.current_target_frame_indices],
+            "target_frame_roles": [str(x) for x in st.current_target_frame_roles],
             "source_image_refs": [tuple(x) for x in st.source_image_refs],
             "target_image_refs": [tuple(x) for x in st.target_image_refs],
             "visited_block_indices": sorted(int(x) for x in st.visited_block_indices),
