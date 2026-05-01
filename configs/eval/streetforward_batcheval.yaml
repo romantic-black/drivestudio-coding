@@ -1,0 +1,66 @@
+base_config_file: configs/minimal_streetforward_stage5_4_production_multi_scene_v8.yaml
+
+batch_eval:
+  enable: true
+  output_dir: outputs/batch_eval
+  data_mode: segment_finetune_train
+
+  checkpoint:
+    path: ""
+    strict: true
+
+  dataset:
+    scene_ids: ${data.eval_scene_ids}
+    segment_policy: all
+    require_full_window: true
+    stride: 20
+    max_episodes_per_scene: null
+    max_total_episodes: null
+    window_policy: sliding
+
+  cameras:
+    ids: [0, 1, 2]
+    names: ["front_left", "front", "front_right"]
+
+  runtime:
+    no_grad: true
+    amp: true
+    reset_state_per_episode: true
+    update_node_state: true
+    update_hidden_state: true
+    update_view_transient: true
+
+  history:
+    update_step_norm_ema: true
+    record_support_residual_on_input_exit: true
+    record_each_step: false
+
+  render:
+    save_pre_update: true
+    save_each_iter_views: true
+    save_png: true
+    save_video: false
+    save_numpy: false
+    save_depth_or_acc: false
+
+  metrics:
+    primary_mask: non_sky_non_ego
+    report_full_image: true
+    compute_psnr: true
+    compute_ssim: false
+    compute_lpips: false
+    compute_l1: true
+    min_valid_pixels: 32
+
+  experiments:
+    - name: exp1_single_frame
+      sequence_length: 1
+      input_offsets: [0]
+      eval_offsets: [0]
+      steps_per_input: 8
+
+    - name: exp2_storm20_sparse4
+      sequence_length: 20
+      input_offsets: [0, 5, 10, 15]
+      eval_offsets: all
+      steps_per_input: 8

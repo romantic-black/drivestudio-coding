@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import math
 import logging
 from pathlib import Path
@@ -339,6 +340,13 @@ class MinimalStreetForwardStage5_3_Production(MinimalStreetForwardStage5_3):
         self.stage5_2_block_support_rigid = self._clone_tensor_dict_dict(snap["support_rigid"])
         self._stage5_2_last_full_inputs = snap["last_full_inputs"]
 
+    def _autocast_ctx(self, *, amp: bool):
+        if not bool(amp):
+            return contextlib.nullcontext()
+        if self.device.type != "cuda" or not torch.cuda.is_available():
+            return contextlib.nullcontext()
+        return torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True)
+
     @torch.no_grad()
     def eval_sparse_update_step(
         self,
@@ -346,16 +354,22 @@ class MinimalStreetForwardStage5_3_Production(MinimalStreetForwardStage5_3):
         *,
         local_iter: int,
         num_local_iters: int,
+        amp: bool = False,
+        update_node_state: bool = True,
+        update_hidden_state: bool = True,
+        update_view_transient: bool = True,
+        update_step_norm_ema: bool = False,
     ) -> Dict[str, Any]:
         _ = (local_iter, num_local_iters)
-        out = self.demo_infer_step(
-            batch,
-            scheduler_events=None,
-            update_node_state=True,
-            update_hidden_state=True,
-            update_history_memory=False,
-            update_view_transient=True,
-        )
+        with self._autocast_ctx(amp=bool(amp)):
+            out = self.demo_infer_step(
+                batch,
+                scheduler_events=None,
+                update_node_state=bool(update_node_state),
+                update_hidden_state=bool(update_hidden_state),
+                update_history_memory=bool(update_step_norm_ema),
+                update_view_transient=bool(update_view_transient),
+            )
         return {
             "loss": float(out.get("loss", 0.0)),
             "num_targets": int(out.get("num_targets", 0)),
@@ -379,6 +393,7 @@ class MinimalStreetForwardStage5_3_Production(MinimalStreetForwardStage5_3):
         image_refs: List[Tuple[int, int]],
         camera_ids: List[int],
         save_dir: Optional[Path] = None,
+        amp: bool = False,
     ) -> Dict[str, Any]:
         _ = camera_ids
         if len(image_refs) == 0:
@@ -418,14 +433,15 @@ class MinimalStreetForwardStage5_3_Production(MinimalStreetForwardStage5_3):
         runtime_snap = self._snapshot_eval_runtime()
         self.eval()
         try:
-            out = self.demo_infer_step(
-                batch,
-                scheduler_events=None,
-                update_node_state=False,
-                update_hidden_state=False,
-                update_history_memory=False,
-                update_view_transient=False,
-            )
+            with self._autocast_ctx(amp=bool(amp)):
+                out = self.demo_infer_step(
+                    batch,
+                    scheduler_events=None,
+                    update_node_state=False,
+                    update_hidden_state=False,
+                    update_history_memory=False,
+                    update_view_transient=False,
+                )
         finally:
             self._restore_eval_runtime(runtime_snap)
             if prev_mode:
