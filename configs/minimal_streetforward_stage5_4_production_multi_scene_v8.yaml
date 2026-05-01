@@ -96,6 +96,7 @@ scheduler_v8:
     total_target_frames: 3
     include_source_frame: true
     target_policy: visited_episode_frames
+    block_source_frame_policy: random_within_keyframe_per_visit
     frame_within_keyframe_policy: random_once_per_episode
     min_keyframes_required_policy: skip_if_less_than_window
   traversal:
@@ -120,7 +121,7 @@ scheduler_v8:
     insufficient_policy: skip
     add_to_source_image_refs: false
     add_to_history_record_views: false
-    sample_once_per_block: true
+    sample_once_per_block: false
     exclude_source_frame: true
     exclude_existing_target_frames: true
     camera_policy: all_cams

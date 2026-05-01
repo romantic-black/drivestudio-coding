@@ -9,7 +9,8 @@ V8 保留 V7 的 episode-level traversal 与 `step_major` 执行机制，但移�
 
 - V7 的主要问题不是 `step_major`，而是 target 仍来自 future rolling window。
 - V8 只在 episode 内使用 `E` 个 block source frames，不再预留 `E + T - 1` 的 future frames。
-- V8 的 target 来自 `当前 source + 当前 episode 内已访问过的 block source frames`。
+- V8 的 target 来自 `当前 source + 当前 episode 内已访问过的 block source frames`；
+  当启用随机 source 策略时，visited block 使用“最近一次访问时的 source frame”。
 
 ---
 
@@ -30,8 +31,8 @@ V7:
 
 V8:
   episode_window_keyframes = E
-  block b source = f_b
-  block b target = source f_b + 当前 episode 内已经访问过的 block source frames
+  block b source = source_policy(keyframe_b)
+  block b target = source(b, current_visit) + 当前 episode 内已经访问过的 block source frames
 ```
 
 其中：
@@ -103,6 +104,8 @@ class EpisodePlanV8:
 ```python
 current_episode_state = {
     "frame_chain": frame_chain,
+    "block_current_source_frame_indices": [...],  # len == E, 每个 block 最近一次 source
+    "episode_source_candidate_frames": [...],     # preload 用候选 source 帧集合
     "visited_block_indices": set(),
     "block_first_visit_order": {},
     "current_source_frame_idx": -1,
@@ -146,11 +149,12 @@ W = E
 def _build_target_frames_for_block_v8(
     *,
     frame_chain: List[int],
+    block_source_frames: List[int],
     block_idx: int,
+    source_frame: int,
     visited_block_indices: set[int],
     max_target_frames: int,
 ) -> List[int]:
-    source_frame = int(frame_chain[block_idx])
     if max_target_frames < 1:
         raise ValueError("max_target_frames must be >= 1")
 
@@ -168,7 +172,7 @@ def _build_target_frames_for_block_v8(
             break
         selected_blocks.append(int(b))
 
-    return [int(source_frame)] + [int(frame_chain[b]) for b in selected_blocks]
+    return [int(source_frame)] + [int(block_source_frames[b]) for b in selected_blocks]
 ```
 
 说明：
@@ -182,9 +186,9 @@ def _build_target_frames_for_block_v8(
 
 V8 的 `_select_block()` 关键流程：
 
-1. 读取 `frame_chain` 与 `block_idx`。
-2. 基于当前 `visited_block_indices` 构造 target。
-3. 更新 `source_image_refs/target_image_refs`。
+1. 先根据 `block_source_frame_policy` 在当前 block keyframe 选择 source。
+2. 基于当前 `visited_block_indices` 与 `block_current_source_frame_indices` 构造 target。
+3. 更新 `source_image_refs/target_image_refs`，并刷新当前 block 的最近 source。
 4. 最后再将当前 block 记为 visited（保证首次访问不会引入自己之后的未访问帧）。
 
 参考伪代码：
@@ -330,6 +334,7 @@ scheduler_v8:
     total_target_frames: 3          # V8 语义: max_target_frames
     include_source_frame: true
     target_policy: visited_episode_frames
+    block_source_frame_policy: fixed_once_per_episode  # or random_within_keyframe_per_visit
     frame_within_keyframe_policy: random_once_per_episode
     min_keyframes_required_policy: skip_if_less_than_window
   traversal:
@@ -347,6 +352,13 @@ scheduler_v8:
     emit_hints: true
     warm_next_block_exact: true
     warm_next_episode_chain: true
+  near_random_supervision:
+    enable: true
+    frames_per_block: 1
+    same_keyframe_only: true
+    insufficient_policy: skip
+    exclude_source_frame: true
+    sample_once_per_block: false
 ```
 
 验证：
@@ -393,6 +405,8 @@ if total_target_frames > blocks_per_episode:
     )
 if target_policy != "visited_episode_frames":
     raise ValueError("scheduler_v8 only supports target_policy=visited_episode_frames")
+if block_source_frame_policy not in ("fixed_once_per_episode", "random_within_keyframe_per_visit"):
+    raise ValueError("scheduler_v8.episode.block_source_frame_policy is invalid")
 if reset_policy != "episode_end":
     raise ValueError("scheduler_v8 requires execution.reset_policy=episode_end")
 if not include_source_frame:

@@ -2171,6 +2171,7 @@ class MultiSceneDatasetV4:
         target_policy: str = "visited_episode_frames",
         reset_policy: str = "episode_end",
         near_random_supervision_cfg: Optional[Any] = None,
+        block_source_frame_policy: str = "fixed_once_per_episode",
     ) -> TrainSchedulerV8:
         return TrainSchedulerV8(
             dataset=self,
@@ -2195,6 +2196,7 @@ class MultiSceneDatasetV4:
             target_policy=str(target_policy),
             reset_policy=str(reset_policy),
             near_random_supervision_cfg=near_random_supervision_cfg,
+            block_source_frame_policy=str(block_source_frame_policy),
         )
 
     # Preload worker hooks

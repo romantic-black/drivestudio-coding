@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -30,6 +30,32 @@ def _make_sidx(*, scene_id: int, segment_id: int, base_frame: int = 10) -> Segme
     )
 
 
+def _make_sidx_multi_frame_per_keyframe(*, scene_id: int, segment_id: int, base_frame: int = 10) -> SegmentIndexV4:
+    keyframes = [0, 1, 2, 3, 4, 5]
+    keyframe_to_frames = {k: [base_frame + k, base_frame + 100 + k] for k in keyframes}
+    frame_to_keyframe = {}
+    frames = []
+    for k in keyframes:
+        for f in keyframe_to_frames[k]:
+            frame_to_keyframe[int(f)] = int(k)
+            frames.append(int(f))
+    return SegmentIndexV4(
+        scene_id=scene_id,
+        segment_id=segment_id,
+        num_cams=2,
+        frame_indices=frames,
+        test_frame_indices=[],
+        train_frame_set=frozenset(frames),
+        test_frame_set=frozenset(),
+        keyframe_indices=keyframes,
+        keyframe_to_frames=keyframe_to_frames,
+        frame_to_keyframe=frame_to_keyframe,
+        segment_first_frame_idx=frames[0],
+        train_image_refs=tuple((f, 0) for f in frames),
+        test_image_refs=tuple(),
+    )
+
+
 def _make_mock_dataset() -> MagicMock:
     ds = MagicMock(spec=MultiSceneDatasetV4)
     ds._initialized = True
@@ -37,7 +63,7 @@ def _make_mock_dataset() -> MagicMock:
     ds.list_training_scene_ids = MagicMock(return_value=[1])
     ds.list_segment_ids = MagicMock(return_value=[0])
     ds.get_segment_index = MagicMock(return_value=_make_sidx(scene_id=1, segment_id=0, base_frame=10))
-    ds.get_segment_batch_from_image_refs = MagicMock(return_value={"ok": True})
+    ds.get_segment_batch_from_image_refs = MagicMock(side_effect=lambda *args, **kwargs: {"ok": True})
     ds.build_preload_hint = MagicMock(
         side_effect=lambda **kwargs: {
             "scene_id": kwargs["scene_id"],
@@ -194,3 +220,111 @@ def test_v8_block_begin_additional_chain_hint_uses_episode_chain_scope():
     events = sch.pop_events()
     scopes = [str(e.get("hint_scope")) for e in events if e.get("type") == "preload_hint"]
     assert "episode_chain_exact" in scopes
+
+
+def test_v8_random_source_policy_resamples_source_per_visit_and_updates_history_targets():
+    ds = MagicMock(spec=MultiSceneDatasetV4)
+    ds._initialized = True
+    ds.initialize = MagicMock()
+    ds.list_training_scene_ids = MagicMock(return_value=[1])
+    ds.list_segment_ids = MagicMock(return_value=[0])
+    ds.get_segment_index = MagicMock(
+        return_value=_make_sidx_multi_frame_per_keyframe(scene_id=1, segment_id=0, base_frame=10)
+    )
+    ds.get_segment_batch_from_image_refs = MagicMock(side_effect=lambda *args, **kwargs: {"ok": True})
+    ds.build_preload_hint = MagicMock(
+        side_effect=lambda **kwargs: {
+            "scene_id": kwargs["scene_id"],
+            "segment_id": kwargs["segment_id"],
+            "future_image_refs": kwargs["future_image_refs"],
+            "scope": kwargs["scope"],
+        }
+    )
+    ds.submit_preload_hint = MagicMock()
+
+    sch = TrainSchedulerV8(
+        dataset=ds,
+        steps_per_block=2,
+        blocks_per_episode=3,
+        total_target_frames=3,
+        include_source_frame=True,
+        frame_within_keyframe_policy="middle_frame",
+        min_keyframes_required_policy="skip_if_less_than_window",
+        traversal_mode="linear_scene_segment",
+        switch_after_episode=True,
+        segment_order="ascending",
+        scene_order="ascending",
+        include_test=False,
+        fixed_scene_id=1,
+        fixed_segment_id=0,
+        emit_preload_hints=False,
+        warm_next_block_exact=False,
+        warm_next_episode_chain=False,
+        block_order="step_major",
+        step_major_switch_interval_steps=1,
+        target_policy="visited_episode_frames",
+        reset_policy="episode_end",
+        block_source_frame_policy="random_within_keyframe_per_visit",
+    )
+
+    with patch(
+        "datasets.train_scheduler_v8.random.choice",
+        side_effect=[110, 111, 112, 10, 11, 12],
+    ):
+        batches = [sch.next_batch() for _ in range(4)]
+
+    aligned0 = batches[0]["_scheduler_v8_aligned_info"]
+    aligned1 = batches[1]["_scheduler_v8_aligned_info"]
+    aligned2 = batches[2]["_scheduler_v8_aligned_info"]
+    aligned3 = batches[3]["_scheduler_v8_aligned_info"]
+    assert int(aligned0["source_frame_idx"]) == 110
+    assert [int(x) for x in aligned0["target_frame_indices"]] == [110]
+    assert int(aligned1["source_frame_idx"]) == 111
+    assert [int(x) for x in aligned1["target_frame_indices"]] == [111, 110]
+    assert int(aligned2["source_frame_idx"]) == 112
+    assert [int(x) for x in aligned2["target_frame_indices"]] == [112, 111, 110]
+    assert int(aligned3["source_frame_idx"]) == 10
+    assert [int(x) for x in aligned3["target_frame_indices"]] == [10, 111, 112]
+
+
+def test_v8_random_source_with_near_random_skip_when_single_frame_only():
+    ds = _make_mock_dataset()
+    sch = TrainSchedulerV8(
+        dataset=ds,
+        steps_per_block=1,
+        blocks_per_episode=3,
+        total_target_frames=3,
+        include_source_frame=True,
+        frame_within_keyframe_policy="middle_frame",
+        min_keyframes_required_policy="skip_if_less_than_window",
+        traversal_mode="linear_scene_segment",
+        switch_after_episode=True,
+        segment_order="ascending",
+        scene_order="ascending",
+        include_test=False,
+        fixed_scene_id=1,
+        fixed_segment_id=0,
+        emit_preload_hints=False,
+        warm_next_block_exact=False,
+        warm_next_episode_chain=False,
+        block_order="step_major",
+        step_major_switch_interval_steps=1,
+        target_policy="visited_episode_frames",
+        reset_policy="episode_end",
+        near_random_supervision_cfg={
+            "enable": True,
+            "frames_per_block": 1,
+            "same_keyframe_only": True,
+            "insufficient_policy": "skip",
+            "sample_once_per_block": False,
+            "exclude_source_frame": True,
+            "exclude_existing_target_frames": True,
+            "camera_policy": "all_cams",
+            "role_name": "near_random",
+        },
+        block_source_frame_policy="random_within_keyframe_per_visit",
+    )
+    batch = sch.next_batch()
+    req = batch.get("request_meta") or {}
+    assert [int(x) for x in req.get("near_random_frame_indices", [])] == []
+    assert float(req.get("scheduler/near_random/skip_ratio", 0.0)) == pytest.approx(1.0)

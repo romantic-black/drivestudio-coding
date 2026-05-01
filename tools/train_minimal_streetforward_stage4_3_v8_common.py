@@ -69,6 +69,7 @@ def build_train_scheduler_v8_from_cfg(cfg: Any, dataset: MultiSceneDatasetV4) ->
         raise ValueError("scheduler_v8.execution.step_major_switch_interval_steps must be >= 1")
     reset_policy = str(execution.get("reset_policy", "episode_end"))
     target_policy = str(ep.get("target_policy", "visited_episode_frames"))
+    block_source_frame_policy = str(ep.get("block_source_frame_policy", "fixed_once_per_episode"))
     near_random_cfg = sv8.get("near_random_supervision") or {}
 
     fixed_scene_id, fixed_segment_id = resolve_fixed_scene_segment_v8(cfg)
@@ -97,5 +98,5 @@ def build_train_scheduler_v8_from_cfg(cfg: Any, dataset: MultiSceneDatasetV4) ->
         target_policy=target_policy,
         reset_policy=reset_policy,
         near_random_supervision_cfg=near_random_cfg,
+        block_source_frame_policy=block_source_frame_policy,
     )
-

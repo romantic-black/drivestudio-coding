@@ -43,6 +43,7 @@ class TrainSchedulerV8(TrainSchedulerV7):
         target_policy: str = "visited_episode_frames",
         reset_policy: str = "episode_end",
         near_random_supervision_cfg: Optional[Any] = None,
+        block_source_frame_policy: str = "fixed_once_per_episode",
     ) -> None:
         if total_target_frames < 1:
             raise ValueError("scheduler_v8.episode.total_target_frames must be >= 1")
@@ -62,6 +63,12 @@ class TrainSchedulerV8(TrainSchedulerV7):
         self._skip_next_start_new_epoch = True
         self.target_policy = str(target_policy)
         self.reset_policy = str(reset_policy)
+        self.block_source_frame_policy = str(block_source_frame_policy)
+        if self.block_source_frame_policy not in ("fixed_once_per_episode", "random_within_keyframe_per_visit"):
+            raise ValueError(
+                "scheduler_v8.episode.block_source_frame_policy must be one of "
+                "['fixed_once_per_episode', 'random_within_keyframe_per_visit']"
+            )
         self.near_random_cfg = near_random_supervision_cfg or {}
         self.near_random_enable = bool(self._cfg_get(self.near_random_cfg, "enable", False))
         self.near_random_frames_per_block = int(self._cfg_get(self.near_random_cfg, "frames_per_block", 1))
@@ -127,6 +134,90 @@ class TrainSchedulerV8(TrainSchedulerV7):
             raise ValueError(f"cannot sample {int(k)} without replacement from {len(candidates)} candidates")
         return [int(x) for x in random.sample(list(candidates), int(k))]
 
+    @staticmethod
+    def _resolve_block_source_frame_at_index(
+        *,
+        block_source_frames: List[int],
+        frame_chain: List[int],
+        block_idx: int,
+    ) -> int:
+        b = int(block_idx)
+        if b < 0 or b >= len(frame_chain):
+            raise ValueError(f"block_idx={b} out of range for frame_chain len={len(frame_chain)}")
+        if b < len(block_source_frames):
+            source = int(block_source_frames[b])
+            if source >= 0:
+                return int(source)
+        return int(frame_chain[b])
+
+    def _episode_source_candidates_for_keyframe_window(
+        self,
+        *,
+        sidx: SegmentIndexLike,
+        keyframe_window: List[int],
+        frame_chain: List[int],
+    ) -> List[int]:
+        if self.block_source_frame_policy == "fixed_once_per_episode":
+            return [int(x) for x in frame_chain]
+        out: List[int] = []
+        seen: Set[int] = set()
+        for kf in keyframe_window:
+            for f in list(sidx.keyframe_to_frames[int(kf)]):
+                fi = int(f)
+                if fi in seen:
+                    continue
+                out.append(int(fi))
+                seen.add(int(fi))
+        if len(out) == 0:
+            return [int(x) for x in frame_chain]
+        return out
+
+    def _sample_source_frame_for_block(
+        self,
+        *,
+        st: Dict[str, Any],
+        sidx: SegmentIndexLike,
+        block_idx: int,
+    ) -> tuple[int, int]:
+        bcur = int(block_idx)
+        frame_chain = [int(x) for x in st["frame_chain"]]
+        keyframe_window = [int(x) for x in st["keyframe_window"]]
+        if bcur < 0 or bcur >= len(frame_chain):
+            raise ValueError(f"invalid block_idx={bcur} for episode")
+        source_keyframe_idx = int(keyframe_window[bcur])
+        if self.block_source_frame_policy == "fixed_once_per_episode":
+            return int(source_keyframe_idx), int(frame_chain[bcur])
+        frames = [int(x) for x in list(sidx.keyframe_to_frames[int(source_keyframe_idx)])]
+        if len(frames) == 0:
+            raise ValueError(f"keyframe_to_frames[{int(source_keyframe_idx)}] must not be empty")
+        return int(source_keyframe_idx), int(random.choice(frames))
+
+    def _near_random_cached_frames_valid(
+        self,
+        *,
+        cached_frames: List[int],
+        sidx: SegmentIndexLike,
+        source_keyframe_idx: int,
+        source_frame: int,
+        existing_target_frames: List[int],
+        num_frames: int,
+    ) -> bool:
+        cached = [int(x) for x in cached_frames]
+        if len(cached) != int(num_frames):
+            return False
+        keyframe_frames = set(int(x) for x in list(sidx.keyframe_to_frames[int(source_keyframe_idx)]))
+        existing = set(int(x) for x in existing_target_frames)
+        if len(set(cached)) != len(cached):
+            return False
+        for f in cached:
+            if int(f) not in keyframe_frames:
+                return False
+            if self.near_random_exclude_source and int(f) == int(source_frame):
+                return False
+            if self.near_random_exclude_existing and int(f) in existing:
+                return False
+        return True
+
     def start_new_epoch(self) -> None:
         if bool(getattr(self, "_skip_next_start_new_epoch", False)):
             self._skip_next_start_new_epoch = False
@@ -178,6 +269,12 @@ class TrainSchedulerV8(TrainSchedulerV7):
 
         keyframe_window = [int(x) for x in plan.keyframe_window]
         frame_chain = [int(x) for x in plan.frame_chain]
+        sidx = self.dataset.get_segment_index(scene_id, segment_id)
+        episode_source_candidates = self._episode_source_candidates_for_keyframe_window(
+            sidx=sidx,
+            keyframe_window=[int(x) for x in keyframe_window],
+            frame_chain=[int(x) for x in frame_chain],
+        )
         rt = self._segment_runtime[key]
         rt["episodes_started"] = int(rt["episodes_started"]) + 1
         episode_base_block_idx_global = int(self._block_idx_global)
@@ -192,6 +289,8 @@ class TrainSchedulerV8(TrainSchedulerV7):
             "episode_start_keyframe_pos": int(plan.episode_start_keyframe_pos),
             "keyframe_window": keyframe_window,
             "frame_chain": frame_chain,
+            "episode_source_candidate_frames": [int(x) for x in episode_source_candidates],
+            "block_current_source_frame_indices": [int(x) for x in frame_chain],
             "block_cursor": int(self._episode_block_visit_order[0]) if self.block_order == "step_major" else 0,
             "block_repeat_step": 0,
             "episode_step_cursor": 0,
@@ -240,7 +339,10 @@ class TrainSchedulerV8(TrainSchedulerV7):
         )
         self._episode_idx_global += 1
 
-        refs = self._frame_targets_to_image_refs(int(plan.num_cams), [int(x) for x in frame_chain])
+        refs = self._frame_targets_to_image_refs(
+            int(plan.num_cams),
+            [int(x) for x in episode_source_candidates],
+        )
         if self.block_order == "step_major":
             self._emit_preload_hint(
                 scene_id=int(plan.scene_id),
@@ -252,9 +354,15 @@ class TrainSchedulerV8(TrainSchedulerV7):
         if self.warm_next_episode_chain:
             next_plan = self._peek_next_episode_plan()
             if next_plan is not None:
+                next_sidx = self.dataset.get_segment_index(int(next_plan.scene_id), int(next_plan.segment_id))
+                next_episode_source_candidates = self._episode_source_candidates_for_keyframe_window(
+                    sidx=next_sidx,
+                    keyframe_window=[int(x) for x in next_plan.keyframe_window],
+                    frame_chain=[int(x) for x in next_plan.frame_chain],
+                )
                 next_refs = self._frame_targets_to_image_refs(
                     int(next_plan.num_cams),
-                    [int(x) for x in next_plan.frame_chain],
+                    [int(x) for x in next_episode_source_candidates],
                 )
                 self._emit_preload_hint(
                     scene_id=int(next_plan.scene_id),
@@ -268,11 +376,14 @@ class TrainSchedulerV8(TrainSchedulerV7):
         self,
         *,
         frame_chain: List[int],
+        block_source_frames: List[int],
         block_idx: int,
+        source_frame: int,
         visited_block_indices: Set[int],
         max_target_frames: int,
     ) -> List[int]:
-        source_frame = int(frame_chain[int(block_idx)])
+        chain = [int(x) for x in frame_chain]
+        sources = [int(x) for x in block_source_frames]
         candidates = [int(b) for b in visited_block_indices if int(b) != int(block_idx)]
         prev_blocks = sorted([b for b in candidates if b < int(block_idx)], reverse=True)
         next_blocks = sorted([b for b in candidates if b > int(block_idx)])
@@ -285,7 +396,16 @@ class TrainSchedulerV8(TrainSchedulerV7):
             if len(selected_blocks) >= int(max_target_frames) - 1:
                 break
             selected_blocks.append(int(b))
-        return [int(source_frame)] + [int(frame_chain[b]) for b in selected_blocks]
+        return [int(source_frame)] + [
+            int(
+                self._resolve_block_source_frame_at_index(
+                    block_source_frames=sources,
+                    frame_chain=chain,
+                    block_idx=int(b),
+                )
+            )
+            for b in selected_blocks
+        ]
 
     def _select_block(self, block_idx: int) -> None:
         st = self.current_episode_state
@@ -296,23 +416,42 @@ class TrainSchedulerV8(TrainSchedulerV7):
         if bcur < 0 or bcur >= len(frame_chain):
             raise ValueError(f"invalid block_idx={bcur} for episode")
 
+        self._set_current_scheduler_scope(int(st["scene_id"]), int(st["segment_id"]))
+        sidx = self.dataset.get_segment_index(int(st["scene_id"]), int(st["segment_id"]))
+        source_keyframe_idx, source_frame = self._sample_source_frame_for_block(
+            st=st,
+            sidx=sidx,
+            block_idx=int(bcur),
+        )
+        block_source_frames = [int(x) for x in st.get("block_current_source_frame_indices", frame_chain)]
+        if len(block_source_frames) != len(frame_chain):
+            block_source_frames = [int(x) for x in frame_chain]
         base_target_frames = self._build_target_frames_for_block_v8(
             frame_chain=frame_chain,
+            block_source_frames=block_source_frames,
             block_idx=bcur,
+            source_frame=int(source_frame),
             visited_block_indices=set(st["visited_block_indices"]),
             max_target_frames=int(self.total_target_frames),
         )
-        source_frame = int(frame_chain[bcur])
         base_roles = ["source"] + ["visited" for _ in base_target_frames[1:]]
         num_cams = int(st["num_cams"])
-        self._set_current_scheduler_scope(int(st["scene_id"]), int(st["segment_id"]))
-        sidx = self.dataset.get_segment_index(int(st["scene_id"]), int(st["segment_id"]))
-        source_keyframe_idx = int(sidx.frame_to_keyframe[int(source_frame)])
         near_random_frames: List[int] = []
         if self.near_random_enable:
+            reuse_cached = False
             if self.near_random_sample_once_per_block and int(bcur) in st["block_near_random_frame_indices"]:
-                near_random_frames = [int(x) for x in st["block_near_random_frame_indices"][int(bcur)]]
-            else:
+                cached = [int(x) for x in st["block_near_random_frame_indices"][int(bcur)]]
+                if self._near_random_cached_frames_valid(
+                    cached_frames=[int(x) for x in cached],
+                    sidx=sidx,
+                    source_keyframe_idx=int(source_keyframe_idx),
+                    source_frame=int(source_frame),
+                    existing_target_frames=[int(x) for x in base_target_frames],
+                    num_frames=int(self.near_random_frames_per_block),
+                ):
+                    near_random_frames = [int(x) for x in cached]
+                    reuse_cached = True
+            if not reuse_cached:
                 near_random_frames, num_candidates = self._sample_near_random_frames_for_block(
                     sidx=sidx,
                     source_keyframe_idx=int(source_keyframe_idx),
@@ -344,6 +483,8 @@ class TrainSchedulerV8(TrainSchedulerV7):
         st["current_source_frame_idx"] = int(source_frame)
         st["current_target_frame_indices"] = [int(x) for x in target_frames]
         st["current_target_frame_roles"] = [str(x) for x in target_frame_roles]
+        block_source_frames[int(bcur)] = int(source_frame)
+        st["block_current_source_frame_indices"] = [int(x) for x in block_source_frames]
         st["source_keyframe_idx"] = int(source_keyframe_idx)
         st["source_image_ref"] = tuple(source_image_ref)
         st["source_image_refs"] = [tuple(x) for x in source_image_refs]
@@ -431,7 +572,7 @@ class TrainSchedulerV8(TrainSchedulerV7):
         if original_warm_next_block_exact:
             refs = self._frame_targets_to_image_refs(
                 int(st["num_cams"]),
-                [int(x) for x in st["frame_chain"]],
+                [int(x) for x in st.get("episode_source_candidate_frames", st["frame_chain"])],
             )
             self._emit_preload_hint(
                 scene_id=int(st["scene_id"]),
@@ -443,21 +584,28 @@ class TrainSchedulerV8(TrainSchedulerV7):
 
     def _emit_block_end_for_block(self, st: Dict[str, Any], block_idx: int) -> None:
         frame_chain = [int(x) for x in st["frame_chain"]]
+        block_source_frames = [int(x) for x in st.get("block_current_source_frame_indices", frame_chain)]
         bcur = int(block_idx)
         if bcur < 0 or bcur >= len(frame_chain):
             raise ValueError(f"invalid block_idx={block_idx} for block_end")
+        source_frame = self._resolve_block_source_frame_at_index(
+            block_source_frames=[int(x) for x in block_source_frames],
+            frame_chain=[int(x) for x in frame_chain],
+            block_idx=int(bcur),
+        )
         first_target_frames = st.get("block_first_target_frame_indices", {}).get(int(bcur))
         last_target_frames = st.get("block_last_target_frame_indices", {}).get(int(bcur))
         if last_target_frames is None:
             last_target_frames = self._build_target_frames_for_block_v8(
                 frame_chain=frame_chain,
+                block_source_frames=block_source_frames,
                 block_idx=bcur,
+                source_frame=int(source_frame),
                 visited_block_indices=set(st.get("visited_block_indices", set())),
                 max_target_frames=int(self.total_target_frames),
             )
         if first_target_frames is None:
             first_target_frames = [int(x) for x in last_target_frames]
-        source_frame = int(frame_chain[bcur])
         num_cams = int(st["num_cams"])
         source_image_ref = (int(source_frame), 0)
         target_image_refs = self._frame_targets_to_image_refs(num_cams, [int(x) for x in last_target_frames])
@@ -500,18 +648,25 @@ class TrainSchedulerV8(TrainSchedulerV7):
 
     def _emit_block_exit_for_block(self, st: Dict[str, Any], block_idx: int) -> None:
         frame_chain = [int(x) for x in st["frame_chain"]]
+        block_source_frames = [int(x) for x in st.get("block_current_source_frame_indices", frame_chain)]
         bcur = int(block_idx)
         if bcur < 0 or bcur >= len(frame_chain):
             raise ValueError(f"invalid block_idx={block_idx} for block_exit")
+        source_frame = self._resolve_block_source_frame_at_index(
+            block_source_frames=[int(x) for x in block_source_frames],
+            frame_chain=[int(x) for x in frame_chain],
+            block_idx=int(bcur),
+        )
         target_frames = st.get("block_last_target_frame_indices", {}).get(int(bcur))
         if target_frames is None:
             target_frames = self._build_target_frames_for_block_v8(
                 frame_chain=frame_chain,
+                block_source_frames=block_source_frames,
                 block_idx=bcur,
+                source_frame=int(source_frame),
                 visited_block_indices=set(st.get("visited_block_indices", set())),
                 max_target_frames=int(self.total_target_frames),
             )
-        source_frame = int(frame_chain[bcur])
         num_cams = int(st["num_cams"])
         source_image_ref = (int(source_frame), 0)
         target_image_refs = self._frame_targets_to_image_refs(num_cams, [int(x) for x in target_frames])
@@ -552,7 +707,11 @@ class TrainSchedulerV8(TrainSchedulerV7):
         info = dict(super()._aligned_info(st))
         info["scheduler_version"] = "v8"
         info["target_policy"] = str(self.target_policy)
+        info["block_source_frame_policy"] = str(self.block_source_frame_policy)
         info["visited_block_indices"] = sorted(int(x) for x in st.get("visited_block_indices", set()))
+        info["block_current_source_frame_indices"] = [
+            int(x) for x in st.get("block_current_source_frame_indices", st.get("frame_chain", []))
+        ]
         info["block_first_visit_order"] = {
             int(k): int(v) for k, v in dict(st.get("block_first_visit_order", {})).items()
         }
