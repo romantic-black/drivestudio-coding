@@ -1213,14 +1213,43 @@ class MultiSceneDatasetV4:
                 )
 
     def _build_segment_index_from_asset_payload(self, payload: Dict[str, Any]) -> SegmentIndexV4:
+        asset_num_cams = int(payload["num_cams"])
+        configured_cams = [int(x) for x in self._pixel_source_cameras]
+        if len(configured_cams) > 0:
+            expected_prefix = list(range(len(configured_cams)))
+            if configured_cams != expected_prefix:
+                raise ValueError(
+                    "MultiSceneDatasetV4 currently expects data.pixel_source.cameras to be a zero-based "
+                    f"contiguous prefix when narrowing pre-exported assets; got {configured_cams}. "
+                    "Re-export assets with the desired camera order or use a prefix such as [0, 1, 2]."
+                )
+            if len(configured_cams) > asset_num_cams:
+                raise ValueError(
+                    "data.pixel_source.cameras requests more cameras than the asset contains: "
+                    f"configured={configured_cams}, asset_num_cams={asset_num_cams}"
+                )
+            active_cam_ids = set(configured_cams)
+            effective_num_cams = int(len(configured_cams))
+        else:
+            active_cam_ids = set(range(asset_num_cams))
+            effective_num_cams = int(asset_num_cams)
+
         train_frames = [int(x) for x in payload["frame_indices"]]
         test_frames = [int(x) for x in payload["test_frame_indices"]]
-        train_refs = tuple((int(x[0]), int(x[1])) for x in np.asarray(payload["train_image_refs"]).tolist())
-        test_refs = tuple((int(x[0]), int(x[1])) for x in np.asarray(payload["test_image_refs"]).tolist())
+        train_refs = tuple(
+            (int(x[0]), int(x[1]))
+            for x in np.asarray(payload["train_image_refs"]).tolist()
+            if int(x[1]) in active_cam_ids
+        )
+        test_refs = tuple(
+            (int(x[0]), int(x[1]))
+            for x in np.asarray(payload["test_image_refs"]).tolist()
+            if int(x[1]) in active_cam_ids
+        )
         return SegmentIndexV4(
             scene_id=int(payload["scene_id"]),
             segment_id=int(payload["segment_id"]),
-            num_cams=int(payload["num_cams"]),
+            num_cams=effective_num_cams,
             frame_indices=train_frames,
             test_frame_indices=test_frames,
             train_frame_set=frozenset(train_frames),

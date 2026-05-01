@@ -1,4 +1,4 @@
-output_name: experiment001_60w_40w_12block
+output_name: experiment002_60w_40w_12block_base_on_001
 
 data:
   data_root: "/root/autodl-tmp/nuScenes/"
@@ -7,7 +7,7 @@ data:
   end_timestep: -1
   preload_device: cpu
   sky_mask_semantics: one_is_sky
-  train_scene_ids: [5, 6, 7, 8, 9,14, 16, 24, 32, 40, 99, 107, 115, 123, 131, 139, 147, 155, 163, 171, 179, 195, 214,
+  train_scene_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9,14, 16, 24, 32, 40, 99, 107, 115, 123, 131, 139, 147, 155, 163, 171, 179, 195, 214,
     17, 25, 33, 41, 49, 100, 108, 116, 124, 132, 140, 148, 156, 164, 172, 180, 188, 196, 215,
     10, 18, 26, 34, 42, 93, 101, 109, 117, 125, 133, 141, 149, 157, 165, 173, 181, 189, 197, 216,
     11, 19, 27, 35, 43, 94, 102, 110, 118, 126, 134, 142, 150, 158, 166, 174, 182, 190, 198, 217,
@@ -15,7 +15,7 @@ data:
     13, 21, 29, 37, 45, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200,
     22, 30, 38, 46, 97, 105, 113, 121, 129, 137, 145, 153, 161, 169, 177, 185, 193, 201,
     15, 23, 31, 39, 47, 98, 106, 114, 122, 130, 138, 146, 154, 162, 170, 178, 186, 194]
-  eval_scene_ids: [0, 1, 2, 3, 4]
+  eval_scene_ids: []
   preload:
     enable: true
     num_workers: 1
@@ -31,8 +31,8 @@ data:
     stats_log_interval_steps: 0
   pixel_source:
     type: datasets.nuscenes.nuscenes_sourceloader.NuScenesPixelSource
-    cameras: [0, 1, 2, 3, 4, 5]
-    downscale_when_loading: [3, 3, 3, 3, 3, 3]
+    cameras: [0, 1, 2]
+    downscale_when_loading: [3, 3, 3]
     downscale: 1
     undistort: false
     load_sky_mask: true
@@ -116,7 +116,7 @@ scheduler_v8:
     warm_next_episode_chain: true
   near_random_supervision:
     enable: true
-    frames_per_block: 1
+    frames_per_block: 2
     same_keyframe_only: true
     insufficient_policy: skip
     add_to_source_image_refs: false
@@ -383,7 +383,7 @@ losses:
     visited:
       weight: 0.7
     near_random:
-      weight: 0.3
+      weight: 0.7
       schedule:
         enable: false
         type: warmup_linear
@@ -501,7 +501,7 @@ logging:
   output_root: /root/autodl-tmp/outputs
   project: minimal_sf_stage5_4_multi_scene_v8_adamw_warmcos
   log_dir: null
-  image_interval_blocks: 96
+  image_interval_blocks: 300
   train_monitor:
     enable_heavy_metrics: false
     include_per_view_metrics: true
@@ -512,14 +512,14 @@ logging:
   metrics_history_append: false
   use_tensorboard: true
   offset_monitor:
-    enable: true
+    enable: false
     near_radius_m: 5.0
     saturation_tanh_threshold: 0.95
   diagnostics:
     enable: false
     interval: 500
     window_size: 50
-    save_branch_renders: true
+    save_branch_renders: false
   performance:
     enable: false
     phase_timing: false
