@@ -31,11 +31,15 @@ class StudentPriorFusionUNet(nn.Module):
         out_dim: int,
         base_dim: int,
         use_confidence: bool,
+        extra_input_channels: int = 0,
     ) -> None:
         super().__init__()
         if int(base_dim) % 8 != 0:
             raise ValueError("student_extractor.base_channels must be divisible by 8 for GroupNorm.")
-        in_ch = 3 + int(prior_dim) + (1 if bool(use_confidence) else 0)
+        self.extra_input_channels = int(extra_input_channels)
+        if int(self.extra_input_channels) < 0:
+            raise ValueError("extra_input_channels must be >= 0.")
+        in_ch = 3 + int(prior_dim) + (1 if bool(use_confidence) else 0) + int(self.extra_input_channels)
         c1 = int(base_dim)
         c2 = int(base_dim) * 2
 
@@ -66,6 +70,7 @@ class StudentPriorFusionUNet(nn.Module):
         render_rgb: torch.Tensor,
         prior_map: torch.Tensor,
         prior_conf: Optional[torch.Tensor],
+        extra_inputs: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         x_rgb = self._to_nchw(render_rgb, expected_channels=3)
         x_prior = self._to_nchw(prior_map, expected_channels=self.prior_dim)
@@ -79,6 +84,15 @@ class StudentPriorFusionUNet(nn.Module):
             if x_conf.shape[-2:] != x_rgb.shape[-2:]:
                 x_conf = F.interpolate(x_conf, size=x_rgb.shape[-2:], mode="bilinear", align_corners=False)
             parts.append(x_conf)
+        if int(self.extra_input_channels) > 0:
+            if extra_inputs is None:
+                raise ValueError(
+                    "StudentPriorFusionUNet requires extra_inputs when extra_input_channels > 0."
+                )
+            x_extra = self._to_nchw(extra_inputs, expected_channels=int(self.extra_input_channels))
+            if x_extra.shape[-2:] != x_rgb.shape[-2:]:
+                x_extra = F.interpolate(x_extra, size=x_rgb.shape[-2:], mode="nearest")
+            parts.append(x_extra)
         x = torch.cat(parts, dim=1)
 
         e1 = self.enc1(x)

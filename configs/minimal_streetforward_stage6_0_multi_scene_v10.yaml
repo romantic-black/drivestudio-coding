@@ -1,0 +1,181 @@
+# Stage6_0 multi-scene config skeleton for V10 scheduler.
+# This config focuses on Stage6_0 semantic boundaries and fast-fail keys.
+
+model:
+  stage: "6_0"
+  production_training: false
+  backprojector_version: "v4"
+  # Keep Stage5_4-required model fields when running full training.
+  # The reduced skeleton below is for Stage6_0 wiring checks.
+  feat_2d_channels: 32
+  feature_extractor:
+    type: dinov2_unet_fusion
+    dino:
+      model_name: vit_base_patch14_reg4_dinov2
+      pretrained: true
+      freeze: true
+      out_channels: 32
+      intermediate_layers: [4, 8, 11]
+      pad_to_patch_multiple: 14
+    residual_unet:
+      in_channels: 6
+      feat_channels: 32
+      base_channels: 32
+      feature_downscale: 1
+      depth: 4
+      bilinear: true
+    fusion:
+      hidden_channels: 64
+      out_channels: 32
+  history_memory:
+    enable: true
+    record_on: block_exit
+    record_views: source_image_refs
+    support:
+      fast_ema_beta_visible: 0.7
+      fast_ema_beta_invisible: 0.95
+      slow_ema_beta_visible: 0.9
+      slow_ema_beta_invisible: 0.99
+    residual:
+      fast_error_beta: 0.8
+      slow_error_beta: 0.98
+      error_eps: 1.0e-6
+    update:
+      fast_ema_beta: 0.8
+      slow_ema_beta: 0.98
+      apply_in_eval: false
+
+current_observation:
+  enable: true
+  dim: 2
+  rho_source: feature
+  eps: 1.0e-6
+  input_to_struct_decoder: true
+  input_to_far_mlp: true
+  input_to_gru: true
+  input_to_history_gate: true
+  record_to_history_memory: false
+
+# Compatibility keys required by Stage5_3 validation path.
+scheduler_v8:
+  episode:
+    target_policy: visited_episode_frames
+  execution:
+    reset_policy: episode_end
+
+scheduler_v10:
+  enable: true
+  block:
+    steps_per_block: 2
+  episode:
+    blocks_per_episode: 4
+    total_target_frames: 3
+    include_source_frame: true
+    frame_within_keyframe_policy: middle_frame
+    min_keyframes_required_policy: skip_if_less_than_window
+    target_policy: visited_episode_frames
+    block_source_frame_policy: fixed_once_per_episode
+  traversal:
+    mode: linear_scene_segment
+    switch_after_episode: true
+    segment_order: ascending
+    scene_order: ascending
+  preload:
+    emit_hints: true
+    warm_next_block_exact: true
+    warm_next_episode_chain: true
+  execution:
+    block_order: step_major
+    step_major_switch_interval_steps: 1
+    reset_policy: episode_end
+  role_sampling:
+    first_step_role: teacher
+    force_teacher_on_block_entry: true
+    teacher_prob: 0.2
+    student_prob: 0.8
+    teacher_frame_policy: random_within_keyframe
+    teacher_resample_policy: fixed_per_block
+    student_frame_policy: random_within_same_keyframe_except_teacher
+    skip_student_if_single_source: true
+    skip_student_if_no_prior: true
+    fallback_to_teacher: true
+  targets:
+    weights:
+      teacher_source: 1.0
+      student_source: 1.0
+      teacher_anchor: 0.1
+      history_visited: 0.1
+      probe_near: 0.0
+  history_record:
+    observed:
+      trigger: teacher_exit
+      record_on_block_exit: false
+    runtime:
+      trigger: step_exit
+  probe_near:
+    enable: true
+    frames_per_block: 1
+    same_keyframe_only: true
+    insufficient_policy: skip
+    role_name: probe_near
+    loss_weight: 0.0
+  camera_sampling:
+    enable: false
+
+stage6_0:
+  enable: true
+  phase: default
+  teacher_prior:
+    dim: 32
+    confidence_norm: 1.0
+  student:
+    student_extractor:
+      base_channels: 64
+      use_confidence: true
+    valid_mask:
+      enable: true
+      apply_before_unet: true
+      append_as_channel: true
+      downsample_mode: nearest
+      mask_render_rgb: true
+      mask_teacher_prior: true
+      mask_prior_conf: true
+      mask_history_context: true
+      zero_invalid_output: true
+  bridge:
+    live:
+      enable: true
+      rerun_teacher_2d_current_step: true
+      student_loss_to_teacher_prior_adapter: true
+      student_loss_to_teacher_backbone: false
+      student_loss_to_teacher_dino: false
+    cache:
+      enable: true
+      detach_write: true
+      detach_read: true
+      reset_on: episode_begin
+      fallback_when_live_missing: true
+
+losses:
+  stage6_0:
+    normalize_by_domain: true
+    self:
+      teacher_weight: 0.2
+      student_weight: 1.0
+    teacher_anchor:
+      enable: true
+      weight: 0.1
+      role_name: teacher_anchor
+      max_frames: 1
+    history:
+      enable: true
+      visited_weight: 0.1
+      max_targets: 2
+      exclude_near: true
+      exclude_teacher_anchor: true
+    probe:
+      near:
+        enable: true
+        loss_weight: 0.0
+        log_only: true
+
