@@ -228,7 +228,12 @@ def convert_batch_to_minimal_format(
             passthrough["request_meta"] = dict(request_meta_batch)
         else:
             passthrough["request_meta"] = request_meta_batch
-    for k in ("_scheduler_v4_aligned_info", "_scheduler_v7_aligned_info", "_scheduler_v8_aligned_info"):
+    for k in (
+        "_scheduler_v4_aligned_info",
+        "_scheduler_v7_aligned_info",
+        "_scheduler_v8_aligned_info",
+        "_scheduler_v9_aligned_info",
+    ):
         if batch.get(k) is not None:
             passthrough[k] = batch.get(k)
     if isinstance(pointcloud, dict):

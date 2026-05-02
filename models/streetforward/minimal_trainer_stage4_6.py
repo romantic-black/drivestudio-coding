@@ -236,7 +236,7 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
             return int(getattr(opt, "global_step"))
         if hasattr(self, "global_step"):
             return int(getattr(self, "global_step"))
-        aligned = batch.get("_scheduler_v8_aligned_info") or {}
+        aligned = batch.get("_scheduler_v9_aligned_info") or batch.get("_scheduler_v8_aligned_info") or {}
         return int(aligned.get("global_step", 0))
 
     @staticmethod
@@ -1469,24 +1469,16 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
             "_src_backproject_pass_count": src_backproject_pass_count,
             "_cache_key": key,
             "_num_views_no_non_sky_supervision": int(views_no_non_sky),
-            "loss/target_weight/source": float(self._target_role_weight("source", current_loss_step)),
-            "loss/target_weight/visited": float(self._target_role_weight("visited", current_loss_step)),
-            "loss/target_weight/near_random": float(self._target_role_weight("near_random", current_loss_step)),
-            "loss/rgb/source": float(
-                (role_rgb_num["source"] / torch.clamp(role_rgb_den["source"], min=weight_eps)).detach().item()
-            )
-            if "source" in role_rgb_num
-            else 0.0,
-            "loss/rgb/visited": float(
-                (role_rgb_num["visited"] / torch.clamp(role_rgb_den["visited"], min=weight_eps)).detach().item()
-            )
-            if "visited" in role_rgb_num
-            else 0.0,
-            "loss/rgb/near_random": float(
-                (role_rgb_num["near_random"] / torch.clamp(role_rgb_den["near_random"], min=weight_eps)).detach().item()
-            )
-            if "near_random" in role_rgb_num
-            else 0.0,
+            **{
+                f"loss/target_weight/{str(role)}": float(self._target_role_weight(str(role), current_loss_step))
+                for role in sorted(role_rgb_num.keys(), key=str)
+            },
+            **{
+                f"loss/rgb/{str(role)}": float(
+                    (role_rgb_num[str(role)] / torch.clamp(role_rgb_den[str(role)], min=weight_eps)).detach().item()
+                )
+                for role in sorted(role_rgb_num.keys(), key=str)
+            },
             "pred_rgbs": pred_rgbs_t,
             "gt_images": gt_images_t,
             "pred_rgb": pred_rgbs_t[0],

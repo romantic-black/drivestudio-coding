@@ -1546,6 +1546,18 @@ def main() -> None:
                         )
                 if defer_node_state_reset_for_block_exit_record:
                     model.reset_node_state()
+            stage5_5_block_exit_monitor: Dict[str, Any] = {}
+            if model_stage == "5_5" and hasattr(model, "record_block_history"):
+                for ev in step_events:
+                    if str(ev.get("type", "")) != "block_exit":
+                        continue
+                    rec_metrics = model.record_block_history(minimal_batch, ev)
+                    for k, v in rec_metrics.items():
+                        sk = str(k)
+                        if isinstance(v, bool):
+                            stage5_5_block_exit_monitor[sk] = bool(v)
+                        elif isinstance(v, (int, float)):
+                            stage5_5_block_exit_monitor[sk] = float(v)
             loss_val = float(result["loss"])
             pred_rgbs = result["pred_rgbs"]
             gt_images = result["gt_images"]
@@ -1956,7 +1968,14 @@ def main() -> None:
                             row[k] = float(v)
                 # Always persist optimizer/lr/loss namespace scalars for run diagnosis,
                 # independent of include_extra_result_metrics.
-                always_scalar_prefixes = ("optimizer/", "lr/", "loss/")
+                always_scalar_prefixes = (
+                    "optimizer/",
+                    "lr/",
+                    "loss/",
+                    "stage5_5_",
+                    "scheduler_v9/",
+                    "history/",
+                )
                 for k, v in result.items():
                     if k.startswith("_") or k in row:
                         continue
@@ -1966,6 +1985,9 @@ def main() -> None:
                         row[k] = bool(v)
                     elif isinstance(v, (int, float)):
                         row[k] = float(v)
+                if isinstance(result.get("stage5_5_role"), str):
+                    row["stage5_5_role"] = str(result["stage5_5_role"])
+                row.update(stage5_5_block_exit_monitor)
                 row["loss_mask_ratio"] = float(row["loss_mask"] / max(float(loss_val), 1e-8))
                 row.update(metric_vals)
                 if diag_row:

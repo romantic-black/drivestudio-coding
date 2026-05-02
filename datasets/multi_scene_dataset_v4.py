@@ -32,6 +32,7 @@ from datasets.streetforward_assets import StreetForwardAssetStore
 from datasets.train_scheduler_v6 import TrainSchedulerV6
 from datasets.train_scheduler_v7 import TrainSchedulerV7
 from datasets.train_scheduler_v8 import TrainSchedulerV8
+from datasets.train_scheduler_v9 import TrainSchedulerV9
 
 ImageRef = Tuple[int, int]
 
@@ -2226,6 +2227,66 @@ class MultiSceneDatasetV4:
             reset_policy=str(reset_policy),
             near_random_supervision_cfg=near_random_supervision_cfg,
             block_source_frame_policy=str(block_source_frame_policy),
+        )
+
+    def create_train_scheduler_v9(
+        self,
+        *,
+        steps_per_block: int,
+        blocks_per_episode: int,
+        total_target_frames: int,
+        include_source_frame: bool,
+        frame_within_keyframe_policy: str,
+        min_keyframes_required_policy: str,
+        traversal_mode: str,
+        switch_after_episode: bool,
+        segment_order: str,
+        scene_order: str,
+        include_test: bool,
+        fixed_scene_id: Optional[int],
+        fixed_segment_id: Optional[int],
+        emit_preload_hints: bool,
+        warm_next_block_exact: bool,
+        warm_next_episode_chain: bool,
+        block_order: str = "block_major",
+        step_major_switch_interval_steps: int = 1,
+        target_policy: str = "visited_episode_frames",
+        reset_policy: str = "episode_end",
+        near_random_supervision_cfg: Optional[Any] = None,
+        block_source_frame_policy: str = "fixed_once_per_episode",
+        role_sampling_cfg: Optional[Any] = None,
+        targets_cfg: Optional[Any] = None,
+        history_record_cfg: Optional[Any] = None,
+        preload_cfg: Optional[Any] = None,
+    ) -> TrainSchedulerV9:
+        return TrainSchedulerV9(
+            dataset=self,
+            steps_per_block=steps_per_block,
+            blocks_per_episode=blocks_per_episode,
+            total_target_frames=total_target_frames,
+            include_source_frame=include_source_frame,
+            frame_within_keyframe_policy=frame_within_keyframe_policy,
+            min_keyframes_required_policy=min_keyframes_required_policy,
+            traversal_mode=traversal_mode,
+            switch_after_episode=switch_after_episode,
+            segment_order=segment_order,
+            scene_order=scene_order,
+            include_test=include_test,
+            fixed_scene_id=fixed_scene_id,
+            fixed_segment_id=fixed_segment_id,
+            emit_preload_hints=emit_preload_hints,
+            warm_next_block_exact=warm_next_block_exact,
+            warm_next_episode_chain=warm_next_episode_chain,
+            block_order=str(block_order),
+            step_major_switch_interval_steps=int(step_major_switch_interval_steps),
+            target_policy=str(target_policy),
+            reset_policy=str(reset_policy),
+            near_random_supervision_cfg=near_random_supervision_cfg,
+            block_source_frame_policy=str(block_source_frame_policy),
+            role_sampling_cfg=role_sampling_cfg,
+            targets_cfg=targets_cfg,
+            history_record_cfg=history_record_cfg,
+            preload_cfg=preload_cfg,
         )
 
     # Preload worker hooks

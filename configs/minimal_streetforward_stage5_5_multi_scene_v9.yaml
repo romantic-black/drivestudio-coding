@@ -1,4 +1,10 @@
-output_name: experiment002_60w_40w_12block_base_on_001
+# Stage5_5 multi-scene production-style config + Scheduler V9.
+# Derived from minimal_streetforward_stage5_4_production_multi_scene_v8.yaml.
+# Note: model.production_training=false matches tools/train_minimal_streetforward_stage5_5_multi_scene_v9.py (research trainer).
+# scheduler_v8 block is kept only for inherited Stage5_3 config validation fields.
+# Actual training scheduler is v9 from tools/train_minimal_streetforward_stage5_5_multi_scene_v9.py.
+
+output_name: experiment001_60w_40w
 
 data:
   data_root: "/root/autodl-tmp/nuScenes/"
@@ -7,14 +13,7 @@ data:
   end_timestep: -1
   preload_device: cpu
   sky_mask_semantics: one_is_sky
-  train_scene_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9,14, 16, 24, 32, 40, 99, 107, 115, 123, 131, 139, 147, 155, 163, 171, 179, 195, 214,
-    17, 25, 33, 41, 49, 100, 108, 116, 124, 132, 140, 148, 156, 164, 172, 180, 188, 196, 215,
-    10, 18, 26, 34, 42, 93, 101, 109, 117, 125, 133, 141, 149, 157, 165, 173, 181, 189, 197, 216,
-    11, 19, 27, 35, 43, 94, 102, 110, 118, 126, 134, 142, 150, 158, 166, 174, 182, 190, 198, 217,
-    12, 20, 36, 44, 95, 103, 111, 119, 127, 135, 143, 151, 159, 167, 175, 183, 191, 199, 218,
-    13, 21, 29, 37, 45, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200,
-    22, 30, 38, 46, 97, 105, 113, 121, 129, 137, 145, 153, 161, 169, 177, 185, 193, 201,
-    15, 23, 31, 39, 47, 98, 106, 114, 122, 130, 138, 146, 154, 162, 170, 178, 186, 194]
+  train_scene_ids: [0, 1, 2, 3, 4, 5,]
   eval_scene_ids: []
   preload:
     enable: true
@@ -59,7 +58,7 @@ data:
 
 dataset:
   num_source_keyframes: 1
-  num_target_keyframes: 3
+  num_target_keyframes: 4
   segment_overlap_ratio: 0.2
   min_keyframes_per_scene: 2
   min_keyframes_per_segment: 2
@@ -87,13 +86,14 @@ dataset:
       enable: true
       traj_length_thresh_m: 0.5
 
+# Required by MinimalStreetForwardStage5_3 config validation (episode/reset_policy alignment).
 scheduler_v8:
-  enable: true
+  enable: false
   block:
     steps_per_block: 12
   episode:
-    blocks_per_episode: 5
-    total_target_frames: 3
+    blocks_per_episode: 4
+    total_target_frames: 4
     include_source_frame: true
     target_policy: visited_episode_frames
     block_source_frame_policy: fixed_once_per_episode
@@ -127,9 +127,109 @@ scheduler_v8:
     camera_policy: all_cams
     role_name: near_random
 
+scheduler_v9:
+  enable: true
+  block:
+    steps_per_block: 12
+  episode:
+    blocks_per_episode: 4
+    total_target_frames: 4
+    include_source_frame: true
+    target_policy: visited_episode_frames
+    block_source_frame_policy: random_within_keyframe_per_visit
+    frame_within_keyframe_policy: random_once_per_episode
+    min_keyframes_required_policy: skip_if_less_than_window
+  traversal:
+    mode: round_robin_episode_interleave
+    switch_after_episode: true
+    fixed_scene_id: null
+    fixed_segment_id: null
+    segment_order: ascending
+    scene_order: shuffle_per_epoch
+  execution:
+    block_order: step_major
+    step_major_switch_interval_steps: 4
+    reset_policy: episode_end
+  role_sampling:
+    first_step_role: teacher
+    force_teacher_on_block_entry: true
+    teacher_prob: 0.2
+    student_prob: 0.8
+    teacher_frame_policy: random_within_keyframe
+    teacher_resample_policy: fixed_per_block
+    student_frame_policy: random_within_same_keyframe_except_teacher
+    skip_student_if_single_source: true
+    skip_student_if_no_prior: true
+    fallback_to_teacher: true
+  targets:
+    max_target_frames_including_source: ${scheduler_v9.episode.total_target_frames}
+    # Role lists below are documentation; TrainSchedulerV9 builds targets from weights + fixed role strings in code.
+    teacher:
+      include_source: true
+      include_visited: true
+      source_role_name: teacher_source
+      visited_role_name: visited
+    student:
+      include_source: true
+      include_teacher_preserve: true
+      include_visited: true
+      source_role_name: student_source
+      teacher_preserve_role_name: teacher_preserve
+      visited_role_name: visited
+    weights:
+      teacher_source: 1.0
+      student_source: 1.0
+      teacher_preserve: 0.3
+      visited: 0.2
+      near_random: 0.2
+  history_record:
+    observed:
+      trigger: teacher_exit
+      record_on_teacher_exit: true
+      record_on_student_exit: false
+      record_on_block_exit: false
+      fields:
+        support_obs: true
+        residual_obs: true
+        teacher_seen_count: true
+        last_teacher_step: true
+        teacher_prior_conf: true
+    runtime:
+      trigger: step_exit
+      record_on_teacher_exit: true
+      record_on_student_exit: true
+      flush_on_block_exit: true
+      fields:
+        update_norm: true
+        view_delta: true
+        runtime_support: true
+        prior_used_conf: true
+        student_seen_count: true
+        last_update_step: true
+        initialized: true
+  preload:
+    emit_hints: true
+    warm_teacher_frame: true
+    warm_student_candidates: true
+    warm_teacher_preserve_targets: true
+    warm_next_block_exact: true
+    warm_next_episode_chain: true
+  near_random_supervision:
+    enable: true
+    frames_per_block: 2
+    same_keyframe_only: true
+    insufficient_policy: skip
+    add_to_source_image_refs: false
+    add_to_history_record_views: false
+    sample_once_per_block: false
+    exclude_source_frame: true
+    exclude_existing_target_frames: true
+    camera_policy: all_cams
+    role_name: near_random
+
 validation_v8:
   eval_enable: false
-  mode: inference_only  # segment_finetune_train
+  mode: inference_only
   block:
     steps_per_block: 16
   episode:
@@ -159,8 +259,8 @@ validation_v8:
     enable: false
 
 model:
-  stage: "5_4"
-  production_training: true
+  stage: "5_5"
+  production_training: false
   backprojector_version: "v4"
   scale_init_value: 0.1
   sh_degree: 1
@@ -356,6 +456,7 @@ current_observation:
   dim: 2
   rho_source: feature
   eps: 1.0e-6
+  embed_dim: 8
   input_to_struct_decoder: true
   input_to_far_mlp: true
   input_to_gru: true
@@ -365,8 +466,91 @@ current_observation:
     log_stats: true
     log_interval_steps: 50
 
+stage5_5:
+  enable: true
+  fallback_to_teacher_if_no_prior: true
+  # Optional: load Stage5_4 (or compatible) weights after Stage5_5 modules are built.
+  # Non-strict load allows missing student_prior_fusion_unet.*; tighten via allowlists / strict.
+  init:
+    from_stage5_4_checkpoint: true
+    checkpoint_path: "/root/autodl-tmp/outputs/minimal_sf_stage5_4_multi_scene_v8_adamw_warmcos/experiment002_60w_40w_12block_base_on_001/checkpoints/minimal_sf_stage5_4_multi_scene_v8_step50000.pt"
+    strict: false
+    missing_key_prefix_allowlist:
+      - "student_prior_fusion_unet."
+    unexpected_key_prefix_allowlist: []
+    reset_teacher_prior_cache: true
+  teacher:
+    input_gt: true
+    input_render: true
+    use_dinov2: true
+    init_from_stage5_4_extractor: true
+    freeze_extractor: false
+  student:
+    input_render: true
+    input_teacher_prior_projection: true
+    input_teacher_prior_confidence: true
+    use_dinov2: false
+    update_node_state: true
+    update_hidden_state: true
+    update_view_transient: true
+    update_observed_history: false
+    update_runtime_history: true
+    update_teacher_prior: false
+  teacher_prior:
+    enable: true
+    dim: 32
+    update_policy: overwrite_valid
+    reset_on: episode_begin
+    detach: true
+    eps: 1.0e-6
+    support_min_bg: ${model.branches.bg.src_backproject_support_min}
+    support_min_distant: ${model.branches.distant.src_backproject_support_min}
+    support_min_rigid: ${model.branches.rigid.src_backproject_support_min}
+    confidence:
+      mode: log1p_norm
+      norm: 1.0
+      clamp_min: 0.0
+      clamp_max: 1.0
+  feature_splatting:
+    enable: true
+    backend: gsplat
+    use_existing_renderer: true
+    feature_dim: 32
+    pack_feature_and_confidence: true
+    packed_channels: 33
+    normalize_by_confidence: true
+    eps: 1.0e-6
+    render_resolution: image
+    render_dtype: fp16
+    detach_geometry: true
+    detach_prior_feature: true
+    background_feature: 0.0
+    background_confidence: 0.0
+  student_extractor:
+    type: lightweight_prior_unet
+    in_channels: 36
+    base_channels: 32
+    feat_channels: 32
+    depth: 3
+    use_norm: true
+    output_layout: VHWC
+    use_confidence: true
+  history_record:
+    policy: role_aware_split
+    observed:
+      record_on: teacher_exit
+      update_by_teacher: true
+      update_by_student: false
+    runtime:
+      update_by_teacher: true
+      update_by_student: true
+    block_exit:
+      record_observed: false
+      flush_runtime: true
+      require_teacher_seen_per_block: true
+
 training_recipe:
-  name: stage5_4_adamw_warmcos_v1
+  name: stage5_5_adamw_warmcos_v1
 
 losses:
   photometric:
@@ -381,14 +565,14 @@ losses:
     source:
       weight: 1.0
     visited:
-      weight: 0.7
+      weight: 0.2
     near_random:
-      weight: 0.7
+      weight: 0.2
       schedule:
         enable: false
         type: warmup_linear
         start_weight: 0.3
-        end_weight: 0.5
+        end_weight: 0.2
         warmup_steps: 20000
 
 optimizer:
@@ -430,6 +614,12 @@ optimizer:
           - "image_feature_extractor.fusion"
           - "image_feature_extractor.fusion_neck"
       lr: 1.5e-4
+      weight_decay: 1.0e-4
+    student_prior_unet:
+      match:
+        prefixes:
+          - "student_prior_fusion_unet"
+      lr: 1.0e-4
       weight_decay: 1.0e-4
     struct_near_xcpe:
       match:
@@ -499,13 +689,13 @@ eval:
 
 logging:
   output_root: /root/autodl-tmp/outputs
-  project: minimal_sf_stage5_4_multi_scene_v8_adamw_warmcos
+  project: minimal_sf_stage5_5_multi_scene_v9_adamw_warmcos
   log_dir: null
   image_interval_blocks: 300
   train_monitor:
     enable_heavy_metrics: false
     include_per_view_metrics: true
-    include_extra_result_metrics: false
+    include_extra_result_metrics: true
     enable_low_psnr_image_dump: false
   low_psnr_train_images_subdir: train_low_psnr
   enable_jsonl_metrics: true

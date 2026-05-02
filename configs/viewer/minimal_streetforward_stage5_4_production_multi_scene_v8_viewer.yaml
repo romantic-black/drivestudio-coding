@@ -31,8 +31,8 @@ data:
     stats_log_interval_steps: 0
   pixel_source:
     type: datasets.nuscenes.nuscenes_sourceloader.NuScenesPixelSource
-    cameras: [0]
-    downscale_when_loading: [3]
+    cameras: [0, 1, 2]
+    downscale_when_loading: [3, 3, 3]
     downscale: 1
     undistort: false
     load_sky_mask: true
