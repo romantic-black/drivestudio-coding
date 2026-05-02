@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -1293,6 +1294,17 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
         role_rgb_num: Dict[str, torch.Tensor] = {}
         role_rgb_den: Dict[str, torch.Tensor] = {}
         role_counts: Dict[str, int] = {}
+        monitor_role_l1_sum: Dict[str, float] = {}
+        monitor_role_ssim_sum: Dict[str, float] = {}
+        monitor_role_rgb_sum: Dict[str, float] = {}
+        monitor_role_psnr_sum: Dict[str, float] = {}
+        monitor_role_count: Dict[str, int] = {}
+        monitor_role_weight_sum: Dict[str, float] = {}
+        monitor_all_l1_sum = 0.0
+        monitor_all_ssim_sum = 0.0
+        monitor_all_rgb_sum = 0.0
+        monitor_all_psnr_sum = 0.0
+        monitor_all_count = 0
         for F in sorted_frames:
             group = by_frame[F]
             for orig_i, t in group:
@@ -1326,12 +1338,17 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
                 if non_sky_pixels > 0.0:
                     l1_numer = (torch.abs(pred_rgb - gt_image) * valid_non_sky_mask.unsqueeze(-1)).sum()
                     l1_i = self.loss_w_l1 * (l1_numer / (valid_non_sky_mask.sum() * 3.0))
+                    mse_i = (
+                        ((pred_rgb - gt_image) ** 2 * valid_non_sky_mask.unsqueeze(-1)).sum()
+                        / (valid_non_sky_mask.sum() * 3.0)
+                    )
                     ssim_i = self.loss_w_ssim * compute_ssim_loss_masked(
                         pred_rgb, gt_image, valid_mask=valid_non_sky_mask, sky_mask=None, data_range=1.0
                     )
                 else:
                     views_no_non_sky += 1
                     l1_i = pred_rgb.sum() * 0.0
+                    mse_i = pred_rgb.sum() * 0.0
                     ssim_i = pred_rgb.sum() * 0.0
                 gt_occupied = (1.0 - sm) * valid_loss_mask
                 pred_occupied = opacity.clamp(0.0, 1.0) * valid_loss_mask
@@ -1353,6 +1370,23 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
                 role_rgb_num[role] = role_rgb_num.get(role, zero.clone()) + (l1_i * view_weight)
                 role_rgb_den[role] = role_rgb_den.get(role, zero.clone()) + view_weight
                 role_counts[role] = int(role_counts.get(role, 0)) + 1
+                l1_det = float(l1_i.detach().item())
+                ssim_det = float(ssim_i.detach().item())
+                mse_det = float(mse_i.detach().item())
+                psnr_det = float(-10.0 * math.log10(max(mse_det, 1.0e-12))) if non_sky_pixels > 0.0 else 0.0
+                rgb_det = float(l1_det + ssim_det)
+                vw_det = float(view_weight.detach().item())
+                monitor_all_l1_sum += l1_det
+                monitor_all_ssim_sum += ssim_det
+                monitor_all_rgb_sum += rgb_det
+                monitor_all_psnr_sum += psnr_det
+                monitor_all_count += 1
+                monitor_role_l1_sum[role] = float(monitor_role_l1_sum.get(role, 0.0)) + l1_det
+                monitor_role_ssim_sum[role] = float(monitor_role_ssim_sum.get(role, 0.0)) + ssim_det
+                monitor_role_rgb_sum[role] = float(monitor_role_rgb_sum.get(role, 0.0)) + rgb_det
+                monitor_role_psnr_sum[role] = float(monitor_role_psnr_sum.get(role, 0.0)) + psnr_det
+                monitor_role_count[role] = int(monitor_role_count.get(role, 0)) + 1
+                monitor_role_weight_sum[role] = float(monitor_role_weight_sum.get(role, 0.0)) + vw_det
         if normalize_by_weight_sum:
             denom = torch.clamp(total_weight_sum, min=weight_eps)
         else:
@@ -1365,6 +1399,11 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
         ssim_mean = weighted_ssim_sum / denom
         mask_mean = weighted_mask_sum / denom
         entropy_mean = weighted_entropy_sum / denom
+        monitor_den = max(int(monitor_all_count), 1)
+        monitor_l1_all = float(monitor_all_l1_sum / float(monitor_den))
+        monitor_ssim_all = float(monitor_all_ssim_sum / float(monitor_den))
+        monitor_rgb_all = float(monitor_all_rgb_sum / float(monitor_den))
+        monitor_psnr_all = float(monitor_all_psnr_sum / float(monitor_den))
         for fidx, num in frame_loss_num.items():
             den = torch.clamp(frame_loss_den[fidx], min=weight_eps)
             frame_loss_map[int(fidx)] = float((num / den).detach().item())
@@ -1443,6 +1482,22 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
             "loss_ssim": ssim_mean,
             "loss_mask": mask_mean,
             "loss_opacity_entropy": entropy_mean,
+            "loss_optim": float(loss.detach().item()),
+            "loss_optim_l1": float(l1_mean.detach().item()),
+            "loss_optim_ssim": float(ssim_mean.detach().item()),
+            "loss_optim_mask": float(mask_mean.detach().item()),
+            "loss_optim_opacity_entropy": float(entropy_mean.detach().item()),
+            "loss_optim_weight_sum": float(total_weight_sum.detach().item()),
+            "loss_optim_num_images": int(sum(int(v) for v in role_counts.values())),
+            "loss_optim_normalize_by_weight_sum": float(1.0 if normalize_by_weight_sum else 0.0),
+            "monitor/l1/all": float(monitor_l1_all),
+            "monitor/ssim/all": float(monitor_ssim_all),
+            "monitor/rgb/all": float(monitor_rgb_all),
+            "monitor/psnr/all": float(monitor_psnr_all),
+            "monitor/l1_all_unweighted": float(monitor_l1_all),
+            "monitor/ssim_all_unweighted": float(monitor_ssim_all),
+            "monitor/rgb_all_unweighted": float(monitor_rgb_all),
+            "monitor/psnr_all_unweighted": float(monitor_psnr_all),
             "render_params": render_params_bg,
             "_render_params_bg": render_params_bg,
             "proxies": proxies_bg,
@@ -1490,6 +1545,38 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
                     (role_rgb_num[str(role)] / torch.clamp(role_rgb_den[str(role)], min=weight_eps)).detach().item()
                 )
                 for role in sorted(role_rgb_num.keys(), key=str)
+            },
+            **{
+                f"monitor/l1/{str(role)}": float(
+                    monitor_role_l1_sum[str(role)] / max(int(monitor_role_count[str(role)]), 1)
+                )
+                for role in sorted(monitor_role_count.keys(), key=str)
+            },
+            **{
+                f"monitor/ssim/{str(role)}": float(
+                    monitor_role_ssim_sum[str(role)] / max(int(monitor_role_count[str(role)]), 1)
+                )
+                for role in sorted(monitor_role_count.keys(), key=str)
+            },
+            **{
+                f"monitor/rgb/{str(role)}": float(
+                    monitor_role_rgb_sum[str(role)] / max(int(monitor_role_count[str(role)]), 1)
+                )
+                for role in sorted(monitor_role_count.keys(), key=str)
+            },
+            **{
+                f"monitor/psnr/{str(role)}": float(
+                    monitor_role_psnr_sum[str(role)] / max(int(monitor_role_count[str(role)]), 1)
+                )
+                for role in sorted(monitor_role_count.keys(), key=str)
+            },
+            **{
+                f"monitor/count/{str(role)}": float(monitor_role_count[str(role)])
+                for role in sorted(monitor_role_count.keys(), key=str)
+            },
+            **{
+                f"monitor/weight_sum/{str(role)}": float(monitor_role_weight_sum[str(role)])
+                for role in sorted(monitor_role_weight_sum.keys(), key=str)
             },
             "pred_rgbs": pred_rgbs_t,
             "gt_images": gt_images_t,

@@ -13,7 +13,14 @@ data:
   end_timestep: -1
   preload_device: cpu
   sky_mask_semantics: one_is_sky
-  train_scene_ids: [0, 1, 2, 3, 4, 5,]
+  train_scene_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9,14, 16, 24, 32, 40, 99, 107, 115, 123, 131, 139, 147, 155, 163, 171, 179, 195, 214,
+    17, 25, 33, 41, 49, 100, 108, 116, 124, 132, 140, 148, 156, 164, 172, 180, 188, 196, 215,
+    10, 18, 26, 34, 42, 93, 101, 109, 117, 125, 133, 141, 149, 157, 165, 173, 181, 189, 197, 216,
+    11, 19, 27, 35, 43, 94, 102, 110, 118, 126, 134, 142, 150, 158, 166, 174, 182, 190, 198, 217,
+    12, 20, 36, 44, 95, 103, 111, 119, 127, 135, 143, 151, 159, 167, 175, 183, 191, 199, 218,
+    13, 21, 29, 37, 45, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200,
+    22, 30, 38, 46, 97, 105, 113, 121, 129, 137, 145, 153, 161, 169, 177, 185, 193, 201,
+    15, 23, 31, 39, 47, 98, 106, 114, 122, 130, 138, 146, 154, 162, 170, 178, 186, 194]
   eval_scene_ids: []
   preload:
     enable: true
@@ -26,12 +33,13 @@ data:
     warm_next_block_exact: true
     warm_test_refs: false
     warm_episode_source_superset: true
+    warm_episode_chain_exact: true
     enable_view_pack_cache: true
     stats_log_interval_steps: 0
   pixel_source:
     type: datasets.nuscenes.nuscenes_sourceloader.NuScenesPixelSource
-    cameras: [0, 1, 2]
-    downscale_when_loading: [3, 3, 3]
+    cameras: [0, 1, 2, 3, 4, 5]
+    downscale_when_loading: [3, 3, 3, 3, 3, 3]
     downscale: 1
     undistort: false
     load_sky_mask: true
@@ -150,6 +158,33 @@ scheduler_v9:
     block_order: step_major
     step_major_switch_interval_steps: 4
     reset_policy: episode_end
+  camera_sampling:
+    enable: true
+    scope: episode
+    policy: explicit_groups
+    freeze_within_episode: true
+    camera_groups:
+      - [0, 1, 2]
+      - [1, 2, 3]
+      - [2, 3, 4]
+      - [3, 4, 5]
+      - [4, 5, 0]
+      - [5, 0, 1]
+    group_order: shuffle_cycle
+    group_weights: null
+    camera_names:
+      0: front_left
+      1: front
+      2: front_right
+      3: rear_right
+      4: rear
+      5: rear_left
+    apply_to_source: true
+    apply_to_teacher: true
+    apply_to_target: true
+    apply_to_history_record: true
+    apply_to_preload: true
+    log_names: true
   role_sampling:
     first_step_role: teacher
     force_teacher_on_block_entry: true
@@ -224,7 +259,7 @@ scheduler_v9:
     sample_once_per_block: false
     exclude_source_frame: true
     exclude_existing_target_frames: true
-    camera_policy: all_cams
+    camera_policy: active_episode_cams
     role_name: near_random
 
 validation_v8:

@@ -257,9 +257,9 @@ class AssetPreloadManagerV2:
                 victim = self._heap.pop(victim_idx)
                 heapq.heapify(self._heap)
                 vk = (
+                    int(victim[4]),
                     int(victim[2]),
                     int(victim[3]),
-                    int(victim[4]),
                     int(victim[5][0]),
                     int(victim[5][1]),
                 )

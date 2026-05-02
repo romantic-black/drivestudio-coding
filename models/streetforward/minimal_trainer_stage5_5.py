@@ -177,6 +177,13 @@ class MinimalStreetForwardStage5_5(MinimalStreetForwardStage5_4):
                 "Stage5_5 no longer supports history_record.policy=teacher_only. "
                 "Use scheduler_v9.history_record.observed/runtime split."
             )
+        hist5_policy = str((hist5 or {}).get("policy", "")).strip().lower()
+        history_cfg = self._cfg_get(self._cfg_get(config, "model", {}), "history_memory", {}) or {}
+        legacy_record_on = str(self._cfg_get(history_cfg, "record_on", "")).strip().lower()
+        if legacy_record_on == "block_exit" and hist5_policy == "role_aware_split":
+            logger.warning(
+                "Stage5_5 overrides legacy model.history_memory.record_on=block_exit with role-aware history policy."
+            )
         prior_cfg = self._require_key(stage5_5_cfg, "teacher_prior", "stage5_5")
         prior_dim = int(self._require_key(prior_cfg, "dim", "stage5_5.teacher_prior"))
         if prior_dim <= 0:
@@ -518,9 +525,9 @@ class MinimalStreetForwardStage5_5(MinimalStreetForwardStage5_4):
                 width=int(width),
             )
             features_2d = self.student_prior_fusion_unet(
-                render_rgb=scene_rgb_batch,
-                prior_map=prior_map,
-                prior_conf=prior_conf_map if self.stage5_5_student_use_conf else None,
+                render_rgb=scene_rgb_batch.detach(),
+                prior_map=prior_map.detach(),
+                prior_conf=prior_conf_map.detach() if prior_conf_map is not None else None,
             )
 
         source_pair_valid_mask = self._build_source_pair_valid_mask(
@@ -602,10 +609,21 @@ class MinimalStreetForwardStage5_5(MinimalStreetForwardStage5_4):
         step: int,
         num_targets: int,
     ) -> Tuple[torch.Tensor, List[str]]:
+        _ = step
         meta = batch.get("request_meta") or {}
         if str(meta.get("scheduler_version", "")) == "v9":
             w = meta.get("target_image_loss_base_weights")
             roles = [str(x) for x in list(meta.get("target_image_roles") or [])]
+            refs = list(meta.get("target_image_refs") or [])
+            if isinstance(w, (list, tuple)):
+                if len(roles) != len(refs):
+                    raise ValueError(
+                        f"target_image_roles/target_image_refs mismatch: {len(roles)} vs {len(refs)}"
+                    )
+                if len(w) != len(refs):
+                    raise ValueError(
+                        f"target_image_loss_base_weights/target_image_refs mismatch: {len(w)} vs {len(refs)}"
+                    )
             if isinstance(w, (list, tuple)) and len(w) == int(num_targets) and len(roles) == int(num_targets):
                 return (
                     torch.tensor([float(x) for x in w], dtype=torch.float32, device=self.device),
@@ -763,6 +781,29 @@ class MinimalStreetForwardStage5_5(MinimalStreetForwardStage5_4):
             out["stage5_5_prior_conf_mean"] = 0.0
         if "stage5_5_prior_conf_nonzero_ratio" not in out:
             out["stage5_5_prior_conf_nonzero_ratio"] = 0.0
+        actual_role = str(out.get("stage5_5_role", self._stage5_5_last_role))
+        primary_role = "teacher_source" if actual_role == "teacher" else "student_source"
+        primary_l1 = out.get(f"monitor/l1/{primary_role}")
+        primary_psnr = out.get(f"monitor/psnr/{primary_role}")
+        if isinstance(primary_l1, (int, float)):
+            out["monitor/l1/primary"] = float(primary_l1)
+            out["monitor/primary_l1"] = float(primary_l1)
+        if isinstance(primary_psnr, (int, float)):
+            out["monitor/psnr/primary"] = float(primary_psnr)
+            out["monitor/primary_psnr"] = float(primary_psnr)
+        l1_student = out.get("monitor/l1/student_source")
+        l1_preserve = out.get("monitor/l1/teacher_preserve")
+        if isinstance(l1_student, (int, float)) and isinstance(l1_preserve, (int, float)):
+            out["monitor/student_teacher_gap_l1"] = float(l1_preserve) - float(l1_student)
+        psnr_student = out.get("monitor/psnr/student_source")
+        psnr_preserve = out.get("monitor/psnr/teacher_preserve")
+        if isinstance(psnr_student, (int, float)) and isinstance(psnr_preserve, (int, float)):
+            out["monitor/student_teacher_gap_psnr"] = float(psnr_preserve) - float(psnr_student)
+        if actual_role == "student":
+            out["stage5_5/prior_conf_mean_student_only"] = float(out.get("stage5_5_prior_conf_mean", 0.0))
+            out["stage5_5/prior_conf_nonzero_ratio_student_only"] = float(
+                out.get("stage5_5_prior_conf_nonzero_ratio", 0.0)
+            )
         return out
 
     def _commit_block_runtime_support_to_history(

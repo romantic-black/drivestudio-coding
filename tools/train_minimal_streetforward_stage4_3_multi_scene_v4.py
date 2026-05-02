@@ -1680,6 +1680,7 @@ def main() -> None:
                         elif isinstance(v, (int, float)):
                             stage5_5_block_exit_monitor[sk] = float(v)
             loss_val = float(result["loss"])
+            loss_optim_val = float(result.get("loss_optim", loss_val))
             pred_rgbs = result["pred_rgbs"]
             gt_images = result["gt_images"]
             num_views = len(pred_rgbs)
@@ -1696,6 +1697,16 @@ def main() -> None:
                     {
                         "loss_sum": 0.0,
                         "loss_count": 0,
+                        "loss_optim_sum": 0.0,
+                        "loss_optim_count": 0,
+                        "sum__monitor/l1/primary": 0.0,
+                        "count__monitor/l1/primary": 0,
+                        "sum__monitor/l1/student_source": 0.0,
+                        "count__monitor/l1/student_source": 0,
+                        "sum__monitor/l1/teacher_source": 0.0,
+                        "count__monitor/l1/teacher_source": 0,
+                        "sum__monitor/l1/teacher_preserve": 0.0,
+                        "count__monitor/l1/teacher_preserve": 0,
                         "scene_id": int(scheduler_info.get("scene_id", -1)),
                         "segment_id": int(scheduler_info.get("segment_id", -1)),
                         "episode_idx_global": int(scheduler_info.get("episode_idx_global", -1)),
@@ -1704,6 +1715,22 @@ def main() -> None:
                 )
                 block_acc["loss_sum"] = float(block_acc.get("loss_sum", 0.0)) + float(loss_val)
                 block_acc["loss_count"] = int(block_acc.get("loss_count", 0)) + 1
+                block_acc["loss_optim_sum"] = float(block_acc.get("loss_optim_sum", 0.0)) + float(loss_optim_val)
+                block_acc["loss_optim_count"] = int(block_acc.get("loss_optim_count", 0)) + 1
+                monitor_block_keys = (
+                    "monitor/l1/primary",
+                    "monitor/l1/student_source",
+                    "monitor/l1/teacher_source",
+                    "monitor/l1/teacher_preserve",
+                )
+                for mk in monitor_block_keys:
+                    mv = result.get(mk)
+                    if not isinstance(mv, (int, float)):
+                        continue
+                    sum_k = f"sum__{mk}"
+                    cnt_k = f"count__{mk}"
+                    block_acc[sum_k] = float(block_acc.get(sum_k, 0.0)) + float(mv)
+                    block_acc[cnt_k] = int(block_acc.get(cnt_k, 0)) + 1
 
             if step % log_interval == 0:
                 logger.info(
@@ -1840,8 +1867,31 @@ def main() -> None:
 
                 acc = block_loss_accum.pop(int(block_idx_global), None)
                 mean_loss: Optional[float] = None
+                mean_loss_optim: Optional[float] = None
+                mean_monitor_primary_l1_in_block: Optional[float] = None
+                mean_monitor_student_source_l1_in_block: Optional[float] = None
+                mean_monitor_teacher_source_l1_in_block: Optional[float] = None
+                mean_monitor_teacher_preserve_l1_in_block: Optional[float] = None
                 if acc is not None and int(acc.get("loss_count", 0)) > 0:
                     mean_loss = float(acc["loss_sum"]) / float(acc["loss_count"])
+                if acc is not None and int(acc.get("loss_optim_count", 0)) > 0:
+                    mean_loss_optim = float(acc["loss_optim_sum"]) / float(acc["loss_optim_count"])
+                if acc is not None and int(acc.get("count__monitor/l1/primary", 0)) > 0:
+                    mean_monitor_primary_l1_in_block = float(acc["sum__monitor/l1/primary"]) / float(
+                        acc["count__monitor/l1/primary"]
+                    )
+                if acc is not None and int(acc.get("count__monitor/l1/student_source", 0)) > 0:
+                    mean_monitor_student_source_l1_in_block = float(acc["sum__monitor/l1/student_source"]) / float(
+                        acc["count__monitor/l1/student_source"]
+                    )
+                if acc is not None and int(acc.get("count__monitor/l1/teacher_source", 0)) > 0:
+                    mean_monitor_teacher_source_l1_in_block = float(acc["sum__monitor/l1/teacher_source"]) / float(
+                        acc["count__monitor/l1/teacher_source"]
+                    )
+                if acc is not None and int(acc.get("count__monitor/l1/teacher_preserve", 0)) > 0:
+                    mean_monitor_teacher_preserve_l1_in_block = float(acc["sum__monitor/l1/teacher_preserve"]) / float(
+                        acc["count__monitor/l1/teacher_preserve"]
+                    )
                 # Monitoring metrics are logging-only; detach to avoid extra autograd graph/memory.
                 pred_rgbs_eval = [p.detach() for p in pred_rgbs]
                 gt_images_eval = [g.detach() for g in gt_images]
@@ -2044,9 +2094,10 @@ def main() -> None:
                     else "n/a"
                 )
                 mean_loss_log = "n/a" if mean_loss is None else f"{float(mean_loss):.6f}"
+                mean_loss_optim_log = "n/a" if mean_loss_optim is None else f"{float(mean_loss_optim):.6f}"
                 logger.info(
                     "BLOCK_END global_step=%s scene_id=%s scene_dir=%s segment=%s block_seg=%s block_global=%s "
-                    "mean_loss=%s mse=%.6e metric_scope=%s psnr_mean=%s onepass=%d",
+                    "mean_loss=%s mean_loss_optim=%s mse=%.6e metric_scope=%s psnr_mean=%s onepass=%d",
                     ev.get("global_step"),
                     ev.get("scene_id"),
                     _scene_dir_str(ev.get("scene_id", -1)),
@@ -2054,6 +2105,7 @@ def main() -> None:
                     ev.get("block_idx_in_segment"),
                     ev.get("block_idx_global"),
                     mean_loss_log,
+                    mean_loss_optim_log,
                     mse_val,
                     metric_scope,
                     psnr_log,
@@ -2084,11 +2136,42 @@ def main() -> None:
                     "R_steps": int(scheduler_info.get("R_steps", -1)),
                     "T_steps": int(scheduler_info.get("T_steps", -1)),
                     "loss": float(loss_val),
+                    "loss_optim": float(loss_optim_val),
                     "mean_loss_in_block": float(mean_loss) if mean_loss is not None else None,
+                    "mean_loss_optim_in_block": float(mean_loss_optim) if mean_loss_optim is not None else None,
                     "loss_l1": float(result.get("loss_l1", 0.0)),
                     "loss_ssim": float(result.get("loss_ssim", 0.0)),
                     "loss_mask": float(result.get("loss_mask", 0.0)),
                     "loss_opacity_entropy": float(result.get("loss_opacity_entropy", 0.0)),
+                    "loss_optim_l1": float(result.get("loss_optim_l1", result.get("loss_l1", 0.0))),
+                    "loss_optim_ssim": float(result.get("loss_optim_ssim", result.get("loss_ssim", 0.0))),
+                    "loss_optim_mask": float(result.get("loss_optim_mask", result.get("loss_mask", 0.0))),
+                    "loss_optim_opacity_entropy": float(
+                        result.get("loss_optim_opacity_entropy", result.get("loss_opacity_entropy", 0.0))
+                    ),
+                    "loss_optim_weight_sum": float(result.get("loss_optim_weight_sum", 0.0)),
+                    "loss_optim_num_images": int(result.get("loss_optim_num_images", 0)),
+                    "loss_optim_normalize_by_weight_sum": float(result.get("loss_optim_normalize_by_weight_sum", 0.0)),
+                    "mean_monitor_primary_l1_in_block": (
+                        float(mean_monitor_primary_l1_in_block)
+                        if mean_monitor_primary_l1_in_block is not None
+                        else None
+                    ),
+                    "mean_monitor_student_source_l1_in_block": (
+                        float(mean_monitor_student_source_l1_in_block)
+                        if mean_monitor_student_source_l1_in_block is not None
+                        else None
+                    ),
+                    "mean_monitor_teacher_source_l1_in_block": (
+                        float(mean_monitor_teacher_source_l1_in_block)
+                        if mean_monitor_teacher_source_l1_in_block is not None
+                        else None
+                    ),
+                    "mean_monitor_teacher_preserve_l1_in_block": (
+                        float(mean_monitor_teacher_preserve_l1_in_block)
+                        if mean_monitor_teacher_preserve_l1_in_block is not None
+                        else None
+                    ),
                     "num_rigid_src_feat_valid": int(result.get("num_rigid_src_feat_valid", 0)),
                     "num_rigid_update": int(result.get("num_rigid_update", 0)),
                     "num_target_frames": int(result.get("num_target_frames", 0)),
@@ -2147,7 +2230,9 @@ def main() -> None:
                     "optimizer/",
                     "lr/",
                     "loss/",
+                    "monitor/",
                     "stage5_5_",
+                    "stage5_5/",
                     "scheduler_v9/",
                     "history/",
                 )
@@ -2164,6 +2249,7 @@ def main() -> None:
                     row["stage5_5_role"] = str(result["stage5_5_role"])
                 row.update(stage5_5_block_exit_monitor)
                 row["loss_mask_ratio"] = float(row["loss_mask"] / max(float(loss_val), 1e-8))
+                row["loss_optim_mask_ratio"] = float(row["loss_optim_mask"] / max(float(loss_optim_val), 1e-8))
                 row.update(metric_vals)
                 if diag_row:
                     row.update(diag_row)
@@ -2174,13 +2260,21 @@ def main() -> None:
                 _write_metrics_history(metrics_fh, row)
                 if writer is not None:
                     writer.add_scalar("train/loss", float(loss_val), step)
+                    writer.add_scalar("train/loss_optim", float(loss_optim_val), step)
                     if mean_loss is not None:
                         writer.add_scalar("train/mean_loss_in_block", float(mean_loss), step)
+                    if mean_loss_optim is not None:
+                        writer.add_scalar("train/mean_loss_optim_in_block", float(mean_loss_optim), step)
                     writer.add_scalar("train/mse", float(mse_val), step)
                     writer.add_scalar("train/num_bg_update", int(result.get("num_bg_update", 0)), step)
                     writer.add_scalar("train/num_distant_update", int(result.get("num_distant_update", 0)), step)
                     writer.add_scalar("train/num_gaussians_sky", int(result.get("num_gaussians_sky", 0)), step)
                     writer.add_scalar("train/src_backproject_pass_count", int(result.get("src_backproject_pass_count", 0)), step)
+                    for k, v in result.items():
+                        if not str(k).startswith(("monitor/", "loss/")):
+                            continue
+                        if isinstance(v, (int, float)):
+                            writer.add_scalar(f"train/{k}", float(v), step)
                     for k, v in metric_vals.items():
                         writer.add_scalar(f"train/{k}", float(v), step)
                     if train_monitor_include_extra_result_metrics:

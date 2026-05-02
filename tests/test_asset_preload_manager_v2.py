@@ -88,6 +88,20 @@ def test_asset_preload_manager_v2_high_priority_eviction():
     assert int(mgr._heap[0][3]) == 1
 
 
+def test_asset_preload_manager_v2_evicted_task_can_be_requeued_after_dedupe_cleanup():
+    cfg = _cfg_dict()
+    cfg["max_pending_tasks"] = 1
+    ds = _DummyDataset()
+    mgr = AssetPreloadManagerV2(ds, parse_preload_cfg_v2(cfg))
+    mgr.submit_segment_static(10, 1, 0, meta={"kind": "low"})
+    mgr.submit_segment_static(0, 1, 1, meta={"kind": "high"})
+    assert len(mgr._heap) == 1
+    assert int(mgr._heap[0][3]) == 1
+    mgr.submit_segment_static(-1, 1, 0, meta={"kind": "requeue_low"})
+    assert len(mgr._heap) == 1
+    assert int(mgr._heap[0][3]) == 0
+
+
 def test_asset_preload_manager_v2_episode_chain_exact_warms_view_pack():
     ds = _DummyDataset()
     mgr = AssetPreloadManagerV2(ds, parse_preload_cfg_v2(_cfg_dict()))
@@ -111,4 +125,3 @@ def test_asset_preload_manager_v2_episode_chain_exact_warms_view_pack():
     kinds = [x[0] for x in ds.calls]
     assert "view_meta" in kinds
     assert "view_pack" in kinds
-

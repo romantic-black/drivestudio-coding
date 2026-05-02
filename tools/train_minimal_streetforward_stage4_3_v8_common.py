@@ -124,6 +124,7 @@ def build_train_scheduler_v9_from_cfg(cfg: Any, dataset: MultiSceneDatasetV4) ->
     targets = sv9.get("targets") or {}
     history_record = sv9.get("history_record") or {}
     near_random_cfg = sv9.get("near_random_supervision") or {}
+    camera_sampling_cfg = sv9.get("camera_sampling") or {}
 
     if block is None or ep is None or trav is None or preload is None:
         raise ValueError("scheduler_v9 must define block/episode/traversal/preload")
@@ -198,4 +199,5 @@ def build_train_scheduler_v9_from_cfg(cfg: Any, dataset: MultiSceneDatasetV4) ->
         targets_cfg=targets,
         history_record_cfg=history_record,
         preload_cfg=preload,
+        camera_sampling_cfg=camera_sampling_cfg,
     )

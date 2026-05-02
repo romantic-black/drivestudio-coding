@@ -18,7 +18,7 @@ def _make_sidx_single_frame(*, scene_id: int, segment_id: int, base_frame: int =
     return SegmentIndexV4(
         scene_id=scene_id,
         segment_id=segment_id,
-        num_cams=2,
+        num_cams=6,
         frame_indices=frames,
         test_frame_indices=[],
         train_frame_set=frozenset(frames),
@@ -27,7 +27,7 @@ def _make_sidx_single_frame(*, scene_id: int, segment_id: int, base_frame: int =
         keyframe_to_frames=keyframe_to_frames,
         frame_to_keyframe=frame_to_keyframe,
         segment_first_frame_idx=frames[0],
-        train_image_refs=tuple((f, 0) for f in frames),
+        train_image_refs=tuple((f, c) for f in frames for c in range(6)),
         test_image_refs=tuple(),
     )
 
@@ -44,7 +44,7 @@ def _make_sidx_multi_frame(*, scene_id: int, segment_id: int, base_frame: int = 
     return SegmentIndexV4(
         scene_id=scene_id,
         segment_id=segment_id,
-        num_cams=2,
+        num_cams=6,
         frame_indices=frames,
         test_frame_indices=[],
         train_frame_set=frozenset(frames),
@@ -53,7 +53,7 @@ def _make_sidx_multi_frame(*, scene_id: int, segment_id: int, base_frame: int = 
         keyframe_to_frames=keyframe_to_frames,
         frame_to_keyframe=frame_to_keyframe,
         segment_first_frame_idx=frames[0],
-        train_image_refs=tuple((f, 0) for f in frames),
+        train_image_refs=tuple((f, c) for f in frames for c in range(6)),
         test_image_refs=tuple(),
     )
 
@@ -111,13 +111,14 @@ def _build_scheduler(ds: MagicMock, **kwargs) -> TrainSchedulerV9:
         include_test=False,
         fixed_scene_id=1,
         fixed_segment_id=0,
-        emit_preload_hints=False,
-        warm_next_block_exact=False,
-        warm_next_episode_chain=False,
+        emit_preload_hints=bool(kwargs.get("emit_preload_hints", False)),
+        warm_next_block_exact=bool(kwargs.get("warm_next_block_exact", False)),
+        warm_next_episode_chain=bool(kwargs.get("warm_next_episode_chain", False)),
         block_order=str(kwargs.get("block_order", "step_major")),
         step_major_switch_interval_steps=int(kwargs.get("step_major_switch_interval_steps", 1)),
         target_policy="visited_episode_frames",
         reset_policy="episode_end",
+        near_random_supervision_cfg=kwargs.get("near_random_supervision_cfg"),
         role_sampling_cfg=role_sampling_cfg,
         targets_cfg={
             "weights": {
@@ -137,6 +138,7 @@ def _build_scheduler(ds: MagicMock, **kwargs) -> TrainSchedulerV9:
                 "trigger": "step_exit",
             },
         },
+        camera_sampling_cfg=kwargs.get("camera_sampling_cfg", {}),
     )
 
 
@@ -150,6 +152,46 @@ def test_v9_single_source_keyframe_all_teacher():
         assert bool(meta["stage5_5_has_student"]) is False
         assert bool(meta["history_record/record_observed_on_step_exit"]) is True
         assert bool(meta["stage5_5_force_teacher_on_block_entry"]) is True
+
+
+def test_v9_rejects_unsupported_teacher_resample_policy():
+    ds = _make_mock_dataset(multi_frame=True)
+    with pytest.raises(ValueError, match="teacher_resample_policy"):
+        _build_scheduler(
+            ds,
+            role_sampling_cfg={
+                "teacher_resample_policy": "resample_per_step",
+            },
+        )
+
+
+def test_v9_accepts_active_episode_cams_near_random_policy():
+    ds = _make_mock_dataset(multi_frame=True)
+    sch = _build_scheduler(
+        ds,
+        near_random_supervision_cfg={
+            "enable": True,
+            "frames_per_block": 1,
+            "same_keyframe_only": True,
+            "insufficient_policy": "skip",
+            "camera_policy": "active_episode_cams",
+        },
+        camera_sampling_cfg={
+            "enable": True,
+            "scope": "episode",
+            "policy": "explicit_groups",
+            "camera_groups": [[0, 1, 2]],
+            "group_order": "cycle",
+            "freeze_within_episode": True,
+            "apply_to_source": True,
+            "apply_to_teacher": True,
+            "apply_to_target": True,
+            "apply_to_history_record": True,
+            "apply_to_preload": True,
+        },
+    )
+    assert str(sch.near_random_camera_policy_v9) == "active_episode_cams"
+    assert str(sch.near_random_camera_policy) == "all_cams"
 
 
 def test_v9_first_step_in_block_must_be_teacher():
@@ -352,6 +394,19 @@ def test_build_train_scheduler_v9_reads_fixed_scene_from_scheduler_v9_traversal(
                         "trigger": "step_exit",
                     },
                 },
+                "camera_sampling": {
+                    "enable": True,
+                    "scope": "episode",
+                    "policy": "explicit_groups",
+                    "camera_groups": [[0, 1, 2], [1, 2, 3]],
+                    "group_order": "shuffle_cycle",
+                    "freeze_within_episode": True,
+                    "apply_to_source": True,
+                    "apply_to_teacher": True,
+                    "apply_to_target": True,
+                    "apply_to_history_record": True,
+                    "apply_to_preload": True,
+                },
             },
         }
     )
@@ -363,6 +418,7 @@ def test_build_train_scheduler_v9_reads_fixed_scene_from_scheduler_v9_traversal(
     _, kwargs = ds.create_train_scheduler_v9.call_args
     assert int(kwargs["fixed_scene_id"]) == 7
     assert int(kwargs["fixed_segment_id"]) == 3
+    assert bool(kwargs["camera_sampling_cfg"]["enable"]) is True
 
 
 def test_v9_resolve_visited_prefers_last_teacher_frame():
@@ -392,6 +448,102 @@ def test_v9_materialize_current_batch_injects_v9_request_meta():
     assert "history_record/runtime_record_trigger" in meta
     assert "target_frame_loss_base_weights" in meta
     assert "target_image_loss_base_weights" in meta
+    assert "camera_sampling/active_cam_ids" in meta
+
+
+def test_v9_camera_group_fixed_within_episode_and_switches_across_episodes():
+    ds = _make_mock_dataset(multi_frame=True)
+    sch = _build_scheduler(
+        ds,
+        steps_per_block=1,
+        blocks_per_episode=2,
+        total_target_frames=2,
+        camera_sampling_cfg={
+            "enable": True,
+            "scope": "episode",
+            "policy": "explicit_groups",
+            "camera_groups": [[0, 1, 2], [1, 2, 3]],
+            "group_order": "cycle",
+            "freeze_within_episode": True,
+            "apply_to_source": True,
+            "apply_to_teacher": True,
+            "apply_to_target": True,
+            "apply_to_history_record": True,
+            "apply_to_preload": True,
+            "camera_names": {0: "front_left", 1: "front", 2: "front_right", 3: "rear_right"},
+        },
+    )
+    b0 = sch.next_batch()["request_meta"]
+    b1 = sch.next_batch()["request_meta"]
+    b2 = sch.next_batch()["request_meta"]
+
+    assert [int(x) for x in b0["camera_sampling/active_cam_ids"]] == [0, 1, 2]
+    assert [int(x) for x in b1["camera_sampling/active_cam_ids"]] == [0, 1, 2]
+    assert [int(x) for x in b2["camera_sampling/active_cam_ids"]] == [1, 2, 3]
+
+    source_refs = [tuple(x) for x in b0["source_image_refs"]]
+    teacher_refs = [tuple(x) for x in b0["stage5_5_teacher_image_refs"]]
+    target_refs = [tuple(x) for x in b0["target_image_refs"]]
+    target_frames = [int(x) for x in b0["target_frame_indices"]]
+    target_roles = [str(x) for x in b0["target_image_roles"]]
+    target_weights = [float(x) for x in b0["target_image_loss_base_weights"]]
+    observed_refs = [tuple(x) for x in b0["history_record/observed_record_image_refs"]]
+    runtime_refs = [tuple(x) for x in b0["history_record/runtime_record_image_refs"]]
+
+    assert len(source_refs) == 3
+    assert len(teacher_refs) == 3
+    assert len(target_refs) == len(target_frames) * 3
+    assert len(target_roles) == len(target_refs)
+    assert len(target_weights) == len(target_refs)
+    assert observed_refs == teacher_refs
+    assert runtime_refs == source_refs
+    assert float(b0["scheduler_v9/active_num_cams"]) == 3.0
+    assert [str(x) for x in b0["camera_sampling/active_cam_names"]] == ["front_left", "front", "front_right"]
+
+
+def test_v9_preload_hints_only_include_active_episode_cams():
+    ds = _make_mock_dataset(multi_frame=True)
+    sch = _build_scheduler(
+        ds,
+        steps_per_block=1,
+        blocks_per_episode=2,
+        total_target_frames=2,
+        emit_preload_hints=True,
+        warm_next_block_exact=True,
+        warm_next_episode_chain=True,
+        camera_sampling_cfg={
+            "enable": True,
+            "scope": "episode",
+            "policy": "explicit_groups",
+            "camera_groups": [[2, 3, 4]],
+            "group_order": "cycle",
+            "freeze_within_episode": True,
+            "apply_to_source": True,
+            "apply_to_teacher": True,
+            "apply_to_target": True,
+            "apply_to_history_record": True,
+            "apply_to_preload": True,
+        },
+    )
+    batch = sch.next_batch()
+    meta = batch["request_meta"]
+    assert ds.build_preload_hint.call_count > 0
+    scopes = [str(call.kwargs["scope"]) for call in ds.build_preload_hint.call_args_list]
+    assert "episode_chain_exact" in scopes
+    assert "next_block_exact" in scopes
+    next_exact_refs = set()
+    for call in ds.build_preload_hint.call_args_list:
+        refs = [tuple(x) for x in call.kwargs["future_image_refs"]]
+        assert len(refs) > 0
+        assert set(int(ref[1]) for ref in refs).issubset({2, 3, 4})
+        if str(call.kwargs["scope"]) == "next_block_exact":
+            next_exact_refs.update((int(ref[0]), int(ref[1])) for ref in refs)
+    required_refs = set(
+        [tuple(x) for x in list(meta["source_image_refs"])]
+        + [tuple(x) for x in list(meta["stage5_5_teacher_image_refs"])]
+        + [tuple(x) for x in list(meta["target_image_refs"])]
+    )
+    assert required_refs.issubset(next_exact_refs)
 
 
 def test_v9_target_loss_weights_have_frame_and_image_levels():

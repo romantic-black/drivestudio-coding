@@ -2258,6 +2258,7 @@ class MultiSceneDatasetV4:
         targets_cfg: Optional[Any] = None,
         history_record_cfg: Optional[Any] = None,
         preload_cfg: Optional[Any] = None,
+        camera_sampling_cfg: Optional[Any] = None,
     ) -> TrainSchedulerV9:
         return TrainSchedulerV9(
             dataset=self,
@@ -2287,6 +2288,7 @@ class MultiSceneDatasetV4:
             targets_cfg=targets_cfg,
             history_record_cfg=history_record_cfg,
             preload_cfg=preload_cfg,
+            camera_sampling_cfg=camera_sampling_cfg,
         )
 
     # Preload worker hooks

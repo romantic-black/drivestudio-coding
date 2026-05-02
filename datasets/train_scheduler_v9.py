@@ -38,18 +38,45 @@ class TrainSchedulerV9(TrainSchedulerV8):
         targets_cfg: Optional[Any] = None,
         history_record_cfg: Optional[Any] = None,
         preload_cfg: Optional[Any] = None,
+        camera_sampling_cfg: Optional[Any] = None,
     ) -> None:
         self.role_sampling_cfg = role_sampling_cfg or {}
         self.targets_cfg = targets_cfg or {}
         self.history_record_cfg = history_record_cfg or {}
         self.preload_cfg = preload_cfg or {}
+        self.camera_sampling_cfg = camera_sampling_cfg or {}
         self._student_cycle_ptr_by_block: Dict[int, int] = {}
+        self.camera_sampling_enable = False
+        self.camera_sampling_policy = "explicit_groups"
+        self.camera_group_order = "shuffle_cycle"
+        self.camera_freeze_within_episode = True
+        self.camera_groups: List[Tuple[int, ...]] = []
+        self.camera_group_weights: Optional[List[float]] = None
+        self.camera_names_map: Dict[int, str] = {}
+        self._camera_group_cycle_order: List[int] = []
+        self._camera_group_cycle_ptr = 0
+        self.near_random_camera_policy_v9 = str(
+            self._cfg_get(near_random_supervision_cfg, "camera_policy", "all_cams")
+        )
+        if self.near_random_camera_policy_v9 not in {"all_cams", "active_episode_cams"}:
+            raise ValueError(
+                "scheduler_v9.near_random_supervision.camera_policy must be one of "
+                f"['all_cams', 'active_episode_cams'], got {self.near_random_camera_policy_v9!r}"
+            )
+        near_random_cfg_for_super: Optional[Any] = near_random_supervision_cfg
+        if self.near_random_camera_policy_v9 == "active_episode_cams":
+            nr_cfg = {}
+            if near_random_supervision_cfg is not None and hasattr(near_random_supervision_cfg, "items"):
+                nr_cfg = {k: v for k, v in near_random_supervision_cfg.items()}
+            nr_cfg["camera_policy"] = "all_cams"
+            near_random_cfg_for_super = nr_cfg
 
         role_cfg = self.role_sampling_cfg
         self.first_step_role = str(self._cfg_get(role_cfg, "first_step_role", "teacher"))
         self.teacher_prob = float(self._cfg_get(role_cfg, "teacher_prob", 0.4))
         self.student_prob = float(self._cfg_get(role_cfg, "student_prob", 0.6))
         self.teacher_frame_policy = str(self._cfg_get(role_cfg, "teacher_frame_policy", "random_within_keyframe"))
+        self.teacher_resample_policy = str(self._cfg_get(role_cfg, "teacher_resample_policy", "fixed_per_block"))
         self.student_frame_policy = str(
             self._cfg_get(role_cfg, "student_frame_policy", "random_within_same_keyframe_except_teacher")
         )
@@ -80,10 +107,16 @@ class TrainSchedulerV9(TrainSchedulerV8):
             raise ValueError("SchedulerV9 requires first_step_role=teacher")
         if self.student_prob > 0.0 and self.teacher_prob <= 0.0:
             raise ValueError("SchedulerV9 requires teacher_prob > 0 when student_prob > 0")
+        if self.teacher_resample_policy != "fixed_per_block":
+            raise ValueError(
+                "SchedulerV9 only supports role_sampling.teacher_resample_policy=fixed_per_block, "
+                f"got {self.teacher_resample_policy!r}"
+            )
         if self.observed_trigger != "teacher_exit":
             raise ValueError("SchedulerV9 requires observed history trigger=teacher_exit")
         if self.observed_record_on_block_exit:
             raise ValueError("SchedulerV9 must not record observed support/residual on block_exit")
+        self._parse_camera_sampling_cfg()
 
         super().__init__(
             dataset=dataset,
@@ -107,9 +140,131 @@ class TrainSchedulerV9(TrainSchedulerV8):
             step_major_switch_interval_steps=step_major_switch_interval_steps,
             target_policy=target_policy,
             reset_policy=reset_policy,
-            near_random_supervision_cfg=near_random_supervision_cfg,
+            near_random_supervision_cfg=near_random_cfg_for_super,
             block_source_frame_policy=block_source_frame_policy,
         )
+
+    def _parse_camera_sampling_cfg(self) -> None:
+        cfg = self.camera_sampling_cfg
+        self.camera_sampling_enable = bool(self._cfg_get(cfg, "enable", False))
+        self.camera_sampling_policy = str(self._cfg_get(cfg, "policy", "explicit_groups"))
+        self.camera_group_order = str(self._cfg_get(cfg, "group_order", "shuffle_cycle"))
+        self.camera_freeze_within_episode = bool(self._cfg_get(cfg, "freeze_within_episode", True))
+        raw_groups = self._cfg_get(cfg, "camera_groups", None)
+        raw_groups = [] if raw_groups is None else list(raw_groups)
+        self.camera_groups = [tuple(int(x) for x in group) for group in raw_groups]
+        names_cfg = self._cfg_get(cfg, "camera_names", {}) or {}
+        self.camera_names_map = {int(k): str(v) for k, v in dict(names_cfg).items()}
+
+        if not self.camera_sampling_enable:
+            return
+        if str(self._cfg_get(cfg, "scope", "episode")) != "episode":
+            raise ValueError("scheduler_v9.camera_sampling.scope must be 'episode'")
+        if not self.camera_freeze_within_episode:
+            raise ValueError("scheduler_v9.camera_sampling.freeze_within_episode must be true")
+        if self.camera_sampling_policy != "explicit_groups":
+            raise ValueError(
+                f"unsupported scheduler_v9.camera_sampling.policy={self.camera_sampling_policy!r}, "
+                "only 'explicit_groups' is supported"
+            )
+        if len(self.camera_groups) == 0:
+            raise ValueError("scheduler_v9.camera_sampling.camera_groups must not be empty")
+        group_lens = sorted({len(g) for g in self.camera_groups})
+        if len(group_lens) != 1 or int(group_lens[0]) <= 0:
+            raise ValueError(
+                "scheduler_v9.camera_sampling.camera_groups must all share one positive length, "
+                f"got lengths={group_lens}"
+            )
+        allowed_orders = {"random", "cycle", "shuffle_cycle", "weighted_random"}
+        if self.camera_group_order not in allowed_orders:
+            raise ValueError(
+                f"unsupported scheduler_v9.camera_sampling.group_order={self.camera_group_order!r}; "
+                f"allowed={sorted(allowed_orders)}"
+            )
+
+        weights = self._cfg_get(cfg, "group_weights", None)
+        if self.camera_group_order == "weighted_random":
+            if weights is None:
+                raise ValueError("group_order=weighted_random requires scheduler_v9.camera_sampling.group_weights")
+            parsed_weights = [float(x) for x in list(weights)]
+            if len(parsed_weights) != len(self.camera_groups):
+                raise ValueError(
+                    "group_weights length mismatch: "
+                    f"groups={len(self.camera_groups)} weights={len(parsed_weights)}"
+                )
+            if any(w <= 0.0 for w in parsed_weights):
+                raise ValueError("group_weights must be positive")
+            self.camera_group_weights = [float(x) for x in parsed_weights]
+        elif weights is not None:
+            parsed_weights = [float(x) for x in list(weights)]
+            if len(parsed_weights) != len(self.camera_groups):
+                raise ValueError(
+                    "group_weights length mismatch: "
+                    f"groups={len(self.camera_groups)} weights={len(parsed_weights)}"
+                )
+            self.camera_group_weights = [float(x) for x in parsed_weights]
+
+        for flag_key in (
+            "apply_to_source",
+            "apply_to_teacher",
+            "apply_to_target",
+            "apply_to_history_record",
+            "apply_to_preload",
+        ):
+            if bool(self._cfg_get(cfg, flag_key, True)) is not True:
+                raise ValueError(f"scheduler_v9.camera_sampling.{flag_key} must be true when camera_sampling.enable=true")
+
+    def _sample_episode_camera_group(self, *, fallback_num_cams: int) -> Tuple[List[int], int]:
+        if not self.camera_sampling_enable:
+            if int(fallback_num_cams) <= 0:
+                raise ValueError(f"invalid fallback_num_cams={fallback_num_cams}")
+            return [int(x) for x in range(int(fallback_num_cams))], -1
+
+        n = int(len(self.camera_groups))
+        if n <= 0:
+            raise ValueError("camera sampling enabled but no camera_groups configured")
+
+        if self.camera_group_order == "random":
+            idx = int(random.randrange(n))
+        elif self.camera_group_order == "cycle":
+            idx = int(self._camera_group_cycle_ptr % n)
+            self._camera_group_cycle_ptr += 1
+        elif self.camera_group_order == "shuffle_cycle":
+            if (not self._camera_group_cycle_order) or int(self._camera_group_cycle_ptr) >= len(self._camera_group_cycle_order):
+                self._camera_group_cycle_order = list(range(n))
+                random.shuffle(self._camera_group_cycle_order)
+                self._camera_group_cycle_ptr = 0
+            idx = int(self._camera_group_cycle_order[self._camera_group_cycle_ptr])
+            self._camera_group_cycle_ptr += 1
+        elif self.camera_group_order == "weighted_random":
+            weights = self.camera_group_weights
+            if weights is None:
+                raise ValueError("group_order=weighted_random requires parsed camera_group_weights")
+            idx = int(random.choices(list(range(n)), weights=weights, k=1)[0])
+        else:
+            raise ValueError(f"unsupported camera_group_order={self.camera_group_order!r}")
+
+        cams = [int(x) for x in self.camera_groups[int(idx)]]
+        if int(fallback_num_cams) <= 0:
+            raise ValueError(f"invalid fallback_num_cams={fallback_num_cams}")
+        for cam_id in cams:
+            if cam_id < 0 or cam_id >= int(fallback_num_cams):
+                raise ValueError(
+                    "camera_groups contains out-of-range cam id: "
+                    f"cam_id={cam_id}, available=[0,{int(fallback_num_cams) - 1}]"
+                )
+        return cams, int(idx)
+
+    def _peek_episode_camera_group(self, *, fallback_num_cams: int) -> Tuple[List[int], int]:
+        random_state = random.getstate()
+        cycle_order = [int(x) for x in self._camera_group_cycle_order]
+        cycle_ptr = int(self._camera_group_cycle_ptr)
+        try:
+            return self._sample_episode_camera_group(fallback_num_cams=int(fallback_num_cams))
+        finally:
+            random.setstate(random_state)
+            self._camera_group_cycle_order = [int(x) for x in cycle_order]
+            self._camera_group_cycle_ptr = int(cycle_ptr)
 
     def _emit(self, event: Dict[str, Any]) -> None:
         out = dict(event)
@@ -118,10 +273,19 @@ class TrainSchedulerV9(TrainSchedulerV8):
         super()._emit(out)
 
     def _start_episode_from_plan(self, plan: EpisodePlanV8) -> None:
-        super()._start_episode_from_plan(plan)
+        if self.camera_sampling_enable:
+            original_emit_preload_hints = bool(self.emit_preload_hints)
+            self.emit_preload_hints = False
+            try:
+                super()._start_episode_from_plan(plan)
+            finally:
+                self.emit_preload_hints = original_emit_preload_hints
+        else:
+            super()._start_episode_from_plan(plan)
         st = self.current_episode_state
         if st is None:
             raise ValueError("TrainSchedulerV9 internal state is not initialized")
+        active_cam_ids, active_group_idx = self._sample_episode_camera_group(fallback_num_cams=int(st["num_cams"]))
         self._student_cycle_ptr_by_block = {}
         st.update(
             {
@@ -150,7 +314,89 @@ class TrainSchedulerV9(TrainSchedulerV8):
                 "current_block_entry_id": 0,
                 "block_entry_counts": [0 for _ in range(self.blocks_per_episode)],
                 "block_entry_teacher_counts": [0 for _ in range(self.blocks_per_episode)],
+                "active_cam_ids": [int(x) for x in active_cam_ids],
+                "active_camera_group_idx": int(active_group_idx),
+                "active_num_cams": int(len(active_cam_ids)),
             }
+        )
+        if self.camera_sampling_enable and self.block_order == "step_major":
+            refs = self._frame_targets_to_image_refs_for_cams(
+                [int(x) for x in st.get("episode_source_candidate_frames", st["frame_chain"])],
+                [int(x) for x in active_cam_ids],
+            )
+            self._emit_preload_hint(
+                scene_id=int(st["scene_id"]),
+                segment_id=int(st["segment_id"]),
+                future_image_refs=refs,
+                hint_scope="episode_chain_exact",
+                block_idx_global=int(st["episode_base_block_idx_global"]),
+            )
+            if self.warm_next_episode_chain:
+                next_plan = self._peek_next_episode_plan()
+                if next_plan is not None:
+                    next_sidx = self.dataset.get_segment_index(int(next_plan.scene_id), int(next_plan.segment_id))
+                    next_episode_source_candidates = self._episode_source_candidates_for_keyframe_window(
+                        sidx=next_sidx,
+                        keyframe_window=[int(x) for x in next_plan.keyframe_window],
+                        frame_chain=[int(x) for x in next_plan.frame_chain],
+                    )
+                    next_active_cam_ids, _ = self._peek_episode_camera_group(
+                        fallback_num_cams=int(next_plan.num_cams)
+                    )
+                    next_refs = self._frame_targets_to_image_refs_for_cams(
+                        [int(x) for x in next_episode_source_candidates],
+                        [int(x) for x in next_active_cam_ids],
+                    )
+                    self._emit_preload_hint(
+                        scene_id=int(next_plan.scene_id),
+                        segment_id=int(next_plan.segment_id),
+                        future_image_refs=next_refs,
+                        hint_scope="episode_chain_exact",
+                        block_idx_global=int(st["episode_base_block_idx_global"]),
+                    )
+
+    def _emit_block_begin_for_current_state(self) -> None:
+        if not self.camera_sampling_enable:
+            super()._emit_block_begin_for_current_state()
+            return
+        original_warm_next_block_exact = bool(self.warm_next_block_exact)
+        self.warm_next_block_exact = False
+        try:
+            super()._emit_block_begin_for_current_state()
+        finally:
+            self.warm_next_block_exact = original_warm_next_block_exact
+        st = self.current_episode_state
+        if st is None:
+            raise ValueError("TrainSchedulerV9 internal state is not initialized")
+        if not original_warm_next_block_exact:
+            return
+        active_cam_ids = self._active_cam_ids_for_state(st)
+        refs: List[Tuple[int, int]] = []
+        for key in ("source_image_refs", "current_teacher_image_refs", "target_image_refs"):
+            refs.extend((int(ref[0]), int(ref[1])) for ref in list(st.get(key, [])))
+        student_candidates = [int(x) for x in list(st.get("current_v9_student_candidates", []))]
+        if len(student_candidates) > 0:
+            refs.extend(
+                self._frame_targets_to_image_refs_for_cams(
+                    [int(x) for x in student_candidates],
+                    [int(x) for x in active_cam_ids],
+                )
+            )
+        refs = list(dict.fromkeys((int(f), int(c)) for f, c in refs))
+        if len(refs) == 0:
+            refs = self._frame_targets_to_image_refs_for_cams(
+                [int(st.get("current_source_frame_idx", -1))],
+                [int(x) for x in active_cam_ids],
+            )
+            refs = [(int(f), int(c)) for f, c in refs if int(f) >= 0]
+        if len(refs) == 0:
+            return
+        self._emit_preload_hint(
+            scene_id=int(st["scene_id"]),
+            segment_id=int(st["segment_id"]),
+            future_image_refs=refs,
+            hint_scope="next_block_exact",
+            block_idx_global=int(st["block_idx_global"]),
         )
 
     def _sample_teacher_frame(self, *, frames: List[int], fallback_frame: int) -> int:
@@ -283,6 +529,23 @@ class TrainSchedulerV9(TrainSchedulerV8):
                 out.append(float(w))
         return out
 
+    def _active_cam_ids_for_state(self, st: Dict[str, Any]) -> List[int]:
+        cams = [int(x) for x in st.get("active_cam_ids", [])]
+        if len(cams) == 0:
+            num_cams = int(st.get("num_cams", 0))
+            if num_cams <= 0:
+                raise ValueError("current episode has neither active_cam_ids nor valid num_cams")
+            cams = [int(x) for x in range(num_cams)]
+        return cams
+
+    @staticmethod
+    def _frame_targets_to_image_refs_for_cams(target_frames: List[int], cam_ids: List[int]) -> List[Tuple[int, int]]:
+        refs: List[Tuple[int, int]] = []
+        for frame_idx in target_frames:
+            for cam_id in cam_ids:
+                refs.append((int(frame_idx), int(cam_id)))
+        return refs
+
     def _build_v9_target_frames_for_role(
         self,
         *,
@@ -386,7 +649,10 @@ class TrainSchedulerV9(TrainSchedulerV8):
             source_frame=int(source_frame),
             teacher_frame=int(teacher_preserve_frame),
         )
-        num_cams = int(st["num_cams"])
+        active_cam_ids = self._active_cam_ids_for_state(st)
+        num_active_cams = int(len(active_cam_ids))
+        if num_active_cams <= 0:
+            raise ValueError("active_cam_ids must not be empty")
         near_random_frames: List[int] = []
         if self.near_random_enable:
             near_random_frames, num_candidates = self._sample_near_random_frames_for_block(
@@ -416,17 +682,17 @@ class TrainSchedulerV9(TrainSchedulerV8):
                 float(self.near_random_weight),
             )
 
-        source_image_ref = (int(source_frame), 0)
-        source_image_refs = self._frame_targets_to_image_refs(num_cams, [int(source_frame)])
-        teacher_image_refs = self._frame_targets_to_image_refs(num_cams, [int(teacher_frame)])
-        target_image_refs = self._frame_targets_to_image_refs(num_cams, [int(x) for x in target_frames])
+        source_image_ref = (int(source_frame), int(active_cam_ids[0]))
+        source_image_refs = self._frame_targets_to_image_refs_for_cams([int(source_frame)], active_cam_ids)
+        teacher_image_refs = self._frame_targets_to_image_refs_for_cams([int(teacher_frame)], active_cam_ids)
+        target_image_refs = self._frame_targets_to_image_refs_for_cams([int(x) for x in target_frames], active_cam_ids)
         target_image_roles = self._frame_roles_to_image_roles(
-            num_cams=num_cams,
+            num_cams=num_active_cams,
             target_frames=[int(x) for x in target_frames],
             target_frame_roles=[str(x) for x in target_frame_roles],
         )
         target_image_weights = self._frame_weights_to_image_weights(
-            num_cams=num_cams,
+            num_cams=num_active_cams,
             target_frame_weights=[float(x) for x in target_frame_weights],
         )
 
@@ -511,13 +777,16 @@ class TrainSchedulerV9(TrainSchedulerV8):
             raise ValueError(
                 f"target_frames/target_frame_weights mismatch: {len(target_frames)} vs {len(target_frame_weights)}"
             )
+        active_cam_ids = self._active_cam_ids_for_state(st)
+        num_active_cams = int(len(active_cam_ids))
+        active_cam_names = [str(self.camera_names_map.get(int(cam_id), str(cam_id))) for cam_id in active_cam_ids]
         target_image_roles = self._frame_roles_to_image_roles(
-            num_cams=int(st["num_cams"]),
+            num_cams=num_active_cams,
             target_frames=[int(x) for x in target_frames],
             target_frame_roles=[str(x) for x in target_roles],
         )
         target_image_weights = self._frame_weights_to_image_weights(
-            num_cams=int(st["num_cams"]),
+            num_cams=num_active_cams,
             target_frame_weights=[float(x) for x in target_frame_weights],
         )
         if len(target_image_weights) != len(target_image_refs):
@@ -585,6 +854,12 @@ class TrainSchedulerV9(TrainSchedulerV8):
             "scheduler_v9/block_entry_count": float(entry_count_cur),
             "scheduler_v9/block_entry_teacher_count": float(entry_teacher_count_cur),
             "scheduler_v9/force_teacher_on_block_entry": float(1.0 if self.force_teacher_on_block_entry else 0.0),
+            "scheduler_v9/active_num_cams": float(num_active_cams),
+            "camera_sampling/enable": bool(self.camera_sampling_enable),
+            "camera_sampling/active_cam_ids": [int(x) for x in active_cam_ids],
+            "camera_sampling/active_camera_group_idx": int(st.get("active_camera_group_idx", -1)),
+            "camera_sampling/active_num_cams": int(num_active_cams),
+            "camera_sampling/active_cam_names": [str(x) for x in active_cam_names],
         }
 
     def _advance_after_emitting_current_batch_v9(self, st: Dict[str, Any], current_block_idx: int) -> None:
@@ -623,11 +898,14 @@ class TrainSchedulerV9(TrainSchedulerV8):
         info["stage5_5_role"] = str(st.get("current_stage5_5_role", "teacher"))
         info["stage5_5_block_entry_step"] = int(st.get("current_block_entry_step", 0))
         info["stage5_5_force_teacher_on_block_entry"] = bool(self.force_teacher_on_block_entry)
+        info["active_cam_ids"] = [int(x) for x in self._active_cam_ids_for_state(st)]
+        info["active_camera_group_idx"] = int(st.get("active_camera_group_idx", -1))
         info["teacher_frame_idx"] = int(st.get("current_teacher_frame_idx", -1))
         info["student_frame_idx"] = int(st.get("current_student_frame_idx", -1))
         target_frame_weights = [float(x) for x in st.get("current_target_frame_weights", [])]
+        active_cam_ids = self._active_cam_ids_for_state(st)
         target_image_weights = self._frame_weights_to_image_weights(
-            num_cams=int(st.get("num_cams", 0)),
+            num_cams=int(len(active_cam_ids)),
             target_frame_weights=[float(x) for x in target_frame_weights],
         )
         info["target_frame_loss_base_weights"] = [float(x) for x in target_frame_weights]
