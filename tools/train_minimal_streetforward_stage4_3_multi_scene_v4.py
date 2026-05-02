@@ -43,6 +43,7 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from datasets.validation_scheduler_v7 import ValidationEpisodeSpecV7, build_validation_episode_specs_v7
 from models.streetforward.metrics import compute_ssim_loss_masked
 from models.streetforward.minimal_trainer_stage4_3 import MinimalStreetForwardStage4_3, RuntimePolicy
+from tools.streetforward_test_export import save_3dgs_state
 from tools.streetforward_validation_v7_config import ValidationV7Config, parse_validation_v7_config
 from tools.train_minimal_streetforward_stage1_1 import (
     _compute_metrics,
@@ -150,6 +151,116 @@ def _save_train_monitor_triplets(
             view_suffix=vsuf,
             save_error=False,
         )
+
+
+_EXPORT_3DGS_SCENE_TRIGGER_MODES = ("block_end", "raw_step_interval", "episode_end")
+
+
+def _parse_export_3dgs_scene_cfg(
+    cfg: Any, scheduler_steps_per_block: int
+) -> Optional[Dict[str, Any]]:
+    """Parse logging.export_3dgs_scene.
+
+    Returns None when the sub-block is missing or enable=False (zero-IO no-op).
+    Otherwise validates fields fast-fail and returns a dict with keys:
+      enable, interval_blocks, interval_steps, subdir, trigger, include_hidden.
+    """
+    logging_cfg = cfg.get("logging") if hasattr(cfg, "get") else None
+    if logging_cfg is None:
+        return None
+    raw = logging_cfg.get("export_3dgs_scene") if hasattr(logging_cfg, "get") else None
+    if raw is None:
+        return None
+    if not hasattr(raw, "get"):
+        raise ValueError("logging.export_3dgs_scene must be a mapping when present.")
+    if "enable" not in raw:
+        raise ValueError("logging.export_3dgs_scene.enable is required when the sub-block is present.")
+    enable = bool(raw.get("enable"))
+    if not enable:
+        return None
+    if "interval_blocks" not in raw:
+        raise ValueError("logging.export_3dgs_scene.interval_blocks is required when enable=true.")
+    interval_blocks = int(raw.get("interval_blocks"))
+    if interval_blocks < 1:
+        raise ValueError(
+            f"logging.export_3dgs_scene.interval_blocks must be >= 1, got {interval_blocks}"
+        )
+    if "subdir" not in raw:
+        raise ValueError("logging.export_3dgs_scene.subdir is required when enable=true.")
+    subdir = str(raw.get("subdir")).strip()
+    if not subdir:
+        raise ValueError("logging.export_3dgs_scene.subdir must be non-empty.")
+    if "trigger" not in raw:
+        raise ValueError("logging.export_3dgs_scene.trigger is required when enable=true.")
+    trigger = str(raw.get("trigger")).strip()
+    if trigger not in _EXPORT_3DGS_SCENE_TRIGGER_MODES:
+        raise ValueError(
+            "logging.export_3dgs_scene.trigger must be one of "
+            f"{list(_EXPORT_3DGS_SCENE_TRIGGER_MODES)}, got {trigger!r}"
+        )
+    if "include_hidden" not in raw:
+        raise ValueError("logging.export_3dgs_scene.include_hidden is required when enable=true.")
+    include_hidden_raw = raw.get("include_hidden")
+    if not isinstance(include_hidden_raw, bool):
+        raise ValueError(
+            "logging.export_3dgs_scene.include_hidden must be a bool, "
+            f"got {type(include_hidden_raw).__name__}"
+        )
+    steps_per_block = int(scheduler_steps_per_block)
+    if steps_per_block < 1:
+        steps_per_block = 1
+    return {
+        "enable": True,
+        "interval_blocks": int(interval_blocks),
+        "interval_steps": int(interval_blocks * steps_per_block),
+        "subdir": subdir,
+        "trigger": trigger,
+        "include_hidden": bool(include_hidden_raw),
+    }
+
+
+def _save_3dgs_scene_snapshot(
+    *,
+    model: Any,
+    minimal_batch: Dict[str, Any],
+    log_dir: str,
+    subdir: str,
+    block_idx_global: int,
+    step: int,
+    include_hidden: bool,
+) -> None:
+    """Export the current optimized 3DGS scene state and save to log_dir/subdir/."""
+    src_frame = minimal_batch.get("source_frame_idx")
+    if src_frame is None:
+        raise ValueError(
+            "export_3dgs_scene requires minimal_batch['source_frame_idx'] to align rigid branch."
+        )
+    scene_id = int(minimal_batch.get("scene_id", -1))
+    segment_id = int(minimal_batch.get("segment_id", -1))
+    out_dir = os.path.join(str(log_dir), str(subdir))
+    os.makedirs(out_dir, exist_ok=True)
+    fname = (
+        f"scene_{scene_id:03d}_seg_{segment_id:03d}"
+        f"_block_{int(block_idx_global):06d}_step_{int(step):08d}.pt"
+    )
+    out_path = os.path.join(out_dir, fname)
+    save_t0 = time.perf_counter()
+    state = model.export_3dgs_state(
+        minimal_batch,
+        include_hidden=bool(include_hidden),
+        rigid_export_frame_idx=int(src_frame),
+    )
+    save_3dgs_state(out_path, state)
+    save_ms = float((time.perf_counter() - save_t0) * 1000.0)
+    logger.info(
+        "export_3dgs_scene saved: path=%s scene_id=%s segment_id=%s block=%s step=%s elapsed_ms=%.2f",
+        out_path,
+        scene_id,
+        segment_id,
+        int(block_idx_global),
+        int(step),
+        save_ms,
+    )
 
 
 def _build_scheduler_node_sync_v8_fallback(
@@ -1224,6 +1335,16 @@ def main() -> None:
         logger.info(
             "Train image trigger episode_end gate: save when completed_blocks %% interval_blocks_equiv == 0"
         )
+    export_3dgs_scene_cfg = _parse_export_3dgs_scene_cfg(cfg, scheduler_steps_per_block)
+    if export_3dgs_scene_cfg is not None:
+        logger.info(
+            "export_3dgs_scene enabled: trigger=%s interval_blocks=%s interval_steps=%s subdir=%s include_hidden=%s",
+            export_3dgs_scene_cfg["trigger"],
+            int(export_3dgs_scene_cfg["interval_blocks"]),
+            int(export_3dgs_scene_cfg["interval_steps"]),
+            export_3dgs_scene_cfg["subdir"],
+            bool(export_3dgs_scene_cfg["include_hidden"]),
+        )
     low_psnr_train_images_subdir: Optional[str] = None
     if save_train_views_psnr_below is not None:
         if "low_psnr_train_images_subdir" not in cfg.logging:
@@ -1628,6 +1749,24 @@ def main() -> None:
                         scene_id_fallback=scheduler_info.get("scene_id", -1),
                         pixel_camera_ids=pixel_camera_ids,
                     )
+            if (
+                export_3dgs_scene_cfg is not None
+                and export_3dgs_scene_cfg["trigger"] == "raw_step_interval"
+            ):
+                scheduler_global_step_export = int(scheduler_info.get("global_step", step + 1))
+                if (
+                    scheduler_global_step_export > 0
+                    and scheduler_global_step_export % int(export_3dgs_scene_cfg["interval_steps"]) == 0
+                ):
+                    _save_3dgs_scene_snapshot(
+                        model=model,
+                        minimal_batch=minimal_batch,
+                        log_dir=str(cfg.log_dir),
+                        subdir=str(export_3dgs_scene_cfg["subdir"]),
+                        block_idx_global=int(scheduler_info.get("block_idx_global", 0)),
+                        step=int(step),
+                        include_hidden=bool(export_3dgs_scene_cfg["include_hidden"]),
+                    )
             if image_trigger_mode == "episode_end":
                 if any(ev.get("type") == "episode_end" for ev in step_events):
                     completed_blocks = int(scheduler_info.get("block_idx_global", -1)) + 1
@@ -1641,6 +1780,25 @@ def main() -> None:
                             block_idx_global=int(scheduler_info.get("block_idx_global", 0)),
                             scene_id_fallback=scheduler_info.get("scene_id", -1),
                             pixel_camera_ids=pixel_camera_ids,
+                        )
+            if (
+                export_3dgs_scene_cfg is not None
+                and export_3dgs_scene_cfg["trigger"] == "episode_end"
+            ):
+                if any(ev.get("type") == "episode_end" for ev in step_events):
+                    completed_blocks_export = int(scheduler_info.get("block_idx_global", -1)) + 1
+                    if (
+                        completed_blocks_export > 0
+                        and completed_blocks_export % int(export_3dgs_scene_cfg["interval_blocks"]) == 0
+                    ):
+                        _save_3dgs_scene_snapshot(
+                            model=model,
+                            minimal_batch=minimal_batch,
+                            log_dir=str(cfg.log_dir),
+                            subdir=str(export_3dgs_scene_cfg["subdir"]),
+                            block_idx_global=int(scheduler_info.get("block_idx_global", 0)),
+                            step=int(step),
+                            include_hidden=bool(export_3dgs_scene_cfg["include_hidden"]),
                         )
 
             block_end_monitor_ms = 0.0
@@ -1661,6 +1819,23 @@ def main() -> None:
                             block_idx_global=int(block_idx_global),
                             scene_id_fallback=ev.get("scene_id", -1),
                             pixel_camera_ids=pixel_camera_ids,
+                        )
+                if (
+                    export_3dgs_scene_cfg is not None
+                    and export_3dgs_scene_cfg["trigger"] == "block_end"
+                ):
+                    if (
+                        block_idx_global >= 1
+                        and (block_idx_global - 1) % int(export_3dgs_scene_cfg["interval_blocks"]) == 0
+                    ):
+                        _save_3dgs_scene_snapshot(
+                            model=model,
+                            minimal_batch=minimal_batch,
+                            log_dir=str(cfg.log_dir),
+                            subdir=str(export_3dgs_scene_cfg["subdir"]),
+                            block_idx_global=int(block_idx_global),
+                            step=int(step),
+                            include_hidden=bool(export_3dgs_scene_cfg["include_hidden"]),
                         )
 
                 acc = block_loss_accum.pop(int(block_idx_global), None)

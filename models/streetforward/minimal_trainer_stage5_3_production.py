@@ -425,7 +425,7 @@ class MinimalStreetForwardStage5_3_Production(MinimalStreetForwardStage5_3):
         batch = convert_batch_to_minimal_format(
             raw,
             self.device,
-            num_targets=None,
+            num_targets=len(eval_refs),
             include_source_for_2d=True,
         )
 
