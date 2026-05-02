@@ -152,6 +152,7 @@ class TrainSchedulerV10(TrainSchedulerV9):
         meta["scheduler_v10/train_target_num_frames"] = float(len(train_frame_triplets))
         meta["scheduler_v10/probe_target_num_frames"] = float(len(probe_frame_triplets))
         meta["scheduler_v10/live_teacher_bridge_enable"] = float(1.0 if live_bridge_enable else 0.0)
+        meta["scheduler/v10_is_compat_v9"] = 1.0
 
         batch["request_meta"] = meta
 
@@ -186,4 +187,3 @@ class TrainSchedulerV10(TrainSchedulerV9):
         out = dict(super().get_current_info())
         out["scheduler_version"] = "v10"
         return out
-

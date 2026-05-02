@@ -1,19 +1,174 @@
-# Stage6_0 multi-scene config skeleton for V10 scheduler.
-# This config focuses on Stage6_0 semantic boundaries and fast-fail keys.
-
+# Stage6_0 多场景 + TrainScheduler V10；本文件自包含，勿再使用 base_config_file 叠加。
+output_name: experiment002_60w_40w_12block_base_on_001
+data:
+  data_root: /root/autodl-tmp/nuScenes/
+  dataset: nuscenes
+  start_timestep: 0
+  end_timestep: -1
+  preload_device: cpu
+  sky_mask_semantics: one_is_sky
+  train_scene_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9,14, 16, 24, 32, 40, 99, 107, 115, 123, 131, 139, 147, 155, 163, 171, 179, 195, 214,
+    17, 25, 33, 41, 49, 100, 108, 116, 124, 132, 140, 148, 156, 164, 172, 180, 188, 196, 215,
+    10, 18, 26, 34, 42, 93, 101, 109, 117, 125, 133, 141, 149, 157, 165, 173, 181, 189, 197, 216,
+    11, 19, 27, 35, 43, 94, 102, 110, 118, 126, 134, 142, 150, 158, 166, 174, 182, 190, 198, 217,
+    12, 20, 36, 44, 95, 103, 111, 119, 127, 135, 143, 151, 159, 167, 175, 183, 191, 199, 218,
+    13, 21, 29, 37, 45, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200,
+    22, 30, 38, 46, 97, 105, 113, 121, 129, 137, 145, 153, 161, 169, 177, 185, 193, 201,
+    15, 23, 31, 39, 47, 98, 106, 114, 122, 130, 138, 146, 154, 162, 170, 178, 186, 194]
+  eval_scene_ids: []
+  preload:
+    enable: true
+    num_workers: 1
+    max_pending_tasks: 64
+    dedupe_tasks: true
+    drop_stale_hints: true
+    warm_scene_meta: true
+    warm_segment_static: true
+    warm_next_block_exact: true
+    warm_test_refs: false
+    warm_episode_source_superset: true
+    enable_view_pack_cache: true
+    stats_log_interval_steps: 0
+  pixel_source:
+    type: datasets.nuscenes.nuscenes_sourceloader.NuScenesPixelSource
+    cameras: [0, 1, 2]
+    downscale_when_loading: [3, 3, 3]
+    downscale: 1
+    undistort: false
+    load_sky_mask: true
+    load_dynamic_mask: true
+    load_egocar_mask: true
+    load_depth_maps: true
+    load_objects: true
+    load_smpl: false
+    sampler:
+      buffer_downscale: 8
+      buffer_ratio: 0.5
+      start_enhance_weight: 3
+  lidar_source:
+    type: datasets.nuscenes.nuscenes_sourceloader.NuScenesLiDARSource
+    load_lidar: true
+    lidar_downsample_factor: 1
+    lidar_percentile: 0.02
+  assets:
+    root: /root/autodl-tmp/streetforward_assets_pt60w_40w
+  scene_asset_cache_max_items: 64
+  segment_static_cache_max_items: 128
+  image_meta_cache_max_items: 8192
+  view_pack_cache_max_items: 4096
+dataset:
+  num_source_keyframes: 1
+  num_target_keyframes: 3
+  segment_overlap_ratio: 0.2
+  min_keyframes_per_scene: 2
+  min_keyframes_per_segment: 2
+  preload_scene_count: 2
+  keyframe_split_config:
+    num_splits: 0
+    min_count: 1
+    min_length: 3.0
+  segment_aabb: [[-20.0, -10.0, -20.0], [20.0, 4.8, 40.0]]
+  pointcloud:
+    type: hybrid
+    lidar_sparsity: full
+    monocular_chosen_cam_ids: [0, 1, 2, 3, 4, 5]
+    monocular_sparsity: full
+    monocular_filter_sky: true
+    monocular_depth_consistency: false
+    monocular_downscale: 1
+    monocular_dynamic_recovery_bbox_expand_xyz_m: [0.5, 0.2, 0.5]
+    monocular_dynamic_recovery_max_points_per_instance: 20000
+    near_max_points: 600000
+    distant_max_points: 400000
+    static_instance_motion:
+      enable: true
+      traj_length_thresh_m: 0.5
+scheduler_v8:
+  enable: true
+  block:
+    steps_per_block: 12
+  episode:
+    blocks_per_episode: 5
+    total_target_frames: 3
+    include_source_frame: true
+    target_policy: visited_episode_frames
+    block_source_frame_policy: fixed_once_per_episode
+    frame_within_keyframe_policy: random_once_per_episode
+    min_keyframes_required_policy: skip_if_less_than_window
+  traversal:
+    mode: round_robin_episode_interleave
+    switch_after_episode: true
+    fixed_scene_id: null
+    fixed_segment_id: null
+    segment_order: ascending
+    scene_order: shuffle_per_epoch
+  execution:
+    block_order: step_major
+    step_major_switch_interval_steps: 4
+    reset_policy: episode_end
+  preload:
+    emit_hints: true
+    warm_next_block_exact: true
+    warm_next_episode_chain: true
+  near_random_supervision:
+    enable: true
+    frames_per_block: 2
+    same_keyframe_only: true
+    insufficient_policy: skip
+    add_to_source_image_refs: false
+    add_to_history_record_views: false
+    sample_once_per_block: false
+    exclude_source_frame: true
+    exclude_existing_target_frames: true
+    camera_policy: all_cams
+    role_name: near_random
+validation_v8:
+  eval_enable: false
+  mode: inference_only
+  block:
+    steps_per_block: 16
+  episode:
+    blocks_per_episode: 5
+    total_target_frames: 3
+    target_policy: visited_episode_frames
+  execution:
+    block_order: step_major
+    step_major_switch_interval_steps: 4
+    reset_policy: episode_end
+  trigger:
+    by: train_episode_interval
+    validate_every_n_episodes: 100
+    run_at_train_start: false
+  episode_selection:
+    policy: middle
+  render:
+    save_images: true
+    save_dir: validation/episodes
+  cache:
+    persist_across_training: true
+  metrics:
+    use_sky_mask_regions: true
+    min_valid_pixels_per_region: 32
+    require_sky_mask: true
+  near_random_supervision:
+    enable: false
 model:
-  stage: "6_0"
+  stage: '6_0'
   production_training: false
-  backprojector_version: "v4"
-  # Keep Stage5_4-required model fields when running full training.
-  # The reduced skeleton below is for Stage6_0 wiring checks.
+  backprojector_version: v4
+  scale_init_value: 0.1
+  sh_degree: 1
+  voxel_size: 0.2
+  sparseConv_outdim: 32
   feat_2d_channels: 32
+  feat_2d_downscale: 1
   feature_extractor:
     type: dinov2_unet_fusion
     dino:
       model_name: vit_base_patch14_reg4_dinov2
       pretrained: true
       freeze: true
+      weights_path: null
       out_channels: 32
       intermediate_layers: [4, 8, 11]
       pad_to_patch_multiple: 14
@@ -27,6 +182,66 @@ model:
     fusion:
       hidden_channels: 64
       out_channels: 32
+  use_fused_cuda_backproject_v2: true
+  use_fused_cuda_backproject_v3: true
+  use_fused_cuda_backproject_v4: true
+  fused_cuda_backproject_v4_force_fallback: false
+  param_embed_dim: 48
+  offset_gru_hidden_dim: 48
+  offset_gru_use_reset_gate: true
+  rigid_routed:
+    route_space: source_frame_world
+    route_aabb: segment_aabb
+    inside_decoder: bg
+    outside_decoder: distant
+    update_means: true
+    update_quat: true
+  struct_decoder:
+    enable: true
+    type: routed_near_far
+    scope: full_routed
+    output_role: gru_input
+    point_preserving: true
+    include_bg: true
+    include_distant: true
+    include_rigid_in: true
+    include_rigid_out: true
+    feat_2d_channels: 32
+    param_embed_dim: 32
+    branch_embed_dim: 8
+    support_embed_dim: 8
+    history_embed_dim: 16
+    token:
+      use_2d_feat: true
+      use_support: true
+      use_branch_embed: true
+      use_param_embed: true
+      use_anchor_rgb: false
+      use_hidden_state: false
+      zero_invalid_2d_feat: true
+    near:
+      type: xcpe
+      branches: [bg, rigid_in]
+      channels: 64
+      voxel_size: 0.2
+      sparse_backend: spconv
+      clamp_grid_coord: false
+      xcpe:
+        num_layers: 2
+        kernel_size: 3
+        residual_scale_init: 0.005
+        norm: layernorm
+        act: gelu
+    far:
+      type: mlp
+      branches: [distant, rigid_out]
+      channels: 64
+      hidden_dim: 64
+      num_layers: 2
+      norm: layernorm
+      act: gelu
+      history_embed:
+        enable: false
   history_memory:
     enable: true
     record_on: block_exit
@@ -39,30 +254,317 @@ model:
     residual:
       fast_error_beta: 0.8
       slow_error_beta: 0.98
-      error_eps: 1.0e-6
+      error_eps: 1.0e-06
     update:
       fast_ema_beta: 0.8
       slow_ema_beta: 0.98
       apply_in_eval: false
-
+  view_transient:
+    enable: true
+    source: ego_to_point
+    input_to_gate: true
+    input_to_struct_decoder: false
+    use_delta_xyz: true
+    use_delta_norm: true
+    use_angle_delta: false
+    use_initialized_flag: false
+    detach: true
+    update_in_train: true
+    update_in_eval: true
+  update_gate:
+    enable: true
+    type: attribute_5
+    hidden_dim: 64
+    require_initialized_in_input: true
+    include_visible_now: true
+    bind_with_mask_update: true
+    min_gate:
+      means: 0.03
+      scales: 0.03
+      quat: 0.01
+      opacity: 0.05
+      sh: 0.05
+    init_bias:
+      means: -1.4
+      scales: -1.7
+      quat: -2.0
+      opacity: -0.4
+      sh: 0.4
+    branch_bias:
+      bg:
+        means: 0.0
+        scales: 0.0
+        quat: -0.2
+        opacity: 0.0
+        sh: 0.1
+      distant:
+        means: -1.0
+        scales: -0.3
+        quat: -1.0
+        opacity: 0.0
+        sh: 0.0
+      rigid_in:
+        means: -0.2
+        scales: -0.2
+        quat: -0.3
+        opacity: 0.1
+        sh: 0.2
+      rigid_out:
+        means: -0.8
+        scales: -0.3
+        quat: -0.8
+        opacity: 0.0
+        sh: 0.0
+    hidden_gate:
+      mode: weighted_sum
+      weights:
+        means: 0.2
+        scales: 0.0
+        quat: 0.0
+        opacity: 0.3
+        sh: 0.5
+  branches:
+    bg:
+      src_backproject_support_min: 0.01
+      enable_selective_update: false
+      freeze_means: false
+      init:
+        scale_init:
+          mode: knn
+          isotropic_log_value: -2.3
+          knn_k: 8
+          knn_log_scale_bias: -1.5
+        opacity_init: 0.1
+      limits:
+        offset_max: 0.1
+        scale_max: 0.1
+        omega_max: 0.1
+        opacity_max: 0.15
+        sh_dc_max: 0.15
+        sh_rest_max: 0.08
+      eta:
+        means: 1.0
+        scales: 1.0
+        opacity: 1.0
+        sh_dc: 1.0
+        sh_rest: 1.0
+      mlp:
+        hidden_dim: 64
+        use_3d_feat: true
+        use_2d_feat: true
+    distant:
+      src_backproject_support_min: 0.01
+      enable_selective_update: false
+      freeze_means: true
+      init:
+        scale_init:
+          mode: isotropic
+          isotropic_log_value: -1.7
+          knn_k: 8
+          knn_log_scale_bias: -1.2
+        opacity_init: 0.05
+      limits:
+        offset_max: 0.02
+        scale_max: 0.08
+        omega_max: 0.01
+        opacity_max: 0.08
+        sh_dc_max: 0.12
+        sh_rest_max: 0.03
+      eta:
+        means: 0.2
+        scales: 0.7
+        opacity: 0.8
+        sh_dc: 1.0
+        sh_rest: 0.6
+      mlp:
+        hidden_dim: 64
+        use_3d_feat: false
+        use_2d_feat: true
+        freeze_quat: true
+    rigid:
+      src_backproject_support_min: 0.01
+      init:
+        scale_init:
+          mode: knn
+          isotropic_log_value: -2.9
+          knn_k: 8
+          knn_log_scale_bias: -1.5
+        opacity_init: 0.2
+      eta:
+        means: 0.5
+        scales: 0.8
+        opacity: 1.0
+        sh_dc: 1.0
+        sh_rest: 0.6
 current_observation:
   enable: true
   dim: 2
   rho_source: feature
-  eps: 1.0e-6
+  eps: 1.0e-06
   input_to_struct_decoder: true
   input_to_far_mlp: true
   input_to_gru: true
   input_to_history_gate: true
   record_to_history_memory: false
-
-# Compatibility keys required by Stage5_3 validation path.
-scheduler_v8:
-  episode:
-    target_policy: visited_episode_frames
-  execution:
-    reset_policy: episode_end
-
+  debug:
+    log_stats: true
+    log_interval_steps: 50
+training_recipe:
+  name: stage5_4_adamw_warmcos_v1
+losses:
+  photometric:
+    exclude_sky_region: true
+  rgb:
+    w: 1.0
+  ssim:
+    w: 0.05
+  mask:
+    w: 0.02
+    opacity_loss_type: bce
+    require_sky_mask: true
+  opacity_entropy:
+    w: 0.0
+  target_view_weights:
+    enable: true
+    normalize_by_weight_sum: true
+    source:
+      weight: 1.0
+    visited:
+      weight: 0.7
+    near_random:
+      weight: 0.7
+      schedule:
+        enable: false
+        type: warmup_linear
+        start_weight: 0.3
+        end_weight: 0.5
+        warmup_steps: 20000
+  stage6_0:
+    normalize_by_domain: true
+    self:
+      teacher_source_weight: 0.2
+      student_source_weight: 1.0
+    teacher_anchor:
+      enable: true
+      weight: 0.1
+      role_name: teacher_anchor
+      max_frames: 1
+    history:
+      enable: true
+      visited_weight: 0.1
+      max_targets: 2
+      exclude_near: true
+      exclude_teacher_anchor: true
+    probe:
+      near:
+        enable: true
+        loss_weight: 0.0
+        log_only: true
+optimizer:
+  type: adamw
+  lr: 0.0001
+  betas: [0.9, 0.95]
+  eps: 1.0e-08
+  weight_decay: 0.0001
+  filter_frozen: true
+  no_weight_decay:
+    enable: true
+    name_keywords: [".bias", "bias", "norm", "Norm", "ln", "LayerNorm", "embedding", "Embedding"]
+    ndim_leq: 1
+  groups:
+    dino:
+      match:
+        prefixes: [image_feature_extractor.dino_adapter.backbone]
+      lr: 0.0
+      weight_decay: 0.0
+    residual_unet:
+      match:
+        prefixes: [image_feature_extractor.residual, image_feature_extractor.residual_unet]
+      lr: 0.0001
+      weight_decay: 0.0001
+    fusion_neck:
+      match:
+        prefixes: [image_feature_extractor.fusion, image_feature_extractor.fusion_neck]
+      lr: 0.00015
+      weight_decay: 0.0001
+    struct_near_xcpe:
+      match:
+        prefixes: [struct_decoder.near_decoder]
+      lr: 0.00015
+      weight_decay: 0.0001
+    struct_far_mlp:
+      match:
+        prefixes: [struct_decoder.far_decoder]
+      lr: 0.0001
+      weight_decay: 0.0001
+    gate_history:
+      match:
+        prefixes: [stage5_2_history_proj, stage5_2_gate_branch_embed, stage5_2_gate_mlp]
+      lr: 5.0e-05
+      weight_decay: 0.0
+    recurrent_update:
+      match:
+        contains: [offset_gru, mlp_offset, mlp_conv, mlp_opacity, gaussion_decoder, gaussian_decoder]
+      lr: 8.0e-05
+      weight_decay: 5.0e-05
+    default:
+      lr: 0.0001
+      weight_decay: 0.0001
+lr_scheduler:
+  enable: true
+  type: cosine
+  interval: step
+  total_steps: ${training.max_iterations}
+  min_lr_ratio: 0.05
+training:
+  max_iterations: 3000010
+  log_interval: 100
+  save_checkpoint_freq: 10000
+  seed: 41
+  amp:
+    enable: false
+    dtype: fp16
+  grad_clip:
+    enable: true
+    max_norm: 1.0
+    norm_type: 2.0
+  bad_step:
+    policy: fast_fail
+    fail_on_nonfinite_loss: true
+    fail_on_nonfinite_grad: true
+    fail_on_amp_overflow: false
+    fail_on_grad_norm_gt: 100.0
+eval:
+  enable_psnr: true
+  save_train_views_psnr_below: null
+  run_test_at_end: false
+logging:
+  output_root: /root/autodl-tmp/outputs
+  project: minimal_sf_stage6_0_multi_scene_v10
+  log_dir: null
+  image_interval_blocks: 300
+  train_monitor:
+    enable_heavy_metrics: false
+    include_per_view_metrics: true
+    include_extra_result_metrics: false
+    enable_low_psnr_image_dump: false
+  low_psnr_train_images_subdir: train_low_psnr
+  enable_jsonl_metrics: true
+  metrics_history_append: false
+  use_tensorboard: true
+  offset_monitor:
+    enable: false
+    near_radius_m: 5.0
+    saturation_tanh_threshold: 0.95
+  diagnostics:
+    enable: false
+    interval: 500
+    window_size: 50
+    save_branch_renders: false
+  performance:
+    enable: false
+    phase_timing: false
+    cuda_memory: false
 scheduler_v10:
   enable: true
   block:
@@ -121,7 +623,6 @@ scheduler_v10:
     loss_weight: 0.0
   camera_sampling:
     enable: false
-
 stage6_0:
   enable: true
   phase: default
@@ -129,6 +630,7 @@ stage6_0:
     dim: 32
     confidence_norm: 1.0
   student:
+    input_history_context: false
     student_extractor:
       base_channels: 64
       use_confidence: true
@@ -140,7 +642,7 @@ stage6_0:
       mask_render_rgb: true
       mask_teacher_prior: true
       mask_prior_conf: true
-      mask_history_context: true
+      mask_history_context: false
       zero_invalid_output: true
   bridge:
     live:
@@ -149,33 +651,12 @@ stage6_0:
       student_loss_to_teacher_prior_adapter: true
       student_loss_to_teacher_backbone: false
       student_loss_to_teacher_dino: false
+      detach_geometry: true
+      detach_opacity: true
+      require_on_student: true
     cache:
       enable: true
       detach_write: true
       detach_read: true
       reset_on: episode_begin
       fallback_when_live_missing: true
-
-losses:
-  stage6_0:
-    normalize_by_domain: true
-    self:
-      teacher_weight: 0.2
-      student_weight: 1.0
-    teacher_anchor:
-      enable: true
-      weight: 0.1
-      role_name: teacher_anchor
-      max_frames: 1
-    history:
-      enable: true
-      visited_weight: 0.1
-      max_targets: 2
-      exclude_near: true
-      exclude_teacher_anchor: true
-    probe:
-      near:
-        enable: true
-        loss_weight: 0.0
-        log_only: true
-

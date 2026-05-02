@@ -84,7 +84,7 @@ def test_v10_emits_structured_request_and_new_roles() -> None:
     assert "live_teacher_bridge" in req
     assert "train_targets" in req
     assert "probe_targets" in req
+    assert meta["scheduler/v10_is_compat_v9"] == 1.0
     roles = [str(x) for x in meta.get("target_frame_roles", [])]
     assert "teacher_preserve" not in roles
     assert "teacher_anchor" in roles or "teacher_source" in roles
-

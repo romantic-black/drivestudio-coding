@@ -44,6 +44,25 @@ except ImportError:
 logger = logging.getLogger(__name__)
 current_time = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
 
+
+def _load_config_with_optional_base(config_file: str):
+    cfg = OmegaConf.load(config_file)
+    base_config_file = cfg.get("base_config_file")
+    if base_config_file is None:
+        return cfg
+    base_path = str(base_config_file)
+    if not os.path.isabs(base_path):
+        config_dir = os.path.dirname(os.path.abspath(config_file))
+        candidates = [
+            base_path,
+            os.path.join(config_dir, base_path),
+            os.path.join(config_dir, os.path.basename(base_path)),
+        ]
+        base_path = next((p for p in candidates if os.path.exists(p)), candidates[0])
+    base_cfg = OmegaConf.load(base_path)
+    return OmegaConf.merge(base_cfg, cfg)
+
+
 # Checkpoint filename prefix for Stage 1.1
 CKPT_PREFIX = "minimal_sf_stage1_1"
 
@@ -490,7 +509,7 @@ def convert_batch_to_minimal_format(
 
 
 def setup(args: argparse.Namespace):
-    cfg = OmegaConf.load(args.config_file)
+    cfg = _load_config_with_optional_base(args.config_file)
     if getattr(args, "opts", None):
         cli = OmegaConf.from_cli(args.opts)
         cfg = OmegaConf.merge(cfg, cli)
