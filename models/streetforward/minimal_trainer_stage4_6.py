@@ -721,12 +721,24 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
         with torch.no_grad():
             if U.numel() == 0:
                 return
-            node_state_rigid.means[U] = render_params_rigid_local_U["means_r"].detach()
-            node_state_rigid.scales_log[U] = render_params_rigid_local_U["scales_log_r"].detach()
-            node_state_rigid.quats[U] = render_params_rigid_local_U["quats_r"].detach()
-            node_state_rigid.opacity_logit[U] = render_params_rigid_local_U["opacity_logit_r"].detach()
-            node_state_rigid.sh_dc[U] = render_params_rigid_local_U["sh_dc_r"].detach()
-            node_state_rigid.sh_rest[U] = render_params_rigid_local_U["sh_rest_r"].detach()
+            node_state_rigid.means[U] = render_params_rigid_local_U["means_r"].detach().to(
+                device=node_state_rigid.means.device, dtype=node_state_rigid.means.dtype
+            )
+            node_state_rigid.scales_log[U] = render_params_rigid_local_U["scales_log_r"].detach().to(
+                device=node_state_rigid.scales_log.device, dtype=node_state_rigid.scales_log.dtype
+            )
+            node_state_rigid.quats[U] = render_params_rigid_local_U["quats_r"].detach().to(
+                device=node_state_rigid.quats.device, dtype=node_state_rigid.quats.dtype
+            )
+            node_state_rigid.opacity_logit[U] = render_params_rigid_local_U["opacity_logit_r"].detach().to(
+                device=node_state_rigid.opacity_logit.device, dtype=node_state_rigid.opacity_logit.dtype
+            )
+            node_state_rigid.sh_dc[U] = render_params_rigid_local_U["sh_dc_r"].detach().to(
+                device=node_state_rigid.sh_dc.device, dtype=node_state_rigid.sh_dc.dtype
+            )
+            node_state_rigid.sh_rest[U] = render_params_rigid_local_U["sh_rest_r"].detach().to(
+                device=node_state_rigid.sh_rest.device, dtype=node_state_rigid.sh_rest.dtype
+            )
 
     @staticmethod
     def _pack_rigid_local_subsets(

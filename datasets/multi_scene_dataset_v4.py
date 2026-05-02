@@ -1372,9 +1372,9 @@ class MultiSceneDatasetV4:
         return t.to(device=self.device)
 
     def _load_mask_from_asset_path(self, path_str: str, height: int, width: int) -> Tensor:
-        arr = np.asarray(Image.open(path_str))
+        arr = np.array(Image.open(path_str), copy=True)
         if arr.ndim == 3:
-            arr = arr[..., 0]
+            arr = arr[..., 0].copy()
         mask = torch.as_tensor(arr, dtype=torch.float32)
         if mask.shape[0] != int(height) or mask.shape[1] != int(width):
             mask = self._resize_2d_tensor_to_hw(mask, int(height), int(width), mode="nearest")

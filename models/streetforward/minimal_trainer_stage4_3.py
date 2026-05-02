@@ -639,13 +639,23 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
                 render_params["means_r"][valid_idx].detach(),
                 min=self.bbx_min,
                 max=self.bbx_max,
-            )
+            ).to(device=node_state_bg.means.device, dtype=node_state_bg.means.dtype)
             node_state_bg.means[valid_idx] = means_clamped
-            node_state_bg.scales_log[valid_idx] = render_params["scales_log_r"][valid_idx].detach()
-            node_state_bg.quats[valid_idx] = render_params["quats_r"][valid_idx].detach()
-            node_state_bg.opacity_logit[valid_idx] = render_params["opacity_logit_r"][valid_idx].detach()
-            node_state_bg.sh_dc[valid_idx] = render_params["sh_dc_r"][valid_idx].detach()
-            node_state_bg.sh_rest[valid_idx] = render_params["sh_rest_r"][valid_idx].detach()
+            node_state_bg.scales_log[valid_idx] = render_params["scales_log_r"][valid_idx].detach().to(
+                device=node_state_bg.scales_log.device, dtype=node_state_bg.scales_log.dtype
+            )
+            node_state_bg.quats[valid_idx] = render_params["quats_r"][valid_idx].detach().to(
+                device=node_state_bg.quats.device, dtype=node_state_bg.quats.dtype
+            )
+            node_state_bg.opacity_logit[valid_idx] = render_params["opacity_logit_r"][valid_idx].detach().to(
+                device=node_state_bg.opacity_logit.device, dtype=node_state_bg.opacity_logit.dtype
+            )
+            node_state_bg.sh_dc[valid_idx] = render_params["sh_dc_r"][valid_idx].detach().to(
+                device=node_state_bg.sh_dc.device, dtype=node_state_bg.sh_dc.dtype
+            )
+            node_state_bg.sh_rest[valid_idx] = render_params["sh_rest_r"][valid_idx].detach().to(
+                device=node_state_bg.sh_rest.device, dtype=node_state_bg.sh_rest.dtype
+            )
 
     def _update_node_state_distant_subset(
         self,
@@ -659,12 +669,24 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
             # Distant Gaussians are far-field / segment-exterior by design; do not clamp means to
             # dataset.segment_aabb (input_aabb_*). Clamping collapsed visible distant points onto the
             # AABB shell and destroyed frustum overlap after the first scheduler writeback.
-            node_state_distant.means[valid_idx] = render_params["means_r"][valid_idx].detach()
-            node_state_distant.scales_log[valid_idx] = render_params["scales_log_r"][valid_idx].detach()
-            node_state_distant.quats[valid_idx] = render_params["quats_r"][valid_idx].detach()
-            node_state_distant.opacity_logit[valid_idx] = render_params["opacity_logit_r"][valid_idx].detach()
-            node_state_distant.sh_dc[valid_idx] = render_params["sh_dc_r"][valid_idx].detach()
-            node_state_distant.sh_rest[valid_idx] = render_params["sh_rest_r"][valid_idx].detach()
+            node_state_distant.means[valid_idx] = render_params["means_r"][valid_idx].detach().to(
+                device=node_state_distant.means.device, dtype=node_state_distant.means.dtype
+            )
+            node_state_distant.scales_log[valid_idx] = render_params["scales_log_r"][valid_idx].detach().to(
+                device=node_state_distant.scales_log.device, dtype=node_state_distant.scales_log.dtype
+            )
+            node_state_distant.quats[valid_idx] = render_params["quats_r"][valid_idx].detach().to(
+                device=node_state_distant.quats.device, dtype=node_state_distant.quats.dtype
+            )
+            node_state_distant.opacity_logit[valid_idx] = render_params["opacity_logit_r"][valid_idx].detach().to(
+                device=node_state_distant.opacity_logit.device, dtype=node_state_distant.opacity_logit.dtype
+            )
+            node_state_distant.sh_dc[valid_idx] = render_params["sh_dc_r"][valid_idx].detach().to(
+                device=node_state_distant.sh_dc.device, dtype=node_state_distant.sh_dc.dtype
+            )
+            node_state_distant.sh_rest[valid_idx] = render_params["sh_rest_r"][valid_idx].detach().to(
+                device=node_state_distant.sh_rest.device, dtype=node_state_distant.sh_rest.dtype
+            )
 
     def forward(self, batch: Dict) -> Dict[str, Any]:
         targets = batch["targets"]

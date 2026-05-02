@@ -20,7 +20,7 @@ from streetforward_eval.protocols import protocol_from_dict, validate_protocol
 from streetforward_eval.runner import RunnerRuntimeConfig, StreetForwardBatchEvalRunner
 from streetforward_eval.snapshot_writer import RenderSaveConfig, SnapshotWriter
 from streetforward_eval.summary import build_summary_rows, write_summary_csv
-from tools.train_minimal_streetforward_stage4_3_v8_common import build_multi_scene_dataset_v4
+from tools.train_minimal_streetforward_stage4_3_v8_common import build_multi_scene_dataset_v4_for_demo
 
 logger = logging.getLogger("streetforward_batcheval")
 
@@ -139,6 +139,23 @@ def _collect_episode_scene_ids(cfg: Any) -> List[int]:
     if len(scene_ids) == 0:
         raise ValueError("batch_eval.dataset.scene_ids must be non-empty list[int]")
     return [int(x) for x in scene_ids]
+
+
+def _scope_dataset_to_batch_eval_scene_ids(cfg: Any) -> None:
+    scene_ids = _collect_episode_scene_ids(cfg)
+    data_mode = str(cfg.batch_eval.get("data_mode", "segment_finetune_train")).strip()
+    if data_mode != "segment_finetune_train":
+        raise ValueError(
+            f"unsupported batch_eval.data_mode={data_mode!r}; "
+            "MultiSceneDatasetV4 batch eval currently uses segment_finetune_train assets."
+        )
+    if cfg.get("data") is None:
+        raise ValueError("config.data is required")
+    cfg.data.train_scene_ids = list(scene_ids)
+    logger.info(
+        "scoped dataset data.train_scene_ids to batch_eval.dataset.scene_ids: %s",
+        scene_ids,
+    )
 
 
 def _resolve_output_root(cfg: Any, args: argparse.Namespace) -> Path:
@@ -261,6 +278,14 @@ def _run_one_experiment(
         final_iter = max(int(r["global_iter"]) for r in rows)
         final_rows.extend([r for r in rows if int(r["global_iter"]) == int(final_iter)])
     write_summary_csv(exp_dir / "summary.csv", build_summary_rows(final_rows))
+    logger.info(
+        "experiment=%s wrote outputs to %s (metrics_iter=%s summary=%s final_views=%d)",
+        protocol.name,
+        exp_dir,
+        exp_dir / "metrics_iter.csv",
+        exp_dir / "summary.csv",
+        int(len(final_rows)),
+    )
 
 
 def main() -> None:
@@ -281,7 +306,8 @@ def main() -> None:
         raise ValueError("batch_eval.enable must be true")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dataset = build_multi_scene_dataset_v4(cfg, device)
+    _scope_dataset_to_batch_eval_scene_ids(cfg)
+    dataset = build_multi_scene_dataset_v4_for_demo(cfg, device)
     dataset.initialize()
 
     model = _build_model(cfg, device)

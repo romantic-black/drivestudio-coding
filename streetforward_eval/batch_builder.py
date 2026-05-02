@@ -98,6 +98,6 @@ def build_update_batch_from_refs(
     return convert_batch_to_minimal_format(
         raw,
         device=device,
-        num_targets=None,
+        num_targets=len(update_target_image_refs),
         include_source_for_2d=True,
     )

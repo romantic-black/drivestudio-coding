@@ -2,7 +2,7 @@ base_config_file: configs/minimal_streetforward_stage5_4_production_multi_scene_
 
 batch_eval:
   enable: true
-  output_dir: outputs/batch_eval
+  output_dir: /root/autodl-tmp/outputs/batch_eval_cam0
   data_mode: segment_finetune_train
 
   checkpoint:
@@ -10,7 +10,7 @@ batch_eval:
     strict: true
 
   dataset:
-    scene_ids: ${data.eval_scene_ids}
+    scene_ids: [8, 9,14, 16, 24, 32, 40, 99, 107, 115, 123,]
     segment_policy: all
     require_full_window: true
     stride: 20
@@ -19,12 +19,12 @@ batch_eval:
     window_policy: sliding
 
   cameras:
-    ids: [0, 1, 2]
-    names: ["front_left", "front", "front_right"]
+    ids: [0]
+    names: ["front"]
 
   runtime:
     no_grad: true
-    amp: true
+    amp: false
     reset_state_per_episode: true
     update_node_state: true
     update_hidden_state: true
