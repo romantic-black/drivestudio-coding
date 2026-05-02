@@ -52,7 +52,6 @@ def test_v10_emits_structured_request_and_new_roles() -> None:
         dataset=ds,
         steps_per_block=2,
         blocks_per_episode=3,
-        total_target_frames=3,
         include_source_frame=True,
         frame_within_keyframe_policy="middle_frame",
         min_keyframes_required_policy="skip_if_less_than_window",
@@ -68,23 +67,31 @@ def test_v10_emits_structured_request_and_new_roles() -> None:
         warm_next_episode_chain=False,
         block_order="step_major",
         step_major_switch_interval_steps=1,
-        target_policy="visited_episode_frames",
-        reset_policy="episode_end",
-        near_random_supervision_cfg={"enable": True, "frames_per_block": 1, "same_keyframe_only": True, "insufficient_policy": "skip", "role_name": "probe_near"},
-        role_sampling_cfg={"first_step_role": "teacher", "teacher_prob": 0.4, "student_prob": 0.6, "teacher_resample_policy": "fixed_per_block"},
-        targets_cfg={"weights": {"teacher_source": 1.0, "student_source": 1.0, "teacher_preserve": 0.1, "visited": 0.2, "near_random": 0.0}},
-        history_record_cfg={"observed": {"trigger": "teacher_exit", "record_on_block_exit": False}, "runtime": {"trigger": "step_exit"}},
-        camera_sampling_cfg={},
+        frame_selection_cfg={
+            "teacher_frame_policy": "random_within_keyframe",
+            "student_cycle_policy": "cycle",
+            "skip_student_if_single_source": True,
+            "fallback_step_type_if_no_student": "teacher_bootstrap",
+            "fallback_step_type_if_no_committed_history": "student_self",
+        },
+        step_program_cfg={"mode": "fixed_cycle", "sequence": ["teacher_bootstrap", "student_self"]},
+        supervision_cfg={
+            "probe_near": {"enable": True, "frames_per_block": 1},
+            "history_visited": {"max_targets": 1, "sampling_policy": "most_recent"},
+        },
+        history_record_cfg={"observed": {"trigger": "teacher_update_exit"}, "runtime": {"trigger": "every_state_update_exit"}},
+        bridge_cfg={"student_steps_use_live_bridge": True},
+        probe_cfg={"enable": True, "frames_per_block": 1, "same_keyframe_only": True},
     )
     batch = sch.next_batch()
     meta = batch["request_meta"]
     assert str(meta["scheduler_version"]) == "v10"
-    assert "scheduler_request_v10" in meta
+    assert "teacher_obs" in meta
+    assert "student_prop" in meta
+    assert "supervision" in meta
     req = meta["scheduler_request_v10"]
-    assert "live_teacher_bridge" in req
-    assert "train_targets" in req
-    assert "probe_targets" in req
-    assert meta["scheduler/v10_is_compat_v9"] == 1.0
+    assert "live_teacher_bridge" in req  # compat block still present
+    assert meta["scheduler/v10_is_compat_v9"] == 0.0
     roles = [str(x) for x in meta.get("target_frame_roles", [])]
     assert "teacher_preserve" not in roles
     assert "teacher_anchor" in roles or "teacher_source" in roles

@@ -7,7 +7,7 @@ from models.streetforward.minimal_trainer_stage6_0 import MinimalStreetForwardSt
 
 def _base_cfg():
     return {
-        "scheduler_v10": {"enable": True, "targets": {"weights": {"probe_near": 0.0}}},
+        "scheduler_v10": {"enable": True},
         "stage6_0": {
             "enable": True,
             "phase": "default",
@@ -24,7 +24,13 @@ def _base_cfg():
                 "cache": {"detach_write": True},
             },
         },
-        "losses": {"stage6_0": {"probe": {"near": {"loss_weight": 0.0}}}},
+        "losses": {
+            "target_view_weights": {"enable": False},
+            "stage6_0": {
+                "self": {"teacher_source_weight": 0.2, "student_source_weight": 1.0},
+                "probe": {"near": {"loss_weight": 0.0}},
+            },
+        },
     }
 
 
@@ -52,11 +58,27 @@ def test_stage6_fast_fail_near_loss_nonzero_without_explicit_phase() -> None:
         stage._validate_stage6_0_config(cfg)
 
 
-def test_stage6_fast_fail_probe_scheduler_weight_nonzero_without_explicit_phase() -> None:
+def test_stage6_fast_fail_scheduler_targets_forbidden() -> None:
     stage = MinimalStreetForwardStage6_0.__new__(MinimalStreetForwardStage6_0)
     cfg = _base_cfg()
-    cfg["scheduler_v10"]["targets"]["weights"]["probe_near"] = 0.2
-    with pytest.raises(ValueError, match="scheduler_v10.targets.weights.probe_near=0"):
+    cfg["scheduler_v10"]["targets"] = {"weights": {"probe_near": 0.2}}
+    with pytest.raises(ValueError, match="forbids scheduler_v10.targets.weights"):
+        stage._validate_stage6_0_config(cfg)
+
+
+def test_stage6_fast_fail_generic_target_view_weights() -> None:
+    stage = MinimalStreetForwardStage6_0.__new__(MinimalStreetForwardStage6_0)
+    cfg = _base_cfg()
+    cfg["losses"]["target_view_weights"]["enable"] = True
+    with pytest.raises(ValueError, match="forbids generic losses.target_view_weights"):
+        stage._validate_stage6_0_config(cfg)
+
+
+def test_stage6_fast_fail_legacy_self_loss_names() -> None:
+    stage = MinimalStreetForwardStage6_0.__new__(MinimalStreetForwardStage6_0)
+    cfg = _base_cfg()
+    cfg["losses"]["stage6_0"]["self"]["teacher_weight"] = 0.2
+    with pytest.raises(ValueError, match="teacher_source_weight"):
         stage._validate_stage6_0_config(cfg)
 
 

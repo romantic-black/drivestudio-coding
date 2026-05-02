@@ -425,7 +425,7 @@ losses:
   opacity_entropy:
     w: 0.0
   target_view_weights:
-    enable: true
+    enable: false
     normalize_by_weight_sum: true
     source:
       weight: 1.0
@@ -446,12 +446,12 @@ losses:
       student_source_weight: 1.0
     teacher_anchor:
       enable: true
-      weight: 0.1
+      weight: 0.05
       role_name: teacher_anchor
       max_frames: 1
     history:
       enable: true
-      visited_weight: 0.1
+      visited_weight: 0.0
       max_targets: 2
       exclude_near: true
       exclude_teacher_anchor: true
@@ -568,7 +568,7 @@ logging:
 scheduler_v10:
   enable: true
   block:
-    steps_per_block: 2
+    steps_per_block: 12
   episode:
     blocks_per_episode: 4
     total_target_frames: 3
@@ -590,39 +590,60 @@ scheduler_v10:
     block_order: step_major
     step_major_switch_interval_steps: 1
     reset_policy: episode_end
-  role_sampling:
-    first_step_role: teacher
-    force_teacher_on_block_entry: true
-    teacher_prob: 0.2
-    student_prob: 0.8
+  frame_selection:
     teacher_frame_policy: random_within_keyframe
-    teacher_resample_policy: fixed_per_block
     student_frame_policy: random_within_same_keyframe_except_teacher
+    student_cycle_policy: cycle
     skip_student_if_single_source: true
-    skip_student_if_no_prior: true
-    fallback_to_teacher: true
-  targets:
-    weights:
-      teacher_source: 1.0
-      student_source: 1.0
-      teacher_anchor: 0.1
-      history_visited: 0.1
-      probe_near: 0.0
+    fallback_step_type_if_no_student: teacher_bootstrap
+    fallback_step_type_if_no_committed_history: student_self
+  step_program:
+    mode: fixed_cycle
+    sequence:
+      - teacher_bootstrap
+      - student_self
+      - student_self
+      - student_anchor
+      - student_self
+      - student_self
+      - student_history
+      - student_self
+      - student_anchor
+      - student_self
+      - student_self
+      - student_history
+  supervision:
+    self_teacher:
+      enable_on: [teacher_bootstrap, teacher_refresh]
+    self_student:
+      enable_on: [student_self, student_anchor, student_history]
+    teacher_anchor:
+      enable_on: [student_anchor]
+      max_frames: 1
+    history_visited:
+      enable_on: [student_history]
+      max_targets: 2
+      min_committed_blocks: 1
+      sampling_policy: most_recent
+    probe_near:
+      enable: true
+      enable_on: [student_self, student_anchor, student_history]
+      frames_per_block: 1
+      same_keyframe_only: true
+      log_only: true
+  bridge:
+    student_steps_use_live_bridge: true
+    fallback_to_cache_bridge: false
   history_record:
     observed:
-      trigger: teacher_exit
-      record_on_block_exit: false
+      trigger: teacher_update_exit
     runtime:
-      trigger: step_exit
+      trigger: every_state_update_exit
   probe_near:
     enable: true
     frames_per_block: 1
     same_keyframe_only: true
-    insufficient_policy: skip
-    role_name: probe_near
-    loss_weight: 0.0
-  camera_sampling:
-    enable: false
+    log_only: true
 stage6_0:
   enable: true
   phase: default
@@ -655,7 +676,7 @@ stage6_0:
       detach_opacity: true
       require_on_student: true
     cache:
-      enable: true
+      enable: false
       detach_write: true
       detach_read: true
       reset_on: episode_begin

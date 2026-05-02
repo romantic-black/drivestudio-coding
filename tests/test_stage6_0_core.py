@@ -66,6 +66,33 @@ def test_stage6_student_valid_mask_preserves_nhwc_layout() -> None:
     assert float(out.render_rgb[:, 2:, :, :].sum().item()) == 0.0
 
 
+def test_stage6_student_valid_mask_supports_mixed_layouts() -> None:
+    render = torch.ones((2, 3, 4, 5), dtype=torch.float32)
+    prior = torch.ones((2, 4, 5, 32), dtype=torch.float32)
+    conf = torch.ones((2, 1, 4, 5), dtype=torch.float32)
+    valid = torch.zeros((2, 4, 5, 1), dtype=torch.float32)
+    valid[:, :2, :, :] = 1.0
+
+    out = apply_student_valid_mask(
+        render_rgb=render,
+        prior_map=prior,
+        prior_conf=conf,
+        valid_mask=valid,
+        append_as_channel=True,
+        prior_dim=32,
+    )
+
+    assert out.render_rgb.shape == render.shape
+    assert out.prior_map.shape == prior.shape
+    assert out.prior_conf is not None
+    assert out.prior_conf.shape == conf.shape
+    assert out.extra_inputs is not None
+    assert out.extra_inputs.shape == (2, 1, 4, 5)
+    assert float(out.render_rgb[:, :, 2:, :].sum().item()) == 0.0
+    assert float(out.prior_map[:, 2:, :, :].sum().item()) == 0.0
+    assert float(out.prior_conf[:, :, 2:, :].sum().item()) == 0.0
+
+
 def test_stage6_teacher_observe_input_supports_nchw_and_nhwc() -> None:
     gt_nchw = torch.zeros((1, 3, 4, 5))
     render_nchw = torch.ones((1, 3, 4, 5))
@@ -96,17 +123,42 @@ def test_stage6_aggregate_loss_excludes_probe() -> None:
 
 def test_stage6_target_role_weight_mapping() -> None:
     stage = MinimalStreetForwardStage6_0.__new__(MinimalStreetForwardStage6_0)
-    stage._scheduler_v10_target_weights = {
+    stage._stage6_domain_loss_weights = {
         "teacher_source": 1.0,
         "student_source": 1.0,
-        "teacher_anchor": 0.1,
-        "history_visited": 0.2,
+        "teacher_anchor": 0.05,
+        "history_visited": 0.0,
         "probe_near": 0.0,
     }
     assert stage._target_role_weight("teacher_source", 0) == 1.0
-    assert stage._target_role_weight("teacher_anchor", 0) == 0.1
-    assert stage._target_role_weight("history_visited", 0) == 0.2
+    assert stage._target_role_weight("teacher_anchor", 0) == 0.05
+    assert stage._target_role_weight("history_visited", 0) == 0.0
     assert stage._target_role_weight("probe_near", 0) == 0.0
+
+
+def test_stage6_build_target_view_weights_uses_stage6_loss_domains() -> None:
+    stage = MinimalStreetForwardStage6_0.__new__(MinimalStreetForwardStage6_0)
+    stage.device = torch.device("cpu")
+    stage._stage6_domain_loss_weights = {
+        "teacher_source": 0.2,
+        "student_source": 1.0,
+        "teacher_anchor": 0.05,
+        "history_visited": 0.0,
+        "probe_near": 0.0,
+    }
+    batch = {
+        "request_meta": {
+            "scheduler_version": "v10",
+            "train_target_image_refs": [(1, 0), (2, 0), (3, 0)],
+            "train_target_image_roles": ["student_source", "teacher_anchor", "history_visited"],
+            "train_target_image_loss_base_weights": [1.0, 1.0, 1.0],
+        }
+    }
+
+    weights, roles = stage._build_target_view_weights(batch, step=0, num_targets=3)
+
+    assert roles == ["student_source", "teacher_anchor", "history_visited"]
+    assert torch.allclose(weights, torch.tensor([1.0, 0.05, 0.0]))
 
 
 def test_stage6_prior_splat_detaches_geometry_and_opacity_by_default() -> None:
