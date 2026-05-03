@@ -715,7 +715,8 @@ class MinimalStreetForwardStage4_2(MinimalStreetForwardStage4_1):
         if profile_phase_timing:
             timing_ms["forward_ms"] = float((t1 - t0) * 1000.0)
         if torch.is_tensor(out.get("loss")):
-            out["loss"].backward()
+            retain_graph = bool(out.get("_retain_graph_for_proxy_backward", False)) and out.get("proxies") is not None
+            out["loss"].backward(retain_graph=retain_graph)
         if out.get("proxies") is not None:
             _backward_to_render_params_bg_rigid_distant(
                 out["render_params"],

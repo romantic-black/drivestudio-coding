@@ -64,6 +64,7 @@ def _make_mock_dataset() -> MagicMock:
     ds.list_segment_ids = MagicMock(return_value=[0])
     ds.get_segment_index = MagicMock(return_value=_make_sidx(scene_id=1, segment_id=0, base_frame=10))
     ds.get_segment_batch_from_image_refs = MagicMock(side_effect=lambda *args, **kwargs: {"ok": True})
+    ds._assemble_segment_batch_from_image_refs = MagicMock(side_effect=lambda *args, **kwargs: {"ok": True})
     ds.build_preload_hint = MagicMock(
         side_effect=lambda **kwargs: {
             "scene_id": kwargs["scene_id"],
@@ -99,6 +100,7 @@ def _build_scheduler(ds: MagicMock, **kwargs) -> TrainSchedulerV8:
         step_major_switch_interval_steps=int(kwargs.get("step_major_switch_interval_steps", 1)),
         target_policy="visited_episode_frames",
         reset_policy="episode_end",
+        aux_feature_splat_targets_cfg=kwargs.get("aux_feature_splat_targets_cfg"),
     )
 
 
@@ -150,6 +152,7 @@ def test_v8_factory_returns_scheduler():
     ds.list_training_scene_ids = MagicMock(return_value=[1])
     ds.list_segment_ids = MagicMock(return_value=[0])
     ds.get_segment_index = MagicMock(return_value=_make_sidx(scene_id=1, segment_id=0, base_frame=10))
+    ds._assemble_segment_batch_from_image_refs = MagicMock(side_effect=lambda *args, **kwargs: {"ok": True})
     sch = MultiSceneDatasetV4.create_train_scheduler_v8(
         ds,
         steps_per_block=1,
@@ -232,6 +235,7 @@ def test_v8_random_source_policy_resamples_source_per_visit_and_updates_history_
         return_value=_make_sidx_multi_frame_per_keyframe(scene_id=1, segment_id=0, base_frame=10)
     )
     ds.get_segment_batch_from_image_refs = MagicMock(side_effect=lambda *args, **kwargs: {"ok": True})
+    ds._assemble_segment_batch_from_image_refs = MagicMock(side_effect=lambda *args, **kwargs: {"ok": True})
     ds.build_preload_hint = MagicMock(
         side_effect=lambda **kwargs: {
             "scene_id": kwargs["scene_id"],
@@ -328,3 +332,69 @@ def test_v8_random_source_with_near_random_skip_when_single_frame_only():
     req = batch.get("request_meta") or {}
     assert [int(x) for x in req.get("near_random_frame_indices", [])] == []
     assert float(req.get("scheduler/near_random/skip_ratio", 0.0)) == pytest.approx(1.0)
+
+
+def test_v8_aux_adjacent_uses_explicit_source_cam():
+    ds = _make_mock_dataset()
+    sidx = _make_sidx_multi_frame_per_keyframe(scene_id=1, segment_id=0, base_frame=10)
+    sch = _build_scheduler(
+        ds,
+        aux_feature_splat_targets_cfg={
+            "enable": True,
+            "policy": "adjacent_frame_same_camera",
+            "max_refs_per_step": 1,
+            "role_name": "aux_feature_splat",
+        },
+    )
+    refs, roles = sch._build_aux_image_refs_for_block(
+        sidx=sidx,
+        source_keyframe_idx=0,
+        source_frame=110,
+        source_cam=1,
+        base_target_frames=[110],
+        num_cams=3,
+        exclude_image_refs=[],
+    )
+    assert refs == [(10, 1)]
+    assert roles == ["aux_feature_splat"]
+
+
+def test_v8_aux_same_timestamp_policy_is_removed():
+    ds = _make_mock_dataset()
+    sidx = _make_sidx(scene_id=1, segment_id=0, base_frame=10)
+    sch = _build_scheduler(
+        ds,
+        aux_feature_splat_targets_cfg={
+            "enable": True,
+            "policy": "same_timestamp_neighbor_camera",
+            "max_refs_per_step": 2,
+            "role_name": "aux_feature_splat",
+        },
+    )
+    with pytest.raises(ValueError, match="unsupported aux_feature_splat_targets policy"):
+        sch._build_aux_image_refs_for_block(
+            sidx=sidx,
+            source_keyframe_idx=0,
+            source_frame=10,
+            source_cam=0,
+            base_target_frames=[10],
+            num_cams=3,
+            exclude_image_refs=[],
+        )
+
+
+def test_v8_aux_fixed_camera_must_be_source_camera():
+    ds = _make_mock_dataset()
+    sch = _build_scheduler(
+        ds,
+        aux_feature_splat_targets_cfg={
+            "enable": True,
+            "policy": "adjacent_frame_same_camera",
+            "aux_camera_policy": "fixed_cam",
+            "fixed_cam_id": 2,
+            "max_refs_per_step": 1,
+            "role_name": "aux_feature_splat",
+        },
+    )
+    with pytest.raises(ValueError, match="is not present in source_image_refs"):
+        sch._select_aux_source_cam(source_image_refs=[(10, 0), (10, 1)], num_cams=3)

@@ -45,7 +45,7 @@ class MinimalStreetForwardStage4_5(MinimalStreetForwardStage4_2):
             model_cfg.get("fused_cuda_backproject_v4_force_fallback", False)
         )
         # Stage5_4 owns the v4 fused observation path and reuses this parent init chain.
-        allow_v4_direct_path = stage_name == "5_4"
+        allow_v4_direct_path = stage_name in {"5_4", "5_5"}
         if (
             self.use_fused_cuda_backproject_v4
             and not self.fused_cuda_backproject_v4_force_fallback

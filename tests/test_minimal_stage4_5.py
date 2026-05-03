@@ -269,7 +269,8 @@ def test_stage4_5_rejects_direct_v4_path_for_non_stage5_4(monkeypatch):
         MinimalStreetForwardStage4_5(config=_Cfg(), device=torch.device("cpu"))
 
 
-def test_stage4_5_allows_stage5_4_to_enable_direct_v4_path(monkeypatch):
+@pytest.mark.parametrize("stage_name", ["5_4", "5_5"])
+def test_stage4_5_allows_stage5_to_enable_direct_v4_path(monkeypatch, stage_name):
     def _fake_super_init(self, config, device, **kwargs):
         del device, kwargs
         self.renderer = object()
@@ -279,7 +280,7 @@ def test_stage4_5_allows_stage5_4_to_enable_direct_v4_path(monkeypatch):
     class _Cfg:
         def __init__(self):
             self.model = {
-                "stage": "5_4",
+                "stage": stage_name,
                 "use_fused_cuda_backproject_v4": True,
                 "fused_cuda_backproject_v4_force_fallback": False,
                 "use_fused_cuda_backproject_v3": True,

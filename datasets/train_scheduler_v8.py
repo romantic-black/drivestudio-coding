@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import random
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 from datasets.train_scheduler_v7 import SegmentIndexLike, TrainSchedulerDatasetV7, TrainSchedulerV7
 
@@ -43,6 +43,7 @@ class TrainSchedulerV8(TrainSchedulerV7):
         target_policy: str = "visited_episode_frames",
         reset_policy: str = "episode_end",
         near_random_supervision_cfg: Optional[Any] = None,
+        aux_feature_splat_targets_cfg: Optional[Any] = None,
         block_source_frame_policy: str = "fixed_once_per_episode",
     ) -> None:
         if total_target_frames < 1:
@@ -79,6 +80,15 @@ class TrainSchedulerV8(TrainSchedulerV7):
         self.near_random_sample_once_per_block = bool(self._cfg_get(self.near_random_cfg, "sample_once_per_block", True))
         self.near_random_camera_policy = str(self._cfg_get(self.near_random_cfg, "camera_policy", "all_cams"))
         self.near_random_role_name = str(self._cfg_get(self.near_random_cfg, "role_name", "near_random"))
+        self.aux_feature_splat_cfg = aux_feature_splat_targets_cfg or {}
+        self.aux_feature_splat_enable = bool(self._cfg_get(self.aux_feature_splat_cfg, "enable", False))
+        self.aux_feature_splat_role_name = str(self._cfg_get(self.aux_feature_splat_cfg, "role_name", "aux_feature_splat"))
+        self.aux_feature_splat_schedule = list(self._cfg_get(self.aux_feature_splat_cfg, "policy_schedule", []) or [])
+        self.aux_feature_splat_max_refs_default = int(self._cfg_get(self.aux_feature_splat_cfg, "max_refs_per_step", 1))
+        self.aux_feature_splat_camera_policy = str(
+            self._cfg_get(self.aux_feature_splat_cfg, "aux_camera_policy", "random_from_source_cams")
+        ).strip().lower()
+        self.aux_feature_splat_fixed_cam_id = int(self._cfg_get(self.aux_feature_splat_cfg, "fixed_cam_id", 0))
         if self.near_random_enable:
             if self.near_random_frames_per_block < 1:
                 raise ValueError("near_random_supervision.frames_per_block must be >= 1")
@@ -88,6 +98,12 @@ class TrainSchedulerV8(TrainSchedulerV7):
                 raise ValueError("v1 only supports near_random_supervision.insufficient_policy=skip")
             if self.near_random_camera_policy != "all_cams":
                 raise ValueError("v1 only supports near_random_supervision.camera_policy=all_cams")
+        if self.aux_feature_splat_enable:
+            if self.aux_feature_splat_camera_policy not in {"random_from_source_cams", "fixed_cam"}:
+                raise ValueError(
+                    "aux_feature_splat_targets.aux_camera_policy must be one of "
+                    "['random_from_source_cams', 'fixed_cam']"
+                )
         super().__init__(
             dataset=dataset,
             steps_per_block=steps_per_block,
@@ -317,6 +333,8 @@ class TrainSchedulerV8(TrainSchedulerV7):
             "source_image_refs": [],
             "target_image_refs": [],
             "target_image_roles": [],
+            "aux_image_refs": [],
+            "aux_image_roles": [],
             "num_cams": int(plan.num_cams),
             "episode_base_block_idx_global": int(episode_base_block_idx_global),
             "episode_base_block_idx_in_segment": int(episode_base_block_idx_in_segment),
@@ -407,6 +425,105 @@ class TrainSchedulerV8(TrainSchedulerV7):
             for b in selected_blocks
         ]
 
+    def _resolve_aux_policy_for_step(self, step: int) -> tuple[str, int]:
+        if not self.aux_feature_splat_enable:
+            return "", 0
+        phases = list(self.aux_feature_splat_schedule)
+        if len(phases) == 0:
+            policy = str(self._cfg_get(self.aux_feature_splat_cfg, "policy", "adjacent_frame_same_camera"))
+            max_refs = int(self._cfg_get(self.aux_feature_splat_cfg, "max_refs_per_step", self.aux_feature_splat_max_refs_default))
+            return policy, max(max_refs, 0)
+        for phase in phases:
+            until_step = int(self._cfg_get(phase, "until_step", -1))
+            policy = str(self._cfg_get(phase, "policy", "adjacent_frame_same_camera"))
+            max_refs = int(self._cfg_get(phase, "max_refs_per_step", self.aux_feature_splat_max_refs_default))
+            if until_step < 0 or int(step) <= int(until_step):
+                return policy, max(max_refs, 0)
+        last = phases[-1]
+        return (
+            str(self._cfg_get(last, "policy", "adjacent_frame_same_camera")),
+            max(int(self._cfg_get(last, "max_refs_per_step", self.aux_feature_splat_max_refs_default)), 0),
+        )
+
+    @staticmethod
+    def _dedupe_image_refs_keep_order(refs: List[tuple[int, int]]) -> List[tuple[int, int]]:
+        seen: Set[tuple[int, int]] = set()
+        out: List[tuple[int, int]] = []
+        for ref in refs:
+            r = (int(ref[0]), int(ref[1]))
+            if r in seen:
+                continue
+            seen.add(r)
+            out.append(r)
+        return out
+
+    def _select_aux_source_cam(self, *, source_image_refs: Sequence[tuple[int, int]], num_cams: int) -> int:
+        source_cams = sorted({int(ref[1]) for ref in source_image_refs})
+        if len(source_cams) == 0:
+            raise ValueError("aux_feature_splat_targets requires non-empty source_image_refs.")
+        if self.aux_feature_splat_camera_policy == "fixed_cam":
+            cam = int(self.aux_feature_splat_fixed_cam_id)
+            if cam < 0 or cam >= int(num_cams):
+                raise ValueError(
+                    f"aux_feature_splat_targets.fixed_cam_id={cam} out of range for num_cams={int(num_cams)}."
+                )
+            if cam not in source_cams:
+                raise ValueError(
+                    f"aux_feature_splat_targets.fixed_cam_id={cam} is not present in source_image_refs={list(source_image_refs)}."
+                )
+            return cam
+        if self.aux_feature_splat_camera_policy == "random_from_source_cams":
+            return int(random.choice(source_cams))
+        raise ValueError(f"unsupported aux_camera_policy={self.aux_feature_splat_camera_policy!r}")
+
+    def _build_aux_image_refs_for_block(
+        self,
+        *,
+        sidx: SegmentIndexLike,
+        source_keyframe_idx: int,
+        source_frame: int,
+        source_cam: int,
+        base_target_frames: List[int],
+        num_cams: int,
+        exclude_image_refs: Optional[Sequence[tuple[int, int]]] = None,
+    ) -> tuple[List[tuple[int, int]], List[str]]:
+        policy, max_refs = self._resolve_aux_policy_for_step(int(self.global_step))
+        if max_refs <= 0 or policy == "":
+            return [], []
+        refs: List[tuple[int, int]] = []
+        policy_norm = str(policy).strip().lower()
+        source_cam = int(source_cam)
+        if policy_norm == "adjacent_frame_same_camera":
+            frames = [int(x) for x in list(sidx.keyframe_to_frames[int(source_keyframe_idx)])]
+            frames_sorted = sorted(frames)
+            if int(source_frame) in frames_sorted:
+                idx = frames_sorted.index(int(source_frame))
+                cand_frames: List[int] = []
+                if idx - 1 >= 0:
+                    cand_frames.append(int(frames_sorted[idx - 1]))
+                if idx + 1 < len(frames_sorted):
+                    cand_frames.append(int(frames_sorted[idx + 1]))
+                for f in cand_frames[:max_refs]:
+                    refs.append((int(f), int(source_cam)))
+        elif policy_norm == "near_random":
+            near_frames, _ = self._sample_near_random_frames_for_block(
+                sidx=sidx,
+                source_keyframe_idx=int(source_keyframe_idx),
+                source_frame=int(source_frame),
+                existing_target_frames=[int(x) for x in base_target_frames],
+                num_frames=int(max_refs),
+            )
+            for f in near_frames:
+                refs.append((int(f), int(source_cam)))
+        else:
+            raise ValueError(f"unsupported aux_feature_splat_targets policy={policy!r}")
+        refs = self._dedupe_image_refs_keep_order(refs)
+        if exclude_image_refs is not None:
+            excluded = {(int(r[0]), int(r[1])) for r in exclude_image_refs}
+            refs = [r for r in refs if (int(r[0]), int(r[1])) not in excluded]
+        roles = [str(self.aux_feature_splat_role_name) for _ in refs]
+        return refs[:max_refs], roles[:max_refs]
+
     def _select_block(self, block_idx: int) -> None:
         st = self.current_episode_state
         if st is None:
@@ -437,7 +554,7 @@ class TrainSchedulerV8(TrainSchedulerV7):
         base_roles = ["source"] + ["visited" for _ in base_target_frames[1:]]
         num_cams = int(st["num_cams"])
         near_random_frames: List[int] = []
-        if self.near_random_enable:
+        if self.near_random_enable and not self.aux_feature_splat_enable:
             reuse_cached = False
             if self.near_random_sample_once_per_block and int(bcur) in st["block_near_random_frame_indices"]:
                 cached = [int(x) for x in st["block_near_random_frame_indices"][int(bcur)]]
@@ -468,8 +585,12 @@ class TrainSchedulerV8(TrainSchedulerV7):
                     st["near_random_sampled_blocks"] = int(st.get("near_random_sampled_blocks", 0)) + 1
                 else:
                     st["near_random_skipped_blocks"] = int(st.get("near_random_skipped_blocks", 0)) + 1
-        target_frames = [int(x) for x in base_target_frames] + [int(x) for x in near_random_frames]
-        target_frame_roles = [str(x) for x in base_roles] + [str(self.near_random_role_name) for _ in near_random_frames]
+        if self.aux_feature_splat_enable:
+            target_frames = [int(x) for x in base_target_frames]
+            target_frame_roles = [str(x) for x in base_roles]
+        else:
+            target_frames = [int(x) for x in base_target_frames] + [int(x) for x in near_random_frames]
+            target_frame_roles = [str(x) for x in base_roles] + [str(self.near_random_role_name) for _ in near_random_frames]
         source_image_ref = (int(source_frame), 0)
         source_image_refs = self._frame_targets_to_image_refs(num_cams, [int(source_frame)])
         target_image_refs = self._frame_targets_to_image_refs(num_cams, target_frames)
@@ -477,6 +598,20 @@ class TrainSchedulerV8(TrainSchedulerV7):
             num_cams=num_cams,
             target_frames=[int(x) for x in target_frames],
             target_frame_roles=[str(x) for x in target_frame_roles],
+        )
+        aux_source_cam = (
+            self._select_aux_source_cam(source_image_refs=source_image_refs, num_cams=int(num_cams))
+            if self.aux_feature_splat_enable
+            else int(source_image_ref[1])
+        )
+        aux_image_refs, aux_image_roles = self._build_aux_image_refs_for_block(
+            sidx=sidx,
+            source_keyframe_idx=int(source_keyframe_idx),
+            source_frame=int(source_frame),
+            source_cam=int(aux_source_cam),
+            base_target_frames=[int(x) for x in base_target_frames],
+            num_cams=int(num_cams),
+            exclude_image_refs=[tuple(x) for x in source_image_refs] + [tuple(x) for x in target_image_refs],
         )
 
         st["block_cursor"] = int(bcur)
@@ -488,8 +623,11 @@ class TrainSchedulerV8(TrainSchedulerV7):
         st["source_keyframe_idx"] = int(source_keyframe_idx)
         st["source_image_ref"] = tuple(source_image_ref)
         st["source_image_refs"] = [tuple(x) for x in source_image_refs]
+        st["aux_source_cam"] = int(aux_source_cam)
         st["target_image_refs"] = [tuple(x) for x in target_image_refs]
         st["target_image_roles"] = [str(x) for x in target_image_roles]
+        st["aux_image_refs"] = [tuple(x) for x in aux_image_refs]
+        st["aux_image_roles"] = [str(x) for x in aux_image_roles]
         st["block_last_target_frame_indices"][int(bcur)] = [int(x) for x in target_frames]
         st["block_target_frame_roles"][int(bcur)] = [str(x) for x in target_frame_roles]
         st["block_target_image_roles"][int(bcur)] = [str(x) for x in target_image_roles]
@@ -717,6 +855,24 @@ class TrainSchedulerV8(TrainSchedulerV7):
         }
         return info
 
+    def _batch_from_state(self, st: Dict[str, Any]) -> Dict[str, Any]:
+        source_refs = [(int(x[0]), int(x[1])) for x in st["source_image_refs"]]
+        target_refs = [(int(x[0]), int(x[1])) for x in st["target_image_refs"]]
+        aux_refs = [(int(x[0]), int(x[1])) for x in list(st.get("aux_image_refs", []))]
+        if not hasattr(self.dataset, "_assemble_segment_batch_from_image_refs"):
+            return super()._batch_from_state(st)
+        return self.dataset._assemble_segment_batch_from_image_refs(
+            int(st["scene_id"]),
+            int(st["segment_id"]),
+            source_refs,
+            target_refs,
+            aux_image_refs=aux_refs,
+            include_test=bool(self.include_test),
+            test_image_refs=None,
+            enforce_target0_equals_source=True,
+            target_ref_purpose="train",
+        )
+
     def materialize_current_batch_without_advance(self) -> Dict[str, Any]:
         batch = super().materialize_current_batch_without_advance()
         aligned = dict(batch.get("_scheduler_v7_aligned_info") or batch.get("_scheduler_v4_aligned_info") or {})
@@ -736,6 +892,10 @@ class TrainSchedulerV8(TrainSchedulerV7):
         request_meta = dict(batch.get("request_meta") or {})
         request_meta["target_frame_roles"] = list(st.get("current_target_frame_roles", []))
         request_meta["target_image_roles"] = list(st.get("target_image_roles", []))
+        request_meta["aux_image_refs"] = list(st.get("aux_image_refs", []))
+        request_meta["aux_image_roles"] = list(st.get("aux_image_roles", []))
+        request_meta["aux_source_cam"] = int(st.get("aux_source_cam", 0))
+        request_meta["aux_camera_policy"] = str(self.aux_feature_splat_camera_policy)
         request_meta["near_random_frame_indices"] = list(
             st.get("block_near_random_frame_indices", {}).get(int(st["block_cursor"]), [])
         )
@@ -753,10 +913,16 @@ class TrainSchedulerV8(TrainSchedulerV7):
             request_meta["source_image_refs"] = list(st.get("source_image_refs", []))
         if request_meta.get("target_image_refs") is None:
             request_meta["target_image_refs"] = list(st.get("target_image_refs", []))
+        if request_meta.get("aux_image_refs") is None:
+            request_meta["aux_image_refs"] = list(st.get("aux_image_refs", []))
         target_refs = request_meta.get("target_image_refs") or batch.get("target_image_refs") or []
         roles = request_meta.get("target_image_roles") or []
         if len(target_refs) != len(roles):
             raise ValueError(f"target_image_refs/target_image_roles mismatch: {len(target_refs)} vs {len(roles)}")
+        aux_refs = request_meta.get("aux_image_refs") or batch.get("aux_image_refs") or []
+        aux_roles = request_meta.get("aux_image_roles") or []
+        if len(aux_roles) > 0 and len(aux_refs) != len(aux_roles):
+            raise ValueError(f"aux_image_refs/aux_image_roles mismatch: {len(aux_refs)} vs {len(aux_roles)}")
         batch["request_meta"] = request_meta
         key = (int(st["scene_id"]), int(st["segment_id"]))
         rt = self._segment_runtime[key]

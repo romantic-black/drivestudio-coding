@@ -71,6 +71,7 @@ def build_train_scheduler_v8_from_cfg(cfg: Any, dataset: MultiSceneDatasetV4) ->
     target_policy = str(ep.get("target_policy", "visited_episode_frames"))
     block_source_frame_policy = str(ep.get("block_source_frame_policy", "fixed_once_per_episode"))
     near_random_cfg = sv8.get("near_random_supervision") or {}
+    aux_feature_splat_targets_cfg = sv8.get("aux_feature_splat_targets") or {}
 
     fixed_scene_id, fixed_segment_id = resolve_fixed_scene_segment_v8(cfg)
     validate_train_scene_for_fixed(cfg, fixed_scene_id)
@@ -98,5 +99,6 @@ def build_train_scheduler_v8_from_cfg(cfg: Any, dataset: MultiSceneDatasetV4) ->
         target_policy=target_policy,
         reset_policy=reset_policy,
         near_random_supervision_cfg=near_random_cfg,
+        aux_feature_splat_targets_cfg=aux_feature_splat_targets_cfg,
         block_source_frame_policy=block_source_frame_policy,
     )

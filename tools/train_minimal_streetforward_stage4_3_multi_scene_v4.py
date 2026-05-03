@@ -152,6 +152,172 @@ def _save_train_monitor_triplets(
         )
 
 
+def _map_to_01(map_tensor: torch.Tensor) -> torch.Tensor:
+    x = map_tensor.detach().float().cpu()
+    x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    if x.dim() == 3 and int(x.shape[-1]) == 1:
+        x = x.squeeze(-1)
+    if x.numel() == 0:
+        return x
+    mn = float(x.min().item())
+    mx = float(x.max().item())
+    if mx > mn:
+        return (x - mn) / (mx - mn)
+    return x * 0.0
+
+
+def _save_stage5_5_aux_debug_maps(
+    *,
+    step: int,
+    aux_debug_maps: Optional[Dict[str, Any]],
+    raw_batch: Dict[str, Any],
+    log_dir: str,
+    block_idx_global: int,
+    scene_id_fallback: Any,
+    writer: Optional[Any] = None,
+) -> None:
+    if not isinstance(aux_debug_maps, dict) or int(block_idx_global) < 1:
+        return
+
+    out_dir = os.path.join(log_dir, "images", "train_aux_uncertainty")
+    os.makedirs(out_dir, exist_ok=True)
+    sc_lab = _scene_folder_label_from_batch(raw_batch, scene_id_fallback)
+    frame_idx = int(aux_debug_maps.get("frame_idx", -1))
+    target_index = int(aux_debug_maps.get("target_index", 0))
+    prefix = (
+        f"step{int(step):06d}_b{int(block_idx_global):06d}_"
+        f"sc{sc_lab}_aux{target_index}_f{frame_idx:05d}"
+    )
+
+    def _save_rgb(name: str, tensor: torch.Tensor) -> None:
+        img = torch.clamp(tensor.detach().float().cpu(), 0.0, 1.0)
+        arr = (img.numpy() * 255.0).clip(0, 255).astype(np.uint8)
+        path = os.path.join(out_dir, f"{prefix}_{name}.png")
+        try:
+            from PIL import Image
+        except ImportError:
+            np.save(path.replace(".png", ".npy"), arr)
+            return
+        Image.fromarray(arr).save(path)
+
+    def _save_signed_rgb(name: str, tensor: torch.Tensor, *, scale: float = 0.5) -> Optional[torch.Tensor]:
+        x = tensor.detach().float().cpu()
+        if x.dim() != 3 or int(x.shape[-1]) != 3:
+            return None
+        s = max(float(scale), 1.0e-6)
+        img = (0.5 + 0.5 * x.clamp(-s, s) / s).clamp(0.0, 1.0)
+        _save_rgb(name, img)
+        return img
+
+    def _save_map(name: str, tensor: torch.Tensor, *, normalize: bool = True) -> torch.Tensor:
+        img = _map_to_01(tensor) if normalize else torch.clamp(tensor.detach().float().cpu(), 0.0, 1.0)
+        arr = (img.numpy() * 255.0).clip(0, 255).astype(np.uint8)
+        path = os.path.join(out_dir, f"{prefix}_{name}.png")
+        try:
+            from PIL import Image
+        except ImportError:
+            np.save(path.replace(".png", ".npy"), arr)
+            return img
+        Image.fromarray(arr).save(path)
+        return img
+
+    gt = aux_debug_maps.get("gt")
+    render = aux_debug_maps.get("render")
+    if torch.is_tensor(gt):
+        _save_rgb("gt", gt)
+    if torch.is_tensor(render):
+        _save_rgb("nearby_render", render)
+
+    pred_rgb_residual = aux_debug_maps.get("pred_rgb_residual")
+    gt_rgb_residual = aux_debug_maps.get("gt_rgb_residual")
+    residual_vis_scale = max(float(aux_debug_maps.get("rgb_residual_max", 0.5) or 0.5), 1.0e-6)
+    pred_residual_vis: Optional[torch.Tensor] = None
+    gt_residual_vis: Optional[torch.Tensor] = None
+    render_plus_pred_residual: Optional[torch.Tensor] = None
+    render_plus_gt_residual: Optional[torch.Tensor] = None
+    if torch.is_tensor(pred_rgb_residual):
+        pred_residual_vis = _save_signed_rgb(
+            "pred_rgb_residual_signed",
+            pred_rgb_residual,
+            scale=residual_vis_scale,
+        )
+    if torch.is_tensor(gt_rgb_residual):
+        gt_residual_vis = _save_signed_rgb(
+            "gt_rgb_residual_signed",
+            gt_rgb_residual,
+            scale=residual_vis_scale,
+        )
+    if torch.is_tensor(render) and torch.is_tensor(pred_rgb_residual):
+        render_cpu = render.detach().float().cpu()
+        residual_cpu = pred_rgb_residual.detach().float().cpu()
+        if tuple(render_cpu.shape) == tuple(residual_cpu.shape):
+            render_plus_pred_residual = torch.clamp(render_cpu + residual_cpu, 0.0, 1.0)
+            _save_rgb("nearby_render_plus_pred_rgb_residual", render_plus_pred_residual)
+    if torch.is_tensor(render) and torch.is_tensor(gt_rgb_residual):
+        render_cpu = render.detach().float().cpu()
+        residual_cpu = gt_rgb_residual.detach().float().cpu()
+        if tuple(render_cpu.shape) == tuple(residual_cpu.shape):
+            render_plus_gt_residual = torch.clamp(render_cpu + residual_cpu, 0.0, 1.0)
+            _save_rgb("nearby_render_plus_gt_rgb_residual", render_plus_gt_residual)
+
+    image_maps: Dict[str, torch.Tensor] = {}
+    for name, normalize in (
+        ("abs_error", True),
+        ("pred_error", True),
+        ("support", True),
+        ("loss_mask", False),
+        ("error_confidence", False),
+        ("support_confidence", False),
+        ("confidence", False),
+        ("bridge_mask", False),
+        ("bridge_weight", False),
+    ):
+        val = aux_debug_maps.get(name)
+        if torch.is_tensor(val):
+            image_maps[name] = _save_map(name, val, normalize=bool(normalize))
+
+    if writer is None:
+        return
+    if torch.is_tensor(render):
+        writer.add_image(
+            "train_aux_uncertainty/nearby_render",
+            torch.clamp(render.detach().float().cpu(), 0.0, 1.0).permute(2, 0, 1),
+            int(step),
+        )
+    if torch.is_tensor(gt):
+        writer.add_image(
+            "train_aux_uncertainty/gt",
+            torch.clamp(gt.detach().float().cpu(), 0.0, 1.0).permute(2, 0, 1),
+            int(step),
+        )
+    if torch.is_tensor(render_plus_pred_residual):
+        writer.add_image(
+            "train_aux_uncertainty/nearby_render_plus_pred_rgb_residual",
+            render_plus_pred_residual.permute(2, 0, 1),
+            int(step),
+        )
+    if torch.is_tensor(render_plus_gt_residual):
+        writer.add_image(
+            "train_aux_uncertainty/nearby_render_plus_gt_rgb_residual",
+            render_plus_gt_residual.permute(2, 0, 1),
+            int(step),
+        )
+    if torch.is_tensor(pred_residual_vis):
+        writer.add_image(
+            "train_aux_uncertainty/pred_rgb_residual_signed",
+            pred_residual_vis.permute(2, 0, 1),
+            int(step),
+        )
+    if torch.is_tensor(gt_residual_vis):
+        writer.add_image(
+            "train_aux_uncertainty/gt_rgb_residual_signed",
+            gt_residual_vis.permute(2, 0, 1),
+            int(step),
+        )
+    for name, img in image_maps.items():
+        writer.add_image(f"train_aux_uncertainty/{name}", img.unsqueeze(0), int(step))
+
+
 def _build_scheduler_node_sync_v8_fallback(
     cfg: Any,
     scheduler_info: Dict[str, Any],
@@ -1616,6 +1782,15 @@ def main() -> None:
                         scene_id_fallback=scheduler_info.get("scene_id", -1),
                         pixel_camera_ids=pixel_camera_ids,
                     )
+                    _save_stage5_5_aux_debug_maps(
+                        step=int(step),
+                        aux_debug_maps=result.get("_stage5_5_aux_debug_maps"),
+                        raw_batch=raw_batch,
+                        log_dir=str(cfg.log_dir),
+                        block_idx_global=int(scheduler_info.get("block_idx_global", 0)),
+                        scene_id_fallback=scheduler_info.get("scene_id", -1),
+                        writer=writer,
+                    )
             if image_trigger_mode == "episode_end":
                 if any(ev.get("type") == "episode_end" for ev in step_events):
                     completed_blocks = int(scheduler_info.get("block_idx_global", -1)) + 1
@@ -1629,6 +1804,15 @@ def main() -> None:
                             block_idx_global=int(scheduler_info.get("block_idx_global", 0)),
                             scene_id_fallback=scheduler_info.get("scene_id", -1),
                             pixel_camera_ids=pixel_camera_ids,
+                        )
+                        _save_stage5_5_aux_debug_maps(
+                            step=int(step),
+                            aux_debug_maps=result.get("_stage5_5_aux_debug_maps"),
+                            raw_batch=raw_batch,
+                            log_dir=str(cfg.log_dir),
+                            block_idx_global=int(scheduler_info.get("block_idx_global", 0)),
+                            scene_id_fallback=scheduler_info.get("scene_id", -1),
+                            writer=writer,
                         )
 
             block_end_monitor_ms = 0.0
@@ -1649,6 +1833,15 @@ def main() -> None:
                             block_idx_global=int(block_idx_global),
                             scene_id_fallback=ev.get("scene_id", -1),
                             pixel_camera_ids=pixel_camera_ids,
+                        )
+                        _save_stage5_5_aux_debug_maps(
+                            step=int(step),
+                            aux_debug_maps=result.get("_stage5_5_aux_debug_maps"),
+                            raw_batch=raw_batch,
+                            log_dir=str(cfg.log_dir),
+                            block_idx_global=int(block_idx_global),
+                            scene_id_fallback=ev.get("scene_id", -1),
+                            writer=writer,
                         )
 
                 acc = block_loss_accum.pop(int(block_idx_global), None)
@@ -1956,7 +2149,7 @@ def main() -> None:
                             row[k] = float(v)
                 # Always persist optimizer/lr/loss namespace scalars for run diagnosis,
                 # independent of include_extra_result_metrics.
-                always_scalar_prefixes = ("optimizer/", "lr/", "loss/")
+                always_scalar_prefixes = ("optimizer/", "lr/", "loss/", "monitor/aux_", "perf/aux_", "grad/aux")
                 for k, v in result.items():
                     if k.startswith("_") or k in row:
                         continue
@@ -1992,6 +2185,11 @@ def main() -> None:
                                 continue
                             if isinstance(v, (int, float)):
                                 writer.add_scalar(f"train/{k}", float(v), step)
+                    for k, v in result.items():
+                        if k.startswith("_") or not any(k.startswith(pf) for pf in always_scalar_prefixes):
+                            continue
+                        if isinstance(v, (int, float)):
+                            writer.add_scalar(f"train/{k}", float(v), step)
                     writer.add_scalar("train/perf/step_time_ms", float(step_time_ms), step)
                 block_end_monitor_ms += float((time.perf_counter() - block_end_t0) * 1000.0)
 

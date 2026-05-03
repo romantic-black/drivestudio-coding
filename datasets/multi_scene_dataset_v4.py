@@ -1655,6 +1655,7 @@ class MultiSceneDatasetV4:
         segment_id: int,
         source_image_refs: Sequence[ImageRef],
         target_image_refs: Sequence[ImageRef],
+        aux_image_refs: Optional[Sequence[ImageRef]] = None,
         *,
         include_test: bool,
         test_image_refs: Optional[Sequence[ImageRef]],
@@ -1670,6 +1671,9 @@ class MultiSceneDatasetV4:
             self.validate_image_ref(scene_id, segment_id, tuple(ref), purpose="train")
         for ref in target_image_refs:
             self.validate_image_ref(scene_id, segment_id, tuple(ref), purpose=target_ref_purpose)
+        if aux_image_refs is not None:
+            for ref in aux_image_refs:
+                self.validate_image_ref(scene_id, segment_id, tuple(ref), purpose="train")
         if enforce_target0_equals_source and tuple(target_image_refs[0]) != tuple(source_image_refs[0]):
             raise ValueError("target_image_refs[0] must equal source_image_ref when enforce_target0_equals_source=True")
 
@@ -1751,7 +1755,15 @@ class MultiSceneDatasetV4:
             target_image_refs,
             allow_missing_keyframe=(target_ref_purpose == "test"),
         )
+        aux_target = None
+        if aux_image_refs is not None and len(aux_image_refs) > 0:
+            aux_target = _load_role(
+                aux_image_refs,
+                allow_missing_keyframe=False,
+            )
         all_frames = set(source["frame_indices"].tolist()) | set(target["frame_indices"].tolist())
+        if aux_target is not None:
+            all_frames = all_frames | set(aux_target["frame_indices"].tolist())
 
         pointcloud = bundle.pointcloud
         knn_init = bundle.knn_init
@@ -1963,6 +1975,7 @@ class MultiSceneDatasetV4:
             "request_meta": {
                 "source_image_refs": [tuple(r) for r in source_image_refs],
                 "target_image_refs": [tuple(r) for r in target_image_refs],
+                "aux_image_refs": [tuple(r) for r in aux_image_refs] if aux_image_refs is not None else [],
                 "test_image_refs": None,
                 "assembly_mode": "image_ref_v4",
             },
@@ -1970,6 +1983,8 @@ class MultiSceneDatasetV4:
             "target": target,
             "pointcloud": pointcloud,
         }
+        if aux_target is not None:
+            batch["aux_target"] = aux_target
         if dynamic_info is not None:
             batch["dynamic_info"] = dynamic_info
         if knn_init_batch is not None:
@@ -2014,6 +2029,7 @@ class MultiSceneDatasetV4:
             request.segment_id,
             source_refs,
             request.target_image_refs,
+            aux_image_refs=None,
             include_test=include_test,
             test_image_refs=request.test_image_refs if include_test else None,
             enforce_target0_equals_source=enforce_target0_equals_source,
@@ -2026,6 +2042,7 @@ class MultiSceneDatasetV4:
             request.segment_id,
             [request.source_image_ref],
             request.eval_image_refs,
+            aux_image_refs=None,
             include_test=False,
             test_image_refs=None,
             enforce_target0_equals_source=False,
@@ -2200,6 +2217,7 @@ class MultiSceneDatasetV4:
         target_policy: str = "visited_episode_frames",
         reset_policy: str = "episode_end",
         near_random_supervision_cfg: Optional[Any] = None,
+        aux_feature_splat_targets_cfg: Optional[Any] = None,
         block_source_frame_policy: str = "fixed_once_per_episode",
     ) -> TrainSchedulerV8:
         return TrainSchedulerV8(
@@ -2225,6 +2243,7 @@ class MultiSceneDatasetV4:
             target_policy=str(target_policy),
             reset_policy=str(reset_policy),
             near_random_supervision_cfg=near_random_supervision_cfg,
+            aux_feature_splat_targets_cfg=aux_feature_splat_targets_cfg,
             block_source_frame_policy=str(block_source_frame_policy),
         )
 

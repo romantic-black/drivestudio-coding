@@ -1,0 +1,613 @@
+output_name: experiment001_60w_40w
+
+data:
+  data_root: "/root/autodl-tmp/nuScenes/"
+  dataset: "nuscenes"
+  start_timestep: 0
+  end_timestep: -1
+  preload_device: cpu
+  sky_mask_semantics: one_is_sky
+  train_scene_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9,14, 16, 24, 32, 40, 99, 107, 115, 123, 131, 139, 147, 155, 163, 171, 179, 195, 214,
+    17, 25, 33, 41, 49, 100, 108, 116, 124, 132, 140, 148, 156, 164, 172, 180, 188, 196, 215,
+    10, 18, 26, 34, 42, 93, 101, 109, 117, 125, 133, 141, 149, 157, 165, 173, 181, 189, 197, 216,
+    11, 19, 27, 35, 43, 94, 102, 110, 118, 126, 134, 142, 150, 158, 166, 174, 182, 190, 198, 217,
+    12, 20, 36, 44, 95, 103, 111, 119, 127, 135, 143, 151, 159, 167, 175, 183, 191, 199, 218,
+    13, 21, 29, 37, 45, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200,
+    22, 30, 38, 46, 97, 105, 113, 121, 129, 137, 145, 153, 161, 169, 177, 185, 193, 201,
+    15, 23, 31, 39, 47, 98, 106, 114, 122, 130, 138, 146, 154, 162, 170, 178, 186, 194]
+  preload:
+    enable: true
+    num_workers: 1
+    max_pending_tasks: 64
+    dedupe_tasks: true
+    drop_stale_hints: true
+    warm_scene_meta: true
+    warm_segment_static: true
+    warm_next_block_exact: true
+    warm_test_refs: false
+    warm_episode_source_superset: true
+    enable_view_pack_cache: true
+    stats_log_interval_steps: 0
+  pixel_source:
+    type: datasets.nuscenes.nuscenes_sourceloader.NuScenesPixelSource
+    cameras: [0, 1, 2]
+    downscale_when_loading: [3, 3, 3]
+    downscale: 1
+    undistort: false
+    load_sky_mask: true
+    load_dynamic_mask: true
+    load_egocar_mask: true
+    load_depth_maps: true
+    load_objects: true
+    load_smpl: false
+    sampler:
+      buffer_downscale: 8
+      buffer_ratio: 0.5
+      start_enhance_weight: 3
+  lidar_source:
+    type: datasets.nuscenes.nuscenes_sourceloader.NuScenesLiDARSource
+    load_lidar: true
+    lidar_downsample_factor: 1
+    lidar_percentile: 0.02
+  assets:
+    root: "/root/autodl-tmp/streetforward_assets_pt60w_40w"
+  scene_asset_cache_max_items: 64
+  segment_static_cache_max_items: 128
+  image_meta_cache_max_items: 8192
+  view_pack_cache_max_items: 4096
+
+dataset:
+  num_source_keyframes: 1
+  num_target_keyframes: 3
+  segment_overlap_ratio: 0.2
+  min_keyframes_per_scene: 2
+  min_keyframes_per_segment: 2
+  preload_scene_count: 2
+  keyframe_split_config:
+    num_splits: 0
+    min_count: 1
+    min_length: 3.0
+  segment_aabb:
+    - [-20.0, -10.0, -20.0]
+    - [20.0, 4.8, 40.0]
+  pointcloud:
+    type: "hybrid"
+    lidar_sparsity: full
+    monocular_chosen_cam_ids: [0, 1, 2, 3, 4, 5]
+    monocular_sparsity: full
+    monocular_filter_sky: true
+    monocular_depth_consistency: false
+    monocular_downscale: 1
+    monocular_dynamic_recovery_bbox_expand_xyz_m: [0.5, 0.2, 0.5]
+    monocular_dynamic_recovery_max_points_per_instance: 20000
+    near_max_points: 600000
+    distant_max_points: 400000
+    static_instance_motion:
+      enable: true
+      traj_length_thresh_m: 0.5
+
+scheduler_v8:
+  enable: true
+  block:
+    steps_per_block: 8
+  episode:
+    blocks_per_episode: 5
+    total_target_frames: 3
+    include_source_frame: true
+    target_policy: visited_episode_frames
+    block_source_frame_policy: fixed_once_per_episode
+    frame_within_keyframe_policy: random_once_per_episode
+    min_keyframes_required_policy: skip_if_less_than_window
+  traversal:
+    mode: round_robin_episode_interleave
+    switch_after_episode: true
+    fixed_scene_id: null
+    fixed_segment_id: null
+    segment_order: ascending
+    scene_order: shuffle_per_epoch
+  execution:
+    block_order: step_major
+    step_major_switch_interval_steps: 4
+    reset_policy: episode_end
+  preload:
+    emit_hints: true
+    warm_next_block_exact: true
+    warm_next_episode_chain: true
+  aux_feature_splat_targets:
+    enable: true
+    role_name: aux_feature_splat
+    policy: adjacent_frame_same_camera
+    max_refs_per_step: 2
+    aux_camera_policy: random_from_source_cams
+
+
+validation_v8:
+  eval_enable: false
+  mode: inference_only  # segment_finetune_train
+  block:
+    steps_per_block: 16
+  episode:
+    blocks_per_episode: 5
+    total_target_frames: 3
+    target_policy: visited_episode_frames
+  execution:
+    block_order: step_major
+    step_major_switch_interval_steps: 4
+    reset_policy: episode_end
+  trigger:
+    by: train_episode_interval
+    validate_every_n_episodes: 100
+    run_at_train_start: false
+  episode_selection:
+    policy: middle
+  render:
+    save_images: true
+    save_dir: validation/episodes
+  cache:
+    persist_across_training: true
+  metrics:
+    use_sky_mask_regions: true
+    min_valid_pixels_per_region: 32
+    require_sky_mask: true
+  near_random_supervision:
+    enable: false
+
+model:
+  stage: "5_5"
+  production_training: true
+  backprojector_version: "v4"
+  scale_init_value: 0.1
+  sh_degree: 1
+  voxel_size: 0.2
+  sparseConv_outdim: 32
+  feat_2d_channels: 32
+  feat_2d_downscale: 1
+  feature_extractor:
+    type: dinov2_unet_fusion
+    dino:
+      model_name: vit_base_patch14_reg4_dinov2
+      pretrained: true
+      freeze: true
+      weights_path: null
+      out_channels: 32
+      intermediate_layers: [4, 8, 11]
+      pad_to_patch_multiple: 14
+    residual_unet:
+      in_channels: 6
+      feat_channels: 32
+      base_channels: 32
+      feature_downscale: 1
+      depth: 4
+      bilinear: true
+    fusion:
+      hidden_channels: 64
+      out_channels: 32
+  use_fused_cuda_backproject_v2: true
+  use_fused_cuda_backproject_v3: true
+  use_fused_cuda_backproject_v4: true
+  fused_cuda_backproject_v4_force_fallback: false
+  param_embed_dim: 48
+  offset_gru_hidden_dim: 48
+  offset_gru_use_reset_gate: true
+  rigid_routed:
+    route_space: source_frame_world
+    route_aabb: segment_aabb
+    inside_decoder: bg
+    outside_decoder: distant
+    update_means: true
+    update_quat: true
+  struct_decoder:
+    enable: true
+    type: "routed_near_far"
+    scope: "full_routed"
+    output_role: "gru_input"
+    point_preserving: true
+    include_bg: true
+    include_distant: true
+    include_rigid_in: true
+    include_rigid_out: true
+    feat_2d_channels: 32
+    param_embed_dim: 32
+    branch_embed_dim: 8
+    support_embed_dim: 8
+    history_embed_dim: 16
+    token:
+      use_2d_feat: true
+      use_support: true
+      use_branch_embed: true
+      use_param_embed: true
+      use_anchor_rgb: false
+      use_hidden_state: false
+      zero_invalid_2d_feat: true
+    near:
+      type: "xcpe"
+      branches: ["bg", "rigid_in"]
+      channels: 64
+      voxel_size: 0.20
+      sparse_backend: "spconv"
+      clamp_grid_coord: false
+      xcpe:
+        num_layers: 2
+        kernel_size: 3
+        residual_scale_init: 5.0e-3
+        norm: "layernorm"
+        act: "gelu"
+    far:
+      type: "mlp"
+      branches: ["distant", "rigid_out"]
+      channels: 64
+      hidden_dim: 64
+      num_layers: 2
+      norm: "layernorm"
+      act: "gelu"
+      history_embed:
+        enable: false
+  history_memory:
+    enable: true
+    record_on: "block_exit"
+    record_views: "source_image_refs"
+    support:
+      fast_ema_beta_visible: 0.35
+      fast_ema_beta_invisible: 0.60
+      slow_ema_beta_visible: 0.90
+      slow_ema_beta_invisible: 0.95
+    residual:
+      fast_error_beta: 0.35
+      slow_error_beta: 0.9
+      error_eps: 1.0e-6
+    update:
+      fast_ema_beta: 0.45
+      slow_ema_beta: 0.92
+      apply_in_eval: true
+  view_transient:
+    enable: true
+    source: ego_to_point
+    input_to_gate: true
+    input_to_struct_decoder: false
+    use_delta_xyz: true
+    use_delta_norm: true
+    use_angle_delta: false
+    use_initialized_flag: false
+    detach: true
+    update_in_train: true
+    update_in_eval: true
+  update_gate:
+    enable: true
+    type: attribute_5
+    hidden_dim: 64
+    require_initialized_in_input: true
+    include_visible_now: true
+    bind_with_mask_update: true
+    min_gate:
+      means: 0.03
+      scales: 0.03
+      quat: 0.01
+      opacity: 0.05
+      sh: 0.05
+    init_bias:
+      means: -1.40
+      scales: -1.70
+      quat: -2.00
+      opacity: -0.40
+      sh: 0.40
+    branch_bias:
+      bg:
+        means: 0.0
+        scales: 0.0
+        quat: -0.2
+        opacity: 0.0
+        sh: 0.1
+      distant:
+        means: -1.0
+        scales: -0.3
+        quat: -1.0
+        opacity: 0.0
+        sh: 0.0
+      rigid_in:
+        means: -0.2
+        scales: -0.2
+        quat: -0.3
+        opacity: 0.1
+        sh: 0.2
+      rigid_out:
+        means: -0.8
+        scales: -0.3
+        quat: -0.8
+        opacity: 0.0
+        sh: 0.0
+    hidden_gate:
+      mode: weighted_sum
+      weights:
+        means: 0.2
+        scales: 0.0
+        quat: 0.0
+        opacity: 0.3
+        sh: 0.5
+  branches:
+    bg:
+      src_backproject_support_min: 1e-2
+      enable_selective_update: false
+      freeze_means: false
+      init: {scale_init: {mode: knn, isotropic_log_value: -2.30, knn_k: 8, knn_log_scale_bias: -1.5}, opacity_init: 0.1}
+      limits: {offset_max: 0.1, scale_max: 0.1, omega_max: 0.1, opacity_max: 0.15, sh_dc_max: 0.15, sh_rest_max: 0.08}
+      eta: {means: 1.0, scales: 1.0, opacity: 1.0, sh_dc: 1.0, sh_rest: 1.0}
+      mlp: {hidden_dim: 64, use_3d_feat: true, use_2d_feat: true}
+    distant:
+      src_backproject_support_min: 1e-2
+      enable_selective_update: false
+      freeze_means: true
+      init: {scale_init: {mode: isotropic, isotropic_log_value: -1.70, knn_k: 8, knn_log_scale_bias: -1.2}, opacity_init: 0.05}
+      limits: {offset_max: 0.02, scale_max: 0.08, omega_max: 0.01, opacity_max: 0.08, sh_dc_max: 0.12, sh_rest_max: 0.03}
+      eta: {means: 0.2, scales: 0.7, opacity: 0.8, sh_dc: 1.0, sh_rest: 0.6}
+      mlp: {hidden_dim: 64, use_3d_feat: false, use_2d_feat: true, freeze_quat: true}
+    rigid:
+      src_backproject_support_min: 1e-2
+      init: {scale_init: {mode: knn, isotropic_log_value: -2.90, knn_k: 8, knn_log_scale_bias: -1.5}, opacity_init: 0.2}
+      eta: {means: 0.5, scales: 0.8, opacity: 1.0, sh_dc: 1.0, sh_rest: 0.6}
+
+current_observation:
+  enable: true
+  dim: 2
+  rho_source: feature
+  eps: 1.0e-6
+  input_to_struct_decoder: true
+  input_to_far_mlp: true
+  input_to_gru: true
+  input_to_history_gate: true
+  record_to_history_memory: false
+  debug:
+    log_stats: true
+    log_interval_steps: 50
+
+feature_splat_uncertainty:
+  # Stage5_5 auxiliary branch. It does two things:
+  # 1) calibration/residual head: predict nearby render error size and RGB correction direction from feature splats.
+  # 2) bridge loss: only where confidence is high, apply a small live-render photometric loss to improve nearby views.
+  enable: true
+  mode: predict_l1_residual  # current supported mode: scalar L1 error + optional RGB residual head.
+
+  target:
+    max_targets_per_step: 1      # number of auxiliary nearby target views sampled per train step.
+    every_n_steps: 1             # run this aux branch every N optimizer steps; 1 means every step.
+    skip_if_no_valid_aux: true   # skip cleanly when the batch has no valid auxiliary target.
+
+  splat:
+    eps: 1.0e-6                  # numerical epsilon used in feature splat normalization.
+    detach_geometry: true        # feature-splat supervision does not update Gaussian geometry through splat weights.
+    detach_alpha_weights: true   # support/alpha weights are treated as fixed context for the aux head.
+    detach_render_context: true  # render used as head input/target is detached; bridge below separately uses live render.
+    src_support_min:
+      # Minimum source-view support for each Gaussian group before its feature is considered source-observed.
+      bg: 1.0e-2
+      distant: 1.0e-2
+      rigid: 1.0e-2
+    support_min_for_extra_loss: 1.0e-4  # threshold for the extra supported-region calibration/residual terms.
+
+  head:
+    hidden_dim: 64               # trunk width for the shared aux head.
+    error_max: 0.5               # scalar error prediction range: e_pred in [0, error_max].
+    residual_max: 0.5            # RGB residual range: r_pred in [-residual_max, residual_max].
+    predict_rgb_residual: true   # add RGB residual head; target is gt - detached_render, not used to patch render in training.
+    use_render_rgb: true         # concatenate detached nearby render RGB as head input context.
+    use_render_alpha: true       # concatenate detached render alpha as head input context.
+    concat_log_support: true     # add log(1 + support) channel; helps separate weak from strong splat support.
+    concat_valid_mask: true      # add valid-loss mask channel so the head can see ignored pixels.
+    zero_invalid_input: true     # zero head inputs outside the valid aux mask.
+    render_context_dropout: 0.3  # randomly drop render RGB/alpha context so the head cannot depend on it completely.
+
+  loss:
+    all_valid_weight: 0.03                 # scalar error-head loss over all valid aux pixels.
+    supported_region_weight: 0.05          # extra scalar error-head loss only where feature support is high enough.
+    rgb_residual_weight: 0.02              # RGB residual-head loss over all valid aux pixels.
+    rgb_residual_supported_weight: 0.03    # extra RGB residual-head loss in supported regions.
+    warmup_steps: 3000                     # linearly ramps the aux-head loss scale.
+    start_weight_scale: 0.0                # aux-head loss scale at warmup start.
+    end_weight_scale: 0.7                  # aux-head loss scale after warmup.
+    mask_sky: true                         # exclude sky from aux-head losses when sky mask exists.
+    mask_egocar: true                      # exclude ego-car pixels from aux-head losses when ego mask exists.
+    min_valid_pixel_ratio: 0.03            # skip aux target if too few pixels remain after masking.
+    skip_empty_supported_loss: true        # do not add supported-region loss when no supported pixels exist.
+
+  bridge:
+    # Bridge is the risky part: it backpropagates through the live nearby render, but only in low-error/high-support regions.
+    enable: true
+    start_after_steps: 10000   # delay until the uncertainty/residual head has basic calibration.
+    warmup_steps: 5000         # linearly ramps bridge from 0 to weight.
+    weight: 0.03               # multiplier on normalized weighted nearby-render L1.
+    max_weight: 0.3            # hard clamp for the scheduled bridge weight.
+
+    error_confidence:
+      mode: exp                # exp means confidence = exp(-predicted_error / tau).
+      tau: 0.15                # smaller tau makes high predicted error shut off bridge faster.
+      min_conf: 0.0
+      max_conf: 1.0
+
+    support_confidence:
+      mode: soft               # soft means support / (support + tau), optionally powered by gamma.
+      tau: 1.0e-4
+      gamma: 0.5               # <1 softens the penalty for medium support.
+      hard_min: 1.0e-5         # used by hard mode, and as a lower gate when configured in code paths that need it.
+
+    mask:
+      use_valid_loss_mask: true      # start from the same valid-pixel mask as aux-head loss.
+      mask_sky: true                 # remove sky from live bridge supervision.
+      mask_egocar: true              # remove ego-car pixels from live bridge supervision.
+      mask_dynamic: false            # keep false unless adjacent-frame dynamic objects dominate bridge loss.
+      require_render_alpha: true     # require current live render to have enough opacity/coverage.
+      render_alpha_min: 0.02
+      min_effective_pixel_ratio: 0.005  # skip bridge target if confidence*mask activates too few pixels.
+
+    loss:
+      type: l1                       # l1 or charbonnier per-pixel RGB loss.
+      normalize_by_weight_sum: true  # normalize by active bridge weight sum, not full image size.
+      detach_confidence: true        # confidence cannot learn to escape bridge loss.
+      detach_mask: true              # masks are gates only, not trainable paths.
+      rgb_reduce: mean               # average RGB channels before spatial weighting.
+
+    grad:
+      # v1 supports the default live-render gradient path. Setting these allow_* flags false is rejected in code.
+      allow_geometry_grad: true
+      allow_color_grad: true
+      allow_feature_extractor_grad: true
+      stopgrad_uncertainty_head_from_bridge: true
+
+    debug:
+      log_interval: 100              # scalar bridge debug log cadence.
+      save_maps_interval: 1000       # extra bridge map dump cadence under log_dir/images/aux_bridge/.
+
+  debug:
+    no_render_probe: true            # periodically compare aux head with vs without render context.
+    no_render_probe_interval: 500
+
+
+training_recipe:
+  name: stage5_5_adamw_warmcos_v1
+
+losses:
+  photometric:
+    exclude_sky_region: true
+  rgb: {w: 1.0}
+  ssim: {w: 0.05}
+  mask: {w: 0.02, opacity_loss_type: bce, require_sky_mask: true}
+  opacity_entropy: {w: 0.0}
+  target_view_weights:
+    enable: true
+    normalize_by_weight_sum: true
+    source:
+      weight: 1.0
+    visited:
+      weight: 0.7
+
+optimizer:
+  type: adamw
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 1.0e-4
+  filter_frozen: true
+  no_weight_decay:
+    enable: true
+    name_keywords:
+      - ".bias"
+      - "bias"
+      - "norm"
+      - "Norm"
+      - "ln"
+      - "LayerNorm"
+      - "embedding"
+      - "Embedding"
+    ndim_leq: 1
+  groups:
+    dino:
+      match:
+        prefixes:
+          - "image_feature_extractor.dino_adapter.backbone"
+      lr: 0.0
+      weight_decay: 0.0
+    residual_unet:
+      match:
+        prefixes:
+          - "image_feature_extractor.residual"
+          - "image_feature_extractor.residual_unet"
+      lr: 1.0e-4
+      weight_decay: 1.0e-4
+    fusion_neck:
+      match:
+        prefixes:
+          - "image_feature_extractor.fusion"
+          - "image_feature_extractor.fusion_neck"
+      lr: 1.5e-4
+      weight_decay: 1.0e-4
+    struct_near_xcpe:
+      match:
+        prefixes:
+          - "struct_decoder.near_decoder"
+      lr: 1.5e-4
+      weight_decay: 1.0e-4
+    struct_far_mlp:
+      match:
+        prefixes:
+          - "struct_decoder.far_decoder"
+      lr: 1.0e-4
+      weight_decay: 1.0e-4
+    gate_history:
+      match:
+        prefixes:
+          - "stage5_2_history_proj"
+          - "stage5_2_gate_branch_embed"
+          - "stage5_2_gate_mlp"
+      lr: 5.0e-5
+      weight_decay: 0.0
+    recurrent_update:
+      match:
+        contains:
+          - "offset_gru"
+          - "mlp_offset"
+          - "mlp_conv"
+          - "mlp_opacity"
+          - "gaussion_decoder"
+          - "gaussian_decoder"
+      lr: 8.0e-5
+      weight_decay: 5.0e-5
+    default:
+      lr: 1.0e-4
+      weight_decay: 1.0e-4
+
+lr_scheduler:
+  enable: true
+  type: cosine
+  interval: step
+  total_steps: ${training.max_iterations}
+  min_lr_ratio: 0.05
+
+training:
+  max_iterations: 3000010
+  log_interval: 100
+  save_checkpoint_freq: 10000
+  seed: 41
+  amp:
+    enable: false
+    dtype: fp16
+  grad_clip:
+    enable: true
+    max_norm: 1.0
+    norm_type: 2.0
+  bad_step:
+    policy: fast_fail
+    fail_on_nonfinite_loss: true
+    fail_on_nonfinite_grad: true
+    fail_on_amp_overflow: false
+    fail_on_grad_norm_gt: 100.0
+
+eval:
+  enable_psnr: true
+  save_train_views_psnr_below: null
+  run_test_at_end: false
+
+logging:
+  output_root: /root/autodl-tmp/outputs
+  project: minimal_sf_stage5_5_multi_scene_v8_adamw_warmcos
+  log_dir: null
+  image_interval_blocks: 300
+  train_monitor:
+    enable_heavy_metrics: false
+    include_per_view_metrics: true
+    include_extra_result_metrics: false
+    enable_low_psnr_image_dump: false
+  low_psnr_train_images_subdir: train_low_psnr
+  enable_jsonl_metrics: true
+  metrics_history_append: false
+  use_tensorboard: true
+  offset_monitor:
+    enable: false
+    near_radius_m: 5.0
+    saturation_tanh_threshold: 0.95
+  diagnostics:
+    enable: false
+    interval: 500
+    window_size: 50
+    save_branch_renders: false
+  performance:
+    enable: false
+    phase_timing: false
+    cuda_memory: false
