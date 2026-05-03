@@ -13,9 +13,17 @@ class Stage6TeacherObserveOutput:
 
 
 def build_teacher_observe_input(*, gt_rgb: torch.Tensor, render_rgb: torch.Tensor, use_gt: bool) -> torch.Tensor:
-    if bool(use_gt):
+    if not bool(use_gt):
+        return render_rgb
+    if gt_rgb.dim() != 4 or render_rgb.dim() != 4:
+        raise ValueError("teacher input expects 4D tensors.")
+    if int(gt_rgb.shape[1]) == 3 and int(render_rgb.shape[1]) == 3:
         return torch.cat([gt_rgb, render_rgb], dim=1)
-    return render_rgb
+    if int(gt_rgb.shape[-1]) == 3 and int(render_rgb.shape[-1]) == 3:
+        return torch.cat([gt_rgb, render_rgb], dim=-1)
+    raise ValueError(
+        f"cannot infer teacher input layout: gt={tuple(gt_rgb.shape)}, render={tuple(render_rgb.shape)}"
+    )
 
 
 def build_student_valid_mask(
@@ -33,4 +41,3 @@ def build_student_valid_mask(
     if not_egocar_mask is not None:
         mask = mask & not_egocar_mask.bool()
     return mask.float()
-

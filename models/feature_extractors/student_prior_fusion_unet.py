@@ -60,9 +60,14 @@ class StudentPriorFusionUNet(nn.Module):
             return t
         if expected_channels is not None and int(t.shape[-1]) == int(expected_channels):
             return t.permute(0, 3, 1, 2).contiguous()
-        if int(t.shape[1]) <= 8:
-            return t
-        return t.permute(0, 3, 1, 2).contiguous()
+        if expected_channels is None:
+            raise ValueError(
+                "StudentPriorFusionUNet requires expected_channels to infer NCHW/NHWC layout."
+            )
+        raise ValueError(
+            "StudentPriorFusionUNet cannot infer tensor layout: "
+            f"expected_channels={int(expected_channels)} shape={tuple(t.shape)}"
+        )
 
     def forward(
         self,

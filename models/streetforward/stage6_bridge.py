@@ -53,6 +53,8 @@ def update_teacher_prior_cache_detached(
 ) -> None:
     """Persistent cache writer. Always detach to prevent cross-step graph retention."""
 
+    if int(cache.bg.feat.shape[-1]) != int(feat_bg.shape[-1]):
+        raise ValueError("teacher prior bg feat dim mismatch.")
     bg_valid = acc_bg > float(support_min_bg)
     cache.bg.feat[bg_valid] = feat_bg[bg_valid].detach().float()
     cache.bg.support[bg_valid] = acc_bg[bg_valid].detach().float()
@@ -60,12 +62,23 @@ def update_teacher_prior_cache_detached(
     cache.bg.last_update_step[bg_valid] = int(global_step)
 
     if feat_distant is not None and acc_distant is not None and int(feat_distant.shape[0]) > 0:
+        if int(cache.distant.feat.shape[-1]) != int(feat_distant.shape[-1]):
+            raise ValueError("teacher prior distant feat dim mismatch.")
         distant_valid = acc_distant > float(support_min_distant)
         cache.distant.feat[distant_valid] = feat_distant[distant_valid].detach().float()
         cache.distant.support[distant_valid] = acc_distant[distant_valid].detach().float()
         cache.distant.valid[distant_valid] = True
         cache.distant.last_update_step[distant_valid] = int(global_step)
 
+    if feat_rigid is not None:
+        if rigid_idx is None:
+            raise ValueError("rigid_idx is required when updating rigid teacher prior.")
+        if acc_rigid is None:
+            raise ValueError("acc_rigid is required when updating rigid teacher prior.")
+        if int(rigid_idx.numel()) != int(feat_rigid.shape[0]):
+            raise ValueError("rigid_idx length must match feat_rigid rows.")
+        if int(cache.rigid.feat.shape[-1]) != int(feat_rigid.shape[-1]):
+            raise ValueError("teacher prior rigid feat dim mismatch.")
     if feat_rigid is not None and acc_rigid is not None and int(feat_rigid.shape[0]) > 0:
         rigid_valid_s = acc_rigid > float(support_min_rigid)
         rigid_local_idx = rigid_idx[rigid_valid_s]
@@ -73,4 +86,3 @@ def update_teacher_prior_cache_detached(
         cache.rigid.support[rigid_local_idx] = acc_rigid[rigid_valid_s].detach().float()
         cache.rigid.valid[rigid_local_idx] = True
         cache.rigid.last_update_step[rigid_local_idx] = int(global_step)
-

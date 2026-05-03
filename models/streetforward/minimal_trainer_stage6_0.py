@@ -11,8 +11,6 @@ from models.streetforward.minimal_trainer_stage4_6 import RigidRoute
 from models.streetforward.minimal_trainer_stage5_4 import MinimalStreetForwardStage5_4
 from models.streetforward.node_states import NodeStateBackground, NodeStateDistant, NodeStateRigid
 from models.streetforward.stage6_bridge import TeacherPriorAdapter, update_teacher_prior_cache_detached
-from models.streetforward.stage6_losses import aggregate_stage6_total_loss
-from models.streetforward.stage6_student import apply_student_valid_mask
 from models.streetforward.teacher_student_prior import TeacherPriorCache, create_teacher_prior_cache
 
 
@@ -27,21 +25,18 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         self._stage6_role_fallback: bool = False
         super().__init__(config=config, device=device, **kwargs)
 
-        sv10 = self._cfg_get(config, "scheduler_v10", {})
-        targets = self._cfg_get(sv10, "targets", {})
-        weights = self._cfg_get(targets, "weights", {})
-        self._scheduler_v10_target_weights = {
-            "teacher_source": float(self._cfg_get(weights, "teacher_source", 1.0)),
-            "student_source": float(self._cfg_get(weights, "student_source", 1.0)),
-            "teacher_anchor": float(self._cfg_get(weights, "teacher_anchor", 0.1)),
-            "history_visited": float(self._cfg_get(weights, "history_visited", 0.1)),
-            "probe_near": float(self._cfg_get(weights, "probe_near", 0.0)),
+        stage6_losses = self._cfg_get(self._cfg_get(config, "losses", {}) or {}, "stage6_0", {}) or {}
+        self_loss_cfg = self._cfg_get(stage6_losses, "self", {}) or {}
+        teacher_anchor_cfg = self._cfg_get(stage6_losses, "teacher_anchor", {}) or {}
+        history_cfg = self._cfg_get(stage6_losses, "history", {}) or {}
+        probe_near_cfg = self._cfg_get(self._cfg_get(stage6_losses, "probe", {}) or {}, "near", {}) or {}
+        self._stage6_domain_loss_weights = {
+            "teacher_source": float(self._cfg_get(self_loss_cfg, "teacher_source_weight", 0.2)),
+            "student_source": float(self._cfg_get(self_loss_cfg, "student_source_weight", 1.0)),
+            "teacher_anchor": float(self._cfg_get(teacher_anchor_cfg, "weight", 0.05)),
+            "history_visited": float(self._cfg_get(history_cfg, "visited_weight", 0.0)),
+            "probe_near": float(self._cfg_get(probe_near_cfg, "loss_weight", 0.0)),
         }
-        stage6_losses = self._cfg_get(self._cfg_get(config, "losses", {}), "stage6_0", {}) or {}
-        self._stage6_loss_w_self_teacher = float(self._cfg_get(self._cfg_get(stage6_losses, "self", {}), "teacher_weight", 0.2))
-        self._stage6_loss_w_self_student = float(self._cfg_get(self._cfg_get(stage6_losses, "self", {}), "student_weight", 1.0))
-        self._stage6_loss_w_teacher_anchor = float(self._cfg_get(self._cfg_get(stage6_losses, "teacher_anchor", {}), "weight", 0.1))
-        self._stage6_loss_w_history = float(self._cfg_get(self._cfg_get(stage6_losses, "history", {}), "visited_weight", 0.1))
 
     @staticmethod
     def _cfg_get(node: Any, key: str, default: Any) -> Any:
@@ -109,15 +104,23 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         forbidden_loss = self._contains_forbidden_key(stage6_losses, forbidden)
         if forbidden_loss is not None:
             raise ValueError(f"Stage6_0 losses forbid '{forbidden_loss}'.")
+        target_view_weights = self._cfg_get(losses_cfg, "target_view_weights", {}) or {}
+        if bool(self._cfg_get(target_view_weights, "enable", False)):
+            raise ValueError(
+                "Stage6_0 forbids generic losses.target_view_weights. "
+                "Use losses.stage6_0.{self,teacher_anchor,history,probe}."
+            )
+        self_loss_cfg = self._cfg_get(stage6_losses, "self", {}) or {}
+        if self._cfg_get(self_loss_cfg, "teacher_weight", None) is not None:
+            raise ValueError("Stage6_0 losses.self.teacher_weight was renamed to teacher_source_weight.")
+        if self._cfg_get(self_loss_cfg, "student_weight", None) is not None:
+            raise ValueError("Stage6_0 losses.self.student_weight was renamed to student_source_weight.")
 
         bridge_cfg = self._require_key(stage6_cfg, "bridge", "stage6_0")
         live_cfg = self._require_key(bridge_cfg, "live", "stage6_0.bridge")
         cache_cfg = self._require_key(bridge_cfg, "cache", "stage6_0.bridge")
-        valid_mask_cfg = self._require_key(
-            self._require_key(stage6_cfg, "student", "stage6_0"),
-            "valid_mask",
-            "stage6_0.student",
-        )
+        student_cfg = self._require_key(stage6_cfg, "student", "stage6_0")
+        valid_mask_cfg = self._require_key(student_cfg, "valid_mask", "stage6_0.student")
 
         if bool(self._cfg_get(live_cfg, "enable", False)) and not bool(
             self._cfg_get(live_cfg, "rerun_teacher_2d_current_step", False)
@@ -129,14 +132,48 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             raise ValueError("Stage6_0 requires student.valid_mask.apply_before_unet=true.")
         if bool(self._cfg_get(valid_mask_cfg, "append_as_channel", False)) is not True:
             raise ValueError("Stage6_0 requires student.valid_mask.append_as_channel=true.")
+        if bool(self._cfg_get(student_cfg, "input_history_context", False)):
+            raise ValueError("Stage6_0 student.input_history_context is not implemented yet.")
+        if bool(self._cfg_get(valid_mask_cfg, "mask_history_context", False)):
+            raise ValueError(
+                "Stage6_0 student.valid_mask.mask_history_context must be false until history context is wired."
+            )
 
         probe_near_cfg = self._cfg_get(self._cfg_get(stage6_losses, "probe", {}), "near", {}) or {}
         near_loss_weight = float(self._cfg_get(probe_near_cfg, "loss_weight", 0.0))
         phase = str(self._cfg_get(stage6_cfg, "phase", "default"))
         if near_loss_weight != 0.0 and phase != "explicit_near_training":
             raise ValueError("Stage6_0 requires probe.near.loss_weight=0 unless phase=explicit_near_training.")
+        if self._cfg_get(scheduler_v10, "targets", None) is not None:
+            raise ValueError("Stage6_0 forbids scheduler_v10.targets.weights; use losses.stage6_0 only.")
         if phase == "warmup" and bool(self._cfg_get(live_cfg, "student_loss_to_teacher_backbone", False)):
             raise ValueError("Stage6_0 warmup forbids student_loss_to_teacher_backbone=true.")
+
+    def _normalize_stage6_step_request(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+        meta = batch.get("request_meta") or {}
+        teacher_obs = dict(self._cfg_get(meta, "teacher_obs", {}) or {})
+        student_prop = dict(self._cfg_get(meta, "student_prop", {}) or {})
+        supervision = dict(self._cfg_get(meta, "supervision", {}) or {})
+        # Backward compatibility with scheduler_request_v10 nested block.
+        if not teacher_obs or not student_prop:
+            req_v10 = dict(self._cfg_get(meta, "scheduler_request_v10", {}) or {})
+            teacher_obs = dict(self._cfg_get(req_v10, "teacher_obs", {}) or {})
+            student_prop = dict(self._cfg_get(req_v10, "student_prop", {}) or {})
+            live = dict(self._cfg_get(req_v10, "live_teacher_bridge", {}) or {})
+            if bool(live.get("enable", False)):
+                teacher_obs["enable"] = True
+                teacher_obs["purpose"] = "live_bridge"
+                teacher_obs["frame_idx"] = int(live.get("frame_idx", teacher_obs.get("frame_idx", -1)))
+                teacher_obs["image_refs"] = list(live.get("image_refs") or teacher_obs.get("image_refs") or [])
+                teacher_obs["update_teacher_prior_cache"] = False
+                teacher_obs["update_state"] = False
+                teacher_obs["update_observed_history"] = False
+                teacher_obs["update_runtime_history"] = False
+        return {
+            "teacher_obs": teacher_obs,
+            "student_prop": student_prop,
+            "supervision": supervision,
+        }
 
     def _init_stage5_3_modules(self, config) -> None:
         super()._init_stage5_3_modules(config)
@@ -162,6 +199,12 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         self.stage6_live_enable = bool(self._cfg_get(live_cfg, "enable", True))
         self.stage6_live_rerun_teacher_2d = bool(self._cfg_get(live_cfg, "rerun_teacher_2d_current_step", True))
         self.stage6_live_to_teacher_backbone = bool(self._cfg_get(live_cfg, "student_loss_to_teacher_backbone", False))
+        self.stage6_live_detach_geometry = bool(self._cfg_get(live_cfg, "detach_geometry", True))
+        self.stage6_live_detach_opacity = bool(self._cfg_get(live_cfg, "detach_opacity", True))
+        self.stage6_live_require_on_student = bool(self._cfg_get(live_cfg, "require_on_student", False))
+        self.stage6_student_input_history_context = bool(self._cfg_get(student_cfg, "input_history_context", False))
+        if self.stage6_student_input_history_context:
+            raise ValueError("Stage6_0 student.input_history_context is not implemented yet.")
         self.stage6_cache_detach_write = bool(self._cfg_get(cache_cfg, "detach_write", True))
         self.stage6_cache_detach_read = bool(self._cfg_get(cache_cfg, "detach_read", True))
         self.stage6_student_append_valid_mask = bool(self._cfg_get(valid_mask_cfg, "append_as_channel", True))
@@ -209,8 +252,13 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         return False
 
     def _get_stage6_role(self, *, batch: Dict[str, Any], cache: TeacherPriorCache, route: RigidRoute) -> str:
-        meta = batch.get("request_meta") or {}
-        requested_role = str(meta.get("stage6_role", meta.get("stage5_5_role", "teacher"))).strip().lower()
+        req = self._normalize_stage6_step_request(batch)
+        student_prop = req.get("student_prop") or {}
+        if "enable" in student_prop:
+            requested_role = "student" if bool(student_prop.get("enable", False)) else "teacher"
+        else:
+            meta = batch.get("request_meta") or {}
+            requested_role = str(meta.get("stage6_role", meta.get("stage5_5_role", "teacher"))).strip().lower()
         if requested_role not in {"teacher", "student"}:
             raise ValueError(f"Unknown Stage6_0 role: {requested_role}")
         role = requested_role
@@ -331,11 +379,21 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             ks_list.append(km.to(device=self.device))
         viewmats = torch.cat(viewmats_list, dim=0)
         Ks = torch.stack(ks_list, dim=0)
+        means = gaussians_scene["means"]
+        quats = gaussians_scene["quats"]
+        scales = gaussians_scene["scales"]
+        opacities = gaussians_scene["opacities"]
+        if bool(getattr(self, "stage6_live_detach_geometry", True)):
+            means = means.detach()
+            quats = quats.detach()
+            scales = scales.detach()
+        if bool(getattr(self, "stage6_live_detach_opacity", True)):
+            opacities = opacities.detach()
         rendered, _, _ = self.renderer(
-            means=gaussians_scene["means"],
-            quats=gaussians_scene["quats"],
-            scales=gaussians_scene["scales"],
-            opacities=gaussians_scene["opacities"],
+            means=means,
+            quats=quats,
+            scales=scales,
+            opacities=opacities,
             colors=packed,
             viewmats=viewmats,
             Ks=Ks,
@@ -389,13 +447,38 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             width=width,
         )
 
-    def _apply_teacher_prior_adapter(self, prior_map: torch.Tensor) -> torch.Tensor:
+    def _apply_teacher_prior_adapter(self, prior_map: torch.Tensor, *, layout: Optional[str] = None) -> torch.Tensor:
         if prior_map.dim() != 4:
             raise ValueError(f"Stage6_0 prior_map must be 4D, got {tuple(prior_map.shape)}")
-        was_nhwc = int(prior_map.shape[-1]) == int(self.stage6_prior_dim)
+        if layout is None:
+            is_nhwc = int(prior_map.shape[-1]) == int(self.stage6_prior_dim)
+            is_nchw = int(prior_map.shape[1]) == int(self.stage6_prior_dim)
+            if is_nhwc and not is_nchw:
+                layout = "nhwc"
+            elif is_nchw and not is_nhwc:
+                layout = "nchw"
+            elif is_nhwc and is_nchw:
+                raise ValueError(f"ambiguous teacher prior adapter layout for shape={tuple(prior_map.shape)}")
+            else:
+                raise ValueError(f"cannot infer teacher prior adapter layout for shape={tuple(prior_map.shape)}")
+        if layout not in {"nhwc", "nchw"}:
+            raise ValueError(f"unsupported teacher prior adapter layout={layout!r}")
+        was_nhwc = layout == "nhwc"
         x = prior_map.permute(0, 3, 1, 2).contiguous() if was_nhwc else prior_map
         y = self.stage6_teacher_prior_adapter(x)
         return y.permute(0, 2, 3, 1).contiguous() if was_nhwc else y
+
+    def _enforce_live_bridge_requirement(self, *, role: str, live_used: bool) -> None:
+        if (
+            str(role) == "student"
+            and bool(getattr(self, "stage6_live_enable", True))
+            and bool(getattr(self, "stage6_live_require_on_student", False))
+            and not bool(live_used)
+        ):
+            raise RuntimeError(
+                "Stage6_0 live bridge required on student step, "
+                "but no teacher live inputs were available."
+            )
 
     def _update_teacher_prior_cache(
         self,
@@ -435,11 +518,17 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         targets = list(batch.get("targets") or [])
         if len(targets) == 0:
             return [], [], None, None
-        meta = batch.get("request_meta") or {}
-        req_v10 = meta.get("scheduler_request_v10") or {}
-        live_req = req_v10.get("live_teacher_bridge") or {}
-        refs = [tuple(x) for x in list(live_req.get("image_refs") or [])]
-        frame_idx = int(live_req.get("frame_idx", -1))
+        req = self._normalize_stage6_step_request(batch)
+        teacher_obs = req.get("teacher_obs") or {}
+        use_live = bool(teacher_obs.get("enable", False)) and str(teacher_obs.get("purpose", "train_update")) == "live_bridge"
+        refs = [tuple(x) for x in list(teacher_obs.get("image_refs") or [])] if use_live else []
+        frame_idx = int(teacher_obs.get("frame_idx", -1)) if use_live else -1
+        if not use_live:
+            meta = batch.get("request_meta") or {}
+            req_v10 = meta.get("scheduler_request_v10") or {}
+            live_req = req_v10.get("live_teacher_bridge") or {}
+            refs = [tuple(x) for x in list(live_req.get("image_refs") or [])]
+            frame_idx = int(live_req.get("frame_idx", -1))
         selected: List[Dict[str, Any]] = []
         if len(refs) > 0:
             refs_set = {(int(f), int(c)) for f, c in refs}
@@ -520,8 +609,9 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             dtype=torch.float32,
         )
         role = self._get_stage6_role(batch=batch, cache=cache, route=route)
-        meta = batch.get("request_meta") or {}
-        req_v10 = meta.get("scheduler_request_v10") or {}
+        req_struct = self._normalize_stage6_step_request(batch)
+        teacher_obs_req = req_struct.get("teacher_obs") or {}
+        student_prop_req = req_struct.get("student_prop") or {}
         prior_conf_map = None
         live_used = False
         cache_fallback = False
@@ -532,8 +622,10 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         else:
             prior_map = None
             if self.stage6_live_enable and self.stage6_live_rerun_teacher_2d:
-                live_req = req_v10.get("live_teacher_bridge") or {}
-                if bool(live_req.get("enable", False)):
+                live_req_enable = bool(teacher_obs_req.get("enable", False)) and str(
+                    teacher_obs_req.get("purpose", "train_update")
+                ) == "live_bridge"
+                if live_req_enable:
                     tv, ti, tsky, tego = self._extract_teacher_live_inputs_from_targets(batch=batch)
                     if len(tv) > 0:
                         teacher_scene_rgbs, _ = self.alpha_t_extractor.render_rgb_only(
@@ -552,6 +644,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                         teacher_feat_2d = self.image_feature_extractor(feat_input_teacher)
                         if not self.stage6_live_to_teacher_backbone:
                             teacher_feat_2d = teacher_feat_2d.detach()
+                        teacher_feat_2d = self._apply_teacher_prior_adapter(teacher_feat_2d, layout="nhwc")
                         teacher_pair_valid_mask = self._build_source_pair_valid_mask(
                             source_images=ti,
                             source_sky_masks=tsky,
@@ -605,9 +698,9 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                                 height=int(height),
                                 width=int(width),
                             )
-                            prior_map = self._apply_teacher_prior_adapter(prior_map)
                             live_used = True
             if prior_map is None:
+                self._enforce_live_bridge_requirement(role=role, live_used=live_used)
                 prior_map, prior_conf_map = self._render_teacher_prior_to_source_view(
                     cache=cache,
                     route=route,
@@ -625,13 +718,6 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             )
             valid_mask = source_pair_valid_mask.unsqueeze(-1)
             if self.stage6_student_apply_mask_before_unet:
-                _ = apply_student_valid_mask(
-                    render_rgb=scene_rgb_batch.detach(),
-                    prior_map=prior_map,
-                    prior_conf=prior_conf_map if prior_conf_map is not None else torch.zeros_like(valid_mask),
-                    valid_mask=valid_mask,
-                    append_as_channel=bool(self.stage6_student_append_valid_mask),
-                )
                 scene_rgb_masked = scene_rgb_batch.detach() * valid_mask
                 prior_map_masked = prior_map * valid_mask
                 prior_conf_masked = prior_conf_map * valid_mask if prior_conf_map is not None else None
@@ -680,7 +766,10 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         feat_2d_rigid_s = feat_2d_all[start : start + num_rigid_s] if num_rigid_s > 0 else None
         acc_w_rigid_s = acc_w_all[start : start + num_rigid_s] if num_rigid_s > 0 else None
 
-        if role == "teacher":
+        allow_teacher_cache_update = bool(
+            teacher_obs_req.get("update_teacher_prior_cache", role == "teacher")
+        )
+        if role == "teacher" and allow_teacher_cache_update:
             self._update_teacher_prior_cache(
                 cache=cache,
                 feat_bg=feat_2d_bg,
@@ -722,15 +811,15 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
 
     def _target_role_weight(self, role: str, step: int) -> float:
         if role in {"teacher_source", "teacher_self"}:
-            return float(self._scheduler_v10_target_weights["teacher_source"])
+            return float(self._stage6_domain_loss_weights["teacher_source"])
         if role in {"student_source", "student_self"}:
-            return float(self._scheduler_v10_target_weights["student_source"])
+            return float(self._stage6_domain_loss_weights["student_source"])
         if role == "teacher_anchor":
-            return float(self._scheduler_v10_target_weights["teacher_anchor"])
+            return float(self._stage6_domain_loss_weights["teacher_anchor"])
         if role == "history_visited":
-            return float(self._scheduler_v10_target_weights["history_visited"])
+            return float(self._stage6_domain_loss_weights["history_visited"])
         if role == "probe_near":
-            return float(self._scheduler_v10_target_weights["probe_near"])
+            return float(self._stage6_domain_loss_weights["probe_near"])
         return super()._target_role_weight(role=role, step=step)
 
     def _build_target_view_weights(
@@ -743,36 +832,71 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         meta = batch.get("request_meta") or {}
         scheduler_version = str(meta.get("scheduler_version", "")).strip().lower()
         if scheduler_version in {"v10", "v9"}:
-            weights = [float(x) for x in list(meta.get("train_target_image_loss_base_weights") or meta.get("target_image_loss_base_weights") or [])]
+            sup = self._cfg_get(meta, "supervision", {}) or {}
+            if isinstance(sup, dict) and len(sup) > 0:
+                ordered_refs = list(meta.get("target_image_refs") or [])
+                role_by_ref: Dict[Tuple[int, int], str] = {}
+                for role_key, domain_role in (
+                    ("self_teacher", "teacher_source"),
+                    ("self_student", "student_source"),
+                    ("teacher_anchor", "teacher_anchor"),
+                    ("history_visited", "history_visited"),
+                    ("probe_near", "probe_near"),
+                ):
+                    domain = self._cfg_get(sup, role_key, {}) or {}
+                    if not bool(self._cfg_get(domain, "enable", False)):
+                        continue
+                    for ref in list(self._cfg_get(domain, "image_refs", []) or []):
+                        role_by_ref[(int(ref[0]), int(ref[1]))] = str(domain_role)
+                if len(role_by_ref) > 0 and len(ordered_refs) == int(num_targets):
+                    roles = [str(role_by_ref.get((int(r[0]), int(r[1])), "student_source")) for r in ordered_refs]
+                    weights = [float(self._target_role_weight(role, int(step))) for role in roles]
+                    return torch.tensor(weights, dtype=torch.float32, device=self.device), roles
             roles = [str(x) for x in list(meta.get("train_target_image_roles") or meta.get("target_image_roles") or [])]
             refs = list(meta.get("train_target_image_refs") or meta.get("target_image_refs") or [])
-            if len(weights) == int(num_targets) and len(roles) == int(num_targets) and len(refs) == int(num_targets):
+            if len(roles) == int(num_targets) and len(refs) == int(num_targets):
+                weights = [float(self._target_role_weight(role, int(step))) for role in roles]
                 return torch.tensor(weights, dtype=torch.float32, device=self.device), roles
         return super()._build_target_view_weights(batch=batch, step=int(step), num_targets=int(num_targets))
 
     def forward(self, batch: Dict[str, Any]) -> Dict[str, Any]:
         self._stage6_active_batch = batch
-        out = super().forward(batch=batch)
-        self._stage6_active_batch = None
-        if torch.is_tensor(out.get("loss")):
-            z = torch.zeros_like(out["loss"])
-            stage6_loss = aggregate_stage6_total_loss(
-                self_teacher=z,
-                self_student=out["loss"],
-                teacher_anchor=z,
-                history=z,
-                w_self_teacher=float(self._stage6_loss_w_self_teacher),
-                w_self_student=float(self._stage6_loss_w_self_student),
-                w_teacher_anchor=float(self._stage6_loss_w_teacher_anchor),
-                w_history=float(self._stage6_loss_w_history),
-            )
-            out["loss"] = stage6_loss.total_train
+        try:
+            out = super().forward(batch=batch)
+        finally:
+            self._stage6_active_batch = None
         meta = batch.get("request_meta") or {}
-        role = str(meta.get("stage6_role", meta.get("stage5_5_role", "teacher")))
-        out["stage6_0/role_teacher"] = float(1.0 if role == "teacher" else 0.0)
-        out["stage6_0/role_student"] = float(1.0 if role == "student" else 0.0)
-        self._stage6_last_role = role
+        req = self._normalize_stage6_step_request(batch)
+        student_prop = req.get("student_prop") or {}
+        if "enable" in student_prop:
+            requested_role = "student" if bool(student_prop.get("enable", False)) else "teacher"
+        else:
+            requested_role = str(meta.get("stage6_role", meta.get("stage5_5_role", "teacher")))
+        actual_role = str(getattr(self, "_stage6_last_role", requested_role))
+        out["stage6_0/role_requested_teacher"] = float(requested_role == "teacher")
+        out["stage6_0/role_requested_student"] = float(requested_role == "student")
+        out["stage6_0/role_actual_teacher"] = float(actual_role == "teacher")
+        out["stage6_0/role_actual_student"] = float(actual_role == "student")
+        out["stage6_0/role_fallback"] = float(bool(self._stage6_role_fallback))
+        out["scheduler/v10_is_compat_v9"] = float(1.0 if str(meta.get("scheduler_version", "")) == "v10" else 0.0)
+        sup = self._cfg_get(meta, "supervision", {}) or {}
+        probe_domain = self._cfg_get(sup, "probe_near", {}) or {}
+        probe_refs = list(self._cfg_get(probe_domain, "image_refs", []) or meta.get("probe_target_image_refs") or [])
+        target_roles = [str(x) for x in list(meta.get("target_image_roles") or [])]
+        target_weights = [float(x) for x in list(meta.get("target_image_loss_base_weights") or [])]
+        probe_weight_sum = sum(
+            float(w) for role, w in zip(target_roles, target_weights) if str(role) == "probe_near"
+        )
+        out["probe/near/num_targets"] = float(len(probe_refs))
+        out["loss/probe_near_weight_sum"] = float(probe_weight_sum)
         return out
+
+    @staticmethod
+    def _pop_first(d: Dict[str, Any], keys: List[str]) -> Any:
+        for key in keys:
+            if key in d:
+                return d.pop(key)
+        return None
 
     def train_step(
         self,
@@ -789,17 +913,17 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             sync_cuda_timing=sync_cuda_timing,
             scheduler_node_sync=scheduler_node_sync,
         )
-        anchor_l1 = out.pop("monitor/l1/teacher_preserve", None)
+        anchor_l1 = self._pop_first(out, ["monitor/l1/teacher_anchor", "monitor/l1/teacher_preserve"])
         if anchor_l1 is not None:
             out["monitor/l1/teacher_anchor"] = float(anchor_l1)
             out["loss/teacher_anchor"] = float(anchor_l1)
-        anchor_psnr = out.pop("monitor/psnr/teacher_preserve", None)
+        anchor_psnr = self._pop_first(out, ["monitor/psnr/teacher_anchor", "monitor/psnr/teacher_preserve"])
         if anchor_psnr is not None:
             out["monitor/psnr/teacher_anchor"] = float(anchor_psnr)
-        near_l1 = out.pop("monitor/l1/near_random", None)
+        near_l1 = self._pop_first(out, ["monitor/l1/probe_near", "monitor/l1/near_random"])
         if near_l1 is not None:
             out["probe/near/l1"] = float(near_l1)
-        near_psnr = out.pop("monitor/psnr/near_random", None)
+        near_psnr = self._pop_first(out, ["monitor/psnr/probe_near", "monitor/psnr/near_random"])
         if near_psnr is not None:
             out["probe/near/psnr"] = float(near_psnr)
         if "loss" in out and torch.is_tensor(out["loss"]):
@@ -810,4 +934,3 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         out = super().reset_node_state(clear_caches=clear_caches)
         self._stage6_teacher_prior_caches.clear()
         return out
-

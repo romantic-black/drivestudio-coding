@@ -56,3 +56,29 @@ def test_stage6_0_select_trainer_rejects_wrong_scheduler(tmp_path):
     with pytest.raises(ValueError, match="scheduler_v10.enable=true"):
         entry._select_stage6_0_trainer(str(p))
 
+
+def test_stage6_0_base_config_overlay_loader(tmp_path):
+    from tools.train_minimal_streetforward_stage1_1 import _load_config_with_optional_base
+
+    base = tmp_path / "base.yaml"
+    overlay = tmp_path / "overlay.yaml"
+    base.write_text(
+        "model:\n"
+        "  stage: \"5_4\"\n"
+        "  branches:\n"
+        "    bg: {}\n"
+        "optimizer:\n"
+        "  lr: 0.001\n",
+        encoding="utf-8",
+    )
+    overlay.write_text(
+        "base_config_file: base.yaml\n"
+        "model:\n"
+        "  stage: \"6_0\"\n",
+        encoding="utf-8",
+    )
+
+    cfg = _load_config_with_optional_base(str(overlay))
+    assert cfg.model.stage == "6_0"
+    assert "branches" in cfg.model
+    assert float(cfg.optimizer.lr) == 0.001
