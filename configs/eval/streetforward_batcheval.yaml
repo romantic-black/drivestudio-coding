@@ -2,15 +2,13 @@ base_config_file: configs/minimal_streetforward_stage5_4_production_multi_scene_
 
 batch_eval:
   enable: true
-  output_dir: /root/autodl-tmp/outputs/batch_eval_cam0
+  output_dir: /root/autodl-tmp/outputs/batch_eval_long_sequence
   data_mode: segment_finetune_train
 
   checkpoint:
-    path: ""
-    strict: true
-
+    path: "/root/autodl-tmp/outputs/minimal_sf_stage5_4_multi_scene_v8_adamw_warmcos/experiment002_60w_40w_12block_base_on_001/checkpoints/minimal_sf_stage5_4_multi_scene_v8_step50000.pt"
   dataset:
-    scene_ids: [8, 9,14, 16, 24, 32, 40, 99, 107, 115, 123,]
+    scene_ids: [8]
     segment_policy: all
     require_full_window: true
     stride: 20
@@ -19,13 +17,15 @@ batch_eval:
     window_policy: sliding
 
   cameras:
-    ids: [0]
-    names: ["front"]
+    ids: [0, 1, 2]
+    names: ["front", "front_left", "front_right"]
 
   runtime:
-    no_grad: true
+    no_grad: false
     amp: false
     reset_state_per_episode: true
+    restore_checkpoint_on_segment: true
+    align_with_scheduler_v8: true
     update_node_state: true
     update_hidden_state: true
     update_view_transient: true
@@ -36,8 +36,8 @@ batch_eval:
     record_each_step: false
 
   render:
-    save_pre_update: true
-    save_each_iter_views: true
+    save_pre_update: false
+    save_each_iter_views: false
     save_png: true
     save_video: false
     save_numpy: false
@@ -53,14 +53,15 @@ batch_eval:
     min_valid_pixels: 32
 
   experiments:
+
+    - name: exp2_long_sequence
+      sequence_length: 20
+      input_offsets: [0, 2, 4, 6, 8, 10, 12, 14, 16, 18]
+      eval_offsets: all
+      steps_per_input: 12
+
     - name: exp1_single_frame
       sequence_length: 1
       input_offsets: [0]
       eval_offsets: [0]
-      steps_per_input: 8
-
-    - name: exp2_storm20_sparse4
-      sequence_length: 20
-      input_offsets: [0, 5, 10, 15]
-      eval_offsets: all
-      steps_per_input: 8
+      steps_per_input: 12

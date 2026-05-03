@@ -146,6 +146,7 @@ class _FakeModel:
                     "cam_idx": int(cam),
                     "pred_rgb": img,
                     "gt_image": img.clone(),
+                    "sky_mask": torch.zeros((4, 4), dtype=torch.float32),
                 }
             )
         return {"rows": rows}
