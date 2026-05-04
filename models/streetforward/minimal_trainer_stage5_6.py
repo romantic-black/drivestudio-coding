@@ -1078,30 +1078,42 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
         route = out.get("_route")
         rigid_count = int(rigid_order.numel())
         if rigid_world is not None and rigid_count > 0:
-            if route is None or node_state_rigid is None:
-                raise RuntimeError("Stage5_6 feedback rigid pack requires _route and _node_state_rigid.")
-            feat_rigid_s = self._current_or_fused_feature(out, "rigid_s", "_feat_2d_rigid_S")
-            acc_rigid_s = out.get("_acc_w_rigid_S")
-            if feat_rigid_s is None or acc_rigid_s is None:
-                raise RuntimeError("Stage5_6 feedback rigid pack requires source rigid features/support.")
-            n_rigid = int(node_state_rigid.means.shape[0])
-            lookup_s = torch.full((n_rigid,), -1, dtype=torch.long, device=self.device)
-            route_s = route.S.to(device=self.device, dtype=torch.long)
-            if int(route_s.numel()) > 0:
-                lookup_s[route_s] = torch.arange(int(route_s.numel()), dtype=torch.long, device=self.device)
-            rows = lookup_s[rigid_order]
-            observed = rows >= 0
             feat_rigid_ordered = feat_bg.new_zeros((rigid_count, int(feat_bg.shape[1])))
             mask_rigid_ordered = torch.zeros((rigid_count,), dtype=torch.bool, device=self.device)
-            if bool(observed.any().item()):
-                obs_rows = rows[observed]
-                feat_rigid_ordered[observed] = feat_rigid_s[obs_rows].to(
-                    device=feat_rigid_ordered.device,
-                    dtype=feat_rigid_ordered.dtype,
-                )
-                mask_rigid_ordered[observed] = (
-                    acc_rigid_s[obs_rows].to(device=self.device) > float(self.rigid_src_backproject_support_min)
-                )
+            if node_state_rigid is not None:
+                if route is None:
+                    raise RuntimeError("Stage5_6 feedback rigid pack requires _route to align rigid features.")
+                route_s = route.S.to(device=self.device, dtype=torch.long)
+                if int(route_s.numel()) > 0:
+                    feat_rigid_s = self._current_or_fused_feature(out, "rigid_s", "_feat_2d_rigid_S")
+                    acc_rigid_s = out.get("_acc_w_rigid_S")
+                    if feat_rigid_s is None or acc_rigid_s is None:
+                        raise RuntimeError(
+                            "Stage5_6 feedback rigid pack requires source rigid features/support when route.S is non-empty."
+                        )
+                n_rigid = int(node_state_rigid.means.shape[0])
+                lookup_s = torch.full((n_rigid,), -1, dtype=torch.long, device=self.device)
+                lookup_s[route_s] = torch.arange(int(route_s.numel()), dtype=torch.long, device=self.device)
+                rows = lookup_s[rigid_order]
+                observed = rows >= 0
+                if bool(observed.any().item()):
+                    obs_rows = rows[observed]
+                    if bool((obs_rows < 0).any().item()) or bool((obs_rows >= int(feat_rigid_s.shape[0])).any().item()) or bool(
+                        (obs_rows >= int(acc_rigid_s.shape[0])).any().item()
+                    ):
+                        raise RuntimeError(
+                            "Stage5_6 feedback rigid pack route-to-source index out of range: "
+                            f"obs_rows_max={int(obs_rows.max().item())}, "
+                            f"feat_rigid_s={int(feat_rigid_s.shape[0])}, acc_rigid_s={int(acc_rigid_s.shape[0])}."
+                        )
+                    observed_idx = torch.nonzero(observed, as_tuple=False).squeeze(1)
+                    feat_rigid_ordered[observed_idx] = feat_rigid_s[obs_rows].to(
+                        device=feat_rigid_ordered.device,
+                        dtype=feat_rigid_ordered.dtype,
+                    )
+                    mask_rigid_ordered[observed_idx] = (
+                        acc_rigid_s[obs_rows].to(device=self.device) > float(self.rigid_src_backproject_support_min)
+                    )
             feats.append(feat_rigid_ordered)
             masks.append(mask_rigid_ordered)
 
