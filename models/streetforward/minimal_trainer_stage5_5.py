@@ -8,6 +8,9 @@ import torch
 import torch.nn as nn
 
 from models.streetforward.math_utils import get_viewmat
+from models.streetforward.metrics import compute_ssim_loss_masked
+from models.streetforward.minimal_trainer_stage3_2d import _create_proxy_params
+from models.streetforward.minimal_trainer_stage4_0 import _merge_params_bg_rigid_distant
 from models.streetforward.minimal_trainer_stage5_4 import MinimalStreetForwardStage5_4
 
 
@@ -62,12 +65,32 @@ FeatureSplatUncertaintyHeadV2 = FeatureSplatUncertaintyHeadV3
 
 class MinimalStreetForwardStage5_5(MinimalStreetForwardStage5_4):
     def __init__(self, config, device: torch.device, **kwargs):
+        self._stage5_5_last_scalar_logs: Dict[str, float] = {}
         super().__init__(config=config, device=device, **kwargs)
         self._debug_check_stage5_5_optimizer_contains_aux_head()
 
     def _init_stage5_3_modules(self, config) -> None:
         super()._init_stage5_3_modules(config)
+        self._init_stage5_5_nearby_direct(config)
         self._init_stage5_5_feature_splat_uncertainty(config)
+
+    def _parse_target_view_weight_cfg(self, config) -> Dict[str, Any]:
+        cfg = super()._parse_target_view_weight_cfg(config)
+        losses_cfg = config.get("losses", {}) if hasattr(config, "get") else {}
+        tvw_cfg = losses_cfg.get("target_view_weights", {}) if hasattr(losses_cfg, "get") else {}
+        nearby_tvw_cfg = tvw_cfg.get("nearby_direct", {}) if hasattr(tvw_cfg, "get") else {}
+        nearby_cfg = config.get("nearby_direct", {}) if hasattr(config, "get") else {}
+        cfg["nearby_direct_weight"] = float(
+            nearby_tvw_cfg.get("weight", nearby_cfg.get("weight", 0.7))
+            if hasattr(nearby_tvw_cfg, "get")
+            else nearby_cfg.get("weight", 0.7)
+        )
+        return cfg
+
+    def _target_role_weight(self, role: str, step: int) -> float:
+        if str(role) == "nearby_direct":
+            return float(self._target_view_weight_cfg.get("nearby_direct_weight", 0.7))
+        return float(super()._target_role_weight(role, step))
 
     def _validate_stage5_3_config(self, config) -> None:
         model_cfg = self._require_key(config, "model", "config")
@@ -221,6 +244,34 @@ class MinimalStreetForwardStage5_5(MinimalStreetForwardStage5_4):
             residual_max=self.stage5_5_residual_max,
             predict_rgb_residual=self.stage5_5_predict_rgb_residual,
         ).to(self.device)
+
+    def _init_stage5_5_nearby_direct(self, config) -> None:
+        cfg = config.get("nearby_direct", {}) if hasattr(config, "get") else {}
+        losses_cfg = config.get("losses", {}) if hasattr(config, "get") else {}
+        tvw_cfg = losses_cfg.get("target_view_weights", {}) if hasattr(losses_cfg, "get") else {}
+        nearby_tvw_cfg = tvw_cfg.get("nearby_direct", {}) if hasattr(tvw_cfg, "get") else {}
+        self.stage5_5_nearby_direct_enabled = bool(cfg.get("enable", False))
+        self.stage5_5_nearby_direct_role = str(cfg.get("role_name", "nearby_direct"))
+        self.stage5_5_nearby_direct_policy = str(cfg.get("policy", "adjacent_frame_same_camera")).strip().lower()
+        if self.stage5_5_nearby_direct_policy not in {"adjacent_frame_same_camera", "near_random"}:
+            raise ValueError(
+                "nearby_direct.policy must be one of ['adjacent_frame_same_camera', 'near_random']."
+            )
+        self.stage5_5_nearby_direct_weight = float(
+            cfg.get(
+                "weight",
+                nearby_tvw_cfg.get(
+                    "weight",
+                    self._target_view_weight_cfg.get("nearby_direct_weight", 0.7),
+                ),
+            )
+        )
+        self.stage5_5_nearby_direct_warmup_steps = int(cfg.get("warmup_steps", 0))
+        self.stage5_5_nearby_direct_max_refs = int(cfg.get("max_refs_per_step", 1))
+        self.stage5_5_nearby_direct_mask_sky = bool(cfg.get("mask_sky", True))
+        self.stage5_5_nearby_direct_mask_egocar = bool(cfg.get("mask_egocar", True))
+        self.stage5_5_nearby_direct_mask_dynamic = bool(cfg.get("mask_dynamic", False))
+        self.stage5_5_nearby_direct_min_valid_pixel_ratio = float(cfg.get("min_valid_pixel_ratio", 0.03))
 
     def _debug_check_stage5_5_optimizer_contains_aux_head(self) -> None:
         opt = getattr(self, "optimizer", None)
@@ -544,7 +595,7 @@ class MinimalStreetForwardStage5_5(MinimalStreetForwardStage5_4):
         bridge_mask: torch.Tensor,
         bridge_weight_map: torch.Tensor,
     ) -> None:
-        interval = int(getattr(self, "stage5_5_bridge_debug_save_maps_interval", 0))
+        interval = int(self._stage5_5_aux_image_interval_steps())
         if interval <= 0 or int(step) % interval != 0 or int(target_index) != 0:
             return
         log_dir = getattr(getattr(self, "config", None), "log_dir", None)
@@ -556,8 +607,9 @@ class MinimalStreetForwardStage5_5(MinimalStreetForwardStage5_4):
         except Exception:
             return
 
-        out_dir = os.path.join(str(log_dir), "images", "aux_bridge", f"step_{int(step):07d}")
+        out_dir = os.path.join(str(log_dir), "images", "aux_bridge")
         os.makedirs(out_dir, exist_ok=True)
+        prefix = f"step_{int(step):07d}_target_{int(target_index):02d}"
 
         def _rgb_u8(x: torch.Tensor) -> "np.ndarray":
             arr = x.detach().float().cpu().clamp(0.0, 1.0).numpy()
@@ -578,15 +630,15 @@ class MinimalStreetForwardStage5_5(MinimalStreetForwardStage5_4):
             return (arr.numpy() * 255.0 + 0.5).astype(np.uint8)
 
         abs_err = (pred_rgb.detach() - gt.detach()).abs().mean(dim=-1)
-        Image.fromarray(_rgb_u8(gt)).save(os.path.join(out_dir, f"target_{target_index:02d}_gt.png"))
-        Image.fromarray(_rgb_u8(pred_rgb)).save(os.path.join(out_dir, f"target_{target_index:02d}_render.png"))
-        Image.fromarray(_map_u8(abs_err)).save(os.path.join(out_dir, f"target_{target_index:02d}_abs_error.png"))
-        Image.fromarray(_map_u8(e_pred)).save(os.path.join(out_dir, f"target_{target_index:02d}_pred_error.png"))
-        Image.fromarray(_map_u8(support)).save(os.path.join(out_dir, f"target_{target_index:02d}_support.png"))
-        Image.fromarray(_map_u8(confidence, normalize=False)).save(os.path.join(out_dir, f"target_{target_index:02d}_confidence.png"))
-        Image.fromarray(_map_u8(bridge_mask, normalize=False)).save(os.path.join(out_dir, f"target_{target_index:02d}_mask.png"))
+        Image.fromarray(_rgb_u8(gt)).save(os.path.join(out_dir, f"{prefix}_gt.png"))
+        Image.fromarray(_rgb_u8(pred_rgb)).save(os.path.join(out_dir, f"{prefix}_render.png"))
+        Image.fromarray(_map_u8(abs_err)).save(os.path.join(out_dir, f"{prefix}_abs_error.png"))
+        Image.fromarray(_map_u8(e_pred)).save(os.path.join(out_dir, f"{prefix}_pred_error.png"))
+        Image.fromarray(_map_u8(support)).save(os.path.join(out_dir, f"{prefix}_support.png"))
+        Image.fromarray(_map_u8(confidence, normalize=False)).save(os.path.join(out_dir, f"{prefix}_confidence.png"))
+        Image.fromarray(_map_u8(bridge_mask, normalize=False)).save(os.path.join(out_dir, f"{prefix}_mask.png"))
         Image.fromarray(_map_u8(bridge_weight_map, normalize=False)).save(
-            os.path.join(out_dir, f"target_{target_index:02d}_weight.png")
+            os.path.join(out_dir, f"{prefix}_weight.png")
         )
 
     def _stage5_5_hw_mask(self, mask: torch.Tensor, *, h: int, w: int, name: str) -> torch.Tensor:
@@ -629,11 +681,18 @@ class MinimalStreetForwardStage5_5(MinimalStreetForwardStage5_4):
         sm = self._stage5_5_hw_mask(sky, h=h, w=w, name="sky_mask")
         return valid_loss_mask * (1.0 - sm).clamp(0.0, 1.0)
 
-    def _collect_aux_targets(self, batch: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _collect_aux_targets(
+        self,
+        batch: Dict[str, Any],
+        *,
+        max_targets: Optional[int] = None,
+        require_materialized: Optional[bool] = None,
+    ) -> List[Dict[str, Any]]:
         request_meta = batch.get("request_meta") or {}
         requested_aux = request_meta.get("aux_image_refs") or batch.get("aux_image_refs") or []
         aux = batch.get("aux_targets")
-        if bool(self.stage5_5_aux_enabled) and len(requested_aux) > 0:
+        require_aux = bool(self.stage5_5_aux_enabled) if require_materialized is None else bool(require_materialized)
+        if require_aux and len(requested_aux) > 0:
             if not isinstance(aux, list) or len(aux) == 0:
                 raise RuntimeError(
                     "Stage5_5 got aux_image_refs but batch['aux_targets'] is missing or empty. "
@@ -641,9 +700,143 @@ class MinimalStreetForwardStage5_5(MinimalStreetForwardStage5_4):
                 )
         if not isinstance(aux, list):
             return []
-        if self.stage5_5_target_max_targets > 0:
-            return aux[: self.stage5_5_target_max_targets]
+        limit = int(self.stage5_5_target_max_targets) if max_targets is None else int(max_targets)
+        if limit > 0:
+            return aux[:limit]
         return aux
+
+    def _stage5_5_nearby_direct_weight(self, step: int) -> float:
+        base = float(getattr(self, "stage5_5_nearby_direct_weight", 0.7))
+        warmup = int(getattr(self, "stage5_5_nearby_direct_warmup_steps", 0))
+        if warmup <= 0:
+            return base
+        ratio = min(1.0, max(0.0, float(int(step)) / float(warmup)))
+        return float(base * ratio)
+
+    def _stage5_5_aux_image_interval_steps(self) -> int:
+        cfg = getattr(self, "config", None)
+        logging_cfg = cfg.get("logging", {}) if hasattr(cfg, "get") else {}
+        sched_cfg = cfg.get("scheduler_v8", {}) if hasattr(cfg, "get") else {}
+        block_cfg = sched_cfg.get("block", {}) if hasattr(sched_cfg, "get") else {}
+        image_blocks = int(logging_cfg.get("image_interval_blocks", 0)) if hasattr(logging_cfg, "get") else 0
+        steps_per_block = int(block_cfg.get("steps_per_block", 1)) if hasattr(block_cfg, "get") else 1
+        if image_blocks > 0:
+            return int(image_blocks * max(steps_per_block, 1))
+        return int(getattr(self, "stage5_5_bridge_debug_save_maps_interval", 0))
+
+    def _stage5_5_main_loss_denominator(self, batch: Dict[str, Any], step: int, like: torch.Tensor) -> torch.Tensor:
+        targets = batch.get("targets") or []
+        num_targets = int(len(targets))
+        if num_targets <= 0:
+            return like.new_zeros(())
+        if bool(self._target_view_weight_cfg.get("normalize_by_weight_sum", True)):
+            weights, _roles = self._build_target_view_weights(batch, step=int(step), num_targets=num_targets)
+            return weights.to(device=like.device, dtype=like.dtype).sum()
+        return like.new_tensor(float(num_targets))
+
+    def _build_nearby_direct_loss_mask(self, target: Dict[str, Any], h: int, w: int) -> torch.Tensor:
+        valid_target = target
+        egocar_for_valid = target.get("egocar_mask")
+        if egocar_for_valid is not None:
+            valid_target = dict(target)
+            valid_target["egocar_mask"] = self._stage5_5_hw_mask(
+                egocar_for_valid,
+                h=h,
+                w=w,
+                name="egocar_mask",
+            )
+        mask = self._valid_loss_mask_from_target(valid_target, height=h, width=w).to(self.device).float()
+
+        if bool(getattr(self, "stage5_5_nearby_direct_mask_sky", True)):
+            sky = target.get("sky_mask")
+            if sky is None:
+                if self.require_sky_mask_for_loss:
+                    raise ValueError("Stage5_5 nearby_direct requires target['sky_mask'] when mask_sky=true.")
+            else:
+                sm = self._stage5_5_hw_mask(sky, h=h, w=w, name="sky_mask")
+                mask = mask * (1.0 - sm).clamp(0.0, 1.0)
+
+        if bool(getattr(self, "stage5_5_nearby_direct_mask_egocar", True)):
+            egocar = target.get("egocar_mask")
+            if egocar is not None:
+                ego = self._stage5_5_hw_mask(egocar, h=h, w=w, name="egocar_mask")
+                mask = mask * (1.0 - ego).clamp(0.0, 1.0)
+
+        if bool(getattr(self, "stage5_5_nearby_direct_mask_dynamic", False)):
+            dynamic = target.get("dynamic_mask")
+            if dynamic is not None:
+                dyn = self._stage5_5_hw_mask(dynamic, h=h, w=w, name="dynamic_mask")
+                mask = mask * (1.0 - dyn).clamp(0.0, 1.0)
+
+        return mask
+
+    def _build_stage5_5_rigid_world_for_aux_frame(
+        self,
+        out: Dict[str, Any],
+        target_frame_idx: int,
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        node_state_rigid = out.get("_node_state_rigid")
+        if node_state_rigid is None:
+            return None
+        u_all = out.get("_rigid_writeback_idx")
+        if u_all is None:
+            u_all = torch.zeros((0,), dtype=torch.long, device=self.device)
+        else:
+            u_all = u_all.to(device=self.device, dtype=torch.long)
+        n_rigid = int(node_state_rigid.means.shape[0])
+        if int(u_all.numel()) > 0:
+            if bool((u_all < 0).any().item()) or bool((u_all >= n_rigid).any().item()):
+                raise RuntimeError("Stage5_5 aux U_all contains out-of-range indices.")
+        is_updated = torch.zeros((n_rigid,), dtype=torch.bool, device=self.device)
+        if int(u_all.numel()) > 0:
+            is_updated[u_all] = True
+        target_valid = torch.nonzero(
+            self._rigid_point_valid_mask(node_state_rigid, int(target_frame_idx)),
+            as_tuple=False,
+        ).squeeze(1).to(device=self.device, dtype=torch.long)
+        if int(target_valid.numel()) == 0:
+            return None
+        idx_train = target_valid[is_updated[target_valid]]
+        idx_frozen = target_valid[~is_updated[target_valid]]
+        rigid_local = out.get("_render_params_rigid_local")
+        if int(idx_train.numel()) > 0 and rigid_local is None:
+            raise RuntimeError("Stage5_5 aux needs _render_params_rigid_local for updated rigid nodes.")
+        return self._build_rigid_world_for_frame(
+            node_state_rigid,
+            int(target_frame_idx),
+            idx_train,
+            idx_frozen,
+            rigid_local,
+            u_all,
+        )
+
+    def _build_nearby_direct_proxy_render_params(
+        self,
+        out: Dict[str, Any],
+        target_frame_idx: int,
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        proxies_bg = out.get("_proxies_bg") or out.get("proxies")
+        render_bg = out.get("_render_params_bg") or out.get("render_params")
+        if proxies_bg is None or render_bg is None:
+            return None
+        render_distant = out.get("_render_params_distant")
+        proxies_distant = out.get("_proxies_distant")
+        if render_distant is not None and proxies_distant is None:
+            raise RuntimeError("Stage5_5 nearby_direct expected _proxies_distant for distant render params.")
+
+        rigid_world = self._build_stage5_5_rigid_world_for_aux_frame(out, int(target_frame_idx))
+        proxy_rigid = None
+        if rigid_world is not None:
+            proxy_rigid = _create_proxy_params(rigid_world)
+            pairs = out.get("_rigid_world_proxy_pairs")
+            if pairs is None:
+                pairs = []
+                out["_rigid_world_proxy_pairs"] = pairs
+            elif not isinstance(pairs, list):
+                pairs = list(pairs)
+                out["_rigid_world_proxy_pairs"] = pairs
+            pairs.append((rigid_world, proxy_rigid))
+        return _merge_params_bg_rigid_distant(proxies_bg, proxy_rigid, proxies_distant)
 
     @staticmethod
     def _merge_lists(items: Sequence[Optional[torch.Tensor]]) -> Optional[torch.Tensor]:
@@ -764,13 +957,148 @@ class MinimalStreetForwardStage5_5(MinimalStreetForwardStage5_4):
             )
         return merged_render, merged_features, merged_mask.bool()
 
+    def _compute_nearby_direct_loss_from_aux_targets(
+        self,
+        *,
+        batch: Dict[str, Any],
+        out: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        zero = out["loss"].new_zeros(())
+        if not bool(getattr(self, "stage5_5_nearby_direct_enabled", False)):
+            return {"loss": zero, "skipped_disabled": 1.0}
+
+        step = int(self._current_loss_step(batch))
+        view_weight_value = float(self._stage5_5_nearby_direct_weight(step))
+        aux_targets = self._collect_aux_targets(
+            batch,
+            max_targets=int(getattr(self, "stage5_5_nearby_direct_max_refs", 1)),
+            require_materialized=True,
+        )
+        if len(aux_targets) == 0:
+            return {
+                "loss": zero,
+                "loss_rgb": zero,
+                "loss_ssim": zero,
+                "monitor_l1": zero,
+                "monitor_psnr": zero,
+                "weight_sum": zero,
+                "denominator": zero,
+                "view_weight": float(view_weight_value),
+                "processed_targets": 0.0,
+                "skipped_empty": 1.0,
+            }
+        if view_weight_value <= 0.0:
+            return {
+                "loss": zero,
+                "loss_rgb": zero,
+                "loss_ssim": zero,
+                "monitor_l1": zero,
+                "monitor_psnr": zero,
+                "weight_sum": zero,
+                "denominator": zero,
+                "view_weight": float(view_weight_value),
+                "processed_targets": 0.0,
+                "skipped_zero_weight": 1.0,
+            }
+
+        weighted_rgb_sum = zero.clone()
+        weighted_ssim_sum = zero.clone()
+        weighted_total_sum = zero.clone()
+        weight_sum = zero.clone()
+        l1_terms: List[torch.Tensor] = []
+        psnr_terms: List[torch.Tensor] = []
+        valid_ratio_terms: List[torch.Tensor] = []
+        processed = 0
+        skipped_low_valid = 0
+
+        for target in aux_targets:
+            gt = target.get("gt_image")
+            view = target.get("view")
+            if "frame_idx" not in target:
+                raise RuntimeError("Stage5_5 nearby_direct target must provide frame_idx.")
+            if gt is None or view is None:
+                raise RuntimeError("Stage5_5 nearby_direct target must provide gt_image and view.")
+            if gt.dim() == 4:
+                gt = gt.squeeze(0)
+            h, w = int(gt.shape[0]), int(gt.shape[1])
+            render_params = self._build_nearby_direct_proxy_render_params(out, int(target["frame_idx"]))
+            if render_params is None:
+                continue
+            pred_rgb, _pred_alpha = self._render_single_view(render_params, view, h, w)
+            gt = gt.to(device=self.device, dtype=pred_rgb.dtype)
+            mask = self._build_nearby_direct_loss_mask(target, h, w).to(device=self.device, dtype=pred_rgb.dtype)
+            valid_ratio = mask.mean()
+            if float(valid_ratio.detach().item()) < float(
+                getattr(self, "stage5_5_nearby_direct_min_valid_pixel_ratio", 0.03)
+            ):
+                skipped_low_valid += 1
+                continue
+            denom_pixels = mask.sum().clamp_min(1.0)
+            abs_rgb = (pred_rgb - gt).abs()
+            l1_raw = (abs_rgb * mask.unsqueeze(-1)).sum() / (denom_pixels * 3.0)
+            l1_loss = float(self.loss_w_l1) * l1_raw
+            ssim_loss = float(self.loss_w_ssim) * compute_ssim_loss_masked(
+                pred_rgb,
+                gt,
+                valid_mask=mask,
+                sky_mask=None,
+                data_range=1.0,
+            )
+            total_i = l1_loss + ssim_loss
+            view_weight = pred_rgb.new_tensor(float(view_weight_value))
+            weighted_rgb_sum = weighted_rgb_sum + l1_loss * view_weight
+            weighted_ssim_sum = weighted_ssim_sum + ssim_loss * view_weight
+            weighted_total_sum = weighted_total_sum + total_i * view_weight
+            weight_sum = weight_sum + view_weight
+            mse = (((pred_rgb - gt) ** 2) * mask.unsqueeze(-1)).sum() / (denom_pixels * 3.0)
+            psnr_terms.append((-10.0 * torch.log10(mse.clamp_min(1.0e-10))).detach())
+            l1_terms.append(l1_raw.detach())
+            valid_ratio_terms.append(valid_ratio.detach())
+            processed += 1
+
+        if processed == 0:
+            return {
+                "loss": zero,
+                "loss_rgb": zero,
+                "loss_ssim": zero,
+                "monitor_l1": zero,
+                "monitor_psnr": zero,
+                "weight_sum": zero,
+                "denominator": zero,
+                "view_weight": float(view_weight_value),
+                "processed_targets": 0.0,
+                "skipped_low_valid": float(skipped_low_valid),
+            }
+
+        if bool(self._target_view_weight_cfg.get("normalize_by_weight_sum", True)):
+            denom = weight_sum.clamp_min(1.0e-8)
+        else:
+            denom = zero.new_tensor(float(processed)).clamp_min(1.0)
+        return {
+            "loss": weighted_total_sum / denom,
+            "loss_rgb": weighted_rgb_sum / denom,
+            "loss_ssim": weighted_ssim_sum / denom,
+            "monitor_l1": torch.stack(l1_terms).mean(),
+            "monitor_psnr": torch.stack(psnr_terms).mean(),
+            "valid_mask_ratio": torch.stack(valid_ratio_terms).mean(),
+            "weight_sum": weight_sum.detach(),
+            "denominator": denom.detach(),
+            "view_weight": float(view_weight_value),
+            "processed_targets": float(processed),
+            "skipped_low_valid": float(skipped_low_valid),
+        }
+
     def _compute_feature_splat_uncertainty_loss(
         self,
         *,
         batch: Dict[str, Any],
         out: Dict[str, Any],
     ) -> Dict[str, Any]:
-        aux_targets = self._collect_aux_targets(batch)
+        aux_targets = self._collect_aux_targets(
+            batch,
+            max_targets=int(self.stage5_5_target_max_targets),
+            require_materialized=bool(self.stage5_5_aux_enabled),
+        )
         if len(aux_targets) == 0:
             return {"loss": out["loss"].new_zeros(()), "skipped_empty": 1.0}
         step = int(self._current_loss_step(batch))
@@ -1201,9 +1529,92 @@ class MinimalStreetForwardStage5_5(MinimalStreetForwardStage5_4):
             total += float(torch.sum(g * g).item())
         return float(total ** 0.5)
 
+    def _capture_stage5_5_scalar_logs(self, out: Dict[str, Any]) -> None:
+        logs: Dict[str, float] = {}
+        prefixes = (
+            "loss/",
+            "monitor/",
+            "perf/aux_",
+            "loss_stage5_5",
+        )
+        for key, val in out.items():
+            ks = str(key)
+            if not any(ks.startswith(prefix) for prefix in prefixes):
+                continue
+            if torch.is_tensor(val):
+                if int(val.numel()) == 1:
+                    logs[ks] = float(val.detach().item())
+            elif isinstance(val, bool):
+                logs[ks] = float(1.0 if val else 0.0)
+            elif isinstance(val, (int, float)):
+                logs[ks] = float(val)
+        self._stage5_5_last_scalar_logs = logs
+
+    def _apply_nearby_direct_loss(
+        self,
+        *,
+        batch: Dict[str, Any],
+        out: Dict[str, Any],
+        nearby_pack: Dict[str, Any],
+    ) -> None:
+        nearby_loss = nearby_pack.get("loss")
+        if not torch.is_tensor(nearby_loss):
+            return
+        step = int(self._current_loss_step(batch))
+        near_den = nearby_pack.get("denominator")
+        if not torch.is_tensor(near_den):
+            near_den = nearby_loss.new_tensor(float(nearby_pack.get("processed_targets", 0.0)))
+        main_den = self._stage5_5_main_loss_denominator(batch, step, nearby_loss)
+        combined_den = (main_den + near_den.to(device=nearby_loss.device, dtype=nearby_loss.dtype)).clamp_min(1.0e-8)
+        if float(near_den.detach().item()) > 0.0:
+            main_scale = main_den / combined_den
+            near_scale = near_den.to(device=nearby_loss.device, dtype=nearby_loss.dtype) / combined_den
+            out["loss"] = out["loss"] * main_scale + nearby_loss * near_scale
+            if torch.is_tensor(out.get("loss_l1")) and torch.is_tensor(nearby_pack.get("loss_rgb")):
+                out["loss_l1"] = out["loss_l1"] * main_scale + nearby_pack["loss_rgb"].to(out["loss_l1"].device) * near_scale
+            if torch.is_tensor(out.get("loss_ssim")) and torch.is_tensor(nearby_pack.get("loss_ssim")):
+                out["loss_ssim"] = out["loss_ssim"] * main_scale + nearby_pack["loss_ssim"].to(out["loss_ssim"].device) * near_scale
+            if torch.is_tensor(out.get("loss_mask")):
+                out["loss_mask"] = out["loss_mask"] * main_scale
+            if torch.is_tensor(out.get("loss_opacity_entropy")):
+                out["loss_opacity_entropy"] = out["loss_opacity_entropy"] * main_scale
+
+        out["loss_stage5_5_nearby_direct"] = float(nearby_loss.detach().item())
+        if torch.is_tensor(nearby_pack.get("loss_rgb")):
+            out["loss/rgb/nearby_direct"] = float(nearby_pack["loss_rgb"].detach().item())
+        else:
+            out["loss/rgb/nearby_direct"] = 0.0
+        if torch.is_tensor(nearby_pack.get("loss_ssim")):
+            out["loss/ssim/nearby_direct"] = float(nearby_pack["loss_ssim"].detach().item())
+        else:
+            out["loss/ssim/nearby_direct"] = 0.0
+        out["loss/target_weight/nearby_direct"] = float(nearby_pack.get("view_weight", 0.0))
+        if torch.is_tensor(nearby_pack.get("monitor_psnr")):
+            out["monitor/psnr/nearby_direct"] = float(nearby_pack["monitor_psnr"].detach().item())
+        else:
+            out["monitor/psnr/nearby_direct"] = 0.0
+        if torch.is_tensor(nearby_pack.get("monitor_l1")):
+            out["monitor/l1/nearby_direct"] = float(nearby_pack["monitor_l1"].detach().item())
+        else:
+            out["monitor/l1/nearby_direct"] = 0.0
+        if torch.is_tensor(nearby_pack.get("valid_mask_ratio")):
+            out["monitor/nearby_direct/valid_mask_ratio"] = float(nearby_pack["valid_mask_ratio"].detach().item())
+        out["monitor/nearby_direct/processed_targets"] = float(nearby_pack.get("processed_targets", 0.0))
+        if nearby_pack.get("skipped_empty"):
+            out["monitor/nearby_direct/skipped_empty_aux_list"] = 1.0
+        if nearby_pack.get("skipped_zero_weight"):
+            out["monitor/nearby_direct/skipped_zero_weight"] = 1.0
+        if nearby_pack.get("skipped_low_valid"):
+            out["monitor/nearby_direct/skipped_low_valid"] = float(nearby_pack.get("skipped_low_valid", 0.0))
+
     def forward(self, batch: Dict) -> Dict[str, Any]:
+        self._stage5_5_last_scalar_logs = {}
         out = super().forward(batch)
+        if self.training and bool(getattr(self, "stage5_5_nearby_direct_enabled", False)):
+            nearby_pack = self._compute_nearby_direct_loss_from_aux_targets(batch=batch, out=out)
+            self._apply_nearby_direct_loss(batch=batch, out=out, nearby_pack=nearby_pack)
         if not self.training or not bool(self.stage5_5_aux_enabled):
+            self._capture_stage5_5_scalar_logs(out)
             return out
         aux_pack = self._compute_feature_splat_uncertainty_loss(batch=batch, out=out)
         aux_loss = aux_pack.get("loss")
@@ -1302,6 +1713,7 @@ class MinimalStreetForwardStage5_5(MinimalStreetForwardStage5_4):
             out["monitor/aux_uncertainty/skipped_no_valid_aux"] = 1.0
         if aux_pack.get("skipped_empty"):
             out["monitor/aux_uncertainty/skipped_empty_aux_list"] = 1.0
+        self._capture_stage5_5_scalar_logs(out)
         return out
 
     def train_step(
@@ -1312,6 +1724,7 @@ class MinimalStreetForwardStage5_5(MinimalStreetForwardStage5_4):
         sync_cuda_timing: bool = False,
         scheduler_node_sync: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        self._stage5_5_last_scalar_logs = {}
         out = super().train_step(
             batch=batch,
             step=step,
@@ -1319,6 +1732,7 @@ class MinimalStreetForwardStage5_5(MinimalStreetForwardStage5_4):
             sync_cuda_timing=sync_cuda_timing,
             scheduler_node_sync=scheduler_node_sync,
         )
+        out.update(getattr(self, "_stage5_5_last_scalar_logs", {}))
         out["grad/aux_head_norm"] = self._param_grad_norm(list(self.stage5_5_uncertainty_head.parameters()))
         feat_params = [p for p in self.image_feature_extractor.parameters() if p.requires_grad]
         out["grad/feature_extractor_total_norm"] = self._param_grad_norm(feat_params)

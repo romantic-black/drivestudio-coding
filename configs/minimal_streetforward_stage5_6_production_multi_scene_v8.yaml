@@ -114,11 +114,19 @@ scheduler_v8:
     warm_next_block_exact: true
     warm_next_episode_chain: true
   aux_feature_splat_targets:
+    enable: false
+  near_random_supervision:
     enable: true
-    role_name: nearby_direct
-    policy: adjacent_frame_same_camera
-    max_refs_per_step: 1
-    aux_camera_policy: random_from_source_cams
+    frames_per_block: 1
+    same_keyframe_only: true
+    insufficient_policy: skip
+    add_to_source_image_refs: false
+    add_to_history_record_views: false
+    sample_once_per_block: true
+    exclude_source_frame: true
+    exclude_existing_target_frames: true
+    camera_policy: all_cams
+    role_name: near_random
 
 
 validation_v8:
@@ -153,7 +161,7 @@ validation_v8:
     enable: false
 
 model:
-  stage: "5_5"
+  stage: "5_6"
   production_training: true
   backprojector_version: "v4"
   scale_init_value: 0.1
@@ -360,118 +368,118 @@ current_observation:
     log_interval_steps: 50
 
 nearby_direct:
-  enable: true
+  enable: false
+  role_name: near_random
   weight: 0.7
   warmup_steps: 0
-  policy: adjacent_frame_same_camera
-  max_refs_per_step: 1
+  policy: near_random_supervision
+  max_refs_per_step: 3
   mask_sky: true
   mask_egocar: true
   mask_dynamic: false
+  min_valid_pixel_ratio: 0.03
 
 feature_splat_uncertainty:
-  # Stage5_5 auxiliary branch. It does two things:
-  # 1) calibration/residual head: predict nearby render error size and RGB correction direction from feature splats.
-  # 2) bridge loss: only where confidence is high, apply a small live-render photometric loss to improve nearby views.
-  enable: true
-  mode: predict_l1_residual  # current supported mode: scalar L1 error + optional RGB residual head.
-
-  target:
-    max_targets_per_step: 1      # number of auxiliary nearby target views sampled per train step.
-    every_n_steps: 1             # run this aux branch every N optimizer steps; 1 means every step.
-    skip_if_no_valid_aux: true   # skip cleanly when the batch has no valid auxiliary target.
-
-  splat:
-    eps: 1.0e-6                  # numerical epsilon used in feature splat normalization.
-    detach_geometry: true        # feature-splat supervision does not update Gaussian geometry through splat weights.
-    detach_alpha_weights: true   # support/alpha weights are treated as fixed context for the aux head.
-    detach_render_context: true  # render used as head input/target is detached; bridge below separately uses live render.
-    src_support_min:
-      # Minimum source-view support for each Gaussian group before its feature is considered source-observed.
-      bg: 1.0e-4
-      distant: 1.0e-4
-      rigid: 1.0e-4
-    support_min_for_extra_loss: 1.0e-5  # threshold for optional supported-region calibration/residual terms.
-
+  enable: false
+  bridge:
+    enable: false
   head:
-    hidden_dim: 64               # trunk width for the shared aux head.
-    error_max: 0.5               # scalar error prediction range: e_pred in [0, error_max].
-    residual_max: 0.5            # RGB residual range: r_pred in [-residual_max, residual_max].
-    predict_rgb_residual: true   # add RGB residual head; target is gt - detached_render, not used to patch render in training.
-    use_render_rgb: true         # concatenate detached nearby render RGB as head input context.
-    use_render_alpha: true       # concatenate detached render alpha as head input context.
-    concat_log_support: true     # add log(1 + support) channel; helps separate weak from strong splat support.
-    concat_valid_mask: true      # add valid-loss mask channel so the head can see ignored pixels.
-    zero_invalid_input: true     # zero head inputs outside the valid aux mask.
-    render_context_dropout: 0.3  # randomly drop render RGB/alpha context so the head cannot depend on it completely.
+    predict_rgb_residual: false
+  loss:
+    rgb_residual_weight: 0.0
+    rgb_residual_supported_weight: 0.0
+
+bridge:
+  enable: false
+
+nearby_error_feedback:
+  enable: true
+  target_role: near_random
+  write_on: step_end
+  skip_write_on_block_exit: true
+  reset_on_block_exit: true
+  reset_on_episode_end: true
+  save_in_checkpoint: false
+
+  warmup:
+    pred_error_only_steps: 7000
+    fusion_start_step: 7000
+    fusion_warmup_steps: 3000
+    fusion_start_scale: 0.0
+    fusion_end_scale: 1.0
+
+  error_pred:
+    enable: true
+    target_role: near_random
+    input_feature: post_update_node_feature
+    splat_to: nearby_view
+    detach_geometry: true
+    detach_alpha_weights: true
+    detach_render_context: true
+    use_render_rgb: true
+    use_render_alpha: true
+    use_source_support_input: false
+    concat_log_support: false
+    concat_valid_mask: false
+    zero_invalid_input: false
+    predict_rgb_residual: false
+    head_type: lite_unet
+    hidden_dim: 64
+    error_feat_dim: 16
+    error_max: 0.7
+    max_targets_per_step: 3
+    every_n_steps: 1
+    skip_if_no_valid_aux: true
+
+  feedback_lift:
+    eps: 1.0e-6
+    support_min: 1.0e-5
+    mask_sky: true
+    mask_egocar: true
+    mask_dynamic: false
+    require_render_alpha: true
+    render_alpha_min: 0.02
+    detach_lifted_feedback: true
+
+  cache:
+    enable: true
+    mode: overwrite
+    max_age: 1
+    store_error_scalar: true
+    store_error_feat: true
+    store_support: true
+    store_valid: true
+    store_age: true
+
+  fusion:
+    enable: true
+    location: before_struct_decoder
+    type: residual_adapter
+    hidden_dim: 64
+    num_layers: 2
+    norm: layernorm
+    act: gelu
+    zero_init_last: true
+    apply_to_bg: true
+    apply_to_distant: true
+    apply_to_rigid: true
+    input_current_source_support: true
+    input_feedback_support: true
+    input_feedback_age: true
+    input_branch_embed: false
 
   loss:
-    all_valid_weight: 0.03                 # scalar error-head loss over all valid aux pixels.
-    supported_region_weight: 0.0           # keep support-dependent aux losses off until support maps are trustworthy.
-    rgb_residual_weight: 0.02              # RGB residual-head loss over all valid aux pixels.
-    rgb_residual_supported_weight: 0.0     # keep support-dependent aux losses off until support maps are trustworthy.
-    warmup_steps: 3000                     # linearly ramps the aux-head loss scale.
-    start_weight_scale: 0.0                # aux-head loss scale at warmup start.
-    end_weight_scale: 0.5                  # aux-head loss scale after warmup.
-    mask_sky: true                         # exclude sky from aux-head losses when sky mask exists.
-    mask_egocar: true                      # exclude ego-car pixels from aux-head losses when ego mask exists.
-    min_valid_pixel_ratio: 0.03            # skip aux target if too few pixels remain after masking.
-    skip_empty_supported_loss: true        # do not add supported-region loss when no supported pixels exist.
-
-  bridge:
-    # Bridge is the risky part: it backpropagates through the live nearby render, but only in low-error/high-support regions.
-    enable: false
-    start_after_steps: 10000   # delay until the uncertainty/residual head has basic calibration.
-    warmup_steps: 5000         # linearly ramps bridge from 0 to weight.
-    weight: 0.03               # multiplier on normalized weighted nearby-render L1.
-    max_weight: 0.3            # hard clamp for the scheduled bridge weight.
-
-    error_confidence:
-      mode: exp                # exp means confidence = exp(-predicted_error / tau).
-      tau: 0.15                # smaller tau makes high predicted error shut off bridge faster.
-      min_conf: 0.0
-      max_conf: 1.0
-
-    support_confidence:
-      mode: soft               # soft means support / (support + tau), optionally powered by gamma.
-      tau: 1.0e-4
-      gamma: 0.5               # <1 softens the penalty for medium support.
-      hard_min: 1.0e-5         # used by hard mode, and as a lower gate when configured in code paths that need it.
-
-    mask:
-      use_valid_loss_mask: true      # start from the same valid-pixel mask as aux-head loss.
-      mask_sky: true                 # remove sky from live bridge supervision.
-      mask_egocar: true              # remove ego-car pixels from live bridge supervision.
-      mask_dynamic: false            # keep false unless adjacent-frame dynamic objects dominate bridge loss.
-      require_render_alpha: true     # require current live render to have enough opacity/coverage.
-      render_alpha_min: 0.02
-      min_effective_pixel_ratio: 0.005  # skip bridge target if confidence*mask activates too few pixels.
-
-    loss:
-      type: l1                       # l1 or charbonnier per-pixel RGB loss.
-      normalize_by_weight_sum: true  # normalize by active bridge weight sum, not full image size.
-      detach_confidence: true        # confidence cannot learn to escape bridge loss.
-      detach_mask: true              # masks are gates only, not trainable paths.
-      rgb_reduce: mean               # average RGB channels before spatial weighting.
-
-    grad:
-      # v1 supports the default live-render gradient path. Setting these allow_* flags false is rejected in code.
-      allow_geometry_grad: true
-      allow_color_grad: true
-      allow_feature_extractor_grad: true
-      stopgrad_uncertainty_head_from_bridge: true
-
-    debug:
-      log_interval: 100              # scalar bridge debug log cadence.
-      save_maps_interval: 0          # aux image dumps follow logging.image_interval_blocks under log_dir/images/aux_bridge/.
-
-  debug:
-    no_render_probe: true            # periodically compare aux head with vs without render context.
-    no_render_probe_interval: 500
+    error_weight: 0.03
+    error_loss_type: charbonnier
+    error_warmup_steps: 3000
+    error_start_weight_scale: 0.0
+    error_end_weight_scale: 1.0
+    normalize_by_valid_pixels: true
+    min_valid_pixel_ratio: 0.03
 
 
 training_recipe:
-  name: stage5_5_adamw_warmcos_v1
+  name: stage5_6_adamw_warmcos_v1
 
 losses:
   photometric:
@@ -487,7 +495,7 @@ losses:
       weight: 1.0
     visited:
       weight: 0.7
-    nearby_direct:
+    near_random:
       weight: 0.7
 
 optimizer:
@@ -561,6 +569,20 @@ optimizer:
           - "gaussian_decoder"
       lr: 8.0e-5
       weight_decay: 5.0e-5
+    stage5_6_error_head:
+      match:
+        prefixes:
+          - "stage5_6_error_head"
+      lr: 1.0e-4
+      weight_decay: 1.0e-4
+    stage5_6_feedback_fuser:
+      match:
+        prefixes:
+          - "stage5_6_bg_fuser"
+          - "stage5_6_distant_fuser"
+          - "stage5_6_rigid_fuser"
+      lr: 8.0e-5
+      weight_decay: 1.0e-4
     default:
       lr: 1.0e-4
       weight_decay: 1.0e-4
@@ -598,7 +620,7 @@ eval:
 
 logging:
   output_root: /root/autodl-tmp/outputs
-  project: minimal_sf_stage5_5_multi_scene_v8_adamw_warmcos
+  project: minimal_sf_stage5_6_multi_scene_v8_adamw_warmcos
   log_dir: null
   image_interval_blocks: 300
   train_monitor:

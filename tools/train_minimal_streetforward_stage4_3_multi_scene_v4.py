@@ -318,6 +318,145 @@ def _save_stage5_5_aux_debug_maps(
         writer.add_image(f"train_aux_uncertainty/{name}", img.unsqueeze(0), int(step))
 
 
+def _stage5_6_debug_view_suffix(
+    *,
+    block_idx_global: int,
+    scene_label: str,
+    image_pack: Dict[str, Any],
+    pixel_camera_ids: List[int],
+    prefix: str,
+) -> str:
+    target_index = int(image_pack.get("target_index", 0))
+    frame_idx = int(image_pack.get("frame_idx", -1))
+    cam_idx = int(image_pack.get("cam_idx", -1))
+    role_prefix = str(image_pack.get("role", prefix)).strip() or str(prefix)
+    if cam_idx >= 0:
+        nusc_suf = _nuscenes_cam_id_suffix(pixel_camera_ids, cam_idx)
+        return (
+            f"b{int(block_idx_global):06d}_sc{scene_label}_{role_prefix}{target_index}_"
+            f"f{frame_idx:05d}_c{cam_idx}{nusc_suf}"
+        )
+    return f"b{int(block_idx_global):06d}_sc{scene_label}_{role_prefix}{target_index}_f{frame_idx:05d}"
+
+
+def _save_stage5_6_debug_images(
+    *,
+    step: int,
+    result: Dict[str, Any],
+    raw_batch: Dict[str, Any],
+    log_dir: str,
+    block_idx_global: int,
+    scene_id_fallback: Any,
+    pixel_camera_ids: List[int],
+) -> None:
+    if int(block_idx_global) < 1:
+        return
+    sc_lab = _scene_folder_label_from_batch(raw_batch, scene_id_fallback)
+
+    nearby_images = result.get("_stage5_6_nearby_debug_images")
+    if isinstance(nearby_images, list):
+        out_train = os.path.join(log_dir, "images", "train")
+        for item in nearby_images:
+            if not isinstance(item, dict):
+                continue
+            pred = item.get("pred")
+            gt = item.get("gt")
+            if not torch.is_tensor(pred) or not torch.is_tensor(gt):
+                continue
+            vsuf = _stage5_6_debug_view_suffix(
+                block_idx_global=int(block_idx_global),
+                scene_label=sc_lab,
+                image_pack=item,
+                pixel_camera_ids=pixel_camera_ids,
+                prefix="nearby",
+            )
+            _save_image_triplet(
+                int(step),
+                pred,
+                gt,
+                out_train,
+                view_suffix=vsuf,
+                save_error=False,
+            )
+
+    error_images = result.get("_stage5_6_error_debug_images")
+    if not isinstance(error_images, list):
+        return
+    out_error = os.path.join(log_dir, "images", "error")
+    os.makedirs(out_error, exist_ok=True)
+
+    def _save_rgb(path: str, tensor: torch.Tensor) -> None:
+        img = torch.clamp(tensor.detach().float().cpu(), 0.0, 1.0)
+        arr = (img.numpy() * 255.0).clip(0, 255).astype(np.uint8)
+        try:
+            from PIL import Image
+        except ImportError:
+            np.save(path.replace(".png", ".npy"), arr)
+            return
+        Image.fromarray(arr).save(path)
+
+    def _save_map(path: str, tensor: torch.Tensor) -> None:
+        img = torch.clamp(tensor.detach().float().cpu(), 0.0, 1.0)
+        if img.dim() == 3 and int(img.shape[-1]) == 1:
+            img = img.squeeze(-1)
+        arr = (img.numpy() * 255.0).clip(0, 255).astype(np.uint8)
+        try:
+            from PIL import Image
+        except ImportError:
+            np.save(path.replace(".png", ".npy"), arr)
+            return
+        Image.fromarray(arr).save(path)
+
+    for item in error_images:
+        if not isinstance(item, dict):
+            continue
+        render = item.get("render")
+        pred_error = item.get("pred_error")
+        actual_error = item.get("actual_error")
+        if not torch.is_tensor(render) or not torch.is_tensor(pred_error) or not torch.is_tensor(actual_error):
+            continue
+        prefix = "step%06d_%s" % (
+            int(step),
+            _stage5_6_debug_view_suffix(
+                block_idx_global=int(block_idx_global),
+                scene_label=sc_lab,
+                image_pack=item,
+                pixel_camera_ids=pixel_camera_ids,
+                prefix="nearby",
+            ),
+        )
+        _save_rgb(os.path.join(out_error, f"{prefix}_render.png"), render)
+        _save_map(os.path.join(out_error, f"{prefix}_error.png"), pred_error)
+        _save_map(os.path.join(out_error, f"{prefix}_actual_error.png"), actual_error)
+
+
+def _stage5_6_debug_images_due(
+    *,
+    image_trigger_mode: str,
+    step: int,
+    scheduler_info: Dict[str, Any],
+    step_events: List[Dict[str, Any]],
+    image_trigger_interval_steps: int,
+    image_interval_blocks_equiv: int,
+) -> bool:
+    if image_trigger_mode == "raw_step_interval":
+        scheduler_global_step = int(scheduler_info.get("global_step", int(step) + 1))
+        return scheduler_global_step > 0 and scheduler_global_step % int(image_trigger_interval_steps) == 0
+    if image_trigger_mode == "episode_end":
+        if not any(ev.get("type") == "episode_end" for ev in step_events):
+            return False
+        completed_blocks = int(scheduler_info.get("block_idx_global", -1)) + 1
+        return completed_blocks > 0 and completed_blocks % int(image_interval_blocks_equiv) == 0
+    if image_trigger_mode == "block_end":
+        for ev in step_events:
+            if ev.get("type") != "block_end":
+                continue
+            block_idx_global = int(ev.get("block_idx_global", 0))
+            if block_idx_global >= 1 and (block_idx_global - 1) % int(image_interval_blocks_equiv) == 0:
+                return True
+    return False
+
+
 def _build_scheduler_node_sync_v8_fallback(
     cfg: Any,
     scheduler_info: Dict[str, Any],
@@ -1622,6 +1761,14 @@ def main() -> None:
             )
             convert_t1 = time.perf_counter()
             batch_convert_ms = float((convert_t1 - convert_t0) * 1000.0)
+            minimal_batch["_stage5_6_collect_debug_images"] = _stage5_6_debug_images_due(
+                image_trigger_mode=image_trigger_mode,
+                step=int(step),
+                scheduler_info=scheduler_info,
+                step_events=step_events,
+                image_trigger_interval_steps=int(image_trigger_interval_steps),
+                image_interval_blocks_equiv=int(image_interval_blocks_equiv),
+            )
 
             step_t0 = time.perf_counter()
             if perf_cfg["enable"] and torch.cuda.is_available():
@@ -1791,6 +1938,15 @@ def main() -> None:
                         scene_id_fallback=scheduler_info.get("scene_id", -1),
                         writer=writer,
                     )
+                    _save_stage5_6_debug_images(
+                        step=int(step),
+                        result=result,
+                        raw_batch=raw_batch,
+                        log_dir=str(cfg.log_dir),
+                        block_idx_global=int(scheduler_info.get("block_idx_global", 0)),
+                        scene_id_fallback=scheduler_info.get("scene_id", -1),
+                        pixel_camera_ids=pixel_camera_ids,
+                    )
             if image_trigger_mode == "episode_end":
                 if any(ev.get("type") == "episode_end" for ev in step_events):
                     completed_blocks = int(scheduler_info.get("block_idx_global", -1)) + 1
@@ -1813,6 +1969,15 @@ def main() -> None:
                             block_idx_global=int(scheduler_info.get("block_idx_global", 0)),
                             scene_id_fallback=scheduler_info.get("scene_id", -1),
                             writer=writer,
+                        )
+                        _save_stage5_6_debug_images(
+                            step=int(step),
+                            result=result,
+                            raw_batch=raw_batch,
+                            log_dir=str(cfg.log_dir),
+                            block_idx_global=int(scheduler_info.get("block_idx_global", 0)),
+                            scene_id_fallback=scheduler_info.get("scene_id", -1),
+                            pixel_camera_ids=pixel_camera_ids,
                         )
 
             block_end_monitor_ms = 0.0
@@ -1842,6 +2007,15 @@ def main() -> None:
                             block_idx_global=int(block_idx_global),
                             scene_id_fallback=ev.get("scene_id", -1),
                             writer=writer,
+                        )
+                        _save_stage5_6_debug_images(
+                            step=int(step),
+                            result=result,
+                            raw_batch=raw_batch,
+                            log_dir=str(cfg.log_dir),
+                            block_idx_global=int(block_idx_global),
+                            scene_id_fallback=ev.get("scene_id", -1),
+                            pixel_camera_ids=pixel_camera_ids,
                         )
 
                 acc = block_loss_accum.pop(int(block_idx_global), None)

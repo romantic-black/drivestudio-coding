@@ -23,6 +23,10 @@ from models.streetforward.minimal_trainer_stage5_5 import MinimalStreetForwardSt
 from models.streetforward.minimal_trainer_stage5_5_production import (
     MinimalStreetForwardStage5_5_Production,
 )
+from models.streetforward.minimal_trainer_stage5_6 import MinimalStreetForwardStage5_6
+from models.streetforward.minimal_trainer_stage5_6_production import (
+    MinimalStreetForwardStage5_6_Production,
+)
 from tools.streetforward_stage5_demo_controller import Stage5DemoController
 from tools.streetforward_stage5_viewer import StreetForwardStage5Viewer
 from tools.train_minimal_streetforward_stage1_1 import setup
@@ -56,7 +60,11 @@ def _select_trainer(stage: str, cfg: Any):
         if use_production:
             return MinimalStreetForwardStage5_5_Production
         return MinimalStreetForwardStage5_5
-    raise ValueError(f"Unsupported stage={stage_norm!r}, expected one of: 5_0, 5_2, 5_3, 5_4, 5_5")
+    if stage_norm == "5_6":
+        if use_production:
+            return MinimalStreetForwardStage5_6_Production
+        return MinimalStreetForwardStage5_6
+    raise ValueError(f"Unsupported stage={stage_norm!r}, expected one of: 5_0, 5_2, 5_3, 5_4, 5_5, 5_6")
 
 
 def _patch_cfg_for_demo(cfg: Any, args: argparse.Namespace) -> None:
@@ -136,7 +144,7 @@ def main() -> None:
         default="configs/demo_minimal_streetforward_stage5_viewer.yaml",
         help="Path to demo config YAML.",
     )
-    parser.add_argument("--stage", type=str, default="5_3", help="Stage trainer variant: 5_0 / 5_2 / 5_3 / 5_4 / 5_5.")
+    parser.add_argument("--stage", type=str, default="5_3", help="Stage trainer variant: 5_0 / 5_2 / 5_3 / 5_4 / 5_5 / 5_6.")
     parser.add_argument("--ckpt", type=str, default="", help="Checkpoint path.")
     parser.add_argument("--scene_id", type=int, default=None, help="Initial scene id for demo traversal.")
     parser.add_argument("--segment_id", type=int, default=None, help="Fixed segment id (optional).")

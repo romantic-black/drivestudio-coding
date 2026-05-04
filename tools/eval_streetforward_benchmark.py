@@ -17,6 +17,9 @@ from models.streetforward.minimal_trainer_stage5_4_production import (
 from models.streetforward.minimal_trainer_stage5_5_production import (
     MinimalStreetForwardStage5_5_Production,
 )
+from models.streetforward.minimal_trainer_stage5_6_production import (
+    MinimalStreetForwardStage5_6_Production,
+)
 from streetforward_eval.episode_builder import TestEpisodeSpec, build_test_episode_specs
 from streetforward_eval.metrics import MetricAccumulator
 from streetforward_eval.protocols import protocol_from_dict, validate_protocol
@@ -76,10 +79,12 @@ def _build_model(cfg: Any, device: torch.device) -> Any:
         model = MinimalStreetForwardStage5_4_Production(cfg, device=device).to(device)
     elif stage == "5_5":
         model = MinimalStreetForwardStage5_5_Production(cfg, device=device).to(device)
+    elif stage == "5_6":
+        model = MinimalStreetForwardStage5_6_Production(cfg, device=device).to(device)
     elif stage == "5_3":
         model = MinimalStreetForwardStage5_3_Production(cfg, device=device).to(device)
     else:
-        raise ValueError(f"unsupported model.stage={cfg.model.stage!r}; expected '5_3', '5_4', or '5_5'")
+        raise ValueError(f"unsupported model.stage={cfg.model.stage!r}; expected '5_3', '5_4', '5_5', or '5_6'")
     return model
 
 

@@ -206,6 +206,8 @@ class MinimalStreetForwardStage5_3_Production(MinimalStreetForwardStage5_3):
             "struct_far_mlp",
             "gate_history",
             "recurrent_update",
+            "stage5_6_error_head",
+            "stage5_6_feedback_fuser",
         ):
             logger.info("optimizer/group/%s/num_params=%s", key, int(logical_counts.get(key, 0)))
         logger.info("optimizer/frozen/dino/num_params=%s", int(meta.get("frozen_dino_params", 0)))
@@ -248,6 +250,10 @@ class MinimalStreetForwardStage5_3_Production(MinimalStreetForwardStage5_3):
                 out["lr/fusion_neck"] = float(group["lr"])
             elif logical_name == "gate_history":
                 out["lr/gate_history"] = float(group["lr"])
+            elif logical_name == "stage5_6_error_head":
+                out["lr/stage5_6_error_head"] = float(group["lr"])
+            elif logical_name == "stage5_6_feedback_fuser":
+                out["lr/stage5_6_feedback_fuser"] = float(group["lr"])
         return out
 
     def build_light_checkpoint_extra(self, *, step: int) -> Dict[str, Any]:

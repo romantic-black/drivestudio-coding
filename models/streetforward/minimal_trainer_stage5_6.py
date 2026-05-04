@@ -1,0 +1,1526 @@
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from models.streetforward.math_utils import get_viewmat
+from models.streetforward.metrics import compute_ssim_loss_masked
+from models.streetforward.minimal_trainer_stage3_2d import _create_proxy_params
+from models.streetforward.minimal_trainer_stage4_0 import _merge_params_bg_rigid_distant
+from models.streetforward.minimal_trainer_stage4_6 import RigidRoute
+from models.streetforward.minimal_trainer_stage5_4 import MinimalStreetForwardStage5_4
+
+
+class Stage5_6ErrorPredictHead(nn.Module):
+    """Predict per-pixel scalar nearby render error and a liftable latent feature."""
+
+    def __init__(
+        self,
+        in_ch: int,
+        hidden_dim: int,
+        latent_dim: int,
+        error_max: float,
+        head_type: str = "dilated_conv",
+    ):
+        super().__init__()
+        if hidden_dim <= 0:
+            raise ValueError(f"Stage5_6ErrorPredictHead hidden_dim must be > 0, got {hidden_dim}.")
+        if latent_dim <= 0:
+            raise ValueError(f"Stage5_6ErrorPredictHead latent_dim must be > 0, got {latent_dim}.")
+        groups = 8 if hidden_dim % 8 == 0 else 1
+        self.error_max = float(error_max)
+        self.head_type = str(head_type).strip().lower()
+        if self.head_type not in {"dilated_conv", "lite_unet"}:
+            raise ValueError("Stage5_6 error_pred.head_type must be one of ['dilated_conv', 'lite_unet'].")
+
+        if self.head_type == "lite_unet":
+            self.enc = nn.Sequential(
+                nn.Conv2d(in_ch, hidden_dim, 3, padding=1, bias=False),
+                nn.GroupNorm(groups, hidden_dim),
+                nn.GELU(),
+                nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1, bias=False),
+                nn.GroupNorm(groups, hidden_dim),
+                nn.GELU(),
+            )
+            self.down = nn.Sequential(
+                nn.Conv2d(hidden_dim, hidden_dim, 3, stride=2, padding=1, bias=False),
+                nn.GroupNorm(groups, hidden_dim),
+                nn.GELU(),
+                nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1, bias=False),
+                nn.GroupNorm(groups, hidden_dim),
+                nn.GELU(),
+            )
+            self.fuse = nn.Sequential(
+                nn.Conv2d(hidden_dim * 2, hidden_dim, 3, padding=1, bias=False),
+                nn.GroupNorm(groups, hidden_dim),
+                nn.GELU(),
+            )
+        else:
+            self.trunk = nn.Sequential(
+                nn.Conv2d(in_ch, hidden_dim, 3, padding=1, bias=False),
+                nn.GroupNorm(groups, hidden_dim),
+                nn.GELU(),
+                nn.Conv2d(hidden_dim, hidden_dim, 3, padding=2, dilation=2, bias=False),
+                nn.GroupNorm(groups, hidden_dim),
+                nn.GELU(),
+                nn.Conv2d(hidden_dim, hidden_dim, 3, padding=4, dilation=4, bias=False),
+                nn.GroupNorm(groups, hidden_dim),
+                nn.GELU(),
+                nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1, bias=False),
+                nn.GroupNorm(groups, hidden_dim),
+                nn.GELU(),
+            )
+        self.err = nn.Conv2d(hidden_dim, 1, 1)
+        self.latent = nn.Conv2d(hidden_dim, latent_dim, 1)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.head_type == "lite_unet":
+            e = self.enc(x)
+            h = self.down(e)
+            h = F.interpolate(h, size=e.shape[-2:], mode="bilinear", align_corners=False)
+            h = self.fuse(torch.cat([e, h], dim=1))
+        else:
+            h = self.trunk(x)
+        return self.error_max * torch.sigmoid(self.err(h)), self.latent(h)
+
+
+class Stage5_6PointResidualFuser(nn.Module):
+    """Zero-init residual adapter for point-level nearby-error feedback fusion."""
+
+    def __init__(
+        self,
+        feat_dim: int,
+        hidden_dim: int = 64,
+        feedback_dim: Optional[int] = None,
+        num_layers: int = 2,
+        *,
+        input_current_source_support: bool = True,
+        input_feedback_support: bool = True,
+        input_feedback_age: bool = True,
+        zero_init_last: bool = True,
+    ):
+        super().__init__()
+        self.feat_dim = int(feat_dim)
+        self.feedback_dim = int(feedback_dim if feedback_dim is not None else feat_dim)
+        self.input_current_source_support = bool(input_current_source_support)
+        self.input_feedback_support = bool(input_feedback_support)
+        self.input_feedback_age = bool(input_feedback_age)
+        if self.feat_dim <= 0 or self.feedback_dim <= 0:
+            raise ValueError("Stage5_6PointResidualFuser requires positive feat_dim and feedback_dim.")
+
+        extra_dim = 2  # log error scalar + valid flag
+        if self.input_current_source_support:
+            extra_dim += 1
+        if self.input_feedback_support:
+            extra_dim += 1
+        if self.input_feedback_age:
+            extra_dim += 1
+        in_dim = self.feat_dim + self.feedback_dim + extra_dim
+        layers: List[nn.Module] = []
+        hdim = int(hidden_dim)
+        depth = max(int(num_layers), 1)
+        for i in range(depth):
+            layers.append(nn.Linear(in_dim if i == 0 else hdim, hdim))
+            layers.append(nn.LayerNorm(hdim))
+            layers.append(nn.GELU())
+        layers.append(nn.Linear(hdim, self.feat_dim))
+        self.net = nn.Sequential(*layers)
+        if zero_init_last:
+            with torch.no_grad():
+                last = self.net[-1]
+                if isinstance(last, nn.Linear):
+                    nn.init.zeros_(last.weight)
+                    nn.init.zeros_(last.bias)
+
+    def _tensor_feedback_pack(self, feedback: torch.Tensor) -> Dict[str, torch.Tensor]:
+        n = int(feedback.shape[0])
+        if int(feedback.shape[1]) < self.feedback_dim:
+            pad = feedback.new_zeros((n, self.feedback_dim - int(feedback.shape[1])))
+            feat = torch.cat([feedback, pad], dim=-1)
+        else:
+            feat = feedback[:, : self.feedback_dim]
+        return {
+            "error": feedback.new_zeros((n, 1)),
+            "feat": feat,
+            "support": feedback.new_ones((n, 1)),
+            "valid": feedback.new_ones((n, 1)),
+            "age": feedback.new_zeros((n, 1)),
+        }
+
+    def forward(
+        self,
+        feat: torch.Tensor,
+        feedback: Any,
+        *,
+        current_support: Optional[torch.Tensor] = None,
+        scale: float = 1.0,
+    ) -> torch.Tensor:
+        if torch.is_tensor(feedback):
+            pack = self._tensor_feedback_pack(feedback.to(device=feat.device, dtype=feat.dtype))
+        elif isinstance(feedback, dict):
+            pack = {
+                k: v.to(device=feat.device, dtype=feat.dtype)
+                for k, v in feedback.items()
+                if torch.is_tensor(v)
+            }
+        else:
+            return feat
+        if "feat" not in pack or "valid" not in pack or int(pack["feat"].shape[0]) != int(feat.shape[0]):
+            return feat
+
+        fb_feat = pack["feat"]
+        if int(fb_feat.shape[1]) < self.feedback_dim:
+            fb_feat = torch.cat(
+                [fb_feat, fb_feat.new_zeros((int(fb_feat.shape[0]), self.feedback_dim - int(fb_feat.shape[1])))],
+                dim=-1,
+            )
+        else:
+            fb_feat = fb_feat[:, : self.feedback_dim]
+        valid = pack.get("valid", feat.new_ones((int(feat.shape[0]), 1))).clamp(0.0, 1.0)
+        error = torch.log1p(pack.get("error", feat.new_zeros((int(feat.shape[0]), 1))).clamp_min(0.0))
+        inputs = [feat, fb_feat, error, valid]
+        if self.input_current_source_support:
+            if current_support is None:
+                cur_s = feat.new_zeros((int(feat.shape[0]), 1))
+            else:
+                cur_s = current_support.to(device=feat.device, dtype=feat.dtype).reshape(int(feat.shape[0]), 1)
+            inputs.append(torch.log1p(cur_s.clamp_min(0.0)))
+        if self.input_feedback_support:
+            fb_s = pack.get("support", feat.new_zeros((int(feat.shape[0]), 1)))
+            inputs.append(torch.log1p(fb_s.clamp_min(0.0)))
+        if self.input_feedback_age:
+            age = pack.get("age", feat.new_zeros((int(feat.shape[0]), 1)))
+            inputs.append(age.clamp_min(0.0))
+        delta = self.net(torch.cat(inputs, dim=-1))
+        delta = delta * valid * float(scale)
+        return feat + delta
+
+
+class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
+    def __init__(self, config, device: torch.device, **kwargs):
+        self._stage5_6_cache: Dict[Tuple[int, int], Dict[str, Any]] = {}
+        self._stage5_6_active_cache: Optional[Dict[str, Optional[Dict[str, torch.Tensor]]]] = None
+        self._stage5_6_active_fusion_scale = 0.0
+        self._stage5_6_fusion_delta_norm_terms: List[torch.Tensor] = []
+        self._stage5_6_last_fused_features: Dict[str, torch.Tensor] = {}
+        self._stage5_6_last_nearby_debug_images: List[Dict[str, Any]] = []
+        self._stage5_6_last_error_debug_images: List[Dict[str, Any]] = []
+        super().__init__(config=config, device=device, **kwargs)
+        self._debug_check_stage5_6_optimizer_contains_new_modules()
+
+    def _validate_stage5_3_config(self, config) -> None:
+        model_cfg = self._require_key(config, "model", "config")
+        if str(self._require_key(model_cfg, "stage", "model")).strip().lower() != "5_6":
+            raise ValueError("Stage5_6 requires model.stage='5_6'.")
+        old_stage = model_cfg.get("stage")
+        model_cfg["stage"] = "5_4"
+        try:
+            super()._validate_stage5_3_config(config)
+        finally:
+            model_cfg["stage"] = old_stage
+
+        fsu_cfg = config.get("feature_splat_uncertainty", {}) if hasattr(config, "get") else {}
+        nef_cfg = config.get("nearby_error_feedback", {}) if hasattr(config, "get") else {}
+        bridge_cfg = fsu_cfg.get("bridge", {}) if hasattr(fsu_cfg, "get") else {}
+        top_bridge_cfg = config.get("bridge", {}) if hasattr(config, "get") else {}
+        if bool(bridge_cfg.get("enable", False)) or bool(top_bridge_cfg.get("enable", False)):
+            raise ValueError("Stage5_6 fast-fail: bridge.enable=true is not supported.")
+        if bool((fsu_cfg.get("head") or {}).get("predict_rgb_residual", False)):
+            raise ValueError(
+                "Stage5_6 fast-fail: feature_splat_uncertainty.head.predict_rgb_residual=true is not supported."
+            )
+        fsu_loss = fsu_cfg.get("loss", {}) if hasattr(fsu_cfg, "get") else {}
+        for key in ("rgb_residual_weight", "rgb_residual_supported_weight"):
+            if float(fsu_loss.get(key, 0.0)) != 0.0:
+                raise ValueError(f"Stage5_6 fast-fail: feature_splat_uncertainty.loss.{key} must be 0.0.")
+        cache_cfg = nef_cfg.get("cache", {}) if hasattr(nef_cfg, "get") else {}
+        mode = str(cache_cfg.get("mode", "overwrite")).strip().lower()
+        if mode != "overwrite":
+            raise ValueError("Stage5_6 nearby_error_feedback.cache.mode currently only supports 'overwrite'.")
+        error_pred_cfg = nef_cfg.get("error_pred", {}) if hasattr(nef_cfg, "get") else {}
+        target_role = str(nef_cfg.get("target_role", error_pred_cfg.get("target_role", "nearby_direct")))
+        scheduler_cfg = config.get("scheduler_v8", {}) if hasattr(config, "get") else {}
+        if hasattr(scheduler_cfg, "get") and target_role == "near_random":
+            aux_cfg = scheduler_cfg.get("aux_feature_splat_targets", {}) or {}
+            near_random_cfg = scheduler_cfg.get("near_random_supervision", {}) or {}
+            if bool(aux_cfg.get("enable", False)):
+                raise ValueError(
+                    "Stage5_6 target_role='near_random' requires scheduler_v8.aux_feature_splat_targets.enable=false."
+                )
+            if not bool(near_random_cfg.get("enable", False)):
+                raise ValueError(
+                    "Stage5_6 target_role='near_random' requires scheduler_v8.near_random_supervision.enable=true."
+                )
+
+    def _parse_target_view_weight_cfg(self, config) -> Dict[str, Any]:
+        cfg = super()._parse_target_view_weight_cfg(config)
+        losses_cfg = config.get("losses", {}) if hasattr(config, "get") else {}
+        tvw_cfg = losses_cfg.get("target_view_weights", {}) if hasattr(losses_cfg, "get") else {}
+        nearby_tvw = tvw_cfg.get("nearby_direct", {}) if hasattr(tvw_cfg, "get") else {}
+        nearby = config.get("nearby_direct", {}) if hasattr(config, "get") else {}
+        cfg["nearby_direct_weight"] = float(nearby_tvw.get("weight", nearby.get("weight", 0.7)))
+        return cfg
+
+    def _target_role_weight(self, role: str, step: int) -> float:
+        if str(role) == "nearby_direct":
+            return float(self._target_view_weight_cfg.get("nearby_direct_weight", 0.7))
+        return float(super()._target_role_weight(role, step))
+
+    def _init_stage5_3_modules(self, config) -> None:
+        super()._init_stage5_3_modules(config)
+        nearby = config.get("nearby_direct", {}) if hasattr(config, "get") else {}
+        fsu = config.get("feature_splat_uncertainty", {}) if hasattr(config, "get") else {}
+        nef = config.get("nearby_error_feedback", {}) if hasattr(config, "get") else {}
+
+        self.stage5_6_nearby_enabled = bool(nearby.get("enable", False))
+        self.stage5_6_nearby_weight = float(
+            nearby.get("weight", self._target_view_weight_cfg.get("nearby_direct_weight", 0.7))
+        )
+        self.stage5_6_nearby_warmup_steps = int(nearby.get("warmup_steps", 0))
+        self.stage5_6_nearby_max_refs = int(nearby.get("max_refs_per_step", 1))
+        self.stage5_6_nearby_mask_sky = bool(nearby.get("mask_sky", True))
+        self.stage5_6_nearby_mask_egocar = bool(nearby.get("mask_egocar", True))
+        self.stage5_6_nearby_mask_dynamic = bool(nearby.get("mask_dynamic", False))
+        self.stage5_6_nearby_min_valid_pixel_ratio = float(nearby.get("min_valid_pixel_ratio", 0.03))
+        self.stage5_6_nearby_role = str(nearby.get("role_name", "nearby_direct"))
+
+        warm_cfg = nef.get("warmup", {}) if hasattr(nef, "get") else {}
+        error_pred_cfg = nef.get("error_pred", {}) if hasattr(nef, "get") else {}
+        lift_cfg = nef.get("feedback_lift", {}) if hasattr(nef, "get") else {}
+        cache_cfg = nef.get("cache", {}) if hasattr(nef, "get") else {}
+        fusion_cfg = nef.get("fusion", {}) if hasattr(nef, "get") else {}
+        loss_cfg = nef.get("loss", {}) if hasattr(nef, "get") else {}
+        fsu_loss = fsu.get("loss", {}) if hasattr(fsu, "get") else {}
+        fsu_head = fsu.get("head", {}) if hasattr(fsu, "get") else {}
+        fsu_splat = fsu.get("splat", {}) if hasattr(fsu, "get") else {}
+        fsu_target = fsu.get("target", {}) if hasattr(fsu, "get") else {}
+        legacy_cache = fsu.get("short_cycle_feedback", {}) if hasattr(fsu, "get") else {}
+
+        self.stage5_6_feedback_enabled = bool(nef.get("enable", fsu.get("enable", False)))
+        self.stage5_6_error_enabled = bool(error_pred_cfg.get("enable", self.stage5_6_feedback_enabled))
+        self.stage5_6_error_target_role = str(nef.get("target_role", error_pred_cfg.get("target_role", "nearby_direct")))
+        self.stage5_6_target_max_targets = int(
+            error_pred_cfg.get("max_targets_per_step", fsu_target.get("max_targets_per_step", 1))
+        )
+        self.stage5_6_target_every_n_steps = int(error_pred_cfg.get("every_n_steps", fsu_target.get("every_n_steps", 1)))
+        self.stage5_6_target_skip_if_no_valid_aux = bool(
+            error_pred_cfg.get("skip_if_no_valid_aux", fsu_target.get("skip_if_no_valid_aux", True))
+        )
+
+        self.stage5_6_detach_geometry = bool(error_pred_cfg.get("detach_geometry", fsu_splat.get("detach_geometry", True)))
+        self.stage5_6_detach_alpha_weights = bool(
+            error_pred_cfg.get("detach_alpha_weights", fsu_splat.get("detach_alpha_weights", True))
+        )
+        self.stage5_6_detach_render_context = bool(
+            error_pred_cfg.get("detach_render_context", fsu_splat.get("detach_render_context", True))
+        )
+        self.stage5_6_splat_eps = float(lift_cfg.get("eps", fsu_splat.get("eps", 1.0e-6)))
+        self.stage5_6_use_render_rgb = bool(error_pred_cfg.get("use_render_rgb", fsu_head.get("use_render_rgb", True)))
+        self.stage5_6_use_render_alpha = bool(error_pred_cfg.get("use_render_alpha", fsu_head.get("use_render_alpha", True)))
+
+        self.stage5_6_lift_support_min = float(lift_cfg.get("support_min", 1.0e-5))
+        self.stage5_6_lift_mask_sky = bool(lift_cfg.get("mask_sky", True))
+        self.stage5_6_lift_mask_egocar = bool(lift_cfg.get("mask_egocar", True))
+        self.stage5_6_lift_mask_dynamic = bool(lift_cfg.get("mask_dynamic", False))
+        self.stage5_6_lift_require_render_alpha = bool(lift_cfg.get("require_render_alpha", True))
+        self.stage5_6_lift_render_alpha_min = float(lift_cfg.get("render_alpha_min", 0.02))
+        self.stage5_6_detach_lifted_feedback = bool(lift_cfg.get("detach_lifted_feedback", True))
+
+        self.stage5_6_error_weight = float(loss_cfg.get("error_weight", fsu_loss.get("all_valid_weight", 0.03)))
+        self.stage5_6_error_loss_type = str(loss_cfg.get("error_loss_type", "charbonnier")).strip().lower()
+        if self.stage5_6_error_loss_type not in {"charbonnier", "l1"}:
+            raise ValueError("nearby_error_feedback.loss.error_loss_type must be one of ['charbonnier', 'l1'].")
+        self.stage5_6_error_warmup_steps = int(loss_cfg.get("error_warmup_steps", fsu_loss.get("warmup_steps", 3000)))
+        self.stage5_6_error_start_weight_scale = float(
+            loss_cfg.get("error_start_weight_scale", fsu_loss.get("start_weight_scale", 0.0))
+        )
+        self.stage5_6_error_end_weight_scale = float(
+            loss_cfg.get("error_end_weight_scale", fsu_loss.get("end_weight_scale", 1.0))
+        )
+        self.stage5_6_error_min_valid_pixel_ratio = float(
+            loss_cfg.get("min_valid_pixel_ratio", fsu_loss.get("min_valid_pixel_ratio", 0.03))
+        )
+
+        self.stage5_6_pred_error_only_steps = int(
+            warm_cfg.get("pred_error_only_steps", fsu.get("pred_error_only_steps", legacy_cache.get("pred_error_only_steps", 7000)))
+        )
+        self.stage5_6_fusion_start_step = int(warm_cfg.get("fusion_start_step", self.stage5_6_pred_error_only_steps))
+        self.stage5_6_fusion_warmup_steps = int(warm_cfg.get("fusion_warmup_steps", 3000))
+        self.stage5_6_fusion_start_scale = float(warm_cfg.get("fusion_start_scale", 0.0))
+        self.stage5_6_fusion_end_scale = float(warm_cfg.get("fusion_end_scale", 1.0))
+        self.stage5_6_cache_enable = bool(cache_cfg.get("enable", legacy_cache.get("enable", True)))
+        self.stage5_6_cache_max_age = int(cache_cfg.get("max_age", legacy_cache.get("max_age", 1)))
+
+        self.stage5_6_fusion_enabled = bool(fusion_cfg.get("enable", True))
+        self.stage5_6_fusion_apply_to_bg = bool(fusion_cfg.get("apply_to_bg", True))
+        self.stage5_6_fusion_apply_to_distant = bool(fusion_cfg.get("apply_to_distant", True))
+        self.stage5_6_fusion_apply_to_rigid = bool(fusion_cfg.get("apply_to_rigid", True))
+        self.stage5_6_fusion_input_current_source_support = bool(
+            fusion_cfg.get("input_current_source_support", True)
+        )
+        self.stage5_6_fusion_input_feedback_support = bool(fusion_cfg.get("input_feedback_support", True))
+        self.stage5_6_fusion_input_feedback_age = bool(fusion_cfg.get("input_feedback_age", True))
+
+        feat_dim = int(self.stage5_2_feat_2d_channels)
+        hidden_dim = int(error_pred_cfg.get("hidden_dim", fsu_head.get("hidden_dim", 64)))
+        error_feat_dim = int(error_pred_cfg.get("error_feat_dim", 8))
+        error_max = float(error_pred_cfg.get("error_max", fsu_head.get("error_max", 0.5)))
+        head_type = str(error_pred_cfg.get("head_type", "dilated_conv")).strip().lower()
+        in_ch = feat_dim
+        if self.stage5_6_use_render_rgb:
+            in_ch += 3
+        if self.stage5_6_use_render_alpha:
+            in_ch += 1
+        self.stage5_6_error_feat_dim = int(error_feat_dim)
+        self.stage5_6_error_head = Stage5_6ErrorPredictHead(
+            in_ch=in_ch,
+            hidden_dim=hidden_dim,
+            latent_dim=error_feat_dim,
+            error_max=error_max,
+            head_type=head_type,
+        ).to(self.device)
+
+        fuse_hidden = int(fusion_cfg.get("hidden_dim", 64))
+        fuse_layers = int(fusion_cfg.get("num_layers", 2))
+        fuser_kwargs = {
+            "feat_dim": feat_dim,
+            "hidden_dim": fuse_hidden,
+            "feedback_dim": error_feat_dim,
+            "num_layers": fuse_layers,
+            "input_current_source_support": self.stage5_6_fusion_input_current_source_support,
+            "input_feedback_support": self.stage5_6_fusion_input_feedback_support,
+            "input_feedback_age": self.stage5_6_fusion_input_feedback_age,
+            "zero_init_last": bool(fusion_cfg.get("zero_init_last", True)),
+        }
+        self.stage5_6_bg_fuser = Stage5_6PointResidualFuser(**fuser_kwargs).to(self.device)
+        self.stage5_6_distant_fuser = Stage5_6PointResidualFuser(**fuser_kwargs).to(self.device)
+        self.stage5_6_rigid_fuser = Stage5_6PointResidualFuser(**fuser_kwargs).to(self.device)
+
+    @staticmethod
+    def _charbonnier(diff: torch.Tensor, eps: float = 1.0e-3) -> torch.Tensor:
+        return torch.sqrt(diff * diff + eps * eps)
+
+    def _debug_check_stage5_6_optimizer_contains_new_modules(self) -> None:
+        opt = getattr(self, "optimizer", None)
+        if opt is None:
+            return
+        opt_param_ids = {id(p) for group in opt.param_groups for p in group.get("params", [])}
+        modules = {
+            "stage5_6_error_head": getattr(self, "stage5_6_error_head", None),
+            "stage5_6_bg_fuser": getattr(self, "stage5_6_bg_fuser", None),
+            "stage5_6_distant_fuser": getattr(self, "stage5_6_distant_fuser", None),
+            "stage5_6_rigid_fuser": getattr(self, "stage5_6_rigid_fuser", None),
+        }
+        missing: List[str] = []
+        for module_name, module in modules.items():
+            if module is None:
+                missing.append(f"{module_name}: module is None")
+                continue
+            for name, p in module.named_parameters():
+                if p.requires_grad and id(p) not in opt_param_ids:
+                    missing.append(f"{module_name}.{name}")
+        if missing:
+            raise RuntimeError(
+                "Stage5_6 new module parameters are not in optimizer: " + ", ".join(missing[:16])
+            )
+
+    def _collect_role_targets(
+        self,
+        batch: Dict[str, Any],
+        *,
+        role: str,
+        max_targets: int,
+        prefer_targets: bool = True,
+        fallback_aux: bool = True,
+        require_aux_if_requested: bool = False,
+    ) -> List[Dict[str, Any]]:
+        request_meta = batch.get("request_meta") or {}
+        wanted_role = str(role)
+        targets = batch.get("targets") if prefer_targets else None
+        roles = [str(x) for x in list(request_meta.get("target_image_roles") or [])]
+        if isinstance(targets, list) and len(roles) == len(targets) and len(roles) > 0:
+            matched: List[Dict[str, Any]] = []
+            for idx, (target, target_role) in enumerate(zip(targets, roles)):
+                if str(target_role) != wanted_role:
+                    continue
+                item = dict(target)
+                item["role"] = str(target_role)
+                item["batch_target_index"] = int(idx)
+                item["target_index"] = int(len(matched))
+                matched.append(item)
+            limit = int(max_targets)
+            if limit > 0:
+                matched = matched[:limit]
+            if len(matched) > 0 or not fallback_aux:
+                return matched
+
+        requested_aux = request_meta.get("aux_image_refs") or batch.get("aux_image_refs") or []
+        aux = batch.get("aux_targets")
+        if require_aux_if_requested and len(requested_aux) > 0:
+            if not isinstance(aux, list) or len(aux) == 0:
+                raise RuntimeError(
+                    "Stage5_6 got aux_image_refs but batch['aux_targets'] is missing or empty. "
+                    "Dataset/conversion must materialize nearby aux targets before trainer.forward()."
+                )
+        if not isinstance(aux, list):
+            return []
+        aux_roles = [str(x) for x in list(request_meta.get("aux_image_roles") or [])]
+        if len(aux_roles) == len(aux) and len(aux_roles) > 0:
+            filtered: List[Dict[str, Any]] = []
+            for idx, (target, aux_role) in enumerate(zip(aux, aux_roles)):
+                if str(aux_role) != wanted_role:
+                    continue
+                item = dict(target)
+                item["role"] = str(aux_role)
+                item["batch_target_index"] = int(idx)
+                item["target_index"] = int(len(filtered))
+                filtered.append(item)
+            aux = filtered
+        else:
+            aux = [dict(t, role=wanted_role, target_index=i) for i, t in enumerate(aux)]
+        limit = int(max_targets)
+        if limit > 0:
+            return aux[:limit]
+        return aux
+
+    def _collect_nearby_aux_targets(
+        self,
+        batch: Dict[str, Any],
+        *,
+        max_targets: int,
+        require_materialized: bool,
+    ) -> List[Dict[str, Any]]:
+        return self._collect_role_targets(
+            batch,
+            role=str(getattr(self, "stage5_6_nearby_role", "nearby_direct")),
+            max_targets=int(max_targets),
+            prefer_targets=False,
+            fallback_aux=True,
+            require_aux_if_requested=bool(require_materialized),
+        )
+
+    def _collect_feedback_targets(
+        self,
+        batch: Dict[str, Any],
+        *,
+        max_targets: int,
+        require_aux_if_requested: bool,
+    ) -> List[Dict[str, Any]]:
+        return self._collect_role_targets(
+            batch,
+            role=str(getattr(self, "stage5_6_error_target_role", "near_random")),
+            max_targets=int(max_targets),
+            prefer_targets=True,
+            fallback_aux=True,
+            require_aux_if_requested=bool(require_aux_if_requested),
+        )
+
+    def _mask_hw(self, mask: torch.Tensor, h: int, w: int, name: str = "mask") -> torch.Tensor:
+        m = mask.to(self.device).float()
+        while m.dim() > 2:
+            if int(m.shape[0]) == 1:
+                m = m.squeeze(0)
+            elif int(m.shape[-1]) == 1:
+                m = m.squeeze(-1)
+            else:
+                raise ValueError(f"Stage5_6 {name} cannot be squeezed to [H,W]: got {tuple(m.shape)}.")
+        if tuple(m.shape) != (int(h), int(w)):
+            raise ValueError(f"Stage5_6 {name} shape mismatch: got {tuple(m.shape)}, expect {(h, w)}.")
+        return m
+
+    def _nearby_weight(self, step: int) -> float:
+        if self.stage5_6_nearby_warmup_steps <= 0:
+            return float(self.stage5_6_nearby_weight)
+        ratio = min(1.0, max(0.0, float(step) / float(self.stage5_6_nearby_warmup_steps)))
+        return float(self.stage5_6_nearby_weight * ratio)
+
+    def _fusion_scale(self, step: int) -> float:
+        if not bool(getattr(self, "stage5_6_cache_enable", True)) or not bool(
+            getattr(self, "stage5_6_fusion_enabled", True)
+        ):
+            return 0.0
+        start = int(getattr(self, "stage5_6_fusion_start_step", 7000))
+        if int(step) < start:
+            return 0.0
+        warm = int(getattr(self, "stage5_6_fusion_warmup_steps", 3000))
+        s0 = float(getattr(self, "stage5_6_fusion_start_scale", 0.0))
+        s1 = float(getattr(self, "stage5_6_fusion_end_scale", 1.0))
+        if warm <= 0:
+            return float(s1)
+        t = min(1.0, max(0.0, float(int(step) - start) / float(warm)))
+        return float(s0 + t * (s1 - s0))
+
+    def _cache_ready(self, step: int) -> bool:
+        return int(step) >= int(self.stage5_6_pred_error_only_steps)
+
+    def _stage5_6_detach_render_params(self, render_params: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        return {k: v.detach() if torch.is_tensor(v) else v for k, v in render_params.items()}
+
+    def _build_rigid_world_for_aux_frame(
+        self,
+        out: Dict[str, Any],
+        target_frame_idx: int,
+    ) -> Tuple[Optional[Dict[str, torch.Tensor]], torch.Tensor]:
+        node_state_rigid = out.get("_node_state_rigid")
+        if node_state_rigid is None:
+            return None, torch.zeros((0,), dtype=torch.long, device=self.device)
+        u_all = out.get("_rigid_writeback_idx")
+        if u_all is None:
+            u_all = torch.zeros((0,), dtype=torch.long, device=self.device)
+        else:
+            u_all = u_all.to(device=self.device, dtype=torch.long)
+        n_rigid = int(node_state_rigid.means.shape[0])
+        if int(u_all.numel()) > 0 and (bool((u_all < 0).any().item()) or bool((u_all >= n_rigid).any().item())):
+            raise RuntimeError("Stage5_6 rigid aux U_all contains out-of-range indices.")
+        is_updated = torch.zeros((n_rigid,), dtype=torch.bool, device=self.device)
+        if int(u_all.numel()) > 0:
+            is_updated[u_all] = True
+        target_valid = torch.nonzero(
+            self._rigid_point_valid_mask(node_state_rigid, int(target_frame_idx)),
+            as_tuple=False,
+        ).squeeze(1).to(device=self.device, dtype=torch.long)
+        if int(target_valid.numel()) == 0:
+            return None, target_valid
+        idx_train = target_valid[is_updated[target_valid]]
+        idx_frozen = target_valid[~is_updated[target_valid]]
+        rigid_local = out.get("_render_params_rigid_local")
+        if int(idx_train.numel()) > 0 and rigid_local is None:
+            raise RuntimeError("Stage5_6 aux needs _render_params_rigid_local for updated rigid nodes.")
+        rigid_world = self._build_rigid_world_for_frame(
+            node_state_rigid,
+            int(target_frame_idx),
+            idx_train,
+            idx_frozen,
+            rigid_local,
+            u_all,
+        )
+        return rigid_world, torch.cat([idx_train, idx_frozen], dim=0)
+
+    def _build_nearby_direct_proxy_render_params(
+        self,
+        out: Dict[str, Any],
+        target_frame_idx: int,
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        proxies_bg = out.get("_proxies_bg") or out.get("proxies")
+        render_bg = out.get("_render_params_bg") or out.get("render_params")
+        if proxies_bg is None or render_bg is None:
+            return None
+        render_distant = out.get("_render_params_distant")
+        proxies_distant = out.get("_proxies_distant")
+        if render_distant is not None and proxies_distant is None:
+            raise RuntimeError("Stage5_6 nearby_direct expected _proxies_distant for distant render params.")
+        rigid_world, _rigid_order = self._build_rigid_world_for_aux_frame(out, int(target_frame_idx))
+        proxy_rigid = None
+        if rigid_world is not None:
+            proxy_rigid = _create_proxy_params(rigid_world)
+            pairs = out.get("_rigid_world_proxy_pairs")
+            if pairs is None:
+                pairs = []
+                out["_rigid_world_proxy_pairs"] = pairs
+            elif not isinstance(pairs, list):
+                pairs = list(pairs)
+                out["_rigid_world_proxy_pairs"] = pairs
+            pairs.append((rigid_world, proxy_rigid))
+        return _merge_params_bg_rigid_distant(proxies_bg, proxy_rigid, proxies_distant)
+
+    def _build_nearby_mask(self, target: Dict[str, Any], h: int, w: int) -> torch.Tensor:
+        valid_target = target
+        egocar_for_valid = target.get("egocar_mask")
+        if egocar_for_valid is not None:
+            valid_target = dict(target)
+            valid_target["egocar_mask"] = self._mask_hw(egocar_for_valid, h, w, "egocar_mask")
+        mask = self._valid_loss_mask_from_target(valid_target, height=h, width=w).to(self.device).float()
+        if self.stage5_6_nearby_mask_sky and target.get("sky_mask") is not None:
+            mask = mask * (1.0 - self._mask_hw(target["sky_mask"], h, w, "sky_mask")).clamp(0.0, 1.0)
+        if self.stage5_6_nearby_mask_egocar and target.get("egocar_mask") is not None:
+            mask = mask * (1.0 - self._mask_hw(target["egocar_mask"], h, w, "egocar_mask")).clamp(0.0, 1.0)
+        if self.stage5_6_nearby_mask_dynamic and target.get("dynamic_mask") is not None:
+            mask = mask * (1.0 - self._mask_hw(target["dynamic_mask"], h, w, "dynamic_mask")).clamp(0.0, 1.0)
+        return mask
+
+    def _build_error_mask(
+        self,
+        target: Dict[str, Any],
+        h: int,
+        w: int,
+        render_alpha: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        mask = self._build_nearby_mask(target, h, w)
+        if bool(getattr(self, "stage5_6_lift_mask_sky", True)) and target.get("sky_mask") is not None:
+            mask = mask * (1.0 - self._mask_hw(target["sky_mask"], h, w, "sky_mask")).clamp(0.0, 1.0)
+        if bool(getattr(self, "stage5_6_lift_mask_egocar", True)) and target.get("egocar_mask") is not None:
+            mask = mask * (1.0 - self._mask_hw(target["egocar_mask"], h, w, "egocar_mask")).clamp(0.0, 1.0)
+        if bool(getattr(self, "stage5_6_lift_mask_dynamic", False)) and target.get("dynamic_mask") is not None:
+            mask = mask * (1.0 - self._mask_hw(target["dynamic_mask"], h, w, "dynamic_mask")).clamp(0.0, 1.0)
+        if bool(getattr(self, "stage5_6_lift_require_render_alpha", True)) and render_alpha is not None:
+            alpha = render_alpha
+            if alpha.dim() == 3 and int(alpha.shape[-1]) == 1:
+                alpha = alpha.squeeze(-1)
+            mask = mask * (alpha.detach().to(device=self.device).float() > float(self.stage5_6_lift_render_alpha_min)).float()
+        return mask
+
+    def _compute_nearby_direct_loss(self, batch: Dict[str, Any], out: Dict[str, Any]) -> Dict[str, Any]:
+        zero = out["loss"].new_zeros(())
+        if not self.stage5_6_nearby_enabled:
+            return {"loss": zero, "processed": 0.0}
+        collect_debug = bool(batch.get("_stage5_6_collect_debug_images", False))
+        aux = self._collect_nearby_aux_targets(
+            batch,
+            max_targets=int(self.stage5_6_nearby_max_refs),
+            require_materialized=True,
+        )
+        if len(aux) == 0:
+            return {"loss": zero, "processed": 0.0, "skipped_empty": 1.0}
+        step = int(self._current_loss_step(batch))
+        view_weight = self._nearby_weight(step)
+        if view_weight <= 0.0:
+            return {"loss": zero, "processed": 0.0, "view_weight": float(view_weight), "skipped_zero_weight": 1.0}
+
+        loss_terms: List[torch.Tensor] = []
+        l1_terms: List[torch.Tensor] = []
+        psnr_terms: List[torch.Tensor] = []
+        valid_terms: List[torch.Tensor] = []
+        debug_images: List[Dict[str, Any]] = []
+        skipped_low_valid = 0
+        for target_idx, t in enumerate(aux):
+            gt = t.get("gt_image")
+            view = t.get("view")
+            frame_idx = t.get("frame_idx")
+            if gt is None or view is None or frame_idx is None:
+                continue
+            if gt.dim() == 4:
+                gt = gt.squeeze(0)
+            h, w = int(gt.shape[0]), int(gt.shape[1])
+            rp = self._build_nearby_direct_proxy_render_params(out, int(frame_idx))
+            if rp is None:
+                continue
+            pred, _alpha = self._render_single_view(rp, view, h, w)
+            gt = gt.to(device=pred.device, dtype=pred.dtype)
+            mask = self._build_nearby_mask(t, h, w).to(device=pred.device, dtype=pred.dtype)
+            valid_ratio = mask.mean()
+            if float(valid_ratio.detach().item()) < float(self.stage5_6_nearby_min_valid_pixel_ratio):
+                skipped_low_valid += 1
+                continue
+            denom = mask.sum().clamp_min(1.0)
+            l1_raw = (pred - gt).abs().mul(mask.unsqueeze(-1)).sum() / (denom * 3.0)
+            ssim = compute_ssim_loss_masked(pred, gt, valid_mask=mask, sky_mask=None, data_range=1.0)
+            loss_terms.append(
+                pred.new_tensor(float(view_weight)) * (float(self.loss_w_l1) * l1_raw + float(self.loss_w_ssim) * ssim)
+            )
+            mse = (((pred - gt) ** 2) * mask.unsqueeze(-1)).sum() / (denom * 3.0)
+            psnr_terms.append((-10.0 * torch.log10(mse.clamp_min(1.0e-10))).detach())
+            l1_terms.append(l1_raw.detach())
+            valid_terms.append(valid_ratio.detach())
+            if collect_debug:
+                debug_images.append(
+                    {
+                        "target_index": int(t.get("target_index", target_idx)),
+                        "frame_idx": int(frame_idx),
+                        "cam_idx": int(t.get("cam_idx", -1)),
+                        "role": str(t.get("role", self.stage5_6_nearby_role)),
+                        "pred": pred.detach().float().cpu(),
+                        "gt": gt.detach().float().cpu(),
+                    }
+                )
+        if len(loss_terms) == 0:
+            return {
+                "loss": zero,
+                "processed": 0.0,
+                "view_weight": float(view_weight),
+                "skipped_low_valid": float(skipped_low_valid),
+            }
+        return {
+            "loss": torch.stack(loss_terms).mean(),
+            "processed": float(len(loss_terms)),
+            "view_weight": float(view_weight),
+            "monitor_l1": torch.stack(l1_terms).mean(),
+            "monitor_psnr": torch.stack(psnr_terms).mean(),
+            "valid_mask_ratio": torch.stack(valid_terms).mean(),
+            "skipped_low_valid": float(skipped_low_valid),
+            **({"debug_images": debug_images} if collect_debug else {}),
+        }
+
+    def _feature_splat_render(
+        self,
+        *,
+        render_params: Dict[str, torch.Tensor],
+        colors: torch.Tensor,
+        view: Any,
+        height: int,
+        width: int,
+        detach_geometry: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if colors.ndim != 2:
+            raise ValueError(f"Stage5_6 feature colors must be [N,C], got {tuple(colors.shape)}.")
+        means = render_params["means_r"]
+        dtype = means.dtype
+        dev = means.device
+        c2w = view.camtoworlds if hasattr(view, "camtoworlds") else view["camtoworlds"]
+        viewmat = get_viewmat(c2w.to(device=dev, dtype=dtype))
+        if hasattr(view, "Ks"):
+            Ks = view.Ks[0:1]
+        elif hasattr(view, "K"):
+            Ks = view.K
+        else:
+            Ks = torch.eye(3, device=dev, dtype=dtype).unsqueeze(0)
+        if Ks.dim() == 2:
+            Ks = Ks.unsqueeze(0)
+        Ks = Ks.to(device=dev, dtype=dtype)
+        quats = render_params["quats_r"]
+        scales = render_params["scales_r"]
+        opacities = render_params["opacities_r"]
+        if detach_geometry:
+            means = means.detach()
+            quats = quats.detach()
+            scales = scales.detach()
+            opacities = opacities.detach()
+        render, alpha, _ = self.renderer(
+            means=means,
+            quats=quats,
+            scales=scales,
+            opacities=opacities,
+            colors=colors,
+            viewmats=viewmat,
+            Ks=Ks,
+            width=int(width),
+            height=int(height),
+            tile_size=16,
+            packed=False,
+            near_plane=0.01,
+            far_plane=1e10,
+            render_mode="RGB",
+            sh_degree=None,
+            sparse_grad=False,
+            absgrad=False,
+            rasterize_mode="classic",
+            channel_chunk=max(32, int(colors.shape[-1])),
+        )
+        feat = render.squeeze(0)
+        acc = alpha.squeeze(0)
+        if acc.dim() == 3:
+            acc = acc[..., 0]
+        return feat, acc
+
+    def _splat_node_features_to_view(
+        self,
+        *,
+        render_params: Dict[str, torch.Tensor],
+        node_features: torch.Tensor,
+        node_mask: torch.Tensor,
+        view: Any,
+        height: int,
+        width: int,
+        detach_geometry: bool,
+        detach_weights: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if bool(detach_weights) and not bool(detach_geometry):
+            raise ValueError("Stage5_6 detach_alpha_weights=true requires detach_geometry=true.")
+        if int(node_features.shape[0]) != int(node_mask.shape[0]):
+            raise ValueError("Stage5_6 node_features/node_mask length mismatch.")
+        n = int(node_features.shape[0])
+        c = int(node_features.shape[1])
+        render_n = int(render_params["means_r"].shape[0])
+        if render_n != n:
+            raise ValueError(f"Stage5_6 render/features length mismatch: {render_n} vs {n}.")
+        render_dev = render_params["means_r"].device
+        render_dtype = render_params["means_r"].dtype
+        if n == 0 or int(node_mask.sum().item()) == 0:
+            return (
+                torch.zeros((height, width, c), dtype=render_dtype, device=render_dev),
+                torch.zeros((height, width), dtype=render_dtype, device=render_dev),
+            )
+        mask_f = node_mask.to(device=render_dev, dtype=render_dtype).reshape(n, 1)
+        colors = torch.zeros((n, c + 1), dtype=render_dtype, device=render_dev)
+        colors[:, :c] = node_features.to(device=render_dev, dtype=render_dtype) * mask_f
+        colors[:, c : c + 1] = mask_f
+        rendered, _alpha = self._feature_splat_render(
+            render_params=render_params,
+            colors=colors,
+            view=view,
+            height=height,
+            width=width,
+            detach_geometry=detach_geometry,
+        )
+        feat_sum = rendered[..., :c]
+        support = rendered[..., c]
+        norm_support = support.detach() if detach_weights else support
+        return feat_sum / (norm_support.unsqueeze(-1) + float(self.stage5_6_splat_eps)), support
+
+    @staticmethod
+    def _merge_lists(items: List[Optional[torch.Tensor]]) -> Optional[torch.Tensor]:
+        valid = [x for x in items if x is not None and int(x.shape[0]) > 0]
+        if len(valid) == 0:
+            return None
+        return torch.cat(valid, dim=0)
+
+    def _current_or_fused_feature(self, out: Dict[str, Any], key: str, fallback_key: str) -> Optional[torch.Tensor]:
+        fused = self._stage5_6_last_fused_features.get(key)
+        if fused is not None:
+            return fused
+        return out.get(fallback_key)
+
+    def _build_feedback_node_pack(
+        self,
+        *,
+        out: Dict[str, Any],
+        target_frame_idx: int,
+    ) -> Optional[Dict[str, Any]]:
+        feat_bg = self._current_or_fused_feature(out, "bg", "_feat_2d_bg")
+        acc_bg = out.get("_acc_w_bg")
+        render_bg = out.get("_render_params_bg")
+        if feat_bg is None or acc_bg is None or render_bg is None:
+            return None
+        feats: List[Optional[torch.Tensor]] = [feat_bg]
+        masks: List[Optional[torch.Tensor]] = [acc_bg > float(self.bg_src_backproject_support_min)]
+
+        rigid_world, rigid_order = self._build_rigid_world_for_aux_frame(out, int(target_frame_idx))
+        node_state_rigid = out.get("_node_state_rigid")
+        route = out.get("_route")
+        rigid_count = int(rigid_order.numel())
+        if rigid_world is not None and rigid_count > 0:
+            if route is None or node_state_rigid is None:
+                raise RuntimeError("Stage5_6 feedback rigid pack requires _route and _node_state_rigid.")
+            feat_rigid_s = self._current_or_fused_feature(out, "rigid_s", "_feat_2d_rigid_S")
+            acc_rigid_s = out.get("_acc_w_rigid_S")
+            if feat_rigid_s is None or acc_rigid_s is None:
+                raise RuntimeError("Stage5_6 feedback rigid pack requires source rigid features/support.")
+            n_rigid = int(node_state_rigid.means.shape[0])
+            lookup_s = torch.full((n_rigid,), -1, dtype=torch.long, device=self.device)
+            route_s = route.S.to(device=self.device, dtype=torch.long)
+            if int(route_s.numel()) > 0:
+                lookup_s[route_s] = torch.arange(int(route_s.numel()), dtype=torch.long, device=self.device)
+            rows = lookup_s[rigid_order]
+            observed = rows >= 0
+            feat_rigid_ordered = feat_bg.new_zeros((rigid_count, int(feat_bg.shape[1])))
+            mask_rigid_ordered = torch.zeros((rigid_count,), dtype=torch.bool, device=self.device)
+            if bool(observed.any().item()):
+                obs_rows = rows[observed]
+                feat_rigid_ordered[observed] = feat_rigid_s[obs_rows].to(
+                    device=feat_rigid_ordered.device,
+                    dtype=feat_rigid_ordered.dtype,
+                )
+                mask_rigid_ordered[observed] = (
+                    acc_rigid_s[obs_rows].to(device=self.device) > float(self.rigid_src_backproject_support_min)
+                )
+            feats.append(feat_rigid_ordered)
+            masks.append(mask_rigid_ordered)
+
+        feat_distant = self._current_or_fused_feature(out, "distant", "_feat_2d_distant")
+        acc_distant = out.get("_acc_w_distant")
+        render_distant = out.get("_render_params_distant")
+        distant_count = 0
+        if feat_distant is not None and acc_distant is not None and render_distant is not None and int(feat_distant.shape[0]) > 0:
+            distant_count = int(feat_distant.shape[0])
+            feats.append(feat_distant)
+            masks.append(acc_distant > float(self.distant_src_backproject_support_min))
+
+        merged_features = self._merge_lists(feats)
+        merged_mask = self._merge_lists(masks)
+        if merged_features is None or merged_mask is None:
+            return None
+        merged_render = self._tensor_merge_bg_rigid_distant_world(render_bg, rigid_world, render_distant)
+        if int(merged_render["means_r"].shape[0]) != int(merged_features.shape[0]):
+            raise RuntimeError(
+                "Stage5_6 feedback render/features length mismatch: "
+                f"{merged_render['means_r'].shape[0]} vs {merged_features.shape[0]}."
+            )
+        num_bg = int(feat_bg.shape[0])
+        return {
+            "render": merged_render,
+            "features": merged_features,
+            "mask": merged_mask.bool(),
+            "num_bg": num_bg,
+            "num_rigid": rigid_count,
+            "num_distant": distant_count,
+            "rigid_order": rigid_order,
+            "num_rigid_total": int(node_state_rigid.means.shape[0]) if node_state_rigid is not None else 0,
+        }
+
+    def _render_params_to_gaussians(self, render_params: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        rp = self._stage5_6_detach_render_params(render_params)
+        return {
+            "means": rp["means_r"],
+            "scales": rp["scales_r"],
+            "quats": rp["quats_r"],
+            "opacities": rp["opacities_r"],
+            "colors": rp["colors_r"],
+        }
+
+    def _make_feedback_branch_pack(
+        self,
+        values: torch.Tensor,
+        support: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        if int(values.shape[1]) != int(self.stage5_6_error_feat_dim) + 1:
+            raise RuntimeError(
+                "Stage5_6 lifted feedback dim mismatch: "
+                f"got {values.shape[1]} expected {int(self.stage5_6_error_feat_dim) + 1}."
+            )
+        sup = support.reshape(-1, 1)
+        pack = {
+            "error": values[:, :1],
+            "feat": values[:, 1:],
+            "support": sup,
+            "valid": (sup > float(self.stage5_6_lift_support_min)).to(dtype=values.dtype),
+            "age": values.new_zeros((int(values.shape[0]), 1)),
+        }
+        if bool(self.stage5_6_detach_lifted_feedback):
+            pack = {k: v.detach() for k, v in pack.items()}
+        return pack
+
+    def _lift_feedback_maps_to_cache(
+        self,
+        *,
+        node_pack: Dict[str, Any],
+        view: Any,
+        height: int,
+        width: int,
+        error_pred: torch.Tensor,
+        latent: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> Optional[Dict[str, Any]]:
+        render_params = node_pack["render"]
+        if not render_params["means_r"].is_cuda:
+            return None
+        if latent.dim() != 3:
+            raise RuntimeError(f"Stage5_6 latent must be [C,H,W], got {tuple(latent.shape)}.")
+        with torch.no_grad():
+            feedback_image = torch.cat([error_pred.detach().unsqueeze(0), latent.detach()], dim=0)
+            feedback_image = feedback_image.permute(1, 2, 0).unsqueeze(0).contiguous()
+            valid_mask = (mask.detach() > 0.0).unsqueeze(0).to(device=feedback_image.device)
+            lifted, support = self.alpha_t_extractor_v4.render_and_backproject_streaming_fused_multi_camera(
+                gaussians=self._render_params_to_gaussians(render_params),
+                cameras=[view],
+                features_2d=feedback_image,
+                height=int(height),
+                width=int(width),
+                num_gaussians=int(render_params["means_r"].shape[0]),
+                backprojector=self.feature_backprojector,
+                source_pair_valid_mask=valid_mask,
+                return_accumulated_weights=True,
+            )
+            lifted = lifted.to(device=self.device)
+            support = support.to(device=self.device)
+            num_bg = int(node_pack["num_bg"])
+            num_rigid = int(node_pack["num_rigid"])
+            num_distant = int(node_pack["num_distant"])
+            start = 0
+            bg_pack = self._make_feedback_branch_pack(lifted[start : start + num_bg], support[start : start + num_bg])
+            start += num_bg
+            rigid_pack = None
+            if num_rigid > 0:
+                rigid_values = lifted[start : start + num_rigid]
+                rigid_support = support[start : start + num_rigid]
+                start += num_rigid
+                n_rigid_total = int(node_pack.get("num_rigid_total", 0))
+                rigid_full = lifted.new_zeros((n_rigid_total, int(lifted.shape[1])))
+                rigid_support_full = support.new_zeros((n_rigid_total,))
+                rigid_order = node_pack["rigid_order"].to(device=self.device, dtype=torch.long)
+                if int(rigid_order.numel()) > 0:
+                    rigid_full[rigid_order] = rigid_values
+                    rigid_support_full[rigid_order] = rigid_support
+                rigid_pack = self._make_feedback_branch_pack(rigid_full, rigid_support_full)
+            distant_pack = None
+            if num_distant > 0:
+                distant_pack = self._make_feedback_branch_pack(
+                    lifted[start : start + num_distant],
+                    support[start : start + num_distant],
+                )
+            branch_packs = {"bg": bg_pack, "distant": distant_pack, "rigid": rigid_pack}
+            stats = self._feedback_cache_stats(branch_packs)
+            return {**branch_packs, **stats}
+
+    def _feedback_cache_stats(self, packs: Dict[str, Optional[Dict[str, torch.Tensor]]]) -> Dict[str, float]:
+        valid_parts: List[torch.Tensor] = []
+        support_parts: List[torch.Tensor] = []
+        error_parts: List[torch.Tensor] = []
+        for pack in packs.values():
+            if not isinstance(pack, dict):
+                continue
+            valid_parts.append(pack["valid"].detach().float().reshape(-1))
+            support_parts.append(pack["support"].detach().float().reshape(-1))
+            error_parts.append(pack["error"].detach().float().reshape(-1))
+        if len(valid_parts) == 0:
+            return {
+                "write_node_ratio": 0.0,
+                "valid_ratio": 0.0,
+                "support_mean": 0.0,
+                "error_mean": 0.0,
+            }
+        valid_all = torch.cat(valid_parts)
+        support_all = torch.cat(support_parts)
+        error_all = torch.cat(error_parts)
+        return {
+            "write_node_ratio": float(valid_all.mean().item()),
+            "valid_ratio": float(valid_all.mean().item()),
+            "support_mean": float(support_all.mean().item()),
+            "error_mean": float(error_all.mean().item()),
+        }
+
+    def _compute_error_pred_loss(self, batch: Dict[str, Any], out: Dict[str, Any]) -> Dict[str, Any]:
+        zero = out["loss"].new_zeros(())
+        if not self.stage5_6_error_enabled:
+            return {"loss": zero, "processed": 0.0}
+        collect_debug = bool(batch.get("_stage5_6_collect_debug_images", False))
+        step = int(self._current_loss_step(batch))
+        if step % max(int(self.stage5_6_target_every_n_steps), 1) != 0:
+            return {"loss": zero, "processed": 0.0, "skipped_interval": 1.0}
+        aux = self._collect_feedback_targets(
+            batch,
+            max_targets=int(self.stage5_6_target_max_targets),
+            require_aux_if_requested=bool(self.stage5_6_target_skip_if_no_valid_aux),
+        )
+        if len(aux) == 0:
+            return {"loss": zero, "processed": 0.0, "skipped_empty": 1.0}
+
+        losses: List[torch.Tensor] = []
+        e_abs_terms: List[torch.Tensor] = []
+        pred_terms: List[torch.Tensor] = []
+        gt_terms: List[torch.Tensor] = []
+        valid_terms: List[torch.Tensor] = []
+        corr_terms: List[float] = []
+        support_terms: List[torch.Tensor] = []
+        debug_images: List[Dict[str, Any]] = []
+        cache_write: Optional[Dict[str, Any]] = None
+        processed = 0
+        skipped_low_valid = 0
+
+        for target_idx, t in enumerate(aux):
+            gt = t.get("gt_image")
+            view = t.get("view")
+            frame_idx = t.get("frame_idx")
+            if gt is None or view is None or frame_idx is None:
+                continue
+            if gt.dim() == 4:
+                gt = gt.squeeze(0)
+            h, w = int(gt.shape[0]), int(gt.shape[1])
+            node_pack = self._build_feedback_node_pack(out=out, target_frame_idx=int(frame_idx))
+            if node_pack is None:
+                continue
+            feat_tilde, support = self._splat_node_features_to_view(
+                render_params=node_pack["render"],
+                node_features=node_pack["features"],
+                node_mask=node_pack["mask"],
+                view=view,
+                height=h,
+                width=w,
+                detach_geometry=bool(self.stage5_6_detach_geometry),
+                detach_weights=bool(self.stage5_6_detach_alpha_weights),
+            )
+            render_ctx_params = (
+                self._stage5_6_detach_render_params(node_pack["render"])
+                if bool(self.stage5_6_detach_render_context)
+                else node_pack["render"]
+            )
+            pred_rgb_ctx, pred_alpha_ctx = self._render_single_view(render_ctx_params, view, h, w)
+            if pred_alpha_ctx.dim() == 3 and int(pred_alpha_ctx.shape[-1]) == 1:
+                pred_alpha_ctx = pred_alpha_ctx.squeeze(-1)
+            gt = gt.to(device=pred_rgb_ctx.device, dtype=pred_rgb_ctx.dtype)
+            e_gt = (pred_rgb_ctx.detach() - gt).abs().mean(dim=-1)
+            e_gt = e_gt.clamp(min=0.0, max=float(getattr(self.stage5_6_error_head, "error_max", 0.5)))
+            mask = self._build_error_mask(t, h, w, pred_alpha_ctx).to(device=pred_rgb_ctx.device, dtype=pred_rgb_ctx.dtype)
+            valid_ratio = mask.mean()
+            if float(valid_ratio.detach().item()) < float(self.stage5_6_error_min_valid_pixel_ratio):
+                skipped_low_valid += 1
+                continue
+            head_inputs = [feat_tilde.permute(2, 0, 1)]
+            if self.stage5_6_use_render_rgb:
+                rgb_ctx = pred_rgb_ctx.detach() if bool(self.stage5_6_detach_render_context) else pred_rgb_ctx
+                head_inputs.append(rgb_ctx.permute(2, 0, 1))
+            if self.stage5_6_use_render_alpha:
+                alpha_ctx = pred_alpha_ctx.detach() if bool(self.stage5_6_detach_render_context) else pred_alpha_ctx
+                head_inputs.append(alpha_ctx.unsqueeze(0))
+            head_in = torch.cat(head_inputs, dim=0).unsqueeze(0)
+            e_pred_raw, latent_raw = self.stage5_6_error_head(head_in)
+            e_pred = e_pred_raw.squeeze(0).squeeze(0)
+            latent = latent_raw.squeeze(0)
+            if tuple(e_pred.shape) != (h, w):
+                raise RuntimeError(f"Stage5_6 e_pred shape mismatch: got {tuple(e_pred.shape)} expected {(h, w)}.")
+            if latent.dim() != 3 or tuple(latent.shape[-2:]) != (h, w):
+                raise RuntimeError(f"Stage5_6 latent shape mismatch: got {tuple(latent.shape)} expected [C,{h},{w}].")
+            diff = e_pred - e_gt
+            per_pixel = self._charbonnier(diff) if self.stage5_6_error_loss_type == "charbonnier" else diff.abs()
+            denom = mask.sum().clamp_min(1.0)
+            loss_i = (per_pixel * mask).sum() / denom
+            losses.append(loss_i)
+            e_abs_terms.append((diff.abs() * mask).sum().detach() / denom.detach())
+            pred_terms.append((e_pred * mask).sum().detach() / denom.detach())
+            gt_terms.append((e_gt * mask).sum().detach() / denom.detach())
+            valid_terms.append(valid_ratio.detach())
+            support_terms.append((support.detach().clamp_min(0.0) * mask.detach()).sum() / denom.detach())
+            if collect_debug:
+                debug_images.append(
+                    {
+                        "target_index": int(t.get("target_index", target_idx)),
+                        "frame_idx": int(frame_idx),
+                        "cam_idx": int(t.get("cam_idx", -1)),
+                        "role": str(t.get("role", self.stage5_6_error_target_role)),
+                        "render": pred_rgb_ctx.detach().float().cpu(),
+                        "pred_error": e_pred.detach().float().cpu(),
+                        "actual_error": e_gt.detach().float().cpu(),
+                    }
+                )
+            processed += 1
+
+            with torch.no_grad():
+                x = e_pred[mask > 0.0].reshape(-1).float()
+                y = e_gt[mask > 0.0].reshape(-1).float()
+                if int(x.numel()) > 8:
+                    vx = x - x.mean()
+                    vy = y - y.mean()
+                    den = (vx.norm() * vy.norm()).clamp_min(1.0e-8)
+                    corr_terms.append(float((vx * vy).sum().item() / float(den.item())))
+
+            if cache_write is None and bool(self.stage5_6_cache_enable) and self._cache_ready(step):
+                cache_write = self._lift_feedback_maps_to_cache(
+                    node_pack=node_pack,
+                    view=view,
+                    height=h,
+                    width=w,
+                    error_pred=e_pred,
+                    latent=latent,
+                    mask=mask,
+                )
+
+        if len(losses) == 0:
+            return {
+                "loss": zero,
+                "processed": 0.0,
+                "skipped_low_valid": float(skipped_low_valid),
+            }
+        scale = self._warmup_linear_value(
+            step,
+            start_value=float(self.stage5_6_error_start_weight_scale),
+            end_value=float(self.stage5_6_error_end_weight_scale),
+            warmup_steps=int(self.stage5_6_error_warmup_steps),
+        )
+        out_pack: Dict[str, Any] = {
+            "loss": float(self.stage5_6_error_weight) * float(scale) * torch.stack(losses).mean(),
+            "loss_raw": torch.stack(losses).mean(),
+            "processed": float(processed),
+            "effective_weight": float(self.stage5_6_error_weight) * float(scale),
+            "e_abs": torch.stack(e_abs_terms).mean(),
+            "u_pred_mean": torch.stack(pred_terms).mean(),
+            "u_gt_mean": torch.stack(gt_terms).mean(),
+            "valid_pixel_ratio": torch.stack(valid_terms).mean(),
+            "support_mean": torch.stack(support_terms).mean(),
+            "e_corr": float(sum(corr_terms) / max(len(corr_terms), 1)),
+            "skipped_low_valid": float(skipped_low_valid),
+            **({"debug_images": debug_images} if collect_debug else {}),
+        }
+        if cache_write is not None:
+            out_pack["cache_write"] = cache_write
+        return out_pack
+
+    def _write_cache(self, batch: Dict[str, Any], out: Dict[str, Any], error_pack: Dict[str, Any]) -> None:
+        if not self.stage5_6_cache_enable:
+            return
+        step = int(self._current_loss_step(batch))
+        if not self._cache_ready(step):
+            return
+        cache_write = error_pack.get("cache_write")
+        if not isinstance(cache_write, dict):
+            return
+        key = out.get("_cache_key")
+        if key is None:
+            key = self._batch_key(batch)
+        self._stage5_6_cache[key] = {
+            "step": int(step),
+            "bg": cache_write.get("bg"),
+            "distant": cache_write.get("distant"),
+            "rigid": cache_write.get("rigid"),
+            "write_node_ratio": float(cache_write.get("write_node_ratio", 0.0)),
+            "valid_ratio": float(cache_write.get("valid_ratio", 0.0)),
+            "support_mean": float(cache_write.get("support_mean", 0.0)),
+            "error_mean": float(cache_write.get("error_mean", 0.0)),
+        }
+
+    def _read_feedback_pack(
+        self,
+        pack: Optional[Dict[str, torch.Tensor]],
+        *,
+        dtype: torch.dtype,
+        elapsed: int,
+        indices: Optional[torch.Tensor] = None,
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        if not isinstance(pack, dict):
+            return None
+        out: Dict[str, torch.Tensor] = {}
+        for k in ("error", "feat", "support", "valid"):
+            val = pack.get(k)
+            if not torch.is_tensor(val):
+                return None
+            if indices is not None:
+                val = val[indices]
+            out[k] = val.to(device=self.device, dtype=dtype)
+        out["age"] = out["valid"].new_full(tuple(out["valid"].shape), float(max(int(elapsed), 0)))
+        return out
+
+    def _read_cache(
+        self,
+        key: Tuple[int, int],
+        route: RigidRoute,
+        dtype: torch.dtype,
+        current_step: int,
+    ) -> Optional[Dict[str, Optional[Dict[str, torch.Tensor]]]]:
+        if self._fusion_scale(current_step) <= 0.0:
+            return None
+        entry = self._stage5_6_cache.get(key)
+        if entry is None:
+            return None
+        step = int(entry["step"])
+        if not self._cache_ready(step):
+            return None
+        elapsed = int(current_step - step)
+        if elapsed > int(self.stage5_6_cache_max_age):
+            self._stage5_6_cache.pop(key, None)
+            return None
+        rigid_s = None
+        if entry.get("rigid") is not None and int(route.S.numel()) > 0:
+            rigid_s = self._read_feedback_pack(
+                entry.get("rigid"),
+                dtype=dtype,
+                elapsed=elapsed,
+                indices=route.S.to(device=self.device, dtype=torch.long),
+            )
+        return {
+            "bg": self._read_feedback_pack(entry.get("bg"), dtype=dtype, elapsed=elapsed),
+            "distant": self._read_feedback_pack(entry.get("distant"), dtype=dtype, elapsed=elapsed),
+            "rigid_s": rigid_s,
+        }
+
+    def _fuse(
+        self,
+        feat: Optional[torch.Tensor],
+        feedback: Optional[Dict[str, torch.Tensor]],
+        fuser: Stage5_6PointResidualFuser,
+        *,
+        current_support: Optional[torch.Tensor],
+        branch_name: str,
+    ) -> Optional[torch.Tensor]:
+        if feat is None or feedback is None:
+            return feat
+        if int(feat.shape[0]) != int(feedback["feat"].shape[0]):
+            return feat
+        scale = float(self._stage5_6_active_fusion_scale)
+        fused = fuser(feat, feedback, current_support=current_support, scale=scale)
+        with torch.no_grad():
+            delta_norm = torch.norm((fused - feat).detach(), dim=-1).mean() if int(feat.shape[0]) > 0 else feat.new_zeros(())
+            self._stage5_6_fusion_delta_norm_terms.append(delta_norm)
+        self._stage5_6_last_fused_features[branch_name] = fused
+        return fused
+
+    def _compute_full_routed_gru_inputs(self, **kwargs):
+        self._stage5_6_active_cache = None
+        self._stage5_6_active_fusion_scale = 0.0
+        self._stage5_6_fusion_delta_norm_terms = []
+        self._stage5_6_last_fused_features = {}
+        batch = kwargs.get("batch")
+        route = kwargs.get("route")
+        feat_2d_bg = kwargs.get("feat_2d_bg")
+        if isinstance(batch, dict) and route is not None and feat_2d_bg is not None:
+            step = int(self._current_loss_step(batch))
+            self._stage5_6_active_fusion_scale = float(self._fusion_scale(step))
+            if bool(self.stage5_6_cache_enable) and self._stage5_6_active_fusion_scale > 0.0:
+                self._stage5_6_active_cache = self._read_cache(
+                    self._batch_key(batch),
+                    route,
+                    feat_2d_bg.dtype,
+                    current_step=step,
+                )
+        try:
+            return super()._compute_full_routed_gru_inputs(**kwargs)
+        finally:
+            self._stage5_6_active_cache = None
+            self._stage5_6_active_fusion_scale = 0.0
+
+    def _build_struct_decoder_input_near(self, **kwargs):
+        cache = self._stage5_6_active_cache
+        if cache is not None:
+            if bool(self.stage5_6_fusion_apply_to_bg):
+                kwargs["feat_2d_bg"] = self._fuse(
+                    kwargs.get("feat_2d_bg"),
+                    cache.get("bg"),
+                    self.stage5_6_bg_fuser,
+                    current_support=kwargs.get("acc_w_bg"),
+                    branch_name="bg",
+                )
+            if bool(self.stage5_6_fusion_apply_to_rigid):
+                kwargs["feat_2d_rigid_S"] = self._fuse(
+                    kwargs.get("feat_2d_rigid_S"),
+                    cache.get("rigid_s"),
+                    self.stage5_6_rigid_fuser,
+                    current_support=kwargs.get("acc_w_rigid_S"),
+                    branch_name="rigid_s",
+                )
+        return super()._build_struct_decoder_input_near(**kwargs)
+
+    def _build_struct_decoder_input_far(self, **kwargs):
+        cache = self._stage5_6_active_cache
+        if cache is not None:
+            if bool(self.stage5_6_fusion_apply_to_distant):
+                kwargs["feat_2d_distant"] = self._fuse(
+                    kwargs.get("feat_2d_distant"),
+                    cache.get("distant"),
+                    self.stage5_6_distant_fuser,
+                    current_support=kwargs.get("acc_w_distant"),
+                    branch_name="distant",
+                )
+            if bool(self.stage5_6_fusion_apply_to_rigid):
+                kwargs["feat_2d_rigid_S"] = self._fuse(
+                    kwargs.get("feat_2d_rigid_S"),
+                    cache.get("rigid_s"),
+                    self.stage5_6_rigid_fuser,
+                    current_support=kwargs.get("acc_w_rigid_S"),
+                    branch_name="rigid_s",
+                )
+        return super()._build_struct_decoder_input_far(**kwargs)
+
+    def _log_nearby_pack(self, out: Dict[str, Any], nearby: Dict[str, Any]) -> None:
+        loss_val = nearby.get("loss")
+        out["loss_stage5_6_nearby_direct"] = float(loss_val.detach().item()) if torch.is_tensor(loss_val) else 0.0
+        out["loss/nearby_direct"] = float(out["loss_stage5_6_nearby_direct"])
+        out["loss/target_weight/nearby_direct"] = float(nearby.get("view_weight", 0.0))
+        out["monitor/nearby_direct/processed_targets"] = float(nearby.get("processed", 0.0))
+        for src_key, out_key in (
+            ("monitor_psnr", "monitor/psnr/nearby_direct"),
+            ("monitor_l1", "monitor/l1/nearby_direct"),
+            ("valid_mask_ratio", "monitor/nearby_direct/valid_mask_ratio"),
+        ):
+            val = nearby.get(src_key)
+            if torch.is_tensor(val):
+                out[out_key] = float(val.detach().item())
+            elif isinstance(val, (int, float)):
+                out[out_key] = float(val)
+        if nearby.get("skipped_empty"):
+            out["monitor/nearby_direct/skipped_empty_aux_list"] = 1.0
+        if nearby.get("skipped_zero_weight"):
+            out["monitor/nearby_direct/skipped_zero_weight"] = 1.0
+        if nearby.get("skipped_low_valid"):
+            out["monitor/nearby_direct/skipped_low_valid"] = float(nearby.get("skipped_low_valid", 0.0))
+
+    def _log_error_pack(self, out: Dict[str, Any], err: Dict[str, Any]) -> None:
+        loss_val = err.get("loss")
+        out["loss_stage5_6_error_pred"] = float(loss_val.detach().item()) if torch.is_tensor(loss_val) else 0.0
+        out["loss/error_pred"] = float(out["loss_stage5_6_error_pred"])
+        out["error_pred/processed_targets"] = float(err.get("processed", 0.0))
+        out["error_pred/effective_weight"] = float(err.get("effective_weight", 0.0))
+        out["monitor/stage5_6/error_pred_processed_targets"] = float(err.get("processed", 0.0))
+        for key in ("e_abs", "u_pred_mean", "u_gt_mean", "valid_pixel_ratio", "support_mean"):
+            val = err.get(key)
+            if torch.is_tensor(val):
+                out[f"error_pred/{key}"] = float(val.detach().item())
+            elif isinstance(val, (int, float)):
+                out[f"error_pred/{key}"] = float(val)
+        out["error_pred/e_corr"] = float(err.get("e_corr", 0.0))
+        if err.get("skipped_interval"):
+            out["error_pred/skipped_interval"] = 1.0
+        if err.get("skipped_empty"):
+            out["error_pred/skipped_empty_aux_list"] = 1.0
+        if err.get("skipped_low_valid"):
+            out["error_pred/skipped_low_valid"] = float(err.get("skipped_low_valid", 0.0))
+
+    def _log_feedback_state(self, out: Dict[str, Any], step: int, err: Dict[str, Any]) -> None:
+        cache_write = err.get("cache_write") if isinstance(err, dict) else None
+        entry = self._stage5_6_cache.get(out.get("_cache_key"))
+        fusion_delta = 0.0
+        if len(self._stage5_6_fusion_delta_norm_terms) > 0:
+            fusion_delta = float(torch.stack(self._stage5_6_fusion_delta_norm_terms).mean().detach().item())
+        age_mean = 0.0
+        if isinstance(entry, dict):
+            age_mean = float(max(int(step) - int(entry.get("step", step)), 0))
+        out["feedback/fusion_enabled"] = float(
+            1.0 if bool(self.stage5_6_cache_enable) and bool(self.stage5_6_fusion_enabled) else 0.0
+        )
+        out["feedback/fusion_scale"] = float(self._fusion_scale(step))
+        out["feedback/fusion_delta_norm"] = float(fusion_delta)
+        out["feedback/cache_size"] = float(len(self._stage5_6_cache))
+        out["feedback/age_mean"] = float(age_mean)
+        for key in ("write_node_ratio", "valid_ratio", "support_mean", "error_mean"):
+            val = 0.0
+            if isinstance(cache_write, dict):
+                val = float(cache_write.get(key, 0.0))
+            elif isinstance(entry, dict):
+                val = float(entry.get(key, 0.0))
+            out[f"feedback/{key}"] = float(val)
+        for branch in ("bg", "distant", "rigid"):
+            ratio = 0.0
+            pack = entry.get(branch) if isinstance(entry, dict) else None
+            if isinstance(pack, dict) and torch.is_tensor(pack.get("valid")) and int(pack["valid"].numel()) > 0:
+                ratio = float(pack["valid"].detach().float().mean().item())
+            out[f"branch/{branch}_feedback_valid"] = float(ratio)
+        out["monitor/stage5_6/cache_size"] = float(len(self._stage5_6_cache))
+
+    def forward(self, batch: Dict) -> Dict[str, Any]:
+        self._stage5_6_last_nearby_debug_images = []
+        self._stage5_6_last_error_debug_images = []
+        out = super().forward(batch)
+        if self.training and self.stage5_6_nearby_enabled:
+            nearby = self._compute_nearby_direct_loss(batch, out)
+            if torch.is_tensor(nearby.get("loss")):
+                out["loss"] = out["loss"] + nearby["loss"]
+                if bool(nearby["loss"].requires_grad) and out.get("proxies") is not None:
+                    out["_retain_graph_for_proxy_backward"] = True
+            self._log_nearby_pack(out, nearby)
+            if isinstance(nearby.get("debug_images"), list):
+                self._stage5_6_last_nearby_debug_images = nearby["debug_images"]
+                out["_stage5_6_nearby_debug_images"] = nearby["debug_images"]
+
+        err = {"loss": out["loss"].new_zeros(()), "processed": 0.0}
+        if self.training and self.stage5_6_error_enabled:
+            err = self._compute_error_pred_loss(batch, out)
+            if torch.is_tensor(err.get("loss")):
+                out["loss"] = out["loss"] + err["loss"]
+            self._log_error_pack(out, err)
+            if isinstance(err.get("debug_images"), list):
+                self._stage5_6_last_error_debug_images = err["debug_images"]
+                out["_stage5_6_error_debug_images"] = err["debug_images"]
+
+        self._write_cache(batch, out, err)
+        self._log_feedback_state(out, int(self._current_loss_step(batch)), err)
+        return out
+
+    def train_step(
+        self,
+        batch: Dict,
+        step: Optional[int] = None,
+        profile_phase_timing: bool = False,
+        sync_cuda_timing: bool = False,
+        scheduler_node_sync: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        self._stage5_6_last_nearby_debug_images = []
+        self._stage5_6_last_error_debug_images = []
+        out = super().train_step(
+            batch=batch,
+            step=step,
+            profile_phase_timing=profile_phase_timing,
+            sync_cuda_timing=sync_cuda_timing,
+            scheduler_node_sync=scheduler_node_sync,
+        )
+        nearby_debug = getattr(self, "_stage5_6_last_nearby_debug_images", [])
+        if isinstance(nearby_debug, list) and len(nearby_debug) > 0:
+            out["_stage5_6_nearby_debug_images"] = nearby_debug
+        error_debug = getattr(self, "_stage5_6_last_error_debug_images", [])
+        if isinstance(error_debug, list) and len(error_debug) > 0:
+            out["_stage5_6_error_debug_images"] = error_debug
+        return out
+
+    def reset_node_state(self) -> None:
+        super().reset_node_state()
+        self._stage5_6_cache.clear()
+        self._stage5_6_active_cache = None
+        self._stage5_6_last_fused_features = {}
+
+    @torch.no_grad()
+    def record_block_history(self, batch: Dict[str, Any], event: Optional[Dict[str, Any]] = None) -> Dict[str, float]:
+        stats = super().record_block_history(batch=batch, event=event)
+        self._stage5_6_cache.clear()
+        self._stage5_6_active_cache = None
+        self._stage5_6_last_fused_features = {}
+        return stats
+
+
+__all__ = ["MinimalStreetForwardStage5_6", "Stage5_6ErrorPredictHead", "Stage5_6PointResidualFuser"]
