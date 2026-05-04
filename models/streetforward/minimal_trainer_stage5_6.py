@@ -87,38 +87,38 @@ class Stage5_6ErrorPredictHead(nn.Module):
         return self.error_max * torch.sigmoid(self.err(h)), self.latent(h)
 
 
-class Stage5_6PointResidualFuser(nn.Module):
-    """Zero-init residual adapter for point-level nearby-error feedback fusion."""
+class Stage5_6FrameFlattenFuser(nn.Module):
+    """Zero-init residual adapter over fixed nearby frame slots."""
 
     def __init__(
         self,
         feat_dim: int,
-        hidden_dim: int = 64,
         feedback_dim: Optional[int] = None,
+        num_slots: int = 1,
+        hidden_dim: int = 64,
         num_layers: int = 2,
         *,
         input_current_source_support: bool = True,
         input_feedback_support: bool = True,
-        input_feedback_age: bool = True,
         zero_init_last: bool = True,
     ):
         super().__init__()
         self.feat_dim = int(feat_dim)
         self.feedback_dim = int(feedback_dim if feedback_dim is not None else feat_dim)
+        self.num_slots = int(num_slots)
         self.input_current_source_support = bool(input_current_source_support)
         self.input_feedback_support = bool(input_feedback_support)
-        self.input_feedback_age = bool(input_feedback_age)
-        if self.feat_dim <= 0 or self.feedback_dim <= 0:
-            raise ValueError("Stage5_6PointResidualFuser requires positive feat_dim and feedback_dim.")
+        if self.feat_dim <= 0 or self.feedback_dim <= 0 or self.num_slots <= 0:
+            raise ValueError("Stage5_6FrameFlattenFuser requires positive feat_dim/feedback_dim/num_slots.")
 
-        extra_dim = 2  # log error scalar + valid flag
+        extra_dim = self.num_slots * self.feedback_dim  # flattened slot features
+        extra_dim += self.num_slots  # slot error
+        extra_dim += self.num_slots  # slot valid
         if self.input_current_source_support:
             extra_dim += 1
         if self.input_feedback_support:
-            extra_dim += 1
-        if self.input_feedback_age:
-            extra_dim += 1
-        in_dim = self.feat_dim + self.feedback_dim + extra_dim
+            extra_dim += self.num_slots
+        in_dim = self.feat_dim + extra_dim
         layers: List[nn.Module] = []
         hdim = int(hidden_dim)
         depth = max(int(num_layers), 1)
@@ -135,20 +135,27 @@ class Stage5_6PointResidualFuser(nn.Module):
                     nn.init.zeros_(last.weight)
                     nn.init.zeros_(last.bias)
 
-    def _tensor_feedback_pack(self, feedback: torch.Tensor) -> Dict[str, torch.Tensor]:
-        n = int(feedback.shape[0])
-        if int(feedback.shape[1]) < self.feedback_dim:
-            pad = feedback.new_zeros((n, self.feedback_dim - int(feedback.shape[1])))
-            feat = torch.cat([feedback, pad], dim=-1)
-        else:
-            feat = feedback[:, : self.feedback_dim]
-        return {
-            "error": feedback.new_zeros((n, 1)),
-            "feat": feat,
-            "support": feedback.new_ones((n, 1)),
-            "valid": feedback.new_ones((n, 1)),
-            "age": feedback.new_zeros((n, 1)),
-        }
+    def _fix_slots(
+        self,
+        tensor: torch.Tensor,
+        *,
+        width: int,
+        default: float = 0.0,
+    ) -> torch.Tensor:
+        if tensor.dim() != 3:
+            raise ValueError(f"Stage5_6 slot tensor must be rank-3 [N,K,D], got {tuple(tensor.shape)}.")
+        n, k, d = int(tensor.shape[0]), int(tensor.shape[1]), int(tensor.shape[2])
+        if d < width:
+            pad = tensor.new_full((n, k, width - d), float(default))
+            tensor = torch.cat([tensor, pad], dim=-1)
+        elif d > width:
+            tensor = tensor[:, :, :width]
+        if k < self.num_slots:
+            pad = tensor.new_full((n, self.num_slots - k, width), float(default))
+            tensor = torch.cat([tensor, pad], dim=1)
+        elif k > self.num_slots:
+            tensor = tensor[:, : self.num_slots, :]
+        return tensor
 
     def forward(
         self,
@@ -158,30 +165,27 @@ class Stage5_6PointResidualFuser(nn.Module):
         current_support: Optional[torch.Tensor] = None,
         scale: float = 1.0,
     ) -> torch.Tensor:
-        if torch.is_tensor(feedback):
-            pack = self._tensor_feedback_pack(feedback.to(device=feat.device, dtype=feat.dtype))
-        elif isinstance(feedback, dict):
-            pack = {
-                k: v.to(device=feat.device, dtype=feat.dtype)
-                for k, v in feedback.items()
-                if torch.is_tensor(v)
-            }
-        else:
+        if not isinstance(feedback, dict):
             return feat
+        pack = {
+            k: v.to(device=feat.device, dtype=feat.dtype)
+            for k, v in feedback.items()
+            if torch.is_tensor(v)
+        }
         if "feat" not in pack or "valid" not in pack or int(pack["feat"].shape[0]) != int(feat.shape[0]):
             return feat
+        fb_feat = self._fix_slots(pack["feat"], width=self.feedback_dim, default=0.0)
+        fb_error = self._fix_slots(pack.get("error", fb_feat.new_zeros((int(feat.shape[0]), self.num_slots, 1))), width=1)
+        fb_valid = self._fix_slots(pack.get("valid", fb_feat.new_zeros((int(feat.shape[0]), self.num_slots, 1))), width=1)
+        fb_valid = fb_valid.clamp(0.0, 1.0)
 
-        fb_feat = pack["feat"]
-        if int(fb_feat.shape[1]) < self.feedback_dim:
-            fb_feat = torch.cat(
-                [fb_feat, fb_feat.new_zeros((int(fb_feat.shape[0]), self.feedback_dim - int(fb_feat.shape[1])))],
-                dim=-1,
-            )
-        else:
-            fb_feat = fb_feat[:, : self.feedback_dim]
-        valid = pack.get("valid", feat.new_ones((int(feat.shape[0]), 1))).clamp(0.0, 1.0)
-        error = torch.log1p(pack.get("error", feat.new_zeros((int(feat.shape[0]), 1))).clamp_min(0.0))
-        inputs = [feat, fb_feat, error, valid]
+        n, k, c = int(fb_feat.shape[0]), int(fb_feat.shape[1]), int(fb_feat.shape[2])
+        inputs = [
+            feat,
+            fb_feat.reshape(n, k * c),
+            torch.log1p(fb_error.clamp_min(0.0)).reshape(n, k),
+            fb_valid.reshape(n, k),
+        ]
         if self.input_current_source_support:
             if current_support is None:
                 cur_s = feat.new_zeros((int(feat.shape[0]), 1))
@@ -189,20 +193,21 @@ class Stage5_6PointResidualFuser(nn.Module):
                 cur_s = current_support.to(device=feat.device, dtype=feat.dtype).reshape(int(feat.shape[0]), 1)
             inputs.append(torch.log1p(cur_s.clamp_min(0.0)))
         if self.input_feedback_support:
-            fb_s = pack.get("support", feat.new_zeros((int(feat.shape[0]), 1)))
-            inputs.append(torch.log1p(fb_s.clamp_min(0.0)))
-        if self.input_feedback_age:
-            age = pack.get("age", feat.new_zeros((int(feat.shape[0]), 1)))
-            inputs.append(age.clamp_min(0.0))
+            fb_sup = self._fix_slots(
+                pack.get("support", fb_feat.new_zeros((int(feat.shape[0]), self.num_slots, 1))),
+                width=1,
+            )
+            inputs.append(torch.log1p(fb_sup.clamp_min(0.0)).reshape(n, k))
+        valid_any = fb_valid.max(dim=1).values.clamp(0.0, 1.0)
         delta = self.net(torch.cat(inputs, dim=-1))
-        delta = delta * valid * float(scale)
+        delta = delta * valid_any * float(scale)
         return feat + delta
 
 
 class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
     def __init__(self, config, device: torch.device, **kwargs):
-        self._stage5_6_cache: Dict[Tuple[int, int], Dict[str, Any]] = {}
-        self._stage5_6_active_cache: Optional[Dict[str, Optional[Dict[str, torch.Tensor]]]] = None
+        self._stage5_6_frame_cache: Dict[Tuple[int, int, int, int], Dict[int, Dict[str, Any]]] = {}
+        self._stage5_6_active_cache: Optional[Dict[str, List[Optional[Dict[str, torch.Tensor]]]]] = None
         self._stage5_6_active_fusion_scale = 0.0
         self._stage5_6_fusion_delta_norm_terms: List[torch.Tensor] = []
         self._stage5_6_last_fused_features: Dict[str, torch.Tensor] = {}
@@ -237,10 +242,20 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
             if float(fsu_loss.get(key, 0.0)) != 0.0:
                 raise ValueError(f"Stage5_6 fast-fail: feature_splat_uncertainty.loss.{key} must be 0.0.")
         cache_cfg = nef_cfg.get("cache", {}) if hasattr(nef_cfg, "get") else {}
-        mode = str(cache_cfg.get("mode", "overwrite")).strip().lower()
-        if mode != "overwrite":
-            raise ValueError("Stage5_6 nearby_error_feedback.cache.mode currently only supports 'overwrite'.")
+        mode = str(cache_cfg.get("mode", "frame_bank")).strip().lower()
+        if mode != "frame_bank":
+            raise ValueError("Stage5_6 nearby_error_feedback.cache.mode currently only supports 'frame_bank'.")
+        if bool(cache_cfg.get("store_age", False)):
+            raise ValueError("Stage5_6 nearby_error_feedback.cache.store_age must be false for frame-slot feedback.")
         error_pred_cfg = nef_cfg.get("error_pred", {}) if hasattr(nef_cfg, "get") else {}
+        if int(error_pred_cfg.get("max_frames_per_step", 1)) < 1:
+            raise ValueError("Stage5_6 nearby_error_feedback.error_pred.max_frames_per_step must be >= 1.")
+        fusion_cfg = nef_cfg.get("fusion", {}) if hasattr(nef_cfg, "get") else {}
+        fusion_type = str(fusion_cfg.get("type", "flatten_frame_slots")).strip().lower()
+        if fusion_type != "flatten_frame_slots":
+            raise ValueError("Stage5_6 nearby_error_feedback.fusion.type must be 'flatten_frame_slots'.")
+        if bool(fusion_cfg.get("input_feedback_age", False)):
+            raise ValueError("Stage5_6 nearby_error_feedback.fusion.input_feedback_age must be false.")
         target_role = str(nef_cfg.get("target_role", error_pred_cfg.get("target_role", "nearby_direct")))
         scheduler_cfg = config.get("scheduler_v8", {}) if hasattr(config, "get") else {}
         if hasattr(scheduler_cfg, "get") and target_role == "near_random":
@@ -253,6 +268,11 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
             if not bool(near_random_cfg.get("enable", False)):
                 raise ValueError(
                     "Stage5_6 target_role='near_random' requires scheduler_v8.near_random_supervision.enable=true."
+                )
+            if not bool(near_random_cfg.get("sample_once_per_block", True)):
+                raise ValueError(
+                    "Stage5_6 target_role='near_random' requires "
+                    "scheduler_v8.near_random_supervision.sample_once_per_block=true."
                 )
 
     def _parse_target_view_weight_cfg(self, config) -> Dict[str, Any]:
@@ -302,9 +322,14 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
         self.stage5_6_feedback_enabled = bool(nef.get("enable", fsu.get("enable", False)))
         self.stage5_6_error_enabled = bool(error_pred_cfg.get("enable", self.stage5_6_feedback_enabled))
         self.stage5_6_error_target_role = str(nef.get("target_role", error_pred_cfg.get("target_role", "nearby_direct")))
-        self.stage5_6_target_max_targets = int(
-            error_pred_cfg.get("max_targets_per_step", fsu_target.get("max_targets_per_step", 1))
-        )
+        max_frames_cfg = error_pred_cfg.get("max_frames_per_step", None)
+        if max_frames_cfg is None:
+            max_targets_fallback = int(error_pred_cfg.get("max_targets_per_step", fsu_target.get("max_targets_per_step", 1)))
+            num_cams_fallback = max(int(getattr(self, "num_cams", 1)), 1)
+            max_frames_cfg = max(max_targets_fallback // num_cams_fallback, 1)
+        self.stage5_6_target_max_frames = int(max_frames_cfg)
+        if self.stage5_6_target_max_frames <= 0:
+            raise ValueError("Stage5_6 nearby_error_feedback.error_pred.max_frames_per_step must be >= 1.")
         self.stage5_6_target_every_n_steps = int(error_pred_cfg.get("every_n_steps", fsu_target.get("every_n_steps", 1)))
         self.stage5_6_target_skip_if_no_valid_aux = bool(
             error_pred_cfg.get("skip_if_no_valid_aux", fsu_target.get("skip_if_no_valid_aux", True))
@@ -353,6 +378,7 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
         self.stage5_6_fusion_end_scale = float(warm_cfg.get("fusion_end_scale", 1.0))
         self.stage5_6_cache_enable = bool(cache_cfg.get("enable", legacy_cache.get("enable", True)))
         self.stage5_6_cache_max_age = int(cache_cfg.get("max_age", legacy_cache.get("max_age", 1)))
+        self.stage5_6_cache_keep_only_current_scope = bool(cache_cfg.get("keep_only_current_scope", True))
 
         self.stage5_6_fusion_enabled = bool(fusion_cfg.get("enable", True))
         self.stage5_6_fusion_apply_to_bg = bool(fusion_cfg.get("apply_to_bg", True))
@@ -362,7 +388,9 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
             fusion_cfg.get("input_current_source_support", True)
         )
         self.stage5_6_fusion_input_feedback_support = bool(fusion_cfg.get("input_feedback_support", True))
-        self.stage5_6_fusion_input_feedback_age = bool(fusion_cfg.get("input_feedback_age", True))
+        self.stage5_6_fusion_num_slots = int(fusion_cfg.get("num_slots", self.stage5_6_target_max_frames))
+        if self.stage5_6_fusion_num_slots <= 0:
+            raise ValueError("Stage5_6 nearby_error_feedback.fusion.num_slots must be >= 1.")
 
         feat_dim = int(self.stage5_2_feat_2d_channels)
         hidden_dim = int(error_pred_cfg.get("hidden_dim", fsu_head.get("hidden_dim", 64)))
@@ -387,17 +415,17 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
         fuse_layers = int(fusion_cfg.get("num_layers", 2))
         fuser_kwargs = {
             "feat_dim": feat_dim,
-            "hidden_dim": fuse_hidden,
             "feedback_dim": error_feat_dim,
+            "num_slots": self.stage5_6_fusion_num_slots,
+            "hidden_dim": fuse_hidden,
             "num_layers": fuse_layers,
             "input_current_source_support": self.stage5_6_fusion_input_current_source_support,
             "input_feedback_support": self.stage5_6_fusion_input_feedback_support,
-            "input_feedback_age": self.stage5_6_fusion_input_feedback_age,
             "zero_init_last": bool(fusion_cfg.get("zero_init_last", True)),
         }
-        self.stage5_6_bg_fuser = Stage5_6PointResidualFuser(**fuser_kwargs).to(self.device)
-        self.stage5_6_distant_fuser = Stage5_6PointResidualFuser(**fuser_kwargs).to(self.device)
-        self.stage5_6_rigid_fuser = Stage5_6PointResidualFuser(**fuser_kwargs).to(self.device)
+        self.stage5_6_bg_fuser = Stage5_6FrameFlattenFuser(**fuser_kwargs).to(self.device)
+        self.stage5_6_distant_fuser = Stage5_6FrameFlattenFuser(**fuser_kwargs).to(self.device)
+        self.stage5_6_rigid_fuser = Stage5_6FrameFlattenFuser(**fuser_kwargs).to(self.device)
 
     @staticmethod
     def _charbonnier(diff: torch.Tensor, eps: float = 1.0e-3) -> torch.Tensor:
@@ -517,6 +545,140 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
             fallback_aux=True,
             require_aux_if_requested=bool(require_aux_if_requested),
         )
+
+    @staticmethod
+    def _safe_int(value: Any, default: int = -1) -> int:
+        if torch.is_tensor(value):
+            if int(value.numel()) == 0:
+                return int(default)
+            return int(value.reshape(-1)[0].item())
+        if value is None:
+            return int(default)
+        return int(value)
+
+    def _stage5_6_scope_key(self, batch: Dict[str, Any]) -> Tuple[int, int, int, int]:
+        scene_id, segment_id = self._batch_key(batch)
+        aligned = (
+            batch.get("_scheduler_v8_aligned_info")
+            or batch.get("_scheduler_v7_aligned_info")
+            or batch.get("_scheduler_v4_aligned_info")
+            or {}
+        )
+        request_meta = batch.get("request_meta") or {}
+        episode_idx = self._safe_int(
+            aligned.get(
+                "episode_idx_global",
+                aligned.get(
+                    "episode_idx",
+                    request_meta.get("episode_idx_global", request_meta.get("episode_idx", None)),
+                ),
+            )
+        )
+        block_idx = self._safe_int(
+            aligned.get(
+                "block_idx_global",
+                request_meta.get("block_idx_global", None),
+            )
+        )
+        if int(episode_idx) < 0 or int(block_idx) < 0:
+            raise RuntimeError(
+                "Stage5_6 frame cache requires episode_idx_global and block_idx_global. "
+                "Check scheduler aligned info / request_meta propagation."
+            )
+        return (int(scene_id), int(segment_id), int(episode_idx), int(block_idx))
+
+    def _feedback_frame_indices_for_fusion(self, batch: Dict[str, Any]) -> List[int]:
+        request_meta = batch.get("request_meta") or {}
+        role = str(getattr(self, "stage5_6_error_target_role", "near_random"))
+        direct = request_meta.get(f"{role}_frame_indices")
+        if isinstance(direct, list) and len(direct) > 0:
+            return [int(x) for x in direct]
+        if role == "near_random":
+            near_random = request_meta.get("near_random_frame_indices") or []
+            if len(near_random) > 0:
+                return [int(x) for x in near_random]
+
+        ordered: List[int] = []
+        seen: set[int] = set()
+
+        def _collect_from_refs(refs: Any, roles: Any) -> None:
+            if not isinstance(refs, list) or not isinstance(roles, list):
+                return
+            if len(refs) != len(roles):
+                return
+            for ref, r in zip(refs, roles):
+                if str(r) != role:
+                    continue
+                if not isinstance(ref, (list, tuple)) or len(ref) < 1:
+                    continue
+                frame_idx = self._safe_int(ref[0], default=-1)
+                if frame_idx < 0 or frame_idx in seen:
+                    continue
+                seen.add(frame_idx)
+                ordered.append(frame_idx)
+
+        _collect_from_refs(request_meta.get("target_image_refs"), request_meta.get("target_image_roles"))
+        _collect_from_refs(request_meta.get("aux_image_refs"), request_meta.get("aux_image_roles"))
+        return ordered
+
+    def _collect_role_frame_targets(
+        self,
+        batch: Dict[str, Any],
+        *,
+        role: str,
+        max_frames: int,
+        require_aux_if_requested: bool,
+    ) -> List[Tuple[int, List[Dict[str, Any]]]]:
+        image_targets = self._collect_role_targets(
+            batch,
+            role=str(role),
+            max_targets=-1,
+            prefer_targets=True,
+            fallback_aux=True,
+            require_aux_if_requested=bool(require_aux_if_requested),
+        )
+        if len(image_targets) == 0:
+            return []
+        all_targets = batch.get("targets") or []
+        expected_cam_set = {
+            int(t.get("cam_idx"))
+            for t in all_targets
+            if isinstance(t, dict) and t.get("cam_idx") is not None
+        }
+        if len(expected_cam_set) == 0:
+            expected_cam_set = {
+                int(t.get("cam_idx"))
+                for t in image_targets
+                if isinstance(t, dict) and t.get("cam_idx") is not None
+            }
+        if len(expected_cam_set) == 0:
+            expected_cam_set = {0}
+        expected_cam_order = sorted(int(x) for x in expected_cam_set)
+        grouped: Dict[int, Dict[int, Dict[str, Any]]] = {}
+        for item in image_targets:
+            frame_idx = item.get("frame_idx")
+            cam_idx = item.get("cam_idx")
+            if frame_idx is None or cam_idx is None:
+                continue
+            frame_i = int(frame_idx)
+            cam_i = int(cam_idx)
+            if frame_i not in grouped:
+                grouped[frame_i] = {}
+            grouped[frame_i][cam_i] = item
+        if len(grouped) == 0:
+            return []
+        ordered_frames = sorted(grouped.keys())
+        frame_groups: List[Tuple[int, List[Dict[str, Any]]]] = []
+        for frame_idx in ordered_frames:
+            cam_map = grouped[frame_idx]
+            if len(cam_map) != len(expected_cam_order):
+                continue
+            if set(cam_map.keys()) != set(expected_cam_order):
+                continue
+            frame_groups.append((int(frame_idx), [cam_map[i] for i in expected_cam_order]))
+        if int(max_frames) > 0:
+            frame_groups = frame_groups[: int(max_frames)]
+        return frame_groups
 
     def _mask_hw(self, mask: torch.Tensor, h: int, w: int, name: str = "mask") -> torch.Tensor:
         m = mask.to(self.device).float()
@@ -748,27 +910,35 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
         *,
         render_params: Dict[str, torch.Tensor],
         colors: torch.Tensor,
-        view: Any,
+        views: List[Any],
         height: int,
         width: int,
         detach_geometry: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if colors.ndim != 2:
             raise ValueError(f"Stage5_6 feature colors must be [N,C], got {tuple(colors.shape)}.")
+        if len(views) == 0:
+            raise ValueError("Stage5_6 feature splat requires at least one view.")
         means = render_params["means_r"]
         dtype = means.dtype
         dev = means.device
-        c2w = view.camtoworlds if hasattr(view, "camtoworlds") else view["camtoworlds"]
-        viewmat = get_viewmat(c2w.to(device=dev, dtype=dtype))
-        if hasattr(view, "Ks"):
-            Ks = view.Ks[0:1]
-        elif hasattr(view, "K"):
-            Ks = view.K
-        else:
-            Ks = torch.eye(3, device=dev, dtype=dtype).unsqueeze(0)
-        if Ks.dim() == 2:
-            Ks = Ks.unsqueeze(0)
-        Ks = Ks.to(device=dev, dtype=dtype)
+        viewmats: List[torch.Tensor] = []
+        intrinsics: List[torch.Tensor] = []
+        for view in views:
+            c2w = view.camtoworlds if hasattr(view, "camtoworlds") else view["camtoworlds"]
+            vm = get_viewmat(c2w.to(device=dev, dtype=dtype))
+            if hasattr(view, "Ks"):
+                ks = view.Ks[0:1]
+            elif hasattr(view, "K"):
+                ks = view.K
+            else:
+                ks = torch.eye(3, device=dev, dtype=dtype).unsqueeze(0)
+            if ks.dim() == 2:
+                ks = ks.unsqueeze(0)
+            viewmats.append(vm.to(device=dev, dtype=dtype))
+            intrinsics.append(ks.to(device=dev, dtype=dtype))
+        viewmat = torch.cat(viewmats, dim=0)
+        Ks = torch.cat(intrinsics, dim=0)
         quats = render_params["quats_r"]
         scales = render_params["scales_r"]
         opacities = render_params["opacities_r"]
@@ -798,9 +968,9 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
             rasterize_mode="classic",
             channel_chunk=max(32, int(colors.shape[-1])),
         )
-        feat = render.squeeze(0)
-        acc = alpha.squeeze(0)
-        if acc.dim() == 3:
+        feat = render
+        acc = alpha
+        if acc.dim() == 4 and int(acc.shape[-1]) == 1:
             acc = acc[..., 0]
         return feat, acc
 
@@ -816,12 +986,39 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
         detach_geometry: bool,
         detach_weights: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        feat_all, support_all = self._splat_node_features_to_views(
+            render_params=render_params,
+            node_features=node_features,
+            node_mask=node_mask,
+            views=[view],
+            height=height,
+            width=width,
+            detach_geometry=detach_geometry,
+            detach_weights=detach_weights,
+        )
+        return feat_all[0], support_all[0]
+
+    def _splat_node_features_to_views(
+        self,
+        *,
+        render_params: Dict[str, torch.Tensor],
+        node_features: torch.Tensor,
+        node_mask: torch.Tensor,
+        views: List[Any],
+        height: int,
+        width: int,
+        detach_geometry: bool,
+        detach_weights: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         if bool(detach_weights) and not bool(detach_geometry):
             raise ValueError("Stage5_6 detach_alpha_weights=true requires detach_geometry=true.")
         if int(node_features.shape[0]) != int(node_mask.shape[0]):
             raise ValueError("Stage5_6 node_features/node_mask length mismatch.")
         n = int(node_features.shape[0])
         c = int(node_features.shape[1])
+        v = int(len(views))
+        if v <= 0:
+            raise ValueError("Stage5_6 splat_to_views expects at least one view.")
         render_n = int(render_params["means_r"].shape[0])
         if render_n != n:
             raise ValueError(f"Stage5_6 render/features length mismatch: {render_n} vs {n}.")
@@ -829,8 +1026,8 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
         render_dtype = render_params["means_r"].dtype
         if n == 0 or int(node_mask.sum().item()) == 0:
             return (
-                torch.zeros((height, width, c), dtype=render_dtype, device=render_dev),
-                torch.zeros((height, width), dtype=render_dtype, device=render_dev),
+                torch.zeros((v, height, width, c), dtype=render_dtype, device=render_dev),
+                torch.zeros((v, height, width), dtype=render_dtype, device=render_dev),
             )
         mask_f = node_mask.to(device=render_dev, dtype=render_dtype).reshape(n, 1)
         colors = torch.zeros((n, c + 1), dtype=render_dtype, device=render_dev)
@@ -839,13 +1036,13 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
         rendered, _alpha = self._feature_splat_render(
             render_params=render_params,
             colors=colors,
-            view=view,
+            views=views,
             height=height,
             width=width,
             detach_geometry=detach_geometry,
         )
-        feat_sum = rendered[..., :c]
-        support = rendered[..., c]
+        feat_sum = rendered[..., :c]  # [V,H,W,C]
+        support = rendered[..., c]  # [V,H,W]
         norm_support = support.detach() if detach_weights else support
         return feat_sum / (norm_support.unsqueeze(-1) + float(self.stage5_6_splat_eps)), support
 
@@ -965,7 +1162,6 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
             "feat": values[:, 1:],
             "support": sup,
             "valid": (sup > float(self.stage5_6_lift_support_min)).to(dtype=values.dtype),
-            "age": values.new_zeros((int(values.shape[0]), 1)),
         }
         if bool(self.stage5_6_detach_lifted_feedback):
             pack = {k: v.detach() for k, v in pack.items()}
@@ -975,7 +1171,7 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
         self,
         *,
         node_pack: Dict[str, Any],
-        view: Any,
+        views: List[Any],
         height: int,
         width: int,
         error_pred: torch.Tensor,
@@ -985,15 +1181,21 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
         render_params = node_pack["render"]
         if not render_params["means_r"].is_cuda:
             return None
-        if latent.dim() != 3:
-            raise RuntimeError(f"Stage5_6 latent must be [C,H,W], got {tuple(latent.shape)}.")
+        if latent.dim() != 4:
+            raise RuntimeError(f"Stage5_6 latent must be [V,C,H,W], got {tuple(latent.shape)}.")
+        if error_pred.dim() != 4 or int(error_pred.shape[1]) != 1:
+            raise RuntimeError(f"Stage5_6 error_pred must be [V,1,H,W], got {tuple(error_pred.shape)}.")
+        if mask.dim() != 3:
+            raise RuntimeError(f"Stage5_6 mask must be [V,H,W], got {tuple(mask.shape)}.")
+        if int(error_pred.shape[0]) != int(len(views)) or int(latent.shape[0]) != int(len(views)):
+            raise RuntimeError("Stage5_6 lift expected matching view count across tensors and camera list.")
         with torch.no_grad():
-            feedback_image = torch.cat([error_pred.detach().unsqueeze(0), latent.detach()], dim=0)
-            feedback_image = feedback_image.permute(1, 2, 0).unsqueeze(0).contiguous()
-            valid_mask = (mask.detach() > 0.0).unsqueeze(0).to(device=feedback_image.device)
+            feedback_image = torch.cat([error_pred.detach(), latent.detach()], dim=1)
+            feedback_image = feedback_image.permute(0, 2, 3, 1).contiguous()
+            valid_mask = (mask.detach() > 0.0).to(device=feedback_image.device)
             lifted, support = self.alpha_t_extractor_v4.render_and_backproject_streaming_fused_multi_camera(
                 gaussians=self._render_params_to_gaussians(render_params),
-                cameras=[view],
+                cameras=views,
                 features_2d=feedback_image,
                 height=int(height),
                 width=int(width),
@@ -1068,15 +1270,16 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
         step = int(self._current_loss_step(batch))
         if step % max(int(self.stage5_6_target_every_n_steps), 1) != 0:
             return {"loss": zero, "processed": 0.0, "skipped_interval": 1.0}
-        aux = self._collect_feedback_targets(
+        frame_groups = self._collect_role_frame_targets(
             batch,
-            max_targets=int(self.stage5_6_target_max_targets),
+            role=str(getattr(self, "stage5_6_error_target_role", "near_random")),
+            max_frames=int(self.stage5_6_target_max_frames),
             require_aux_if_requested=bool(self.stage5_6_target_skip_if_no_valid_aux),
         )
-        if len(aux) == 0:
+        if len(frame_groups) == 0:
             return {"loss": zero, "processed": 0.0, "skipped_empty": 1.0}
 
-        losses: List[torch.Tensor] = []
+        frame_losses: List[torch.Tensor] = []
         e_abs_terms: List[torch.Tensor] = []
         pred_terms: List[torch.Tensor] = []
         gt_terms: List[torch.Tensor] = []
@@ -1084,27 +1287,33 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
         corr_terms: List[float] = []
         support_terms: List[torch.Tensor] = []
         debug_images: List[Dict[str, Any]] = []
-        cache_write: Optional[Dict[str, Any]] = None
-        processed = 0
+        frame_cache_writes: List[Dict[str, Any]] = []
+        processed_views = 0
+        processed_frames = 0
         skipped_low_valid = 0
 
-        for target_idx, t in enumerate(aux):
-            gt = t.get("gt_image")
-            view = t.get("view")
-            frame_idx = t.get("frame_idx")
-            if gt is None or view is None or frame_idx is None:
+        for frame_idx, frame_targets in frame_groups:
+            if len(frame_targets) == 0:
                 continue
-            if gt.dim() == 4:
-                gt = gt.squeeze(0)
-            h, w = int(gt.shape[0]), int(gt.shape[1])
             node_pack = self._build_feedback_node_pack(out=out, target_frame_idx=int(frame_idx))
             if node_pack is None:
                 continue
-            feat_tilde, support = self._splat_node_features_to_view(
+            first_gt = frame_targets[0].get("gt_image")
+            if first_gt is None:
+                continue
+            if first_gt.dim() == 4:
+                first_gt = first_gt.squeeze(0)
+            h, w = int(first_gt.shape[0]), int(first_gt.shape[1])
+            views = [t["view"] for t in frame_targets if t.get("view") is not None]
+            if len(views) != len(frame_targets):
+                continue
+            feat_tilde_all, support_all = self._splat_node_features_to_views(
                 render_params=node_pack["render"],
-                node_features=node_pack["features"],
+                # Keep error-pred branch isolated from Stage4/5 main render graph.
+                # This avoids double-backward conflicts with proxy->render_params custom backward.
+                node_features=node_pack["features"].detach(),
                 node_mask=node_pack["mask"],
-                view=view,
+                views=views,
                 height=h,
                 width=w,
                 detach_geometry=bool(self.stage5_6_detach_geometry),
@@ -1115,80 +1324,114 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
                 if bool(self.stage5_6_detach_render_context)
                 else node_pack["render"]
             )
-            pred_rgb_ctx, pred_alpha_ctx = self._render_single_view(render_ctx_params, view, h, w)
-            if pred_alpha_ctx.dim() == 3 and int(pred_alpha_ctx.shape[-1]) == 1:
-                pred_alpha_ctx = pred_alpha_ctx.squeeze(-1)
-            gt = gt.to(device=pred_rgb_ctx.device, dtype=pred_rgb_ctx.dtype)
-            e_gt = (pred_rgb_ctx.detach() - gt).abs().mean(dim=-1)
-            e_gt = e_gt.clamp(min=0.0, max=float(getattr(self.stage5_6_error_head, "error_max", 0.5)))
-            mask = self._build_error_mask(t, h, w, pred_alpha_ctx).to(device=pred_rgb_ctx.device, dtype=pred_rgb_ctx.dtype)
-            valid_ratio = mask.mean()
-            if float(valid_ratio.detach().item()) < float(self.stage5_6_error_min_valid_pixel_ratio):
-                skipped_low_valid += 1
-                continue
-            head_inputs = [feat_tilde.permute(2, 0, 1)]
-            if self.stage5_6_use_render_rgb:
-                rgb_ctx = pred_rgb_ctx.detach() if bool(self.stage5_6_detach_render_context) else pred_rgb_ctx
-                head_inputs.append(rgb_ctx.permute(2, 0, 1))
-            if self.stage5_6_use_render_alpha:
-                alpha_ctx = pred_alpha_ctx.detach() if bool(self.stage5_6_detach_render_context) else pred_alpha_ctx
-                head_inputs.append(alpha_ctx.unsqueeze(0))
-            head_in = torch.cat(head_inputs, dim=0).unsqueeze(0)
-            e_pred_raw, latent_raw = self.stage5_6_error_head(head_in)
-            e_pred = e_pred_raw.squeeze(0).squeeze(0)
-            latent = latent_raw.squeeze(0)
-            if tuple(e_pred.shape) != (h, w):
-                raise RuntimeError(f"Stage5_6 e_pred shape mismatch: got {tuple(e_pred.shape)} expected {(h, w)}.")
-            if latent.dim() != 3 or tuple(latent.shape[-2:]) != (h, w):
-                raise RuntimeError(f"Stage5_6 latent shape mismatch: got {tuple(latent.shape)} expected [C,{h},{w}].")
-            diff = e_pred - e_gt
-            per_pixel = self._charbonnier(diff) if self.stage5_6_error_loss_type == "charbonnier" else diff.abs()
-            denom = mask.sum().clamp_min(1.0)
-            loss_i = (per_pixel * mask).sum() / denom
-            losses.append(loss_i)
-            e_abs_terms.append((diff.abs() * mask).sum().detach() / denom.detach())
-            pred_terms.append((e_pred * mask).sum().detach() / denom.detach())
-            gt_terms.append((e_gt * mask).sum().detach() / denom.detach())
-            valid_terms.append(valid_ratio.detach())
-            support_terms.append((support.detach().clamp_min(0.0) * mask.detach()).sum() / denom.detach())
-            if collect_debug:
-                debug_images.append(
+            pred_rgb_all: List[torch.Tensor] = []
+            pred_alpha_all: List[torch.Tensor] = []
+            e_gt_all: List[torch.Tensor] = []
+            mask_all: List[torch.Tensor] = []
+            valid_view_idx: List[int] = []
+            local_debug_rows: List[Dict[str, Any]] = []
+            for view_idx, t in enumerate(frame_targets):
+                gt = t.get("gt_image")
+                if gt is None:
+                    continue
+                if gt.dim() == 4:
+                    gt = gt.squeeze(0)
+                pred_rgb_ctx, pred_alpha_ctx = self._render_single_view(render_ctx_params, views[view_idx], h, w)
+                if pred_alpha_ctx.dim() == 3 and int(pred_alpha_ctx.shape[-1]) == 1:
+                    pred_alpha_ctx = pred_alpha_ctx.squeeze(-1)
+                gt = gt.to(device=pred_rgb_ctx.device, dtype=pred_rgb_ctx.dtype)
+                e_gt = (pred_rgb_ctx.detach() - gt).abs().mean(dim=-1)
+                e_gt = e_gt.clamp(min=0.0, max=float(getattr(self.stage5_6_error_head, "error_max", 0.5)))
+                mask = self._build_error_mask(t, h, w, pred_alpha_ctx).to(device=pred_rgb_ctx.device, dtype=pred_rgb_ctx.dtype)
+                valid_ratio = mask.mean()
+                if float(valid_ratio.detach().item()) < float(self.stage5_6_error_min_valid_pixel_ratio):
+                    skipped_low_valid += 1
+                    continue
+                valid_view_idx.append(view_idx)
+                pred_rgb_all.append(pred_rgb_ctx)
+                pred_alpha_all.append(pred_alpha_ctx)
+                e_gt_all.append(e_gt)
+                mask_all.append(mask)
+                local_debug_rows.append(
                     {
-                        "target_index": int(t.get("target_index", target_idx)),
+                        "target_index": int(t.get("target_index", view_idx)),
                         "frame_idx": int(frame_idx),
                         "cam_idx": int(t.get("cam_idx", -1)),
                         "role": str(t.get("role", self.stage5_6_error_target_role)),
                         "render": pred_rgb_ctx.detach().float().cpu(),
-                        "pred_error": e_pred.detach().float().cpu(),
                         "actual_error": e_gt.detach().float().cpu(),
                     }
                 )
-            processed += 1
+            if len(valid_view_idx) == 0:
+                continue
+            feat_tilde = feat_tilde_all[valid_view_idx].permute(0, 3, 1, 2).contiguous()
+            pred_rgb_ctx_v = torch.stack(pred_rgb_all, dim=0).permute(0, 3, 1, 2).contiguous()
+            pred_alpha_ctx_v = torch.stack(pred_alpha_all, dim=0).unsqueeze(1).contiguous()
+            head_inputs = [feat_tilde]
+            if self.stage5_6_use_render_rgb:
+                rgb_ctx = pred_rgb_ctx_v.detach() if bool(self.stage5_6_detach_render_context) else pred_rgb_ctx_v
+                head_inputs.append(rgb_ctx)
+            if self.stage5_6_use_render_alpha:
+                alpha_ctx = pred_alpha_ctx_v.detach() if bool(self.stage5_6_detach_render_context) else pred_alpha_ctx_v
+                head_inputs.append(alpha_ctx)
+            head_in = torch.cat(head_inputs, dim=1)
+            e_pred_raw, latent_raw = self.stage5_6_error_head(head_in)
+            if e_pred_raw.dim() != 4 or latent_raw.dim() != 4:
+                raise RuntimeError("Stage5_6 error head must output [V,1,H,W] and [V,C,H,W].")
+            view_losses: List[torch.Tensor] = []
+            for local_idx in range(int(e_pred_raw.shape[0])):
+                e_pred = e_pred_raw[local_idx, 0]
+                e_gt = e_gt_all[local_idx]
+                mask = mask_all[local_idx]
+                diff = e_pred - e_gt
+                per_pixel = self._charbonnier(diff) if self.stage5_6_error_loss_type == "charbonnier" else diff.abs()
+                denom = mask.sum().clamp_min(1.0)
+                loss_i = (per_pixel * mask).sum() / denom
+                view_losses.append(loss_i)
+                e_abs_terms.append((diff.abs() * mask).sum().detach() / denom.detach())
+                pred_terms.append((e_pred * mask).sum().detach() / denom.detach())
+                gt_terms.append((e_gt * mask).sum().detach() / denom.detach())
+                valid_terms.append(mask.mean().detach())
+                support_map = support_all[valid_view_idx[local_idx]]
+                support_terms.append((support_map.detach().clamp_min(0.0) * mask.detach()).sum() / denom.detach())
+                with torch.no_grad():
+                    x = e_pred[mask > 0.0].reshape(-1).float()
+                    y = e_gt[mask > 0.0].reshape(-1).float()
+                    if int(x.numel()) > 8:
+                        vx = x - x.mean()
+                        vy = y - y.mean()
+                        den = (vx.norm() * vy.norm()).clamp_min(1.0e-8)
+                        corr_terms.append(float((vx * vy).sum().item() / float(den.item())))
+                if collect_debug:
+                    dbg = dict(local_debug_rows[local_idx])
+                    dbg["pred_error"] = e_pred.detach().float().cpu()
+                    debug_images.append(dbg)
+            if len(view_losses) == 0:
+                continue
+            frame_losses.append(torch.stack(view_losses).mean())
+            processed_views += int(len(view_losses))
+            processed_frames += 1
 
-            with torch.no_grad():
-                x = e_pred[mask > 0.0].reshape(-1).float()
-                y = e_gt[mask > 0.0].reshape(-1).float()
-                if int(x.numel()) > 8:
-                    vx = x - x.mean()
-                    vy = y - y.mean()
-                    den = (vx.norm() * vy.norm()).clamp_min(1.0e-8)
-                    corr_terms.append(float((vx * vy).sum().item() / float(den.item())))
-
-            if cache_write is None and bool(self.stage5_6_cache_enable) and self._cache_ready(step):
+            if bool(self.stage5_6_cache_enable) and self._cache_ready(step):
+                frame_mask = torch.stack(mask_all, dim=0)
                 cache_write = self._lift_feedback_maps_to_cache(
                     node_pack=node_pack,
-                    view=view,
+                    views=[views[i] for i in valid_view_idx],
                     height=h,
                     width=w,
-                    error_pred=e_pred,
-                    latent=latent,
-                    mask=mask,
+                    error_pred=e_pred_raw,
+                    latent=latent_raw,
+                    mask=frame_mask,
                 )
+                if cache_write is not None:
+                    cache_write["nearby_frame_idx"] = int(frame_idx)
+                    frame_cache_writes.append(cache_write)
 
-        if len(losses) == 0:
+        if len(frame_losses) == 0:
             return {
                 "loss": zero,
                 "processed": 0.0,
+                "processed_frames": 0.0,
                 "skipped_low_valid": float(skipped_low_valid),
             }
         scale = self._warmup_linear_value(
@@ -1198,9 +1441,10 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
             warmup_steps=int(self.stage5_6_error_warmup_steps),
         )
         out_pack: Dict[str, Any] = {
-            "loss": float(self.stage5_6_error_weight) * float(scale) * torch.stack(losses).mean(),
-            "loss_raw": torch.stack(losses).mean(),
-            "processed": float(processed),
+            "loss": float(self.stage5_6_error_weight) * float(scale) * torch.stack(frame_losses).mean(),
+            "loss_raw": torch.stack(frame_losses).mean(),
+            "processed": float(processed_views),
+            "processed_frames": float(processed_frames),
             "effective_weight": float(self.stage5_6_error_weight) * float(scale),
             "e_abs": torch.stack(e_abs_terms).mean(),
             "u_pred_mean": torch.stack(pred_terms).mean(),
@@ -1211,8 +1455,8 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
             "skipped_low_valid": float(skipped_low_valid),
             **({"debug_images": debug_images} if collect_debug else {}),
         }
-        if cache_write is not None:
-            out_pack["cache_write"] = cache_write
+        if len(frame_cache_writes) > 0:
+            out_pack["cache_write"] = frame_cache_writes
         return out_pack
 
     def _write_cache(self, batch: Dict[str, Any], out: Dict[str, Any], error_pack: Dict[str, Any]) -> None:
@@ -1222,28 +1466,43 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
         if not self._cache_ready(step):
             return
         cache_write = error_pack.get("cache_write")
-        if not isinstance(cache_write, dict):
+        if not isinstance(cache_write, list):
             return
-        key = out.get("_cache_key")
-        if key is None:
-            key = self._batch_key(batch)
-        self._stage5_6_cache[key] = {
-            "step": int(step),
-            "bg": cache_write.get("bg"),
-            "distant": cache_write.get("distant"),
-            "rigid": cache_write.get("rigid"),
-            "write_node_ratio": float(cache_write.get("write_node_ratio", 0.0)),
-            "valid_ratio": float(cache_write.get("valid_ratio", 0.0)),
-            "support_mean": float(cache_write.get("support_mean", 0.0)),
-            "error_mean": float(cache_write.get("error_mean", 0.0)),
-        }
+        scope_key = self._stage5_6_scope_key(batch)
+        if bool(getattr(self, "stage5_6_cache_keep_only_current_scope", True)):
+            current_bank = self._stage5_6_frame_cache.get(scope_key)
+            self._stage5_6_frame_cache.clear()
+            if current_bank is not None:
+                self._stage5_6_frame_cache[scope_key] = current_bank
+        bank = self._stage5_6_frame_cache.setdefault(scope_key, {})
+        for frame_pack in cache_write:
+            if not isinstance(frame_pack, dict):
+                continue
+            nearby_frame_idx = frame_pack.get("nearby_frame_idx")
+            if nearby_frame_idx is None:
+                continue
+            bank[int(nearby_frame_idx)] = {
+                "step": int(step),
+                "scene_id": int(scope_key[0]),
+                "segment_id": int(scope_key[1]),
+                "episode_idx": int(scope_key[2]),
+                "block_idx_global": int(scope_key[3]),
+                "source_frame_idx": self._safe_int(batch.get("source_frame_idx", None)),
+                "nearby_frame_idx": int(nearby_frame_idx),
+                "bg": frame_pack.get("bg"),
+                "distant": frame_pack.get("distant"),
+                "rigid": frame_pack.get("rigid"),
+                "write_node_ratio": float(frame_pack.get("write_node_ratio", 0.0)),
+                "valid_ratio": float(frame_pack.get("valid_ratio", 0.0)),
+                "support_mean": float(frame_pack.get("support_mean", 0.0)),
+                "error_mean": float(frame_pack.get("error_mean", 0.0)),
+            }
 
     def _read_feedback_pack(
         self,
         pack: Optional[Dict[str, torch.Tensor]],
         *,
         dtype: torch.dtype,
-        elapsed: int,
         indices: Optional[torch.Tensor] = None,
     ) -> Optional[Dict[str, torch.Tensor]]:
         if not isinstance(pack, dict):
@@ -1256,54 +1515,137 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
             if indices is not None:
                 val = val[indices]
             out[k] = val.to(device=self.device, dtype=dtype)
-        out["age"] = out["valid"].new_full(tuple(out["valid"].shape), float(max(int(elapsed), 0)))
         return out
 
-    def _read_cache(
+    def _read_frame_entry(
         self,
-        key: Tuple[int, int],
+        entry: Optional[Dict[str, Any]],
+        *,
         route: RigidRoute,
         dtype: torch.dtype,
         current_step: int,
     ) -> Optional[Dict[str, Optional[Dict[str, torch.Tensor]]]]:
-        if self._fusion_scale(current_step) <= 0.0:
-            return None
-        entry = self._stage5_6_cache.get(key)
         if entry is None:
             return None
-        step = int(entry["step"])
+        step = int(entry.get("step", -1))
         if not self._cache_ready(step):
             return None
         elapsed = int(current_step - step)
         if elapsed > int(self.stage5_6_cache_max_age):
-            self._stage5_6_cache.pop(key, None)
             return None
         rigid_s = None
         if entry.get("rigid") is not None and int(route.S.numel()) > 0:
             rigid_s = self._read_feedback_pack(
                 entry.get("rigid"),
                 dtype=dtype,
-                elapsed=elapsed,
                 indices=route.S.to(device=self.device, dtype=torch.long),
             )
         return {
-            "bg": self._read_feedback_pack(entry.get("bg"), dtype=dtype, elapsed=elapsed),
-            "distant": self._read_feedback_pack(entry.get("distant"), dtype=dtype, elapsed=elapsed),
+            "bg": self._read_feedback_pack(entry.get("bg"), dtype=dtype),
+            "distant": self._read_feedback_pack(entry.get("distant"), dtype=dtype),
             "rigid_s": rigid_s,
+        }
+
+    def _read_cache(
+        self,
+        scope_key: Tuple[int, int, int, int],
+        route: RigidRoute,
+        dtype: torch.dtype,
+        current_step: int,
+        frame_indices: List[int],
+    ) -> Optional[Dict[str, List[Optional[Dict[str, torch.Tensor]]]]]:
+        if self._fusion_scale(current_step) <= 0.0:
+            return None
+        if bool(getattr(self, "stage5_6_cache_keep_only_current_scope", True)):
+            current_bank = self._stage5_6_frame_cache.get(scope_key)
+            self._stage5_6_frame_cache.clear()
+            if current_bank is not None:
+                self._stage5_6_frame_cache[scope_key] = current_bank
+        bank = self._stage5_6_frame_cache.get(scope_key)
+        if bank is None:
+            return None
+        slots = max(int(self.stage5_6_fusion_num_slots), 1)
+        frame_ids = [int(x) for x in frame_indices[:slots]]
+        if len(frame_ids) < slots:
+            frame_ids.extend([-1] * (slots - len(frame_ids)))
+        cache_slots: Dict[str, List[Optional[Dict[str, torch.Tensor]]]] = {"bg": [], "distant": [], "rigid_s": []}
+        for frame_idx in frame_ids:
+            frame_entry = bank.get(int(frame_idx)) if int(frame_idx) >= 0 else None
+            frame_pack = self._read_frame_entry(
+                frame_entry,
+                route=route,
+                dtype=dtype,
+                current_step=current_step,
+            )
+            cache_slots["bg"].append(frame_pack.get("bg") if isinstance(frame_pack, dict) else None)
+            cache_slots["distant"].append(frame_pack.get("distant") if isinstance(frame_pack, dict) else None)
+            cache_slots["rigid_s"].append(frame_pack.get("rigid_s") if isinstance(frame_pack, dict) else None)
+        return cache_slots
+
+    def _stack_feedback_slots(
+        self,
+        feedback_slots: Optional[List[Optional[Dict[str, torch.Tensor]]]],
+        *,
+        n_points: int,
+        dtype: torch.dtype,
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        if not isinstance(feedback_slots, list):
+            return None
+        k = max(int(self.stage5_6_fusion_num_slots), 1)
+        slots = feedback_slots[:k]
+        if len(slots) < k:
+            slots.extend([None] * (k - len(slots)))
+        feat_slots: List[torch.Tensor] = []
+        error_slots: List[torch.Tensor] = []
+        support_slots: List[torch.Tensor] = []
+        valid_slots: List[torch.Tensor] = []
+        for slot in slots:
+            if not isinstance(slot, dict):
+                feat_slots.append(torch.zeros((n_points, int(self.stage5_6_error_feat_dim)), device=self.device, dtype=dtype))
+                error_slots.append(torch.zeros((n_points, 1), device=self.device, dtype=dtype))
+                support_slots.append(torch.zeros((n_points, 1), device=self.device, dtype=dtype))
+                valid_slots.append(torch.zeros((n_points, 1), device=self.device, dtype=dtype))
+                continue
+            feat = slot.get("feat")
+            error = slot.get("error")
+            support = slot.get("support")
+            valid = slot.get("valid")
+            if not all(torch.is_tensor(x) for x in (feat, error, support, valid)):
+                feat_slots.append(torch.zeros((n_points, int(self.stage5_6_error_feat_dim)), device=self.device, dtype=dtype))
+                error_slots.append(torch.zeros((n_points, 1), device=self.device, dtype=dtype))
+                support_slots.append(torch.zeros((n_points, 1), device=self.device, dtype=dtype))
+                valid_slots.append(torch.zeros((n_points, 1), device=self.device, dtype=dtype))
+                continue
+            if int(feat.shape[0]) != int(n_points):
+                return None
+            feat_slots.append(feat.to(device=self.device, dtype=dtype))
+            error_slots.append(error.to(device=self.device, dtype=dtype))
+            support_slots.append(support.to(device=self.device, dtype=dtype))
+            valid_slots.append(valid.to(device=self.device, dtype=dtype))
+        return {
+            "feat": torch.stack(feat_slots, dim=1),
+            "error": torch.stack(error_slots, dim=1),
+            "support": torch.stack(support_slots, dim=1),
+            "valid": torch.stack(valid_slots, dim=1),
         }
 
     def _fuse(
         self,
         feat: Optional[torch.Tensor],
-        feedback: Optional[Dict[str, torch.Tensor]],
-        fuser: Stage5_6PointResidualFuser,
+        feedback_slots: Optional[List[Optional[Dict[str, torch.Tensor]]]],
+        fuser: Stage5_6FrameFlattenFuser,
         *,
         current_support: Optional[torch.Tensor],
         branch_name: str,
     ) -> Optional[torch.Tensor]:
-        if feat is None or feedback is None:
+        if feat is None:
             return feat
-        if int(feat.shape[0]) != int(feedback["feat"].shape[0]):
+        feedback = self._stack_feedback_slots(
+            feedback_slots,
+            n_points=int(feat.shape[0]),
+            dtype=feat.dtype,
+        )
+        if feedback is None:
             return feat
         scale = float(self._stage5_6_active_fusion_scale)
         fused = fuser(feat, feedback, current_support=current_support, scale=scale)
@@ -1325,11 +1667,13 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
             step = int(self._current_loss_step(batch))
             self._stage5_6_active_fusion_scale = float(self._fusion_scale(step))
             if bool(self.stage5_6_cache_enable) and self._stage5_6_active_fusion_scale > 0.0:
+                frame_indices = self._feedback_frame_indices_for_fusion(batch)
                 self._stage5_6_active_cache = self._read_cache(
-                    self._batch_key(batch),
+                    self._stage5_6_scope_key(batch),
                     route,
                     feat_2d_bg.dtype,
                     current_step=step,
+                    frame_indices=frame_indices,
                 )
         try:
             return super()._compute_full_routed_gru_inputs(**kwargs)
@@ -1407,8 +1751,10 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
         out["loss_stage5_6_error_pred"] = float(loss_val.detach().item()) if torch.is_tensor(loss_val) else 0.0
         out["loss/error_pred"] = float(out["loss_stage5_6_error_pred"])
         out["error_pred/processed_targets"] = float(err.get("processed", 0.0))
+        out["error_pred/processed_frames"] = float(err.get("processed_frames", 0.0))
         out["error_pred/effective_weight"] = float(err.get("effective_weight", 0.0))
         out["monitor/stage5_6/error_pred_processed_targets"] = float(err.get("processed", 0.0))
+        out["monitor/stage5_6/error_pred_processed_frames"] = float(err.get("processed_frames", 0.0))
         for key in ("e_abs", "u_pred_mean", "u_gt_mean", "valid_pixel_ratio", "support_mean"):
             val = err.get(key)
             if torch.is_tensor(val):
@@ -1425,7 +1771,16 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
 
     def _log_feedback_state(self, out: Dict[str, Any], step: int, err: Dict[str, Any]) -> None:
         cache_write = err.get("cache_write") if isinstance(err, dict) else None
-        entry = self._stage5_6_cache.get(out.get("_cache_key"))
+        scope_key = out.get("_stage5_6_scope_key")
+        frame_bank = self._stage5_6_frame_cache.get(scope_key) if scope_key is not None else None
+        entry = None
+        if isinstance(cache_write, list) and len(cache_write) > 0:
+            latest_frame = cache_write[-1].get("nearby_frame_idx")
+            if isinstance(frame_bank, dict) and latest_frame is not None:
+                entry = frame_bank.get(int(latest_frame))
+        if entry is None and isinstance(frame_bank, dict) and len(frame_bank) > 0:
+            newest = sorted(frame_bank.values(), key=lambda x: int(x.get("step", -1)))
+            entry = newest[-1]
         fusion_delta = 0.0
         if len(self._stage5_6_fusion_delta_norm_terms) > 0:
             fusion_delta = float(torch.stack(self._stage5_6_fusion_delta_norm_terms).mean().detach().item())
@@ -1437,12 +1792,13 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
         )
         out["feedback/fusion_scale"] = float(self._fusion_scale(step))
         out["feedback/fusion_delta_norm"] = float(fusion_delta)
-        out["feedback/cache_size"] = float(len(self._stage5_6_cache))
+        out["feedback/cache_size"] = float(len(self._stage5_6_frame_cache))
+        out["feedback/frame_cache_size"] = float(len(frame_bank) if isinstance(frame_bank, dict) else 0)
         out["feedback/age_mean"] = float(age_mean)
         for key in ("write_node_ratio", "valid_ratio", "support_mean", "error_mean"):
             val = 0.0
-            if isinstance(cache_write, dict):
-                val = float(cache_write.get(key, 0.0))
+            if isinstance(cache_write, list) and len(cache_write) > 0:
+                val = float(cache_write[-1].get(key, 0.0))
             elif isinstance(entry, dict):
                 val = float(entry.get(key, 0.0))
             out[f"feedback/{key}"] = float(val)
@@ -1452,12 +1808,13 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
             if isinstance(pack, dict) and torch.is_tensor(pack.get("valid")) and int(pack["valid"].numel()) > 0:
                 ratio = float(pack["valid"].detach().float().mean().item())
             out[f"branch/{branch}_feedback_valid"] = float(ratio)
-        out["monitor/stage5_6/cache_size"] = float(len(self._stage5_6_cache))
+        out["monitor/stage5_6/cache_size"] = float(len(self._stage5_6_frame_cache))
 
     def forward(self, batch: Dict) -> Dict[str, Any]:
         self._stage5_6_last_nearby_debug_images = []
         self._stage5_6_last_error_debug_images = []
         out = super().forward(batch)
+        out["_stage5_6_scope_key"] = self._stage5_6_scope_key(batch)
         if self.training and self.stage5_6_nearby_enabled:
             nearby = self._compute_nearby_direct_loss(batch, out)
             if torch.is_tensor(nearby.get("loss")):
@@ -1478,7 +1835,6 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
             if isinstance(err.get("debug_images"), list):
                 self._stage5_6_last_error_debug_images = err["debug_images"]
                 out["_stage5_6_error_debug_images"] = err["debug_images"]
-
         self._write_cache(batch, out, err)
         self._log_feedback_state(out, int(self._current_loss_step(batch)), err)
         return out
@@ -1510,17 +1866,17 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
 
     def reset_node_state(self) -> None:
         super().reset_node_state()
-        self._stage5_6_cache.clear()
+        self._stage5_6_frame_cache.clear()
         self._stage5_6_active_cache = None
         self._stage5_6_last_fused_features = {}
 
     @torch.no_grad()
     def record_block_history(self, batch: Dict[str, Any], event: Optional[Dict[str, Any]] = None) -> Dict[str, float]:
         stats = super().record_block_history(batch=batch, event=event)
-        self._stage5_6_cache.clear()
+        self._stage5_6_frame_cache.clear()
         self._stage5_6_active_cache = None
         self._stage5_6_last_fused_features = {}
         return stats
 
 
-__all__ = ["MinimalStreetForwardStage5_6", "Stage5_6ErrorPredictHead", "Stage5_6PointResidualFuser"]
+__all__ = ["MinimalStreetForwardStage5_6", "Stage5_6ErrorPredictHead", "Stage5_6FrameFlattenFuser"]

@@ -117,7 +117,7 @@ scheduler_v8:
     enable: false
   near_random_supervision:
     enable: true
-    frames_per_block: 1
+    frames_per_block: 2
     same_keyframe_only: true
     insufficient_policy: skip
     add_to_source_image_refs: false
@@ -427,7 +427,7 @@ nearby_error_feedback:
     hidden_dim: 64
     error_feat_dim: 16
     error_max: 0.7
-    max_targets_per_step: 3
+    max_frames_per_step: 2
     every_n_steps: 1
     skip_if_no_valid_aux: true
 
@@ -443,18 +443,20 @@ nearby_error_feedback:
 
   cache:
     enable: true
-    mode: overwrite
+    mode: frame_bank
+    keep_only_current_scope: true
     max_age: 1
     store_error_scalar: true
     store_error_feat: true
     store_support: true
     store_valid: true
-    store_age: true
+    store_age: false
 
   fusion:
     enable: true
     location: before_struct_decoder
-    type: residual_adapter
+    type: flatten_frame_slots
+    num_slots: 2
     hidden_dim: 64
     num_layers: 2
     norm: layernorm
@@ -465,7 +467,7 @@ nearby_error_feedback:
     apply_to_rigid: true
     input_current_source_support: true
     input_feedback_support: true
-    input_feedback_age: true
+    input_feedback_age: false
     input_branch_embed: false
 
   loss:

@@ -21,6 +21,8 @@ class MinimalStreetForwardStage5_6_Production(
 
     def _validate_production_config(self, config) -> None:
         super()._validate_production_config(config)
+        # Keep production path in sync with Stage5_6 schema fast-fails.
+        MinimalStreetForwardStage5_6._validate_stage5_3_config(self, config)
         model_cfg = self._require_key(config, "model", "config")
         stage = str(self._require_key(model_cfg, "stage", "model")).strip().lower()
         if stage != "5_6":

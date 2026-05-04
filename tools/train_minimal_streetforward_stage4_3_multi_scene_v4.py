@@ -2323,7 +2323,17 @@ def main() -> None:
                             row[k] = float(v)
                 # Always persist optimizer/lr/loss namespace scalars for run diagnosis,
                 # independent of include_extra_result_metrics.
-                always_scalar_prefixes = ("optimizer/", "lr/", "loss/", "monitor/aux_", "perf/aux_", "grad/aux")
+                always_scalar_prefixes = (
+                    "optimizer/",
+                    "lr/",
+                    "loss/",
+                    "error_pred/",
+                    "feedback/",
+                    "branch/",
+                    "monitor/aux_",
+                    "perf/aux_",
+                    "grad/aux",
+                )
                 for k, v in result.items():
                     if k.startswith("_") or k in row:
                         continue
