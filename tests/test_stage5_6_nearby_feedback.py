@@ -13,9 +13,10 @@ import models.streetforward.minimal_trainer_stage4_5 as stage4_5_mod
 from models.streetforward.minimal_trainer_stage4_2 import MinimalStreetForwardStage4_2
 from models.streetforward.minimal_trainer_stage4_5 import MinimalStreetForwardStage4_5
 from models.streetforward.minimal_trainer_stage5_4 import MinimalStreetForwardStage5_4
+from models.streetforward.minimal_trainer_stage4_6 import RigidRoute
 from models.streetforward.minimal_trainer_stage5_6 import (
     MinimalStreetForwardStage5_6,
-    Stage5_6PointResidualFuser,
+    Stage5_6FrameFlattenFuser,
 )
 
 
@@ -107,7 +108,8 @@ def test_stage5_6_write_cache_uses_lifted_error_feedback_not_source_features():
     stage = MinimalStreetForwardStage5_6.__new__(MinimalStreetForwardStage5_6)
     stage.stage5_6_cache_enable = True
     stage.stage5_6_pred_error_only_steps = 7000
-    stage._stage5_6_cache = {}
+    stage.stage5_6_cache_keep_only_current_scope = True
+    stage._stage5_6_frame_cache = {}
     stage._current_loss_step = lambda batch: 7000
     stage._batch_key = lambda batch: (1, 2)
     lifted_feat = torch.full((3, 4), 2.0)
@@ -119,13 +121,100 @@ def test_stage5_6_write_cache_uses_lifted_error_feedback_not_source_features():
         "valid": torch.ones((3, 1)),
         "age": torch.zeros((3, 1)),
     }
+    batch = {
+        "scene_id": 1,
+        "segment_id": 2,
+        "source_frame_idx": 5,
+        "request_meta": {"episode_idx_global": 3, "block_idx_global": 4},
+    }
     stage._write_cache(
-        {"scene_id": 1, "segment_id": 2},
+        batch,
         {"_cache_key": (1, 2), "_feat_2d_bg": source_feat},
-        {"cache_write": {"bg": bg_pack, "distant": None, "rigid": None, "write_node_ratio": 1.0}},
+        {
+            "cache_write": [
+                {
+                    "nearby_frame_idx": 8,
+                    "bg": bg_pack,
+                    "distant": None,
+                    "rigid": None,
+                    "write_node_ratio": 1.0,
+                }
+            ]
+        },
     )
-    assert torch.equal(stage._stage5_6_cache[(1, 2)]["bg"]["feat"], lifted_feat)
-    assert not torch.equal(stage._stage5_6_cache[(1, 2)]["bg"]["feat"], source_feat)
+    entry = stage._stage5_6_frame_cache[(1, 2, 3, 4)][8]
+    assert torch.equal(entry["bg"]["feat"], lifted_feat)
+    assert not torch.equal(entry["bg"]["feat"], source_feat)
+
+
+def test_stage5_6_read_cache_consumes_same_block_cache_once():
+    stage = MinimalStreetForwardStage5_6.__new__(MinimalStreetForwardStage5_6)
+    stage.device = torch.device("cpu")
+    stage.stage5_6_cache_enable = True
+    stage.stage5_6_pred_error_only_steps = 7000
+    stage.stage5_6_cache_max_age = 1
+    stage.stage5_6_cache_keep_only_current_scope = True
+    stage.stage5_6_fusion_num_slots = 1
+    stage._fusion_scale = lambda step: 1.0
+    scope_key = (1, 2, 3, 4)
+    bg_pack = {
+        "error": torch.full((3, 1), 0.25),
+        "feat": torch.full((3, 4), 2.0),
+        "support": torch.ones((3, 1)),
+        "valid": torch.ones((3, 1)),
+    }
+    stage._stage5_6_frame_cache = {
+        scope_key: {
+            8: {
+                "step": 7000,
+                "bg": bg_pack,
+                "distant": None,
+                "rigid": None,
+            }
+        }
+    }
+    empty_long = torch.empty(0, dtype=torch.long)
+    empty_bool = torch.empty(0, dtype=torch.bool)
+    empty_xyz = torch.empty(0, 3)
+    empty_quat = torch.empty(0, 4)
+    route = RigidRoute(
+        S=empty_long,
+        S_in=empty_long,
+        S_out=empty_long,
+        inside_mask_S=empty_bool,
+        route_inside_global=empty_bool,
+        means_world_S=empty_xyz,
+        quats_world_S=empty_quat,
+    )
+
+    out = stage._read_cache(
+        scope_key,
+        route,
+        torch.float32,
+        current_step=7001,
+        frame_indices=[8],
+    )
+
+    assert out is not None
+    assert torch.equal(out["bg"][0]["feat"], bg_pack["feat"])
+    assert scope_key not in stage._stage5_6_frame_cache
+    assert stage._read_cache(scope_key, route, torch.float32, current_step=7001, frame_indices=[8]) is None
+
+
+def test_stage5_6_write_cache_without_new_payload_clears_current_scope():
+    stage = MinimalStreetForwardStage5_6.__new__(MinimalStreetForwardStage5_6)
+    stage.stage5_6_cache_enable = True
+    stage.stage5_6_pred_error_only_steps = 7000
+    stage.stage5_6_cache_keep_only_current_scope = True
+    stage._current_loss_step = lambda batch: 7001
+    stage._batch_key = lambda batch: (1, 2)
+    scope_key = (1, 2, 3, 4)
+    stage._stage5_6_frame_cache = {scope_key: {8: {"step": 7000}}}
+    batch = {"request_meta": {"episode_idx_global": 3, "block_idx_global": 4}}
+
+    stage._write_cache(batch, {}, {})
+
+    assert scope_key not in stage._stage5_6_frame_cache
 
 
 def test_stage5_6_collects_feedback_targets_from_near_random_target_roles():
@@ -186,14 +275,15 @@ def test_stage5_6_nearby_direct_loss_requests_retain_graph_for_proxy_backward(mo
     stage.stage5_6_error_enabled = False
     stage.stage5_6_cache_enable = False
     stage.stage5_6_fusion_enabled = False
-    stage._stage5_6_cache = {}
+    stage._stage5_6_frame_cache = {}
     stage._compute_nearby_direct_loss = lambda batch, out: {"loss": nearby_loss, "processed": 1.0}
     stage._log_nearby_pack = lambda out, nearby: None
     stage._write_cache = lambda batch, out, err: None
     stage._log_feedback_state = lambda out, step, err: None
     stage._current_loss_step = lambda batch: 0
+    stage._batch_key = lambda batch: (1, 2)
 
-    out = stage.forward({})
+    out = stage.forward({"request_meta": {"episode_idx_global": 3, "block_idx_global": 4}})
     assert out["_retain_graph_for_proxy_backward"] is True
 
 
@@ -225,12 +315,12 @@ def test_stage5_6_reset_node_state_clears_cache(monkeypatch: pytest.MonkeyPatch)
 
     monkeypatch.setattr(MinimalStreetForwardStage5_4, "reset_node_state", _super_reset)
     stage = MinimalStreetForwardStage5_6.__new__(MinimalStreetForwardStage5_6)
-    stage._stage5_6_cache = {(1, 2): {"step": 1}}
+    stage._stage5_6_frame_cache = {(1, 2, 3, 4): {8: {"step": 1}}}
     stage._stage5_6_active_cache = {"bg": None}
     stage._stage5_6_last_fused_features = {"bg": torch.zeros((1, 1))}
     stage.reset_node_state()
     assert stage._super_reset_called is True
-    assert stage._stage5_6_cache == {}
+    assert stage._stage5_6_frame_cache == {}
     assert stage._stage5_6_active_cache is None
     assert stage._stage5_6_last_fused_features == {}
 
@@ -242,21 +332,26 @@ def test_stage5_6_record_block_history_clears_cache(monkeypatch: pytest.MonkeyPa
 
     monkeypatch.setattr(MinimalStreetForwardStage5_4, "record_block_history", _super_record)
     stage = MinimalStreetForwardStage5_6.__new__(MinimalStreetForwardStage5_6)
-    stage._stage5_6_cache = {(3, 4): {"step": 5}}
+    stage._stage5_6_frame_cache = {(3, 4, 5, 6): {8: {"step": 5}}}
     stage._stage5_6_active_cache = {"bg": None}
     stage._stage5_6_last_fused_features = {"bg": torch.zeros((1, 1))}
     out = stage.record_block_history(batch={}, event={"dummy": 1})
     assert out == {"super_called": 1.0}
-    assert stage._stage5_6_cache == {}
+    assert stage._stage5_6_frame_cache == {}
     assert stage._stage5_6_active_cache is None
     assert stage._stage5_6_last_fused_features == {}
 
 
 def test_stage5_6_fuser_zero_init_is_identity():
-    fuser = Stage5_6PointResidualFuser(feat_dim=8, hidden_dim=16)
+    fuser = Stage5_6FrameFlattenFuser(feat_dim=8, feedback_dim=4, num_slots=2, hidden_dim=16)
     feat = torch.randn((5, 8), dtype=torch.float32)
-    residual = torch.randn((5, 8), dtype=torch.float32) * 3.0
-    out = fuser(feat, residual)
+    feedback = {
+        "feat": torch.randn((5, 2, 4), dtype=torch.float32),
+        "error": torch.rand((5, 2, 1), dtype=torch.float32),
+        "support": torch.ones((5, 2, 1), dtype=torch.float32),
+        "valid": torch.ones((5, 2, 1), dtype=torch.float32),
+    }
+    out = fuser(feat, feedback)
     assert torch.allclose(out, feat, atol=0.0, rtol=0.0)
 
 

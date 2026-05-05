@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
+from models.feature_extractors.alpha_t_extractor import _get_viewmat
 from models.streetforward.math_utils import get_viewmat
 from models.streetforward.metrics import compute_ssim_loss_masked
 from models.streetforward.minimal_trainer_stage3_2d import _create_proxy_params
@@ -504,6 +505,17 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
     def _charbonnier(diff: torch.Tensor, eps: float = 1.0e-3) -> torch.Tensor:
         return torch.sqrt(diff * diff + eps * eps)
 
+    def _stage5_6_keep_current_cache_scope(self, scope_key: Tuple[int, int, int, int]) -> None:
+        if not bool(getattr(self, "stage5_6_cache_keep_only_current_scope", True)):
+            return
+        current_bank = self._stage5_6_frame_cache.get(scope_key)
+        self._stage5_6_frame_cache.clear()
+        if current_bank is not None:
+            self._stage5_6_frame_cache[scope_key] = current_bank
+
+    def _stage5_6_clear_cache_scope(self, scope_key: Tuple[int, int, int, int]) -> None:
+        self._stage5_6_frame_cache.pop(scope_key, None)
+
     def _stage5_6_should_checkpoint_render(self, *tensors: torch.Tensor) -> bool:
         if not bool(getattr(self, "stage5_6_render_checkpoint", True)):
             return False
@@ -577,7 +589,7 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
         dtype = means.dtype
         dev = means.device
         c2w = view.camtoworlds if hasattr(view, "camtoworlds") else view["camtoworlds"]
-        viewmat = get_viewmat(c2w.to(device=dev, dtype=dtype))
+        viewmat = _get_viewmat(c2w.to(device=dev, dtype=dtype))
         if hasattr(view, "Ks"):
             k_mat = view.Ks[0:1]
         elif hasattr(view, "K"):
@@ -627,7 +639,7 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
             heights.append(h)
             widths.append(w)
             c2w = view.camtoworlds if hasattr(view, "camtoworlds") else view["camtoworlds"]
-            viewmats_list.append(get_viewmat(c2w.to(device=dev, dtype=dtype)))
+            viewmats_list.append(_get_viewmat(c2w.to(device=dev, dtype=dtype)))
             if hasattr(view, "Ks"):
                 k_mat = view.Ks[0:1]
             elif hasattr(view, "K"):
@@ -1874,17 +1886,15 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
         if not self.stage5_6_cache_enable:
             return
         step = int(self._current_loss_step(batch))
+        scope_key = self._stage5_6_scope_key(batch)
+        self._stage5_6_keep_current_cache_scope(scope_key)
         if not self._cache_ready(step):
+            self._stage5_6_clear_cache_scope(scope_key)
             return
         cache_write = error_pack.get("cache_write")
-        if not isinstance(cache_write, list):
+        if not isinstance(cache_write, list) or len(cache_write) == 0:
+            self._stage5_6_clear_cache_scope(scope_key)
             return
-        scope_key = self._stage5_6_scope_key(batch)
-        if bool(getattr(self, "stage5_6_cache_keep_only_current_scope", True)):
-            current_bank = self._stage5_6_frame_cache.get(scope_key)
-            self._stage5_6_frame_cache.clear()
-            if current_bank is not None:
-                self._stage5_6_frame_cache[scope_key] = current_bank
         bank = self._stage5_6_frame_cache.setdefault(scope_key, {})
         for frame_pack in cache_write:
             if not isinstance(frame_pack, dict):
@@ -1965,13 +1975,10 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
         current_step: int,
         frame_indices: List[int],
     ) -> Optional[Dict[str, List[Optional[Dict[str, torch.Tensor]]]]]:
+        self._stage5_6_keep_current_cache_scope(scope_key)
         if self._fusion_scale(current_step) <= 0.0:
+            self._stage5_6_clear_cache_scope(scope_key)
             return None
-        if bool(getattr(self, "stage5_6_cache_keep_only_current_scope", True)):
-            current_bank = self._stage5_6_frame_cache.get(scope_key)
-            self._stage5_6_frame_cache.clear()
-            if current_bank is not None:
-                self._stage5_6_frame_cache[scope_key] = current_bank
         bank = self._stage5_6_frame_cache.get(scope_key)
         if bank is None:
             return None
@@ -1991,6 +1998,7 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
             cache_slots["bg"].append(frame_pack.get("bg") if isinstance(frame_pack, dict) else None)
             cache_slots["distant"].append(frame_pack.get("distant") if isinstance(frame_pack, dict) else None)
             cache_slots["rigid_s"].append(frame_pack.get("rigid_s") if isinstance(frame_pack, dict) else None)
+        self._stage5_6_clear_cache_scope(scope_key)
         return cache_slots
 
     def _stack_feedback_slots(
