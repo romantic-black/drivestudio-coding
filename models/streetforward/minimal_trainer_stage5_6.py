@@ -1202,12 +1202,17 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
             return torch.zeros((0,), dtype=torch.bool, device=self.device)
         if any(int(render_params[k].shape[0]) != n for k in ("means_r", "scales_r", "quats_r", "opacities_r")):
             raise RuntimeError("Stage5_6 renderable mask expects aligned render params and node_features.")
-        finite_feat = torch.isfinite(node_features).all(dim=1)
+        def _all_finite_per_node(x: torch.Tensor) -> torch.Tensor:
+            if int(x.shape[0]) != n:
+                raise RuntimeError("Stage5_6 renderable finite-check expects first dim == num nodes.")
+            return torch.isfinite(x.reshape(n, -1)).all(dim=1)
+
+        finite_feat = _all_finite_per_node(node_features)
         finite_geo = (
-            torch.isfinite(render_params["means_r"]).all(dim=1)
-            & torch.isfinite(render_params["scales_r"]).all(dim=1)
-            & torch.isfinite(render_params["quats_r"]).all(dim=1)
-            & torch.isfinite(render_params["opacities_r"]).all(dim=1)
+            _all_finite_per_node(render_params["means_r"])
+            & _all_finite_per_node(render_params["scales_r"])
+            & _all_finite_per_node(render_params["quats_r"])
+            & _all_finite_per_node(render_params["opacities_r"])
         )
         opacity_ok = render_params["opacities_r"].reshape(-1) > float(self.stage5_6_renderable_min_opacity)
         scale_ok = render_params["scales_r"].min(dim=1).values > float(self.stage5_6_renderable_min_scale)
