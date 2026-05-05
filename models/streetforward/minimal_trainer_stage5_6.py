@@ -87,6 +87,32 @@ class Stage5_6ErrorPredictHead(nn.Module):
         return self.error_max * torch.sigmoid(self.err(h)), self.latent(h)
 
 
+class ErrorSplatProjector(nn.Module):
+    """Project post-update hidden state for nearby error splat."""
+
+    def __init__(self, in_dim: int, out_dim: int):
+        super().__init__()
+        if int(in_dim) <= 0 or int(out_dim) <= 0:
+            raise ValueError(f"ErrorSplatProjector expects positive dims, got in={in_dim}, out={out_dim}.")
+        self.in_dim = int(in_dim)
+        self.out_dim = int(out_dim)
+        self.net = nn.Sequential(
+            nn.Linear(self.in_dim, self.out_dim),
+            nn.LayerNorm(self.out_dim),
+            nn.GELU(),
+            nn.Linear(self.out_dim, self.out_dim),
+        )
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        if hidden.dim() != 2:
+            raise ValueError(f"ErrorSplatProjector expects [N,C], got {tuple(hidden.shape)}.")
+        if int(hidden.shape[1]) != self.in_dim:
+            raise ValueError(
+                f"ErrorSplatProjector input dim mismatch: got {hidden.shape[1]} expected {self.in_dim}."
+            )
+        return self.net(hidden)
+
+
 class Stage5_6FrameFlattenFuser(nn.Module):
     """Zero-init residual adapter over fixed nearby frame slots."""
 
@@ -248,6 +274,17 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
         if bool(cache_cfg.get("store_age", False)):
             raise ValueError("Stage5_6 nearby_error_feedback.cache.store_age must be false for frame-slot feedback.")
         error_pred_cfg = nef_cfg.get("error_pred", {}) if hasattr(nef_cfg, "get") else {}
+        input_feature = str(error_pred_cfg.get("input_feature", "post_gru_hidden")).strip().lower()
+        if input_feature not in {"post_gru_hidden", "post_update_node_feature", "post_struct"}:
+            raise ValueError(
+                "Stage5_6 nearby_error_feedback.error_pred.input_feature must be one of "
+                "['post_gru_hidden', 'post_update_node_feature', 'post_struct']."
+            )
+        if input_feature == "post_struct":
+            raise ValueError(
+                "Stage5_6 P0 does not implement error_pred.input_feature='post_struct' yet. "
+                "Please use 'post_gru_hidden' or 'post_update_node_feature'."
+            )
         if int(error_pred_cfg.get("max_frames_per_step", 1)) < 1:
             raise ValueError("Stage5_6 nearby_error_feedback.error_pred.max_frames_per_step must be >= 1.")
         fusion_cfg = nef_cfg.get("fusion", {}) if hasattr(nef_cfg, "get") else {}
@@ -322,6 +359,35 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
         self.stage5_6_feedback_enabled = bool(nef.get("enable", fsu.get("enable", False)))
         self.stage5_6_error_enabled = bool(error_pred_cfg.get("enable", self.stage5_6_feedback_enabled))
         self.stage5_6_error_target_role = str(nef.get("target_role", error_pred_cfg.get("target_role", "nearby_direct")))
+        self.stage5_6_error_input_feature = str(error_pred_cfg.get("input_feature", "post_gru_hidden")).strip().lower()
+        if self.stage5_6_error_input_feature not in {"post_gru_hidden", "post_update_node_feature", "post_struct"}:
+            raise ValueError(
+                "Stage5_6 nearby_error_feedback.error_pred.input_feature must be one of "
+                "['post_gru_hidden', 'post_update_node_feature', 'post_struct']."
+            )
+        if self.stage5_6_error_input_feature == "post_struct":
+            raise ValueError(
+                "Stage5_6 P0 does not implement error_pred.input_feature='post_struct' yet. "
+                "Use 'post_gru_hidden' or 'post_update_node_feature'."
+            )
+        self.stage5_6_error_splat_dim = int(
+            error_pred_cfg.get(
+                "error_splat_dim",
+                self.offset_gru_hidden_dim if self.stage5_6_error_input_feature == "post_gru_hidden" else self.stage5_2_feat_2d_channels,
+            )
+        )
+        if self.stage5_6_error_splat_dim <= 0:
+            raise ValueError("Stage5_6 nearby_error_feedback.error_pred.error_splat_dim must be > 0.")
+        self.stage5_6_detach_input_hidden = bool(error_pred_cfg.get("detach_input_hidden", True))
+        self.stage5_6_detach_projected_feature = bool(error_pred_cfg.get("detach_projected_feature", False))
+        self.stage5_6_node_mask_policy = str(error_pred_cfg.get("node_mask_policy", "renderable")).strip().lower()
+        if self.stage5_6_node_mask_policy not in {"renderable", "source_support_threshold"}:
+            raise ValueError(
+                "Stage5_6 nearby_error_feedback.error_pred.node_mask_policy must be "
+                "['renderable', 'source_support_threshold']."
+            )
+        self.stage5_6_renderable_min_opacity = float(error_pred_cfg.get("renderable_min_opacity", 1.0e-4))
+        self.stage5_6_renderable_min_scale = float(error_pred_cfg.get("renderable_min_scale", 1.0e-8))
         max_frames_cfg = error_pred_cfg.get("max_frames_per_step", None)
         if max_frames_cfg is None:
             max_targets_fallback = int(error_pred_cfg.get("max_targets_per_step", fsu_target.get("max_targets_per_step", 1)))
@@ -397,12 +463,16 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
         error_feat_dim = int(error_pred_cfg.get("error_feat_dim", 8))
         error_max = float(error_pred_cfg.get("error_max", fsu_head.get("error_max", 0.5)))
         head_type = str(error_pred_cfg.get("head_type", "dilated_conv")).strip().lower()
-        in_ch = feat_dim
+        in_ch = int(self.stage5_6_error_splat_dim)
         if self.stage5_6_use_render_rgb:
             in_ch += 3
         if self.stage5_6_use_render_alpha:
             in_ch += 1
         self.stage5_6_error_feat_dim = int(error_feat_dim)
+        hidden_in_dim = int(self.offset_gru_hidden_dim)
+        self.err_splat_proj_bg = ErrorSplatProjector(hidden_in_dim, int(self.stage5_6_error_splat_dim)).to(self.device)
+        self.err_splat_proj_distant = ErrorSplatProjector(hidden_in_dim, int(self.stage5_6_error_splat_dim)).to(self.device)
+        self.err_splat_proj_rigid = ErrorSplatProjector(hidden_in_dim, int(self.stage5_6_error_splat_dim)).to(self.device)
         self.stage5_6_error_head = Stage5_6ErrorPredictHead(
             in_ch=in_ch,
             hidden_dim=hidden_dim,
@@ -438,6 +508,9 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
         opt_param_ids = {id(p) for group in opt.param_groups for p in group.get("params", [])}
         modules = {
             "stage5_6_error_head": getattr(self, "stage5_6_error_head", None),
+            "err_splat_proj_bg": getattr(self, "err_splat_proj_bg", None),
+            "err_splat_proj_distant": getattr(self, "err_splat_proj_distant", None),
+            "err_splat_proj_rigid": getattr(self, "err_splat_proj_rigid", None),
             "stage5_6_bg_fuser": getattr(self, "stage5_6_bg_fuser", None),
             "stage5_6_distant_fuser": getattr(self, "stage5_6_distant_fuser", None),
             "stage5_6_rigid_fuser": getattr(self, "stage5_6_rigid_fuser", None),
@@ -1059,7 +1132,88 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
             return fused
         return out.get(fallback_key)
 
-    def _build_feedback_node_pack(
+    def _project_hidden_for_error_splat(
+        self,
+        hidden: Optional[torch.Tensor],
+        projector: ErrorSplatProjector,
+        *,
+        branch_name: str,
+    ) -> Optional[torch.Tensor]:
+        if hidden is None:
+            return None
+        if hidden.dim() != 2:
+            raise RuntimeError(f"Stage5_6 {branch_name} hidden must be [N,C], got {tuple(hidden.shape)}.")
+        h_in = hidden
+        if bool(self.stage5_6_detach_input_hidden):
+            h_in = h_in.detach()
+        projected = projector(h_in.to(device=self.device))
+        if bool(self.stage5_6_detach_projected_feature):
+            projected = projected.detach()
+        return projected
+
+    def _prepare_error_splat_features(self, out: Dict[str, Any]) -> Dict[str, Optional[torch.Tensor]]:
+        if self.stage5_6_error_input_feature != "post_gru_hidden":
+            return {
+                "bg": out.get("_err_splat_feat_bg"),
+                "distant": out.get("_err_splat_feat_distant"),
+                "rigid": out.get("_err_splat_feat_rigid"),
+            }
+        feat_bg = out.get("_err_splat_feat_bg")
+        if feat_bg is None:
+            feat_bg = self._project_hidden_for_error_splat(
+                out.get("_h_new_bg"),
+                self.err_splat_proj_bg,
+                branch_name="bg",
+            )
+            if feat_bg is None:
+                raise RuntimeError("Stage5_6 post_gru_hidden requires _h_new_bg in forward out.")
+            out["_err_splat_feat_bg"] = feat_bg
+
+        feat_distant = out.get("_err_splat_feat_distant")
+        hidden_distant = out.get("_h_new_distant")
+        if feat_distant is None and hidden_distant is not None:
+            feat_distant = self._project_hidden_for_error_splat(
+                hidden_distant,
+                self.err_splat_proj_distant,
+                branch_name="distant",
+            )
+            out["_err_splat_feat_distant"] = feat_distant
+
+        feat_rigid = out.get("_err_splat_feat_rigid")
+        hidden_rigid = out.get("_h_new_rigid")
+        if feat_rigid is None and hidden_rigid is not None:
+            feat_rigid = self._project_hidden_for_error_splat(
+                hidden_rigid,
+                self.err_splat_proj_rigid,
+                branch_name="rigid",
+            )
+            out["_err_splat_feat_rigid"] = feat_rigid
+
+        return {"bg": feat_bg, "distant": feat_distant, "rigid": feat_rigid}
+
+    def _renderable_node_mask(
+        self,
+        *,
+        node_features: torch.Tensor,
+        render_params: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        n = int(node_features.shape[0])
+        if n == 0:
+            return torch.zeros((0,), dtype=torch.bool, device=self.device)
+        if any(int(render_params[k].shape[0]) != n for k in ("means_r", "scales_r", "quats_r", "opacities_r")):
+            raise RuntimeError("Stage5_6 renderable mask expects aligned render params and node_features.")
+        finite_feat = torch.isfinite(node_features).all(dim=1)
+        finite_geo = (
+            torch.isfinite(render_params["means_r"]).all(dim=1)
+            & torch.isfinite(render_params["scales_r"]).all(dim=1)
+            & torch.isfinite(render_params["quats_r"]).all(dim=1)
+            & torch.isfinite(render_params["opacities_r"]).all(dim=1)
+        )
+        opacity_ok = render_params["opacities_r"].reshape(-1) > float(self.stage5_6_renderable_min_opacity)
+        scale_ok = render_params["scales_r"].min(dim=1).values > float(self.stage5_6_renderable_min_scale)
+        return (finite_feat & finite_geo & opacity_ok & scale_ok).to(device=self.device)
+
+    def _build_feedback_node_pack_legacy(
         self,
         *,
         out: Dict[str, Any],
@@ -1146,6 +1300,90 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
             "num_distant": distant_count,
             "rigid_order": rigid_order,
             "num_rigid_total": int(node_state_rigid.means.shape[0]) if node_state_rigid is not None else 0,
+            "allow_feature_grad": False,
+        }
+
+    def _build_feedback_node_pack(
+        self,
+        *,
+        out: Dict[str, Any],
+        target_frame_idx: int,
+    ) -> Optional[Dict[str, Any]]:
+        if self.stage5_6_error_input_feature == "post_update_node_feature":
+            return self._build_feedback_node_pack_legacy(out=out, target_frame_idx=target_frame_idx)
+        if self.stage5_6_error_input_feature == "post_struct":
+            raise RuntimeError(
+                "Stage5_6 P0 does not implement error_pred.input_feature='post_struct'. "
+                "Use post_gru_hidden or post_update_node_feature."
+            )
+        error_feats = self._prepare_error_splat_features(out)
+        feat_bg = error_feats.get("bg")
+        render_bg = out.get("_render_params_bg")
+        if feat_bg is None or render_bg is None:
+            return None
+        acc_bg = out.get("_acc_w_bg")
+
+        rigid_world, rigid_order = self._build_rigid_world_for_aux_frame(out, int(target_frame_idx))
+        node_state_rigid = out.get("_node_state_rigid")
+        feats: List[Optional[torch.Tensor]] = [feat_bg]
+        bg_renderable = self._renderable_node_mask(node_features=feat_bg, render_params=render_bg)
+        if self.stage5_6_node_mask_policy == "source_support_threshold" and acc_bg is not None:
+            bg_renderable = bg_renderable & (acc_bg > float(self.bg_src_backproject_support_min)).to(device=self.device)
+        masks: List[Optional[torch.Tensor]] = [bg_renderable]
+
+        rigid_count = int(rigid_order.numel())
+        if rigid_world is not None and rigid_count > 0:
+            feat_rigid_all = error_feats.get("rigid")
+            if feat_rigid_all is None:
+                raise RuntimeError(
+                    "Stage5_6 post_gru_hidden requires _h_new_rigid -> _err_splat_feat_rigid when rigid branch is active."
+                )
+            rigid_order = rigid_order.to(device=self.device, dtype=torch.long)
+            if bool((rigid_order < 0).any().item()) or bool((rigid_order >= int(feat_rigid_all.shape[0])).any().item()):
+                raise RuntimeError("Stage5_6 rigid_order out of range for _err_splat_feat_rigid.")
+            feat_rigid_ordered = feat_rigid_all[rigid_order]
+            mask_rigid_ordered = self._renderable_node_mask(
+                node_features=feat_rigid_ordered,
+                render_params=rigid_world,
+            )
+            feats.append(feat_rigid_ordered)
+            masks.append(mask_rigid_ordered)
+
+        feat_distant = error_feats.get("distant")
+        render_distant = out.get("_render_params_distant")
+        acc_distant = out.get("_acc_w_distant")
+        distant_count = 0
+        if feat_distant is not None and render_distant is not None and int(feat_distant.shape[0]) > 0:
+            distant_count = int(feat_distant.shape[0])
+            feats.append(feat_distant)
+            distant_renderable = self._renderable_node_mask(node_features=feat_distant, render_params=render_distant)
+            if self.stage5_6_node_mask_policy == "source_support_threshold" and acc_distant is not None:
+                distant_renderable = distant_renderable & (
+                    acc_distant > float(self.distant_src_backproject_support_min)
+                ).to(device=self.device)
+            masks.append(distant_renderable)
+
+        merged_features = self._merge_lists(feats)
+        merged_mask = self._merge_lists(masks)
+        if merged_features is None or merged_mask is None:
+            return None
+        merged_render = self._tensor_merge_bg_rigid_distant_world(render_bg, rigid_world, render_distant)
+        if int(merged_render["means_r"].shape[0]) != int(merged_features.shape[0]):
+            raise RuntimeError(
+                "Stage5_6 feedback render/features length mismatch: "
+                f"{merged_render['means_r'].shape[0]} vs {merged_features.shape[0]}."
+            )
+        num_bg = int(feat_bg.shape[0])
+        return {
+            "render": merged_render,
+            "features": merged_features,
+            "mask": merged_mask.bool(),
+            "num_bg": num_bg,
+            "num_rigid": rigid_count,
+            "num_distant": distant_count,
+            "rigid_order": rigid_order,
+            "num_rigid_total": int(node_state_rigid.means.shape[0]) if node_state_rigid is not None else 0,
+            "allow_feature_grad": not bool(self.stage5_6_detach_projected_feature),
         }
 
     def _render_params_to_gaussians(self, render_params: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -1321,9 +1559,13 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
                 continue
             feat_tilde_all, support_all = self._splat_node_features_to_views(
                 render_params=node_pack["render"],
-                # Keep error-pred branch isolated from Stage4/5 main render graph.
-                # This avoids double-backward conflicts with proxy->render_params custom backward.
-                node_features=node_pack["features"].detach(),
+                # feedback latent is an adapter input for next-step struct features,
+                # not a hidden-state residual. In post-GRU mode keep projector grads.
+                node_features=(
+                    node_pack["features"]
+                    if bool(node_pack.get("allow_feature_grad", False))
+                    else node_pack["features"].detach()
+                ),
                 node_mask=node_pack["mask"],
                 views=views,
                 height=h,

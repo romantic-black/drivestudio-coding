@@ -411,7 +411,11 @@ nearby_error_feedback:
   error_pred:
     enable: true
     target_role: near_random
-    input_feature: post_update_node_feature
+    input_feature: post_gru_hidden
+    error_splat_dim: 48
+    detach_input_hidden: true
+    detach_projected_feature: false
+    node_mask_policy: renderable
     splat_to: nearby_view
     detach_geometry: true
     detach_alpha_weights: true
@@ -465,8 +469,8 @@ nearby_error_feedback:
     apply_to_bg: true
     apply_to_distant: true
     apply_to_rigid: true
-    input_current_source_support: true
-    input_feedback_support: true
+    input_current_source_support: false
+    input_feedback_support: false
     input_feedback_age: false
     input_branch_embed: false
 
