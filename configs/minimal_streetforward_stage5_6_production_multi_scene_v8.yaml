@@ -400,6 +400,8 @@ nearby_error_feedback:
   reset_on_block_exit: true
   reset_on_episode_end: true
   save_in_checkpoint: false
+  memory:
+    render_checkpoint: true
 
   warmup:
     pred_error_only_steps: 7000

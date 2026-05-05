@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from models.streetforward.math_utils import get_viewmat
 from models.streetforward.metrics import compute_ssim_loss_masked
@@ -408,6 +409,8 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
         self.stage5_6_detach_render_context = bool(
             error_pred_cfg.get("detach_render_context", fsu_splat.get("detach_render_context", True))
         )
+        memory_cfg = nef.get("memory", {}) if hasattr(nef, "get") else {}
+        self.stage5_6_render_checkpoint = bool(memory_cfg.get("render_checkpoint", True))
         self.stage5_6_splat_eps = float(lift_cfg.get("eps", fsu_splat.get("eps", 1.0e-6)))
         self.stage5_6_use_render_rgb = bool(error_pred_cfg.get("use_render_rgb", fsu_head.get("use_render_rgb", True)))
         self.stage5_6_use_render_alpha = bool(error_pred_cfg.get("use_render_alpha", fsu_head.get("use_render_alpha", True)))
@@ -500,6 +503,162 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
     @staticmethod
     def _charbonnier(diff: torch.Tensor, eps: float = 1.0e-3) -> torch.Tensor:
         return torch.sqrt(diff * diff + eps * eps)
+
+    def _stage5_6_should_checkpoint_render(self, *tensors: torch.Tensor) -> bool:
+        if not bool(getattr(self, "stage5_6_render_checkpoint", True)):
+            return False
+        if not bool(getattr(self, "training", False)) or not torch.is_grad_enabled():
+            return False
+        return any(torch.is_tensor(t) and bool(t.requires_grad) for t in tensors)
+
+    def _stage5_6_render_rgb_alpha(
+        self,
+        *,
+        means: torch.Tensor,
+        quats: torch.Tensor,
+        scales: torch.Tensor,
+        opacities: torch.Tensor,
+        colors: torch.Tensor,
+        viewmats: torch.Tensor,
+        Ks: torch.Tensor,
+        width: int,
+        height: int,
+        sh_degree: Optional[int],
+        absgrad: bool,
+        channel_chunk: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        def _render(
+            means_t: torch.Tensor,
+            quats_t: torch.Tensor,
+            scales_t: torch.Tensor,
+            opacities_t: torch.Tensor,
+            colors_t: torch.Tensor,
+            viewmats_t: torch.Tensor,
+            Ks_t: torch.Tensor,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+            kwargs = {
+                "means": means_t,
+                "quats": quats_t,
+                "scales": scales_t,
+                "opacities": opacities_t,
+                "colors": colors_t,
+                "viewmats": viewmats_t,
+                "Ks": Ks_t,
+                "width": int(width),
+                "height": int(height),
+                "tile_size": 16,
+                "packed": False,
+                "near_plane": 0.01,
+                "far_plane": 1e10,
+                "render_mode": "RGB",
+                "sh_degree": sh_degree,
+                "sparse_grad": False,
+                "absgrad": bool(absgrad),
+                "rasterize_mode": "classic",
+            }
+            if channel_chunk is not None:
+                kwargs["channel_chunk"] = int(channel_chunk)
+            render, alpha, _ = self.renderer(**kwargs)
+            return render, alpha
+
+        args = (means, quats, scales, opacities, colors, viewmats, Ks)
+        if self._stage5_6_should_checkpoint_render(*args):
+            return checkpoint(_render, *args, use_reentrant=False)
+        return _render(*args)
+
+    def _render_single_view(
+        self,
+        render_params: Dict[str, torch.Tensor],
+        view: Any,
+        height: int,
+        width: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        means = render_params["means_r"]
+        dtype = means.dtype
+        dev = means.device
+        c2w = view.camtoworlds if hasattr(view, "camtoworlds") else view["camtoworlds"]
+        viewmat = get_viewmat(c2w.to(device=dev, dtype=dtype))
+        if hasattr(view, "Ks"):
+            k_mat = view.Ks[0:1]
+        elif hasattr(view, "K"):
+            k_mat = view.K
+        else:
+            k_mat = torch.eye(3, device=dev, dtype=dtype).unsqueeze(0)
+        if k_mat.dim() == 2:
+            k_mat = k_mat.unsqueeze(0)
+        k_mat = k_mat.to(device=dev, dtype=dtype)
+        render, alpha = self._stage5_6_render_rgb_alpha(
+            means=means,
+            quats=render_params["quats_r"],
+            scales=render_params["scales_r"],
+            opacities=render_params["opacities_r"],
+            colors=render_params["colors_r"],
+            viewmats=viewmat,
+            Ks=k_mat,
+            width=int(width),
+            height=int(height),
+            sh_degree=self.sh_degree,
+            absgrad=True,
+        )
+        rgb = render[:, ..., :3].squeeze(0)
+        acc = alpha.squeeze(0)
+        return rgb, acc
+
+    def _render_multi_view(
+        self,
+        render_params: Dict[str, torch.Tensor],
+        targets: List[Dict],
+    ) -> Optional[List[Tuple[torch.Tensor, torch.Tensor]]]:
+        if not targets:
+            return None
+        means = render_params["means_r"]
+        dtype = means.dtype
+        dev = means.device
+        viewmats_list: List[torch.Tensor] = []
+        Ks_list: List[torch.Tensor] = []
+        heights: List[int] = []
+        widths: List[int] = []
+        for target in targets:
+            view = target["view"]
+            gt_image = target["gt_image"]
+            if gt_image.dim() == 4:
+                gt_image = gt_image.squeeze(0)
+            h, w = int(gt_image.shape[0]), int(gt_image.shape[1])
+            heights.append(h)
+            widths.append(w)
+            c2w = view.camtoworlds if hasattr(view, "camtoworlds") else view["camtoworlds"]
+            viewmats_list.append(get_viewmat(c2w.to(device=dev, dtype=dtype)))
+            if hasattr(view, "Ks"):
+                k_mat = view.Ks[0:1]
+            elif hasattr(view, "K"):
+                k_mat = view.K
+            else:
+                k_mat = torch.eye(3, device=dev, dtype=dtype).unsqueeze(0)
+            if k_mat.dim() == 2:
+                k_mat = k_mat.unsqueeze(0)
+            Ks_list.append(k_mat.to(device=dev, dtype=dtype))
+        h0, w0 = heights[0], widths[0]
+        if any(h != h0 or w != w0 for h, w in zip(heights, widths)):
+            return None
+        viewmats = torch.cat(viewmats_list, dim=0)
+        Ks = torch.cat(Ks_list, dim=0)
+        render, alpha = self._stage5_6_render_rgb_alpha(
+            means=means,
+            quats=render_params["quats_r"],
+            scales=render_params["scales_r"],
+            opacities=render_params["opacities_r"],
+            colors=render_params["colors_r"],
+            viewmats=viewmats,
+            Ks=Ks,
+            width=int(w0),
+            height=int(h0),
+            sh_degree=self.sh_degree,
+            absgrad=True,
+        )
+        result: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        for c in range(int(viewmats.shape[0])):
+            result.append((render[c, ..., :3], alpha[c, ..., 0]))
+        return result
 
     def _debug_check_stage5_6_optimizer_contains_new_modules(self) -> None:
         opt = getattr(self, "optimizer", None)
@@ -1020,7 +1179,7 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
             quats = quats.detach()
             scales = scales.detach()
             opacities = opacities.detach()
-        render, alpha, _ = self.renderer(
+        render, alpha = self._stage5_6_render_rgb_alpha(
             means=means,
             quats=quats,
             scales=scales,
@@ -1030,15 +1189,8 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
             Ks=Ks,
             width=int(width),
             height=int(height),
-            tile_size=16,
-            packed=False,
-            near_plane=0.01,
-            far_plane=1e10,
-            render_mode="RGB",
             sh_degree=None,
-            sparse_grad=False,
             absgrad=False,
-            rasterize_mode="classic",
             channel_chunk=max(32, int(colors.shape[-1])),
         )
         feat = render

@@ -804,16 +804,21 @@ class MinimalStreetForwardStage4_2(MinimalStreetForwardStage4_1):
                     perf_metrics[f"perf_{k}"] = float(v / perf_calls)
         perf_metrics["perf_2d_call_count"] = perf_calls
 
+        def _detach_tensor_list(items):
+            if not isinstance(items, list):
+                return items.detach() if torch.is_tensor(items) else items
+            return [x.detach() if torch.is_tensor(x) else x for x in items]
+
         result = {
             "loss": out["loss"].item() if torch.is_tensor(out["loss"]) else out["loss"],
             "loss_l1": out["loss_l1"].item() if torch.is_tensor(out.get("loss_l1")) else float(out.get("loss_l1", 0.0)),
             "loss_ssim": out["loss_ssim"].item() if torch.is_tensor(out.get("loss_ssim")) else float(out.get("loss_ssim", 0.0)),
             "loss_mask": out["loss_mask"].item() if torch.is_tensor(out.get("loss_mask")) else float(out.get("loss_mask", 0.0)),
             "loss_opacity_entropy": out["loss_opacity_entropy"].item() if torch.is_tensor(out.get("loss_opacity_entropy")) else float(out.get("loss_opacity_entropy", 0.0)),
-            "pred_rgbs": out["pred_rgbs"],
-            "gt_images": out["gt_images"],
-            "pred_rgb": out["pred_rgb"],
-            "gt_image": out["gt_image"],
+            "pred_rgbs": _detach_tensor_list(out["pred_rgbs"]),
+            "gt_images": _detach_tensor_list(out["gt_images"]),
+            "pred_rgb": out["pred_rgb"].detach() if torch.is_tensor(out["pred_rgb"]) else out["pred_rgb"],
+            "gt_image": out["gt_image"].detach() if torch.is_tensor(out["gt_image"]) else out["gt_image"],
             "num_gaussians_bg": num_gaussians_bg,
             "num_gaussians_distant": num_gaussians_distant,
             "num_gaussians_rigid": num_gaussians_rigid,
