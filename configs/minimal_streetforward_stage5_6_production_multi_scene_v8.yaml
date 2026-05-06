@@ -414,7 +414,7 @@ nearby_error_feedback:
     enable: true
     target_role: near_random
     input_feature: post_gru_hidden
-    error_splat_dim: 48
+    error_splat_dim: 24
     detach_input_hidden: true
     detach_projected_feature: false
     node_mask_policy: renderable

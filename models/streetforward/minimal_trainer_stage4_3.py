@@ -626,6 +626,63 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
             return torch.ones(num_points, dtype=torch.bool, device=device)
         return torch.ones(num_points, dtype=torch.bool, device=device)
 
+    @staticmethod
+    def _ensure_c2w_4x4(c2w: torch.Tensor) -> torch.Tensor:
+        if c2w.dim() == 3 and int(c2w.shape[0]) == 1:
+            c2w = c2w[0]
+        if tuple(c2w.shape[-2:]) == (4, 4):
+            return c2w
+        if tuple(c2w.shape[-2:]) == (3, 4):
+            pad_shape = list(c2w.shape[:-2]) + [1, 4]
+            pad = torch.zeros(pad_shape, device=c2w.device, dtype=c2w.dtype)
+            pad[..., 0, 3] = 1.0
+            return torch.cat([c2w, pad], dim=-2)
+        raise ValueError(f"camtoworlds must be [...,4,4] or [...,3,4], got {tuple(c2w.shape)}")
+
+    def _sky_points_visible_in_target_sky_pixels(
+        self,
+        means_world: torch.Tensor,
+        target: Dict[str, Any],
+    ) -> torch.Tensor:
+        if means_world.dim() != 2 or int(means_world.shape[-1]) != 3:
+            raise ValueError(f"means_world must be [N,3], got {tuple(means_world.shape)}")
+        view = target["view"]
+        c2w = view.camtoworlds if hasattr(view, "camtoworlds") else view["camtoworlds"]
+        c2w = self._ensure_c2w_4x4(c2w.to(device=means_world.device, dtype=means_world.dtype))
+        viewmat = _get_viewmat(c2w)
+        if viewmat.dim() == 3:
+            viewmat = viewmat[0]
+        if hasattr(view, "Ks"):
+            k_mat = view.Ks
+        elif hasattr(view, "K"):
+            k_mat = view.K
+        else:
+            k_mat = torch.eye(3, device=means_world.device, dtype=means_world.dtype).unsqueeze(0)
+        if k_mat.dim() == 3:
+            k_mat = k_mat[0]
+        k_mat = k_mat.to(device=means_world.device, dtype=means_world.dtype)
+        sky_mask = target.get("sky_mask")
+        if sky_mask is None:
+            return torch.zeros(means_world.shape[0], dtype=torch.bool, device=means_world.device)
+        sm = sky_mask.to(device=means_world.device).float()
+        if sm.dim() == 3:
+            sm = sm.squeeze(-1)
+        height, width = int(sm.shape[0]), int(sm.shape[1])
+        ones = torch.ones(means_world.shape[0], 1, device=means_world.device, dtype=means_world.dtype)
+        pts_h = torch.cat([means_world, ones], dim=-1)
+        cam = (viewmat @ pts_h.T).T
+        z = cam[:, 2]
+        valid_z = z > 1e-8
+        z_safe = z.clamp_min(1e-8)
+        u = (k_mat[0, 0] * cam[:, 0] / z_safe + k_mat[0, 2]).long()
+        v = (k_mat[1, 1] * cam[:, 1] / z_safe + k_mat[1, 2]).long()
+        in_bounds = valid_z & (u >= 0) & (u < width) & (v >= 0) & (v < height)
+        hit = torch.zeros(means_world.shape[0], dtype=torch.bool, device=means_world.device)
+        if bool(in_bounds.any().item()):
+            idx = torch.nonzero(in_bounds, as_tuple=False).squeeze(1)
+            hit[idx] = sm[v[idx], u[idx]] > 0.5
+        return hit
+
     def _update_node_state_bg_subset(
         self,
         node_state_bg: NodeStateBackground,
