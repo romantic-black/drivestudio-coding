@@ -107,6 +107,100 @@ def _masked_metrics(
     }
 
 
+def _prepare_lpips_input(x_hwc_rgb: torch.Tensor) -> torch.Tensor:
+    if x_hwc_rgb.dim() != 3 or int(x_hwc_rgb.shape[-1]) != 3:
+        raise ValueError(f"expected HWC RGB tensor, got shape={tuple(x_hwc_rgb.shape)}")
+    # LPIPS expects NCHW in [-1, 1].
+    chw = x_hwc_rgb.permute(2, 0, 1).unsqueeze(0).clamp(0.0, 1.0)
+    return chw * 2.0 - 1.0
+
+
+def _masked_lpips(
+    *,
+    lpips_model: Any,
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    valid_mask: Optional[torch.Tensor],
+    min_valid_pixels: int,
+) -> Optional[float]:
+    if valid_mask is not None:
+        valid_count = int((valid_mask > 0.5).sum().item())
+        if valid_count < int(min_valid_pixels):
+            return None
+        mask3 = valid_mask.unsqueeze(-1)
+        # Keep non-valid region identical so LPIPS focuses on valid (non-sky) region.
+        pred_eval = pred * mask3 + gt * (1.0 - mask3)
+        gt_eval = gt
+    else:
+        pred_eval = pred
+        gt_eval = gt
+    pred_in = _prepare_lpips_input(pred_eval)
+    gt_in = _prepare_lpips_input(gt_eval)
+    with torch.no_grad():
+        val = lpips_model(pred_in, gt_in)
+    return float(val.reshape(-1).mean().item())
+
+
+def _ssim_map_torch(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+    if pred.shape != gt.shape:
+        raise ValueError(f"pred/gt shape mismatch for SSIM: pred={tuple(pred.shape)} gt={tuple(gt.shape)}")
+    if pred.dim() != 3 or int(pred.shape[-1]) != 3:
+        raise ValueError(f"expected HWC RGB tensors for SSIM, got shape={tuple(pred.shape)}")
+    h = int(pred.shape[0])
+    w = int(pred.shape[1])
+    window_size = int(min(11, h, w))
+    if window_size % 2 == 0:
+        window_size -= 1
+    if window_size < 3:
+        window_size = 3
+
+    x = pred.clamp(0.0, 1.0).permute(2, 0, 1).unsqueeze(0)
+    y = gt.clamp(0.0, 1.0).permute(2, 0, 1).unsqueeze(0)
+    coords = torch.arange(window_size, dtype=x.dtype, device=x.device) - float(window_size // 2)
+    kernel_1d = torch.exp(-(coords ** 2) / (2.0 * 1.5 ** 2))
+    kernel_1d = kernel_1d / kernel_1d.sum().clamp_min(1e-12)
+    kernel_2d = torch.outer(kernel_1d, kernel_1d)
+    kernel = kernel_2d.view(1, 1, window_size, window_size).expand(3, 1, window_size, window_size)
+    pad = int(window_size // 2)
+
+    mu_x = torch.nn.functional.conv2d(x, kernel, padding=pad, groups=3)
+    mu_y = torch.nn.functional.conv2d(y, kernel, padding=pad, groups=3)
+    mu_x2 = mu_x.pow(2)
+    mu_y2 = mu_y.pow(2)
+    mu_xy = mu_x * mu_y
+    sigma_x2 = torch.nn.functional.conv2d(x * x, kernel, padding=pad, groups=3) - mu_x2
+    sigma_y2 = torch.nn.functional.conv2d(y * y, kernel, padding=pad, groups=3) - mu_y2
+    sigma_xy = torch.nn.functional.conv2d(x * y, kernel, padding=pad, groups=3) - mu_xy
+
+    c1 = 0.01 ** 2
+    c2 = 0.03 ** 2
+    ssim_map = ((2.0 * mu_xy + c1) * (2.0 * sigma_xy + c2)) / (
+        (mu_x2 + mu_y2 + c1) * (sigma_x2 + sigma_y2 + c2) + 1e-12
+    )
+    return ssim_map.squeeze(0).permute(1, 2, 0)
+
+
+def _masked_ssim(
+    *,
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    valid_mask: Optional[torch.Tensor],
+    min_valid_pixels: int,
+) -> Optional[float]:
+    if valid_mask is not None:
+        valid = (valid_mask > 0.5).float()
+        valid_count = int(valid.sum().item())
+        if valid_count < int(min_valid_pixels):
+            return None
+        pred_eval = pred * valid.unsqueeze(-1) + gt * (1.0 - valid.unsqueeze(-1))
+        ssim_map = _ssim_map_torch(pred_eval, gt)
+        denom = valid.sum() * float(ssim_map.shape[-1]) + 1e-8
+        return float((ssim_map * valid.unsqueeze(-1)).sum().div(denom).item())
+
+    ssim_map = _ssim_map_torch(pred, gt)
+    return float(ssim_map.mean().item())
+
+
 class MetricAccumulator:
     def __init__(
         self,
@@ -126,10 +220,16 @@ class MetricAccumulator:
         self.compute_l1 = bool(compute_l1)
         self.compute_ssim = bool(compute_ssim)
         self.compute_lpips = bool(compute_lpips)
-        if self.compute_ssim or self.compute_lpips:
-            raise NotImplementedError(
-                "compute_ssim/compute_lpips are configured but not implemented in MetricAccumulator."
-            )
+        self._lpips_model: Any = None
+        if self.compute_lpips:
+            try:
+                import lpips  # type: ignore
+            except Exception as e:
+                raise ImportError(
+                    "compute_lpips=true requires the `lpips` package. Install with `pip install lpips`."
+                ) from e
+            # AlexNet backend is the common LPIPS default for evaluation.
+            self._lpips_model = lpips.LPIPS(net="alex").eval()
         self.iter_rows: List[Dict[str, Any]] = []
         self.episode_rows: Dict[str, List[Dict[str, Any]]] = {}
         self._warned_missing_egocar_for_cam: set[int] = set()
@@ -184,9 +284,20 @@ class MetricAccumulator:
             primary_mask=str(self.protocol.metric_primary_mask),
             min_valid_pixels=int(self.min_valid_pixels),
         )
+        valid_primary = torch.ones(
+            (int(pred_t.shape[0]), int(pred_t.shape[1])), dtype=torch.float32, device=pred_t.device
+        )
+        if "non_sky" in str(self.protocol.metric_primary_mask):
+            if sky_t is None:
+                raise ValueError("primary_mask requires non_sky but sky_mask is missing")
+            valid_primary = valid_primary * (1.0 - (sky_t > 0.5).float())
+        if "non_ego" in str(self.protocol.metric_primary_mask) and ego_t is not None:
+            valid_primary = valid_primary * (1.0 - (ego_t > 0.5).float())
         # Image filenames and visual inspection use this stable non-sky PSNR,
         # independent of the primary CSV mask setting.
         psnr_non_sky = float("nan")
+        ssim_non_sky = float("nan")
+        lpips_non_sky = float("nan")
         if sky_t is not None:
             vals_non_sky = _masked_metrics(
                 pred=pred_t,
@@ -198,6 +309,67 @@ class MetricAccumulator:
             )
             if vals_non_sky["psnr"] is not None:
                 psnr_non_sky = float(vals_non_sky["psnr"])
+            if self.compute_ssim:
+                ssim_non_sky_val = _masked_ssim(
+                    pred=pred_t,
+                    gt=gt_t,
+                    valid_mask=(1.0 - (sky_t > 0.5).float()),
+                    min_valid_pixels=int(self.min_valid_pixels),
+                )
+                if ssim_non_sky_val is not None:
+                    ssim_non_sky = float(ssim_non_sky_val)
+            if self.compute_lpips:
+                assert self._lpips_model is not None
+                lpips_non_sky_val = _masked_lpips(
+                    lpips_model=self._lpips_model.to(pred_t.device),
+                    pred=pred_t,
+                    gt=gt_t,
+                    valid_mask=(1.0 - (sky_t > 0.5).float()),
+                    min_valid_pixels=int(self.min_valid_pixels),
+                )
+                if lpips_non_sky_val is not None:
+                    lpips_non_sky = float(lpips_non_sky_val)
+        ssim_primary = float("nan")
+        ssim_full = float("nan")
+        if self.compute_ssim:
+            ssim_primary_val = _masked_ssim(
+                pred=pred_t,
+                gt=gt_t,
+                valid_mask=valid_primary,
+                min_valid_pixels=int(self.min_valid_pixels),
+            )
+            if ssim_primary_val is not None:
+                ssim_primary = float(ssim_primary_val)
+            ssim_full = float(
+                _masked_ssim(
+                    pred=pred_t,
+                    gt=gt_t,
+                    valid_mask=None,
+                    min_valid_pixels=int(self.min_valid_pixels),
+                )
+            )
+        lpips_primary = float("nan")
+        lpips_full = float("nan")
+        if self.compute_lpips:
+            assert self._lpips_model is not None
+            lpips_primary_val = _masked_lpips(
+                lpips_model=self._lpips_model.to(pred_t.device),
+                pred=pred_t,
+                gt=gt_t,
+                valid_mask=valid_primary,
+                min_valid_pixels=int(self.min_valid_pixels),
+            )
+            if lpips_primary_val is not None:
+                lpips_primary = float(lpips_primary_val)
+            lpips_full = float(
+                _masked_lpips(
+                    lpips_model=self._lpips_model.to(pred_t.device),
+                    pred=pred_t,
+                    gt=gt_t,
+                    valid_mask=None,
+                    min_valid_pixels=int(self.min_valid_pixels),
+                )
+            )
         row = {
             "exp_name": str(spec.exp_name),
             "episode_uid": str(spec.episode_uid),
@@ -219,6 +391,8 @@ class MetricAccumulator:
             "psnr": _safe_float(vals["psnr"]) if self.compute_psnr else float("nan"),
             "psnr_non_sky": float(psnr_non_sky),
             "l1": _safe_float(vals["l1"]) if self.compute_l1 else float("nan"),
+            "ssim_non_sky": float(ssim_non_sky),
+            "lpips_non_sky": float(lpips_non_sky),
             "psnr_full": (
                 _safe_float(vals["psnr_full"])
                 if (self.compute_psnr and bool(self.protocol.report_full_image))
@@ -229,10 +403,18 @@ class MetricAccumulator:
                 if (self.compute_l1 and bool(self.protocol.report_full_image))
                 else float("nan")
             ),
-            "ssim": float("nan"),
-            "lpips": float("nan"),
-            "ssim_full": float("nan"),
-            "lpips_full": float("nan"),
+            "ssim": float(ssim_primary),
+            "lpips": float(lpips_primary),
+            "ssim_full": (
+                float(ssim_full)
+                if (self.compute_ssim and bool(self.protocol.report_full_image))
+                else float("nan")
+            ),
+            "lpips_full": (
+                float(lpips_full)
+                if (self.compute_lpips and bool(self.protocol.report_full_image))
+                else float("nan")
+            ),
             "valid_pixels": int(vals["valid_pixels"]),
         }
         return row

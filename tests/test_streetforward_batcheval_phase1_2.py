@@ -600,3 +600,67 @@ def test_metrics_non_ego_mask_missing_does_not_crash(tmp_path: Path) -> None:
     assert len(rows) == 1
     assert float(rows[0]["psnr"]) > 30.0
     assert float(rows[0]["psnr_non_sky"]) > 30.0
+
+
+def test_metrics_compute_ssim(tmp_path: Path) -> None:
+    protocol = TestProtocolSpec(
+        name="exp1_single_frame",
+        data_mode="segment_finetune_train",
+        sequence_length=1,
+        input_offsets=[0],
+        eval_offsets=[0],
+        camera_ids=[0],
+        camera_names=["front"],
+        steps_per_input=1,
+        save_pre_update=False,
+        save_each_iter_views=False,
+        metric_primary_mask="non_sky",
+        report_full_image=True,
+    )
+    spec = TestEpisodeSpec(
+        exp_name="exp1_single_frame",
+        scene_id=1,
+        segment_id=2,
+        episode_idx=0,
+        sequence_start_pos=0,
+        frame_offsets=[0],
+        frame_ids=[100],
+        input_offsets=[0],
+        eval_offsets=[0],
+        input_frame_ids=[100],
+        eval_frame_ids=[100],
+        camera_ids=[0],
+        camera_names=["front"],
+        input_image_refs=[(100, 0)],
+        eval_image_refs=[(100, 0)],
+        episode_uid="scene001_seg002_start000000",
+    )
+    metric_acc = MetricAccumulator(
+        output_dir=tmp_path / "metrics",
+        protocol=protocol,
+        min_valid_pixels=1,
+        compute_ssim=True,
+        compute_lpips=False,
+    )
+    img = torch.rand((8, 8, 3), dtype=torch.float32)
+    rows = metric_acc.add_iteration_rows(
+        spec=spec,
+        global_iter=1,
+        is_pre_update=False,
+        input_index=0,
+        input_frame_id=100,
+        local_step=1,
+        render_rows=[
+            {
+                "frame_idx": 100,
+                "cam_idx": 0,
+                "pred_rgb": img,
+                "gt_image": img.clone(),
+                "sky_mask": torch.zeros((8, 8), dtype=torch.float32),
+            }
+        ],
+    )
+    assert len(rows) == 1
+    assert float(rows[0]["ssim"]) > 0.99
+    assert float(rows[0]["ssim_full"]) > 0.99
+    assert float(rows[0]["ssim_non_sky"]) > 0.99
