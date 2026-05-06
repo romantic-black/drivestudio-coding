@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import logging
 from pathlib import Path
 from typing import Any, Dict, List
@@ -26,7 +27,7 @@ from streetforward_eval.protocols import protocol_from_dict, validate_protocol
 from streetforward_eval.runner import RunnerRuntimeConfig, StreetForwardBatchEvalRunner
 from streetforward_eval.snapshot_writer import RenderSaveConfig, SnapshotWriter
 from streetforward_eval.summary import build_summary_rows, write_summary_csv
-from tools.train_minimal_streetforward_stage4_3_v8_common import build_multi_scene_dataset_v4
+from tools.train_minimal_streetforward_stage4_3_v8_common import build_multi_scene_dataset_v4_for_demo
 
 logger = logging.getLogger("streetforward_batcheval")
 
@@ -126,6 +127,43 @@ def _load_checkpoint(model: Any, ckpt_path: str, strict: bool) -> None:
     model.eval()
 
 
+def _snapshot_train_checkpoint_bytes(model: Any) -> bytes:
+    payload: Dict[str, Any] = {
+        "model_state_dict": model.state_dict(),
+    }
+    if hasattr(model, "optimizer") and getattr(model, "optimizer", None) is not None:
+        payload["optimizer_state_dict"] = model.optimizer.state_dict()
+    if hasattr(model, "build_light_checkpoint_extra"):
+        try:
+            step = int(getattr(getattr(model, "optimizer", None), "global_step", 0))
+            payload.update(model.build_light_checkpoint_extra(step=step))
+        except Exception as e:
+            logger.warning("skip build_light_checkpoint_extra while snapshotting eval checkpoint: %s", e)
+    buf = io.BytesIO()
+    torch.save(payload, buf)
+    return buf.getvalue()
+
+
+def _restore_train_checkpoint_bytes(model: Any, ckpt_bytes: bytes, device: torch.device) -> None:
+    payload = torch.load(io.BytesIO(ckpt_bytes), map_location=device)
+    model.load_state_dict(payload["model_state_dict"], strict=True)
+    if (
+        "optimizer_state_dict" in payload
+        and hasattr(model, "optimizer")
+        and getattr(model, "optimizer", None) is not None
+    ):
+        if hasattr(model, "load_optimizer_state_from_checkpoint"):
+            loaded = bool(model.load_optimizer_state_from_checkpoint(payload))
+            if not loaded:
+                logger.warning(
+                    "optimizer restore via load_optimizer_state_from_checkpoint returned false; "
+                    "fallback to raw optimizer_state_dict."
+                )
+                model.optimizer.load_state_dict(payload["optimizer_state_dict"])
+        else:
+            model.optimizer.load_state_dict(payload["optimizer_state_dict"])
+
+
 def _resolve_experiments(batch_eval_cfg: Any, args: argparse.Namespace) -> List[Dict[str, Any]]:
     exps_any = batch_eval_cfg.get("experiments")
     exps_list = _as_list(exps_any, "batch_eval.experiments")
@@ -151,6 +189,23 @@ def _collect_episode_scene_ids(cfg: Any) -> List[int]:
     return [int(x) for x in scene_ids]
 
 
+def _scope_dataset_to_batch_eval_scene_ids(cfg: Any) -> None:
+    scene_ids = _collect_episode_scene_ids(cfg)
+    data_mode = str(cfg.batch_eval.get("data_mode", "segment_finetune_train")).strip()
+    if data_mode != "segment_finetune_train":
+        raise ValueError(
+            f"unsupported batch_eval.data_mode={data_mode!r}; "
+            "MultiSceneDatasetV4 batch eval currently uses segment_finetune_train assets."
+        )
+    if cfg.get("data") is None:
+        raise ValueError("config.data is required")
+    cfg.data.train_scene_ids = list(scene_ids)
+    logger.info(
+        "scoped dataset data.train_scene_ids to batch_eval.dataset.scene_ids: %s",
+        scene_ids,
+    )
+
+
 def _resolve_output_root(cfg: Any, args: argparse.Namespace) -> Path:
     if args.output_dir:
         return Path(str(args.output_dir))
@@ -169,6 +224,8 @@ def _run_one_experiment(
     output_root: Path,
     device: torch.device,
     max_total_episodes_override: int | None,
+    base_ckpt_bytes: bytes | None,
+    restore_checkpoint_on_segment: bool,
 ) -> None:
     global_cfg = _as_mapping(_to_plain(cfg.batch_eval), "batch_eval")
     protocol = protocol_from_dict(exp_cfg=exp_cfg, global_cfg=global_cfg)
@@ -228,10 +285,27 @@ def _run_one_experiment(
     )
     runtime = _as_mapping(_to_plain(cfg.batch_eval.get("runtime", {})) or {}, "batch_eval.runtime")
     history = _as_mapping(_to_plain(cfg.batch_eval.get("history", {})) or {}, "batch_eval.history")
-    if bool(history.get("record_each_step", False)):
-        raise NotImplementedError(
-            "batch_eval.history.record_each_step=true is not supported; use input-exit history record."
-        )
+    align_with_scheduler_v8 = bool(runtime.get("align_with_scheduler_v8", False))
+    default_block_order = str(runtime.get("block_order", "block_major"))
+    default_step_major_switch = int(runtime.get("step_major_switch_interval_steps", 1))
+    default_reset_policy = str(runtime.get("reset_policy", "episode_end"))
+    default_target_policy = str(runtime.get("target_frame_policy", "all_observed"))
+    default_max_targets = runtime.get("max_target_frames_including_source")
+    if align_with_scheduler_v8:
+        sv8 = cfg.get("scheduler_v8")
+        if sv8 is None:
+            raise ValueError("batch_eval.runtime.align_with_scheduler_v8=true requires config.scheduler_v8.")
+        sv8_exec = sv8.get("execution") if hasattr(sv8, "get") else None
+        sv8_episode = sv8.get("episode") if hasattr(sv8, "get") else None
+        if sv8_exec is not None:
+            default_block_order = str(sv8_exec.get("block_order", default_block_order))
+            default_step_major_switch = int(
+                sv8_exec.get("step_major_switch_interval_steps", default_step_major_switch)
+            )
+            default_reset_policy = str(sv8_exec.get("reset_policy", default_reset_policy))
+        default_target_policy = "visited_episode_frames"
+        if sv8_episode is not None and sv8_episode.get("total_target_frames") is not None:
+            default_max_targets = int(sv8_episode.get("total_target_frames"))
     runtime_cfg = RunnerRuntimeConfig(
         no_grad=bool(runtime.get("no_grad", True)),
         amp=bool(runtime.get("amp", True)),
@@ -241,6 +315,14 @@ def _run_one_experiment(
         update_view_transient=bool(runtime.get("update_view_transient", True)),
         update_step_norm_ema=bool(history.get("update_step_norm_ema", True)),
         history_record_on_input_exit=bool(history.get("record_support_residual_on_input_exit", True)),
+        history_record_each_step=bool(history.get("record_each_step", False)),
+        block_order=str(default_block_order),
+        step_major_switch_interval_steps=int(default_step_major_switch),
+        reset_policy=str(default_reset_policy),
+        target_frame_policy=str(default_target_policy),
+        max_target_frames_including_source=(
+            None if default_max_targets is None else int(default_max_targets)
+        ),
     )
     runner = StreetForwardBatchEvalRunner(
         model=model,
@@ -252,8 +334,26 @@ def _run_one_experiment(
         runtime_cfg=runtime_cfg,
     )
 
+    if bool(restore_checkpoint_on_segment):
+        if base_ckpt_bytes is None:
+            raise ValueError("restore_checkpoint_on_segment=true but no base checkpoint snapshot is available.")
+        _restore_train_checkpoint_bytes(model, base_ckpt_bytes, device)
+        logger.info("[batcheval] restored base checkpoint before experiment=%s", protocol.name)
+
     logger.info("experiment=%s episodes=%d", protocol.name, len(episode_specs))
+    prev_seg_key: tuple[int, int] | None = None
     for i, spec in enumerate(episode_specs):
+        seg_key = (int(spec.scene_id), int(spec.segment_id))
+        if bool(restore_checkpoint_on_segment) and prev_seg_key is not None and seg_key != prev_seg_key:
+            if base_ckpt_bytes is None:
+                raise ValueError("restore_checkpoint_on_segment=true but no base checkpoint snapshot is available.")
+            _restore_train_checkpoint_bytes(model, base_ckpt_bytes, device)
+            logger.info(
+                "[batcheval] restored base checkpoint at segment boundary %s->%s",
+                prev_seg_key,
+                seg_key,
+            )
+        prev_seg_key = seg_key
         _ = runner.run_episode(spec)
         logger.info(
             "[batcheval] exp=%s episode=%d/%d uid=%s",
@@ -271,6 +371,18 @@ def _run_one_experiment(
         final_iter = max(int(r["global_iter"]) for r in rows)
         final_rows.extend([r for r in rows if int(r["global_iter"]) == int(final_iter)])
     write_summary_csv(exp_dir / "summary.csv", build_summary_rows(final_rows))
+    logger.info(
+        "experiment=%s wrote outputs to %s (png=%s metrics_iter=%s summary=%s final_views=%d)",
+        protocol.name,
+        exp_dir,
+        exp_dir / "image",
+        exp_dir / "metrics_iter.csv",
+        exp_dir / "summary.csv",
+        int(len(final_rows)),
+    )
+    if bool(restore_checkpoint_on_segment) and base_ckpt_bytes is not None:
+        _restore_train_checkpoint_bytes(model, base_ckpt_bytes, device)
+        logger.info("[batcheval] restored base checkpoint after experiment=%s", protocol.name)
 
 
 def main() -> None:
@@ -291,7 +403,8 @@ def main() -> None:
         raise ValueError("batch_eval.enable must be true")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dataset = build_multi_scene_dataset_v4(cfg, device)
+    _scope_dataset_to_batch_eval_scene_ids(cfg)
+    dataset = build_multi_scene_dataset_v4_for_demo(cfg, device)
     dataset.initialize()
 
     model = _build_model(cfg, device)
@@ -306,6 +419,21 @@ def main() -> None:
         ckpt_path=ckpt_path,
         strict=bool(cfg.batch_eval.checkpoint.get("strict", True)),
     )
+    runtime_cfg_any = cfg.batch_eval.get("runtime", {})
+    runtime_cfg = _as_mapping(_to_plain(runtime_cfg_any), "batch_eval.runtime")
+    restore_checkpoint_on_segment = bool(
+        runtime_cfg.get(
+            "restore_checkpoint_on_segment",
+            runtime_cfg.get("reset_ckpt_per_segment", not bool(runtime_cfg.get("no_grad", True))),
+        )
+    )
+    base_ckpt_bytes: bytes | None = None
+    if restore_checkpoint_on_segment:
+        base_ckpt_bytes = _snapshot_train_checkpoint_bytes(model)
+        logger.info(
+            "[batcheval] base checkpoint snapshot captured for segment-wise restore (bytes=%d)",
+            len(base_ckpt_bytes),
+        )
 
     output_root = _resolve_output_root(cfg, args)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -319,6 +447,8 @@ def main() -> None:
             output_root=output_root,
             device=device,
             max_total_episodes_override=args.max_total_episodes,
+            base_ckpt_bytes=base_ckpt_bytes,
+            restore_checkpoint_on_segment=bool(restore_checkpoint_on_segment),
         )
 
 

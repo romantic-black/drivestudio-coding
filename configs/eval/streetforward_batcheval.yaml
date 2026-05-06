@@ -20,12 +20,13 @@ batch_eval:
 
   cameras:
     ids: [0, 1, 2]
-    names: ["front_left", "front", "front_right"]
+    names: ["front", "front_left", "front_right"]
 
   runtime:
     no_grad: true
     amp: true
     reset_state_per_episode: true
+    align_with_scheduler_v8: true
     update_node_state: true
     update_hidden_state: true
     update_view_transient: true
@@ -47,8 +48,8 @@ batch_eval:
     primary_mask: non_sky_non_ego
     report_full_image: true
     compute_psnr: true
-    compute_ssim: true
-    compute_lpips: true
+    compute_ssim: false
+    compute_lpips: false
     compute_l1: true
     min_valid_pixels: 32
 

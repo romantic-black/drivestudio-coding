@@ -92,8 +92,11 @@ def test_update_targets_reject_unobserved_frames() -> None:
 class _FakeModel:
     def __init__(self) -> None:
         self.update_calls = 0
+        self.train_calls = 0
         self.render_calls = 0
         self.history_calls = 0
+        self.reset_node_state_calls = 0
+        self.last_train_sync: Dict[str, Any] | None = None
         self.last_render_refs: List[Tuple[int, int]] = []
 
     def reset_for_segment_eval(self, batch: Dict[str, Any]) -> None:
@@ -124,6 +127,19 @@ class _FakeModel:
         self.update_calls += 1
         return {"loss": 0.0, "num_targets": 1, "num_source_views": 3}
 
+    def train_step(
+        self,
+        batch: Dict[str, Any],
+        step: int | None = None,
+        profile_phase_timing: bool = False,
+        sync_cuda_timing: bool = False,
+        scheduler_node_sync: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        _ = (batch, step, profile_phase_timing, sync_cuda_timing)
+        self.train_calls += 1
+        self.last_train_sync = dict(scheduler_node_sync or {})
+        return {"loss": torch.tensor(0.0)}
+
     def eval_sparse_render_frames(
         self,
         *,
@@ -146,6 +162,7 @@ class _FakeModel:
                     "cam_idx": int(cam),
                     "pred_rgb": img,
                     "gt_image": img.clone(),
+                    "sky_mask": torch.zeros((4, 4), dtype=torch.float32),
                 }
             )
         return {"rows": rows}
@@ -153,6 +170,9 @@ class _FakeModel:
     def eval_sparse_record_history(self, batch: Dict[str, Any]) -> None:
         _ = batch
         self.history_calls += 1
+
+    def reset_node_state(self) -> None:
+        self.reset_node_state_calls += 1
 
 
 def test_runner_iter_count(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -373,6 +393,150 @@ def test_runner_renders_final_even_when_each_iter_disabled(monkeypatch: pytest.M
     assert out["final_iter"] == 3
 
 
+def test_runner_step_major_order_and_visited_targets(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from streetforward_eval import runner as runner_mod
+
+    captured_sources: List[List[Tuple[int, int]]] = []
+    captured_targets: List[List[Tuple[int, int]]] = []
+
+    def _fake_build_update_batch_from_refs(**kwargs: Any) -> Dict[str, Any]:
+        captured_sources.append(list(kwargs["source_image_refs"]))
+        captured_targets.append(list(kwargs["update_target_image_refs"]))
+        return {"dummy": True}
+
+    monkeypatch.setattr(runner_mod, "build_update_batch_from_refs", _fake_build_update_batch_from_refs)
+    protocol = TestProtocolSpec(
+        name="exp_step_major",
+        data_mode="segment_finetune_train",
+        sequence_length=3,
+        input_offsets=[0, 1, 2],
+        eval_offsets=[0, 1, 2],
+        camera_ids=[0],
+        camera_names=["front"],
+        steps_per_input=2,
+        save_pre_update=False,
+        save_each_iter_views=False,
+        metric_primary_mask="full_image",
+        report_full_image=True,
+    )
+    spec = TestEpisodeSpec(
+        exp_name="exp_step_major",
+        scene_id=1,
+        segment_id=2,
+        episode_idx=0,
+        sequence_start_pos=0,
+        frame_offsets=[0, 1, 2],
+        frame_ids=[100, 105, 110],
+        input_offsets=[0, 1, 2],
+        eval_offsets=[0, 1, 2],
+        input_frame_ids=[100, 105, 110],
+        eval_frame_ids=[100, 105, 110],
+        camera_ids=[0],
+        camera_names=["front"],
+        input_image_refs=[(100, 0), (105, 0), (110, 0)],
+        eval_image_refs=[(100, 0), (105, 0), (110, 0)],
+        episode_uid="scene001_seg002_start000000",
+    )
+    model = _FakeModel()
+    runner = StreetForwardBatchEvalRunner(
+        model=model,
+        dataset=object(),
+        protocol=protocol,
+        writer=SnapshotWriter(output_dir=tmp_path / "snapshots"),
+        metric_acc=MetricAccumulator(
+            output_dir=tmp_path / "metrics",
+            protocol=protocol,
+            min_valid_pixels=1,
+            compute_ssim=False,
+            compute_lpips=False,
+        ),
+        device=torch.device("cpu"),
+        runtime_cfg=RunnerRuntimeConfig(
+            reset_state_per_episode=False,
+            history_record_on_input_exit=False,
+            block_order="step_major",
+            step_major_switch_interval_steps=1,
+            target_frame_policy="visited_episode_frames",
+            max_target_frames_including_source=2,
+        ),
+    )
+    runner.run_episode(spec)
+    assert [refs[0][0] for refs in captured_sources] == [100, 105, 110, 100, 105, 110]
+    assert [[ref[0] for ref in refs] for refs in captured_targets[:4]] == [
+        [100],
+        [105, 100],
+        [110, 105],
+        [100, 105],
+    ]
+    assert model.update_calls == 6
+
+
+def test_runner_no_grad_false_uses_train_step(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from streetforward_eval import runner as runner_mod
+
+    def _fake_build_update_batch_from_refs(**kwargs: Any) -> Dict[str, Any]:
+        _ = kwargs
+        return {"dummy": True}
+
+    monkeypatch.setattr(runner_mod, "build_update_batch_from_refs", _fake_build_update_batch_from_refs)
+    protocol = TestProtocolSpec(
+        name="exp_train_eval",
+        data_mode="segment_finetune_train",
+        sequence_length=1,
+        input_offsets=[0],
+        eval_offsets=[0],
+        camera_ids=[0],
+        camera_names=["front"],
+        steps_per_input=1,
+        save_pre_update=False,
+        save_each_iter_views=False,
+        metric_primary_mask="full_image",
+        report_full_image=True,
+    )
+    spec = TestEpisodeSpec(
+        exp_name="exp_train_eval",
+        scene_id=1,
+        segment_id=2,
+        episode_idx=0,
+        sequence_start_pos=0,
+        frame_offsets=[0],
+        frame_ids=[100],
+        input_offsets=[0],
+        eval_offsets=[0],
+        input_frame_ids=[100],
+        eval_frame_ids=[100],
+        camera_ids=[0],
+        camera_names=["front"],
+        input_image_refs=[(100, 0)],
+        eval_image_refs=[(100, 0)],
+        episode_uid="scene001_seg002_start000000",
+    )
+    model = _FakeModel()
+    runner = StreetForwardBatchEvalRunner(
+        model=model,
+        dataset=object(),
+        protocol=protocol,
+        writer=SnapshotWriter(output_dir=tmp_path / "snapshots"),
+        metric_acc=MetricAccumulator(
+            output_dir=tmp_path / "metrics",
+            protocol=protocol,
+            min_valid_pixels=1,
+            compute_ssim=False,
+            compute_lpips=False,
+        ),
+        device=torch.device("cpu"),
+        runtime_cfg=RunnerRuntimeConfig(
+            no_grad=False,
+            reset_state_per_episode=False,
+            history_record_on_input_exit=False,
+        ),
+    )
+    runner.run_episode(spec)
+    assert model.update_calls == 0
+    assert model.train_calls == 1
+    assert model.last_train_sync == {"U": 1, "segment_local_step": 1, "reset_after_block": False}
+
+
 def test_metrics_non_ego_mask_missing_does_not_crash(tmp_path: Path) -> None:
     protocol = TestProtocolSpec(
         name="exp1_single_frame",
@@ -435,3 +599,4 @@ def test_metrics_non_ego_mask_missing_does_not_crash(tmp_path: Path) -> None:
     )
     assert len(rows) == 1
     assert float(rows[0]["psnr"]) > 30.0
+    assert float(rows[0]["psnr_non_sky"]) > 30.0

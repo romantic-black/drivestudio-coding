@@ -184,6 +184,20 @@ class MetricAccumulator:
             primary_mask=str(self.protocol.metric_primary_mask),
             min_valid_pixels=int(self.min_valid_pixels),
         )
+        # Image filenames and visual inspection use this stable non-sky PSNR,
+        # independent of the primary CSV mask setting.
+        psnr_non_sky = float("nan")
+        if sky_t is not None:
+            vals_non_sky = _masked_metrics(
+                pred=pred_t,
+                gt=gt_t,
+                sky_mask=sky_t,
+                egocar_mask=None,
+                primary_mask="non_sky",
+                min_valid_pixels=int(self.min_valid_pixels),
+            )
+            if vals_non_sky["psnr"] is not None:
+                psnr_non_sky = float(vals_non_sky["psnr"])
         row = {
             "exp_name": str(spec.exp_name),
             "episode_uid": str(spec.episode_uid),
@@ -203,6 +217,7 @@ class MetricAccumulator:
             "is_input_frame": bool(int(eval_offset) in set(int(x) for x in spec.input_offsets)),
             "input_count": int(len(spec.input_frame_ids)),
             "psnr": _safe_float(vals["psnr"]) if self.compute_psnr else float("nan"),
+            "psnr_non_sky": float(psnr_non_sky),
             "l1": _safe_float(vals["l1"]) if self.compute_l1 else float("nan"),
             "psnr_full": (
                 _safe_float(vals["psnr_full"])
