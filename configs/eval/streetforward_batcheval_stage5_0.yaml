@@ -10,7 +10,7 @@ batch_eval:
     strict: true
 
   dataset:
-    scene_ids: [10, 140, 194, 142, 114, 121]
+    scene_ids: [10]
     segment_policy: all
     require_full_window: true
     stride: 30
@@ -23,8 +23,8 @@ batch_eval:
     names: ["front", "front_left", "front_right"]
 
   runtime:
-    mode: inference_only
-    no_grad: true
+    mode: segment_finetune_train
+    no_grad: false
     amp: false
     reset_state_per_episode: true
     align_with_scheduler_v8: false
@@ -38,7 +38,7 @@ batch_eval:
     max_target_frames_including_source: 3
 
   sky_eval:
-    enable: true
+    enable: false
     config_file: configs/skybranch_stage5_4_exp002.yaml
     checkpoint: "/root/autodl-tmp/outputs/skybranch_stage5_4_exp002/checkpoints/skybranch_resume_step_100000.pth"
     strict: true
