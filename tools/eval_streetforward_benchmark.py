@@ -578,6 +578,7 @@ def _run_one_experiment(
                 None if ds_cfg.get("max_episodes_per_scene") is None else int(ds_cfg.get("max_episodes_per_scene"))
             ),
             max_total_episodes=max_total_episodes,
+            start_at=(_to_plain(ds_cfg.get("start_at")) if ds_cfg.get("start_at") is not None else None),
         )
     if len(episode_specs) == 0:
         raise ValueError(f"experiment={protocol.name} produced no episode specs")

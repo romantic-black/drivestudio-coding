@@ -1,17 +1,26 @@
-base_config_file: /root/autodl-tmp/outputs/minimal_sf_stage5_6_multi_scene_v8_adamw_warmcos/experiment002_60w_40w_block16/config.yaml
+base_config_file: /root/autodl-tmp/outputs/minimal_sf_stage5_4_multi_scene_v8_adamw_warmcos/experiment002_60w_40w_12block_base_on_001/config.yaml
 
-output_name: stage5_6_demo_viewer
+output_name: stage5_4_demo_viewer
 
 model:
-  stage: "5_6"
+  stage: "5_4"
   production_training: true
+  backprojector_version: "v4"
+  use_fused_cuda_backproject_v4: true
+
+data:
+  train_scene_ids: [10]
+  eval_scene_ids: []
+  preload:
+    enable: false
 
 batch_eval:
   checkpoint:
-    path: "/root/autodl-tmp/outputs/minimal_sf_stage5_6_multi_scene_v8_adamw_warmcos/experiment002_60w_40w_block16/checkpoints/minimal_sf_stage5_6_multi_scene_v8_step250000.pt"
+    path: "/root/autodl-tmp/outputs/minimal_sf_stage5_4_multi_scene_v8_adamw_warmcos/experiment002_60w_40w_12block_base_on_001/checkpoints/minimal_sf_stage5_4_multi_scene_v8_step50000.pt"
     strict: true
   dataset:
-    scene_ids: [10, 140, 194, 196, 142, 114, 121]
+    scene_ids: [10]
+    segment_policy: all
     require_full_window: true
     stride: 30
     window_policy: sliding
@@ -23,17 +32,13 @@ batch_eval:
     names: ["front", "front_left", "front_right"]
   runtime:
     mode: segment_finetune_train
+    no_grad: false
     amp: false
     reset_state_per_episode: true
     align_with_scheduler_v8: true
     update_node_state: true
     update_hidden_state: true
     update_view_transient: true
-  stage5_6_eval:
-    enable_nearby_feedback: true
-    nearby_policy: adjacent_non_input
-    nearby_role_name: near_random
-    allow_partial_nearby: true
   sky_eval:
     enable: false
     compose_for_metrics: false
@@ -41,7 +46,6 @@ batch_eval:
     enable: true
     lr: 2.0e-5
     weight_decay: 1.0e-5
-    train_feedback_fuser: false
     freeze_error_predictor: true
     freeze_sky_branch: true
     freeze_dino: true
@@ -52,7 +56,7 @@ batch_eval:
 
 logging:
   output_root: /root/autodl-tmp/outputs
-  project: minimal_sf_stage5_6_demo_viewer
+  project: minimal_sf_stage5_4_demo_viewer
   log_dir: null
   use_tensorboard: false
 
@@ -60,16 +64,16 @@ demo:
   mode: segment_finetune_train
   reset_train_params_on_scope_change: true
   checkpoint:
-    path: "/root/autodl-tmp/outputs/minimal_sf_stage5_6_multi_scene_v8_adamw_warmcos/experiment002_60w_40w_block16/checkpoints/minimal_sf_stage5_6_multi_scene_v8_step250000.pt"
+    path: "/root/autodl-tmp/outputs/minimal_sf_stage5_4_multi_scene_v8_adamw_warmcos/experiment002_60w_40w_12block_base_on_001/checkpoints/minimal_sf_stage5_4_multi_scene_v8_step50000.pt"
     strict: true
     load_mode: full_state
   scheduler:
-    type: train_v8_stage5_6
-    name: stage5_6_demo_train_v8
-    scene_ids: [10, 140, 194, 196, 142, 114, 121]
+    type: train_v8_stage5_4
+    name: stage5_4_demo_train_v8
+    scene_ids: [10]
     initial_scene_id: 10
     initial_segment_id: 0
-    # In train_v8_stage5_6 mode this is the training episode_start_keyframe_pos,
+    # In train_v8_stage5_4 mode this is the training episode_start_keyframe_pos,
     # not a dense eval-frame window offset.
     initial_sequence_start_pos: 0
     wrap_scene: true
@@ -95,7 +99,7 @@ demo:
     reset_node_state_after_block: false
   viewer:
     host: "0.0.0.0"
-    port: 8080
+    port: 8081
     align_gaussians_to_nerfview: true
     coord_align_mode: gaussian
     rasterize_mode: auto

@@ -10,8 +10,14 @@ batch_eval:
     strict: true
 
   dataset:
-    scene_ids: [10, 140, 194, 142, 114, 121]
+    scene_ids: [10]
     segment_policy: all
+    # Start cursor uses scene-global frame_id; for scene 10 segment 1,
+    # frame_id 100 maps to sequence_start_pos 27 in the exported assets.
+    start_at:
+      scene_id: 10
+      segment_id: 1
+      frame_id: 100
     require_full_window: true
     stride: 30
     max_episodes_per_scene: null
@@ -23,8 +29,8 @@ batch_eval:
     names: ["front", "front_left", "front_right"]
 
   runtime:
-    mode: inference_only
-    no_grad: true
+    mode: segment_finetune_train
+    no_grad: false
     amp: false
     reset_state_per_episode: true
     align_with_scheduler_v8: true
@@ -44,7 +50,7 @@ batch_eval:
   history:
     update_step_norm_ema: true
     record_support_residual_on_input_exit: true
-    record_each_step: false
+    record_each_step: true
 
   render:
     save_pre_update: true
@@ -59,7 +65,7 @@ batch_eval:
     report_full_image: true
     compute_psnr: true
     compute_ssim: true
-    compute_lpips: false
+    compute_lpips: true
     compute_l1: true
     min_valid_pixels: 32
 

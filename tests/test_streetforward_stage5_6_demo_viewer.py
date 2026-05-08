@@ -143,10 +143,16 @@ def _cfg(*, steps_per_input: int = 2, switch: int = 1):
     )
 
 
-def _train_v8_cfg(*, steps_per_block: int = 2, switch: int = 1):
+def _train_v8_cfg(
+    *,
+    steps_per_block: int = 2,
+    switch: int = 1,
+    stage: str = "5_6",
+    scheduler_type: str = "train_v8_stage5_6",
+):
     return OmegaConf.create(
         {
-            "model": {"stage": "5_6", "production_training": True},
+            "model": {"stage": str(stage), "production_training": True},
             "training": {"seed": 0},
             "data": {"train_scene_ids": [10]},
             "scheduler_v8": {
@@ -198,7 +204,7 @@ def _train_v8_cfg(*, steps_per_block: int = 2, switch: int = 1):
             "demo": {
                 "mode": "segment_finetune_train",
                 "scheduler": {
-                    "type": "train_v8_stage5_6",
+                    "type": str(scheduler_type),
                     "scene_ids": [10],
                     "initial_scene_id": 10,
                     "initial_segment_id": 0,
@@ -277,9 +283,107 @@ def test_stage5_6_train_v8_demo_next_step_consumes_train_scheduler_batch():
     controller.prime()
     stats = controller.step_current_block_once()
     assert trainer.seen["scheduler_node_sync"]["segment_local_step"] == 1
-    assert trainer.seen["runtime_policy"].reset_node_state_after_block is True
+    assert trainer.seen["runtime_policy"].reset_node_state_after_block is False
     assert stats["demo_scheduler_type"] == "train_v8_stage5_6"
     assert stats["target_frame_roles"][0] == "source"
+
+
+def test_stage5_4_train_v8_demo_next_step_consumes_train_scheduler_batch():
+    cfg = _train_v8_cfg(steps_per_block=1, switch=1, stage="5_4", scheduler_type="train_v8_stage5_4")
+    sched = build_stage5_demo_scheduler_from_cfg(cfg, _TinyDataset(), device=torch.device("cpu"))
+    trainer = _Trainer()
+    controller = Stage5DemoController(
+        cfg=cfg,
+        dataset=_TinyDataset(),
+        scheduler=sched,
+        trainer=trainer,
+        device=torch.device("cpu"),
+        stage="5_4",
+    )
+    controller.prime()
+    stats = controller.step_current_block_once()
+    assert trainer.seen["scheduler_node_sync"]["segment_local_step"] == 1
+    assert trainer.seen["runtime_policy"].reset_node_state_after_block is False
+    assert stats["demo_scheduler_type"] == "train_v8_stage5_4"
+    assert stats["target_frame_roles"][0] == "source"
+
+
+def test_stage5_6_train_v8_demo_runtime_policy_resets_only_on_scheduler_reset_event():
+    cfg = _train_v8_cfg(steps_per_block=1, switch=1)
+    sched = build_stage5_demo_scheduler_from_cfg(cfg, _TinyDataset(), device=torch.device("cpu"))
+    trainer = _Trainer()
+    controller = Stage5DemoController(
+        cfg=cfg,
+        dataset=_TinyDataset(),
+        scheduler=sched,
+        trainer=trainer,
+        device=torch.device("cpu"),
+        stage="5_6",
+    )
+    controller._run_stage5_6_train_scheduler_step(
+        minimal={"scene_id": 10, "segment_id": 0},
+        scheduler_info={"segment_local_step": 1, "U": 1, "block_order": "step_major"},
+        events=[{"type": "episode_end"}],
+        defer_node_state_reset=False,
+    )
+    assert trainer.seen["runtime_policy"].reset_node_state_after_block is True
+
+
+def test_stage5_6_demo_viewer_defaults_to_auto_rasterization():
+    cfg = _train_v8_cfg()
+    sched = build_stage5_demo_scheduler_from_cfg(cfg, _TinyDataset(), device=torch.device("cpu"))
+    controller = Stage5DemoController(
+        cfg=cfg,
+        dataset=_TinyDataset(),
+        scheduler=sched,
+        trainer=_Trainer(),
+        device=torch.device("cpu"),
+        stage="5_6",
+    )
+    assert controller.viewer_rasterize_mode == "auto"
+
+
+def test_stage5_6_demo_viewer_accepts_classic_rasterization_override():
+    cfg = _train_v8_cfg()
+    cfg.demo.viewer = {"rasterize_mode": "classic"}
+    sched = build_stage5_demo_scheduler_from_cfg(cfg, _TinyDataset(), device=torch.device("cpu"))
+    controller = Stage5DemoController(
+        cfg=cfg,
+        dataset=_TinyDataset(),
+        scheduler=sched,
+        trainer=_Trainer(),
+        device=torch.device("cpu"),
+        stage="5_6",
+    )
+    assert controller.viewer_rasterize_mode == "classic"
+
+
+def test_stage5_6_demo_render_initializes_node_state_from_primed_batch():
+    cfg = _train_v8_cfg()
+    sched = build_stage5_demo_scheduler_from_cfg(cfg, _TinyDataset(), device=torch.device("cpu"))
+    trainer = _Trainer()
+    trainer.node_states_bg = {}
+    trainer.node_states_distant = {}
+    trainer.node_states_rigid = {}
+
+    def _init_states(batch):
+        trainer.seen["init_batch_key"] = (int(batch["scene_id"]), int(batch["segment_id"]))
+        trainer.node_states_bg[trainer.seen["init_batch_key"]] = object()
+        trainer.node_states_distant[trainer.seen["init_batch_key"]] = object()
+        trainer.node_states_rigid[trainer.seen["init_batch_key"]] = object()
+
+    trainer._get_or_init_node_states_bg_rigid_distant = _init_states
+    controller = Stage5DemoController(
+        cfg=cfg,
+        dataset=_TinyDataset(),
+        scheduler=sched,
+        trainer=trainer,
+        device=torch.device("cpu"),
+        stage="5_6",
+    )
+    controller.prime()
+    controller._ensure_render_node_state_initialized((10, 0))
+    assert trainer.seen["init_batch_key"] == (10, 0)
 
 
 class _Trainer(torch.nn.Module):

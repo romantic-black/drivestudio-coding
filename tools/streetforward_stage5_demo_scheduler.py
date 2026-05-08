@@ -1258,7 +1258,10 @@ class Stage5_6TrainV8DemoScheduler:
     match training instead of BatchEval's dense frame-window protocol.
     """
 
+    is_train_v8_demo = True
     is_stage5_6_train_v8_demo = True
+    demo_scheduler_type = "train_v8_stage5_6"
+    demo_scheduler_label = "Stage5_6"
 
     def __init__(self, *, dataset: MultiSceneDatasetV4, cfg: Any, seed: int = 0, device: Any = None) -> None:
         self.dataset = dataset
@@ -1286,7 +1289,7 @@ class Stage5_6TrainV8DemoScheduler:
             self._scene_ids = [int(x) for x in self._as_list(configured_scene_ids)]
         self._scene_ids = sorted(self._scene_ids)
         if len(self._scene_ids) == 0:
-            raise ValueError("Stage5_6 train-v8 demo scheduler requires at least one scene id")
+            raise ValueError(f"{self.demo_scheduler_label} train-v8 demo scheduler requires at least one scene id")
 
         initial_scene_id = scheduler_cfg.get("initial_scene_id")
         initial_segment_id = scheduler_cfg.get("initial_segment_id")
@@ -1356,7 +1359,7 @@ class Stage5_6TrainV8DemoScheduler:
     def _emit(self, event: Dict[str, Any]) -> None:
         out = dict(event)
         out.setdefault("scheduler_version", "v8")
-        out.setdefault("demo_scheduler_type", "train_v8_stage5_6")
+        out.setdefault("demo_scheduler_type", str(self.demo_scheduler_type))
         out.setdefault("scene_id", int(self.scene_id))
         out.setdefault("segment_id", int(self.segment_id))
         out.setdefault("sequence_start_pos", int(self.sequence_start_pos))
@@ -1441,7 +1444,7 @@ class Stage5_6TrainV8DemoScheduler:
         return {
             **raw_info,
             "scheduler_version": "v8",
-            "demo_scheduler_type": "train_v8_stage5_6",
+            "demo_scheduler_type": str(self.demo_scheduler_type),
             "scene_id": int(raw_info.get("scene_id", self.scene_id)),
             "segment_id": int(raw_info.get("segment_id", self.segment_id)),
             "episode_idx_global": int(raw_info.get("episode_idx_global", -1)),
@@ -1622,6 +1625,15 @@ class Stage5_6TrainV8DemoScheduler:
         )
 
 
+class Stage5_4TrainV8DemoScheduler(Stage5_6TrainV8DemoScheduler):
+    """Stage5_4 alias for the real TrainSchedulerV8 demo path."""
+
+    is_stage5_6_train_v8_demo = False
+    is_stage5_4_train_v8_demo = True
+    demo_scheduler_type = "train_v8_stage5_4"
+    demo_scheduler_label = "Stage5_4"
+
+
 def build_stage5_demo_scheduler_from_cfg(
     cfg: Any,
     dataset: MultiSceneDatasetV4,
@@ -1637,4 +1649,6 @@ def build_stage5_demo_scheduler_from_cfg(
         return Stage5_6EvalDemoScheduler(dataset=dataset, cfg=cfg, seed=seed, device=device)
     if scheduler_type == "train_v8_stage5_6":
         return Stage5_6TrainV8DemoScheduler(dataset=dataset, cfg=cfg, seed=seed, device=device)
+    if scheduler_type == "train_v8_stage5_4":
+        return Stage5_4TrainV8DemoScheduler(dataset=dataset, cfg=cfg, seed=seed, device=device)
     return Stage5DemoScheduler(dataset=dataset, cfg=cfg, seed=seed)

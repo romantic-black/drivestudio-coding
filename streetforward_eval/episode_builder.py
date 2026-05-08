@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Literal, Optional, Protocol, Tuple
+from typing import Any, Dict, List, Literal, Optional, Protocol, Tuple
 
 from .protocols import TestProtocolSpec, resolve_eval_offsets
 
@@ -92,6 +92,99 @@ def _filter_segment_ids(segment_ids: List[int], segment_policy: str) -> List[int
     raise ValueError(f"unsupported segment_policy={segment_policy!r}, expected one of ['all','first']")
 
 
+@dataclass(frozen=True)
+class EpisodeStartAt:
+    scene_id: int
+    segment_id: int
+    frame_id: Optional[int] = None
+    sequence_start_pos: Optional[int] = None
+
+
+def _start_at_from_mapping(start_at: Optional[Dict[str, Any]]) -> Optional[EpisodeStartAt]:
+    if start_at is None:
+        return None
+    if not isinstance(start_at, dict):
+        raise ValueError(f"batch_eval.dataset.start_at must be a mapping, got {type(start_at).__name__}")
+    if start_at.get("scene_id") is None:
+        raise ValueError("batch_eval.dataset.start_at.scene_id is required")
+    if start_at.get("segment_id") is None:
+        raise ValueError("batch_eval.dataset.start_at.segment_id is required")
+    frame_id = start_at.get("frame_id")
+    sequence_start_pos = start_at.get("sequence_start_pos")
+    if frame_id is not None and sequence_start_pos is not None:
+        raise ValueError(
+            "batch_eval.dataset.start_at can specify either frame_id or sequence_start_pos, not both"
+        )
+    return EpisodeStartAt(
+        scene_id=int(start_at["scene_id"]),
+        segment_id=int(start_at["segment_id"]),
+        frame_id=None if frame_id is None else int(frame_id),
+        sequence_start_pos=None if sequence_start_pos is None else int(sequence_start_pos),
+    )
+
+
+def _ordered_after_start_scope(
+    *,
+    scene_started: bool,
+    scene_id: int,
+    segment_id: int,
+    start_at: Optional[EpisodeStartAt],
+) -> bool:
+    if start_at is None:
+        return True
+    if not scene_started:
+        return False
+    if int(scene_id) == int(start_at.scene_id) and int(segment_id) < int(start_at.segment_id):
+        return False
+    return True
+
+
+def _start_pos_from_frame_id(
+    *,
+    frames: List[int],
+    frame_id: int,
+    scene_id: int,
+    segment_id: int,
+) -> int:
+    frame_id = int(frame_id)
+    if frame_id in set(int(x) for x in frames):
+        return [int(x) for x in frames].index(frame_id)
+    preview = frames[:5] + (["..."] if len(frames) > 10 else []) + frames[-5:]
+    raise ValueError(
+        "batch_eval.dataset.start_at.frame_id is not in train frames: "
+        f"scene={int(scene_id)} segment={int(segment_id)} frame_id={frame_id} "
+        f"available_count={len(frames)} available_preview={preview}"
+    )
+
+
+def _starts_from_explicit_start(
+    *,
+    num_frames: int,
+    sequence_length: int,
+    stride: int,
+    require_full_window: bool,
+    start_pos: int,
+) -> List[int]:
+    if int(stride) < 1:
+        raise ValueError("stride must be >= 1")
+    if int(start_pos) < 0:
+        raise ValueError(f"batch_eval.dataset.start_at sequence start must be >= 0, got {start_pos}")
+    if bool(require_full_window):
+        max_start = int(num_frames) - int(sequence_length)
+        if int(start_pos) > int(max_start):
+            raise ValueError(
+                "batch_eval.dataset.start_at does not have enough frames for a full window: "
+                f"start_pos={int(start_pos)} num_frames={int(num_frames)} "
+                f"sequence_length={int(sequence_length)}"
+            )
+        return list(range(int(start_pos), int(max_start) + 1, int(stride)))
+    if int(start_pos) >= int(num_frames):
+        raise ValueError(
+            f"batch_eval.dataset.start_at start_pos={int(start_pos)} is out of range for num_frames={int(num_frames)}"
+        )
+    return list(range(int(start_pos), int(num_frames), int(stride)))
+
+
 def build_test_episode_specs(
     *,
     dataset: EvalDatasetLike,
@@ -103,17 +196,44 @@ def build_test_episode_specs(
     require_full_window: bool,
     max_episodes_per_scene: Optional[int],
     max_total_episodes: Optional[int],
+    start_at: Optional[Dict[str, Any]] = None,
 ) -> List[TestEpisodeSpec]:
     specs: List[TestEpisodeSpec] = []
     eval_offsets = resolve_eval_offsets(protocol.eval_offsets, sequence_length=int(protocol.sequence_length))
     episode_idx = 0
+    start_spec = _start_at_from_mapping(start_at)
+    if start_spec is not None and int(start_spec.scene_id) not in set(int(x) for x in scene_ids):
+        raise ValueError(
+            "batch_eval.dataset.start_at.scene_id must be included in batch_eval.dataset.scene_ids: "
+            f"start_at.scene_id={int(start_spec.scene_id)} scene_ids={[int(x) for x in scene_ids]}"
+        )
+    reached_start_scene = start_spec is None
 
     for scene_id_any in scene_ids:
         scene_id = int(scene_id_any)
+        if start_spec is not None:
+            if int(scene_id) == int(start_spec.scene_id):
+                reached_start_scene = True
+            elif not reached_start_scene:
+                continue
         scene_count = 0
         raw_segment_ids = [int(x) for x in dataset.list_segment_ids(scene_id)]
         segment_ids = _filter_segment_ids(raw_segment_ids, segment_policy=str(segment_policy))
+        if start_spec is not None and int(scene_id) == int(start_spec.scene_id):
+            if int(start_spec.segment_id) not in set(segment_ids):
+                raise ValueError(
+                    "batch_eval.dataset.start_at.segment_id is not selected by segment_policy: "
+                    f"scene={int(scene_id)} start_at.segment_id={int(start_spec.segment_id)} "
+                    f"selected_segments={segment_ids}"
+                )
         for segment_id in segment_ids:
+            if not _ordered_after_start_scope(
+                scene_started=bool(reached_start_scene),
+                scene_id=int(scene_id),
+                segment_id=int(segment_id),
+                start_at=start_spec,
+            ):
+                continue
             sidx = dataset.get_segment_index(scene_id, segment_id)
             num_cams = int(sidx.num_cams)
             for cam_id in protocol.camera_ids:
@@ -133,13 +253,37 @@ def build_test_episode_specs(
             if len(frames) == 0:
                 continue
 
-            starts = _window_starts(
-                num_frames=len(frames),
-                sequence_length=int(protocol.sequence_length),
-                window_policy=str(window_policy),
-                stride=int(stride),
-                require_full_window=bool(require_full_window),
-            )
+            if (
+                start_spec is not None
+                and int(scene_id) == int(start_spec.scene_id)
+                and int(segment_id) == int(start_spec.segment_id)
+                and (start_spec.frame_id is not None or start_spec.sequence_start_pos is not None)
+            ):
+                start_pos = (
+                    _start_pos_from_frame_id(
+                        frames=frames,
+                        frame_id=int(start_spec.frame_id),
+                        scene_id=int(scene_id),
+                        segment_id=int(segment_id),
+                    )
+                    if start_spec.frame_id is not None
+                    else int(start_spec.sequence_start_pos)
+                )
+                starts = _starts_from_explicit_start(
+                    num_frames=len(frames),
+                    sequence_length=int(protocol.sequence_length),
+                    stride=int(stride),
+                    require_full_window=bool(require_full_window),
+                    start_pos=int(start_pos),
+                )
+            else:
+                starts = _window_starts(
+                    num_frames=len(frames),
+                    sequence_length=int(protocol.sequence_length),
+                    window_policy=str(window_policy),
+                    stride=int(stride),
+                    require_full_window=bool(require_full_window),
+                )
             for start_pos in starts:
                 end_pos = int(start_pos) + int(protocol.sequence_length)
                 window_frames = [int(x) for x in frames[int(start_pos) : int(end_pos)]]

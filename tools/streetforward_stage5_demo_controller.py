@@ -54,6 +54,9 @@ class Stage5DemoController:
             raise ValueError("demo.viewer.coord_align_mode must be one of: gaussian, camera, off")
         if self.coord_align_mode == "off":
             self.align_gaussians_to_nerfview = False
+        self.viewer_rasterize_mode = str(viewer_cfg.get("rasterize_mode", "auto")).strip().lower()
+        if self.viewer_rasterize_mode not in ("auto", "classic", "antialiased"):
+            raise ValueError("demo.viewer.rasterize_mode must be one of: auto, classic, antialiased")
         mode = str(demo_cfg.get("mode", "frozen_recurrent_inference")).strip()
         self.mode = mode
         mode_norm = mode.lower()
@@ -150,6 +153,19 @@ class Stage5DemoController:
     def _current_scheduler_info(self) -> Dict[str, Any]:
         return self.display.current_scheduler_info or self.scheduler.get_current_info()
 
+    def _is_train_v8_demo(self) -> bool:
+        return bool(
+            getattr(self.scheduler, "is_train_v8_demo", False)
+            or getattr(self.scheduler, "is_stage5_6_train_v8_demo", False)
+            or getattr(self.scheduler, "is_stage5_4_train_v8_demo", False)
+        )
+
+    def _is_eval_v8_demo(self) -> bool:
+        return bool(getattr(self.scheduler, "is_stage5_6_eval_demo", False))
+
+    def _is_v8_scope_managed_demo(self) -> bool:
+        return bool(self._is_eval_v8_demo() or self._is_train_v8_demo())
+
     def _refresh_display_from_raw_batch(
         self,
         raw_batch: Dict[str, Any],
@@ -198,7 +214,7 @@ class Stage5DemoController:
             return {}
         if not hasattr(self.trainer, "record_block_history"):
             return {}
-        if str(self.stage) not in ("5_2", "5_3", "5_6"):
+        if str(self.stage) not in ("5_2", "5_3", "5_4", "5_6"):
             return {}
         minimal = self.display.last_minimal_batch
         if minimal is None:
@@ -345,7 +361,7 @@ class Stage5DemoController:
             do_train=bool(self._mode_train_and_infer),
             update_hidden_state=bool(getattr(self.scheduler, "update_hidden_state", self.update_hidden_state)),
             update_node_state=bool(getattr(self.scheduler, "update_node_state", self.update_node_state)),
-            reset_node_state_after_block=True,
+            reset_node_state_after_block=bool(sync.get("reset_after_block", False)),
             force_eval_mode=False,
         )
         if self._mode_train_and_infer:
@@ -370,7 +386,7 @@ class Stage5DemoController:
             raise ValueError("controller is busy")
         self.busy = True
         try:
-            train_v8_demo = bool(getattr(self.scheduler, "is_stage5_6_train_v8_demo", False))
+            train_v8_demo = self._is_train_v8_demo()
             if train_v8_demo:
                 raw_batch = self.scheduler.next_batch_for_update()
             else:
@@ -395,7 +411,7 @@ class Stage5DemoController:
                         events=events,
                         defer_node_state_reset=bool(defer_node_state_reset),
                     )
-                elif bool(getattr(self.scheduler, "is_stage5_6_eval_demo", False)):
+                elif self._is_eval_v8_demo():
                     aligned = minimal.get("_scheduler_v8_aligned_info") or {}
                     stats = run_stage5_6_update_step(
                         model=self.trainer,
@@ -427,7 +443,7 @@ class Stage5DemoController:
                         events=events,
                         defer_node_state_reset=bool(defer_node_state_reset),
                     )
-                elif bool(getattr(self.scheduler, "is_stage5_6_eval_demo", False)):
+                elif self._is_eval_v8_demo():
                     aligned = minimal.get("_scheduler_v8_aligned_info") or {}
                     stats = run_stage5_6_update_step(
                         model=self.trainer,
@@ -462,7 +478,7 @@ class Stage5DemoController:
                 )
             )
             if should_record and (
-                bool(getattr(self.scheduler, "is_stage5_6_eval_demo", False)) or bool(train_v8_demo)
+                self._is_eval_v8_demo() or bool(train_v8_demo)
             ):
                 rec = self._record_history_for_batch(
                     minimal,
@@ -510,10 +526,8 @@ class Stage5DemoController:
             raw_batch = op()
             merge_stats = dict(stats or {})
             merge_stats.update(rec_stats)
-            stage5_6_reset_scope = bool(getattr(self.scheduler, "is_stage5_6_eval_demo", False)) or bool(
-                getattr(self.scheduler, "is_stage5_6_train_v8_demo", False)
-            )
-            if stage5_6_reset_scope and op_name in {
+            v8_reset_scope = self._is_v8_scope_managed_demo()
+            if v8_reset_scope and op_name in {
                 "next_scene",
                 "prev_scene",
                 "next_segment",
@@ -556,9 +570,7 @@ class Stage5DemoController:
                 raise ValueError("scheduler does not support set_scope")
             raw_batch = self.scheduler.set_scope(int(scene_id), int(segment_id))
             rec_stats.update({"manual_set_scope": 1.0})
-            if bool(getattr(self.scheduler, "is_stage5_6_eval_demo", False)) or bool(
-                getattr(self.scheduler, "is_stage5_6_train_v8_demo", False)
-            ):
+            if self._is_v8_scope_managed_demo():
                 rec_stats.update(self._reset_for_eval_scope_change())
             return self._refresh_display_from_raw_batch(raw_batch, stats=rec_stats)
         finally:
@@ -574,9 +586,7 @@ class Stage5DemoController:
                 raise ValueError("scheduler does not support set_sequence_start_pos")
             raw_batch = self.scheduler.set_sequence_start_pos(int(sequence_start_pos))
             rec_stats.update({"manual_set_sequence_start_pos": 1.0})
-            if bool(getattr(self.scheduler, "is_stage5_6_eval_demo", False)) or bool(
-                getattr(self.scheduler, "is_stage5_6_train_v8_demo", False)
-            ):
+            if self._is_v8_scope_managed_demo():
                 rec_stats.update(self._reset_for_eval_scope_change())
             return self._refresh_display_from_raw_batch(raw_batch, stats=rec_stats)
         finally:
@@ -621,9 +631,7 @@ class Stage5DemoController:
             if not hasattr(self.scheduler, "resample_episode"):
                 raise ValueError("scheduler does not support resample_episode")
             raw_batch = self.scheduler.resample_episode()
-            if bool(getattr(self.scheduler, "is_stage5_6_eval_demo", False)) or bool(
-                getattr(self.scheduler, "is_stage5_6_train_v8_demo", False)
-            ):
+            if self._is_v8_scope_managed_demo():
                 rec_stats.update(self._reset_for_eval_scope_change())
                 rec_stats.update({"manual_resample_episode": 1.0})
             else:
@@ -861,9 +869,66 @@ class Stage5DemoController:
             sh_degree += 1
         return int(sh_degree)
 
+    @staticmethod
+    def _sanitize_render_tensors(
+        means: torch.Tensor,
+        scales: torch.Tensor,
+        quats: torch.Tensor,
+        opacities: torch.Tensor,
+        colors: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        quat_norm = torch.linalg.norm(quats, dim=-1, keepdim=True)
+        quat_identity = torch.zeros_like(quats)
+        quat_identity[..., 0] = 1.0
+        quats = torch.where(
+            torch.isfinite(quat_norm) & (quat_norm > 1.0e-8),
+            quats / quat_norm.clamp_min(1.0e-8),
+            quat_identity,
+        )
+        valid = (
+            torch.isfinite(means).all(dim=-1)
+            & torch.isfinite(scales).all(dim=-1)
+            & torch.isfinite(quats).all(dim=-1)
+            & torch.isfinite(opacities.reshape(-1))
+            & torch.isfinite(colors.reshape(int(colors.shape[0]), -1)).all(dim=-1)
+            & (scales > 0.0).all(dim=-1)
+            & (opacities.reshape(-1) > 1.0e-6)
+        )
+        if bool(valid.all().item()):
+            return means, scales, quats, opacities.reshape(-1), colors
+        return means[valid], scales[valid], quats[valid], opacities.reshape(-1)[valid], colors[valid]
+
     def _get_active_key(self) -> Tuple[int, int]:
         info = self.display.current_scheduler_info or self.scheduler.get_current_info()
         return int(info.get("scene_id", -1)), int(info.get("segment_id", -1))
+
+    def _ensure_render_node_state_initialized(self, key: Tuple[int, int]) -> None:
+        has_bg = isinstance(getattr(self.trainer, "node_states_bg", None), dict) and key in self.trainer.node_states_bg
+        has_distant = (
+            isinstance(getattr(self.trainer, "node_states_distant", None), dict)
+            and key in self.trainer.node_states_distant
+        )
+        has_rigid = (
+            isinstance(getattr(self.trainer, "node_states_rigid", None), dict)
+            and key in self.trainer.node_states_rigid
+        )
+        if has_bg or has_distant or has_rigid:
+            return
+        minimal = self.display.last_minimal_batch
+        if not isinstance(minimal, dict):
+            return
+        batch_key = (
+            int(minimal.get("scene_id", -1)),
+            int(minimal.get("segment_id", -1)),
+        )
+        if batch_key != key:
+            return
+        if hasattr(self.trainer, "_get_or_init_node_states_bg_rigid_distant"):
+            self.trainer._get_or_init_node_states_bg_rigid_distant(minimal)
+        elif hasattr(self.trainer, "_get_or_init_node_states_bg_distant"):
+            self.trainer._get_or_init_node_states_bg_distant(minimal)
+        elif hasattr(self.trainer, "_get_or_init_node_state_bg"):
+            self.trainer._get_or_init_node_state_bg(minimal)
 
     @torch.no_grad()
     def render(
@@ -880,6 +945,7 @@ class Stage5DemoController:
             raise ImportError("gsplat is not available; demo viewer requires gsplat.rendering.rasterization.")
         scene_id, segment_id = self._get_active_key()
         key = (int(scene_id), int(segment_id))
+        self._ensure_render_node_state_initialized(key)
         node_state_bg = self.trainer.node_states_bg.get(key)
         node_state_distant = self.trainer.node_states_distant.get(key)
         node_state_rigid = getattr(self.trainer, "node_states_rigid", {}).get(key)
@@ -935,6 +1001,16 @@ class Stage5DemoController:
         quats = torch.cat(quats_list, dim=0)
         opacities = torch.cat(opacities_list, dim=0)
         colors = torch.cat(colors_list, dim=0)
+        means, scales, quats, opacities, colors = self._sanitize_render_tensors(
+            means,
+            scales,
+            quats,
+            opacities,
+            colors,
+        )
+        if int(means.shape[0]) == 0:
+            w, h = img_wh
+            return np.zeros((h, w, 3), dtype=np.uint8)
         w, h = img_wh
         c2w = torch.from_numpy(camera_state.c2w).float().to(self.device)
         if self.align_gaussians_to_nerfview:
@@ -945,18 +1021,31 @@ class Stage5DemoController:
                 c2w = self._nerfview_camera_c2w_to_dataset_c2w(c2w)
         k = torch.from_numpy(camera_state.get_K(img_wh)).float().to(self.device)
         sh_degree = self._infer_sh_degree(colors)
-        render_colors, _, _ = _gsplat_rasterization(
-            means=means,
-            quats=quats,
-            scales=scales,
-            opacities=opacities,
-            colors=colors,
-            viewmats=torch.linalg.inv(c2w)[None, ...],
-            Ks=k[None, ...],
-            width=int(w),
-            height=int(h),
-            sh_degree=sh_degree,
-            packed=False,
-            rasterize_mode="antialiased",
-        )
+        viewmats = torch.linalg.inv(c2w)[None, ...]
+        Ks = k[None, ...]
+
+        def _rasterize(mode: str) -> Tuple[torch.Tensor, torch.Tensor]:
+            render, alpha, _ = _gsplat_rasterization(
+                means=means,
+                quats=quats,
+                scales=scales,
+                opacities=opacities,
+                colors=colors,
+                viewmats=viewmats,
+                Ks=Ks,
+                width=int(w),
+                height=int(h),
+                sh_degree=sh_degree,
+                packed=False,
+                rasterize_mode=mode,
+            )
+            return render, alpha
+
+        if self.viewer_rasterize_mode == "auto":
+            render_colors, render_alphas = _rasterize("classic")
+            alpha_max = float(render_alphas.detach().max().item()) if int(render_alphas.numel()) > 0 else 0.0
+            if (not torch.isfinite(render_colors).all().item()) or alpha_max <= 1.0e-8:
+                render_colors, _ = _rasterize("antialiased")
+        else:
+            render_colors, _ = _rasterize(self.viewer_rasterize_mode)
         return self._to_numpy_uint8(render_colors[0])
