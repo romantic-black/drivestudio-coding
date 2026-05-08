@@ -221,15 +221,31 @@ class MetricAccumulator:
         self.compute_ssim = bool(compute_ssim)
         self.compute_lpips = bool(compute_lpips)
         self._lpips_model: Any = None
+        self._lpips_backend = ""
         if self.compute_lpips:
             try:
                 import lpips  # type: ignore
-            except Exception as e:
-                raise ImportError(
-                    "compute_lpips=true requires the `lpips` package. Install with `pip install lpips`."
-                ) from e
-            # AlexNet backend is the common LPIPS default for evaluation.
-            self._lpips_model = lpips.LPIPS(net="alex").eval()
+            except Exception as lpips_error:
+                try:
+                    from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+                except Exception as torchmetrics_error:
+                    raise ImportError(
+                        "compute_lpips=true requires either the `lpips` package or "
+                        "`torchmetrics.image.lpip.LearnedPerceptualImagePatchSimilarity`."
+                    ) from torchmetrics_error
+                self._lpips_model = LearnedPerceptualImagePatchSimilarity(
+                    net_type="alex",
+                    normalize=False,
+                ).eval()
+                self._lpips_backend = "torchmetrics"
+                logger.info(
+                    "Using torchmetrics LPIPS backend because standalone lpips import failed: %s",
+                    str(lpips_error),
+                )
+            else:
+                # AlexNet backend is the common LPIPS default for evaluation.
+                self._lpips_model = lpips.LPIPS(net="alex").eval()
+                self._lpips_backend = "lpips"
         self.iter_rows: List[Dict[str, Any]] = []
         self.episode_rows: Dict[str, List[Dict[str, Any]]] = {}
         self._warned_missing_egocar_for_cam: set[int] = set()

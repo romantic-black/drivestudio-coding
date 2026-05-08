@@ -678,6 +678,13 @@ def _run_one_experiment(
         default_target_policy = "visited_episode_frames"
         if sv8_episode is not None and sv8_episode.get("total_target_frames") is not None:
             default_max_targets = int(sv8_episode.get("total_target_frames"))
+    if bool(runtime.get("override_scheduler_execution", False)):
+        if "block_order" in runtime:
+            default_block_order = str(runtime.get("block_order"))
+        if "step_major_switch_interval_steps" in runtime:
+            default_step_major_switch = int(runtime.get("step_major_switch_interval_steps"))
+        if "reset_policy" in runtime:
+            default_reset_policy = str(runtime.get("reset_policy"))
     update_cameras = cfg.batch_eval.get("update_cameras")
     if update_cameras is None:
         update_camera_ids = None
