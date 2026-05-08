@@ -1841,6 +1841,7 @@ class MinimalStreetForwardStage4_5(MinimalStreetForwardStage4_2):
         profile_phase_timing: bool = False,
         sync_cuda_timing: bool = False,
         scheduler_node_sync: Optional[Dict[str, Any]] = None,
+        runtime_policy: Optional[Any] = None,
     ) -> Dict[str, Any]:
         out = super().train_step(
             batch=batch,
@@ -1848,6 +1849,7 @@ class MinimalStreetForwardStage4_5(MinimalStreetForwardStage4_2):
             profile_phase_timing=profile_phase_timing,
             sync_cuda_timing=sync_cuda_timing,
             scheduler_node_sync=scheduler_node_sync,
+            runtime_policy=runtime_policy,
         )
         num_bg = int(out.get("num_gaussians_bg", 0))
         num_distant = int(out.get("num_gaussians_distant", 0))

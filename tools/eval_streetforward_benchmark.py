@@ -4,11 +4,15 @@ import argparse
 import io
 import logging
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
+from models.streetforward.minimal_trainer_stage4_6 import MinimalStreetForwardStage4_6
+from models.streetforward.minimal_trainer_stage5_0 import MinimalStreetForwardStage5_0
+from models.streetforward.minimal_trainer_stage5_2 import MinimalStreetForwardStage5_2
+from models.streetforward.minimal_trainer_stage5_3 import MinimalStreetForwardStage5_3
 from models.streetforward.minimal_trainer_stage5_3_production import (
     MinimalStreetForwardStage5_3_Production,
 )
@@ -27,9 +31,57 @@ from streetforward_eval.protocols import protocol_from_dict, validate_protocol
 from streetforward_eval.runner import RunnerRuntimeConfig, StreetForwardBatchEvalRunner
 from streetforward_eval.snapshot_writer import RenderSaveConfig, SnapshotWriter
 from streetforward_eval.summary import build_summary_rows, write_summary_csv
-from tools.train_minimal_streetforward_stage4_3_v8_common import build_multi_scene_dataset_v4_for_demo
 
 logger = logging.getLogger("streetforward_batcheval")
+
+
+class _BatchEvalOptimizerAdapter:
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        *,
+        grad_clip_norm: float = 0.0,
+        global_step: int = 0,
+    ) -> None:
+        self._optimizer = optimizer
+        self.grad_clip_norm = float(grad_clip_norm)
+        self.global_step = int(global_step)
+        self.last_grad_norm = 0.0
+
+    @property
+    def param_groups(self):
+        return self._optimizer.param_groups
+
+    def zero_grad(self, *args, **kwargs):
+        return self._optimizer.zero_grad(*args, **kwargs)
+
+    def state_dict(self) -> Dict[str, Any]:
+        state = self._optimizer.state_dict()
+        state["_sf_global_step"] = int(self.global_step)
+        state["_sf_last_grad_norm"] = float(self.last_grad_norm)
+        return state
+
+    def load_state_dict(self, state_dict: Dict[str, Any]):
+        state = dict(state_dict)
+        self.global_step = int(state.pop("_sf_global_step", 0))
+        self.last_grad_norm = float(state.pop("_sf_last_grad_norm", 0.0))
+        return self._optimizer.load_state_dict(state)
+
+    def step(self, *args, **kwargs):
+        params = [p for group in self._optimizer.param_groups for p in group["params"]]
+        if float(self.grad_clip_norm) > 0.0 and len(params) > 0:
+            total = torch.nn.utils.clip_grad_norm_(params, max_norm=float(self.grad_clip_norm), error_if_nonfinite=True)
+            self.last_grad_norm = float(total.item() if torch.is_tensor(total) else total)
+        else:
+            sq = 0.0
+            for p in params:
+                if p.grad is None:
+                    continue
+                sq += float(p.grad.detach().float().pow(2).sum().item())
+            self.last_grad_norm = float(sq ** 0.5)
+        out = self._optimizer.step(*args, **kwargs)
+        self.global_step += 1
+        return out
 
 
 def _setup_logging() -> None:
@@ -71,28 +123,63 @@ def _as_mapping(value: Any, name: str) -> Dict[str, Any]:
 def _build_model(cfg: Any, device: torch.device) -> Any:
     stage = str(cfg.model.stage).strip().lower()
     production_training = bool(cfg.model.get("production_training", False))
-    if not production_training:
-        raise ValueError(
-            "BatchEval requires production trainer with eval_sparse interfaces; "
-            "set model.production_training=true."
-        )
-    if stage == "5_4":
-        model = MinimalStreetForwardStage5_4_Production(cfg, device=device).to(device)
-    elif stage == "5_5":
-        model = MinimalStreetForwardStage5_5_Production(cfg, device=device).to(device)
-    elif stage == "5_6":
-        model = MinimalStreetForwardStage5_6_Production(cfg, device=device).to(device)
+    if stage == "4_6":
+        model = MinimalStreetForwardStage4_6(cfg, device=device).to(device)
+    elif stage == "5_0":
+        model = MinimalStreetForwardStage5_0(cfg, device=device).to(device)
+    elif stage == "5_2":
+        model = MinimalStreetForwardStage5_2(cfg, device=device).to(device)
+    elif stage == "5_3" and not production_training:
+        model = MinimalStreetForwardStage5_3(cfg, device=device).to(device)
     elif stage == "5_3":
         model = MinimalStreetForwardStage5_3_Production(cfg, device=device).to(device)
+    elif stage == "5_4":
+        if not production_training:
+            raise ValueError("Stage5_4 BatchEval requires model.production_training=true.")
+        model = MinimalStreetForwardStage5_4_Production(cfg, device=device).to(device)
+    elif stage == "5_5":
+        if not production_training:
+            raise ValueError("Stage5_5 BatchEval requires model.production_training=true.")
+        model = MinimalStreetForwardStage5_5_Production(cfg, device=device).to(device)
+    elif stage == "5_6":
+        if not production_training:
+            raise ValueError("Stage5_6 BatchEval requires model.production_training=true.")
+        model = MinimalStreetForwardStage5_6_Production(cfg, device=device).to(device)
     else:
-        raise ValueError(f"unsupported model.stage={cfg.model.stage!r}; expected '5_3', '5_4', '5_5', or '5_6'")
+        raise ValueError(
+            f"unsupported model.stage={cfg.model.stage!r}; "
+            "expected '4_6', '5_0', '5_2', '5_3', '5_4', '5_5', or '5_6'"
+        )
     return model
 
 
-def _load_checkpoint(model: Any, ckpt_path: str, strict: bool) -> None:
+def _checkpoint_step(payload: Dict[str, Any]) -> int:
+    for key in ("global_step", "step", "iteration", "iter"):
+        if payload.get(key) is not None:
+            try:
+                return int(payload.get(key))
+            except Exception:
+                pass
+    lr_info = payload.get("lr_scheduler")
+    if isinstance(lr_info, dict) and lr_info.get("global_step") is not None:
+        try:
+            return int(lr_info.get("global_step"))
+        except Exception:
+            pass
+    opt_state = payload.get("optimizer_state_dict")
+    if isinstance(opt_state, dict) and opt_state.get("_sf_global_step") is not None:
+        try:
+            return int(opt_state.get("_sf_global_step"))
+        except Exception:
+            pass
+    return 0
+
+
+def _load_checkpoint(model: Any, ckpt_path: str, strict: bool) -> int:
     ckpt = torch.load(str(ckpt_path), map_location=model.device)
     if not isinstance(ckpt, dict):
         raise TypeError(f"checkpoint must be dict-like, got {type(ckpt).__name__}")
+    ckpt_step = _checkpoint_step(ckpt)
     state = (
         ckpt.get("model")
         or ckpt.get("model_state_dict")
@@ -124,7 +211,15 @@ def _load_checkpoint(model: Any, ckpt_path: str, strict: bool) -> None:
             missing[:20],
             unexpected[:20],
         )
+    setattr(model, "global_step", int(ckpt_step))
+    opt = getattr(model, "optimizer", None)
+    if opt is not None and hasattr(opt, "global_step"):
+        try:
+            opt.global_step = int(ckpt_step)
+        except Exception:
+            logger.warning("failed to set optimizer.global_step from checkpoint step=%s", ckpt_step)
     model.eval()
+    return int(ckpt_step)
 
 
 def _snapshot_train_checkpoint_bytes(model: Any) -> bytes:
@@ -162,6 +257,177 @@ def _restore_train_checkpoint_bytes(model: Any, ckpt_bytes: bytes, device: torch
                 model.optimizer.load_state_dict(payload["optimizer_state_dict"])
         else:
             model.optimizer.load_state_dict(payload["optimizer_state_dict"])
+    restored_step = _checkpoint_step(payload)
+    opt = getattr(model, "optimizer", None)
+    if opt is not None and hasattr(opt, "global_step"):
+        restored_step = int(getattr(opt, "global_step"))
+    setattr(model, "global_step", int(restored_step))
+
+
+_SEGMENT_FINETUNE_MAIN_PREFIXES = (
+    "image_feature_extractor.residual",
+    "image_feature_extractor.residual_unet",
+    "image_feature_extractor.fusion",
+    "image_feature_extractor.fusion_neck",
+    "struct_decoder",
+    "stage5_2_history_proj",
+    "stage5_2_gate_branch_embed",
+    "stage5_2_gate_mlp",
+    "current_obs_",
+)
+
+_SEGMENT_FINETUNE_MAIN_TOKENS = (
+    "offset_gru",
+    "gru_update",
+    "gru_candidate",
+    "gru_reset",
+    "gru_to_head",
+    "mlp_offset",
+    "mlp_conv",
+    "mlp_opacity",
+    "gaussion_decoder",
+    "gaussian_decoder",
+)
+
+
+def _is_stage5_6_error_predictor_param(name: str) -> bool:
+    return (
+        name.startswith("stage5_6_error_head")
+        or name.startswith("err_splat_proj_bg")
+        or name.startswith("err_splat_proj_distant")
+        or name.startswith("err_splat_proj_rigid")
+    )
+
+
+def _is_stage5_6_feedback_fuser_param(name: str) -> bool:
+    return (
+        name.startswith("stage5_6_bg_fuser")
+        or name.startswith("stage5_6_distant_fuser")
+        or name.startswith("stage5_6_rigid_fuser")
+    )
+
+
+def _is_sky_param(name: str) -> bool:
+    return (
+        name.startswith("sky_branch")
+        or name.startswith("sky_model")
+        or "_sky" in name
+        or name.startswith("sky_")
+    )
+
+
+def _is_segment_finetune_main_param(name: str) -> bool:
+    if any(name.startswith(prefix) for prefix in _SEGMENT_FINETUNE_MAIN_PREFIXES):
+        return True
+    return any(token in name for token in _SEGMENT_FINETUNE_MAIN_TOKENS)
+
+
+def _configure_segment_finetune_optimizer(
+    model: Any,
+    *,
+    finetune_cfg: Dict[str, Any],
+    start_step: int,
+) -> None:
+    train_feedback_fuser = bool(finetune_cfg.get("train_feedback_fuser", False))
+    freeze_dino = bool(finetune_cfg.get("freeze_dino", True))
+    if not bool(finetune_cfg.get("freeze_error_predictor", True)):
+        logger.warning(
+            "[batcheval] finetune.freeze_error_predictor=false is ignored; "
+            "Stage5_6 error predictor is always frozen in segment_finetune_train."
+        )
+    freeze_sky_branch = bool(finetune_cfg.get("freeze_sky_branch", True))
+    lr = float(finetune_cfg.get("lr", 2.0e-5))
+    weight_decay = float(finetune_cfg.get("weight_decay", 1.0e-5))
+    grad_clip_norm = float(finetune_cfg.get("grad_clip_norm", 0.0))
+
+    params: List[torch.nn.Parameter] = []
+    names: List[str] = []
+    frozen_preview: List[str] = []
+    for name, param in model.named_parameters():
+        # Eval finetune only adapts the Stage5_6 main scene-update structure.
+        # Error prediction/cache fusion/sky are protocol machinery and stay
+        # fixed unless the feedback fuser is explicitly opted in.
+        trainable = bool(_is_segment_finetune_main_param(str(name)))
+        if _is_stage5_6_error_predictor_param(str(name)):
+            trainable = False
+        elif _is_stage5_6_feedback_fuser_param(str(name)):
+            trainable = bool(train_feedback_fuser)
+        elif name.startswith("image_feature_extractor.dino_adapter.backbone"):
+            trainable = not bool(freeze_dino)
+        elif freeze_sky_branch and _is_sky_param(str(name)):
+            trainable = False
+        param.requires_grad_(bool(trainable))
+        if trainable:
+            params.append(param)
+            names.append(str(name))
+        elif len(frozen_preview) < 12:
+            frozen_preview.append(str(name))
+
+    if len(params) == 0:
+        raise ValueError("segment_finetune_train selected zero trainable parameters")
+
+    base_optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+    for group in base_optimizer.param_groups:
+        group["logical_name"] = "batch_eval_segment_finetune"
+        group["param_names"] = list(names)
+    model.optimizer = _BatchEvalOptimizerAdapter(
+        base_optimizer,
+        grad_clip_norm=float(grad_clip_norm),
+        global_step=int(start_step),
+    )
+    if hasattr(model, "lr_scheduler"):
+        model.lr_scheduler = None
+    setattr(model, "global_step", int(start_step))
+    logger.info(
+        "[batcheval] segment_finetune optimizer configured trainable_params=%d lr=%g weight_decay=%g "
+        "train_feedback_fuser=%s freeze_dino=%s preview=%s",
+        len(names),
+        lr,
+        weight_decay,
+        train_feedback_fuser,
+        freeze_dino,
+        names[:12],
+    )
+    logger.info("[batcheval] segment_finetune frozen preview=%s", frozen_preview)
+
+
+def _load_sky_branch_from_cfg(cfg: Any, device: torch.device) -> Optional[Any]:
+    sky_eval = cfg.batch_eval.get("sky_eval")
+    if sky_eval is None or not bool(sky_eval.get("enable", False)):
+        return None
+    config_file = str(sky_eval.get("config_file") or "")
+    checkpoint = str(sky_eval.get("checkpoint") or sky_eval.get("path") or "")
+    if not config_file:
+        raise ValueError("batch_eval.sky_eval.config_file is required when sky_eval.enable=true")
+    if not checkpoint:
+        raise ValueError("batch_eval.sky_eval.checkpoint is required when sky_eval.enable=true")
+
+    from models.streetforward.sky_branch import SkyBranchV0
+
+    sky_cfg = OmegaConf.load(config_file)
+    sky_branch = SkyBranchV0(sky_cfg, device=device).to(device)
+    payload = torch.load(checkpoint, map_location=device)
+    if not isinstance(payload, dict):
+        raise TypeError(f"SkyBranch checkpoint must be dict-like, got {type(payload).__name__}")
+    state = payload.get("sky_branch_state_dict") or payload.get("model_state_dict") or payload.get("state_dict") or payload
+    if not isinstance(state, dict):
+        raise TypeError(f"SkyBranch checkpoint state must be dict-like, got {type(state).__name__}")
+    incompatible = sky_branch.load_state_dict(state, strict=bool(sky_eval.get("strict", True)))
+    missing = list(getattr(incompatible, "missing_keys", []))
+    unexpected = list(getattr(incompatible, "unexpected_keys", []))
+    if bool(sky_eval.get("freeze_params", True)):
+        for p in sky_branch.parameters():
+            p.requires_grad_(False)
+    sky_branch.eval()
+    sky_branch.reset_runtime_state()
+    logger.info(
+        "[batcheval] loaded SkyBranch checkpoint=%s strict=%s missing=%d unexpected=%d",
+        checkpoint,
+        bool(sky_eval.get("strict", True)),
+        len(missing),
+        len(unexpected),
+    )
+    return sky_branch
 
 
 def _resolve_experiments(batch_eval_cfg: Any, args: argparse.Namespace) -> List[Dict[str, Any]]:
@@ -220,6 +486,7 @@ def _run_one_experiment(
     cfg: Any,
     dataset: Any,
     model: Any,
+    sky_branch: Optional[Any],
     exp_cfg: Dict[str, Any],
     output_root: Path,
     device: torch.device,
@@ -285,7 +552,13 @@ def _run_one_experiment(
     )
     runtime = _as_mapping(_to_plain(cfg.batch_eval.get("runtime", {})) or {}, "batch_eval.runtime")
     history = _as_mapping(_to_plain(cfg.batch_eval.get("history", {})) or {}, "batch_eval.history")
+    stage5_6_eval = _as_mapping(_to_plain(cfg.batch_eval.get("stage5_6_eval", {})) or {}, "batch_eval.stage5_6_eval")
+    sky_eval = _as_mapping(_to_plain(cfg.batch_eval.get("sky_eval", {})) or {}, "batch_eval.sky_eval")
     align_with_scheduler_v8 = bool(runtime.get("align_with_scheduler_v8", False))
+    runtime_mode = runtime.get("mode")
+    if runtime_mode is None:
+        runtime_mode = "inference_only" if bool(runtime.get("no_grad", True)) else "segment_finetune_train"
+    runtime_mode = str(runtime_mode)
     default_block_order = str(runtime.get("block_order", "block_major"))
     default_step_major_switch = int(runtime.get("step_major_switch_interval_steps", 1))
     default_reset_policy = str(runtime.get("reset_policy", "episode_end"))
@@ -306,8 +579,15 @@ def _run_one_experiment(
         default_target_policy = "visited_episode_frames"
         if sv8_episode is not None and sv8_episode.get("total_target_frames") is not None:
             default_max_targets = int(sv8_episode.get("total_target_frames"))
+    update_cameras = cfg.batch_eval.get("update_cameras")
+    if update_cameras is None:
+        update_camera_ids = None
+    else:
+        update_cameras = _as_mapping(_to_plain(update_cameras), "batch_eval.update_cameras")
+        update_camera_ids = [int(x) for x in _as_list(update_cameras.get("ids"), "batch_eval.update_cameras.ids")]
     runtime_cfg = RunnerRuntimeConfig(
-        no_grad=bool(runtime.get("no_grad", True)),
+        mode=str(runtime_mode),
+        no_grad=(str(runtime_mode) == "inference_only"),
         amp=bool(runtime.get("amp", True)),
         reset_state_per_episode=bool(runtime.get("reset_state_per_episode", True)),
         update_node_state=bool(runtime.get("update_node_state", True)),
@@ -323,6 +603,13 @@ def _run_one_experiment(
         max_target_frames_including_source=(
             None if default_max_targets is None else int(default_max_targets)
         ),
+        update_camera_ids=update_camera_ids,
+        stage5_6_enable_nearby_feedback=bool(stage5_6_eval.get("enable_nearby_feedback", False)),
+        stage5_6_nearby_policy=str(stage5_6_eval.get("nearby_policy", "adjacent_non_input")),
+        stage5_6_nearby_role_name=str(stage5_6_eval.get("nearby_role_name", "near_random")),
+        stage5_6_allow_partial_nearby=bool(stage5_6_eval.get("allow_partial_nearby", True)),
+        sky_compose_for_metrics=bool(sky_eval.get("compose_for_metrics", sky_branch is not None)),
+        sky_reset_state_per_episode=bool(sky_eval.get("reset_runtime_state_per_episode", True)),
     )
     runner = StreetForwardBatchEvalRunner(
         model=model,
@@ -332,6 +619,7 @@ def _run_one_experiment(
         metric_acc=metric_acc,
         device=device,
         runtime_cfg=runtime_cfg,
+        sky_branch=sky_branch,
     )
 
     if bool(restore_checkpoint_on_segment):
@@ -404,27 +692,47 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _scope_dataset_to_batch_eval_scene_ids(cfg)
+    from tools.train_minimal_streetforward_stage4_3_v8_common import build_multi_scene_dataset_v4_for_demo
+
     dataset = build_multi_scene_dataset_v4_for_demo(cfg, device)
     dataset.initialize()
 
     model = _build_model(cfg, device)
-    model.bind_eval_dataset(dataset)
+    if hasattr(model, "bind_eval_dataset"):
+        model.bind_eval_dataset(dataset)
+    else:
+        setattr(model, "_bound_dataset", dataset)
 
     ckpt_cfg_path = cfg.batch_eval.checkpoint.get("path")
-    ckpt_path = str(args.checkpoint or ckpt_cfg_path)
+    ckpt_path = str(args.checkpoint or ckpt_cfg_path or "")
     if not ckpt_path:
         raise ValueError("checkpoint path must be provided by --checkpoint or batch_eval.checkpoint.path")
-    _load_checkpoint(
+    ckpt_step = _load_checkpoint(
         model,
         ckpt_path=ckpt_path,
         strict=bool(cfg.batch_eval.checkpoint.get("strict", True)),
     )
     runtime_cfg_any = cfg.batch_eval.get("runtime", {})
     runtime_cfg = _as_mapping(_to_plain(runtime_cfg_any), "batch_eval.runtime")
+    runtime_mode = runtime_cfg.get("mode")
+    if runtime_mode is None:
+        runtime_mode = "inference_only" if bool(runtime_cfg.get("no_grad", True)) else "segment_finetune_train"
+    runtime_mode = str(runtime_mode)
+    if runtime_mode == "segment_finetune_train":
+        finetune_cfg = _as_mapping(
+            _to_plain(cfg.batch_eval.get("finetune", {})) or {},
+            "batch_eval.finetune",
+        )
+        _configure_segment_finetune_optimizer(
+            model,
+            finetune_cfg=finetune_cfg,
+            start_step=int(ckpt_step),
+        )
+    sky_branch = _load_sky_branch_from_cfg(cfg, device)
     restore_checkpoint_on_segment = bool(
         runtime_cfg.get(
             "restore_checkpoint_on_segment",
-            runtime_cfg.get("reset_ckpt_per_segment", not bool(runtime_cfg.get("no_grad", True))),
+            runtime_cfg.get("reset_ckpt_per_segment", str(runtime_mode) == "segment_finetune_train"),
         )
     )
     base_ckpt_bytes: bytes | None = None
@@ -443,6 +751,7 @@ def main() -> None:
             cfg=cfg,
             dataset=dataset,
             model=model,
+            sky_branch=sky_branch,
             exp_cfg=exp_cfg,
             output_root=output_root,
             device=device,

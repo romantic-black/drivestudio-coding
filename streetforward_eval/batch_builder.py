@@ -5,7 +5,6 @@ from typing import Any, Dict, List, Tuple
 import torch
 
 from datasets.multi_scene_dataset_v4 import BatchRequestV4
-from tools.train_minimal_streetforward_stage1_1 import convert_batch_to_minimal_format
 
 ImageRef = Tuple[int, int]
 
@@ -64,6 +63,8 @@ def build_update_batch_from_refs(
     protocol_name: str,
     device: torch.device,
 ) -> Dict[str, Any]:
+    from tools.train_minimal_streetforward_stage1_1 import convert_batch_to_minimal_format
+
     source_frame_idx = validate_source_refs(source_image_refs, camera_ids)
     validate_update_target_refs(
         update_target_image_refs=update_target_image_refs,

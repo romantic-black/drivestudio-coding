@@ -699,25 +699,44 @@ class MinimalStreetForwardStage4_2(MinimalStreetForwardStage4_1):
         profile_phase_timing: bool = False,
         sync_cuda_timing: bool = False,
         scheduler_node_sync: Optional[Dict[str, Any]] = None,
+        runtime_policy: Optional[Any] = None,
     ) -> Dict[str, Any]:
-        self.train()
+        policy = runtime_policy
+        do_backward = True if policy is None else bool(getattr(policy, "do_backward", True))
+        do_optimizer_step = True if policy is None else bool(getattr(policy, "do_optimizer_step", do_backward))
+        update_hidden_cache = True if policy is None else bool(getattr(policy, "update_hidden_cache", True))
+        writeback_node_state = True if policy is None else bool(getattr(policy, "writeback_node_state", True))
+        reset_node_state_after_block = False if policy is None else bool(
+            getattr(policy, "reset_node_state_after_block", False)
+        )
+        force_eval_mode = False if policy is None else bool(getattr(policy, "force_eval_mode", False))
+        if do_optimizer_step and not do_backward:
+            raise ValueError("RuntimePolicy invalid: do_optimizer_step=true requires do_backward=true")
+        prev_mode = self.training
+        if force_eval_mode:
+            self.eval()
+        else:
+            self.train()
         self._perf_acc = {}
         node_state_sync_update = False
         node_state_sync_reset = False
         timing_ms: Dict[str, float] = {"forward_ms": 0.0, "backward_ms": 0.0, "optimizer_ms": 0.0}
         t0 = time.perf_counter()
-        self.optimizer.zero_grad()
+        if do_backward:
+            self.optimizer.zero_grad()
         out = self.forward(batch)
+        if force_eval_mode and prev_mode:
+            self.train()
         if profile_phase_timing:
             if sync_cuda_timing and torch.cuda.is_available():
                 torch.cuda.synchronize()
         t1 = time.perf_counter()
         if profile_phase_timing:
             timing_ms["forward_ms"] = float((t1 - t0) * 1000.0)
-        if torch.is_tensor(out.get("loss")):
+        if do_backward and torch.is_tensor(out.get("loss")):
             retain_graph = bool(out.get("_retain_graph_for_proxy_backward", False)) and out.get("proxies") is not None
             out["loss"].backward(retain_graph=retain_graph)
-        if out.get("proxies") is not None:
+        if do_backward and out.get("proxies") is not None:
             _backward_to_render_params_bg_rigid_distant(
                 out["render_params"],
                 out["proxies"],
@@ -727,21 +746,22 @@ class MinimalStreetForwardStage4_2(MinimalStreetForwardStage4_1):
                 out.get("_proxies_distant"),
                 rigid_world_proxy_pairs=out.get("_rigid_world_proxy_pairs"),
             )
-        grad_norms = self._compute_branch_grad_norms()
+        grad_norms = self._compute_branch_grad_norms() if do_backward else {}
         if profile_phase_timing:
             if sync_cuda_timing and torch.cuda.is_available():
                 torch.cuda.synchronize()
         t2 = time.perf_counter()
         if profile_phase_timing:
             timing_ms["backward_ms"] = float((t2 - t1) * 1000.0)
-        self.optimizer.step()
+        if do_optimizer_step:
+            self.optimizer.step()
         if profile_phase_timing:
             if sync_cuda_timing and torch.cuda.is_available():
                 torch.cuda.synchronize()
         t3 = time.perf_counter()
         if profile_phase_timing:
             timing_ms["optimizer_ms"] = float((t3 - t2) * 1000.0)
-        if "_cache_key" in out:
+        if update_hidden_cache and "_cache_key" in out:
             key = out["_cache_key"]
             if out.get("_h_new_bg") is not None:
                 self.h_cache_bg[key] = out["_h_new_bg"].detach()
@@ -750,7 +770,7 @@ class MinimalStreetForwardStage4_2(MinimalStreetForwardStage4_1):
             if out.get("_h_new_rigid") is not None:
                 self.h_cache_rigid[key] = out["_h_new_rigid"].detach()
 
-        if scheduler_node_sync is not None:
+        if writeback_node_state and scheduler_node_sync is not None:
             U = int(scheduler_node_sync["U"])
             seg = int(scheduler_node_sync["segment_local_step"])
             reset_after_block = bool(scheduler_node_sync.get("reset_after_block", False))
@@ -762,10 +782,18 @@ class MinimalStreetForwardStage4_2(MinimalStreetForwardStage4_1):
             if reset_after_block:
                 self.reset_node_state()
                 node_state_sync_reset = True
-        elif self.update_node_state_interval > 0 and step is not None and step % self.update_node_state_interval == 0:
+        elif (
+            writeback_node_state
+            and self.update_node_state_interval > 0
+            and step is not None
+            and step % self.update_node_state_interval == 0
+        ):
             self._writeback_node_states_from_out(out)
             if self.reset_node_state_interval > 0 and step % self.reset_node_state_interval == 0:
                 self.reset_node_state()
+        if reset_node_state_after_block:
+            self.reset_node_state()
+            node_state_sync_reset = True
 
         num_gaussians_bg = int(out["_node_state_bg"].means.shape[0])
         node_state_distant = out.get("_node_state_distant")

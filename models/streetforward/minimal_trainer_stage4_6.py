@@ -1519,6 +1519,7 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
         profile_phase_timing: bool = False,
         sync_cuda_timing: bool = False,
         scheduler_node_sync: Optional[Dict[str, Any]] = None,
+        runtime_policy: Optional[Any] = None,
     ) -> Dict[str, Any]:
         out = super().train_step(
             batch=batch,
@@ -1526,6 +1527,7 @@ class MinimalStreetForwardStage4_6(MinimalStreetForwardStage4_5BaseNoRigidHead):
             profile_phase_timing=profile_phase_timing,
             sync_cuda_timing=sync_cuda_timing,
             scheduler_node_sync=scheduler_node_sync,
+            runtime_policy=runtime_policy,
         )
         # Stage4_6 no longer has rigid-specific trainable heads.
         # Keep legacy metric for compatibility and expose shared-head diagnostics.

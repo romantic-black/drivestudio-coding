@@ -230,14 +230,18 @@ class MinimalStreetForwardStage5_3_Production(MinimalStreetForwardStage5_3):
         profile_phase_timing: bool = False,
         sync_cuda_timing: bool = False,
         scheduler_node_sync: Optional[Dict[str, Any]] = None,
+        runtime_policy: Optional[Any] = None,
     ) -> Dict[str, Any]:
-        out = super().train_step(
-            batch=batch,
-            step=step,
-            profile_phase_timing=profile_phase_timing,
-            sync_cuda_timing=sync_cuda_timing,
-            scheduler_node_sync=scheduler_node_sync,
-        )
+        kwargs: Dict[str, Any] = {
+            "batch": batch,
+            "step": step,
+            "profile_phase_timing": profile_phase_timing,
+            "sync_cuda_timing": sync_cuda_timing,
+            "scheduler_node_sync": scheduler_node_sync,
+        }
+        if runtime_policy is not None:
+            kwargs["runtime_policy"] = runtime_policy
+        out = super().train_step(**kwargs)
         out["optimizer/global_step"] = float(self.optimizer.global_step)
         out["optimizer/grad_norm_total"] = float(self.optimizer.last_grad_norm)
         for group in self.optimizer.param_groups:

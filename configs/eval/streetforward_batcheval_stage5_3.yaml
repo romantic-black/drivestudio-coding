@@ -1,11 +1,12 @@
-base_config_file: /root/autodl-tmp/outputs/minimal_sf_stage5_4_multi_scene_v8_adamw_warmcos/experiment002_60w_40w_12block_base_on_001/config.yaml
+base_config_file: /root/autodl-tmp/outputs/minimal_sf_stage5_3_multi_scene_v8/experiment002_120w/config.yaml
+
 batch_eval:
   enable: true
-  output_dir: /root/autodl-tmp/outputs/batch_eval_10
+  output_dir: /root/autodl-tmp/outputs/batch_eval_10_stage5_3
   data_mode: segment_finetune_train
 
   checkpoint:
-    path: "/root/autodl-tmp/outputs/minimal_sf_stage5_4_multi_scene_v8_adamw_warmcos/experiment002_60w_40w_12block_base_on_001/checkpoints/minimal_sf_stage5_4_multi_scene_v8_step50000.pt"
+    path: "/root/autodl-tmp/outputs/minimal_sf_stage5_3_multi_scene_v8/experiment002_120w/checkpoints/minimal_sf_stage5_3_multi_scene_v8_step50000.pt"
     strict: true
 
   dataset:
@@ -22,7 +23,8 @@ batch_eval:
     names: ["front", "front_left", "front_right"]
 
   runtime:
-    no_grad: false
+    mode: inference_only
+    no_grad: true
     amp: false
     reset_state_per_episode: true
     align_with_scheduler_v8: true
@@ -33,7 +35,7 @@ batch_eval:
   history:
     update_step_norm_ema: true
     record_support_residual_on_input_exit: true
-    record_each_step: true
+    record_each_step: false
 
   render:
     save_pre_update: true
@@ -48,12 +50,12 @@ batch_eval:
     report_full_image: true
     compute_psnr: true
     compute_ssim: true
-    compute_lpips: true
+    compute_lpips: false
     compute_l1: true
     min_valid_pixels: 32
 
   experiments:
-    - name: exp2_10_5
+    - name: exp2_10_5_stage5_3
       sequence_length: 10
       input_offsets: [1, 3, 5, 7, 9]
       eval_offsets: all

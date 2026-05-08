@@ -1,0 +1,89 @@
+base_config_file: /root/autodl-tmp/outputs/minimal_sf_stage5_6_multi_scene_v8_adamw_warmcos/experiment002_60w_40w_block16/config.yaml
+
+batch_eval:
+  enable: true
+  output_dir: /root/autodl-tmp/outputs/batch_eval_10_stage5_6_sky
+  data_mode: segment_finetune_train
+
+  checkpoint:
+    path: "/root/autodl-tmp/outputs/minimal_sf_stage5_6_multi_scene_v8_adamw_warmcos/experiment002_60w_40w_block16/checkpoints/minimal_sf_stage5_6_multi_scene_v8_step250000.pt"
+    strict: true
+
+  dataset:
+    scene_ids: [10, 140, 194, 196,  142, 114, 121]
+    segment_policy: all
+    require_full_window: true
+    stride: 30
+    max_episodes_per_scene: null
+    max_total_episodes: null
+    window_policy: sliding
+
+  cameras:
+    ids: [0, 1, 2]
+    names: ["front", "front_left", "front_right"]
+
+  update_cameras:
+    ids: [0, 1, 2]
+    names: ["front", "front_left", "front_right"]
+
+  runtime:
+    mode: segment_finetune_train
+    amp: false
+    reset_state_per_episode: true
+    align_with_scheduler_v8: true
+    update_node_state: true
+    update_hidden_state: true
+    update_view_transient: true
+
+  stage5_6_eval:
+    enable_nearby_feedback: true
+    nearby_policy: adjacent_non_input
+    nearby_role_name: near_random
+    allow_partial_nearby: true
+
+  sky_eval:
+    enable: true
+    config_file: configs/skybranch_stage5_4_exp002.yaml
+    checkpoint: "/root/autodl-tmp/outputs/skybranch_stage5_4_exp002/checkpoints/skybranch_resume_step_100000.pth"
+    strict: true
+    freeze_params: true
+    compose_for_metrics: true
+    reset_runtime_state_per_episode: true
+
+  finetune:
+    enable: true
+    lr: 2.0e-5
+    weight_decay: 1.0e-5
+    train_feedback_fuser: false
+    freeze_error_predictor: true
+    freeze_sky_branch: true
+    freeze_dino: true
+
+  history:
+    update_step_norm_ema: true
+    record_support_residual_on_input_exit: true
+    record_each_step: false
+
+  render:
+    save_pre_update: true
+    save_each_iter_views: false
+    save_png: true
+    save_video: false
+    save_numpy: false
+    save_depth_or_acc: false
+
+  metrics:
+    primary_mask: full_image
+    report_full_image: true
+    compute_psnr: true
+    compute_ssim: true
+    compute_lpips: true
+    compute_l1: true
+    min_valid_pixels: 32
+
+  experiments:
+    - name: exp2_10_5_stage5_6_sky
+      sequence_length: 10
+      input_offsets: [0, 2, 4, 6, 8]
+      eval_offsets: all
+      steps_per_input: 16

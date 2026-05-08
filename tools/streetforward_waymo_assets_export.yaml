@@ -1,0 +1,119 @@
+output_name: streetforward_waymo_assets_export
+
+data:
+  data_root: "/root/autodl-tmp/waymo"
+  dataset: "waymo"
+  start_timestep: 0
+  end_timestep: -1
+  preload_device: cpu
+  sky_mask_semantics: one_is_sky
+
+  # 按你的实际场景改；先用一个 scene 试跑
+  train_scene_ids: [546, 552, 555, 581, 592, 610, 614, 620, 621, 623, 640, 700, 703, 735, 754, 784, 788, 795, 796]
+  eval_scene_ids: []
+
+  preload:
+    enable: false
+
+  pixel_source:
+    type: datasets.waymo.waymo_sourceloader.WaymoPixelSource
+    # 暂存区 preflight 对 waymo 默认/推荐就是前三前向相机
+    cameras: [0, 1, 2]
+    downscale_when_loading: [3, 3, 3]
+    downscale: 1
+    undistort: false
+    test_image_stride: 0
+    max_test_images: 0
+    load_sky_mask: true
+    load_dynamic_mask: true
+    load_egocar_mask: true
+    load_depth_maps: true
+    load_objects: true
+    load_smpl: false
+    sampler:
+      buffer_downscale: 8
+      buffer_ratio: 0.5
+      start_enhance_weight: 3
+
+  lidar_source:
+    type: datasets.waymo.waymo_sourceloader.WaymoLiDARSource
+    load_lidar: true
+    # 这 5 个 key 现在是 waymo preflight 强校验必填
+    only_use_top_lidar: true
+    truncated_max_range: null
+    truncated_min_range: null
+    lidar_downsample_factor: 1
+    lidar_percentile: 0.02
+
+  assets:
+    root: "/root/autodl-tmp/streetforward_assets_waymo"
+
+dataset:
+  num_source_keyframes: 1
+  num_target_keyframes: 3
+  segment_overlap_ratio: 0.2
+  min_keyframes_per_scene: 2
+  min_keyframes_per_segment: 2
+  preload_scene_count: 2
+  keyframe_split_config:
+    num_splits: 0
+    min_count: 1
+    min_length: 3.0
+
+  # 注意：这里仍然是 seg0_camera_opencv 语义
+  segment_aabb:
+    - [-20.0, -10.0, -5.0]
+    - [20.0, 4.8, 80.0]
+
+  pointcloud:
+    type: "hybrid"
+    lidar_sparsity: full
+    monocular_chosen_cam_ids: [0, 1, 2]
+    monocular_sparsity: full
+    monocular_filter_sky: true
+    monocular_depth_consistency: false
+    monocular_downscale: 1
+    monocular_dynamic_recovery_bbox_expand_xyz_m: [0.5, 0.2, 0.5]
+    monocular_dynamic_recovery_max_points_per_instance: 20000
+    near_max_points: 600000
+    distant_max_points: 400000
+    static_instance_motion:
+      enable: true
+      traj_length_thresh_m: 0.5
+
+# knn 资产脚本会读取这些
+model:
+  stage: "5_1"
+  struct_decoder:
+    enable: true
+    type: "xcpe_knn_attn"
+    knn_attention:
+      enable: true
+      neighbor_policy: "fixed_cached"
+      out_neighbor_policy: "mask_self_fallback"
+      k: 8
+  branches:
+    bg:
+      init:
+        scale_init:
+          mode: knn
+          isotropic_log_value: -2.30
+          knn_k: 8
+          knn_log_scale_bias: -1.5
+        opacity_init: 0.1
+    distant:
+      init:
+        scale_init:
+          mode: isotropic
+          isotropic_log_value: -1.90
+          knn_k: 8
+          knn_log_scale_bias: -1.5
+        opacity_init: 0.05
+    rigid:
+      init:
+        scale_init:
+          mode: knn
+          isotropic_log_value: -2.90
+          knn_k: 8
+          knn_log_scale_bias: -1.5
+        opacity_init: 0.2
