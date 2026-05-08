@@ -64,22 +64,14 @@ demo:
     strict: true
     load_mode: full_state
   scheduler:
-    type: eval_v8_stage5_6
-    name: stage5_6_demo_eval
+    type: train_v8_stage5_6
+    name: stage5_6_demo_train_v8
     scene_ids: [10, 140, 194, 196, 142, 114, 121]
     initial_scene_id: 10
     initial_segment_id: 0
+    # In train_v8_stage5_6 mode this is the training episode_start_keyframe_pos,
+    # not a dense eval-frame window offset.
     initial_sequence_start_pos: 0
-    sequence_length: 10
-    input_offsets: [0, 2, 4, 6, 8]
-    eval_offsets: all
-    steps_per_input: 16
-    block_order: step_major
-    step_major_switch_interval_steps: 4
-    max_target_frames_including_source: 3
-    window_policy: sliding
-    stride: 30
-    require_full_window: true
     wrap_scene: true
     wrap_segment: true
     wrap_episode: true

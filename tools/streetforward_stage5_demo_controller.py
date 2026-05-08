@@ -13,7 +13,7 @@ except ImportError:
 
 from nerfview import CameraState
 
-from streetforward_eval.stage5_6_runtime import run_stage5_6_update_step
+from streetforward_eval.stage5_6_runtime import run_stage5_6_update_step, stage5_6_runtime_policy
 from tools.train_minimal_streetforward_stage1_1 import convert_batch_to_minimal_format
 
 
@@ -140,6 +140,7 @@ class Stage5DemoController:
         return (
             raw_batch.get("_scheduler_demo_v1_info")
             or raw_batch.get("_scheduler_eval_v8_demo_info")
+            or raw_batch.get("_scheduler_train_v8_demo_info")
             or raw_batch.get("_scheduler_v8_aligned_info")
             or raw_batch.get("_scheduler_v7_aligned_info")
             or raw_batch.get("_scheduler_v4_aligned_info")
@@ -258,6 +259,7 @@ class Stage5DemoController:
         out: Dict[str, Any] = {
             "stage": self.stage,
             "mode": self.mode,
+            "demo_scheduler_type": str(scheduler_info.get("demo_scheduler_type", "")),
             "global_step": int(self.display.global_step),
             "optimizer_global_step": int(
                 getattr(getattr(self.trainer, "optimizer", None), "global_step", getattr(self.trainer, "global_step", 0))
@@ -292,18 +294,108 @@ class Stage5DemoController:
         out.update(stats)
         return out
 
+    def _stage5_6_scheduler_node_sync_from_events(
+        self,
+        scheduler_info: Dict[str, Any],
+        events: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        sv8 = self.cfg.get("scheduler_v8") if self.cfg is not None and hasattr(self.cfg, "get") else None
+        execution = sv8.get("execution") if sv8 is not None and hasattr(sv8, "get") else None
+        block_order = str(scheduler_info.get("block_order", "block_major")).strip()
+        if execution is not None and hasattr(execution, "get"):
+            reset_policy = str(
+                execution.get(
+                    "reset_policy",
+                    "episode_end" if block_order == "step_major" else "block_end",
+                )
+            ).strip()
+        else:
+            reset_policy = "episode_end" if block_order == "step_major" else "block_end"
+        if reset_policy not in ("block_end", "episode_end", "never"):
+            raise ValueError("scheduler_v8.execution.reset_policy must be one of ['block_end', 'episode_end', 'never']")
+        if reset_policy == "block_end":
+            should_reset = any(isinstance(ev, dict) and ev.get("type") == "block_end" for ev in events)
+        elif reset_policy == "episode_end":
+            should_reset = any(isinstance(ev, dict) and ev.get("type") == "episode_end" for ev in events)
+        else:
+            should_reset = False
+        u = int(scheduler_info.get("U", 1))
+        if u < 1:
+            raise ValueError("scheduler_v8 scheduler_info.U must be >= 1 for model node-state sync")
+        return {
+            "U": int(u),
+            "segment_local_step": int(scheduler_info.get("segment_local_step", 0)),
+            "reset_after_block": bool(should_reset),
+            "reset_policy": str(reset_policy),
+        }
+
+    def _run_stage5_6_train_scheduler_step(
+        self,
+        *,
+        minimal: Dict[str, Any],
+        scheduler_info: Dict[str, Any],
+        events: List[Dict[str, Any]],
+        defer_node_state_reset: bool,
+    ) -> Dict[str, Any]:
+        sync = self._stage5_6_scheduler_node_sync_from_events(scheduler_info, events)
+        if bool(defer_node_state_reset) and bool(sync.get("reset_after_block", False)):
+            sync = dict(sync)
+            sync["reset_after_block"] = False
+        policy = stage5_6_runtime_policy(
+            do_train=bool(self._mode_train_and_infer),
+            update_hidden_state=bool(getattr(self.scheduler, "update_hidden_state", self.update_hidden_state)),
+            update_node_state=bool(getattr(self.scheduler, "update_node_state", self.update_node_state)),
+            reset_node_state_after_block=True,
+            force_eval_mode=False,
+        )
+        if self._mode_train_and_infer:
+            return self.trainer.train_step(
+                minimal,
+                step=None,
+                profile_phase_timing=False,
+                sync_cuda_timing=False,
+                scheduler_node_sync=sync,
+                runtime_policy=policy,
+            )
+        with torch.no_grad():
+            return self.trainer.inference_step_from_train_batch(
+                minimal,
+                step=None,
+                scheduler_node_sync=sync,
+                runtime_policy=policy,
+            )
+
     def step_current_block_once(self) -> Dict[str, Any]:
         if self.busy:
             raise ValueError("controller is busy")
         self.busy = True
         try:
-            raw_batch = self.scheduler.materialize_current_batch_without_advance()
+            train_v8_demo = bool(getattr(self.scheduler, "is_stage5_6_train_v8_demo", False))
+            if train_v8_demo:
+                raw_batch = self.scheduler.next_batch_for_update()
+            else:
+                raw_batch = self.scheduler.materialize_current_batch_without_advance()
             events = self.scheduler.pop_events() if hasattr(self.scheduler, "pop_events") else []
             info = self._extract_scheduler_info(raw_batch)
             minimal = self._batch_to_minimal(raw_batch)
             did_train_step = False
+            event_block_exit = any(isinstance(e, dict) and e.get("type") == "block_exit" for e in events)
+            should_record = bool(self.record_each_step) or (
+                bool(self.record_block_history_on_block_exit) and bool(event_block_exit)
+            )
+            defer_node_state_reset = False
+            if train_v8_demo and should_record:
+                sync_probe = self._stage5_6_scheduler_node_sync_from_events(info, events)
+                defer_node_state_reset = bool(sync_probe.get("reset_after_block", False))
             if self._mode_train_and_infer:
-                if bool(getattr(self.scheduler, "is_stage5_6_eval_demo", False)):
+                if train_v8_demo:
+                    stats = self._run_stage5_6_train_scheduler_step(
+                        minimal=minimal,
+                        scheduler_info=info,
+                        events=events,
+                        defer_node_state_reset=bool(defer_node_state_reset),
+                    )
+                elif bool(getattr(self.scheduler, "is_stage5_6_eval_demo", False)):
                     aligned = minimal.get("_scheduler_v8_aligned_info") or {}
                     stats = run_stage5_6_update_step(
                         model=self.trainer,
@@ -328,7 +420,14 @@ class Stage5DemoController:
                     )
                 did_train_step = True
             else:
-                if bool(getattr(self.scheduler, "is_stage5_6_eval_demo", False)):
+                if train_v8_demo:
+                    stats = self._run_stage5_6_train_scheduler_step(
+                        minimal=minimal,
+                        scheduler_info=info,
+                        events=events,
+                        defer_node_state_reset=bool(defer_node_state_reset),
+                    )
+                elif bool(getattr(self.scheduler, "is_stage5_6_eval_demo", False)):
                     aligned = minimal.get("_scheduler_v8_aligned_info") or {}
                     stats = run_stage5_6_update_step(
                         model=self.trainer,
@@ -347,26 +446,36 @@ class Stage5DemoController:
                         update_history_memory=self.update_history_memory,
                         update_view_transient=self.update_view_transient,
                     )
-            if hasattr(self.scheduler, "mark_current_block_updated"):
+            if (not train_v8_demo) and hasattr(self.scheduler, "mark_current_block_updated"):
                 self.scheduler.mark_current_block_updated()
             post_events = self.scheduler.pop_events() if hasattr(self.scheduler, "pop_events") else []
             all_events = list(events) + list(post_events)
             should_record = bool(self.record_each_step) or (
                 bool(self.record_block_history_on_block_exit)
                 and any(
-                    isinstance(e, dict) and e.get("type") == "demo_block_exit" and bool(e.get("model_update", False))
+                    isinstance(e, dict)
+                    and (
+                        (e.get("type") == "demo_block_exit" and bool(e.get("model_update", False)))
+                        or e.get("type") == "block_exit"
+                    )
                     for e in all_events
                 )
             )
-            if should_record and bool(getattr(self.scheduler, "is_stage5_6_eval_demo", False)):
+            if should_record and (
+                bool(getattr(self.scheduler, "is_stage5_6_eval_demo", False)) or bool(train_v8_demo)
+            ):
                 rec = self._record_history_for_batch(
                     minimal,
                     minimal.get("_scheduler_v8_aligned_info") or info,
-                    reason="eval_cursor_step",
+                    reason="train_v8_step" if train_v8_demo else "eval_cursor_step",
                 )
                 if rec:
                     stats = dict(stats or {})
                     stats.update(rec)
+            if bool(defer_node_state_reset) and hasattr(self.trainer, "reset_node_state"):
+                self.trainer.reset_node_state()
+                stats = dict(stats or {})
+                stats["deferred_node_state_reset"] = 1.0
             self.display.global_step += 1
             if did_train_step:
                 self.train_steps_total += 1
@@ -401,7 +510,10 @@ class Stage5DemoController:
             raw_batch = op()
             merge_stats = dict(stats or {})
             merge_stats.update(rec_stats)
-            if bool(getattr(self.scheduler, "is_stage5_6_eval_demo", False)) and op_name in {
+            stage5_6_reset_scope = bool(getattr(self.scheduler, "is_stage5_6_eval_demo", False)) or bool(
+                getattr(self.scheduler, "is_stage5_6_train_v8_demo", False)
+            )
+            if stage5_6_reset_scope and op_name in {
                 "next_scene",
                 "prev_scene",
                 "next_segment",
@@ -444,7 +556,9 @@ class Stage5DemoController:
                 raise ValueError("scheduler does not support set_scope")
             raw_batch = self.scheduler.set_scope(int(scene_id), int(segment_id))
             rec_stats.update({"manual_set_scope": 1.0})
-            if bool(getattr(self.scheduler, "is_stage5_6_eval_demo", False)):
+            if bool(getattr(self.scheduler, "is_stage5_6_eval_demo", False)) or bool(
+                getattr(self.scheduler, "is_stage5_6_train_v8_demo", False)
+            ):
                 rec_stats.update(self._reset_for_eval_scope_change())
             return self._refresh_display_from_raw_batch(raw_batch, stats=rec_stats)
         finally:
@@ -460,7 +574,9 @@ class Stage5DemoController:
                 raise ValueError("scheduler does not support set_sequence_start_pos")
             raw_batch = self.scheduler.set_sequence_start_pos(int(sequence_start_pos))
             rec_stats.update({"manual_set_sequence_start_pos": 1.0})
-            if bool(getattr(self.scheduler, "is_stage5_6_eval_demo", False)):
+            if bool(getattr(self.scheduler, "is_stage5_6_eval_demo", False)) or bool(
+                getattr(self.scheduler, "is_stage5_6_train_v8_demo", False)
+            ):
                 rec_stats.update(self._reset_for_eval_scope_change())
             return self._refresh_display_from_raw_batch(raw_batch, stats=rec_stats)
         finally:
@@ -505,7 +621,9 @@ class Stage5DemoController:
             if not hasattr(self.scheduler, "resample_episode"):
                 raise ValueError("scheduler does not support resample_episode")
             raw_batch = self.scheduler.resample_episode()
-            if bool(getattr(self.scheduler, "is_stage5_6_eval_demo", False)):
+            if bool(getattr(self.scheduler, "is_stage5_6_eval_demo", False)) or bool(
+                getattr(self.scheduler, "is_stage5_6_train_v8_demo", False)
+            ):
                 rec_stats.update(self._reset_for_eval_scope_change())
                 rec_stats.update({"manual_resample_episode": 1.0})
             else:
