@@ -41,6 +41,10 @@ def build_summary_rows(final_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 "num_views": int(len(rows)),
                 "mean_psnr": _mean([float(r["psnr"]) for r in rows]),
                 "mean_l1": _mean([float(r["l1"]) for r in rows]),
+                "mean_ssim": _mean([float(r.get("ssim", float("nan"))) for r in rows]),
+                "mean_ssim_non_sky": _mean([float(r.get("ssim_non_sky", float("nan"))) for r in rows]),
+                "mean_lpips": _mean([float(r["lpips"]) for r in rows]),
+                "mean_lpips_non_sky": _mean([float(r.get("lpips_non_sky", float("nan"))) for r in rows]),
                 "mean_psnr_input_frames": _mean(
                     [float(r["psnr"]) for r in rows if str(r.get("frame_group")) == "input"]
                 ),

@@ -1,0 +1,166 @@
+output_name: skybranch_v0_on_stage5_6
+log_dir: outputs/skybranch_v0
+
+streetforward:
+  checkpoint: "/path/to/streetforward_5_6.ckpt"
+  config: "configs/minimal_streetforward_stage5_6_production_multi_scene_v8.yaml"
+  freeze_params: true
+  eval_mode: true
+
+data:
+  data_root: "/root/autodl-tmp/nuScenes/"
+  dataset: "nuscenes"
+  sky_mask_semantics: one_is_sky
+  train_scene_ids: [0]
+  preload:
+    enable: true
+    num_workers: 1
+    max_pending_tasks: 64
+    dedupe_tasks: true
+    drop_stale_hints: true
+    warm_scene_meta: true
+    warm_segment_static: true
+    warm_next_block_exact: true
+    warm_test_refs: false
+    warm_episode_source_superset: true
+    enable_view_pack_cache: true
+  pixel_source:
+    type: datasets.nuscenes.nuscenes_sourceloader.NuScenesPixelSource
+    cameras: [0, 1, 2]
+    downscale_when_loading: [3, 3, 3]
+    downscale: 1
+    undistort: false
+    load_sky_mask: true
+    load_dynamic_mask: true
+    load_egocar_mask: true
+    load_depth_maps: true
+    load_objects: true
+  lidar_source:
+    type: datasets.nuscenes.nuscenes_sourceloader.NuScenesLiDARSource
+    load_lidar: true
+  assets:
+    root: "/root/autodl-tmp/streetforward_assets"
+
+dataset:
+  num_source_keyframes: 1
+  num_target_keyframes: 3
+  segment_overlap_ratio: 0.2
+  min_keyframes_per_scene: 2
+  min_keyframes_per_segment: 2
+  segment_aabb:
+    - [-20.0, -10.0, -20.0]
+    - [20.0, 4.8, 40.0]
+  pointcloud:
+    type: "hybrid"
+    lidar_sparsity: full
+    monocular_chosen_cam_ids: [0, 1, 2, 3, 4, 5]
+    monocular_sparsity: full
+    monocular_filter_sky: true
+
+scheduler_v8:
+  enable: true
+  block:
+    steps_per_block: 16
+  episode:
+    blocks_per_episode: 5
+    total_target_frames: 3
+    include_source_frame: true
+    target_policy: visited_episode_frames
+    block_source_frame_policy: fixed_once_per_episode
+    frame_within_keyframe_policy: random_once_per_episode
+    min_keyframes_required_policy: skip_if_less_than_window
+  traversal:
+    mode: round_robin_episode_interleave
+    switch_after_episode: true
+    fixed_scene_id: null
+    fixed_segment_id: null
+    segment_order: ascending
+    scene_order: shuffle_per_epoch
+  execution:
+    block_order: step_major
+    step_major_switch_interval_steps: 4
+    reset_policy: episode_end
+  preload:
+    emit_hints: true
+    warm_next_block_exact: true
+    warm_next_episode_chain: true
+  aux_feature_splat_targets:
+    enable: false
+  near_random_supervision:
+    enable: false
+
+model:
+  stage: "skybranch_v0"
+  sh_degree: 2
+  # Keep KNN extraction compatible with the existing V4 dataset builder.
+  struct_decoder:
+    enable: false
+
+sky:
+  origin_mode: camera_centered_rotation_only
+  center_local: [0.0, 0.0, 0.0]
+  radius: 80.0
+  resolution: 48
+  hemisphere: true
+  hemisphere_up: [0.0, -1.0, 0.0]
+
+sky_branch:
+  sh_degree: 2
+  feature_dim: 64
+  hidden_dim: 64
+  clamp_sh_dc: true
+  render:
+    unpremultiply_rgb: true
+    alpha_eps: 1.0e-4
+  direct_rgb_lift:
+    enable: true
+    blend: 0.35
+    support_min: 1.0e-4
+  feature_extractor:
+    in_channels: 7
+    hidden_dim: 64
+    num_blocks: 3
+    output_dim: 64
+  lifting:
+    support_min: 1.0e-4
+    weight_threshold: 1.0e-5
+    use_sky_core_mask: true
+    sky_core_erode_kernel: 5
+  init:
+    opacity_init: 0.7
+    scale_init:
+      mode: angular
+      angular_coverage_factor: 1.0
+      isotropic_log_value: -1.5
+  eta:
+    scales: 0.0
+    opacity: 0.0
+    sh_dc: 0.05
+    sh_rest: 0.0
+
+loss:
+  type: charbonnier
+  eps: 1.0e-3
+  comp_weight: 1.0
+  sky_direct_weight: 0.2
+  sky_alpha_weight: 0.0
+  sh_smooth_weight: 0.0
+  sky_core_erode_kernel: 5
+  semantic_weight:
+    sky_core: 1.0
+    sky_boundary: 0.2
+    non_sky: 0.0
+
+optimizer:
+  type: adamw
+  lr: 2.0e-4
+  weight_decay: 1.0e-4
+  eps: 1.0e-8
+
+training:
+  max_iterations: 60000
+  amp: true
+  grad_clip_norm: 1.0
+  reset_sky_state_policy: segment
+  log_interval: 100
+  save_checkpoint_freq: 1000

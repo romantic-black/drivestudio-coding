@@ -341,6 +341,113 @@ class MinimalStreetForwardStage4_5(MinimalStreetForwardStage4_2):
         c2w = view.camtoworlds if hasattr(view, "camtoworlds") else view["camtoworlds"]
         return c2w if c2w.dim() == 2 else c2w[0]
 
+    def _render_params_from_node_state_for_scene_render(self, node_state: Any) -> Dict[str, torch.Tensor]:
+        colors = torch.cat([node_state.sh_dc[:, None, :], node_state.sh_rest], dim=1)
+        scales = torch.exp(node_state.scales_log)
+        render_alpha = torch.sigmoid(node_state.opacity_logit).squeeze(-1)
+        return {
+            "means_r": node_state.means,
+            "scales_log_r": node_state.scales_log,
+            "scales_r": scales,
+            "quats_r": node_state.quats,
+            "opacity_logit_r": node_state.opacity_logit,
+            "opacities_r": render_alpha,
+            "sh_dc_r": node_state.sh_dc,
+            "sh_rest_r": node_state.sh_rest,
+            "colors_r": colors,
+        }
+
+    @staticmethod
+    def _alpha_map_hwc(alpha: torch.Tensor) -> torch.Tensor:
+        if alpha.dim() == 2:
+            return alpha.unsqueeze(-1)
+        if alpha.dim() == 3 and int(alpha.shape[-1]) == 1:
+            return alpha
+        if alpha.dim() == 3 and int(alpha.shape[0]) == 1:
+            return alpha.permute(1, 2, 0).contiguous()
+        raise ValueError(f"render alpha map must be [H,W], [H,W,1], or [1,H,W], got {tuple(alpha.shape)}")
+
+    @staticmethod
+    def _render_item_hw(item: Dict[str, Any]) -> Tuple[int, int]:
+        if "height" in item and "width" in item:
+            return int(item["height"]), int(item["width"])
+        gt = item.get("gt_image")
+        if gt is None:
+            raise ValueError("render item must provide height/width or gt_image for render size inference.")
+        if gt.dim() == 4:
+            gt = gt.squeeze(0)
+        return int(gt.shape[0]), int(gt.shape[1])
+
+    def _render_scene_views_from_current_state(
+        self,
+        batch: Dict[str, Any],
+        render_items: List[Dict[str, Any]],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Pure scene render from the current runtime node state.
+
+        This method does not run the StreetForward updater, does not write back node
+        state, and does not update hidden/history caches. It returns rendered alpha
+        maps, not per-Gaussian opacity parameters.
+        """
+        if len(render_items) == 0:
+            empty_rgb = torch.empty(0, 0, 0, 3, device=self.device)
+            empty_alpha = torch.empty(0, 0, 0, 1, device=self.device)
+            return empty_rgb, empty_alpha
+
+        key = self._batch_key(batch)
+        if key not in self.node_states_bg:
+            self.ensure_runtime_state_from_batch(batch)
+        node_state_bg = self.node_states_bg[key]
+        node_state_distant = self.node_states_distant.get(key)
+        node_state_rigid = self.node_states_rigid.get(key)
+
+        render_bg = self._render_params_from_node_state_for_scene_render(node_state_bg)
+        render_distant = (
+            self._render_params_from_node_state_for_scene_render(node_state_distant)
+            if node_state_distant is not None
+            else None
+        )
+        default_frame_idx = int(batch.get("source_frame_idx", 0))
+        rgb_list: List[torch.Tensor] = []
+        alpha_list: List[torch.Tensor] = []
+        ref_hw: Optional[Tuple[int, int]] = None
+
+        for idx, item in enumerate(render_items):
+            if "view" not in item:
+                raise ValueError(f"render_items[{idx}] must provide a view.")
+            height, width = self._render_item_hw(item)
+            hw = (height, width)
+            if ref_hw is None:
+                ref_hw = hw
+            elif hw != ref_hw:
+                raise ValueError(
+                    "Pure scene render currently requires all render items to share H/W. "
+                    f"Mismatch at idx={idx}: {hw} vs {ref_hw}."
+                )
+
+            rigid_world = None
+            if node_state_rigid is not None:
+                frame_idx = int(item.get("frame_idx", default_frame_idx))
+                visible = self._rigid_point_valid_mask(node_state_rigid, frame_idx)
+                visible_idx = torch.nonzero(visible, as_tuple=False).squeeze(1)
+                empty = torch.empty(0, dtype=torch.long, device=self.device)
+                rigid_world = self._build_rigid_world_for_frame(
+                    node_state_rigid,
+                    frame_idx,
+                    empty,
+                    visible_idx,
+                    render_params_rigid_local=None,
+                    U=empty,
+                )
+
+            merged = self._tensor_merge_bg_rigid_distant_world(render_bg, rigid_world, render_distant)
+            rgb, alpha = self._render_single_view(merged, item["view"], height, width)
+            rgb_list.append(rgb)
+            alpha_list.append(self._alpha_map_hwc(alpha))
+
+        return torch.stack(rgb_list, dim=0), torch.stack(alpha_list, dim=0)
+
     def _source_camera_centers(self, source_views: List[Any]) -> Optional[torch.Tensor]:
         if not source_views:
             return None
@@ -1195,9 +1302,11 @@ class MinimalStreetForwardStage4_5(MinimalStreetForwardStage4_2):
             pred_by_idx, _ = _run_frame_renders(False, {}, None, render_params_rigid_local, U)
             pred_rgbs: List[torch.Tensor] = []
             gt_images: List[torch.Tensor] = []
+            render_alpha_maps: List[torch.Tensor] = []
             for i in range(len(targets)):
-                pr, _acc = pred_by_idx[i]
+                pr, acc = pred_by_idx[i]
                 pred_rgbs.append(pr)
+                render_alpha_maps.append(self._alpha_map_hwc(acc))
                 gt = targets[i]["gt_image"]
                 if gt.dim() == 4:
                     gt = gt.squeeze(0)
@@ -1207,6 +1316,7 @@ class MinimalStreetForwardStage4_5(MinimalStreetForwardStage4_2):
                 "render_params": render_params_bg,
                 "pred_rgbs": pred_rgbs,
                 "gt_images": gt_images,
+                "render_alpha_maps": render_alpha_maps,
                 "pred_rgb": pred_rgbs[0],
                 "gt_image": gt_images[0],
                 "_render_params_distant": render_params_distant,
@@ -1236,7 +1346,7 @@ class MinimalStreetForwardStage4_5(MinimalStreetForwardStage4_2):
 
         pred_rgbs_t: List[torch.Tensor] = []
         gt_images_t: List[torch.Tensor] = []
-        opacities_t: List[torch.Tensor] = []
+        render_alpha_maps_t: List[torch.Tensor] = []
         for i in range(len(targets)):
             pr, acc = pred_by_idx[i]
             pred_rgbs_t.append(pr)
@@ -1244,7 +1354,7 @@ class MinimalStreetForwardStage4_5(MinimalStreetForwardStage4_2):
             if gt.dim() == 4:
                 gt = gt.squeeze(0)
             gt_images_t.append(gt)
-            opacities_t.append(acc)
+            render_alpha_maps_t.append(self._alpha_map_hwc(acc))
 
         loss_l1_list: List[torch.Tensor] = []
         loss_ssim_list: List[torch.Tensor] = []
@@ -1260,9 +1370,9 @@ class MinimalStreetForwardStage4_5(MinimalStreetForwardStage4_2):
             for orig_i, t in group:
                 pred_rgb = pred_rgbs_t[orig_i]
                 gt_image = gt_images_t[orig_i]
-                opacity = opacities_t[orig_i].to(self.device).float()
-                if opacity.dim() == 3 and opacity.shape[-1] == 1:
-                    opacity = opacity.squeeze(-1)
+                render_alpha = render_alpha_maps_t[orig_i].to(self.device).float()
+                if render_alpha.dim() == 3 and render_alpha.shape[-1] == 1:
+                    render_alpha = render_alpha.squeeze(-1)
                 h, w = gt_image.shape[0], gt_image.shape[1]
                 valid_loss_mask = self._valid_loss_mask_from_target(t, height=h, width=w)
                 if float(valid_loss_mask.sum().item()) <= 0:
@@ -1296,9 +1406,9 @@ class MinimalStreetForwardStage4_5(MinimalStreetForwardStage4_2):
                     ssim_i = pred_rgb.sum() * 0.0
 
                 gt_occupied = (1.0 - sm) * valid_loss_mask
-                pred_occupied = opacity.clamp(0.0, 1.0) * valid_loss_mask
+                pred_occupied = render_alpha.clamp(0.0, 1.0) * valid_loss_mask
                 mask_i = self.loss_w_mask * self._mask_bce(pred_occupied, gt_occupied, valid_loss_mask)
-                p = opacity.clamp(1e-6, 1.0 - 1e-6)
+                p = render_alpha.clamp(1e-6, 1.0 - 1e-6)
                 entropy_i = self.loss_w_opacity_entropy * self._masked_mean(-p * torch.log(p), valid_loss_mask)
                 total_i = l1_i + ssim_i + mask_i + entropy_i
                 loss_l1_list.append(l1_i)
@@ -1392,6 +1502,7 @@ class MinimalStreetForwardStage4_5(MinimalStreetForwardStage4_2):
             "_num_views_no_non_sky_supervision": int(views_no_non_sky),
             "pred_rgbs": pred_rgbs_t,
             "gt_images": gt_images_t,
+            "render_alpha_maps": render_alpha_maps_t,
             "pred_rgb": pred_rgbs_t[0],
             "gt_image": gt_images_t[0],
         }
@@ -1676,7 +1787,10 @@ class MinimalStreetForwardStage4_5(MinimalStreetForwardStage4_2):
         if policy.do_backward or policy.do_optimizer_step:
             raise ValueError("inference_step_from_train_batch requires do_backward=false and do_optimizer_step=false")
 
-        self.train()
+        if policy.force_eval_mode:
+            self.eval()
+        else:
+            self.train()
         self._perf_acc = {}
         node_state_sync_update = False
         node_state_sync_reset = False
@@ -1711,6 +1825,7 @@ class MinimalStreetForwardStage4_5(MinimalStreetForwardStage4_2):
             "loss": loss_val.item() if torch.is_tensor(loss_val) else float(loss_val) if loss_val is not None else 0.0,
             "pred_rgbs": out["pred_rgbs"],
             "gt_images": out["gt_images"],
+            "render_alpha_maps": out.get("render_alpha_maps", []),
             "pred_rgb": out["pred_rgb"],
             "gt_image": out["gt_image"],
             "num_targets": len(batch.get("targets", [])),

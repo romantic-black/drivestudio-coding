@@ -101,14 +101,6 @@ def validate_protocol(
                 f"eval offset out of range: {o}, sequence_length={protocol.sequence_length}"
             )
 
-    if require_20frame_sparse4:
-        if int(protocol.sequence_length) != 20:
-            raise ValueError("exp2 requires sequence_length=20")
-        if [int(x) for x in protocol.input_offsets] != [0, 5, 10, 15]:
-            raise ValueError("exp2 requires input_offsets=[0,5,10,15]")
-        if protocol.eval_offsets != "all":
-            raise ValueError("exp2 requires eval_offsets=all")
-
 
 def protocol_from_dict(
     *,

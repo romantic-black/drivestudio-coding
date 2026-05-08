@@ -9,6 +9,9 @@ import torch
 from omegaconf import OmegaConf
 
 from datasets.streetforward_assets import StreetForwardAssetStore
+from tools.streetforward_asset_export_preflight import (
+    prepare_streetforward_asset_export_config,
+)
 from tools.streetforward_export_require_full_config import (
     require_full_training_config_for_asset_export,
 )
@@ -192,6 +195,7 @@ def main() -> None:
 
     cfg = OmegaConf.load(args.config_file)
     require_full_training_config_for_asset_export(cfg)
+    prepare_streetforward_asset_export_config(cfg)
     if cfg.data.get("assets") is not None:
         cfg.data.assets.enable = False
     device = torch.device("cpu")

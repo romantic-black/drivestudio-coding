@@ -9,6 +9,10 @@ from omegaconf import OmegaConf
 
 from datasets.streetforward_assets import StreetForwardAssetStore
 from tools.build_streetforward_scene_assets import _build_scene_asset
+from tools.streetforward_asset_export_preflight import (
+    build_streetforward_coordinate_metadata,
+    prepare_streetforward_asset_export_config,
+)
 from tools.streetforward_export_require_full_config import (
     require_full_training_config_for_asset_export,
 )
@@ -109,6 +113,12 @@ def _build_segment_asset(
             sum(int(np.asarray(v).shape[0]) for v in pointcloud.get("dynamic", {}).values())
         ),
     }
+    coordinate_metadata = build_streetforward_coordinate_metadata(dataset_name)
+    pointcloud_payload = dict(pointcloud)
+    pointcloud_metadata = dict(pointcloud.get("metadata") or {})
+    pointcloud_metadata.update(coordinate_metadata)
+    pointcloud_payload["metadata"] = pointcloud_metadata
+
     return store.export_segment_asset(
         dataset=dataset_name,
         scene_id=int(scene_id),
@@ -131,10 +141,11 @@ def _build_segment_asset(
             "segment_first_frame_idx": int(seg0_frame_idx),
             "segment_pose_source": str(seg0_source),
         },
-        pointcloud_payload=pointcloud,
+        pointcloud_payload=pointcloud_payload,
         dynamic_tracks_payload=dynamic_tracks,
         segment_aabb=dataset.segment_aabb_np,
         pointcloud_config_normalized=dict(dataset.pointcloud_config),
+        coordinate_metadata=coordinate_metadata,
         stats=stats,
     )
 
@@ -169,6 +180,7 @@ def main() -> None:
 
     cfg = OmegaConf.load(args.config_file)
     require_full_training_config_for_asset_export(cfg)
+    prepare_streetforward_asset_export_config(cfg)
     if cfg.data.get("assets") is not None:
         cfg.data.assets.enable = False
     device = torch.device("cpu")

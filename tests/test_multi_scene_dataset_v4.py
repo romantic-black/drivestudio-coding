@@ -18,6 +18,7 @@ def _prepare_demo_assets(
     pointcloud_config_normalized: dict | None = None,
     pointcloud_payload: dict | None = None,
     knn_payload: dict | None = None,
+    coordinate_metadata: dict | None = None,
 ):
     image0 = tmp_path / "im0.png"
     image1 = tmp_path / "im1.png"
@@ -157,6 +158,7 @@ def _prepare_demo_assets(
         segment_aabb=np.asarray([[-1, -1, -1], [1, 1, 1]], dtype=np.float32),
         pointcloud_config_normalized=pointcloud_config_normalized,
         stats={"background_points": bg_n, "dynamic_points": dyn_n},
+        coordinate_metadata=coordinate_metadata,
     )
     if knn_payload is not None:
         store.export_segment_knn_init_asset(
@@ -359,6 +361,25 @@ def test_v4_segment_aabb_mismatch_raises(tmp_path):
     )
     with pytest.raises(ValueError, match="segment_aabb mismatch"):
         ds.initialize()
+
+
+def test_v4_accepts_standard_coordinate_metadata(tmp_path):
+    MultiSceneDatasetV4._validate_segment_coordinate_metadata(
+        {"asset_coordinate_frame": "seg0_camera_opencv"},
+        scene_id=1,
+        segment_id=0,
+        context="test",
+    )
+
+
+def test_v4_rejects_unknown_coordinate_metadata(tmp_path):
+    with pytest.raises(ValueError, match="Unsupported StreetForward segment asset coordinate frame"):
+        MultiSceneDatasetV4._validate_segment_coordinate_metadata(
+            {"coordinate_metadata": {"asset_coordinate_frame": "waymo_native_ego"}},
+            scene_id=1,
+            segment_id=0,
+            context="test",
+        )
 
 
 def test_v4_requires_explicit_cache_limits(tmp_path):

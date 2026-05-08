@@ -169,6 +169,7 @@ def _build_minimal_source_stack_from_dataset_source(
     src_sky = source_data.get("sky_mask")
     src_vd = source_data.get("viewdirs")
     src_ego = source_data.get("egocar_mask")
+    src_dyn = source_data.get("dynamic_mask")
     if src_sky is not None and src_sky.shape[0] >= n:
         src_sky_list = [src_sky[i].to(device) for i in range(n)]
         out["source_sky_masks"] = src_sky_list
@@ -179,6 +180,10 @@ def _build_minimal_source_stack_from_dataset_source(
         src_ego_list = [src_ego[i].to(device) for i in range(n)]
         out["source_egocar_masks"] = src_ego_list
         out["source_egocar_mask"] = src_ego_list
+    if src_dyn is not None and src_dyn.shape[0] >= n:
+        src_dyn_list = [src_dyn[i].to(device) for i in range(n)]
+        out["source_dynamic_masks"] = src_dyn_list
+        out["source_dynamic_mask"] = src_dyn_list
     return out
 
 
@@ -334,6 +339,7 @@ def convert_batch_to_minimal_format(
             source_sky_masks: List[torch.Tensor] = []
             source_viewdirs: List[torch.Tensor] = []
             source_egocar_masks: List[torch.Tensor] = []
+            source_dynamic_masks: List[torch.Tensor] = []
             source_data = batch.get("source")
             if not isinstance(source_data, dict):
                 raise ValueError("explicit view_selection requires batch['source'] dict for source-only Stage4 contract.")
@@ -346,12 +352,15 @@ def convert_batch_to_minimal_format(
                 src_sky = source_data.get("sky_mask")
                 src_vd = source_data.get("viewdirs")
                 src_ego = source_data.get("egocar_mask")
+                src_dyn = source_data.get("dynamic_mask")
                 if src_sky is not None:
                     source_sky_masks.append(src_sky[row].to(device))
                 if src_vd is not None:
                     source_viewdirs.append(src_vd[row].to(device))
                 if src_ego is not None:
                     source_egocar_masks.append(src_ego[row].to(device))
+                if src_dyn is not None:
+                    source_dynamic_masks.append(src_dyn[row].to(device))
             if test_frame_indices:
                 test_frame_indices = _finalize_test_frame_indices_for_minimal(test_frame_indices, targets_minimal)
             return {
@@ -377,6 +386,8 @@ def convert_batch_to_minimal_format(
                 **({"source_viewdirs": source_viewdirs} if source_viewdirs else {}),
                 **({"source_egocar_masks": source_egocar_masks} if source_egocar_masks else {}),
                 **({"source_egocar_mask": source_egocar_masks} if source_egocar_masks else {}),
+                **({"source_dynamic_masks": source_dynamic_masks} if source_dynamic_masks else {}),
+                **({"source_dynamic_mask": source_dynamic_masks} if source_dynamic_masks else {}),
                 **passthrough,
             }
         targets_minimal = build_explicit_targets_only(batch, device, explicit)
@@ -484,6 +495,7 @@ def convert_batch_to_minimal_format(
                 src_sky = source_data.get("sky_mask")
                 src_vd = source_data.get("viewdirs")
                 src_ego = source_data.get("egocar_mask")
+                src_dyn = source_data.get("dynamic_mask")
                 if src_sky is not None and src_sky.shape[0] > 0:
                     src_sky_list = [src_sky[0].to(device)]
                     result["source_sky_masks"] = src_sky_list
@@ -494,6 +506,10 @@ def convert_batch_to_minimal_format(
                     src_ego_list = [src_ego[0].to(device)]
                     result["source_egocar_masks"] = src_ego_list
                     result["source_egocar_mask"] = src_ego_list
+                if src_dyn is not None and src_dyn.shape[0] > 0:
+                    src_dyn_list = [src_dyn[0].to(device)]
+                    result["source_dynamic_masks"] = src_dyn_list
+                    result["source_dynamic_mask"] = src_dyn_list
     return result
 
 
