@@ -93,10 +93,13 @@ class _FakeModel:
     def __init__(self) -> None:
         self.update_calls = 0
         self.train_calls = 0
+        self.infer_train_batch_calls = 0
         self.render_calls = 0
         self.history_calls = 0
         self.reset_node_state_calls = 0
         self.last_train_sync: Dict[str, Any] | None = None
+        self.last_infer_policy: Any = None
+        self.infer_batches: List[Dict[str, Any]] = []
         self.last_render_refs: List[Tuple[int, int]] = []
 
     def reset_for_segment_eval(self, batch: Dict[str, Any]) -> None:
@@ -134,11 +137,34 @@ class _FakeModel:
         profile_phase_timing: bool = False,
         sync_cuda_timing: bool = False,
         scheduler_node_sync: Dict[str, Any] | None = None,
+        runtime_policy: Any = None,
     ) -> Dict[str, Any]:
-        _ = (batch, step, profile_phase_timing, sync_cuda_timing)
+        _ = (batch, step, profile_phase_timing, sync_cuda_timing, runtime_policy)
         self.train_calls += 1
         self.last_train_sync = dict(scheduler_node_sync or {})
         return {"loss": torch.tensor(0.0)}
+
+    def inference_step_from_train_batch(
+        self,
+        batch: Dict[str, Any],
+        step: int | None = None,
+        scheduler_node_sync: Dict[str, Any] | None = None,
+        runtime_policy: Any = None,
+    ) -> Dict[str, Any]:
+        _ = (step, scheduler_node_sync)
+        self.infer_train_batch_calls += 1
+        self.last_infer_policy = runtime_policy
+        self.infer_batches.append(batch)
+        return {"loss": 0.0, "pred_rgbs": [], "gt_images": []}
+
+    def _render_scene_views_from_current_state(
+        self,
+        batch: Dict[str, Any],
+        render_items: List[Dict[str, Any]],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        _ = batch
+        n = len(render_items)
+        return torch.zeros((n, 4, 4, 3)), torch.ones((n, 4, 4, 1))
 
     def eval_sparse_render_frames(
         self,
@@ -469,6 +495,223 @@ def test_runner_step_major_order_and_visited_targets(monkeypatch: pytest.MonkeyP
         [100, 105],
     ]
     assert model.update_calls == 6
+
+
+class _Stage56Dataset:
+    def __init__(self) -> None:
+        self.raw_batches: List[Dict[str, Any]] = []
+
+    def _assemble_segment_batch_from_image_refs(
+        self,
+        scene_id: int,
+        segment_id: int,
+        source_image_refs: List[Tuple[int, int]],
+        target_image_refs: List[Tuple[int, int]],
+        aux_image_refs: List[Tuple[int, int]] | None = None,
+        *,
+        include_test: bool,
+        test_image_refs: Any,
+        enforce_target0_equals_source: bool,
+        target_ref_purpose: str = "train",
+    ) -> Dict[str, Any]:
+        _ = (aux_image_refs, include_test, test_image_refs, enforce_target0_equals_source, target_ref_purpose)
+        raw = {
+            "scene_id": int(scene_id),
+            "segment_id": int(segment_id),
+            "source_image_refs": list(source_image_refs),
+            "target_image_refs": list(target_image_refs),
+            "request_meta": {
+                "source_image_refs": list(source_image_refs),
+                "target_image_refs": list(target_image_refs),
+            },
+        }
+        self.raw_batches.append(raw)
+        return raw
+
+
+def _fake_minimal_from_raw(raw: Dict[str, Any], device: torch.device, num_targets: int, include_source_for_2d: bool, **_: Any) -> Dict[str, Any]:
+    _ = include_source_for_2d
+    target_refs = list(raw.get("request_meta", {}).get("target_image_refs") or raw.get("target_image_refs") or [])
+    source_refs = list(raw.get("request_meta", {}).get("source_image_refs") or raw.get("source_image_refs") or [])
+    targets: List[Dict[str, Any]] = []
+    for frame_idx, cam_idx in target_refs[:num_targets]:
+        targets.append(
+            {
+                "frame_idx": int(frame_idx),
+                "cam_idx": int(cam_idx),
+                "view": object(),
+                "gt_image": torch.zeros((4, 4, 3), device=device),
+                "sky_mask": torch.zeros((4, 4), device=device),
+            }
+        )
+    out = {
+        "scene_id": int(raw["scene_id"]),
+        "segment_id": int(raw["segment_id"]),
+        "request_meta": dict(raw.get("request_meta") or {}),
+        "targets": targets,
+        "source_views": [object() for _ in source_refs],
+        "source_images": [torch.zeros((4, 4, 3), device=device) for _ in source_refs],
+        "source_frame_idx": int(source_refs[0][0]) if source_refs else -1,
+    }
+    for key in ("_scheduler_v4_aligned_info", "_scheduler_v7_aligned_info", "_scheduler_v8_aligned_info"):
+        if key in raw:
+            out[key] = dict(raw[key])
+    return out
+
+
+def test_stage5_6_adjacent_nearby_metadata(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from streetforward_eval import runner as runner_mod
+
+    monkeypatch.setattr(runner_mod, "convert_batch_to_minimal_format", _fake_minimal_from_raw)
+    protocol = TestProtocolSpec(
+        name="exp_stage56_nearby",
+        data_mode="segment_finetune_train",
+        sequence_length=10,
+        input_offsets=[1, 3, 5, 7, 9],
+        eval_offsets="all",
+        camera_ids=[0],
+        camera_names=["front"],
+        steps_per_input=1,
+        save_pre_update=False,
+        save_each_iter_views=False,
+        metric_primary_mask="full_image",
+        report_full_image=True,
+    )
+    spec = TestEpisodeSpec(
+        exp_name=protocol.name,
+        scene_id=1,
+        segment_id=2,
+        episode_idx=0,
+        sequence_start_pos=0,
+        frame_offsets=list(range(10)),
+        frame_ids=list(range(100, 110)),
+        input_offsets=[1, 3, 5, 7, 9],
+        eval_offsets=list(range(10)),
+        input_frame_ids=[101, 103, 105, 107, 109],
+        eval_frame_ids=list(range(100, 110)),
+        camera_ids=[0],
+        camera_names=["front"],
+        input_image_refs=[(101, 0), (103, 0), (105, 0), (107, 0), (109, 0)],
+        eval_image_refs=[(f, 0) for f in range(100, 110)],
+        episode_uid="scene001_seg002_start000000",
+    )
+    model = _FakeModel()
+    runner = StreetForwardBatchEvalRunner(
+        model=model,
+        dataset=_Stage56Dataset(),
+        protocol=protocol,
+        writer=SnapshotWriter(output_dir=tmp_path / "snapshots"),
+        metric_acc=MetricAccumulator(
+            output_dir=tmp_path / "metrics",
+            protocol=protocol,
+            min_valid_pixels=1,
+            compute_ssim=False,
+            compute_lpips=False,
+        ),
+        device=torch.device("cpu"),
+        runtime_cfg=RunnerRuntimeConfig(
+            mode="inference_only",
+            reset_state_per_episode=False,
+            history_record_on_input_exit=False,
+            stage5_6_enable_nearby_feedback=True,
+            update_camera_ids=[0],
+            target_frame_policy="visited_episode_frames",
+            max_target_frames_including_source=3,
+        ),
+    )
+    runner.run_episode(spec)
+    nearby = [
+        list((b.get("request_meta") or {}).get("near_random_frame_indices") or [])
+        for b in model.infer_batches
+    ]
+    assert nearby == [[100, 102], [102, 104], [104, 106], [106, 108], [108]]
+    for batch in model.infer_batches:
+        rm = batch["request_meta"]
+        assert len(rm["target_image_refs"]) == len(rm["target_image_roles"])
+        assert "near_random" in rm["target_image_roles"]
+        assert batch["_scheduler_v8_aligned_info"]["scheduler_version"] == "v8"
+        assert batch["_scheduler_v8_aligned_info"]["episode_idx_global"] == 0
+
+
+class _FakeSkyBranch:
+    def __init__(self) -> None:
+        self.forward_calls = 0
+        self.reset_calls = 0
+
+    def reset_runtime_state(self) -> None:
+        self.reset_calls += 1
+
+    def forward_scene_batch(self, batch: Dict[str, Any], scene_pack: Any, *, writeback: bool = False) -> Any:
+        assert writeback is True
+        assert scene_pack.source_rgb.shape[-1] == 3
+        assert scene_pack.target_rgb.shape[-1] == 3
+        _ = batch
+        self.forward_calls += 1
+        return object()
+
+
+def test_stage5_6_sky_branch_updates_after_each_scene_step(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from streetforward_eval import runner as runner_mod
+
+    monkeypatch.setattr(runner_mod, "convert_batch_to_minimal_format", _fake_minimal_from_raw)
+    protocol = TestProtocolSpec(
+        name="exp_stage56_sky",
+        data_mode="segment_finetune_train",
+        sequence_length=2,
+        input_offsets=[0, 1],
+        eval_offsets=[0, 1],
+        camera_ids=[0],
+        camera_names=["front"],
+        steps_per_input=2,
+        save_pre_update=False,
+        save_each_iter_views=False,
+        metric_primary_mask="full_image",
+        report_full_image=True,
+    )
+    spec = TestEpisodeSpec(
+        exp_name=protocol.name,
+        scene_id=1,
+        segment_id=2,
+        episode_idx=0,
+        sequence_start_pos=0,
+        frame_offsets=[0, 1],
+        frame_ids=[100, 101],
+        input_offsets=[0, 1],
+        eval_offsets=[0, 1],
+        input_frame_ids=[100, 101],
+        eval_frame_ids=[100, 101],
+        camera_ids=[0],
+        camera_names=["front"],
+        input_image_refs=[(100, 0), (101, 0)],
+        eval_image_refs=[(100, 0), (101, 0)],
+        episode_uid="scene001_seg002_start000000",
+    )
+    sky = _FakeSkyBranch()
+    runner = StreetForwardBatchEvalRunner(
+        model=_FakeModel(),
+        dataset=_Stage56Dataset(),
+        protocol=protocol,
+        writer=SnapshotWriter(output_dir=tmp_path / "snapshots"),
+        metric_acc=MetricAccumulator(
+            output_dir=tmp_path / "metrics",
+            protocol=protocol,
+            min_valid_pixels=1,
+            compute_ssim=False,
+            compute_lpips=False,
+        ),
+        device=torch.device("cpu"),
+        runtime_cfg=RunnerRuntimeConfig(
+            mode="inference_only",
+            reset_state_per_episode=False,
+            history_record_on_input_exit=False,
+            stage5_6_enable_nearby_feedback=True,
+            update_camera_ids=[0],
+        ),
+        sky_branch=sky,
+    )
+    runner.run_episode(spec)
+    assert sky.reset_calls == 1
+    assert sky.forward_calls == 4
 
 
 def test_runner_no_grad_false_uses_train_step(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-from models.streetforward.math_utils import get_viewmat
+from models.feature_extractors.alpha_t_extractor import _get_viewmat as get_viewmat
 from models.streetforward.metrics import compute_ssim_loss_masked
 from models.streetforward.minimal_trainer_stage3_2d import _create_proxy_params
 from models.streetforward.minimal_trainer_stage4_0 import _merge_params_bg_rigid_distant
@@ -1876,15 +1876,12 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
         step = int(self._current_loss_step(batch))
         if not self._cache_ready(step):
             return
+        scope_key = self._stage5_6_scope_key(batch)
+        if bool(getattr(self, "stage5_6_cache_keep_only_current_scope", True)):
+            self._stage5_6_frame_cache.clear()
         cache_write = error_pack.get("cache_write")
         if not isinstance(cache_write, list):
             return
-        scope_key = self._stage5_6_scope_key(batch)
-        if bool(getattr(self, "stage5_6_cache_keep_only_current_scope", True)):
-            current_bank = self._stage5_6_frame_cache.get(scope_key)
-            self._stage5_6_frame_cache.clear()
-            if current_bank is not None:
-                self._stage5_6_frame_cache[scope_key] = current_bank
         bank = self._stage5_6_frame_cache.setdefault(scope_key, {})
         for frame_pack in cache_write:
             if not isinstance(frame_pack, dict):
@@ -1967,12 +1964,9 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
     ) -> Optional[Dict[str, List[Optional[Dict[str, torch.Tensor]]]]]:
         if self._fusion_scale(current_step) <= 0.0:
             return None
-        if bool(getattr(self, "stage5_6_cache_keep_only_current_scope", True)):
-            current_bank = self._stage5_6_frame_cache.get(scope_key)
-            self._stage5_6_frame_cache.clear()
-            if current_bank is not None:
-                self._stage5_6_frame_cache[scope_key] = current_bank
         bank = self._stage5_6_frame_cache.get(scope_key)
+        if bool(getattr(self, "stage5_6_cache_keep_only_current_scope", True)):
+            self._stage5_6_frame_cache.clear()
         if bank is None:
             return None
         slots = max(int(self.stage5_6_fusion_num_slots), 1)
@@ -2225,7 +2219,8 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
         self._stage5_6_last_nearby_debug_images = []
         self._stage5_6_last_error_debug_images = []
         out = super().forward(batch)
-        out["_stage5_6_scope_key"] = self._stage5_6_scope_key(batch)
+        if self.training or bool(self.stage5_6_cache_enable):
+            out["_stage5_6_scope_key"] = self._stage5_6_scope_key(batch)
         if self.training and self.stage5_6_nearby_enabled:
             nearby = self._compute_nearby_direct_loss(batch, out)
             if torch.is_tensor(nearby.get("loss")):
@@ -2257,16 +2252,20 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
         profile_phase_timing: bool = False,
         sync_cuda_timing: bool = False,
         scheduler_node_sync: Optional[Dict[str, Any]] = None,
+        runtime_policy: Optional[Any] = None,
     ) -> Dict[str, Any]:
         self._stage5_6_last_nearby_debug_images = []
         self._stage5_6_last_error_debug_images = []
-        out = super().train_step(
-            batch=batch,
-            step=step,
-            profile_phase_timing=profile_phase_timing,
-            sync_cuda_timing=sync_cuda_timing,
-            scheduler_node_sync=scheduler_node_sync,
-        )
+        kwargs: Dict[str, Any] = {
+            "batch": batch,
+            "step": step,
+            "profile_phase_timing": profile_phase_timing,
+            "sync_cuda_timing": sync_cuda_timing,
+            "scheduler_node_sync": scheduler_node_sync,
+        }
+        if runtime_policy is not None:
+            kwargs["runtime_policy"] = runtime_policy
+        out = super().train_step(**kwargs)
         nearby_debug = getattr(self, "_stage5_6_last_nearby_debug_images", [])
         if isinstance(nearby_debug, list) and len(nearby_debug) > 0:
             out["_stage5_6_nearby_debug_images"] = nearby_debug

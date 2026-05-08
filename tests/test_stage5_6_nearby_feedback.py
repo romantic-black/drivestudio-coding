@@ -8,8 +8,29 @@ import torch
 from omegaconf import OmegaConf
 
 sys.modules.setdefault("open3d", types.SimpleNamespace())
+sys.modules.setdefault("pytorch3d", types.SimpleNamespace())
+sys.modules.setdefault(
+    "pytorch3d.ops",
+    types.SimpleNamespace(knn_points=lambda *args, **kwargs: None),
+)
+sys.modules.setdefault(
+    "pytorch3d.transforms",
+    types.SimpleNamespace(
+        matrix_to_quaternion=lambda x: torch.zeros((*x.shape[:-2], 4), device=x.device, dtype=x.dtype),
+        quaternion_to_matrix=lambda x: torch.eye(3, device=x.device, dtype=x.dtype).expand(*x.shape[:-1], 3, 3),
+        axis_angle_to_matrix=lambda x: torch.eye(3, device=x.device, dtype=x.dtype).expand(*x.shape[:-1], 3, 3),
+    ),
+)
+_nvdiffrast_mod = types.ModuleType("nvdiffrast")
+_nvdiffrast_torch_mod = types.ModuleType("nvdiffrast.torch")
+setattr(_nvdiffrast_mod, "torch", _nvdiffrast_torch_mod)
+sys.modules.setdefault("nvdiffrast", _nvdiffrast_mod)
+sys.modules.setdefault("nvdiffrast.torch", _nvdiffrast_torch_mod)
 
 import models.streetforward.minimal_trainer_stage4_5 as stage4_5_mod
+import models.streetforward.minimal_trainer_stage5_6 as stage5_6_mod
+from models.feature_extractors.alpha_t_extractor import _get_viewmat as _no_flip_viewmat
+from models.streetforward.math_utils import get_viewmat as _yz_flip_viewmat
 from models.streetforward.minimal_trainer_stage4_2 import MinimalStreetForwardStage4_2
 from models.streetforward.minimal_trainer_stage4_5 import MinimalStreetForwardStage4_5
 from models.streetforward.minimal_trainer_stage5_4 import MinimalStreetForwardStage5_4
@@ -18,6 +39,18 @@ from models.streetforward.minimal_trainer_stage5_6 import (
     MinimalStreetForwardStage5_6,
     Stage5_6FrameFlattenFuser,
 )
+
+
+def test_stage5_6_render_viewmat_matches_stage5_4_no_axis_flip():
+    c2w = torch.eye(4, dtype=torch.float32)
+    c2w[:3, 3] = torch.tensor([1.0, 2.0, 3.0])
+
+    actual = stage5_6_mod.get_viewmat(c2w)
+    expected = _no_flip_viewmat(c2w)
+    flipped = _yz_flip_viewmat(c2w)
+
+    assert torch.allclose(actual, expected)
+    assert not torch.allclose(actual, flipped)
 
 
 def test_stage5_6_fast_fail_when_bridge_enabled(monkeypatch: pytest.MonkeyPatch):
@@ -307,6 +340,106 @@ def test_stage5_6_train_step_preserves_debug_images_after_parent_result_filter(m
     out = stage.train_step({})
     assert len(out["_stage5_6_nearby_debug_images"]) == 1
     assert len(out["_stage5_6_error_debug_images"]) == 1
+
+
+def test_stage5_6_train_step_forwards_runtime_policy(monkeypatch: pytest.MonkeyPatch):
+    seen = {}
+
+    def _super_train_step(
+        self,
+        batch,
+        step=None,
+        profile_phase_timing=False,
+        sync_cuda_timing=False,
+        scheduler_node_sync=None,
+        runtime_policy=None,
+    ):
+        _ = (self, batch, step, profile_phase_timing, sync_cuda_timing, scheduler_node_sync)
+        seen["runtime_policy"] = runtime_policy
+        return {"loss": 0.0}
+
+    monkeypatch.setattr(MinimalStreetForwardStage5_4, "train_step", _super_train_step)
+    stage = MinimalStreetForwardStage5_6.__new__(MinimalStreetForwardStage5_6)
+    policy = object()
+
+    _ = stage.train_step({}, runtime_policy=policy)
+    assert seen["runtime_policy"] is policy
+
+
+def test_batcheval_segment_finetune_freezes_error_and_feedback_by_default():
+    from tools.eval_streetforward_benchmark import _configure_segment_finetune_optimizer
+
+    class _ImageFeatureExtractor(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.residual = torch.nn.Linear(2, 2)
+            self.fusion = torch.nn.Linear(2, 2)
+            self.dino_adapter = torch.nn.Module()
+            self.dino_adapter.backbone = torch.nn.Linear(2, 2)
+
+    class _TinyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.sparse_conv = torch.nn.Linear(2, 2)
+            self.image_feature_extractor = _ImageFeatureExtractor()
+            self.struct_decoder = torch.nn.Linear(2, 2)
+            self.mlp_params_embed = torch.nn.Linear(2, 2)
+            self.param_embed_norm = torch.nn.LayerNorm(2)
+            self.gru_update = torch.nn.Linear(2, 2)
+            self.gru_candidate = torch.nn.Linear(2, 2)
+            self.stage5_6_error_head = torch.nn.Linear(2, 2)
+            self.err_splat_proj_bg = torch.nn.Linear(2, 2)
+            self.stage5_6_bg_fuser = torch.nn.Linear(2, 2)
+            self.current_obs_struct_embed = torch.nn.Linear(2, 2)
+            self.mlp_offset_pos = torch.nn.Linear(2, 2)
+            self.mlp_conv_sky = torch.nn.Linear(2, 2)
+            self.sky_model = torch.nn.Linear(2, 2)
+
+    model = _TinyModel()
+    _configure_segment_finetune_optimizer(
+        model,
+        finetune_cfg={"lr": 1.0e-5, "weight_decay": 0.0, "train_feedback_fuser": False},
+        start_step=123,
+    )
+
+    flags = {name: p.requires_grad for name, p in model.named_parameters()}
+    assert flags["struct_decoder.weight"] is True
+    assert flags["sparse_conv.weight"] is False
+    assert flags["mlp_params_embed.weight"] is False
+    assert flags["param_embed_norm.weight"] is False
+    assert flags["gru_update.weight"] is True
+    assert flags["gru_candidate.weight"] is True
+    assert flags["mlp_offset_pos.weight"] is True
+    assert flags["image_feature_extractor.residual.weight"] is True
+    assert flags["image_feature_extractor.fusion.weight"] is True
+    assert flags["current_obs_struct_embed.weight"] is True
+    assert flags["stage5_6_error_head.weight"] is False
+    assert flags["err_splat_proj_bg.weight"] is False
+    assert flags["stage5_6_bg_fuser.weight"] is False
+    assert flags["image_feature_extractor.dino_adapter.backbone.weight"] is False
+    assert flags["mlp_conv_sky.weight"] is False
+    assert flags["sky_model.weight"] is False
+    assert model.optimizer.global_step == 123
+
+    _configure_segment_finetune_optimizer(
+        model,
+        finetune_cfg={"lr": 1.0e-5, "weight_decay": 0.0, "train_feedback_fuser": True},
+        start_step=124,
+    )
+    flags = {name: p.requires_grad for name, p in model.named_parameters()}
+    assert flags["stage5_6_bg_fuser.weight"] is True
+    assert flags["stage5_6_error_head.weight"] is False
+    assert flags["sparse_conv.weight"] is False
+    assert model.optimizer.global_step == 124
+
+    _configure_segment_finetune_optimizer(
+        model,
+        finetune_cfg={"lr": 1.0e-5, "weight_decay": 0.0, "freeze_dino": False},
+        start_step=125,
+    )
+    flags = {name: p.requires_grad for name, p in model.named_parameters()}
+    assert flags["image_feature_extractor.dino_adapter.backbone.weight"] is True
+    assert flags["stage5_6_error_head.weight"] is False
 
 
 def test_stage5_6_reset_node_state_clears_cache(monkeypatch: pytest.MonkeyPatch):

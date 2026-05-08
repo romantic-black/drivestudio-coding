@@ -6,11 +6,25 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from pytorch3d.ops import knn_points
-import nvdiffrast.torch as dr
 from utils.geometry import rotation_6d_to_matrix
 
 logger = logging.getLogger()
+
+
+def _knn_points(*args, **kwargs):
+    try:
+        from pytorch3d.ops import knn_points
+    except Exception as exc:
+        raise ImportError("pytorch3d.ops.knn_points is required for VoxelDeformer SMPL queries.") from exc
+    return knn_points(*args, **kwargs)
+
+
+def _nvdiffrast_texture(*args, **kwargs):
+    try:
+        import nvdiffrast.torch as dr
+    except Exception as exc:
+        raise ImportError("nvdiffrast is required for EnvLight cubemap sampling.") from exc
+    return dr.texture(*args, **kwargs)
 
 class XYZ_Encoder(nn.Module):
     encoder_type = "XYZ_Encoder"
@@ -197,7 +211,7 @@ class EnvLight(torch.nn.Module):
         if len(prefix) != 3:  # reshape to [B, H, W, -1]
             l = l.reshape(1, 1, -1, l.shape[-1])
 
-        light = dr.texture(self.base[None, ...], l, filter_mode='linear', boundary_mode='cube')
+        light = _nvdiffrast_texture(self.base[None, ...], l, filter_mode='linear', boundary_mode='cube')
         light = light.view(*prefix, -1)
 
         return light
@@ -640,7 +654,7 @@ class VoxelDeformer(nn.Module):
 
     def _query_weights_smpl(self, x, smpl_verts, smpl_weights):
         # adapted from https://github.com/jby1993/SelfReconCode/blob/main/model/Deformer.py
-        dist, idx, _ = knn_points(x, smpl_verts.detach(), K=30) # [B, N, 30]
+        dist, idx, _ = _knn_points(x, smpl_verts.detach(), K=30) # [B, N, 30]
         dist = dist.sqrt().clamp_(0.0001, 1.0)
         expanded_smpl_weights = smpl_weights.unsqueeze(2).expand(-1, -1, idx.shape[2], -1) # [B, N, 30, J]
         weights = expanded_smpl_weights.gather(1, idx.unsqueeze(-1).expand(-1, -1, -1, expanded_smpl_weights.shape[-1])) # [B, N, 30, J]
