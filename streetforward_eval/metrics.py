@@ -370,6 +370,8 @@ class MetricAccumulator:
                     min_valid_pixels=int(self.min_valid_pixels),
                 )
             )
+        is_input_frame = bool(int(eval_offset) in set(int(x) for x in spec.input_offsets))
+        metric_group = "reconstruction" if is_input_frame else "nvs"
         row = {
             "exp_name": str(spec.exp_name),
             "episode_uid": str(spec.episode_uid),
@@ -386,7 +388,8 @@ class MetricAccumulator:
             "cam_id": int(cam_id),
             "cam_name": str(cam_name),
             "frame_group": str(classify_eval_frame(int(eval_offset), [int(x) for x in spec.input_offsets])),
-            "is_input_frame": bool(int(eval_offset) in set(int(x) for x in spec.input_offsets)),
+            "is_input_frame": bool(is_input_frame),
+            "metric_group": str(metric_group),
             "input_count": int(len(spec.input_frame_ids)),
             "psnr": _safe_float(vals["psnr"]) if self.compute_psnr else float("nan"),
             "psnr_non_sky": float(psnr_non_sky),
@@ -461,12 +464,34 @@ class MetricAccumulator:
         final_rows = [r for r in rows if int(r["global_iter"]) == int(final_iter)]
         psnr_vals = [float(r["psnr"]) for r in final_rows if not math.isnan(float(r["psnr"]))]
         l1_vals = [float(r["l1"]) for r in final_rows if not math.isnan(float(r["l1"]))]
+
+        def _mean_for(group: str, key: str) -> float:
+            vals = [
+                float(r.get(key, float("nan")))
+                for r in final_rows
+                if str(r.get("metric_group")) == str(group)
+                and not math.isnan(float(r.get(key, float("nan"))))
+            ]
+            return float(sum(vals) / len(vals)) if len(vals) > 0 else float("nan")
+
         return {
             "episode_uid": str(spec.episode_uid),
             "num_rows": int(len(rows)),
             "final_iter": int(final_iter),
             "mean_psnr": float(sum(psnr_vals) / len(psnr_vals)) if len(psnr_vals) > 0 else float("nan"),
             "mean_l1": float(sum(l1_vals) / len(l1_vals)) if len(l1_vals) > 0 else float("nan"),
+            "num_rows_reconstruction": int(
+                len([r for r in final_rows if str(r.get("metric_group")) == "reconstruction"])
+            ),
+            "num_rows_nvs": int(len([r for r in final_rows if str(r.get("metric_group")) == "nvs"])),
+            "mean_psnr_reconstruction": _mean_for("reconstruction", "psnr"),
+            "mean_psnr_nvs": _mean_for("nvs", "psnr"),
+            "mean_l1_reconstruction": _mean_for("reconstruction", "l1"),
+            "mean_l1_nvs": _mean_for("nvs", "l1"),
+            "mean_ssim_reconstruction": _mean_for("reconstruction", "ssim"),
+            "mean_ssim_nvs": _mean_for("nvs", "ssim"),
+            "mean_lpips_reconstruction": _mean_for("reconstruction", "lpips"),
+            "mean_lpips_nvs": _mean_for("nvs", "lpips"),
         }
 
     def write_csvs(self) -> None:

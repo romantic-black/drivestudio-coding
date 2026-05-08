@@ -13,6 +13,7 @@ except ImportError:
 
 from nerfview import CameraState
 
+from streetforward_eval.stage5_6_runtime import run_stage5_6_update_step
 from tools.train_minimal_streetforward_stage1_1 import convert_batch_to_minimal_format
 
 
@@ -70,6 +71,16 @@ class Stage5DemoController:
         self.update_history_memory = bool(infer_cfg.get("update_history_memory", True))
         self.update_view_transient = bool(infer_cfg.get("update_view_transient", True))
         self.record_block_history_on_block_exit = bool(infer_cfg.get("record_block_history_on_block_exit", True))
+        history_cfg = cfg.get("batch_eval", {}).get("history", {}) if cfg.get("batch_eval") is not None else {}
+        demo_history_cfg = demo_cfg.get("history") or {}
+        self.record_each_step = bool(demo_history_cfg.get("record_each_step", history_cfg.get("record_each_step", False)))
+        self.record_block_history_on_block_exit = bool(
+            demo_history_cfg.get(
+                "record_support_residual_on_input_exit",
+                history_cfg.get("record_support_residual_on_input_exit", self.record_block_history_on_block_exit),
+            )
+        )
+        self.reset_train_params_on_scope_change = bool(demo_cfg.get("reset_train_params_on_scope_change", True))
         self.no_optimizer_step = bool(infer_cfg.get("no_optimizer_step", False))
         self.no_backward = bool(infer_cfg.get("no_backward", False))
         if self._mode_train_and_infer and (self.no_optimizer_step or self.no_backward):
@@ -84,6 +95,9 @@ class Stage5DemoController:
             raise ValueError("demo.train_infer.state_write_interval_steps must be >= 1")
         self._recorded_block_update_counts: Dict[Tuple[int, int, int, int], int] = {}
         self._initial_model_state_dict = self._snapshot_model_state_dict()
+        self._initial_optimizer_global_step = int(
+            getattr(getattr(self.trainer, "optimizer", None), "global_step", getattr(self.trainer, "global_step", 0))
+        )
         self.train_steps_total = 0
         self.train_steps_since_param_reset = 0
         self.train_param_reset_count = 0
@@ -108,6 +122,8 @@ class Stage5DemoController:
         return out
 
     def _batch_to_minimal(self, raw_batch: Dict[str, Any]) -> Dict[str, Any]:
+        if isinstance(raw_batch, dict) and isinstance(raw_batch.get("targets"), list):
+            return raw_batch
         tgt = raw_batch.get("target")
         if not isinstance(tgt, dict) or tgt.get("image") is None:
             raise ValueError("scheduler batch must contain target.image")
@@ -123,6 +139,7 @@ class Stage5DemoController:
     def _extract_scheduler_info(self, raw_batch: Dict[str, Any]) -> Dict[str, Any]:
         return (
             raw_batch.get("_scheduler_demo_v1_info")
+            or raw_batch.get("_scheduler_eval_v8_demo_info")
             or raw_batch.get("_scheduler_v8_aligned_info")
             or raw_batch.get("_scheduler_v7_aligned_info")
             or raw_batch.get("_scheduler_v4_aligned_info")
@@ -180,7 +197,7 @@ class Stage5DemoController:
             return {}
         if not hasattr(self.trainer, "record_block_history"):
             return {}
-        if str(self.stage) not in ("5_2", "5_3"):
+        if str(self.stage) not in ("5_2", "5_3", "5_6"):
             return {}
         minimal = self.display.last_minimal_batch
         if minimal is None:
@@ -207,6 +224,19 @@ class Stage5DemoController:
             return dict(rec_stats)
         return {}
 
+    def _record_history_for_batch(
+        self,
+        minimal: Dict[str, Any],
+        scheduler_info: Dict[str, Any],
+        *,
+        reason: str,
+    ) -> Dict[str, Any]:
+        if not hasattr(self.trainer, "record_block_history"):
+            return {}
+        event = self._make_block_exit_event_for_recording(scheduler_info, reason=reason)
+        out = self.trainer.record_block_history(minimal, event)
+        return dict(out) if isinstance(out, dict) else {}
+
     def prime(self) -> Dict[str, Any]:
         if not hasattr(self.scheduler, "materialize_current_batch_without_advance"):
             raise ValueError("scheduler must implement materialize_current_batch_without_advance for demo prime")
@@ -229,6 +259,9 @@ class Stage5DemoController:
             "stage": self.stage,
             "mode": self.mode,
             "global_step": int(self.display.global_step),
+            "optimizer_global_step": int(
+                getattr(getattr(self.trainer, "optimizer", None), "global_step", getattr(self.trainer, "global_step", 0))
+            ),
             "trained_steps_total": int(self.train_steps_total),
             "trained_steps_since_param_reset": int(self.train_steps_since_param_reset),
             "train_param_reset_count": int(self.train_param_reset_count),
@@ -238,9 +271,17 @@ class Stage5DemoController:
             "block_idx_global": int(scheduler_info.get("block_idx_global", -1)),
             "demo_block_uid": int(scheduler_info.get("demo_block_uid", -1)),
             "block_idx_in_episode": int(scheduler_info.get("block_idx_in_episode", -1)),
+            "block_repeat_step": int(scheduler_info.get("block_repeat_step", -1)),
             "segment_local_step": int(scheduler_info.get("segment_local_step", -1)),
+            "visit_cursor": int(scheduler_info.get("visit_cursor", -1)),
+            "visit_total": int(scheduler_info.get("visit_total", -1)),
+            "episode_done": bool(scheduler_info.get("episode_done", False)),
+            "sequence_start_pos": int(scheduler_info.get("sequence_start_pos", -1)),
             "source_frame_idx": int(scheduler_info.get("source_frame_idx", -1)),
             "target_frame_indices": [int(x) for x in scheduler_info.get("target_frame_indices", [])],
+            "target_frame_roles": [str(x) for x in scheduler_info.get("target_frame_roles", [])],
+            "target_image_roles": [str(x) for x in request_meta.get("target_image_roles", [])],
+            "near_random_frame_indices": [int(x) for x in request_meta.get("near_random_frame_indices", [])],
             "source_image_refs": [tuple(x) for x in source_refs],
             "target_image_refs": [tuple(x) for x in target_refs],
             "last_event_type": str(latest_event.get("type", "")),
@@ -262,32 +303,70 @@ class Stage5DemoController:
             minimal = self._batch_to_minimal(raw_batch)
             did_train_step = False
             if self._mode_train_and_infer:
-                scheduler_node_sync = {
-                    "U": int(self.train_infer_state_write_interval_steps),
-                    "segment_local_step": int(info.get("segment_local_step", self.display.global_step)) + 1,
-                    "reset_after_block": bool(self.train_infer_reset_node_state_after_block),
-                }
-                stats = self.trainer.train_step(
-                    minimal,
-                    step=int(self.display.global_step + 1),
-                    profile_phase_timing=False,
-                    sync_cuda_timing=False,
-                    scheduler_node_sync=scheduler_node_sync,
-                )
+                if bool(getattr(self.scheduler, "is_stage5_6_eval_demo", False)):
+                    aligned = minimal.get("_scheduler_v8_aligned_info") or {}
+                    stats = run_stage5_6_update_step(
+                        model=self.trainer,
+                        update_batch=minimal,
+                        mode="segment_finetune_train",
+                        segment_local_step=int(aligned.get("segment_local_step", self.display.global_step + 1)),
+                        update_hidden_state=bool(getattr(self.scheduler, "update_hidden_state", self.update_hidden_state)),
+                        update_node_state=bool(getattr(self.scheduler, "update_node_state", self.update_node_state)),
+                    )
+                else:
+                    scheduler_node_sync = {
+                        "U": int(self.train_infer_state_write_interval_steps),
+                        "segment_local_step": int(info.get("segment_local_step", self.display.global_step)) + 1,
+                        "reset_after_block": bool(self.train_infer_reset_node_state_after_block),
+                    }
+                    stats = self.trainer.train_step(
+                        minimal,
+                        step=int(self.display.global_step + 1),
+                        profile_phase_timing=False,
+                        sync_cuda_timing=False,
+                        scheduler_node_sync=scheduler_node_sync,
+                    )
                 did_train_step = True
             else:
-                stats = self.trainer.demo_infer_step(
-                    minimal,
-                    scheduler_events=events,
-                    update_node_state=self.update_node_state,
-                    update_hidden_state=self.update_hidden_state,
-                    update_history_memory=self.update_history_memory,
-                    update_view_transient=self.update_view_transient,
-                )
+                if bool(getattr(self.scheduler, "is_stage5_6_eval_demo", False)):
+                    aligned = minimal.get("_scheduler_v8_aligned_info") or {}
+                    stats = run_stage5_6_update_step(
+                        model=self.trainer,
+                        update_batch=minimal,
+                        mode="inference_only",
+                        segment_local_step=int(aligned.get("segment_local_step", self.display.global_step + 1)),
+                        update_hidden_state=bool(getattr(self.scheduler, "update_hidden_state", self.update_hidden_state)),
+                        update_node_state=bool(getattr(self.scheduler, "update_node_state", self.update_node_state)),
+                    )
+                else:
+                    stats = self.trainer.demo_infer_step(
+                        minimal,
+                        scheduler_events=events,
+                        update_node_state=self.update_node_state,
+                        update_hidden_state=self.update_hidden_state,
+                        update_history_memory=self.update_history_memory,
+                        update_view_transient=self.update_view_transient,
+                    )
             if hasattr(self.scheduler, "mark_current_block_updated"):
                 self.scheduler.mark_current_block_updated()
             post_events = self.scheduler.pop_events() if hasattr(self.scheduler, "pop_events") else []
             all_events = list(events) + list(post_events)
+            should_record = bool(self.record_each_step) or (
+                bool(self.record_block_history_on_block_exit)
+                and any(
+                    isinstance(e, dict) and e.get("type") == "demo_block_exit" and bool(e.get("model_update", False))
+                    for e in all_events
+                )
+            )
+            if should_record and bool(getattr(self.scheduler, "is_stage5_6_eval_demo", False)):
+                rec = self._record_history_for_batch(
+                    minimal,
+                    minimal.get("_scheduler_v8_aligned_info") or info,
+                    reason="eval_cursor_step",
+                )
+                if rec:
+                    stats = dict(stats or {})
+                    stats.update(rec)
             self.display.global_step += 1
             if did_train_step:
                 self.train_steps_total += 1
@@ -322,6 +401,14 @@ class Stage5DemoController:
             raw_batch = op()
             merge_stats = dict(stats or {})
             merge_stats.update(rec_stats)
+            if bool(getattr(self.scheduler, "is_stage5_6_eval_demo", False)) and op_name in {
+                "next_scene",
+                "prev_scene",
+                "next_segment",
+                "prev_segment",
+                "resample_episode",
+            }:
+                merge_stats.update(self._reset_for_eval_scope_change())
             return self._refresh_display_from_raw_batch(raw_batch, stats=merge_stats)
         finally:
             self.busy = False
@@ -357,9 +444,57 @@ class Stage5DemoController:
                 raise ValueError("scheduler does not support set_scope")
             raw_batch = self.scheduler.set_scope(int(scene_id), int(segment_id))
             rec_stats.update({"manual_set_scope": 1.0})
+            if bool(getattr(self.scheduler, "is_stage5_6_eval_demo", False)):
+                rec_stats.update(self._reset_for_eval_scope_change())
             return self._refresh_display_from_raw_batch(raw_batch, stats=rec_stats)
         finally:
             self.busy = False
+
+    def set_sequence_start_pos(self, sequence_start_pos: int) -> Dict[str, Any]:
+        if self.busy:
+            raise ValueError("controller is busy")
+        self.busy = True
+        try:
+            rec_stats = self._maybe_record_current_block_history(reason="set_sequence_start_pos")
+            if not hasattr(self.scheduler, "set_sequence_start_pos"):
+                raise ValueError("scheduler does not support set_sequence_start_pos")
+            raw_batch = self.scheduler.set_sequence_start_pos(int(sequence_start_pos))
+            rec_stats.update({"manual_set_sequence_start_pos": 1.0})
+            if bool(getattr(self.scheduler, "is_stage5_6_eval_demo", False)):
+                rec_stats.update(self._reset_for_eval_scope_change())
+            return self._refresh_display_from_raw_batch(raw_batch, stats=rec_stats)
+        finally:
+            self.busy = False
+
+    def run_current_chunk(self) -> Dict[str, Any]:
+        info = self._current_scheduler_info()
+        start_block = int(info.get("block_idx_in_episode", -1))
+        last: Dict[str, Any] = dict(self.display.last_stats or {})
+        steps = 0
+        while start_block >= 0 and not bool(getattr(self.scheduler, "is_episode_done", lambda: False)()):
+            last = self.step_current_block_once()
+            steps += 1
+            cur = self._current_scheduler_info()
+            if bool(cur.get("episode_done", False)) or int(cur.get("block_idx_in_episode", -1)) != start_block:
+                break
+        last = dict(last)
+        last["run_current_chunk_steps"] = int(steps)
+        self.display.last_stats.update(last)
+        return last
+
+    def run_episode(self) -> Dict[str, Any]:
+        last: Dict[str, Any] = dict(self.display.last_stats or {})
+        max_steps = int((self._current_scheduler_info() or {}).get("visit_total", 0))
+        steps = 0
+        while not bool(getattr(self.scheduler, "is_episode_done", lambda: False)()):
+            last = self.step_current_block_once()
+            steps += 1
+            if max_steps > 0 and steps > max_steps:
+                raise RuntimeError("run_episode exceeded scheduler visit_total")
+        last = dict(last)
+        last["run_episode_steps"] = int(steps)
+        self.display.last_stats.update(last)
+        return last
 
     def new_episode_and_reset_segment_state(self) -> Dict[str, Any]:
         if self.busy:
@@ -370,8 +505,12 @@ class Stage5DemoController:
             if not hasattr(self.scheduler, "resample_episode"):
                 raise ValueError("scheduler does not support resample_episode")
             raw_batch = self.scheduler.resample_episode()
-            self._clear_state_for_active_segment()
-            rec_stats.update({"manual_resample_episode": 1.0, "reset_segment_state": 1.0})
+            if bool(getattr(self.scheduler, "is_stage5_6_eval_demo", False)):
+                rec_stats.update(self._reset_for_eval_scope_change())
+                rec_stats.update({"manual_resample_episode": 1.0})
+            else:
+                self._clear_state_for_active_segment()
+                rec_stats.update({"manual_resample_episode": 1.0, "reset_segment_state": 1.0})
             return self._refresh_display_from_raw_batch(raw_batch, stats=rec_stats)
         finally:
             self.busy = False
@@ -391,6 +530,13 @@ class Stage5DemoController:
             return []
         seg = int(info.get("segment_id", -1))
         return [] if seg < 0 else [seg]
+
+    def list_sequence_start_positions(self) -> List[int]:
+        if hasattr(self.scheduler, "list_sequence_start_positions"):
+            return [int(x) for x in self.scheduler.list_sequence_start_positions()]
+        info = self._current_scheduler_info()
+        start = int(info.get("sequence_start_pos", -1))
+        return [] if start < 0 else [start]
 
     def reset_current_scene_state(self) -> Dict[str, Any]:
         return self.reset_current_segment_state()
@@ -423,6 +569,77 @@ class Stage5DemoController:
             self._recorded_block_update_counts.pop(k, None)
         return key
 
+    def _clear_all_runtime_state(self) -> None:
+        if hasattr(self.trainer, "reset_node_state"):
+            self.trainer.reset_node_state()
+        for name in (
+            "h_cache_bg",
+            "h_cache_distant",
+            "h_cache_rigid",
+            "stage5_2_history_bg",
+            "stage5_2_history_distant",
+            "stage5_2_history_rigid",
+            "stage5_2_last_step_update_norm",
+            "stage5_2_block_support_bg",
+            "stage5_2_block_support_distant",
+            "stage5_2_block_support_rigid",
+        ):
+            cache = getattr(self.trainer, name, None)
+            if isinstance(cache, dict):
+                cache.clear()
+        for name in (
+            "_stage5_6_frame_cache",
+            "_stage5_6_active_cache",
+            "_stage5_6_last_fused_features",
+        ):
+            if hasattr(self.trainer, name):
+                value = getattr(self.trainer, name)
+                if isinstance(value, dict):
+                    value.clear()
+                else:
+                    setattr(self.trainer, name, None if name == "_stage5_6_active_cache" else {})
+        if hasattr(self.trainer, "_stage5_2_last_full_inputs"):
+            self.trainer._stage5_2_last_full_inputs = None
+        self._recorded_block_update_counts.clear()
+
+    def _restore_training_parameters_in_place(self) -> Tuple[int, int]:
+        state_dict = self._clone_state_dict_for_load(self._initial_model_state_dict)
+        missing_keys, unexpected_keys = self.trainer.load_state_dict(state_dict, strict=False)
+        if hasattr(self.trainer, "zero_grad"):
+            try:
+                self.trainer.zero_grad(set_to_none=True)
+            except TypeError:
+                self.trainer.zero_grad()
+        optimizer = getattr(self.trainer, "optimizer", None)
+        if optimizer is not None:
+            if hasattr(optimizer, "zero_grad"):
+                try:
+                    optimizer.zero_grad(set_to_none=True)
+                except TypeError:
+                    optimizer.zero_grad()
+            if hasattr(optimizer, "state") and isinstance(optimizer.state, dict):
+                optimizer.state.clear()
+            if hasattr(optimizer, "global_step"):
+                optimizer.global_step = int(self._initial_optimizer_global_step)
+        setattr(self.trainer, "global_step", int(self._initial_optimizer_global_step))
+        self.train_steps_since_param_reset = 0
+        self.train_param_reset_count += 1
+        return len(missing_keys), len(unexpected_keys)
+
+    def _reset_for_eval_scope_change(self) -> Dict[str, float]:
+        self._clear_all_runtime_state()
+        stats: Dict[str, float] = {"reset_all_demo_state": 1.0}
+        if self.reset_train_params_on_scope_change and self._mode_train_and_infer:
+            missing, unexpected = self._restore_training_parameters_in_place()
+            stats.update(
+                {
+                    "reset_training_parameters": 1.0,
+                    "reset_training_parameters_missing_keys": float(missing),
+                    "reset_training_parameters_unexpected_keys": float(unexpected),
+                }
+            )
+        return stats
+
     def reset_current_segment_state(self) -> Dict[str, Any]:
         if self.busy:
             raise ValueError("controller is busy")
@@ -445,17 +662,7 @@ class Stage5DemoController:
     def reset_all_demo_state(self) -> Dict[str, Any]:
         if self.busy:
             raise ValueError("controller is busy")
-        if hasattr(self.trainer, "reset_node_state"):
-            self.trainer.reset_node_state()
-        if hasattr(self.trainer, "h_cache_bg"):
-            self.trainer.h_cache_bg.clear()
-        if hasattr(self.trainer, "h_cache_distant"):
-            self.trainer.h_cache_distant.clear()
-        if hasattr(self.trainer, "h_cache_rigid"):
-            self.trainer.h_cache_rigid.clear()
-        if hasattr(self.trainer, "_stage5_2_last_full_inputs"):
-            self.trainer._stage5_2_last_full_inputs = None
-        self._recorded_block_update_counts.clear()
+        self._clear_all_runtime_state()
         info = self._current_scheduler_info()
         minimal = self.display.last_minimal_batch or {}
         self.display.last_stats = self._build_status(
@@ -471,24 +678,8 @@ class Stage5DemoController:
             raise ValueError("controller is busy")
         self.busy = True
         try:
-            state_dict = self._clone_state_dict_for_load(self._initial_model_state_dict)
-            missing_keys, unexpected_keys = self.trainer.load_state_dict(state_dict, strict=False)
-            if hasattr(self.trainer, "zero_grad"):
-                try:
-                    self.trainer.zero_grad(set_to_none=True)
-                except TypeError:
-                    self.trainer.zero_grad()
-            optimizer = getattr(self.trainer, "optimizer", None)
-            if optimizer is not None:
-                if hasattr(optimizer, "zero_grad"):
-                    try:
-                        optimizer.zero_grad(set_to_none=True)
-                    except TypeError:
-                        optimizer.zero_grad()
-                if hasattr(optimizer, "state") and isinstance(optimizer.state, dict):
-                    optimizer.state.clear()
+            missing_count, unexpected_count = self._restore_training_parameters_in_place()
             self.train_steps_since_param_reset = 0
-            self.train_param_reset_count += 1
             info = self._current_scheduler_info()
             minimal = self.display.last_minimal_batch
             if minimal is None and hasattr(self.scheduler, "materialize_current_batch_without_advance"):
@@ -498,8 +689,8 @@ class Stage5DemoController:
             self.display.last_stats = self._build_status(
                 stats={
                     "reset_training_parameters": 1.0,
-                    "reset_training_parameters_missing_keys": float(len(missing_keys)),
-                    "reset_training_parameters_unexpected_keys": float(len(unexpected_keys)),
+                    "reset_training_parameters_missing_keys": float(missing_count),
+                    "reset_training_parameters_unexpected_keys": float(unexpected_count),
                 },
                 minimal_batch=minimal or {},
                 events=self.display.last_events,

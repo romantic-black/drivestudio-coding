@@ -88,6 +88,9 @@ class StreetForwardStage5Viewer(Viewer):
         segment_options = tuple(str(x) for x in self.controller.list_segment_ids(initial_scene))
         if len(segment_options) == 0:
             segment_options = ("-1",)
+        window_options = tuple(str(x) for x in self.controller.list_sequence_start_positions())
+        if len(window_options) == 0:
+            window_options = ("0",)
         initial_stats = self.controller.display.last_stats or {}
         initial_source_frame = int(initial_stats.get("source_frame_idx", -1))
         with self._demo_folder:
@@ -104,11 +107,22 @@ class StreetForwardStage5Viewer(Viewer):
                 options=segment_options,
                 initial_value=segment_options[0],
             )
+            window_select = self.server.gui.add_dropdown(
+                "Window Start",
+                options=window_options,
+                initial_value=window_options[0],
+            )
             global_step = self.server.gui.add_number("Global Step", initial_value=0, disabled=True)
+            optimizer_step = self.server.gui.add_number("Optimizer Step", initial_value=0, disabled=True)
             block_global = self.server.gui.add_number("Block Global", initial_value=-1, disabled=True)
+            block_repeat = self.server.gui.add_number("Block Repeat", initial_value=-1, disabled=True)
             segment_step = self.server.gui.add_number("Segment Step", initial_value=-1, disabled=True)
+            visit_cursor = self.server.gui.add_text("Visit", initial_value="0 / 0", disabled=True)
+            sequence_start = self.server.gui.add_number("Sequence Start", initial_value=-1, disabled=True)
             source_refs = self.server.gui.add_text("Source Refs", initial_value="[]", disabled=True)
             target_refs = self.server.gui.add_text("Target Refs", initial_value="[]", disabled=True)
+            target_roles = self.server.gui.add_text("Target Roles", initial_value="[]", disabled=True)
+            near_random = self.server.gui.add_text("Nearby", initial_value="[]", disabled=True)
             last_event = self.server.gui.add_text("Last Event", initial_value="", disabled=True)
             num_bg_update = self.server.gui.add_number("num_bg_update", initial_value=0, disabled=True)
             num_distant_update = self.server.gui.add_number("num_distant_update", initial_value=0, disabled=True)
@@ -125,9 +139,9 @@ class StreetForwardStage5Viewer(Viewer):
             next_scene = self.server.gui.add_button("Next Scene")
             prev_segment = self.server.gui.add_button("Prev Segment")
             next_segment = self.server.gui.add_button("Next Segment")
-            prev_block = self.server.gui.add_button("Prev Block")
             next_step = self.server.gui.add_button("Next Step", color="blue")
-            next_block = self.server.gui.add_button("Next Block")
+            run_chunk = self.server.gui.add_button("Run Current Chunk")
+            run_episode = self.server.gui.add_button("Run Episode")
             reset_state = self.server.gui.add_button("Reset Current Segment State")
             reset_all_state = self.server.gui.add_button("Reset All Demo State")
             next_episode_reset = self.server.gui.add_button("Next Episode + Reset Segment")
@@ -155,6 +169,9 @@ class StreetForwardStage5Viewer(Viewer):
                 segments = tuple(str(x) for x in self.controller.list_segment_ids(cur_scene))
                 if len(segments) == 0:
                     segments = ("-1",)
+                starts = tuple(str(x) for x in self.controller.list_sequence_start_positions())
+                if len(starts) == 0:
+                    starts = ("0",)
                 self._suspend_scope_callbacks = True
                 scene_select.options = scenes
                 if str(cur_scene) in scenes:
@@ -166,6 +183,9 @@ class StreetForwardStage5Viewer(Viewer):
                     segment_select.value = str(cur_segment)
                 else:
                     segment_select.value = segments[0]
+                window_select.options = starts
+                cur_start = int((self.controller.display.last_stats or {}).get("sequence_start_pos", -1))
+                window_select.value = str(cur_start) if str(cur_start) in starts else starts[0]
                 self._suspend_scope_callbacks = False
 
             @next_step.on_click
@@ -173,7 +193,8 @@ class StreetForwardStage5Viewer(Viewer):
                 if self.controller.busy:
                     return
                 next_step.disabled = True
-                next_block.disabled = True
+                run_chunk.disabled = True
+                run_episode.disabled = True
                 try:
                     self.controller.step_current_block_once()
                     self.rerender(None)
@@ -181,25 +202,42 @@ class StreetForwardStage5Viewer(Viewer):
                     self.refresh_panel_state()
                 finally:
                     next_step.disabled = False
-                    next_block.disabled = False
+                    run_chunk.disabled = False
+                    run_episode.disabled = False
 
-            @prev_block.on_click
+            @run_chunk.on_click
             def _(_) -> None:
                 if self.controller.busy:
                     return
-                self.controller.prev_block()
-                self.rerender(None)
-                _refresh_scope_dropdowns_from_stats()
-                self.refresh_panel_state()
+                next_step.disabled = True
+                run_chunk.disabled = True
+                run_episode.disabled = True
+                try:
+                    self.controller.run_current_chunk()
+                    self.rerender(None)
+                    _refresh_scope_dropdowns_from_stats()
+                    self.refresh_panel_state()
+                finally:
+                    next_step.disabled = False
+                    run_chunk.disabled = False
+                    run_episode.disabled = False
 
-            @next_block.on_click
+            @run_episode.on_click
             def _(_) -> None:
                 if self.controller.busy:
                     return
-                self.controller.next_block()
-                self.rerender(None)
-                _refresh_scope_dropdowns_from_stats()
-                self.refresh_panel_state()
+                next_step.disabled = True
+                run_chunk.disabled = True
+                run_episode.disabled = True
+                try:
+                    self.controller.run_episode()
+                    self.rerender(None)
+                    _refresh_scope_dropdowns_from_stats()
+                    self.refresh_panel_state()
+                finally:
+                    next_step.disabled = False
+                    run_chunk.disabled = False
+                    run_episode.disabled = False
 
             @prev_scene.on_click
             def _(_) -> None:
@@ -258,6 +296,15 @@ class StreetForwardStage5Viewer(Viewer):
                 scene_val = int(scene_select.value)
                 segment_val = int(segment_select.value)
                 self.controller.set_scope(scene_val, segment_val)
+                self.rerender(None)
+                _refresh_scope_dropdowns_from_stats()
+                self.refresh_panel_state()
+
+            @window_select.on_update
+            def _(_) -> None:
+                if self.controller.busy or self._suspend_scope_callbacks:
+                    return
+                self.controller.set_sequence_start_pos(int(window_select.value))
                 self.rerender(None)
                 _refresh_scope_dropdowns_from_stats()
                 self.refresh_panel_state()
@@ -329,11 +376,18 @@ class StreetForwardStage5Viewer(Viewer):
             "segment_id": segment_id,
             "scene_select": scene_select,
             "segment_select": segment_select,
+            "window_select": window_select,
             "global_step": global_step,
+            "optimizer_step": optimizer_step,
             "block_global": block_global,
+            "block_repeat": block_repeat,
             "segment_step": segment_step,
+            "visit_cursor": visit_cursor,
+            "sequence_start": sequence_start,
             "source_refs": source_refs,
             "target_refs": target_refs,
+            "target_roles": target_roles,
+            "near_random": near_random,
             "last_event": last_event,
             "num_bg_update": num_bg_update,
             "num_distant_update": num_distant_update,
@@ -376,10 +430,18 @@ class StreetForwardStage5Viewer(Viewer):
         self._demo_tab_handles["scene_id"].value = int(stats.get("scene_id", -1))
         self._demo_tab_handles["segment_id"].value = int(stats.get("segment_id", -1))
         self._demo_tab_handles["global_step"].value = int(stats.get("global_step", 0))
+        self._demo_tab_handles["optimizer_step"].value = int(stats.get("optimizer_global_step", 0))
         self._demo_tab_handles["block_global"].value = int(stats.get("block_idx_global", -1))
+        self._demo_tab_handles["block_repeat"].value = int(stats.get("block_repeat_step", -1))
         self._demo_tab_handles["segment_step"].value = int(stats.get("segment_local_step", -1))
+        self._demo_tab_handles["visit_cursor"].value = (
+            f"{int(stats.get('visit_cursor', -1))} / {int(stats.get('visit_total', -1))}"
+        )
+        self._demo_tab_handles["sequence_start"].value = int(stats.get("sequence_start_pos", -1))
         self._demo_tab_handles["source_refs"].value = str(list(stats.get("source_image_refs", [])))
         self._demo_tab_handles["target_refs"].value = str(list(stats.get("target_image_refs", [])))
+        self._demo_tab_handles["target_roles"].value = str(list(stats.get("target_frame_roles", [])))
+        self._demo_tab_handles["near_random"].value = str(list(stats.get("near_random_frame_indices", [])))
         self._demo_tab_handles["last_event"].value = str(stats.get("last_event_type", ""))
         self._demo_tab_handles["num_bg_update"].value = int(stats.get("num_bg_update", 0))
         self._demo_tab_handles["num_distant_update"].value = int(stats.get("num_distant_update", 0))
@@ -404,6 +466,9 @@ class StreetForwardStage5Viewer(Viewer):
             segments = tuple(str(x) for x in self.controller.list_segment_ids(scene_val))
             if len(segments) == 0:
                 segments = ("-1",)
+            starts = tuple(str(x) for x in self.controller.list_sequence_start_positions())
+            if len(starts) == 0:
+                starts = ("0",)
             self._suspend_scope_callbacks = True
             self._demo_tab_handles["scene_select"].options = scenes
             self._demo_tab_handles["scene_select"].value = str(scene_val) if str(scene_val) in scenes else scenes[0]
@@ -411,4 +476,8 @@ class StreetForwardStage5Viewer(Viewer):
             self._demo_tab_handles["segment_select"].value = (
                 str(segment_val) if str(segment_val) in segments else segments[0]
             )
+            if "window_select" in self._demo_tab_handles:
+                start_val = int(stats.get("sequence_start_pos", -1))
+                self._demo_tab_handles["window_select"].options = starts
+                self._demo_tab_handles["window_select"].value = str(start_val) if str(start_val) in starts else starts[0]
             self._suspend_scope_callbacks = False
