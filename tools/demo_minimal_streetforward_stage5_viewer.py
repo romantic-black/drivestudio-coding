@@ -75,7 +75,8 @@ def _patch_cfg_for_demo(cfg: Any, args: argparse.Namespace) -> None:
         cfg.demo = {}
     if cfg.demo.get("scheduler") is None:
         cfg.demo.scheduler = {}
-    cfg.demo.scheduler.type = "eval_v8_stage5_6"
+    if cfg.demo.scheduler.get("type") is None:
+        cfg.demo.scheduler.type = "train_v8_stage5_6"
     cfg.demo.scheduler.initial_scene_id = None if args.scene_id is None else int(args.scene_id)
     cfg.demo.scheduler.initial_segment_id = None if args.segment_id is None else int(args.segment_id)
     if args.sequence_start_pos is not None:
@@ -180,7 +181,12 @@ def main() -> None:
     parser.add_argument("--ckpt", type=str, default="", help="Checkpoint path.")
     parser.add_argument("--scene_id", type=int, default=None, help="Initial scene id for demo traversal.")
     parser.add_argument("--segment_id", type=int, default=None, help="Fixed segment id (optional).")
-    parser.add_argument("--sequence_start_pos", type=int, default=None, help="Initial eval window start position.")
+    parser.add_argument(
+        "--sequence_start_pos",
+        type=int,
+        default=None,
+        help="Initial training episode_start_keyframe_pos for train-v8 mode, or eval window start for eval-v8 mode.",
+    )
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Viewer host.")
     parser.add_argument("--port", type=int, default=8080, help="Viewer port.")
     parser.add_argument("--device", type=str, default="", help="Explicit torch device, e.g. cuda:0 / cpu.")

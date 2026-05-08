@@ -442,6 +442,7 @@ def stage5_6_runtime_policy(
     do_train: bool,
     update_hidden_state: bool,
     update_node_state: bool,
+    reset_node_state_after_block: bool = False,
     force_eval_mode: bool = False,
 ):
     from models.streetforward.minimal_trainer_stage4_3 import RuntimePolicy
@@ -451,7 +452,7 @@ def stage5_6_runtime_policy(
         do_optimizer_step=bool(do_train),
         update_hidden_cache=bool(update_hidden_state),
         writeback_node_state=bool(update_node_state),
-        reset_node_state_after_block=False,
+        reset_node_state_after_block=bool(reset_node_state_after_block),
         force_eval_mode=bool(force_eval_mode),
     )
 

@@ -6,21 +6,38 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
+from datasets.train_scheduler_v8 import TrainSchedulerV8
 from streetforward_eval.runner import StreetForwardBatchEvalRunner
 from tools.streetforward_stage5_demo_controller import Stage5DemoController
 from tools.streetforward_stage5_demo_scheduler import build_stage5_demo_scheduler_from_cfg
 
 
 class _SegmentIndex:
-    def __init__(self, *, num_frames: int = 12, num_cams: int = 2):
+    def __init__(self, *, num_keyframes: int = 8, frames_per_keyframe: int = 3, num_cams: int = 2):
+        num_frames = int(num_keyframes) * int(frames_per_keyframe)
         self.frame_indices = list(range(num_frames))
         self.train_frame_set = set(range(num_frames))
         self.num_cams = int(num_cams)
+        self.keyframe_indices = list(range(int(num_keyframes)))
+        self.keyframe_to_frames = {
+            int(k): [int(k * frames_per_keyframe + i) for i in range(int(frames_per_keyframe))]
+            for k in self.keyframe_indices
+        }
+        self.frame_to_keyframe = {
+            int(f): int(k)
+            for k, frames in self.keyframe_to_frames.items()
+            for f in frames
+        }
+        self.test_frame_indices = []
 
 
 class _TinyDataset:
     def __init__(self):
         self.sidx = _SegmentIndex()
+        self._initialized = False
+
+    def initialize(self):
+        self._initialized = True
 
     def list_training_scene_ids(self):
         return [10]
@@ -71,6 +88,20 @@ class _TinyDataset:
             "request_meta": {},
         }
 
+    def get_segment_batch_from_image_refs(self, request, *, enforce_target0_equals_source=True):
+        return self._assemble_segment_batch_from_image_refs(
+            request.scene_id,
+            request.segment_id,
+            request.source_image_refs or [request.source_image_ref],
+            request.target_image_refs,
+            include_test=bool(getattr(request, "include_test", False)),
+            test_image_refs=getattr(request, "test_image_refs", None),
+            enforce_target0_equals_source=bool(enforce_target0_equals_source),
+        )
+
+    def create_train_scheduler_v8(self, **kwargs):
+        return TrainSchedulerV8(dataset=self, **kwargs)
+
 
 def _cfg(*, steps_per_input: int = 2, switch: int = 1):
     return OmegaConf.create(
@@ -106,6 +137,73 @@ def _cfg(*, steps_per_input: int = 2, switch: int = 1):
                     "window_policy": "sliding",
                     "stride": 1,
                     "require_full_window": True,
+                },
+            },
+        }
+    )
+
+
+def _train_v8_cfg(*, steps_per_block: int = 2, switch: int = 1):
+    return OmegaConf.create(
+        {
+            "model": {"stage": "5_6", "production_training": True},
+            "training": {"seed": 0},
+            "data": {"train_scene_ids": [10]},
+            "scheduler_v8": {
+                "enable": True,
+                "block": {"steps_per_block": int(steps_per_block)},
+                "episode": {
+                    "blocks_per_episode": 3,
+                    "total_target_frames": 2,
+                    "include_source_frame": True,
+                    "target_policy": "visited_episode_frames",
+                    "block_source_frame_policy": "fixed_once_per_episode",
+                    "frame_within_keyframe_policy": "middle_frame",
+                    "min_keyframes_required_policy": "skip_if_less_than_window",
+                },
+                "traversal": {
+                    "mode": "linear_scene_segment",
+                    "switch_after_episode": True,
+                    "fixed_scene_id": None,
+                    "fixed_segment_id": None,
+                    "segment_order": "ascending",
+                    "scene_order": "ascending",
+                },
+                "execution": {
+                    "block_order": "step_major",
+                    "step_major_switch_interval_steps": int(switch),
+                    "reset_policy": "episode_end",
+                },
+                "preload": {
+                    "emit_hints": False,
+                    "warm_next_block_exact": False,
+                    "warm_next_episode_chain": False,
+                },
+                "aux_feature_splat_targets": {"enable": False},
+                "near_random_supervision": {
+                    "enable": True,
+                    "frames_per_block": 2,
+                    "same_keyframe_only": True,
+                    "insufficient_policy": "skip",
+                    "sample_once_per_block": True,
+                    "exclude_source_frame": True,
+                    "exclude_existing_target_frames": True,
+                    "camera_policy": "all_cams",
+                    "role_name": "near_random",
+                },
+            },
+            "batch_eval": {
+                "history": {"record_support_residual_on_input_exit": True, "record_each_step": False},
+            },
+            "demo": {
+                "mode": "segment_finetune_train",
+                "scheduler": {
+                    "type": "train_v8_stage5_6",
+                    "scene_ids": [10],
+                    "initial_scene_id": 10,
+                    "initial_segment_id": 0,
+                    "initial_sequence_start_pos": 0,
+                    "wrap_episode": True,
                 },
             },
         }
@@ -149,6 +247,39 @@ def test_stage5_6_demo_can_select_segment_and_window():
     assert int(info["scene_id"]) == 10
     assert int(info["segment_id"]) == 1
     assert info["block_current_source_frame_indices"] == [2, 4, 6, 8, 10]
+
+
+def test_stage5_6_train_v8_demo_uses_training_near_random_keyframe_sampling():
+    sched = build_stage5_demo_scheduler_from_cfg(_train_v8_cfg(), _TinyDataset(), device=torch.device("cpu"))
+    batch = sched.materialize_current_batch_without_advance()
+    rm = batch["request_meta"]
+    source_frame = int(batch["_scheduler_v8_aligned_info"]["source_frame_idx"])
+    near = [int(x) for x in rm["near_random_frame_indices"]]
+    assert len(near) == 2
+    assert source_frame not in near
+    assert {x // 3 for x in near} == {source_frame // 3}
+    assert rm["target_frame_roles"] == ["source", "near_random", "near_random"]
+    assert rm["target_image_roles"].count("near_random") == 4
+
+
+def test_stage5_6_train_v8_demo_next_step_consumes_train_scheduler_batch():
+    cfg = _train_v8_cfg(steps_per_block=1, switch=1)
+    sched = build_stage5_demo_scheduler_from_cfg(cfg, _TinyDataset(), device=torch.device("cpu"))
+    trainer = _Trainer()
+    controller = Stage5DemoController(
+        cfg=cfg,
+        dataset=_TinyDataset(),
+        scheduler=sched,
+        trainer=trainer,
+        device=torch.device("cpu"),
+        stage="5_6",
+    )
+    controller.prime()
+    stats = controller.step_current_block_once()
+    assert trainer.seen["scheduler_node_sync"]["segment_local_step"] == 1
+    assert trainer.seen["runtime_policy"].reset_node_state_after_block is True
+    assert stats["demo_scheduler_type"] == "train_v8_stage5_6"
+    assert stats["target_frame_roles"][0] == "source"
 
 
 class _Trainer(torch.nn.Module):

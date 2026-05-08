@@ -8,6 +8,7 @@ from datasets.multi_scene_dataset_v4 import BatchRequestV4, MultiSceneDatasetV4
 from streetforward_eval.episode_builder import TestEpisodeSpec
 from streetforward_eval.protocols import TestProtocolSpec, resolve_eval_offsets
 from streetforward_eval.stage5_6_runtime import build_stage5_6_eval_train_batch, iter_block_visit_order
+from tools.train_minimal_streetforward_stage4_3_v8_common import build_train_scheduler_v8_from_cfg
 
 ImageRef = Tuple[int, int]
 
@@ -1249,6 +1250,378 @@ class Stage5_6EvalDemoScheduler:
         )
 
 
+class Stage5_6TrainV8DemoScheduler:
+    """Interactive wrapper around the real TrainSchedulerV8.
+
+    The demo owns scene/segment/episode selection, but every update batch comes
+    from TrainSchedulerV8.next_batch(), so source/target/near_random semantics
+    match training instead of BatchEval's dense frame-window protocol.
+    """
+
+    is_stage5_6_train_v8_demo = True
+
+    def __init__(self, *, dataset: MultiSceneDatasetV4, cfg: Any, seed: int = 0, device: Any = None) -> None:
+        self.dataset = dataset
+        self.cfg = cfg
+        self.seed = int(seed)
+        self.device = device
+        random.seed(int(seed))
+        self.scheduler = build_train_scheduler_v8_from_cfg(cfg, dataset)
+        self.scheduler.pop_events()
+
+        demo_cfg = cfg.get("demo") or {}
+        scheduler_cfg = demo_cfg.get("scheduler") or {}
+        self.wrap_scene = bool(scheduler_cfg.get("wrap_scene", True))
+        self.wrap_segment = bool(scheduler_cfg.get("wrap_segment", True))
+        self.wrap_episode = bool(scheduler_cfg.get("wrap_episode", True))
+        self.update_node_state = bool((demo_cfg.get("inference") or {}).get("update_node_state", True))
+        self.update_hidden_state = bool((demo_cfg.get("inference") or {}).get("update_hidden_state", True))
+
+        configured_scene_ids = scheduler_cfg.get("scene_ids")
+        if configured_scene_ids is None:
+            configured_scene_ids = cfg.get("data", {}).get("train_scene_ids") if cfg.get("data") is not None else None
+        if configured_scene_ids is None:
+            self._scene_ids = [int(x) for x in dataset.list_training_scene_ids()]
+        else:
+            self._scene_ids = [int(x) for x in self._as_list(configured_scene_ids)]
+        self._scene_ids = sorted(self._scene_ids)
+        if len(self._scene_ids) == 0:
+            raise ValueError("Stage5_6 train-v8 demo scheduler requires at least one scene id")
+
+        initial_scene_id = scheduler_cfg.get("initial_scene_id")
+        initial_segment_id = scheduler_cfg.get("initial_segment_id")
+        self.scene_id, self.segment_id = self._resolve_initial_scope(initial_scene_id, initial_segment_id)
+        self.sequence_start_pos = self._resolve_initial_start(scheduler_cfg.get("initial_sequence_start_pos"))
+
+        self._events: List[Dict[str, Any]] = []
+        self._last_raw_batch: Optional[Dict[str, Any]] = None
+        self._last_info: Dict[str, Any] = {}
+        self._start_manual_episode(
+            scene_id=int(self.scene_id),
+            segment_id=int(self.segment_id),
+            sequence_start_pos=int(self.sequence_start_pos),
+            reason="init",
+        )
+
+    @staticmethod
+    def _as_list(value: Any) -> List[Any]:
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple)):
+            return list(value)
+        try:
+            from omegaconf import ListConfig
+
+            if isinstance(value, ListConfig):
+                return list(value)
+        except Exception:
+            pass
+        return [value]
+
+    def _ordered_segment_ids(self, scene_id: int) -> List[int]:
+        return sorted(int(x) for x in self.dataset.list_segment_ids(int(scene_id)))
+
+    def _resolve_initial_scope(self, initial_scene_id: Any, initial_segment_id: Any) -> Tuple[int, int]:
+        scene_id = int(self._scene_ids[0] if initial_scene_id is None else initial_scene_id)
+        if scene_id not in set(self._scene_ids):
+            raise ValueError(f"initial scene_id={scene_id} is not configured in demo.scheduler.scene_ids={self._scene_ids}")
+        seg_ids = self._ordered_segment_ids(scene_id)
+        if len(seg_ids) == 0:
+            raise ValueError(f"scene_id={scene_id} has no segment ids")
+        segment_id = int(seg_ids[0] if initial_segment_id is None else initial_segment_id)
+        if segment_id not in set(seg_ids):
+            raise ValueError(f"segment_id={segment_id} is invalid for scene_id={scene_id}, valid={seg_ids}")
+        return int(scene_id), int(segment_id)
+
+    def _episode_start_positions(self, scene_id: int, segment_id: int) -> List[int]:
+        sidx = self.dataset.get_segment_index(int(scene_id), int(segment_id))
+        starts = self.scheduler._build_segment_episode_starts(
+            num_keyframes=len(sidx.keyframe_indices),
+            e_blocks=int(self.scheduler.blocks_per_episode),
+            window_keyframes=int(self.scheduler.episode_window_keyframes),
+        )
+        return [int(x) for x in starts]
+
+    def _resolve_initial_start(self, initial_start: Any) -> int:
+        starts = self._episode_start_positions(int(self.scene_id), int(self.segment_id))
+        if len(starts) == 0:
+            raise ValueError(f"scene={self.scene_id} segment={self.segment_id} has no valid train-v8 episodes")
+        if initial_start is None:
+            return int(starts[0])
+        start = int(initial_start)
+        if start not in set(starts):
+            raise ValueError(f"initial_sequence_start_pos={start} is invalid for train-v8 starts {starts[:12]}")
+        return int(start)
+
+    def _emit(self, event: Dict[str, Any]) -> None:
+        out = dict(event)
+        out.setdefault("scheduler_version", "v8")
+        out.setdefault("demo_scheduler_type", "train_v8_stage5_6")
+        out.setdefault("scene_id", int(self.scene_id))
+        out.setdefault("segment_id", int(self.segment_id))
+        out.setdefault("sequence_start_pos", int(self.sequence_start_pos))
+        self._events.append(out)
+
+    def _reset_segment_runtime_for_demo_scope(self, scene_id: int, segment_id: int) -> None:
+        key = (int(scene_id), int(segment_id))
+        rt = self.scheduler._segment_runtime.get(key)
+        if not isinstance(rt, dict):
+            raise ValueError(f"TrainSchedulerV8 has no runtime for scene={scene_id} segment={segment_id}")
+        rt["segment_local_step"] = 0
+        rt["block_idx_in_segment"] = 0
+        rt["episodes_started"] = 0
+        rt["episodes_completed"] = 0
+        rt["segment_begun"] = False
+        rt["segment_ended"] = False
+
+    def _start_manual_episode(self, *, scene_id: int, segment_id: int, sequence_start_pos: int, reason: str) -> None:
+        sidx = self.dataset.get_segment_index(int(scene_id), int(segment_id))
+        starts = self._episode_start_positions(int(scene_id), int(segment_id))
+        if int(sequence_start_pos) not in set(starts):
+            raise ValueError(f"sequence_start_pos={sequence_start_pos} is invalid for train-v8 starts {starts[:12]}")
+        self.scene_id = int(scene_id)
+        self.segment_id = int(segment_id)
+        self.sequence_start_pos = int(sequence_start_pos)
+        self._reset_segment_runtime_for_demo_scope(int(scene_id), int(segment_id))
+        self.scheduler.current_episode_state = None
+        plan = self.scheduler._build_episode_plan(
+            sidx,
+            scene_id=int(scene_id),
+            segment_id=int(segment_id),
+            episode_start_keyframe_pos=int(sequence_start_pos),
+        )
+        self.scheduler._start_episode_from_plan(plan)
+        self.scheduler._start_block()
+        self._last_raw_batch = None
+        self._last_info = self._build_info(reason=str(reason))
+        self._emit({"type": "demo_episode_reset", "reason": str(reason), "manual": True, "model_update": False})
+
+    def _attach_train_v8_request_meta(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+        request_meta = dict(batch.get("request_meta") or {})
+        if request_meta.get("target_image_roles") is not None and request_meta.get("target_frame_roles") is not None:
+            batch["request_meta"] = request_meta
+            return batch
+        st = self.scheduler.current_episode_state
+        if st is None:
+            return batch
+        request_meta["target_frame_roles"] = list(st.get("current_target_frame_roles", []))
+        request_meta["target_image_roles"] = list(st.get("target_image_roles", []))
+        request_meta["aux_image_refs"] = list(st.get("aux_image_refs", []))
+        request_meta["aux_image_roles"] = list(st.get("aux_image_roles", []))
+        request_meta["aux_source_cam"] = int(st.get("aux_source_cam", 0))
+        request_meta["aux_camera_policy"] = str(getattr(self.scheduler, "aux_feature_splat_camera_policy", ""))
+        request_meta["near_random_frame_indices"] = list(
+            st.get("block_near_random_frame_indices", {}).get(int(st["block_cursor"]), [])
+        )
+        request_meta["near_random_supervision_enable"] = bool(getattr(self.scheduler, "near_random_enable", False))
+        attempted = int(st.get("near_random_attempted_blocks", 0))
+        skipped = int(st.get("near_random_skipped_blocks", 0))
+        sampled = int(st.get("near_random_sampled_blocks", 0))
+        candidate_sum = float(st.get("near_random_candidate_frames_sum", 0.0))
+        request_meta["scheduler/near_random/enabled"] = float(1.0 if getattr(self.scheduler, "near_random_enable", False) else 0.0)
+        request_meta["scheduler/near_random/num_frames"] = float(len(request_meta["near_random_frame_indices"]))
+        request_meta["scheduler/near_random/skip_ratio"] = float(skipped / max(attempted, 1))
+        request_meta["scheduler/near_random/num_candidate_frames_mean"] = float(candidate_sum / max(attempted, 1))
+        request_meta["scheduler/near_random/sampled_blocks"] = float(sampled)
+        request_meta.setdefault("source_image_refs", list(st.get("source_image_refs", [])))
+        request_meta.setdefault("target_image_refs", list(st.get("target_image_refs", [])))
+        request_meta.setdefault("aux_image_refs", list(st.get("aux_image_refs", [])))
+        batch["request_meta"] = request_meta
+        return batch
+
+    def _build_info(self, *, reason: str = "", batch: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        raw_info = {}
+        if isinstance(batch, dict):
+            raw_info = dict(batch.get("_scheduler_v8_aligned_info") or batch.get("_scheduler_v7_aligned_info") or {})
+        if not raw_info:
+            raw_info = dict(self.scheduler.get_current_info())
+        st = self.scheduler.current_episode_state
+        rm = dict(batch.get("request_meta") or {}) if isinstance(batch, dict) else {}
+        updated = raw_info.get("block_update_counts", [])
+        return {
+            **raw_info,
+            "scheduler_version": "v8",
+            "demo_scheduler_type": "train_v8_stage5_6",
+            "scene_id": int(raw_info.get("scene_id", self.scene_id)),
+            "segment_id": int(raw_info.get("segment_id", self.segment_id)),
+            "episode_idx_global": int(raw_info.get("episode_idx_global", -1)),
+            "block_idx_global": int(raw_info.get("block_idx_global", -1)),
+            "block_idx_in_episode": int(raw_info.get("block_idx_in_episode", -1)),
+            "block_repeat_step": int(raw_info.get("block_repeat_step", 0)),
+            "segment_local_step": int(raw_info.get("segment_local_step", 0)),
+            "source_frame_idx": int(raw_info.get("source_frame_idx", -1)),
+            "target_frame_indices": [int(x) for x in raw_info.get("target_frame_indices", [])],
+            "target_frame_roles": [str(x) for x in rm.get("target_frame_roles", [])],
+            "near_random_frame_indices": [int(x) for x in rm.get("near_random_frame_indices", [])],
+            "source_image_refs": [tuple(x) for x in rm.get("source_image_refs", [])],
+            "target_image_refs": [tuple(x) for x in rm.get("target_image_refs", [])],
+            "target_image_roles": [str(x) for x in rm.get("target_image_roles", [])],
+            "visited_block_indices": [int(x) for x in raw_info.get("visited_block_indices", [])],
+            "updated_block_counts": {i: int(v) for i, v in enumerate(updated)} if isinstance(updated, list) else {},
+            "sequence_start_pos": int(self.sequence_start_pos),
+            "sequence_length": int(getattr(self.scheduler, "blocks_per_episode", 0)),
+            "input_offsets": list(range(int(getattr(self.scheduler, "blocks_per_episode", 0)))),
+            "input_frame_ids": [int(x) for x in (st or {}).get("frame_chain", [])],
+            "visit_cursor": int(raw_info.get("episode_step_cursor", getattr(self.scheduler, "total_episode_steps", 0))),
+            "visit_total": int(getattr(self.scheduler, "total_episode_steps", 0)),
+            "episode_done": bool(self.scheduler.current_episode_state is None),
+            "block_order": str(getattr(self.scheduler, "block_order", "")),
+            "step_major_switch_interval_steps": int(getattr(self.scheduler, "step_major_switch_interval_steps", 1)),
+            "last_reason": str(reason),
+            "global_step": int(getattr(self.scheduler, "global_step", 0)),
+        }
+
+    def _decorate_batch(self, batch: Dict[str, Any], *, reason: str) -> Dict[str, Any]:
+        batch = self._attach_train_v8_request_meta(batch)
+        self._last_raw_batch = batch
+        self._last_info = self._build_info(reason=str(reason), batch=batch)
+        batch["_scheduler_train_v8_demo_info"] = dict(self._last_info)
+        return batch
+
+    def materialize_current_batch_without_advance(self) -> Dict[str, Any]:
+        if self.is_episode_done() and self._last_raw_batch is not None:
+            return self._last_raw_batch
+        batch = self.scheduler.materialize_current_batch_without_advance()
+        return self._decorate_batch(batch, reason="materialize")
+
+    def next_batch_for_update(self) -> Dict[str, Any]:
+        if self.is_episode_done():
+            raise ValueError("current train-v8 demo episode is done; use Next Episode / Reset Segment.")
+        batch = self.scheduler.next_batch()
+        return self._decorate_batch(batch, reason="next_batch")
+
+    def pop_events(self) -> List[Dict[str, Any]]:
+        out = [dict(x) for x in self._events]
+        self._events.clear()
+        out.extend([dict(x) for x in self.scheduler.pop_events()])
+        return out
+
+    def get_current_info(self) -> Dict[str, Any]:
+        return dict(self._last_info or self._build_info(reason="get_current_info"))
+
+    def is_episode_done(self) -> bool:
+        return self.scheduler.current_episode_state is None
+
+    def list_scene_ids(self) -> List[int]:
+        return [int(x) for x in self._scene_ids]
+
+    def list_segment_ids(self, scene_id: int) -> List[int]:
+        return self._ordered_segment_ids(int(scene_id))
+
+    def list_sequence_start_positions(self) -> List[int]:
+        return self._episode_start_positions(int(self.scene_id), int(self.segment_id))
+
+    def _set_scope_and_start(self, *, scene_id: int, segment_id: int, sequence_start_pos: int, reason: str) -> Dict[str, Any]:
+        if int(scene_id) not in set(self._scene_ids):
+            raise ValueError(f"scene_id={scene_id} is not configured")
+        seg_ids = self._ordered_segment_ids(int(scene_id))
+        if int(segment_id) not in set(seg_ids):
+            raise ValueError(f"segment_id={segment_id} is invalid for scene_id={scene_id}, valid={seg_ids}")
+        old_scene = int(self.scene_id)
+        old_segment = int(self.segment_id)
+        old_start = int(self.sequence_start_pos)
+        self._start_manual_episode(
+            scene_id=int(scene_id),
+            segment_id=int(segment_id),
+            sequence_start_pos=int(sequence_start_pos),
+            reason=str(reason),
+        )
+        self._emit(
+            {
+                "type": "demo_scope_change",
+                "old_scene_id": int(old_scene),
+                "old_segment_id": int(old_segment),
+                "old_sequence_start_pos": int(old_start),
+                "new_scene_id": int(scene_id),
+                "new_segment_id": int(segment_id),
+                "new_sequence_start_pos": int(sequence_start_pos),
+                "reason": str(reason),
+                "manual": True,
+                "model_update": False,
+            }
+        )
+        return self.materialize_current_batch_without_advance()
+
+    def set_scope(self, scene_id: int, segment_id: int) -> Dict[str, Any]:
+        starts = self._episode_start_positions(int(scene_id), int(segment_id))
+        if len(starts) == 0:
+            raise ValueError(f"scene_id={scene_id} segment_id={segment_id} has no valid train-v8 starts")
+        return self._set_scope_and_start(
+            scene_id=int(scene_id),
+            segment_id=int(segment_id),
+            sequence_start_pos=int(starts[0]),
+            reason="set_scope",
+        )
+
+    def set_sequence_start_pos(self, sequence_start_pos: int) -> Dict[str, Any]:
+        return self._set_scope_and_start(
+            scene_id=int(self.scene_id),
+            segment_id=int(self.segment_id),
+            sequence_start_pos=int(sequence_start_pos),
+            reason="set_sequence_start_pos",
+        )
+
+    def set_scene(self, scene_id: int) -> Dict[str, Any]:
+        seg_ids = self._ordered_segment_ids(int(scene_id))
+        if len(seg_ids) == 0:
+            raise ValueError(f"scene_id={scene_id} has no segments")
+        return self.set_scope(int(scene_id), int(seg_ids[0]))
+
+    def set_segment(self, segment_id: int) -> Dict[str, Any]:
+        return self.set_scope(int(self.scene_id), int(segment_id))
+
+    def next_scene(self) -> Dict[str, Any]:
+        idx = self._scene_ids.index(int(self.scene_id)) + 1
+        if idx >= len(self._scene_ids):
+            if not self.wrap_scene:
+                raise ValueError("next_scene overflow and wrap_scene=false")
+            idx = 0
+        return self.set_scene(int(self._scene_ids[idx]))
+
+    def prev_scene(self) -> Dict[str, Any]:
+        idx = self._scene_ids.index(int(self.scene_id)) - 1
+        if idx < 0:
+            if not self.wrap_scene:
+                raise ValueError("prev_scene overflow and wrap_scene=false")
+            idx = len(self._scene_ids) - 1
+        return self.set_scene(int(self._scene_ids[idx]))
+
+    def next_segment(self) -> Dict[str, Any]:
+        seg_ids = self._ordered_segment_ids(int(self.scene_id))
+        idx = seg_ids.index(int(self.segment_id)) + 1
+        if idx >= len(seg_ids):
+            if not self.wrap_segment:
+                raise ValueError("next_segment overflow and wrap_segment=false")
+            idx = 0
+        return self.set_segment(int(seg_ids[idx]))
+
+    def prev_segment(self) -> Dict[str, Any]:
+        seg_ids = self._ordered_segment_ids(int(self.scene_id))
+        idx = seg_ids.index(int(self.segment_id)) - 1
+        if idx < 0:
+            if not self.wrap_segment:
+                raise ValueError("prev_segment overflow and wrap_segment=false")
+            idx = len(seg_ids) - 1
+        return self.set_segment(int(seg_ids[idx]))
+
+    def resample_episode(self) -> Dict[str, Any]:
+        starts = self._episode_start_positions(int(self.scene_id), int(self.segment_id))
+        if len(starts) == 0:
+            raise ValueError("current scope has no valid train-v8 starts")
+        cur_idx = starts.index(int(self.sequence_start_pos)) if int(self.sequence_start_pos) in set(starts) else -1
+        next_idx = cur_idx + 1
+        if next_idx >= len(starts):
+            if not self.wrap_episode:
+                raise ValueError("resample_episode overflow and wrap_episode=false")
+            next_idx = 0
+        return self._set_scope_and_start(
+            scene_id=int(self.scene_id),
+            segment_id=int(self.segment_id),
+            sequence_start_pos=int(starts[next_idx]),
+            reason="manual_episode_resample",
+        )
+
+
 def build_stage5_demo_scheduler_from_cfg(
     cfg: Any,
     dataset: MultiSceneDatasetV4,
@@ -1259,6 +1632,9 @@ def build_stage5_demo_scheduler_from_cfg(
     seed = int(training_cfg.get("seed", 0))
     demo_cfg = cfg.get("demo") or {}
     scheduler_cfg = demo_cfg.get("scheduler") or {}
-    if str(scheduler_cfg.get("type", "")).strip() == "eval_v8_stage5_6":
+    scheduler_type = str(scheduler_cfg.get("type", "")).strip()
+    if scheduler_type == "eval_v8_stage5_6":
         return Stage5_6EvalDemoScheduler(dataset=dataset, cfg=cfg, seed=seed, device=device)
+    if scheduler_type == "train_v8_stage5_6":
+        return Stage5_6TrainV8DemoScheduler(dataset=dataset, cfg=cfg, seed=seed, device=device)
     return Stage5DemoScheduler(dataset=dataset, cfg=cfg, seed=seed)

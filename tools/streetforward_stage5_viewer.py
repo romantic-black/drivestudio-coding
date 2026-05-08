@@ -108,7 +108,7 @@ class StreetForwardStage5Viewer(Viewer):
                 initial_value=segment_options[0],
             )
             window_select = self.server.gui.add_dropdown(
-                "Window Start",
+                "Episode Start",
                 options=window_options,
                 initial_value=window_options[0],
             )
@@ -118,7 +118,7 @@ class StreetForwardStage5Viewer(Viewer):
             block_repeat = self.server.gui.add_number("Block Repeat", initial_value=-1, disabled=True)
             segment_step = self.server.gui.add_number("Segment Step", initial_value=-1, disabled=True)
             visit_cursor = self.server.gui.add_text("Visit", initial_value="0 / 0", disabled=True)
-            sequence_start = self.server.gui.add_number("Sequence Start", initial_value=-1, disabled=True)
+            sequence_start = self.server.gui.add_number("Start Pos", initial_value=-1, disabled=True)
             source_refs = self.server.gui.add_text("Source Refs", initial_value="[]", disabled=True)
             target_refs = self.server.gui.add_text("Target Refs", initial_value="[]", disabled=True)
             target_roles = self.server.gui.add_text("Target Roles", initial_value="[]", disabled=True)
