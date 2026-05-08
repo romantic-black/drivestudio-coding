@@ -25,7 +25,7 @@ def _mean(rows: list[Dict[str, Any]], key: str) -> float:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate standalone SkyBranch with opacity blender")
+    parser = argparse.ArgumentParser(description="Evaluate standalone SkyBranch with sky-mask composition")
     parser.add_argument("--config_file", default="configs/minimal_skybranch_v0.yaml")
     parser.add_argument("--checkpoint", required=True, help="SkyBranch model checkpoint; runtime sky state is ignored.")
     parser.add_argument("--max_steps", type=int, default=100)

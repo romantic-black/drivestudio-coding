@@ -7,6 +7,10 @@ import torch
 from omegaconf import OmegaConf
 
 from models.streetforward.minimal_trainer_stage4_3 import RuntimePolicy
+from models.streetforward.minimal_trainer_stage5_4 import MinimalStreetForwardStage5_4
+from models.streetforward.minimal_trainer_stage5_4_production import MinimalStreetForwardStage5_4_Production
+from models.streetforward.minimal_trainer_stage5_5 import MinimalStreetForwardStage5_5
+from models.streetforward.minimal_trainer_stage5_5_production import MinimalStreetForwardStage5_5_Production
 from models.streetforward.minimal_trainer_stage5_6 import MinimalStreetForwardStage5_6
 from models.streetforward.minimal_trainer_stage5_6_production import MinimalStreetForwardStage5_6_Production
 
@@ -43,27 +47,75 @@ class FrozenStreetForwardSceneProvider:
         config: Optional[Any] = None,
         checkpoint_path: Optional[str] = None,
         model: Optional[Any] = None,
+        eval_mode: bool = True,
     ) -> None:
         self.device = device
+        self.eval_mode = bool(eval_mode)
         if model is None:
             if config is None:
                 raise ValueError("config is required when model is not provided.")
             model_cfg = config.get("model") if hasattr(config, "get") else getattr(config, "model")
             use_production = bool(model_cfg.get("production_training", False))
-            cls = MinimalStreetForwardStage5_6_Production if use_production else MinimalStreetForwardStage5_6
+            cls = self._resolve_streetforward_class(str(model_cfg.get("stage", "5_6")), use_production)
             model = cls(config=config, device=device).to(device)
             if checkpoint_path:
-                model.load_checkpoint(checkpoint_path, load_optimizer=False, strict=False)
+                self._load_checkpoint_into_model(model, checkpoint_path)
         self.model = model.to(device) if hasattr(model, "to") else model
-        self.model.eval()
+        if self.eval_mode:
+            self.model.eval()
+        else:
+            self.model.train()
         for p in self.model.parameters():
             p.requires_grad_(False)
         self._pending_reset = False
 
+    @staticmethod
+    def _resolve_streetforward_class(stage: str, use_production: bool) -> Any:
+        stage_norm = str(stage).strip().lower()
+        if stage_norm in {"5_4", "stage5_4"}:
+            return MinimalStreetForwardStage5_4_Production if use_production else MinimalStreetForwardStage5_4
+        if stage_norm in {"5_5", "stage5_5"}:
+            return MinimalStreetForwardStage5_5_Production if use_production else MinimalStreetForwardStage5_5
+        if stage_norm in {"5_6", "stage5_6"}:
+            return MinimalStreetForwardStage5_6_Production if use_production else MinimalStreetForwardStage5_6
+        raise ValueError(f"Unsupported frozen StreetForward stage for SkyBranch provider: {stage!r}")
+
+    @staticmethod
+    def _load_checkpoint_into_model(model: Any, checkpoint_path: str) -> None:
+        if hasattr(model, "load_checkpoint"):
+            model.load_checkpoint(checkpoint_path, load_optimizer=False, strict=False)
+            return
+        payload = torch.load(checkpoint_path, map_location="cpu")
+        state = None
+        if isinstance(payload, dict):
+            for key in ("model_state_dict", "state_dict", "model"):
+                value = payload.get(key)
+                if isinstance(value, dict):
+                    state = value
+                    break
+        if state is None and isinstance(payload, dict) and all(torch.is_tensor(v) for v in payload.values()):
+            state = payload
+        if state is None:
+            raise ValueError(f"Checkpoint does not contain a model state_dict: {checkpoint_path}")
+        model.load_state_dict(state, strict=False)
+
     @classmethod
-    def from_paths(cls, *, config_path: str, checkpoint_path: str, device: torch.device) -> "FrozenStreetForwardSceneProvider":
+    def from_paths(
+        cls,
+        *,
+        config_path: str,
+        checkpoint_path: str,
+        device: torch.device,
+        eval_mode: bool = True,
+    ) -> "FrozenStreetForwardSceneProvider":
         cfg = OmegaConf.load(config_path)
-        return cls(device=device, config=cfg, checkpoint_path=checkpoint_path)
+        return cls(device=device, config=cfg, checkpoint_path=checkpoint_path, eval_mode=eval_mode)
+
+    def _apply_mode(self) -> None:
+        if self.eval_mode:
+            self.model.eval()
+        else:
+            self.model.train()
 
     def update_scene_state(
         self,
@@ -81,18 +133,23 @@ class FrozenStreetForwardSceneProvider:
             update_hidden_cache=True,
             writeback_node_state=True,
             reset_node_state_after_block=False,
+            force_eval_mode=self.eval_mode,
         )
         with torch.no_grad():
-            if hasattr(self.model, "inference_step_from_train_batch"):
-                return self.model.inference_step_from_train_batch(
-                    minimal_batch,
-                    scheduler_node_sync=sync,
-                    runtime_policy=policy,
-                )
-            out = self.model.forward(minimal_batch)
-            if hasattr(self.model, "_writeback_node_states_from_out"):
-                self.model._writeback_node_states_from_out(out)
-            return out
+            try:
+                if hasattr(self.model, "inference_step_from_train_batch"):
+                    return self.model.inference_step_from_train_batch(
+                        minimal_batch,
+                        scheduler_node_sync=sync,
+                        runtime_policy=policy,
+                    )
+                self._apply_mode()
+                out = self.model.forward(minimal_batch)
+                if hasattr(self.model, "_writeback_node_states_from_out"):
+                    self.model._writeback_node_states_from_out(out)
+                return out
+            finally:
+                self._apply_mode()
 
     def apply_pending_reset(self) -> None:
         if self._pending_reset:
@@ -156,6 +213,7 @@ class FrozenStreetForwardSceneProvider:
                 default_frame_idx=default_frame_idx,
             )
         with torch.no_grad():
+            self._apply_mode()
             rgb, alpha = self.model._render_scene_views_from_current_state(minimal_batch, items)
         return rgb.detach(), alpha.detach()
 

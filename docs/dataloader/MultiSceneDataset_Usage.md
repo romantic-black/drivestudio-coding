@@ -72,6 +72,25 @@ aabb = torch.tensor([
 
 StreetForward 方案 A 约定：`crop_aabb` / `input_aabb` 定义在 **segment 第一帧坐标系**。数据侧会将点云（背景/远景的“世界坐标”）及 source/target/test 相机外参统一转换到该坐标系；动态点云保持局部坐标不变。
 
+### StreetForward 资产坐标契约
+
+`build_streetforward_scene_assets.py` / `build_streetforward_segment_assets.py` 导出的资产统一使用 **seg0 camera/OpenCV** 坐标系：
+
+- **x**：向右为正
+- **y**：向下为正
+- **z**：向前为正
+
+Waymo 原生坐标为 `x` 前、`y` 左、`z` 上；Waymo sourceloader 会先按自身 `OPENCV2DATASET` 约定构造 camera-to-world，再由 StreetForward 的 `world_to_seg0 @ camera_to_world / pointcloud / dynamic_tracks` 路径归一到上述 seg0 camera/OpenCV 坐标。训练和推理不应再对 Waymo 做额外坐标分支。
+
+Waymo 资产导出默认使用前向 3 相机 `[0, 1, 2]`。当前处理后的 Waymo 样例数据通常只有这 3 个相机有 depth `.npy`；若 `load_depth_maps: true` 且选择 side camera `3/4`，导出前 preflight 会直接报错。`dataset.segment_aabb` 也必须继续写 seg0 camera/OpenCV 坐标，推荐 Waymo 默认范围为：
+
+```yaml
+dataset:
+  segment_aabb:
+    - [-20.0, -10.0, -5.0]
+    - [20.0, 4.8, 80.0]
+```
+
 **示例**：
 ```python
 # 典型的段 AABB 范围

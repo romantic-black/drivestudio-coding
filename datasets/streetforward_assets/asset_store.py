@@ -972,6 +972,7 @@ class StreetForwardAssetStore:
         segment_aabb: Any,
         pointcloud_config_normalized: Dict[str, Any],
         stats: Dict[str, Any],
+        coordinate_metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
         dynamic = pointcloud_payload.get("dynamic", {})
         instance_mapping = pointcloud_payload.get("instance_mapping", {})
@@ -1015,6 +1016,7 @@ class StreetForwardAssetStore:
         asset_id = f"seg-{dataset}-{int(scene_id):06d}-{int(segment_id):06d}-{fp_short}"
         final_dir = self.segment_pool_dir / asset_id
         now = int(time.time())
+        coord_meta = dict(coordinate_metadata or {})
         manifest = {
             "asset_type": "streetforward_segment_init_asset",
             "schema_version": SCHEMA_VERSION,
@@ -1036,6 +1038,11 @@ class StreetForwardAssetStore:
             "implementation_fingerprint": _fingerprint_placeholder("streetforward-v3"),
             "created_at_unix": now,
         }
+        if coord_meta:
+            manifest["coordinate_metadata"] = coord_meta
+            asset_frame = coord_meta.get("asset_coordinate_frame")
+            if asset_frame is not None:
+                manifest["asset_coordinate_frame"] = str(asset_frame)
         require_manifest_fields(manifest, asset_type="streetforward_segment_init_asset")
 
         def _writer(tmp_dir: Path) -> None:

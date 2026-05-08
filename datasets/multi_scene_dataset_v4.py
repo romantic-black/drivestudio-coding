@@ -52,6 +52,8 @@ _V4_CACHE_MAX_ITEM_KEYS = (
 
 _EGO_MASK_MISSING = object()
 
+_EXPECTED_ASSET_COORDINATE_FRAME = "seg0_camera_opencv"
+
 
 @dataclass(frozen=True)
 class SegmentIndexV4:
@@ -424,6 +426,29 @@ class MultiSceneDatasetV4:
             f"asset_caps={_extract_pointcloud_caps(asset_pc)} runtime_caps={_extract_pointcloud_caps(runtime_pc)}). "
             "Re-export assets (segment + segment_knn) with the current pointcloud config."
         )
+
+    @staticmethod
+    def _validate_segment_coordinate_metadata(
+        segment_manifest: Dict[str, Any],
+        *,
+        scene_id: int,
+        segment_id: int,
+        context: str,
+    ) -> None:
+        raw_frame = segment_manifest.get("asset_coordinate_frame")
+        coord_meta = segment_manifest.get("coordinate_metadata")
+        if raw_frame is None and isinstance(coord_meta, dict):
+            raw_frame = coord_meta.get("asset_coordinate_frame")
+        if raw_frame is None:
+            return
+        frame = str(raw_frame)
+        if frame != _EXPECTED_ASSET_COORDINATE_FRAME:
+            raise ValueError(
+                "Unsupported StreetForward segment asset coordinate frame: "
+                f"{frame!r} (expected {_EXPECTED_ASSET_COORDINATE_FRAME!r}; "
+                f"context={context} scene_id={int(scene_id)} segment_id={int(segment_id)}). "
+                "Re-export assets with the standard seg0 camera/OpenCV coordinate contract."
+            )
 
     def _validate_required_knn_payload(
         self,
@@ -828,6 +853,12 @@ class MultiSceneDatasetV4:
                     ds_name, int(scene_id), int(segment_id)
                 )
                 segment_manifest = resolved["segment_manifest"]
+                self._validate_segment_coordinate_metadata(
+                    segment_manifest,
+                    scene_id=int(scene_id),
+                    segment_id=int(segment_id),
+                    context="initialize/_validate_training_assets",
+                )
                 asset_aabb = segment_manifest.get("segment_aabb")
                 if asset_aabb is None:
                     raise ValueError(
@@ -967,6 +998,12 @@ class MultiSceneDatasetV4:
             scene_handle = resolved["scene_handle"]
             segment_manifest = resolved["segment_manifest"]
             parent_scene_asset_id = str(segment_manifest["parent_scene_asset_id"])
+            self._validate_segment_coordinate_metadata(
+                segment_manifest,
+                scene_id=int(scene_id),
+                segment_id=int(segment_id),
+                context="_resolve_segment_bundle",
+            )
 
             segment_payload = segment_handle.load_segment_index()
             segment_pose = segment_handle.load_segment_pose()
@@ -1199,6 +1236,13 @@ class MultiSceneDatasetV4:
             if cnt < 0:
                 raise ValueError(f"knn_init dynamic_offsets invalid count for intid={intid}: {cnt}")
             asset_count_by_intid[int(intid)] = cnt
+
+        if len(asset_count_by_intid) == 0 and len(runtime_intids) > 0:
+            # Backward compatibility for older fixed-KNN assets/tests that stored
+            # rigid_knn_idx rows but no explicit dynamic_instance_intids layout.
+            # Row-count alignment is validated before this call; keep the legacy
+            # runtime dynamic ordering assumption instead of failing here.
+            return
 
         for i, intid in enumerate(runtime_intids):
             if intid not in asset_count_by_intid:
@@ -1802,6 +1846,8 @@ class MultiSceneDatasetV4:
                     for intid in sorted(visible_intids_in_batch)
                     if int(intid) in dynamic_points_full
                 }
+                if len(visible_intids_in_batch) == 0:
+                    dynamic_info = None
 
         knn_init_batch: Optional[Dict[str, Any]] = None
         if self._knn_requirements.enabled and knn_init is not None:
@@ -2019,9 +2065,10 @@ class MultiSceneDatasetV4:
         enforce_target0_equals_source: bool = True,
     ) -> Dict[str, Any]:
         include_test = bool(request.include_test)
+        source_image_refs = getattr(request, "source_image_refs", None)
         source_refs = (
-            [tuple(x) for x in request.source_image_refs]
-            if request.source_image_refs is not None
+            [tuple(x) for x in source_image_refs]
+            if source_image_refs is not None
             else [tuple(request.source_image_ref)]
         )
         return self._assemble_segment_batch_from_image_refs(
@@ -2031,7 +2078,7 @@ class MultiSceneDatasetV4:
             request.target_image_refs,
             aux_image_refs=None,
             include_test=include_test,
-            test_image_refs=request.test_image_refs if include_test else None,
+            test_image_refs=getattr(request, "test_image_refs", None) if include_test else None,
             enforce_target0_equals_source=enforce_target0_equals_source,
             target_ref_purpose="train",
         )

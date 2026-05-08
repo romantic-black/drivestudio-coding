@@ -41,7 +41,6 @@ def skybranch_loss(
     gt_rgb: torch.Tensor,
     sky_mask: torch.Tensor,
     valid_mask: torch.Tensor,
-    scene_alpha: torch.Tensor,
     cfg: Any,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     eps = float(get_cfg(cfg, "eps", 1.0e-3))
@@ -51,7 +50,6 @@ def skybranch_loss(
     sem_cfg = get_cfg(cfg, "semantic_weight", {}) or {}
     w_sky_core = float(get_cfg(sem_cfg, "sky_core", 1.0))
     w_sky_boundary = float(get_cfg(sem_cfg, "sky_boundary", 0.2))
-    w_non_sky = float(get_cfg(sem_cfg, "non_sky", 0.05))
     erode_kernel = int(get_cfg(cfg, "sky_core_erode_kernel", 5))
 
     if sky_mask.dim() == 4 and int(sky_mask.shape[-1]) == 1:
@@ -62,19 +60,15 @@ def skybranch_loss(
         valid_vhw = valid_mask[..., 0]
     else:
         valid_vhw = valid_mask
-    if scene_alpha.dim() == 4 and int(scene_alpha.shape[-1]) == 1:
-        scene_alpha_vhw = scene_alpha[..., 0]
-    else:
-        scene_alpha_vhw = scene_alpha
     if sky_alpha.dim() == 4 and int(sky_alpha.shape[-1]) == 1:
         sky_alpha_vhw = sky_alpha[..., 0]
     else:
         sky_alpha_vhw = sky_alpha
 
     sky_core, sky_boundary, non_sky = build_sky_regions(sky_mask_vhw, erode_kernel=erode_kernel)
-    trans = (1.0 - scene_alpha_vhw.detach()).clamp(0.0, 1.0)
-    w_sem = w_sky_core * sky_core + w_sky_boundary * sky_boundary + w_non_sky * non_sky
-    w = valid_vhw.float().clamp(0.0, 1.0) * trans * w_sem
+    sky_region = sky_mask_vhw.float().clamp(0.0, 1.0)
+    w_sem = w_sky_core * sky_core + w_sky_boundary * sky_boundary
+    w = valid_vhw.float().clamp(0.0, 1.0) * sky_region * w_sem
 
     loss_comp = masked_mean(charbonnier(comp_rgb - gt_rgb, eps), w) if float(w.sum().item()) > 0.0 else comp_rgb.sum() * 0.0
     core_w = valid_vhw.float().clamp(0.0, 1.0) * sky_core
@@ -89,15 +83,17 @@ def skybranch_loss(
         else sky_alpha_vhw.sum() * 0.0
     )
     loss = comp_weight * loss_comp + sky_direct_weight * loss_sky_direct + sky_alpha_weight * loss_alpha
+    core_has_pixels = float(core_w.sum().item()) > 0.0
     logs = {
         "loss_comp": loss_comp.detach(),
         "loss_sky_direct": loss_sky_direct.detach(),
         "loss_alpha": loss_alpha.detach(),
         "composite_psnr": compute_psnr(comp_rgb.detach(), gt_rgb.detach()),
-        "sky_psnr": compute_psnr(sky_rgb.detach(), gt_rgb.detach(), sky_core.detach()),
+        "sky_psnr": compute_psnr(sky_rgb.detach(), gt_rgb.detach(), core_w.detach()) if core_has_pixels else sky_rgb.detach().sum() * 0.0,
         "non_sky_psnr": compute_psnr(comp_rgb.detach(), gt_rgb.detach(), non_sky.detach()),
         "sky_alpha_mean": sky_alpha_vhw.detach().mean(),
-        "sky_alpha_core_mean": masked_mean(sky_alpha_vhw.detach(), core_w.detach()) if float(core_w.sum().item()) > 0.0 else sky_alpha_vhw.detach().mean() * 0.0,
-        "scene_trans_sky_mean": masked_mean(trans.detach(), core_w.detach()) if float(core_w.sum().item()) > 0.0 else trans.detach().mean() * 0.0,
+        "sky_alpha_core_mean": masked_mean(sky_alpha_vhw.detach(), core_w.detach()) if core_has_pixels else sky_alpha_vhw.detach().mean() * 0.0,
+        "sky_loss_valid_pixels": w.detach().sum(),
+        "sky_core_valid_pixels": core_w.detach().sum(),
     }
     return loss, logs

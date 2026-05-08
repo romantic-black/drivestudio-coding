@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import inspect
+import math
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -45,7 +47,7 @@ class _ResBlock2d(nn.Module):
 
 
 class SkyFeatureExtractor(nn.Module):
-    def __init__(self, in_channels: int = 8, hidden_dim: int = 64, output_dim: int = 64, num_blocks: int = 3) -> None:
+    def __init__(self, in_channels: int = 7, hidden_dim: int = 64, output_dim: int = 64, num_blocks: int = 3) -> None:
         super().__init__()
         blocks: List[nn.Module] = [nn.Conv2d(in_channels, hidden_dim, 3, padding=1), nn.ReLU(inplace=True)]
         for _ in range(max(int(num_blocks), 1)):
@@ -59,24 +61,19 @@ class SkyFeatureExtractor(nn.Module):
         source_rgb: torch.Tensor,
         current_sky_rgb: torch.Tensor,
         sky_mask: torch.Tensor,
-        scene_alpha: torch.Tensor,
     ) -> torch.Tensor:
         if source_rgb.dim() != 4 or int(source_rgb.shape[-1]) != 3:
             raise ValueError(f"source_rgb must be [V,H,W,3], got {tuple(source_rgb.shape)}")
         current_sky_rgb = current_sky_rgb.to(device=source_rgb.device, dtype=source_rgb.dtype)
         sky_mask = sky_mask.to(device=source_rgb.device, dtype=source_rgb.dtype)
-        scene_alpha = scene_alpha.to(device=source_rgb.device, dtype=source_rgb.dtype)
         if sky_mask.dim() == 3:
             sky_mask = sky_mask.unsqueeze(-1)
-        if scene_alpha.dim() == 3:
-            scene_alpha = scene_alpha.unsqueeze(-1)
-        trans = (1.0 - scene_alpha.detach()).clamp(0.0, 1.0)
+        mask = sky_mask.clamp(0.0, 1.0)
         x = torch.cat(
             [
-                source_rgb,
-                current_sky_rgb.detach(),
-                sky_mask.clamp(0.0, 1.0),
-                trans,
+                source_rgb * mask,
+                current_sky_rgb.detach() * mask,
+                mask,
             ],
             dim=-1,
         )
@@ -117,6 +114,8 @@ class SkyBranchV0(nn.Module):
         init_cfg = get_cfg(branch_cfg, "init", {}) or {}
         lifting_cfg = get_cfg(branch_cfg, "lifting", {}) or {}
         feat_cfg = get_cfg(branch_cfg, "feature_extractor", {}) or {}
+        render_cfg = get_cfg(branch_cfg, "render", {}) or {}
+        direct_rgb_cfg = get_cfg(branch_cfg, "direct_rgb_lift", {}) or {}
 
         self.sh_degree = int(get_cfg(branch_cfg, "sh_degree", get_cfg(config, "sh_degree", 2)))
         self.sky_resolution = int(get_cfg(sky_cfg, "resolution", 32))
@@ -126,7 +125,9 @@ class SkyBranchV0(nn.Module):
         self.sky_hemisphere_up = tuple(float(x) for x in get_cfg(sky_cfg, "hemisphere_up", SKY_UP_MULTISCENE))
         self.opacity_init = float(get_cfg(init_cfg, "opacity_init", 0.7))
         scale_init = get_cfg(init_cfg, "scale_init", {}) or {}
+        self.scale_init_mode = str(get_cfg(scale_init, "mode", "isotropic_log")).strip().lower()
         self.scale_init_log = float(get_cfg(scale_init, "isotropic_log_value", -1.5))
+        self.scale_init_angular_coverage = float(get_cfg(scale_init, "angular_coverage_factor", 2.0))
         self.feature_dim = int(get_cfg(branch_cfg, "feature_dim", 64))
         self.hidden_dim = int(get_cfg(branch_cfg, "hidden_dim", 64))
         self.support_min = float(get_cfg(lifting_cfg, "support_min", 1.0e-4))
@@ -138,6 +139,12 @@ class SkyBranchV0(nn.Module):
         self.eta_opacity = float(get_cfg(eta_cfg, "opacity", 0.20))
         self.eta_sh_dc = float(get_cfg(eta_cfg, "sh_dc", 0.05))
         self.eta_sh_rest = float(get_cfg(eta_cfg, "sh_rest", 0.02))
+        self.unpremultiply_rgb = bool(get_cfg(render_cfg, "unpremultiply_rgb", True))
+        self.unpremultiply_alpha_eps = float(get_cfg(render_cfg, "alpha_eps", 1.0e-4))
+        self.clamp_sh_dc = bool(get_cfg(branch_cfg, "clamp_sh_dc", True))
+        self.direct_rgb_lift_enable = bool(get_cfg(direct_rgb_cfg, "enable", True))
+        self.direct_rgb_blend = float(get_cfg(direct_rgb_cfg, "blend", 0.35))
+        self.direct_rgb_support_min = float(get_cfg(direct_rgb_cfg, "support_min", self.support_min))
 
         self.renderer = renderer or _gsplat_rasterization
         if self.renderer is None and alpha_t_extractor is None:
@@ -146,7 +153,7 @@ class SkyBranchV0(nn.Module):
         self.feature_backprojector = backprojector or FeatureBackprojector(weight_threshold=self.weight_threshold)
 
         self.feature_extractor = SkyFeatureExtractor(
-            in_channels=int(get_cfg(feat_cfg, "in_channels", 8)),
+            in_channels=int(get_cfg(feat_cfg, "in_channels", 7)),
             hidden_dim=int(get_cfg(feat_cfg, "hidden_dim", 64)),
             output_dim=int(get_cfg(feat_cfg, "output_dim", self.feature_dim)),
             num_blocks=int(get_cfg(feat_cfg, "num_blocks", 3)),
@@ -189,7 +196,17 @@ class SkyBranchV0(nn.Module):
             up=self.sky_hemisphere_up,
         )
         n = int(means.shape[0])
-        scales_log = torch.full((n, 3), self.scale_init_log, device=self.device, dtype=means.dtype)
+        if self.scale_init_mode in {"angular", "auto_angular", "hemisphere_angular"}:
+            # Approximate spacing on a hemisphere with N=resolution^2 points:
+            # angular spacing ~= sqrt(2*pi/N). Convert to world-space scale at shell radius.
+            spacing = float(self.sky_radius) * math.sqrt(2.0 * math.pi) / max(float(self.sky_resolution), 1.0)
+            scale_value = max(float(self.scale_init_angular_coverage) * spacing, 1.0e-4)
+            scale_log = math.log(scale_value)
+        elif self.scale_init_mode in {"isotropic", "isotropic_log"}:
+            scale_log = self.scale_init_log
+        else:
+            raise ValueError("sky_branch.init.scale_init.mode must be one of ['isotropic_log', 'isotropic', 'angular'].")
+        scales_log = torch.full((n, 3), float(scale_log), device=self.device, dtype=means.dtype)
         quats = torch.zeros(n, 4, device=self.device, dtype=means.dtype)
         quats[:, 0] = 1.0
         opacity_logit = torch.logit(torch.full((n, 1), self.opacity_init, device=self.device, dtype=means.dtype))
@@ -241,6 +258,8 @@ class SkyBranchV0(nn.Module):
         scales_log_r = state.scales_log + self.eta_scales * offset_scales
         opacity_logit_r = state.opacity_logit + self.eta_opacity * offset_opacity
         sh_dc_r = state.sh_dc + self.eta_sh_dc * offset_sh[:, :3]
+        if self.clamp_sh_dc:
+            sh_dc_r = sh_dc_r.clamp(float(_rgb_to_sh(torch.zeros(1)).item()), float(_rgb_to_sh(torch.ones(1)).item()))
         sh_rest_r = state.sh_rest + self.eta_sh_rest * sh_rest_offset
         colors_r = torch.cat([sh_dc_r[:, None, :], sh_rest_r], dim=1)
         return {
@@ -289,7 +308,32 @@ class SkyBranchV0(nn.Module):
         alpha_map = alpha.squeeze(0)
         if alpha_map.dim() == 2:
             alpha_map = alpha_map.unsqueeze(-1)
+        if self.unpremultiply_rgb:
+            rgb = rgb / alpha_map.clamp_min(self.unpremultiply_alpha_eps)
         return rgb, alpha_map
+
+    def apply_direct_rgb_lift(
+        self,
+        render_params: Dict[str, torch.Tensor],
+        *,
+        node_rgb: torch.Tensor,
+        rgb_support: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        if not self.direct_rgb_lift_enable or self.direct_rgb_blend <= 0.0:
+            return render_params
+        support = rgb_support.reshape(-1)
+        gate = (support > self.direct_rgb_support_min).to(device=render_params["means_r"].device, dtype=render_params["means_r"].dtype).unsqueeze(-1)
+        if float(gate.sum().detach().item()) <= 0.0:
+            return render_params
+        blend = gate * float(self.direct_rgb_blend)
+        target_sh_dc = _rgb_to_sh(node_rgb.clamp(0.0, 1.0).to(device=render_params["sh_dc_r"].device, dtype=render_params["sh_dc_r"].dtype))
+        sh_dc_r = render_params["sh_dc_r"] * (1.0 - blend) + target_sh_dc * blend
+        if self.clamp_sh_dc:
+            sh_dc_r = sh_dc_r.clamp(float(_rgb_to_sh(torch.zeros(1)).item()), float(_rgb_to_sh(torch.ones(1)).item()))
+        out = dict(render_params)
+        out["sh_dc_r"] = sh_dc_r
+        out["colors_r"] = torch.cat([sh_dc_r[:, None, :], out["sh_rest_r"]], dim=1)
+        return out
 
     def render_views(
         self,
@@ -330,6 +374,14 @@ class SkyBranchV0(nn.Module):
                 raise ValueError("source_egocar_masks length must match source_images.")
             ego = torch.stack([squeeze_mask(m.to(self.device), name=f"source_egocar_masks[{i}]") for i, m in enumerate(ego_raw)], dim=0)
             valid = valid & (ego <= 0.5)
+        dyn_raw = batch.get("source_dynamic_masks")
+        if dyn_raw is None:
+            dyn_raw = batch.get("source_dynamic_mask")
+        if dyn_raw is not None:
+            if len(dyn_raw) != len(source_images):
+                raise ValueError("source_dynamic_masks length must match source_images.")
+            dyn = torch.stack([squeeze_mask(m.to(self.device), name=f"source_dynamic_masks[{i}]") for i, m in enumerate(dyn_raw)], dim=0)
+            valid = valid & (dyn <= 0.5)
         return sky_mask, valid
 
     def build_lifting_mask(self, sky_mask_vhw: torch.Tensor, valid_vhw: torch.Tensor) -> torch.Tensor:
@@ -358,6 +410,16 @@ class SkyBranchV0(nn.Module):
         if source_pair_valid_mask.dim() != 3 or source_pair_valid_mask.dtype != torch.bool:
             raise ValueError(f"source_pair_valid_mask must be [V,H,W] bool, got {tuple(source_pair_valid_mask.shape)} {source_pair_valid_mask.dtype}")
         height, width = int(source_pair_valid_mask.shape[1]), int(source_pair_valid_mask.shape[2])
+        viewmats_override = torch.cat(
+            [
+                rotation_only_viewmat_from_view(view).to(
+                    device=render_params["means_r"].device,
+                    dtype=render_params["means_r"].dtype,
+                )
+                for view in source_views
+            ],
+            dim=0,
+        )
         kwargs = dict(
             gaussians=self.render_params_to_gaussians(render_params),
             cameras=source_views,
@@ -366,12 +428,20 @@ class SkyBranchV0(nn.Module):
             width=width,
             num_gaussians=int(render_params["means_r"].shape[0]),
             backprojector=self.feature_backprojector,
+            viewmats_override=viewmats_override,
             source_pair_valid_mask=source_pair_valid_mask,
             return_accumulated_weights=True,
         )
-        if hasattr(self.alpha_t_extractor, "render_and_backproject_streaming_fused_multi_camera"):
-            return self.alpha_t_extractor.render_and_backproject_streaming_fused_multi_camera(**kwargs)
-        return self.alpha_t_extractor.render_and_backproject_streaming(**kwargs)
+        if not hasattr(self.alpha_t_extractor, "render_and_backproject_streaming_fused_multi_camera"):
+            raise RuntimeError("SkyBranchV0 requires fused multi-camera lifting with viewmats_override support.")
+        fn = self.alpha_t_extractor.render_and_backproject_streaming_fused_multi_camera
+        sig = inspect.signature(fn)
+        if "viewmats_override" not in sig.parameters:
+            raise RuntimeError(
+                "SkyBranchV0 requires AlphaTWeightExtractor.render_and_backproject_streaming_fused_multi_camera "
+                "to expose a viewmats_override parameter for rotation-only sky lifting."
+            )
+        return fn(**kwargs)
 
     def update_sky_state(
         self,
@@ -427,17 +497,78 @@ class SkyBranchV0(nn.Module):
             ego = t.get("egocar_mask")
             if ego is not None:
                 valid = valid * (1.0 - squeeze_mask(ego.to(self.device), name=f"targets[{i}].egocar_mask")).clamp(0.0, 1.0)
+            dynamic = t.get("dynamic_mask")
+            if dynamic is not None:
+                valid = valid * (1.0 - squeeze_mask(dynamic.to(self.device), name=f"targets[{i}].dynamic_mask")).clamp(0.0, 1.0)
             target_valid.append(valid)
         target_valid_mask = torch.stack(target_valid, dim=0)
+        target_sky_valid = target_valid_mask.float().clamp(0.0, 1.0) * (target_sky_mask > 0.5).float()
 
         current_params = self.state_to_render_params(state)
-        sky_src_rgb, _ = self.render_views(current_params, source_views, source_images)
         source_sky_mask, source_valid = self.build_source_masks(batch, source_images)
+        scene_rgb = scene_pack.target_rgb.detach().to(self.device)
+        sky_mask_comp = target_sky_mask.clamp(0.0, 1.0).unsqueeze(-1)
+        gt_rgb = stack_hwc3(target_images, name="target_images").to(self.device)
+        loss_cfg = get_cfg(self.config, "loss", {}) or {}
+        if get_cfg(loss_cfg, "sky_core_erode_kernel", None) is None:
+            try:
+                loss_cfg.sky_core_erode_kernel = self.sky_core_erode_kernel
+            except Exception:
+                pass
+
+        if float(target_sky_valid.sum().detach().item()) <= 0.0:
+            source_pair_valid_mask = self.build_lifting_mask(source_sky_mask, source_valid)
+            sky_tgt_rgb, sky_tgt_alpha = self.render_views(current_params, target_views, target_images)
+            comp_rgb = scene_rgb * (1.0 - sky_mask_comp) + sky_tgt_rgb * sky_mask_comp
+            zero_loss = comp_rgb.sum() * 0.0
+            _, logs = skybranch_loss(
+                comp_rgb=comp_rgb,
+                sky_rgb=sky_tgt_rgb,
+                sky_alpha=sky_tgt_alpha,
+                gt_rgb=gt_rgb,
+                sky_mask=target_sky_mask,
+                valid_mask=target_valid_mask,
+                cfg=loss_cfg,
+            )
+            logs = dict(logs)
+            logs["loss_comp"] = zero_loss.detach()
+            logs["loss_sky_direct"] = zero_loss.detach()
+            logs["loss_alpha"] = zero_loss.detach()
+            logs["target_sky_valid_pixels"] = target_sky_valid.detach().sum()
+            logs["target_sky_valid_ratio"] = target_sky_valid.detach().mean()
+            logs["sky_support_mean"] = torch.zeros((), device=self.device)
+            logs["sky_support_ratio"] = torch.zeros((), device=self.device)
+            logs["sky_updated_node_ratio"] = torch.zeros((), device=self.device)
+            logs["sky_offset_scale_mean"] = torch.zeros((), device=self.device)
+            logs["sky_offset_scale_max"] = torch.zeros((), device=self.device)
+            logs["sky_offset_opacity_mean"] = torch.zeros((), device=self.device)
+            logs["sky_offset_opacity_max"] = torch.zeros((), device=self.device)
+            logs["sky_offset_sh_mean"] = torch.zeros((), device=self.device)
+            logs["sky_offset_sh_max"] = torch.zeros((), device=self.device)
+            logs["sky_direct_rgb_support_ratio"] = torch.zeros((), device=self.device)
+            logs["sky_direct_rgb_std"] = torch.zeros((), device=self.device)
+            logs["sky_sh_dc_std"] = current_params["sh_dc_r"].detach().float().std()
+            logs["sky_render_rgb_std"] = sky_tgt_rgb.detach().float().std()
+            logs["skip_step"] = torch.ones((), device=self.device)
+            return SkyBranchForwardOutput(
+                loss=zero_loss,
+                logs=logs,
+                render_params_sky=current_params,
+                node_state_sky=state,
+                h_new_sky=h_old,
+                cache_key=key,
+                source_pair_valid_mask=source_pair_valid_mask,
+                support=torch.zeros(state.means.shape[0], device=self.device, dtype=state.means.dtype),
+                sky_rgb=sky_tgt_rgb,
+                sky_alpha=sky_tgt_alpha,
+                comp_rgb=comp_rgb,
+            )
+
+        sky_src_rgb, _ = self.render_views(current_params, source_views, source_images)
         sky_feat2d = self.feature_extractor(
             source_rgb=stack_hwc3(source_images, name="source_images"),
             current_sky_rgb=sky_src_rgb,
             sky_mask=source_sky_mask,
-            scene_alpha=scene_pack.source_alpha.detach().to(self.device),
         )
         source_pair_valid_mask = self.build_lifting_mask(source_sky_mask, source_valid)
         node_feat, support = self.lift_features_to_sky_nodes(
@@ -446,18 +577,26 @@ class SkyBranchV0(nn.Module):
             feat2d=sky_feat2d,
             source_pair_valid_mask=source_pair_valid_mask,
         )
+        direct_rgb_support = torch.zeros_like(support)
+        direct_rgb_std = torch.zeros((), device=self.device)
+        if self.direct_rgb_lift_enable:
+            source_rgb_for_lift = stack_hwc3(source_images, name="source_images") * source_sky_mask.clamp(0.0, 1.0).unsqueeze(-1)
+            node_rgb, direct_rgb_support = self.lift_features_to_sky_nodes(
+                render_params=current_params,
+                source_views=source_views,
+                feat2d=source_rgb_for_lift.detach().contiguous(),
+                source_pair_valid_mask=source_pair_valid_mask,
+            )
+            direct_rgb_std = node_rgb.detach().float().std()
         render_params_sky, h_new, offsets = self.update_sky_state(state, node_feat, support, h_old)
+        if self.direct_rgb_lift_enable:
+            render_params_sky = self.apply_direct_rgb_lift(
+                render_params_sky,
+                node_rgb=node_rgb.detach(),
+                rgb_support=direct_rgb_support.detach(),
+            )
         sky_tgt_rgb, sky_tgt_alpha = self.render_views(render_params_sky, target_views, target_images)
-        scene_rgb = scene_pack.target_rgb.detach().to(self.device)
-        scene_alpha = scene_pack.target_alpha.detach().to(self.device)
-        comp_rgb = scene_rgb + (1.0 - scene_alpha.clamp(0.0, 1.0)) * sky_tgt_rgb
-        gt_rgb = stack_hwc3(target_images, name="target_images").to(self.device)
-        loss_cfg = get_cfg(self.config, "loss", {}) or {}
-        if get_cfg(loss_cfg, "sky_core_erode_kernel", None) is None:
-            try:
-                loss_cfg.sky_core_erode_kernel = self.sky_core_erode_kernel
-            except Exception:
-                pass
+        comp_rgb = scene_rgb * (1.0 - sky_mask_comp) + sky_tgt_rgb * sky_mask_comp
         loss, logs = skybranch_loss(
             comp_rgb=comp_rgb,
             sky_rgb=sky_tgt_rgb,
@@ -465,7 +604,6 @@ class SkyBranchV0(nn.Module):
             gt_rgb=gt_rgb,
             sky_mask=target_sky_mask,
             valid_mask=target_valid_mask,
-            scene_alpha=scene_alpha,
             cfg=loss_cfg,
         )
         logs = dict(logs)
@@ -479,6 +617,13 @@ class SkyBranchV0(nn.Module):
         logs["sky_offset_opacity_max"] = offsets["offset_opacity"].detach().abs().max()
         logs["sky_offset_sh_mean"] = offsets["offset_sh"].detach().abs().mean()
         logs["sky_offset_sh_max"] = offsets["offset_sh"].detach().abs().max()
+        logs["sky_direct_rgb_support_ratio"] = (direct_rgb_support.detach().reshape(-1) > self.direct_rgb_support_min).float().mean()
+        logs["sky_direct_rgb_std"] = direct_rgb_std
+        logs["sky_sh_dc_std"] = render_params_sky["sh_dc_r"].detach().float().std()
+        logs["sky_render_rgb_std"] = sky_tgt_rgb.detach().float().std()
+        logs["target_sky_valid_pixels"] = target_sky_valid.detach().sum()
+        logs["target_sky_valid_ratio"] = target_sky_valid.detach().mean()
+        logs["skip_step"] = torch.zeros((), device=self.device)
         out = SkyBranchForwardOutput(
             loss=loss,
             logs=logs,
@@ -509,6 +654,10 @@ class SkyBranchV0(nn.Module):
     def reset_runtime_state(self) -> None:
         self.node_states_sky.clear()
         self.h_cache_sky.clear()
+
+    def reset_runtime_state_key(self, key: Tuple[int, int]) -> None:
+        self.node_states_sky.pop(key, None)
+        self.h_cache_sky.pop(key, None)
 
     @staticmethod
     def _state_to_cpu_dict(state: NodeStateSky) -> Dict[str, torch.Tensor]:

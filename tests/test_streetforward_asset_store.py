@@ -161,12 +161,14 @@ def test_segment_asset_roundtrip(tmp_path):
         segment_aabb=np.asarray([[-1, -1, -1], [1, 1, 1]], dtype=np.float32),
         pointcloud_config_normalized={"type": "hybrid"},
         stats={"background_points": 2},
+        coordinate_metadata={"asset_coordinate_frame": "seg0_camera_opencv"},
     )
 
     assert seg_asset_id.startswith("seg-nuscenes-")
     handle = store.verify_segment_asset("nuscenes", 1, 0)
     manifest = handle.load_manifest()
     assert manifest["asset_id"] == seg_asset_id
+    assert manifest["asset_coordinate_frame"] == "seg0_camera_opencv"
     sidx = handle.load_segment_index()
     assert sidx["num_cams"] == 2
     pc = handle.load_pointcloud()

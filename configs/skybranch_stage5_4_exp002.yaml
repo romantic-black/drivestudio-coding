@@ -1,17 +1,29 @@
-output_name: skybranch_v0_on_stage5_6
-log_dir: outputs/skybranch_v0
+output_name: skybranch_stage5_4_exp002
+log_dir: /root/autodl-tmp/outputs/skybranch_stage5_4_exp002
 
 streetforward:
-  checkpoint: "/path/to/streetforward_5_6.ckpt"
-  config: "configs/minimal_streetforward_stage5_6_production_multi_scene_v8.yaml"
+  config: /root/autodl-tmp/outputs/minimal_sf_stage5_4_multi_scene_v8_adamw_warmcos/experiment002_60w_40w_12block_base_on_001/config.yaml
+  checkpoint: /root/autodl-tmp/outputs/minimal_sf_stage5_4_multi_scene_v8_adamw_warmcos/experiment002_60w_40w_12block_base_on_001/checkpoints/minimal_sf_stage5_4_multi_scene_v8_step50000.pt
   freeze_params: true
   eval_mode: true
 
 data:
-  data_root: "/root/autodl-tmp/nuScenes/"
-  dataset: "nuscenes"
+  data_root: /root/autodl-tmp/nuScenes/
+  dataset: nuscenes
+  start_timestep: 0
+  end_timestep: -1
+  preload_device: cpu
   sky_mask_semantics: one_is_sky
-  train_scene_ids: [0]
+  # Start small. Override this list for full training.
+  train_scene_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9,14, 16, 24, 32, 40, 99, 107, 115, 123, 131, 139, 147, 155, 163, 171, 179, 195, 214,
+    17, 25, 33, 41, 49, 100, 108, 116, 124, 132, 140, 148, 156, 164, 172, 180, 188, 196, 215,
+    10, 18, 26, 34, 42, 93, 101, 109, 117, 125, 133, 141, 149, 157, 165, 173, 181, 189, 197, 216,
+    11, 19, 27, 35, 43, 94, 102, 110, 118, 126, 134, 142, 150, 158, 166, 174, 182, 190, 198, 217,
+    12, 20, 36, 44, 95, 103, 111, 119, 127, 135, 143, 151, 159, 167, 175, 183, 191, 199, 218,
+    13, 21, 29, 37, 45, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200,
+    22, 30, 38, 46, 97, 105, 113, 121, 129, 137, 145, 153, 161, 169, 177, 185, 193, 201,
+    15, 23, 31, 39, 47, 98, 106, 114, 122, 130, 138, 146, 154, 162, 170, 178, 186, 194]
+  eval_scene_ids: []
   preload:
     enable: true
     num_workers: 1
@@ -24,6 +36,7 @@ data:
     warm_test_refs: false
     warm_episode_source_superset: true
     enable_view_pack_cache: true
+    stats_log_interval_steps: 0
   pixel_source:
     type: datasets.nuscenes.nuscenes_sourceloader.NuScenesPixelSource
     cameras: [0, 1, 2]
@@ -35,11 +48,24 @@ data:
     load_egocar_mask: true
     load_depth_maps: true
     load_objects: true
+    load_smpl: false
+    sampler:
+      buffer_downscale: 8
+      buffer_ratio: 0.5
+      start_enhance_weight: 3
   lidar_source:
     type: datasets.nuscenes.nuscenes_sourceloader.NuScenesLiDARSource
     load_lidar: true
+    lidar_downsample_factor: 1
+    lidar_percentile: 0.02
   assets:
-    root: "/root/autodl-tmp/streetforward_assets"
+    root: /root/autodl-tmp/streetforward_assets_pt60w_40w
+  # Keep caches modest for the standalone SkyBranch run; frozen StreetForward
+  # already carries a large DINO/scene model in memory.
+  scene_asset_cache_max_items: 8
+  segment_static_cache_max_items: 16
+  image_meta_cache_max_items: 8192
+  view_pack_cache_max_items: 1024
 
 dataset:
   num_source_keyframes: 1
@@ -47,26 +73,40 @@ dataset:
   segment_overlap_ratio: 0.2
   min_keyframes_per_scene: 2
   min_keyframes_per_segment: 2
+  preload_scene_count: 2
+  keyframe_split_config:
+    num_splits: 0
+    min_count: 1
+    min_length: 3.0
   segment_aabb:
     - [-20.0, -10.0, -20.0]
     - [20.0, 4.8, 40.0]
   pointcloud:
-    type: "hybrid"
+    type: hybrid
     lidar_sparsity: full
     monocular_chosen_cam_ids: [0, 1, 2, 3, 4, 5]
     monocular_sparsity: full
     monocular_filter_sky: true
+    monocular_depth_consistency: false
+    monocular_downscale: 1
+    monocular_dynamic_recovery_bbox_expand_xyz_m: [0.5, 0.2, 0.5]
+    monocular_dynamic_recovery_max_points_per_instance: 20000
+    near_max_points: 600000
+    distant_max_points: 400000
+    static_instance_motion:
+      enable: true
+      traj_length_thresh_m: 0.5
 
 scheduler_v8:
   enable: true
   block:
-    steps_per_block: 16
+    steps_per_block: 12
   episode:
     blocks_per_episode: 5
     total_target_frames: 3
     include_source_frame: true
     target_policy: visited_episode_frames
-    block_source_frame_policy: fixed_once_per_episode
+    block_source_frame_policy: random_within_keyframe_per_visit
     frame_within_keyframe_policy: random_once_per_episode
     min_keyframes_required_policy: skip_if_less_than_window
   traversal:
@@ -89,12 +129,32 @@ scheduler_v8:
   near_random_supervision:
     enable: false
 
+# Keep the frozen StreetForward model config shape for dataset KNN requirements.
 model:
-  stage: "skybranch_v0"
-  sh_degree: 2
-  # Keep KNN extraction compatible with the existing V4 dataset builder.
+  stage: "5_4"
+  production_training: true
+  backprojector_version: v4
+  sh_degree: 1
   struct_decoder:
-    enable: false
+    enable: true
+    type: routed_near_far
+    knn_attention:
+      enable: false
+  branches:
+    bg:
+      init:
+        scale_init:
+          mode: knn
+          knn_k: 8
+    distant:
+      init:
+        scale_init:
+          mode: isotropic
+    rigid:
+      init:
+        scale_init:
+          mode: knn
+          knn_k: 8
 
 sky:
   origin_mode: camera_centered_rotation_only
@@ -158,9 +218,19 @@ optimizer:
   eps: 1.0e-8
 
 training:
-  max_iterations: 60000
-  amp: true
+  max_iterations: 100000
+  amp: false
   grad_clip_norm: 1.0
   reset_sky_state_policy: segment
+  log_on: block_end
   log_interval: 100
   save_checkpoint_freq: 1000
+  cleanup:
+    empty_cache_after_step: true
+
+logging:
+  enable_jsonl_metrics: true
+  metrics_history_append: true
+  use_tensorboard: true
+  image_trigger: block_end
+  image_interval_blocks: 50

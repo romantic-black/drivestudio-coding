@@ -23,7 +23,7 @@ def _cfg() -> OmegaConf:
                 "sh_degree": 1,
                 "feature_dim": 8,
                 "hidden_dim": 8,
-                "feature_extractor": {"in_channels": 8, "hidden_dim": 8, "output_dim": 8, "num_blocks": 1},
+                "feature_extractor": {"in_channels": 7, "hidden_dim": 8, "output_dim": 8, "num_blocks": 1},
                 "lifting": {"support_min": 1.0e-4, "weight_threshold": 0.0, "use_sky_core_mask": True, "sky_core_erode_kernel": 1},
                 "init": {"opacity_init": 0.7, "scale_init": {"isotropic_log_value": -1.5}},
                 "eta": {"scales": 0.03, "opacity": 0.2, "sh_dc": 0.05, "sh_rest": 0.02},
@@ -34,7 +34,7 @@ def _cfg() -> OmegaConf:
                 "sky_direct_weight": 0.2,
                 "sky_alpha_weight": 0.05,
                 "sky_core_erode_kernel": 1,
-                "semantic_weight": {"sky_core": 1.0, "sky_boundary": 0.2, "non_sky": 0.05},
+                "semantic_weight": {"sky_core": 1.0, "sky_boundary": 0.2, "non_sky": 0.0},
             },
             "optimizer": {"type": "adamw", "lr": 1.0e-3, "eps": 1.0e-8, "weight_decay": 0.0},
             "training": {"amp": False, "grad_clip_norm": 1.0},
@@ -58,12 +58,27 @@ def _fake_renderer(**kwargs):
 
 
 class _FakeExtractor:
-    def render_and_backproject_streaming_fused_multi_camera(self, **kwargs):
-        mask = kwargs["source_pair_valid_mask"]
+    def render_and_backproject_streaming_fused_multi_camera(
+        self,
+        *,
+        gaussians,
+        cameras,
+        features_2d,
+        height,
+        width,
+        num_gaussians,
+        backprojector,
+        viewmats_override,
+        source_pair_valid_mask,
+        return_accumulated_weights=False,
+    ):
+        del gaussians, cameras, height, width, backprojector, return_accumulated_weights
+        assert torch.allclose(viewmats_override[..., :3, 3], torch.zeros_like(viewmats_override[..., :3, 3]))
+        mask = source_pair_valid_mask
         assert mask.dtype == torch.bool
         assert tuple(mask.shape) == (1, 2, 2)
-        feat2d = kwargs["features_2d"]
-        n = int(kwargs["num_gaussians"])
+        feat2d = features_2d
+        n = int(num_gaussians)
         feat = feat2d.mean(dim=(0, 1, 2), keepdim=False).unsqueeze(0).expand(n, -1)
         support = torch.ones(n, device=feat2d.device, dtype=feat2d.dtype)
         return feat, support
@@ -81,6 +96,7 @@ class _FakeSceneModel(torch.nn.Module):
 
     def inference_step_from_train_batch(self, batch, scheduler_node_sync=None, runtime_policy=None):
         del batch, scheduler_node_sync, runtime_policy
+        self.train()
         self.version += 1
         return {"loss": 0.0}
 
@@ -125,6 +141,7 @@ def test_scene_provider_render_pack_uses_render_alpha_maps_and_single_updated_st
     assert torch.allclose(pack.source_alpha, pack.target_alpha)
     assert model.version == 1
     assert model.reset_calls == 0
+    assert model.training is False
     provider.apply_pending_reset()
     assert model.reset_calls == 1
 
@@ -178,6 +195,55 @@ def test_skybranch_forward_keeps_feature_extractor_grad_path():
     assert torch.equal(out.node_state_sky.means, branch.node_states_sky[(1, 2)].means)
 
 
+def test_skybranch_composite_uses_sky_mask_not_scene_alpha():
+    branch = SkyBranchV0(_cfg(), torch.device("cpu"), renderer=_fake_renderer, alpha_t_extractor=_FakeExtractor())
+    img = torch.zeros(2, 2, 3)
+    sky_mask = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+    batch = {
+        "scene_id": 1,
+        "segment_id": 2,
+        "source_views": [_view()],
+        "source_images": [img],
+        "source_sky_masks": [torch.ones(2, 2)],
+        "targets": [{"view": _view(), "gt_image": torch.ones(2, 2, 3) * 0.8, "sky_mask": sky_mask, "frame_idx": 1}],
+    }
+    scene_rgb = torch.ones(1, 2, 2, 3) * 0.25
+    scene_pack = SceneRenderPack(
+        source_rgb=torch.zeros(1, 2, 2, 3),
+        source_alpha=torch.ones(1, 2, 2, 1),
+        target_rgb=scene_rgb,
+        target_alpha=torch.ones(1, 2, 2, 1),
+    )
+    out = branch.forward_scene_batch(batch, scene_pack)
+    assert torch.allclose(out.comp_rgb[0, 0, 1], scene_rgb[0, 0, 1])
+    assert torch.allclose(out.comp_rgb[0, 1, 0], scene_rgb[0, 1, 0])
+    assert torch.allclose(out.comp_rgb[0, 0, 0], out.sky_rgb[0, 0, 0])
+    assert torch.allclose(out.comp_rgb[0, 1, 1], out.sky_rgb[0, 1, 1])
+
+
+def test_skybranch_skips_when_target_has_no_valid_sky():
+    branch = SkyBranchV0(_cfg(), torch.device("cpu"), renderer=_fake_renderer, alpha_t_extractor=_FakeExtractor())
+    img = torch.zeros(2, 2, 3)
+    batch = {
+        "scene_id": 1,
+        "segment_id": 2,
+        "source_views": [_view()],
+        "source_images": [img],
+        "source_sky_masks": [torch.ones(2, 2)],
+        "targets": [{"view": _view(), "gt_image": torch.ones(2, 2, 3) * 0.8, "sky_mask": torch.zeros(2, 2), "frame_idx": 1}],
+    }
+    scene_pack = SceneRenderPack(
+        source_rgb=torch.zeros(1, 2, 2, 3),
+        source_alpha=torch.zeros(1, 2, 2, 1),
+        target_rgb=torch.ones(1, 2, 2, 3) * 0.25,
+        target_alpha=torch.zeros(1, 2, 2, 1),
+    )
+    out = branch.forward_scene_batch(batch, scene_pack)
+    assert float(out.logs["skip_step"].item()) == 1.0
+    assert float(out.logs["target_sky_valid_pixels"].item()) == 0.0
+    assert torch.allclose(out.comp_rgb, scene_pack.target_rgb)
+
+
 def test_model_checkpoint_excludes_runtime_sky_state(tmp_path):
     cfg = _cfg()
     branch = SkyBranchV0(cfg, torch.device("cpu"), renderer=_fake_renderer, alpha_t_extractor=_FakeExtractor())
@@ -213,3 +279,29 @@ def test_resume_checkpoint_restores_runtime_sky_state(tmp_path):
     assert (1, 2) in restored_branch.node_states_sky
     assert (1, 2) in restored_branch.h_cache_sky
     assert torch.allclose(restored_branch.h_cache_sky[(1, 2)], torch.full_like(restored_branch.h_cache_sky[(1, 2)], 3.0))
+
+
+def test_trainer_resets_sky_runtime_on_scheduler_reset():
+    cfg = _cfg()
+    cfg.training.reset_sky_state_policy = "segment"
+    branch = SkyBranchV0(cfg, torch.device("cpu"), renderer=_fake_renderer, alpha_t_extractor=_FakeExtractor())
+    provider = FrozenStreetForwardSceneProvider(device=torch.device("cpu"), model=_FakeSceneModel())
+    trainer = MinimalSkyBranchTrainer(cfg, torch.device("cpu"), scene_provider=provider, sky_branch=branch)
+    img = torch.zeros(2, 2, 3)
+    batch = {
+        "scene_id": 1,
+        "segment_id": 2,
+        "source_views": [_view()],
+        "source_images": [img],
+        "source_sky_masks": [torch.ones(2, 2)],
+        "source_frame_idx": 0,
+        "targets": [{"view": _view(), "gt_image": torch.ones(2, 2, 3) * 0.8, "sky_mask": torch.ones(2, 2), "frame_idx": 1}],
+    }
+    logs = trainer.train_step(
+        batch,
+        step=1,
+        scheduler_node_sync={"U": 1, "segment_local_step": 1, "reset_after_block": True},
+    )
+    assert logs["sky_runtime_reset"] == 1.0
+    assert (1, 2) not in branch.node_states_sky
+    assert (1, 2) not in branch.h_cache_sky

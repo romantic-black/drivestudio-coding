@@ -38,6 +38,7 @@ class RuntimePolicy:
     update_hidden_cache: bool
     writeback_node_state: bool
     reset_node_state_after_block: bool
+    force_eval_mode: bool = False
 
 
 def _composite_sky_gs(pred_rgb: torch.Tensor, opacity: torch.Tensor, rgb_sky: torch.Tensor) -> torch.Tensor:
@@ -1728,7 +1729,10 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
         elif not hasattr(self, "global_step"):
             self.global_step = 0
 
-        self.train()
+        if policy.force_eval_mode:
+            self.eval()
+        else:
+            self.train()
         self._perf_acc = {}
         node_state_sync_update = False
         node_state_sync_reset = False

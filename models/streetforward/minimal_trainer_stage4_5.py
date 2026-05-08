@@ -1787,7 +1787,10 @@ class MinimalStreetForwardStage4_5(MinimalStreetForwardStage4_2):
         if policy.do_backward or policy.do_optimizer_step:
             raise ValueError("inference_step_from_train_batch requires do_backward=false and do_optimizer_step=false")
 
-        self.train()
+        if policy.force_eval_mode:
+            self.eval()
+        else:
+            self.train()
         self._perf_acc = {}
         node_state_sync_update = False
         node_state_sync_reset = False
