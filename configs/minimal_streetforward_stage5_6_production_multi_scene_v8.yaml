@@ -1,4 +1,4 @@
-output_name: experiment001_60w_40w_block16
+output_name: experiment002_60w_40w_block16
 
 data:
   data_root: "/root/autodl-tmp/nuScenes/"
@@ -401,7 +401,7 @@ nearby_error_feedback:
   reset_on_episode_end: true
   save_in_checkpoint: false
   memory:
-    render_checkpoint: true
+    render_checkpoint: false
 
   warmup:
     pred_error_only_steps: 7000
@@ -414,7 +414,7 @@ nearby_error_feedback:
     enable: true
     target_role: near_random
     input_feature: post_gru_hidden
-    error_splat_dim: 48
+    error_splat_dim: 24
     detach_input_hidden: true
     detach_projected_feature: false
     node_mask_policy: renderable
@@ -477,7 +477,7 @@ nearby_error_feedback:
     input_branch_embed: false
 
   loss:
-    error_weight: 0.03
+    error_weight: 0.2
     error_loss_type: charbonnier
     error_warmup_steps: 3000
     error_start_weight_scale: 0.0
