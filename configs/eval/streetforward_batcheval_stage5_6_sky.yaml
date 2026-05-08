@@ -13,7 +13,7 @@ batch_eval:
     scene_ids: [10  ]
     segment_policy: all
     require_full_window: true
-    stride: 30
+    stride: 20
     max_episodes_per_scene: null
     max_total_episodes: null
     window_policy: sliding

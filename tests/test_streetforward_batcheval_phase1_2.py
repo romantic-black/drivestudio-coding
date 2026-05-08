@@ -81,6 +81,59 @@ def test_episode_builder_relative_to_absolute_mapping() -> None:
     assert spec.eval_frame_ids == list(range(100, 120))
 
 
+class _StartAtDataset:
+    def list_segment_ids(self, scene_id: int) -> List[int]:
+        assert int(scene_id) == 10
+        return [0, 1, 2]
+
+    def get_segment_index(self, scene_id: int, segment_id: int) -> _DummySegmentIndex:
+        assert int(scene_id) == 10
+        starts = {0: 0, 1: 73, 2: 200}
+        start = starts[int(segment_id)]
+        frames = list(range(start, start + 60))
+        return _DummySegmentIndex(
+            frame_indices=frames,
+            train_frame_set=set(frames),
+            num_cams=3,
+        )
+
+
+def test_episode_builder_start_at_frame_id_rebases_sliding_starts() -> None:
+    protocol = TestProtocolSpec(
+        name="exp_start_at",
+        data_mode="segment_finetune_train",
+        sequence_length=10,
+        input_offsets=[1, 3, 5, 7, 9],
+        eval_offsets="all",
+        camera_ids=[0],
+        camera_names=["front"],
+        steps_per_input=1,
+        save_pre_update=False,
+        save_each_iter_views=False,
+        metric_primary_mask="full_image",
+        report_full_image=True,
+    )
+    specs = build_test_episode_specs(
+        dataset=_StartAtDataset(),
+        scene_ids=[10],
+        protocol=protocol,
+        segment_policy="all",
+        window_policy="sliding",
+        stride=30,
+        require_full_window=True,
+        max_episodes_per_scene=None,
+        max_total_episodes=None,
+        start_at={"scene_id": 10, "segment_id": 1, "frame_id": 100},
+    )
+    assert [(s.scene_id, s.segment_id, s.sequence_start_pos, s.frame_ids[0]) for s in specs] == [
+        (10, 1, 27, 100),
+        (10, 2, 0, 200),
+        (10, 2, 30, 230),
+    ]
+    assert specs[0].input_frame_ids == [101, 103, 105, 107, 109]
+    assert specs[0].episode_uid == "scene010_seg001_start000027"
+
+
 def test_update_targets_reject_unobserved_frames() -> None:
     with pytest.raises(ValueError):
         validate_update_target_refs(
