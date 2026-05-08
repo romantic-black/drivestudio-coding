@@ -11,6 +11,13 @@ import torch
 from .batch_builder import build_update_batch_from_refs, make_refs_for_frames
 from .episode_builder import TestEpisodeSpec
 from .protocols import TestProtocolSpec
+from .stage5_6_runtime import (
+    build_stage5_6_eval_train_batch,
+    iter_block_visit_order,
+    nearby_offsets_adjacent_non_input,
+    run_stage5_6_update_step,
+    stage5_6_runtime_policy,
+)
 
 ImageRef = Tuple[int, int]
 
@@ -389,28 +396,17 @@ class StreetForwardBatchEvalRunner:
         block_order: str,
         step_major_switch_interval_steps: int,
     ) -> List[int]:
-        if int(num_blocks) < 1:
-            return []
-        if int(steps_per_block) < 1:
-            raise ValueError("steps_per_input must be >= 1")
-        order = str(block_order).strip()
-        if order == "block_major":
-            return [int(b) for b in range(int(num_blocks)) for _ in range(int(steps_per_block))]
-        if order == "step_major":
-            switch_every = int(step_major_switch_interval_steps)
-            if switch_every < 1:
-                raise ValueError("step_major_switch_interval_steps must be >= 1")
-            out: List[int] = []
-            for round_base in range(0, int(steps_per_block), int(switch_every)):
-                chunk = int(min(int(switch_every), int(steps_per_block) - int(round_base)))
-                for b in range(int(num_blocks)):
-                    out.extend([int(b)] * int(chunk))
-            return out
-        raise ValueError(f"unsupported runtime.block_order={block_order!r}, expected block_major/step_major")
+        return iter_block_visit_order(
+            num_blocks=int(num_blocks),
+            steps_per_block=int(steps_per_block),
+            block_order=str(block_order),
+            step_major_switch_interval_steps=int(step_major_switch_interval_steps),
+        )
 
     def _build_target_frame_order(
         self,
         *,
+        spec: TestEpisodeSpec,
         input_frame_ids: List[int],
         current_block_idx: int,
         observed_block_order: List[int],
@@ -451,23 +447,91 @@ class StreetForwardBatchEvalRunner:
                 selected_blocks.append(int(b))
             return [int(source_frame)] + [int(input_frame_ids[b]) for b in selected_blocks]
 
+        if policy == "scheduler_v7_block_window":
+            if max_targets is None:
+                raise ValueError(
+                    "runtime.target_frame_policy='scheduler_v7_block_window' requires "
+                    "runtime.max_target_frames_including_source."
+                )
+            limit = int(max_targets)
+            source_offset = int(spec.input_offsets[int(cur)])
+            if int(source_frame) != int(spec.frame_ids[int(source_offset)]):
+                raise ValueError(
+                    "scheduler_v7_block_window requires input_offsets to point at input_frame_ids; "
+                    f"block={cur} input_offset={source_offset} source_frame={source_frame}"
+                )
+            end = int(source_offset) + int(limit)
+            if end > len(spec.frame_ids):
+                raise ValueError(
+                    "scheduler_v7_block_window target range exceeds episode frame window: "
+                    f"source_offset={source_offset} limit={limit} window_len={len(spec.frame_ids)}"
+                )
+            return [int(x) for x in spec.frame_ids[int(source_offset) : int(end)]]
+
         raise ValueError(
             "unsupported runtime.target_frame_policy="
-            f"{policy!r}, expected one of ['all_observed', 'visited_episode_frames']"
+            f"{policy!r}, expected one of "
+            "['all_observed', 'visited_episode_frames', 'scheduler_v7_block_window']"
         )
+
+    def _generic_scheduler_aligned_info(
+        self,
+        *,
+        spec: TestEpisodeSpec,
+        block_idx: int,
+        block_repeat_step: int,
+        segment_local_step: int,
+        target_frames: List[int],
+        source_image_refs: List[ImageRef],
+        target_image_refs: List[ImageRef],
+        visited_blocks: Set[int],
+    ) -> Dict[str, Any]:
+        policy = str(self.runtime_cfg.target_frame_policy).strip()
+        if policy == "scheduler_v7_block_window":
+            scheduler_version = "v7"
+        else:
+            scheduler_version = "batcheval"
+        block_idx_global = int(spec.episode_idx) * int(max(len(spec.input_frame_ids), 1)) + int(block_idx)
+        return {
+            "epoch_idx": 0,
+            "global_step": int(segment_local_step),
+            "scene_id": int(spec.scene_id),
+            "segment_id": int(spec.segment_id),
+            "segment_local_step": int(segment_local_step),
+            "segment_local_u": int(segment_local_step),
+            "segment_step_budget": int(len(spec.input_frame_ids) * int(self.protocol.steps_per_input)),
+            "segment_budget_u": int(len(spec.input_frame_ids) * int(self.protocol.steps_per_input)),
+            "block_idx_in_segment": int(block_idx_global),
+            "block_idx_global": int(block_idx_global),
+            "block_idx_in_episode": int(block_idx),
+            "source_frame_idx": int(spec.input_frame_ids[int(block_idx)]),
+            "source_keyframe_idx": -1,
+            "source_cam_idx": int(source_image_refs[0][1]) if source_image_refs else -1,
+            "source_image_ref": tuple(source_image_refs[0]) if source_image_refs else (-1, -1),
+            "source_image_refs": [(int(f), int(c)) for f, c in source_image_refs],
+            "target_frame_indices": [int(x) for x in target_frames],
+            "target_image_refs": [(int(f), int(c)) for f, c in target_image_refs],
+            "target_policy": str(policy),
+            "visited_block_indices": sorted(int(x) for x in visited_blocks),
+            "block_current_source_frame_indices": [int(x) for x in spec.input_frame_ids],
+            "U": 1,
+            "K_u_nominal": int(self.protocol.steps_per_input),
+            "K_u_effective": int(self.protocol.steps_per_input),
+            "K_steps_effective": int(self.protocol.steps_per_input),
+            "K_steps": int(self.protocol.steps_per_input),
+            "R_steps": 0,
+            "T_steps": int(self.protocol.steps_per_input),
+            "episode_idx_global": int(spec.episode_idx),
+            "block_repeat_step": int(block_repeat_step),
+            "block_order": str(self.runtime_cfg.block_order),
+            "step_major_switch_interval_steps": int(self.runtime_cfg.step_major_switch_interval_steps),
+            "episode_step_cursor": int(segment_local_step),
+            "scheduler_version": str(scheduler_version),
+        }
 
     @staticmethod
     def _nearby_offsets_adjacent_non_input(spec: TestEpisodeSpec, input_offset: int) -> List[int]:
-        input_set = set(int(x) for x in spec.input_offsets)
-        valid_set = set(int(x) for x in spec.frame_offsets)
-        out: List[int] = []
-        for off in (int(input_offset) - 1, int(input_offset) + 1):
-            if int(off) not in valid_set:
-                continue
-            if int(off) in input_set:
-                continue
-            out.append(int(off))
-        return out
+        return nearby_offsets_adjacent_non_input(spec, int(input_offset))
 
     @staticmethod
     def _expand_roles(frame_roles: List[str], camera_ids: List[int]) -> List[str]:
@@ -515,143 +579,31 @@ class StreetForwardBatchEvalRunner:
         segment_local_step: int,
         visited_blocks: Set[int],
     ) -> Dict[str, Any]:
-        update_camera_ids = self._update_camera_ids(spec)
-        input_frame_ids = [int(x) for x in spec.input_frame_ids]
-        source_frame = int(input_frame_ids[int(block_idx)])
-        limit = self.runtime_cfg.max_target_frames_including_source
-        max_targets = len(input_frame_ids) if limit is None else max(int(limit), 1)
-        prev_blocks = sorted([int(b) for b in visited_blocks if int(b) < int(block_idx)], reverse=True)
-        next_blocks = sorted([int(b) for b in visited_blocks if int(b) > int(block_idx)])
-        selected_blocks: List[int] = []
-        for b in prev_blocks:
-            if len(selected_blocks) >= int(max_targets - 1):
-                break
-            selected_blocks.append(int(b))
-        for b in next_blocks:
-            if len(selected_blocks) >= int(max_targets - 1):
-                break
-            selected_blocks.append(int(b))
-        base_frames = [int(source_frame)] + [int(input_frame_ids[b]) for b in selected_blocks]
-        base_roles = ["source"] + ["visited" for _ in base_frames[1:]]
-        visited_frames_full = [int(source_frame)] + [int(input_frame_ids[b]) for b in sorted(int(x) for x in visited_blocks)]
-        near_frames = self._nearby_frames_for_block(
+        return build_stage5_6_eval_train_batch(
+            dataset=self.dataset,
             spec=spec,
-            input_offset=int(spec.input_offsets[int(block_idx)]),
-            existing_target_frames=[int(x) for x in (base_frames + visited_frames_full)],
-            input_frame_ids=[int(x) for x in input_frame_ids],
-        )
-        target_frames = [int(x) for x in base_frames] + [int(x) for x in near_frames]
-        role_name = str(self.runtime_cfg.stage5_6_nearby_role_name)
-        target_frame_roles = [str(x) for x in base_roles] + [role_name for _ in near_frames]
-
-        source_image_refs = make_refs_for_frames(frame_ids=[source_frame], camera_ids=update_camera_ids)
-        target_image_refs = make_refs_for_frames(frame_ids=target_frames, camera_ids=update_camera_ids)
-        target_image_roles = self._expand_roles(target_frame_roles, update_camera_ids)
-        if len(target_image_refs) != len(target_image_roles):
-            raise ValueError(
-                f"target_image_refs/target_image_roles mismatch: {len(target_image_refs)} vs {len(target_image_roles)}"
-            )
-
-        raw = self.dataset._assemble_segment_batch_from_image_refs(
-            int(spec.scene_id),
-            int(spec.segment_id),
-            [(int(f), int(c)) for f, c in source_image_refs],
-            [(int(f), int(c)) for f, c in target_image_refs],
-            aux_image_refs=[],
-            include_test=False,
-            test_image_refs=None,
-            enforce_target0_equals_source=True,
-            target_ref_purpose="train",
-        )
-        request_meta = dict(raw.get("request_meta") or {})
-        request_meta.update(
-            {
-                "eval_protocol": str(self.protocol.name),
-                "batch_role": "update",
-                "scheduler_version": "v8",
-                "source_image_refs": [(int(f), int(c)) for f, c in source_image_refs],
-                "target_image_refs": [(int(f), int(c)) for f, c in target_image_refs],
-                "update_target_image_refs": [(int(f), int(c)) for f, c in target_image_refs],
-                "target_frame_roles": [str(x) for x in target_frame_roles],
-                "target_image_roles": [str(x) for x in target_image_roles],
-                "observed_frame_ids": sorted(
-                    set(int(spec.input_frame_ids[int(b)]) for b in set(int(x) for x in visited_blocks) | {int(block_idx)})
-                ),
-                "source_frame_idx": int(source_frame),
-                "near_random_frame_indices": [int(x) for x in near_frames],
-                f"{role_name}_frame_indices": [int(x) for x in near_frames],
-                "near_random_supervision_enable": True,
-                "scheduler/near_random/enabled": 1.0,
-                "scheduler/near_random/num_frames": float(len(near_frames)),
-                "scheduler/near_random/skip_ratio": 0.0 if len(near_frames) > 0 else 1.0,
-                "scheduler/near_random/num_candidate_frames_mean": float(len(near_frames)),
-                "scheduler/near_random/sampled_blocks": 1.0 if len(near_frames) > 0 else 0.0,
-            }
-        )
-        raw["request_meta"] = request_meta
-
-        block_idx_global = int(spec.episode_idx) * int(max(len(spec.input_frame_ids), 1)) + int(block_idx)
-        aligned = {
-            "epoch_idx": 0,
-            "global_step": int(segment_local_step),
-            "scene_id": int(spec.scene_id),
-            "segment_id": int(spec.segment_id),
-            "segment_local_step": int(segment_local_step),
-            "segment_local_u": int(segment_local_step),
-            "segment_step_budget": int(len(spec.input_frame_ids) * self.protocol.steps_per_input),
-            "segment_budget_u": int(len(spec.input_frame_ids) * self.protocol.steps_per_input),
-            "block_idx_in_segment": int(block_idx_global),
-            "block_idx_global": int(block_idx_global),
-            "block_idx_in_episode": int(block_idx),
-            "source_frame_idx": int(source_frame),
-            "source_keyframe_idx": -1,
-            "source_cam_idx": int(source_image_refs[0][1]),
-            "source_image_ref": tuple(source_image_refs[0]),
-            "source_image_refs": [(int(f), int(c)) for f, c in source_image_refs],
-            "target_frame_indices": [int(x) for x in target_frames],
-            "target_image_refs": [(int(f), int(c)) for f, c in target_image_refs],
-            "target_image_roles": [str(x) for x in target_image_roles],
-            "target_policy": str(self.runtime_cfg.target_frame_policy),
-            "visited_block_indices": sorted(int(x) for x in visited_blocks),
-            "block_current_source_frame_indices": [int(x) for x in input_frame_ids],
-            "U": 1,
-            "K_u_nominal": int(self.protocol.steps_per_input),
-            "K_u_effective": int(self.protocol.steps_per_input),
-            "K_steps_effective": int(self.protocol.steps_per_input),
-            "K_steps": int(self.protocol.steps_per_input),
-            "R_steps": 0,
-            "T_steps": int(self.protocol.steps_per_input),
-            "episode_idx_global": int(spec.episode_idx),
-            "block_repeat_step": int(block_repeat_step),
-            "block_order": str(self.runtime_cfg.block_order),
-            "step_major_switch_interval_steps": int(self.runtime_cfg.step_major_switch_interval_steps),
-            "episode_step_cursor": int(segment_local_step),
-            "scheduler_version": "v8",
-        }
-        raw["_scheduler_v4_aligned_info"] = dict(aligned)
-        raw["_scheduler_v7_aligned_info"] = dict(aligned)
-        raw["_scheduler_v8_aligned_info"] = dict(aligned)
-        batch = convert_batch_to_minimal_format(
-            raw,
+            block_idx=int(block_idx),
+            block_repeat_step=int(block_repeat_step),
+            segment_local_step=int(segment_local_step),
+            visited_blocks=set(int(x) for x in visited_blocks),
             device=self.device,
-            num_targets=len(target_image_refs),
-            include_source_for_2d=True,
+            update_camera_ids=self.runtime_cfg.update_camera_ids,
+            protocol_name=str(self.protocol.name),
+            steps_per_input=int(self.protocol.steps_per_input),
+            target_frame_policy=str(self.runtime_cfg.target_frame_policy),
+            max_target_frames_including_source=self.runtime_cfg.max_target_frames_including_source,
+            nearby_policy=str(self.runtime_cfg.stage5_6_nearby_policy),
+            nearby_role_name=str(self.runtime_cfg.stage5_6_nearby_role_name),
+            allow_partial_nearby=bool(self.runtime_cfg.stage5_6_allow_partial_nearby),
+            block_order=str(self.runtime_cfg.block_order),
+            step_major_switch_interval_steps=int(self.runtime_cfg.step_major_switch_interval_steps),
         )
-        batch["request_meta"] = dict(batch.get("request_meta") or request_meta)
-        batch["_scheduler_v4_aligned_info"] = dict(aligned)
-        batch["_scheduler_v7_aligned_info"] = dict(aligned)
-        batch["_scheduler_v8_aligned_info"] = dict(aligned)
-        return batch
 
     def _runtime_policy(self, *, do_train: bool):
-        from models.streetforward.minimal_trainer_stage4_3 import RuntimePolicy
-
-        return RuntimePolicy(
-            do_backward=bool(do_train),
-            do_optimizer_step=bool(do_train),
-            update_hidden_cache=bool(self.runtime_cfg.update_hidden_state),
-            writeback_node_state=bool(self.runtime_cfg.update_node_state),
-            reset_node_state_after_block=False,
+        return stage5_6_runtime_policy(
+            do_train=bool(do_train),
+            update_hidden_state=bool(self.runtime_cfg.update_hidden_state),
+            update_node_state=bool(self.runtime_cfg.update_node_state),
             force_eval_mode=False,
         )
 
@@ -721,28 +673,14 @@ class StreetForwardBatchEvalRunner:
         *,
         segment_local_step: int,
     ) -> Dict[str, Any]:
-        sync = {
-            "U": 1,
-            "segment_local_step": int(segment_local_step),
-            "reset_after_block": False,
-        }
-        mode = self._runtime_mode()
-        if mode == "segment_finetune_train":
-            return self.model.train_step(
-                update_batch,
-                step=None,
-                profile_phase_timing=False,
-                sync_cuda_timing=False,
-                scheduler_node_sync=sync,
-                runtime_policy=self._runtime_policy(do_train=True),
-            )
-        with torch.no_grad():
-            return self.model.inference_step_from_train_batch(
-                update_batch,
-                step=None,
-                scheduler_node_sync=sync,
-                runtime_policy=self._runtime_policy(do_train=False),
-            )
+        return run_stage5_6_update_step(
+            model=self.model,
+            update_batch=update_batch,
+            mode=self._runtime_mode(),
+            segment_local_step=int(segment_local_step),
+            update_hidden_state=bool(self.runtime_cfg.update_hidden_state),
+            update_node_state=bool(self.runtime_cfg.update_node_state),
+        )
 
     def _render_scene_pack_from_current_state(self, update_batch: Dict[str, Any]) -> Any:
         if not hasattr(self.model, "_render_scene_views_from_current_state"):
@@ -851,6 +789,7 @@ class StreetForwardBatchEvalRunner:
             local_step = int(local_step_by_block[int(input_index)])
 
             target_frame_order = self._build_target_frame_order(
+                spec=spec,
                 input_frame_ids=[int(x) for x in spec.input_frame_ids],
                 current_block_idx=int(input_index),
                 observed_block_order=[int(x) for x in observed_block_order],
@@ -859,6 +798,8 @@ class StreetForwardBatchEvalRunner:
             current_observed_frames = sorted(
                 set(int(spec.input_frame_ids[int(b)]) for b in set(int(x) for x in visited_blocks) | {int(input_index)})
             )
+            if str(self.runtime_cfg.target_frame_policy).strip() == "scheduler_v7_block_window":
+                current_observed_frames = [int(x) for x in target_frame_order]
 
             global_iter += 1
             if self._uses_stage5_6_train_batch_path():
@@ -890,7 +831,20 @@ class StreetForwardBatchEvalRunner:
                     camera_ids=[int(x) for x in spec.camera_ids],
                     protocol_name=str(self.protocol.name),
                     device=self.device,
+                    enforce_target0_equals_source=True,
                 )
+                aligned = self._generic_scheduler_aligned_info(
+                    spec=spec,
+                    block_idx=int(input_index),
+                    block_repeat_step=int(local_step),
+                    segment_local_step=int(global_iter),
+                    target_frames=[int(x) for x in target_frame_order],
+                    source_image_refs=[(int(f), int(c)) for f, c in source_refs],
+                    target_image_refs=[(int(f), int(c)) for f, c in update_target_refs],
+                    visited_blocks=set(int(x) for x in visited_blocks),
+                )
+                update_batch["_scheduler_v4_aligned_info"] = dict(aligned)
+                update_batch["_scheduler_v7_aligned_info"] = dict(aligned)
                 if bool(self.runtime_cfg.no_grad):
                     self._run_eval_sparse_update_step(
                         update_batch,

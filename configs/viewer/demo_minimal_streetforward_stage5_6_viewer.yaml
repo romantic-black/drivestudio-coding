@@ -1,0 +1,115 @@
+base_config_file: /root/autodl-tmp/outputs/minimal_sf_stage5_6_multi_scene_v8_adamw_warmcos/experiment002_60w_40w_block16/config.yaml
+
+output_name: stage5_6_demo_viewer
+
+model:
+  stage: "5_6"
+  production_training: true
+
+batch_eval:
+  checkpoint:
+    path: "/root/autodl-tmp/outputs/minimal_sf_stage5_6_multi_scene_v8_adamw_warmcos/experiment002_60w_40w_block16/checkpoints/minimal_sf_stage5_6_multi_scene_v8_step250000.pt"
+    strict: true
+  dataset:
+    scene_ids: [10, 140, 194, 196, 142, 114, 121]
+    require_full_window: true
+    stride: 30
+    window_policy: sliding
+  cameras:
+    ids: [0, 1, 2]
+    names: ["front", "front_left", "front_right"]
+  update_cameras:
+    ids: [0, 1, 2]
+    names: ["front", "front_left", "front_right"]
+  runtime:
+    mode: segment_finetune_train
+    amp: false
+    reset_state_per_episode: true
+    align_with_scheduler_v8: true
+    update_node_state: true
+    update_hidden_state: true
+    update_view_transient: true
+  stage5_6_eval:
+    enable_nearby_feedback: true
+    nearby_policy: adjacent_non_input
+    nearby_role_name: near_random
+    allow_partial_nearby: true
+  sky_eval:
+    enable: false
+    compose_for_metrics: false
+  finetune:
+    enable: true
+    lr: 2.0e-5
+    weight_decay: 1.0e-5
+    train_feedback_fuser: false
+    freeze_error_predictor: true
+    freeze_sky_branch: true
+    freeze_dino: true
+  history:
+    update_step_norm_ema: true
+    record_support_residual_on_input_exit: true
+    record_each_step: false
+
+logging:
+  output_root: /root/autodl-tmp/outputs
+  project: minimal_sf_stage5_6_demo_viewer
+  log_dir: null
+  use_tensorboard: false
+
+demo:
+  mode: segment_finetune_train
+  reset_train_params_on_scope_change: true
+  checkpoint:
+    path: "/root/autodl-tmp/outputs/minimal_sf_stage5_6_multi_scene_v8_adamw_warmcos/experiment002_60w_40w_block16/checkpoints/minimal_sf_stage5_6_multi_scene_v8_step250000.pt"
+    strict: true
+    load_mode: full_state
+  scheduler:
+    type: eval_v8_stage5_6
+    name: stage5_6_demo_eval
+    scene_ids: [10, 140, 194, 196, 142, 114, 121]
+    initial_scene_id: 10
+    initial_segment_id: 0
+    initial_sequence_start_pos: 0
+    sequence_length: 10
+    input_offsets: [0, 2, 4, 6, 8]
+    eval_offsets: all
+    steps_per_input: 16
+    block_order: step_major
+    step_major_switch_interval_steps: 4
+    max_target_frames_including_source: 3
+    window_policy: sliding
+    stride: 30
+    require_full_window: true
+    wrap_scene: true
+    wrap_segment: true
+    wrap_episode: true
+  cameras:
+    ids: [0, 1, 2]
+    names: ["front", "front_left", "front_right"]
+  update_cameras:
+    ids: [0, 1, 2]
+    names: ["front", "front_left", "front_right"]
+  pause_on_start: true
+  display_branches: ["bg", "distant", "rigid"]
+  hide_rigid: false
+  inference:
+    update_node_state: true
+    update_hidden_state: true
+    update_history_memory: true
+    update_view_transient: true
+    record_block_history_on_block_exit: true
+  train_infer:
+    state_write_interval_steps: 1
+    reset_node_state_after_block: false
+  viewer:
+    host: "0.0.0.0"
+    port: 8080
+    align_gaussians_to_nerfview: true
+    coord_align_mode: gaussian
+    show_bg: true
+    show_distant: true
+    show_rigid: true
+    viewer_res: 1280
+    default_render_mode: rgb
+    default_max_sh_degree: 1
+    default_near_far: [0.01, 200.0]

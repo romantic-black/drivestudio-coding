@@ -62,6 +62,7 @@ def build_update_batch_from_refs(
     camera_ids: List[int],
     protocol_name: str,
     device: torch.device,
+    enforce_target0_equals_source: bool = True,
 ) -> Dict[str, Any]:
     from tools.train_minimal_streetforward_stage1_1 import convert_batch_to_minimal_format
 
@@ -81,7 +82,7 @@ def build_update_batch_from_refs(
             target_image_refs=[(int(f), int(c)) for f, c in update_target_image_refs],
             include_test=False,
         ),
-        enforce_target0_equals_source=False,
+        enforce_target0_equals_source=bool(enforce_target0_equals_source),
     )
 
     rm = dict(raw.get("request_meta") or {})

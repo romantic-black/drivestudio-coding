@@ -30,6 +30,15 @@ batch_eval:
     update_hidden_state: true
     update_view_transient: true
 
+  sky_eval:
+    enable: true
+    config_file: configs/skybranch_stage5_4_exp002.yaml
+    checkpoint: "/root/autodl-tmp/outputs/skybranch_stage5_4_exp002/checkpoints/skybranch_resume_step_100000.pth"
+    strict: true
+    freeze_params: true
+    compose_for_metrics: true
+    reset_runtime_state_per_episode: true
+
   history:
     update_step_norm_ema: true
     record_support_residual_on_input_exit: true

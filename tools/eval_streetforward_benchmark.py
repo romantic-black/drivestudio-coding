@@ -25,10 +25,12 @@ from models.streetforward.minimal_trainer_stage5_5_production import (
 from models.streetforward.minimal_trainer_stage5_6_production import (
     MinimalStreetForwardStage5_6_Production,
 )
+from datasets.validation_scheduler_v7 import build_validation_episode_specs_v7
 from streetforward_eval.episode_builder import TestEpisodeSpec, build_test_episode_specs
 from streetforward_eval.metrics import MetricAccumulator
-from streetforward_eval.protocols import protocol_from_dict, validate_protocol
+from streetforward_eval.protocols import protocol_from_dict, resolve_eval_offsets, validate_protocol
 from streetforward_eval.runner import RunnerRuntimeConfig, StreetForwardBatchEvalRunner
+from streetforward_eval.stage5_6_runtime import configure_segment_finetune_optimizer
 from streetforward_eval.snapshot_writer import RenderSaveConfig, SnapshotWriter
 from streetforward_eval.summary import build_summary_rows, write_summary_csv
 
@@ -222,6 +224,27 @@ def _load_checkpoint(model: Any, ckpt_path: str, strict: bool) -> int:
     return int(ckpt_step)
 
 
+def _load_checkpoint_optimizer_state(model: Any, ckpt_path: str, device: torch.device) -> bool:
+    opt = getattr(model, "optimizer", None)
+    if opt is None:
+        raise ValueError("segment_finetune_train requires model.optimizer to restore checkpoint optimizer state")
+    ckpt = torch.load(str(ckpt_path), map_location=device)
+    if not isinstance(ckpt, dict):
+        raise TypeError(f"checkpoint must be dict-like, got {type(ckpt).__name__}")
+    opt_state = ckpt.get("optimizer_state_dict") or ckpt.get("optimizer")
+    if opt_state is None:
+        logger.warning("[batcheval] checkpoint has no optimizer_state_dict; using freshly initialized optimizer")
+        return False
+    if hasattr(model, "load_optimizer_state_from_checkpoint"):
+        loaded = bool(model.load_optimizer_state_from_checkpoint(ckpt))
+        if loaded:
+            logger.info("[batcheval] restored optimizer state through model.load_optimizer_state_from_checkpoint")
+            return True
+    opt.load_state_dict(opt_state)
+    logger.info("[batcheval] restored optimizer_state_dict from checkpoint")
+    return True
+
+
 def _snapshot_train_checkpoint_bytes(model: Any) -> bytes:
     payload: Dict[str, Any] = {
         "model_state_dict": model.state_dict(),
@@ -328,67 +351,12 @@ def _configure_segment_finetune_optimizer(
     finetune_cfg: Dict[str, Any],
     start_step: int,
 ) -> None:
-    train_feedback_fuser = bool(finetune_cfg.get("train_feedback_fuser", False))
-    freeze_dino = bool(finetune_cfg.get("freeze_dino", True))
-    if not bool(finetune_cfg.get("freeze_error_predictor", True)):
-        logger.warning(
-            "[batcheval] finetune.freeze_error_predictor=false is ignored; "
-            "Stage5_6 error predictor is always frozen in segment_finetune_train."
-        )
-    freeze_sky_branch = bool(finetune_cfg.get("freeze_sky_branch", True))
-    lr = float(finetune_cfg.get("lr", 2.0e-5))
-    weight_decay = float(finetune_cfg.get("weight_decay", 1.0e-5))
-    grad_clip_norm = float(finetune_cfg.get("grad_clip_norm", 0.0))
-
-    params: List[torch.nn.Parameter] = []
-    names: List[str] = []
-    frozen_preview: List[str] = []
-    for name, param in model.named_parameters():
-        # Eval finetune only adapts the Stage5_6 main scene-update structure.
-        # Error prediction/cache fusion/sky are protocol machinery and stay
-        # fixed unless the feedback fuser is explicitly opted in.
-        trainable = bool(_is_segment_finetune_main_param(str(name)))
-        if _is_stage5_6_error_predictor_param(str(name)):
-            trainable = False
-        elif _is_stage5_6_feedback_fuser_param(str(name)):
-            trainable = bool(train_feedback_fuser)
-        elif name.startswith("image_feature_extractor.dino_adapter.backbone"):
-            trainable = not bool(freeze_dino)
-        elif freeze_sky_branch and _is_sky_param(str(name)):
-            trainable = False
-        param.requires_grad_(bool(trainable))
-        if trainable:
-            params.append(param)
-            names.append(str(name))
-        elif len(frozen_preview) < 12:
-            frozen_preview.append(str(name))
-
-    if len(params) == 0:
-        raise ValueError("segment_finetune_train selected zero trainable parameters")
-
-    base_optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
-    for group in base_optimizer.param_groups:
-        group["logical_name"] = "batch_eval_segment_finetune"
-        group["param_names"] = list(names)
-    model.optimizer = _BatchEvalOptimizerAdapter(
-        base_optimizer,
-        grad_clip_norm=float(grad_clip_norm),
-        global_step=int(start_step),
+    configure_segment_finetune_optimizer(
+        model,
+        finetune_cfg=dict(finetune_cfg),
+        start_step=int(start_step),
+        log_prefix="batcheval",
     )
-    if hasattr(model, "lr_scheduler"):
-        model.lr_scheduler = None
-    setattr(model, "global_step", int(start_step))
-    logger.info(
-        "[batcheval] segment_finetune optimizer configured trainable_params=%d lr=%g weight_decay=%g "
-        "train_feedback_fuser=%s freeze_dino=%s preview=%s",
-        len(names),
-        lr,
-        weight_decay,
-        train_feedback_fuser,
-        freeze_dino,
-        names[:12],
-    )
-    logger.info("[batcheval] segment_finetune frozen preview=%s", frozen_preview)
 
 
 def _load_sky_branch_from_cfg(cfg: Any, device: torch.device) -> Optional[Any]:
@@ -455,6 +423,86 @@ def _collect_episode_scene_ids(cfg: Any) -> List[int]:
     return [int(x) for x in scene_ids]
 
 
+def _build_scheduler_v7_episode_specs(
+    *,
+    cfg: Any,
+    dataset: Any,
+    protocol: Any,
+    max_total_episodes: int | None,
+) -> List[TestEpisodeSpec]:
+    sv7 = cfg.get("scheduler_v7")
+    if sv7 is None or not bool(sv7.get("enable", False)):
+        raise ValueError("batch_eval.runtime.align_with_scheduler_v7=true requires scheduler_v7.enable=true")
+    ep = sv7.get("episode")
+    if ep is None:
+        raise ValueError("scheduler_v7.episode is required")
+    blocks_per_episode = int(ep.get("blocks_per_episode"))
+    total_target_frames = int(ep.get("total_target_frames"))
+    expected_sequence_length = int(blocks_per_episode + total_target_frames - 1)
+    if int(protocol.sequence_length) != int(expected_sequence_length):
+        raise ValueError(
+            "scheduler_v7-aligned batch_eval requires sequence_length="
+            f"{expected_sequence_length}, got {int(protocol.sequence_length)}"
+        )
+    expected_input_offsets = list(range(int(blocks_per_episode)))
+    if [int(x) for x in protocol.input_offsets] != expected_input_offsets:
+        raise ValueError(
+            "scheduler_v7-aligned batch_eval requires input_offsets="
+            f"{expected_input_offsets}, got {[int(x) for x in protocol.input_offsets]}"
+        )
+
+    val_specs = build_validation_episode_specs_v7(
+        dataset=dataset,
+        eval_scene_ids=_collect_episode_scene_ids(cfg),
+        blocks_per_episode=int(blocks_per_episode),
+        total_target_frames=int(total_target_frames),
+    )
+    eval_offsets = resolve_eval_offsets(protocol.eval_offsets, sequence_length=int(protocol.sequence_length))
+    out: List[TestEpisodeSpec] = []
+    for idx, vs in enumerate(val_specs):
+        frame_ids = [int(x) for x in vs.frame_chain]
+        for cam_id in protocol.camera_ids:
+            if int(cam_id) < 0 or int(cam_id) >= int(vs.num_cams):
+                raise ValueError(
+                    f"camera id out of range for scheduler_v7 episode scene={int(vs.scene_id)} "
+                    f"segment={int(vs.segment_id)}: cam_id={int(cam_id)} num_cams={int(vs.num_cams)}"
+                )
+        input_frame_ids = [int(frame_ids[int(o)]) for o in protocol.input_offsets]
+        eval_frame_ids = [int(frame_ids[int(o)]) for o in eval_offsets]
+        input_image_refs = [
+            (int(f), int(c)) for f in input_frame_ids for c in [int(x) for x in protocol.camera_ids]
+        ]
+        eval_image_refs = [
+            (int(f), int(c)) for f in eval_frame_ids for c in [int(x) for x in protocol.camera_ids]
+        ]
+        out.append(
+            TestEpisodeSpec(
+                exp_name=str(protocol.name),
+                scene_id=int(vs.scene_id),
+                segment_id=int(vs.segment_id),
+                episode_idx=int(idx),
+                sequence_start_pos=int(vs.episode_start_keyframe_pos),
+                frame_offsets=list(range(len(frame_ids))),
+                frame_ids=[int(x) for x in frame_ids],
+                input_offsets=[int(x) for x in protocol.input_offsets],
+                eval_offsets=[int(x) for x in eval_offsets],
+                input_frame_ids=[int(x) for x in input_frame_ids],
+                eval_frame_ids=[int(x) for x in eval_frame_ids],
+                camera_ids=[int(x) for x in protocol.camera_ids],
+                camera_names=[str(x) for x in protocol.camera_names],
+                input_image_refs=[(int(f), int(c)) for f, c in input_image_refs],
+                eval_image_refs=[(int(f), int(c)) for f, c in eval_image_refs],
+                episode_uid=(
+                    f"scene{int(vs.scene_id):03d}_seg{int(vs.segment_id):03d}_"
+                    f"kfstart{int(vs.episode_start_keyframe_pos):06d}"
+                ),
+            )
+        )
+        if max_total_episodes is not None and len(out) >= int(max_total_episodes):
+            return out[: int(max_total_episodes)]
+    return out
+
+
 def _scope_dataset_to_batch_eval_scene_ids(cfg: Any) -> None:
     scene_ids = _collect_episode_scene_ids(cfg)
     data_mode = str(cfg.batch_eval.get("data_mode", "segment_finetune_train")).strip()
@@ -509,19 +557,28 @@ def _run_one_experiment(
             else int(ds_cfg.get("max_total_episodes"))
         )
     )
-    episode_specs = build_test_episode_specs(
-        dataset=dataset,
-        scene_ids=_collect_episode_scene_ids(cfg),
-        protocol=protocol,
-        segment_policy=str(ds_cfg.get("segment_policy", "all")),
-        window_policy=str(ds_cfg.get("window_policy", "sliding")),
-        stride=int(ds_cfg.get("stride", protocol.sequence_length)),
-        require_full_window=bool(ds_cfg.get("require_full_window", True)),
-        max_episodes_per_scene=(
-            None if ds_cfg.get("max_episodes_per_scene") is None else int(ds_cfg.get("max_episodes_per_scene"))
-        ),
-        max_total_episodes=max_total_episodes,
-    )
+    runtime_early = _as_mapping(_to_plain(cfg.batch_eval.get("runtime", {})) or {}, "batch_eval.runtime")
+    if bool(runtime_early.get("align_with_scheduler_v7", False)):
+        episode_specs = _build_scheduler_v7_episode_specs(
+            cfg=cfg,
+            dataset=dataset,
+            protocol=protocol,
+            max_total_episodes=max_total_episodes,
+        )
+    else:
+        episode_specs = build_test_episode_specs(
+            dataset=dataset,
+            scene_ids=_collect_episode_scene_ids(cfg),
+            protocol=protocol,
+            segment_policy=str(ds_cfg.get("segment_policy", "all")),
+            window_policy=str(ds_cfg.get("window_policy", "sliding")),
+            stride=int(ds_cfg.get("stride", protocol.sequence_length)),
+            require_full_window=bool(ds_cfg.get("require_full_window", True)),
+            max_episodes_per_scene=(
+                None if ds_cfg.get("max_episodes_per_scene") is None else int(ds_cfg.get("max_episodes_per_scene"))
+            ),
+            max_total_episodes=max_total_episodes,
+        )
     if len(episode_specs) == 0:
         raise ValueError(f"experiment={protocol.name} produced no episode specs")
 
@@ -554,7 +611,10 @@ def _run_one_experiment(
     history = _as_mapping(_to_plain(cfg.batch_eval.get("history", {})) or {}, "batch_eval.history")
     stage5_6_eval = _as_mapping(_to_plain(cfg.batch_eval.get("stage5_6_eval", {})) or {}, "batch_eval.stage5_6_eval")
     sky_eval = _as_mapping(_to_plain(cfg.batch_eval.get("sky_eval", {})) or {}, "batch_eval.sky_eval")
+    align_with_scheduler_v7 = bool(runtime.get("align_with_scheduler_v7", False))
     align_with_scheduler_v8 = bool(runtime.get("align_with_scheduler_v8", False))
+    if align_with_scheduler_v7 and align_with_scheduler_v8:
+        raise ValueError("batch_eval.runtime cannot enable both align_with_scheduler_v7 and align_with_scheduler_v8")
     runtime_mode = runtime.get("mode")
     if runtime_mode is None:
         runtime_mode = "inference_only" if bool(runtime.get("no_grad", True)) else "segment_finetune_train"
@@ -564,6 +624,45 @@ def _run_one_experiment(
     default_reset_policy = str(runtime.get("reset_policy", "episode_end"))
     default_target_policy = str(runtime.get("target_frame_policy", "all_observed"))
     default_max_targets = runtime.get("max_target_frames_including_source")
+    if align_with_scheduler_v7:
+        sv7 = cfg.get("scheduler_v7")
+        if sv7 is None:
+            raise ValueError("batch_eval.runtime.align_with_scheduler_v7=true requires config.scheduler_v7.")
+        sv7_block = sv7.get("block") if hasattr(sv7, "get") else None
+        sv7_episode = sv7.get("episode") if hasattr(sv7, "get") else None
+        sv7_exec = sv7.get("execution") if hasattr(sv7, "get") else None
+        if sv7_block is None or sv7_episode is None:
+            raise ValueError("scheduler_v7-aligned batch_eval requires scheduler_v7.block and scheduler_v7.episode")
+        scheduler_steps_per_block = int(sv7_block.get("steps_per_block"))
+        if int(protocol.steps_per_input) != int(scheduler_steps_per_block):
+            raise ValueError(
+                "scheduler_v7-aligned batch_eval requires experiment.steps_per_input="
+                f"{scheduler_steps_per_block}, got {int(protocol.steps_per_input)}"
+            )
+        if sv7_exec is not None:
+            default_block_order = str(sv7_exec.get("block_order", default_block_order))
+            default_step_major_switch = int(
+                sv7_exec.get("step_major_switch_interval_steps", default_step_major_switch)
+            )
+            default_reset_policy = str(sv7_exec.get("reset_policy", default_reset_policy))
+        else:
+            default_block_order = "block_major"
+            default_step_major_switch = 1
+            sv3_mns = None
+            sv3 = cfg.get("scheduler_v3") if hasattr(cfg, "get") else None
+            if sv3 is not None and hasattr(sv3, "get"):
+                sv3_mns = sv3.get("model_node_state")
+            if sv3_mns is not None and bool(sv3_mns.get("sync_with_scheduler", False)):
+                default_reset_policy = str(
+                    sv3_mns.get(
+                        "reset_policy",
+                        "episode_end" if default_block_order == "step_major" else "block_end",
+                    )
+                )
+            else:
+                default_reset_policy = "episode_end" if default_block_order == "step_major" else "block_end"
+        default_target_policy = "scheduler_v7_block_window"
+        default_max_targets = int(sv7_episode.get("total_target_frames"))
     if align_with_scheduler_v8:
         sv8 = cfg.get("scheduler_v8")
         if sv8 is None:
@@ -723,11 +822,27 @@ def main() -> None:
             _to_plain(cfg.batch_eval.get("finetune", {})) or {},
             "batch_eval.finetune",
         )
-        _configure_segment_finetune_optimizer(
-            model,
-            finetune_cfg=finetune_cfg,
-            start_step=int(ckpt_step),
-        )
+        stage = str(cfg.model.stage).strip().lower()
+        use_restricted_finetune = bool(finetune_cfg.get("enable", stage == "5_6"))
+        if use_restricted_finetune:
+            _configure_segment_finetune_optimizer(
+                model,
+                finetune_cfg=finetune_cfg,
+                start_step=int(ckpt_step),
+            )
+        else:
+            if bool(finetune_cfg.get("load_optimizer_state", True)):
+                _load_checkpoint_optimizer_state(model, ckpt_path=ckpt_path, device=device)
+            setattr(model, "global_step", int(ckpt_step))
+            opt = getattr(model, "optimizer", None)
+            if opt is not None and hasattr(opt, "global_step"):
+                opt.global_step = int(ckpt_step)
+            logger.info(
+                "[batcheval] segment_finetune_train uses model's training optimizer unchanged "
+                "(stage=%s checkpoint_step=%d).",
+                stage,
+                int(ckpt_step),
+            )
     sky_branch = _load_sky_branch_from_cfg(cfg, device)
     restore_checkpoint_on_segment = bool(
         runtime_cfg.get(

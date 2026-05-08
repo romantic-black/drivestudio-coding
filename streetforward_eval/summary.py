@@ -13,6 +13,36 @@ def _mean(values: List[float]) -> float:
     return float(sum(vals) / len(vals))
 
 
+def _row_float(row: Dict[str, Any], key: str) -> float:
+    try:
+        return float(row.get(key, float("nan")))
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _is_metric_group(row: Dict[str, Any], group: str) -> bool:
+    row_group = row.get("metric_group")
+    if row_group is not None:
+        return str(row_group) == str(group)
+    # Backward-compatible fallback for rows produced before metric_group existed.
+    is_input_any = row.get("is_input_frame")
+    if isinstance(is_input_any, str):
+        is_input = str(is_input_any).strip().lower() in ("1", "true", "yes")
+    elif is_input_any is None:
+        is_input = str(row.get("frame_group")) == "input"
+    else:
+        is_input = bool(is_input_any)
+    return bool(is_input) if str(group) == "reconstruction" else not bool(is_input)
+
+
+def _mean_key(rows: List[Dict[str, Any]], key: str) -> float:
+    return _mean([_row_float(r, key) for r in rows])
+
+
+def _mean_key_for_group(rows: List[Dict[str, Any]], key: str, group: str) -> float:
+    return _mean([_row_float(r, key) for r in rows if _is_metric_group(r, group)])
+
+
 def build_summary_rows(final_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if len(final_rows) == 0:
         return []
@@ -30,6 +60,8 @@ def build_summary_rows(final_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     out: List[Dict[str, Any]] = []
     for _, rows in by_exp.items():
         first = rows[0]
+        reconstruction_rows = [r for r in rows if _is_metric_group(r, "reconstruction")]
+        nvs_rows = [r for r in rows if _is_metric_group(r, "nvs")]
         out.append(
             {
                 "exp_name": str(first.get("exp_name", "")),
@@ -39,12 +71,30 @@ def build_summary_rows(final_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 "train_block_size_label": str(first.get("train_block_size_label", "")),
                 "num_episodes": int(len(set(str(r["episode_uid"]) for r in rows))),
                 "num_views": int(len(rows)),
-                "mean_psnr": _mean([float(r["psnr"]) for r in rows]),
-                "mean_l1": _mean([float(r["l1"]) for r in rows]),
-                "mean_ssim": _mean([float(r.get("ssim", float("nan"))) for r in rows]),
-                "mean_ssim_non_sky": _mean([float(r.get("ssim_non_sky", float("nan"))) for r in rows]),
-                "mean_lpips": _mean([float(r["lpips"]) for r in rows]),
-                "mean_lpips_non_sky": _mean([float(r.get("lpips_non_sky", float("nan"))) for r in rows]),
+                "num_views_reconstruction": int(len(reconstruction_rows)),
+                "num_views_nvs": int(len(nvs_rows)),
+                "mean_psnr": _mean_key(rows, "psnr"),
+                "mean_l1": _mean_key(rows, "l1"),
+                "mean_ssim": _mean_key(rows, "ssim"),
+                "mean_ssim_non_sky": _mean_key(rows, "ssim_non_sky"),
+                "mean_lpips": _mean_key(rows, "lpips"),
+                "mean_lpips_non_sky": _mean_key(rows, "lpips_non_sky"),
+                "mean_psnr_reconstruction": _mean_key_for_group(rows, "psnr", "reconstruction"),
+                "mean_psnr_nvs": _mean_key_for_group(rows, "psnr", "nvs"),
+                "mean_l1_reconstruction": _mean_key_for_group(rows, "l1", "reconstruction"),
+                "mean_l1_nvs": _mean_key_for_group(rows, "l1", "nvs"),
+                "mean_ssim_reconstruction": _mean_key_for_group(rows, "ssim", "reconstruction"),
+                "mean_ssim_nvs": _mean_key_for_group(rows, "ssim", "nvs"),
+                "mean_ssim_non_sky_reconstruction": _mean_key_for_group(
+                    rows, "ssim_non_sky", "reconstruction"
+                ),
+                "mean_ssim_non_sky_nvs": _mean_key_for_group(rows, "ssim_non_sky", "nvs"),
+                "mean_lpips_reconstruction": _mean_key_for_group(rows, "lpips", "reconstruction"),
+                "mean_lpips_nvs": _mean_key_for_group(rows, "lpips", "nvs"),
+                "mean_lpips_non_sky_reconstruction": _mean_key_for_group(
+                    rows, "lpips_non_sky", "reconstruction"
+                ),
+                "mean_lpips_non_sky_nvs": _mean_key_for_group(rows, "lpips_non_sky", "nvs"),
                 "mean_psnr_input_frames": _mean(
                     [float(r["psnr"]) for r in rows if str(r.get("frame_group")) == "input"]
                 ),
