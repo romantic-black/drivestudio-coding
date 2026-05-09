@@ -143,7 +143,8 @@ def _cfg_get(node: Any, key: str, default: Any = None) -> Any:
     if node is None:
         return default
     if isinstance(node, dict):
-        return node.get(key, default)
+        val = node.get(key, default)
+        return default if val is None else val
     if hasattr(node, "get"):
         val = node.get(key, default)
         return default if val is None else val
@@ -163,6 +164,14 @@ def _as_list(value: Any) -> List[Any]:
     except Exception:
         pass
     return [value]
+
+
+def _is_auto(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str) and value.strip().lower() in {"", "auto", "none", "null"}:
+        return True
+    return False
 
 
 def derive_input_offsets(*, window_size: int, input_gap_frames: int, explicit: Optional[Any] = None) -> List[int]:
@@ -410,7 +419,34 @@ class Stage5DemoVideoExporter:
         self.discard_history_between_windows = bool(_cfg_get(recon_cfg, "discard_history_between_windows", True))
 
         self.source_fps = float(_cfg_get(interp_cfg, "source_fps", 10.0))
-        self.subframes_per_interval = int(_cfg_get(interp_cfg, "subframes_per_source_interval", 2))
+        if float(self.source_fps) <= 0.0:
+            raise ValueError("video.interpolation.source_fps must be > 0")
+        target_fps_raw = _cfg_get(interp_cfg, "target_fps", None)
+        subframes_raw = _cfg_get(interp_cfg, "subframes_per_source_interval", None)
+        output_fps_raw = _cfg_get(output_cfg, "fps", None)
+        if _is_auto(target_fps_raw) and (not _is_auto(output_fps_raw)) and _is_auto(subframes_raw):
+            target_fps_raw = output_fps_raw
+        if not _is_auto(target_fps_raw):
+            target_fps = float(target_fps_raw)
+            if target_fps < 20.0:
+                raise ValueError("video.interpolation.target_fps must be >= 20")
+            ratio = target_fps / float(self.source_fps)
+            subframes = int(round(ratio))
+            if subframes < 1 or abs(float(subframes) - float(ratio)) > 1.0e-6:
+                raise ValueError(
+                    "video.interpolation.target_fps must be an integer multiple of source_fps "
+                    f"for deterministic interpolation; got target_fps={target_fps} source_fps={self.source_fps}."
+                )
+            if not _is_auto(subframes_raw) and int(subframes_raw) != int(subframes):
+                raise ValueError(
+                    "video.interpolation.subframes_per_source_interval conflicts with target_fps: "
+                    f"subframes={subframes_raw} but target/source requires {subframes}."
+                )
+            self.subframes_per_interval = int(subframes)
+            fps_default = int(round(target_fps))
+        else:
+            self.subframes_per_interval = int(2 if _is_auto(subframes_raw) else subframes_raw)
+            fps_default = int(round(float(self.source_fps) * int(self.subframes_per_interval)))
         self.include_tail_interval = bool(_cfg_get(interp_cfg, "include_window_tail_interval", True))
         self.rigid_frame_policy = str(_cfg_get(interp_cfg, "rigid_frame_policy", "nearest")).strip().lower()
         if self.rigid_frame_policy not in {"floor", "nearest", "ceil"}:
@@ -418,10 +454,15 @@ class Stage5DemoVideoExporter:
         if int(self.subframes_per_interval) < 1:
             raise ValueError("video.interpolation.subframes_per_source_interval must be >= 1")
 
-        fps_default = int(round(float(self.source_fps) * int(self.subframes_per_interval)))
         self.fps = int(_cfg_get(output_cfg, "fps", fps_default))
         if int(self.fps) < 20:
             raise ValueError("video.output.fps must be >= 20 for the requested demo output")
+        if int(self.fps) != int(fps_default):
+            raise ValueError(
+                "video.output.fps must match the interpolation sample rate so all videos share one time base: "
+                f"output.fps={self.fps}, derived={fps_default}. Set video.output.fps=null or make it match."
+            )
+        self.target_fps = int(fps_default)
         self.layout = str(_cfg_get(output_cfg, "layout", "auto")).strip().lower()
         self.write_combined = bool(_cfg_get(output_cfg, "write_combined", True))
         self.write_separate = bool(_cfg_get(output_cfg, "write_separate_per_camera", False))
@@ -743,6 +784,7 @@ class Stage5DemoVideoExporter:
 
         metadata: Dict[str, Any] = {
             "fps": int(self.fps),
+            "target_fps": int(self.target_fps),
             "source_fps": float(self.source_fps),
             "subframes_per_source_interval": int(self.subframes_per_interval),
             "window_size": int(self.window_size),
