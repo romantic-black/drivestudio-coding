@@ -154,6 +154,56 @@ def test_scheduler_v7_episode_builder_allows_non_strict_protocol_window() -> Non
     assert spec.eval_frame_ids == list(range(102, 112))
 
 
+def test_scheduler_v7_episode_builder_honors_batch_eval_start_at() -> None:
+    from tools.eval_streetforward_benchmark import _build_scheduler_v7_episode_specs
+
+    cfg = OmegaConf.create(
+        {
+            "scheduler_v7": {
+                "enable": True,
+                "episode": {
+                    "blocks_per_episode": 3,
+                    "total_target_frames": 3,
+                },
+            },
+            "batch_eval": {
+                "dataset": {
+                    "scene_ids": [1],
+                    "start_at": {"scene_id": 1, "segment_id": 2, "frame_id": 100},
+                },
+            },
+        }
+    )
+    protocol = TestProtocolSpec(
+        name="exp_v7_sparse",
+        data_mode="segment_finetune_train",
+        sequence_length=10,
+        input_offsets=[0, 2, 4],
+        eval_offsets="all",
+        camera_ids=[0],
+        camera_names=["front"],
+        steps_per_input=1,
+        save_pre_update=False,
+        save_each_iter_views=False,
+        metric_primary_mask="full_image",
+        report_full_image=True,
+    )
+
+    specs = _build_scheduler_v7_episode_specs(
+        cfg=cfg,
+        dataset=_DummyV7Dataset(),
+        protocol=protocol,
+        max_total_episodes=None,
+    )
+
+    assert len(specs) == 1
+    spec = specs[0]
+    assert spec.segment_id == 2
+    assert spec.sequence_start_pos == 0
+    assert spec.frame_ids[0] == 100
+    assert spec.input_frame_ids == [100, 102, 104]
+
+
 class _StartAtDataset:
     def list_segment_ids(self, scene_id: int) -> List[int]:
         assert int(scene_id) == 10

@@ -465,12 +465,15 @@ def _build_scheduler_v7_episode_specs(
             int(required_sequence_length),
         )
 
+    ds_cfg = cfg.batch_eval.dataset
+    start_at = _to_plain(ds_cfg.get("start_at")) if ds_cfg.get("start_at") is not None else None
     val_specs = build_validation_episode_specs_v7(
         dataset=dataset,
         eval_scene_ids=_collect_episode_scene_ids(cfg),
         blocks_per_episode=int(blocks_per_episode),
         total_target_frames=int(total_target_frames),
         min_window_keyframes=int(required_sequence_length),
+        start_at=start_at,
     )
     out: List[TestEpisodeSpec] = []
     for idx, vs in enumerate(val_specs):
