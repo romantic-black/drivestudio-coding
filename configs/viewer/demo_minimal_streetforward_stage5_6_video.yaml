@@ -13,15 +13,15 @@ batch_eval:
     path: "/root/autodl-tmp/outputs/minimal_sf_stage5_6_multi_scene_v8_adamw_warmcos/experiment002_60w_40w_block16/checkpoints/minimal_sf_stage5_6_multi_scene_v8_step250000.pt"
     strict: true
   dataset:
-    scene_ids: [10]
+    scene_ids: [194]
     # 视频脚本实际由 demo.scheduler.initial_segment_id 锁定 segment=1；
     # 这个字段保留给 batch_eval 兼容路径，不会触发视频脚本遍历所有 segment。
     segment_policy: all
     # 从该帧所在位置开始生成窗口；脚本会按 stride=8 继续取后续窗口。
     start_at:
-      scene_id: 10
-      segment_id: 1
-      frame_id: 80
+      scene_id: 194
+      segment_id: 0
+      frame_id: 0
     require_full_window: true
     stride: 4
     window_policy: sliding
@@ -80,14 +80,14 @@ demo:
   scheduler:
     type: eval_v8_stage5_6
     name: stage5_6_demo_video_eval_v8
-    scene_ids: [10]
-    initial_scene_id: 10
+    scene_ids: [194]
+    initial_scene_id: 194
     # 视频生成固定当前 segment；不会像 batch eval 那样遍历所有 segment。
-    initial_segment_id: 1
+    initial_segment_id: 3
     # 一个重建窗口只覆盖 8 个 nuScenes 10Hz 数据帧。
-    sequence_length: 8
+    sequence_length: 20
     # 默认输入帧为 0/2/4/6，即中间间隔 1 帧；也可通过 video.reconstruction.input_gap_frames 推导。
-    input_offsets: [0, 2, 4, 6]
+    input_offsets: [0, 2, 4, 6, 8, 10, 12, 14, 16, 18]
     eval_offsets: all
     # demo 优先观感，不追求速度；可继续增大以换取更充分的窗口内适配。
     steps_per_input: 18
@@ -132,49 +132,45 @@ video:
   reconstruction:
     # 这里是视频脚本的主配置源；启动时会同步覆盖 demo.scheduler 中的窗口参数。
     # 每轮只用 8 帧建场景；前后 transition 帧只用于过渡，主视频拼接时丢弃。
-    window_size: 8
+    window_size: 6
     # transition_frames=2 时，8 帧窗口只拼接中间 4 帧，因此 stride=4 会提高视频段数量。
     window_stride: 4
-    transition_frames: 2
+    transition_frames_before: 2
     # input_gap_frames=1 => 自动推导输入 offset [0,2,4,6]。
-    input_gap_frames: 1
+    input_gap_frames: 0
     # 留空表示按 input_gap_frames 自动推导；若手动填写，会覆盖自动推导。
     input_offsets: []
-    steps_per_input: 18
-    max_target_frames_including_source: 4
+    steps_per_input: 16
+    max_target_frames_including_source: 8
     block_order: block_major
     step_major_switch_interval_steps: 1
     require_full_window: true
     window_policy: sliding
-    # 每段恢复原始行为：切换窗口时重置 demo runtime state，不沿用上一段 node state。
+    # 下一段沿用上一段 node state，但丢弃 GRU hidden/history/support 等历史缓存。
     state_carryover: reset
     discard_history_between_windows: true
     # 默认只导出 4 个窗口便于快速看效果；需要完整视频可设为 null。
     max_windows: 4
     sequence_start_positions: []
   interpolation:
-    # nuScenes 数据帧按 10Hz 读取；target_fps=20 会自动推导 2 个子帧。
-    # 若要输出 50Hz，只需覆盖 video.interpolation.target_fps=50，会自动推导 5 个子帧。
+    # nuScenes 数据帧按 10Hz 读取；subframes=2 后输出 20Hz。
     source_fps: 10.0
-    target_fps: 20
-    subframes_per_source_interval: auto
+    subframes_per_source_interval: 4
     # true 表示每个窗口最后一帧会继续插值到下一窗口首帧，减少窗口边界顿挫。
     include_window_tail_interval: true
     # 动态刚体无法连续插值时，按最近真实帧选择刚体姿态。
     rigid_frame_policy: nearest
   render:
-    # base 训练配置按 downscale_when_loading=3 载入图像；demo 视频提升到 nuScenes 原始前摄分辨率。
-    # three_front 横拼后为 4800x900；front 单相机为 1600x900。
-    height: 900
-    width: 1600
+    # null 表示使用数据原始分辨率；若要降采样，height/width 必须一起设置。
+    height: null
+    width: null
   output:
     dir: null
-    name: stage5_6_three_front_demo
-    # null 表示和 interpolation.target_fps 使用同一时间基；也可手动设为相同数值。
-    fps: null
+    name: stage5_6_three_front_20hz_demo
+    fps: 40
     # 三前摄默认横向拼接；front 单相机建议改成 single。
     layout: horizontal
-    write_combined: true
+    write_combined: true  
     write_separate_per_camera: false
     show_camera_labels: false
     # 额外输出所有渲染图像，包括前后 transition 帧；主视频只写非 transition 帧。
