@@ -24,6 +24,10 @@ batch_eval:
   dataset:
     scene_ids: [10]
     segment_policy: all
+    start_at:
+      scene_id: 10
+      segment_id: 0
+      frame_id: 100
     require_full_window: true
     stride: 30
     max_episodes_per_scene: null
@@ -83,7 +87,7 @@ batch_eval:
 
   experiments:
     - name: exp_v7_5_3_stage4_6
-      sequence_length: 5
-      input_offsets: [0, 2, 4]
+      sequence_length: 10
+      input_offsets: [0, 2, 4, 6, 8]
       eval_offsets: all
       steps_per_input: 8
