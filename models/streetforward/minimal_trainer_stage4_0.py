@@ -461,6 +461,13 @@ class MinimalStreetForwardStage4_0(MinimalStreetForwardStage3_3):
         resolved = self._resolve_rigid_frame_idx(node_state_rigid, frame_idx)
         if resolved is None:
             raise ValueError(f"Rigid frame_idx={frame_idx} missing in dynamic_info frame_ids={node_state_rigid.frame_ids}")
+        if resolved < 0 or resolved >= int(node_state_rigid.instances_fv.shape[0]):
+            raise ValueError(
+                "Rigid runtime state is inconsistent: "
+                f"frame_idx={frame_idx} resolved_slot={resolved} "
+                f"instances_fv_rows={int(node_state_rigid.instances_fv.shape[0])} "
+                f"frame_ids={node_state_rigid.frame_ids}"
+            )
         return node_state_rigid.instances_fv[resolved].bool()
 
     def _rigid_point_valid_mask(self, node_state_rigid: NodeStateRigid, frame_idx: int) -> torch.Tensor:

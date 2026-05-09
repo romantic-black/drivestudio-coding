@@ -4,6 +4,7 @@ Minimal StreetForward Stage 4.3: Stage 4.2 + sky GS shell (hemisphere, two-pass 
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 import logging
 import time
@@ -1364,7 +1365,7 @@ class MinimalStreetForwardStage4_3(MinimalStreetForwardStage4_2):
                 if torch.is_tensor(v):
                     out[k] = v.detach().clone()
                 else:
-                    out[k] = v
+                    out[k] = copy.deepcopy(v)
             return out
 
         return {

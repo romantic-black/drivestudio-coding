@@ -8,6 +8,7 @@ Minimal StreetForward Stage 4.5:
 
 from __future__ import annotations
 
+import copy
 import logging
 import time
 from collections import defaultdict
@@ -1644,7 +1645,7 @@ class MinimalStreetForwardStage4_5(MinimalStreetForwardStage4_2):
                 if torch.is_tensor(v):
                     out[k] = v.detach().clone()
                 else:
-                    out[k] = v
+                    out[k] = copy.deepcopy(v)
             return out
 
         return {
