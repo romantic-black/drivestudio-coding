@@ -23,7 +23,7 @@ batch_eval:
       segment_id: 1
       frame_id: 80
     require_full_window: true
-    stride: 8
+    stride: 4
     window_policy: sliding
   cameras:
     ids: [0, 1, 2]
@@ -95,7 +95,7 @@ demo:
     step_major_switch_interval_steps: 1
     max_target_frames_including_source: 4
     window_policy: sliding
-    stride: 8
+    stride: 4
     require_full_window: true
     wrap_scene: true
     wrap_segment: true
@@ -131,9 +131,11 @@ video:
     names: ["front", "front_left", "front_right"]
   reconstruction:
     # 这里是视频脚本的主配置源；启动时会同步覆盖 demo.scheduler 中的窗口参数。
-    # 每轮只用 8 帧建场景；完成后按 window_stride 跳到下一个 8 帧窗口。
+    # 每轮只用 8 帧建场景；前后 transition 帧只用于过渡，主视频拼接时丢弃。
     window_size: 8
-    window_stride: 8
+    # transition_frames=2 时，8 帧窗口只拼接中间 4 帧，因此 stride=4 会提高视频段数量。
+    window_stride: 4
+    transition_frames: 2
     # input_gap_frames=1 => 自动推导输入 offset [0,2,4,6]。
     input_gap_frames: 1
     # 留空表示按 input_gap_frames 自动推导；若手动填写，会覆盖自动推导。
@@ -144,6 +146,9 @@ video:
     step_major_switch_interval_steps: 1
     require_full_window: true
     window_policy: sliding
+    # 下一段沿用上一段 node state，但丢弃 GRU hidden/history/support 等历史缓存。
+    state_carryover: node_state
+    discard_history_between_windows: true
     # 默认只导出 4 个窗口便于快速看效果；需要完整视频可设为 null。
     max_windows: 4
     sequence_start_positions: []
@@ -168,4 +173,6 @@ video:
     write_combined: true
     write_separate_per_camera: false
     show_camera_labels: false
+    # 额外输出所有渲染图像，包括前后 transition 帧；主视频只写非 transition 帧。
+    save_all_images: true
     save_png_frames: false
