@@ -35,6 +35,12 @@ class RenderSample:
     rigid_frame_idx: int
     window_index: int
     sequence_start_pos: int
+    local_source_pos: float
+    global_source_pos: float
+    global_time_seconds: float
+    global_output_time_index: int
+    anchor_input_offset: int
+    is_transition: bool
 
 
 class _VideoWriterSet:
@@ -387,6 +393,21 @@ class Stage5DemoVideoExporter:
         self.max_windows = _cfg_get(recon_cfg, "max_windows", None)
         self.max_windows = None if self.max_windows is None else int(self.max_windows)
         self.explicit_sequence_starts = [int(x) for x in _as_list(_cfg_get(recon_cfg, "sequence_start_positions", []))]
+        transition_frames = int(_cfg_get(recon_cfg, "transition_frames", 0))
+        self.transition_frames_before = int(_cfg_get(recon_cfg, "transition_frames_before", transition_frames))
+        self.transition_frames_after = int(_cfg_get(recon_cfg, "transition_frames_after", transition_frames))
+        if self.transition_frames_before < 0 or self.transition_frames_after < 0:
+            raise ValueError("video.reconstruction transition frame counts must be >= 0")
+        if self.transition_frames_before + self.transition_frames_after >= int(self.window_size):
+            raise ValueError(
+                "video.reconstruction transition frames leave no stitchable core: "
+                f"before={self.transition_frames_before} after={self.transition_frames_after} "
+                f"window_size={self.window_size}"
+            )
+        self.state_carryover = str(_cfg_get(recon_cfg, "state_carryover", "reset")).strip().lower()
+        if self.state_carryover not in {"reset", "node_state"}:
+            raise ValueError("video.reconstruction.state_carryover must be one of: reset, node_state")
+        self.discard_history_between_windows = bool(_cfg_get(recon_cfg, "discard_history_between_windows", True))
 
         self.source_fps = float(_cfg_get(interp_cfg, "source_fps", 10.0))
         self.subframes_per_interval = int(_cfg_get(interp_cfg, "subframes_per_source_interval", 2))
@@ -405,6 +426,7 @@ class Stage5DemoVideoExporter:
         self.write_combined = bool(_cfg_get(output_cfg, "write_combined", True))
         self.write_separate = bool(_cfg_get(output_cfg, "write_separate_per_camera", False))
         self.save_png_frames = bool(_cfg_get(output_cfg, "save_png_frames", False))
+        self.save_all_images = bool(_cfg_get(output_cfg, "save_all_images", self.save_png_frames))
         self.show_labels = bool(_cfg_get(output_cfg, "show_camera_labels", False))
         self.base_name = _safe_stem(str(_cfg_get(output_cfg, "name", "stage5_6_demo_video")))
 
@@ -500,12 +522,25 @@ class Stage5DemoVideoExporter:
             return []
         samples: List[RenderSample] = []
         valid_rigid_frames = set(frames)
-        interval_pairs: List[Tuple[int, int]] = [(frames[i], frames[i + 1]) for i in range(len(frames) - 1)]
+        interval_pairs: List[Tuple[int, int, int]] = [(i, frames[i], frames[i + 1]) for i in range(len(frames) - 1)]
         if bool(self.include_tail_interval) and next_frame_id is not None:
-            interval_pairs.append((int(frames[-1]), int(next_frame_id)))
-        for f0, f1 in interval_pairs:
+            interval_pairs.append((len(frames) - 1, int(frames[-1]), int(next_frame_id)))
+        input_offsets = sorted({int(x) for x in self.input_offsets})
+        stitch_start = float(self.transition_frames_before)
+        stitch_end = float(int(self.window_size) - int(self.transition_frames_after))
+        for interval_offset, f0, f1 in interval_pairs:
             for sub in range(int(self.subframes_per_interval)):
                 alpha = float(sub) / float(self.subframes_per_interval)
+                local_source_pos = float(interval_offset) + float(alpha)
+                anchors = [int(x) for x in input_offsets if float(x) <= local_source_pos]
+                if not anchors:
+                    continue
+                anchor_input_offset = int(anchors[-1])
+                global_source_pos = float(sequence_start_pos) + float(local_source_pos)
+                global_frame_value = (1.0 - float(alpha)) * float(f0) + float(alpha) * float(f1)
+                global_time_seconds = float(global_frame_value) / float(self.source_fps)
+                global_output_time_index = int(round(global_time_seconds * float(self.fps)))
+                is_transition = bool(local_source_pos < stitch_start or local_source_pos >= stitch_end)
                 samples.append(
                     RenderSample(
                         frame0=int(f0),
@@ -519,9 +554,20 @@ class Stage5DemoVideoExporter:
                         ),
                         window_index=int(window_index),
                         sequence_start_pos=int(sequence_start_pos),
+                        local_source_pos=float(local_source_pos),
+                        global_source_pos=float(global_source_pos),
+                        global_time_seconds=float(global_time_seconds),
+                        global_output_time_index=int(global_output_time_index),
+                        anchor_input_offset=int(anchor_input_offset),
+                        is_transition=bool(is_transition),
                     )
                 )
         if not bool(self.include_tail_interval) or next_frame_id is None:
+            local_source_pos = float(len(frames) - 1)
+            anchors = [int(x) for x in input_offsets if float(x) <= local_source_pos]
+            if not anchors:
+                return samples
+            global_time_seconds = float(frames[-1]) / float(self.source_fps)
             samples.append(
                 RenderSample(
                     frame0=int(frames[-1]),
@@ -530,6 +576,12 @@ class Stage5DemoVideoExporter:
                     rigid_frame_idx=int(frames[-1]),
                     window_index=int(window_index),
                     sequence_start_pos=int(sequence_start_pos),
+                    local_source_pos=float(local_source_pos),
+                    global_source_pos=float(sequence_start_pos) + float(local_source_pos),
+                    global_time_seconds=float(global_time_seconds),
+                    global_output_time_index=int(round(global_time_seconds * float(self.fps))),
+                    anchor_input_offset=int(anchors[-1]),
+                    is_transition=bool(local_source_pos < stitch_start or local_source_pos >= stitch_end),
                 )
             )
         return samples
@@ -581,6 +633,94 @@ class Stage5DemoVideoExporter:
             out[int(cam_id)] = _to_uint8(rgb[idx])
         return out
 
+    def _discard_history_keep_node_state(self) -> None:
+        if not bool(self.discard_history_between_windows):
+            return
+        info = self.controller.scheduler.get_current_info()
+        key = (int(info.get("scene_id", -1)), int(info.get("segment_id", -1)))
+        keyed_cache_names = (
+            "h_cache_bg",
+            "h_cache_distant",
+            "h_cache_rigid",
+            "stage5_2_history_bg",
+            "stage5_2_history_distant",
+            "stage5_2_history_rigid",
+            "stage5_2_last_step_update_norm",
+            "stage5_2_block_support_bg",
+            "stage5_2_block_support_distant",
+            "stage5_2_block_support_rigid",
+        )
+        for name in keyed_cache_names:
+            cache = getattr(self.controller.trainer, name, None)
+            if isinstance(cache, dict):
+                cache.pop(key, None)
+        if hasattr(self.controller.trainer, "_stage5_2_last_full_inputs"):
+            self.controller.trainer._stage5_2_last_full_inputs = None
+        if hasattr(self.controller.trainer, "_stage5_6_active_cache"):
+            self.controller.trainer._stage5_6_active_cache = None
+        if hasattr(self.controller.trainer, "_stage5_6_last_fused_features"):
+            self.controller.trainer._stage5_6_last_fused_features = {}
+        if hasattr(self.controller.trainer, "_stage5_6_last_nearby_debug_images"):
+            self.controller.trainer._stage5_6_last_nearby_debug_images = []
+        if hasattr(self.controller.trainer, "_stage5_6_last_error_debug_images"):
+            self.controller.trainer._stage5_6_last_error_debug_images = []
+        if hasattr(self.controller.trainer, "_stage5_6_fusion_delta_norm_terms"):
+            self.controller.trainer._stage5_6_fusion_delta_norm_terms = []
+        for name in ("_stage5_6_frame_cache", "_stage5_6_fusion_delta_norm_terms"):
+            value = getattr(self.controller.trainer, name, None)
+            if isinstance(value, dict):
+                value.clear()
+        if hasattr(self.controller, "_recorded_block_update_counts"):
+            self.controller._recorded_block_update_counts.clear()
+        if hasattr(self.controller, "_clear_display_render_cache"):
+            self.controller._clear_display_render_cache()
+
+    def _set_sequence_start_for_window(self, *, window_index: int, start: int) -> None:
+        cur_info = self.controller.scheduler.get_current_info()
+        cur_start = int(cur_info.get("sequence_start_pos", -1))
+        if int(window_index) == 0 and int(cur_start) == int(start):
+            return
+        if str(self.state_carryover) != "node_state":
+            self.controller.set_sequence_start_pos(int(start))
+            return
+        if getattr(self.controller, "busy", False):
+            raise ValueError("controller is busy")
+        self.controller.busy = True
+        try:
+            raw_batch = self.controller.scheduler.set_sequence_start_pos(int(start))
+            self._discard_history_keep_node_state()
+            self.controller._refresh_display_from_raw_batch(
+                raw_batch,
+                stats={
+                    "manual_set_sequence_start_pos": 1.0,
+                    "preserve_node_state_between_video_windows": 1.0,
+                    "discard_history_between_video_windows": float(
+                        1.0 if self.discard_history_between_windows else 0.0
+                    ),
+                },
+            )
+        finally:
+            self.controller.busy = False
+
+    def _save_all_images(
+        self,
+        *,
+        frame_dir: Path,
+        sample: RenderSample,
+        combined: Optional[np.ndarray],
+        per_camera: Dict[int, np.ndarray],
+    ) -> None:
+        role = "transition" if bool(sample.is_transition) else "stitch"
+        stem = (
+            f"t{int(sample.global_output_time_index):010d}_"
+            f"w{int(sample.window_index):04d}_"
+            f"src{float(sample.global_source_pos):010.3f}_{role}"
+        )
+        if combined is not None:
+            Image.fromarray(combined).save(frame_dir / f"{stem}_combined.png")
+        for cam_id, frame in per_camera.items():
+            Image.fromarray(frame).save(frame_dir / f"{stem}_cam{int(cam_id)}.png")
+
     def export(self) -> Dict[str, Any]:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         starts = _select_sequence_starts(
@@ -597,9 +737,9 @@ class Stage5DemoVideoExporter:
             write_combined=bool(self.write_combined),
             write_separate=bool(self.write_separate),
         )
-        png_dir = self.output_dir / "frames"
-        if self.save_png_frames:
-            png_dir.mkdir(parents=True, exist_ok=True)
+        all_frames_dir = self.output_dir / "frames_all"
+        if self.save_all_images:
+            all_frames_dir.mkdir(parents=True, exist_ok=True)
 
         metadata: Dict[str, Any] = {
             "fps": int(self.fps),
@@ -607,22 +747,23 @@ class Stage5DemoVideoExporter:
             "subframes_per_source_interval": int(self.subframes_per_interval),
             "window_size": int(self.window_size),
             "window_stride": int(self.window_stride),
+            "transition_frames_before": int(self.transition_frames_before),
+            "transition_frames_after": int(self.transition_frames_after),
+            "state_carryover": str(self.state_carryover),
+            "discard_history_between_windows": bool(self.discard_history_between_windows),
             "input_offsets": [int(x) for x in self.input_offsets],
             "camera_ids": [int(x) for x in self.camera_ids],
             "camera_names": [str(x) for x in self.camera_names],
             "sequence_starts": [int(x) for x in starts],
             "videos": {k: str(v) for k, v in writers.paths.items()},
+            "all_frames_dir": str(all_frames_dir) if self.save_all_images else None,
             "samples": [],
         }
-        total_samples = 0
+        total_rendered_samples = 0
+        total_stitched_samples = 0
         try:
             for window_index, start in enumerate(starts):
-                if window_index == 0:
-                    cur_info = self.controller.scheduler.get_current_info()
-                    if int(cur_info.get("sequence_start_pos", start)) != int(start):
-                        self.controller.set_sequence_start_pos(int(start))
-                else:
-                    self.controller.set_sequence_start_pos(int(start))
+                self._set_sequence_start_for_window(window_index=int(window_index), start=int(start))
                 stats = self.controller.run_episode()
                 scene_id = int(stats.get("scene_id", self.controller.scheduler.get_current_info().get("scene_id", -1)))
                 segment_id = int(
@@ -666,41 +807,59 @@ class Stage5DemoVideoExporter:
                 for sample in samples:
                     per_camera = self._render_sample(records=records, sample=sample)
                     frames = [per_camera[int(c)] for c in self.camera_ids]
-                    combined = (
-                        _tile_frames(
-                            frames,
-                            layout=str(self.layout),
-                            labels=self.camera_names,
-                            show_labels=bool(self.show_labels),
-                        )
-                        if self.write_combined
-                        else None
+                    combined = _tile_frames(
+                        frames,
+                        layout=str(self.layout),
+                        labels=self.camera_names,
+                        show_labels=bool(self.show_labels),
                     )
-                    writers.append(combined=combined, per_camera=per_camera)
-                    if self.save_png_frames:
-                        if combined is not None:
-                            Image.fromarray(combined).save(png_dir / f"frame_{total_samples:06d}.png")
-                        for cam_id, frame in per_camera.items():
-                            Image.fromarray(frame).save(png_dir / f"frame_{total_samples:06d}_cam{int(cam_id)}.png")
+                    if self.save_all_images:
+                        self._save_all_images(
+                            frame_dir=all_frames_dir,
+                            sample=sample,
+                            combined=combined,
+                            per_camera=per_camera,
+                        )
+                    stitched_frame_index: Optional[int] = None
+                    if not bool(sample.is_transition):
+                        writers.append(
+                            combined=combined if self.write_combined else None,
+                            per_camera=per_camera,
+                        )
+                        stitched_frame_index = int(total_stitched_samples)
+                        total_stitched_samples += 1
                     metadata["samples"].append(
                         {
-                            "index": int(total_samples),
+                            "rendered_index": int(total_rendered_samples),
+                            "stitched_frame_index": stitched_frame_index,
                             "window_index": int(sample.window_index),
                             "sequence_start_pos": int(sample.sequence_start_pos),
                             "frame0": int(sample.frame0),
                             "frame1": int(sample.frame1),
                             "alpha": float(sample.alpha),
                             "rigid_frame_idx": int(sample.rigid_frame_idx),
+                            "local_source_pos": float(sample.local_source_pos),
+                            "global_source_pos": float(sample.global_source_pos),
+                            "global_time_seconds": float(sample.global_time_seconds),
+                            "global_output_time_index": int(sample.global_output_time_index),
+                            "anchor_input_offset": int(sample.anchor_input_offset),
+                            "is_transition": bool(sample.is_transition),
                         }
                     )
-                    total_samples += 1
+                    total_rendered_samples += 1
         finally:
             writers.close()
 
-        metadata["num_video_frames"] = int(total_samples)
+        metadata["num_rendered_frames_including_transition"] = int(total_rendered_samples)
+        metadata["num_video_frames"] = int(total_stitched_samples)
         metadata_path = self.output_dir / f"{self.base_name}_metadata.json"
         with open(metadata_path, "w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=2)
         metadata["metadata_path"] = str(metadata_path)
-        logger.info("video export wrote %d frames to %s", int(total_samples), self.output_dir)
+        logger.info(
+            "video export rendered %d frames (%d stitched video frames) to %s",
+            int(total_rendered_samples),
+            int(total_stitched_samples),
+            self.output_dir,
+        )
         return metadata
