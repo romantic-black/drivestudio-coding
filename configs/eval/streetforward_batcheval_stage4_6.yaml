@@ -32,7 +32,7 @@ scheduler_v8:
     scene_order: shuffle_per_epoch
   execution:
     block_order: step_major
-    step_major_switch_interval_steps: 4
+    step_major_switch_interval_steps: 8
     reset_policy: episode_end
   preload:
     emit_hints: true
@@ -49,12 +49,12 @@ batch_eval:
     strict: true
 
   dataset:
-    scene_ids: [10]
+    scene_ids: [115]
     segment_policy: all
     start_at:
-      scene_id: 10
+      scene_id: 115
       segment_id: 1
-      frame_id: 100
+      frame_id: 96
     require_full_window: true
     stride: 30
     max_episodes_per_scene: null
@@ -116,7 +116,7 @@ batch_eval:
 
   experiments:
     - name: exp_v8_10_5_stage4_6
-      sequence_length: 10
-      input_offsets: [0, 2, 4, 6, 8]
+      sequence_length: 6
+      input_offsets: [0, 2, 4]
       eval_offsets: all
       steps_per_input: 8

@@ -10,14 +10,14 @@ batch_eval:
     strict: true
 
   dataset:
-    scene_ids: [10  ]
+    scene_ids: [115 ]
     segment_policy: all
     start_at:
-      scene_id: 10
+      scene_id: 115
       segment_id: 1
-      frame_id: 100
+      frame_id: 84
     require_full_window: true
-    stride: 20
+    stride: 30
     max_episodes_per_scene: null
     max_total_episodes: null
     window_policy: sliding
@@ -37,7 +37,7 @@ batch_eval:
     align_with_scheduler_v8: true
     override_scheduler_execution: true
     block_order: step_major
-    step_major_switch_interval_steps: 4
+    step_major_switch_interval_steps: 8
     update_node_state: true
     update_hidden_state: true
     update_view_transient: true
@@ -89,8 +89,8 @@ batch_eval:
     min_valid_pixels: 32
 
   experiments:
-    - name: exp2_10_5_stage5_6_sky
-      sequence_length: 10
-      input_offsets: [0, 2, 4, 6, 8]
+    - name: exp2_8_4_stage5_6_sky
+      sequence_length: 8
+      input_offsets: [0, 2, 4, 6]
       eval_offsets: all
       steps_per_input: 16

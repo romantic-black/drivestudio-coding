@@ -10,7 +10,11 @@ batch_eval:
     strict: true
 
   dataset:
-    scene_ids: [140]
+    scene_ids: [40]
+    start_at:
+      scene_id: 40
+      segment_id: 1
+      frame_id: 40
     segment_policy: all
     require_full_window: true
     stride: 200

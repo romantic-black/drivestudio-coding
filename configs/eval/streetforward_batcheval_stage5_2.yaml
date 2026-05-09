@@ -10,8 +10,12 @@ batch_eval:
     strict: true
 
   dataset:
-    scene_ids: [10]
+    scene_ids: [115]
     segment_policy: all
+    start_at:
+      scene_id: 115
+      segment_id: 1
+      frame_id: 88
     require_full_window: true
     stride: 30
     max_episodes_per_scene: null
@@ -48,7 +52,7 @@ batch_eval:
 
   render:
     save_pre_update: true
-    save_each_iter_views: false
+    save_each_iter_views: true
     save_png: true
     save_video: false
     save_numpy: false
