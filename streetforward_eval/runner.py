@@ -599,6 +599,7 @@ class StreetForwardBatchEvalRunner:
             allow_partial_nearby=bool(self.runtime_cfg.stage5_6_allow_partial_nearby),
             block_order=str(self.runtime_cfg.block_order),
             step_major_switch_interval_steps=int(self.runtime_cfg.step_major_switch_interval_steps),
+            enable_nearby_feedback=bool(self.runtime_cfg.stage5_6_enable_nearby_feedback),
         )
 
     def _runtime_policy(self, *, do_train: bool):

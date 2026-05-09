@@ -735,7 +735,6 @@ class Stage5_6EvalDemoScheduler:
         runtime_cfg = batch_eval_cfg.get("runtime") or {}
         history_cfg = batch_eval_cfg.get("history") or {}
         stage5_6_cfg = batch_eval_cfg.get("stage5_6_eval") or {}
-        self.start_at_cfg = batch_eval_dataset_cfg.get("start_at") or None
         sv8_cfg = cfg.get("scheduler_v8") or {}
         sv8_exec = sv8_cfg.get("execution") if hasattr(sv8_cfg, "get") else None
         sv8_episode = sv8_cfg.get("episode") if hasattr(sv8_cfg, "get") else None
@@ -783,6 +782,7 @@ class Stage5_6EvalDemoScheduler:
         self.update_hidden_state = bool(runtime_cfg.get("update_hidden_state", True))
         self.record_each_step = bool(history_cfg.get("record_each_step", False))
         self.record_history_on_input_exit = bool(history_cfg.get("record_support_residual_on_input_exit", True))
+        self.enable_nearby_feedback = bool(stage5_6_cfg.get("enable_nearby_feedback", True))
         self.nearby_policy = str(stage5_6_cfg.get("nearby_policy", "adjacent_non_input"))
         self.nearby_role_name = str(stage5_6_cfg.get("nearby_role_name", "near_random"))
         self.allow_partial_nearby = bool(stage5_6_cfg.get("allow_partial_nearby", True))
@@ -814,11 +814,6 @@ class Stage5_6EvalDemoScheduler:
 
         initial_scene_id = scheduler_cfg.get("initial_scene_id")
         initial_segment_id = scheduler_cfg.get("initial_segment_id")
-        if self.start_at_cfg is not None and hasattr(self.start_at_cfg, "get"):
-            if initial_scene_id is None and self.start_at_cfg.get("scene_id") is not None:
-                initial_scene_id = int(self.start_at_cfg.get("scene_id"))
-            if initial_segment_id is None and self.start_at_cfg.get("segment_id") is not None:
-                initial_segment_id = int(self.start_at_cfg.get("segment_id"))
         self.scene_id, self.segment_id = self._resolve_initial_scope(initial_scene_id, initial_segment_id)
         self.sequence_start_pos = self._resolve_initial_start(scheduler_cfg.get("initial_sequence_start_pos"))
 
@@ -874,29 +869,6 @@ class Stage5_6EvalDemoScheduler:
             return [int(f) for f in all_frames if int(f) in train_set]
         return all_frames
 
-    def _start_at_sequence_pos_for_scope(self, scene_id: int, segment_id: int) -> Optional[int]:
-        cfg = self.start_at_cfg
-        if cfg is None or not hasattr(cfg, "get"):
-            return None
-        if cfg.get("scene_id") is None or cfg.get("segment_id") is None:
-            return None
-        if int(cfg.get("scene_id")) != int(scene_id) or int(cfg.get("segment_id")) != int(segment_id):
-            return None
-        if cfg.get("sequence_start_pos") is not None:
-            return int(cfg.get("sequence_start_pos"))
-        if cfg.get("frame_id") is None:
-            return None
-        frames = self._frames_for_segment(int(scene_id), int(segment_id))
-        frame_id = int(cfg.get("frame_id"))
-        if frame_id not in set(int(x) for x in frames):
-            preview = frames[:5] + (["..."] if len(frames) > 10 else []) + frames[-5:]
-            raise ValueError(
-                "demo/batch_eval start_at.frame_id is not in train frames: "
-                f"scene={int(scene_id)} segment={int(segment_id)} frame_id={frame_id} "
-                f"available_count={len(frames)} available_preview={preview}"
-            )
-        return [int(x) for x in frames].index(frame_id)
-
     def _window_starts(self, scene_id: int, segment_id: int) -> List[int]:
         frames = self._frames_for_segment(int(scene_id), int(segment_id))
         if len(frames) == 0:
@@ -905,24 +877,6 @@ class Stage5_6EvalDemoScheduler:
             return []
         if int(self.stride) < 1:
             raise ValueError("demo.scheduler.stride must be >= 1")
-        explicit_start = self._start_at_sequence_pos_for_scope(int(scene_id), int(segment_id))
-        if explicit_start is not None:
-            start = int(explicit_start)
-            if start < 0:
-                raise ValueError(f"demo/batch_eval start_at sequence start must be >= 0, got {start}")
-            if self.require_full_window:
-                max_start = len(frames) - int(self.sequence_length)
-                if start > max_start:
-                    raise ValueError(
-                        "demo/batch_eval start_at does not have enough frames for a full window: "
-                        f"start_pos={start} num_frames={len(frames)} sequence_length={int(self.sequence_length)}"
-                    )
-                return list(range(start, max_start + 1, int(self.stride)))
-            if start >= len(frames):
-                raise ValueError(
-                    f"demo/batch_eval start_at start_pos={start} is out of range for num_frames={len(frames)}"
-                )
-            return list(range(start, len(frames), int(self.stride)))
         if self.window_policy == "middle":
             return [max(0, (len(frames) - int(self.sequence_length)) // 2)]
         if self.window_policy == "sliding":
@@ -1062,6 +1016,7 @@ class Stage5_6EvalDemoScheduler:
             "sequence_length": int(self.sequence_length),
             "input_offsets": [int(x) for x in self._spec.input_offsets],
             "input_frame_ids": [int(x) for x in self._spec.input_frame_ids],
+            "enable_nearby_feedback": bool(self.enable_nearby_feedback),
             "visit_cursor": int(self._visit_cursor),
             "visit_total": int(len(self._visit_order)),
             "episode_done": bool(self.is_episode_done()),
@@ -1113,6 +1068,7 @@ class Stage5_6EvalDemoScheduler:
             allow_partial_nearby=bool(self.allow_partial_nearby),
             block_order=str(self.block_order),
             step_major_switch_interval_steps=int(self.step_major_switch_interval_steps),
+            enable_nearby_feedback=bool(self.enable_nearby_feedback),
         )
         self._last_batch = batch
         self._last_info = self._build_info(reason="materialize")
