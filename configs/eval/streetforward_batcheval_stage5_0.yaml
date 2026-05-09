@@ -38,7 +38,7 @@ batch_eval:
     max_target_frames_including_source: 3
 
   sky_eval:
-    enable: false
+    enable: true
     config_file: configs/skybranch_stage5_4_exp002.yaml
     checkpoint: "/root/autodl-tmp/outputs/skybranch_stage5_4_exp002/checkpoints/skybranch_resume_step_100000.pth"
     strict: true
@@ -64,7 +64,7 @@ batch_eval:
     report_full_image: true
     compute_psnr: true
     compute_ssim: true
-    compute_lpips: false
+    compute_lpips: true
     compute_l1: true
     min_valid_pixels: 32
 

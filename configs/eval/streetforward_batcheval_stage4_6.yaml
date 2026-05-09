@@ -22,7 +22,7 @@ batch_eval:
     strict: true
 
   dataset:
-    scene_ids: [10, 140, 194, 142, 114, 121]
+    scene_ids: [10]
     segment_policy: all
     require_full_window: true
     stride: 30
@@ -31,12 +31,12 @@ batch_eval:
     window_policy: sliding
 
   cameras:
-    ids: [0, 1, 2, 3, 4, 5]
-    names: ["front", "front_left", "front_right", "back_left", "back_right", "back"]
+    ids: [0, 1, 2]
+    names: ["front", "front_left", "front_right"]
 
   runtime:
-    mode: segment_finetune_train
-    no_grad: false
+    mode: inference_only
+    no_grad: true
     amp: false
     reset_state_per_episode: true
     align_with_scheduler_v7: true
@@ -52,6 +52,12 @@ batch_eval:
 
   sky_eval:
     enable: false
+    config_file: configs/skybranch_stage5_4_exp002.yaml
+    checkpoint: "/root/autodl-tmp/outputs/skybranch_stage5_4_exp002/checkpoints/skybranch_resume_step_100000.pth"
+    strict: true
+    freeze_params: true
+    compose_for_metrics: true
+    reset_runtime_state_per_episode: true
 
   history:
     update_step_norm_ema: true
@@ -71,13 +77,13 @@ batch_eval:
     report_full_image: true
     compute_psnr: true
     compute_ssim: true
-    compute_lpips: false
+    compute_lpips: true
     compute_l1: true
     min_valid_pixels: 32
 
   experiments:
     - name: exp_v7_5_3_stage4_6
       sequence_length: 5
-      input_offsets: [0, 1, 2]
+      input_offsets: [0, 2, 4]
       eval_offsets: all
       steps_per_input: 8

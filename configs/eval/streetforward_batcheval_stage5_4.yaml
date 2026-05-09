@@ -71,7 +71,7 @@ batch_eval:
 
   experiments:
     - name: exp2_10_5_stage5_4
-      sequence_length: 10
-      input_offsets: [1, 3, 5, 7, 9]
+      sequence_length: 6
+      input_offsets: [0,1, 2, 3, 4, 5]
       eval_offsets: all
-      steps_per_input: 8
+      steps_per_input: 12
