@@ -489,6 +489,8 @@ class StreetForwardBatchEvalRunner:
         policy = str(self.runtime_cfg.target_frame_policy).strip()
         if policy == "scheduler_v7_block_window":
             scheduler_version = "v7"
+        elif policy == "visited_episode_frames":
+            scheduler_version = "v8"
         else:
             scheduler_version = "batcheval"
         block_idx_global = int(spec.episode_idx) * int(max(len(spec.input_frame_ids), 1)) + int(block_idx)
@@ -845,6 +847,8 @@ class StreetForwardBatchEvalRunner:
                 )
                 update_batch["_scheduler_v4_aligned_info"] = dict(aligned)
                 update_batch["_scheduler_v7_aligned_info"] = dict(aligned)
+                if str(aligned.get("scheduler_version")) == "v8":
+                    update_batch["_scheduler_v8_aligned_info"] = dict(aligned)
                 if bool(self.runtime_cfg.no_grad):
                     self._run_eval_sparse_update_step(
                         update_batch,

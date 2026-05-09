@@ -12,9 +12,36 @@ dataset:
     near_max_points: 400000
     distant_max_points: 800000
 
+scheduler_v8:
+  enable: true
+  block:
+    steps_per_block: 8
+  episode:
+    blocks_per_episode: 5
+    total_target_frames: 3
+    include_source_frame: true
+    target_policy: visited_episode_frames
+    frame_within_keyframe_policy: random_once_per_episode
+    min_keyframes_required_policy: skip_if_less_than_window
+  traversal:
+    mode: round_robin_episode_interleave
+    switch_after_episode: true
+    fixed_scene_id: null
+    fixed_segment_id: null
+    segment_order: ascending
+    scene_order: shuffle_per_epoch
+  execution:
+    block_order: step_major
+    step_major_switch_interval_steps: 4
+    reset_policy: episode_end
+  preload:
+    emit_hints: true
+    warm_next_block_exact: true
+    warm_next_episode_chain: true
+
 batch_eval:
   enable: true
-  output_dir: /root/autodl-tmp/outputs/batch_eval_v7_stage4_6
+  output_dir: /root/autodl-tmp/outputs/batch_eval_v8_stage4_6
   data_mode: segment_finetune_train
 
   checkpoint:
@@ -43,15 +70,15 @@ batch_eval:
     no_grad: true
     amp: false
     reset_state_per_episode: true
-    align_with_scheduler_v7: true
-    align_with_scheduler_v8: false
+    align_with_scheduler_v7: false
+    align_with_scheduler_v8: true
     update_node_state: true
     update_hidden_state: true
     update_view_transient: true
-    block_order: block_major
-    step_major_switch_interval_steps: 1
-    reset_policy: block_end
-    target_frame_policy: scheduler_v7_block_window
+    block_order: step_major
+    step_major_switch_interval_steps: 4
+    reset_policy: episode_end
+    target_frame_policy: visited_episode_frames
     max_target_frames_including_source: 3
 
   sky_eval:
@@ -86,7 +113,7 @@ batch_eval:
     min_valid_pixels: 32
 
   experiments:
-    - name: exp_v7_5_3_stage4_6
+    - name: exp_v8_10_5_stage4_6
       sequence_length: 10
       input_offsets: [0, 2, 4, 6, 8]
       eval_offsets: all

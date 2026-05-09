@@ -277,6 +277,7 @@ class _FakeModel:
         self.last_train_sync: Dict[str, Any] | None = None
         self.last_infer_policy: Any = None
         self.infer_batches: List[Dict[str, Any]] = []
+        self.update_batches: List[Dict[str, Any]] = []
         self.last_render_refs: List[Tuple[int, int]] = []
 
     def reset_for_segment_eval(self, batch: Dict[str, Any]) -> None:
@@ -305,6 +306,7 @@ class _FakeModel:
             update_step_norm_ema,
         )
         self.update_calls += 1
+        self.update_batches.append(batch)
         return {"loss": 0.0, "num_targets": 1, "num_source_views": 3}
 
     def train_step(
@@ -672,6 +674,7 @@ def test_runner_step_major_order_and_visited_targets(monkeypatch: pytest.MonkeyP
         [100, 105],
     ]
     assert model.update_calls == 6
+    assert all(batch["_scheduler_v8_aligned_info"]["scheduler_version"] == "v8" for batch in model.update_batches)
 
 
 class _Stage56Dataset:
