@@ -439,16 +439,30 @@ def _build_scheduler_v7_episode_specs(
     blocks_per_episode = int(ep.get("blocks_per_episode"))
     total_target_frames = int(ep.get("total_target_frames"))
     expected_sequence_length = int(blocks_per_episode + total_target_frames - 1)
+    protocol_input_offsets = [int(x) for x in protocol.input_offsets]
+    eval_offsets = resolve_eval_offsets(protocol.eval_offsets, sequence_length=int(protocol.sequence_length))
+    required_sequence_length = max(
+        int(expected_sequence_length),
+        int(protocol.sequence_length),
+        int(max(eval_offsets) + 1) if len(eval_offsets) > 0 else 0,
+        int(max(protocol_input_offsets) + total_target_frames) if len(protocol_input_offsets) > 0 else 0,
+    )
     if int(protocol.sequence_length) != int(expected_sequence_length):
-        raise ValueError(
-            "scheduler_v7-aligned batch_eval requires sequence_length="
-            f"{expected_sequence_length}, got {int(protocol.sequence_length)}"
+        logger.warning(
+            "scheduler_v7-aligned batch_eval using non-strict sequence_length: "
+            "scheduler=%d protocol=%d required_window=%d",
+            int(expected_sequence_length),
+            int(protocol.sequence_length),
+            int(required_sequence_length),
         )
     expected_input_offsets = list(range(int(blocks_per_episode)))
-    if [int(x) for x in protocol.input_offsets] != expected_input_offsets:
-        raise ValueError(
-            "scheduler_v7-aligned batch_eval requires input_offsets="
-            f"{expected_input_offsets}, got {[int(x) for x in protocol.input_offsets]}"
+    if protocol_input_offsets != expected_input_offsets:
+        logger.warning(
+            "scheduler_v7-aligned batch_eval using non-strict input_offsets: "
+            "scheduler=%s protocol=%s required_window=%d",
+            expected_input_offsets,
+            protocol_input_offsets,
+            int(required_sequence_length),
         )
 
     val_specs = build_validation_episode_specs_v7(
@@ -456,8 +470,8 @@ def _build_scheduler_v7_episode_specs(
         eval_scene_ids=_collect_episode_scene_ids(cfg),
         blocks_per_episode=int(blocks_per_episode),
         total_target_frames=int(total_target_frames),
+        min_window_keyframes=int(required_sequence_length),
     )
-    eval_offsets = resolve_eval_offsets(protocol.eval_offsets, sequence_length=int(protocol.sequence_length))
     out: List[TestEpisodeSpec] = []
     for idx, vs in enumerate(val_specs):
         frame_ids = [int(x) for x in vs.frame_chain]
@@ -636,9 +650,11 @@ def _run_one_experiment(
             raise ValueError("scheduler_v7-aligned batch_eval requires scheduler_v7.block and scheduler_v7.episode")
         scheduler_steps_per_block = int(sv7_block.get("steps_per_block"))
         if int(protocol.steps_per_input) != int(scheduler_steps_per_block):
-            raise ValueError(
-                "scheduler_v7-aligned batch_eval requires experiment.steps_per_input="
-                f"{scheduler_steps_per_block}, got {int(protocol.steps_per_input)}"
+            logger.warning(
+                "scheduler_v7-aligned batch_eval using non-strict steps_per_input: "
+                "scheduler=%d protocol=%d",
+                int(scheduler_steps_per_block),
+                int(protocol.steps_per_input),
             )
         if sv7_exec is not None:
             default_block_order = str(sv7_exec.get("block_order", default_block_order))

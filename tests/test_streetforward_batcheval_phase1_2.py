@@ -40,6 +40,29 @@ class _DummyDataset:
         )
 
 
+@dataclass
+class _DummyV7SegmentIndex:
+    keyframe_indices: List[int]
+    keyframe_to_frames: Dict[int, List[int]]
+    num_cams: int
+
+
+class _DummyV7Dataset:
+    def list_segment_ids(self, scene_id: int) -> List[int]:
+        assert int(scene_id) == 1
+        return [2]
+
+    def get_segment_index(self, scene_id: int, segment_id: int) -> _DummyV7SegmentIndex:
+        assert int(scene_id) == 1
+        assert int(segment_id) == 2
+        keyframes = list(range(12))
+        return _DummyV7SegmentIndex(
+            keyframe_indices=keyframes,
+            keyframe_to_frames={int(k): [100 + int(k)] for k in keyframes},
+            num_cams=1,
+        )
+
+
 def _make_protocol_exp2() -> TestProtocolSpec:
     return TestProtocolSpec(
         name="exp2_storm20_sparse4",
@@ -79,6 +102,56 @@ def test_episode_builder_relative_to_absolute_mapping() -> None:
     assert spec.input_frame_ids == [100, 105, 110, 115]
     assert spec.eval_offsets == list(range(20))
     assert spec.eval_frame_ids == list(range(100, 120))
+
+
+def test_scheduler_v7_episode_builder_allows_non_strict_protocol_window() -> None:
+    from tools.eval_streetforward_benchmark import _build_scheduler_v7_episode_specs
+
+    cfg = OmegaConf.create(
+        {
+            "scheduler_v7": {
+                "enable": True,
+                "episode": {
+                    "blocks_per_episode": 3,
+                    "total_target_frames": 3,
+                },
+            },
+            "batch_eval": {
+                "dataset": {
+                    "scene_ids": [1],
+                },
+            },
+        }
+    )
+    protocol = TestProtocolSpec(
+        name="exp_v7_sparse",
+        data_mode="segment_finetune_train",
+        sequence_length=10,
+        input_offsets=[0, 2, 4],
+        eval_offsets="all",
+        camera_ids=[0],
+        camera_names=["front"],
+        steps_per_input=1,
+        save_pre_update=False,
+        save_each_iter_views=False,
+        metric_primary_mask="full_image",
+        report_full_image=True,
+    )
+
+    specs = _build_scheduler_v7_episode_specs(
+        cfg=cfg,
+        dataset=_DummyV7Dataset(),
+        protocol=protocol,
+        max_total_episodes=None,
+    )
+
+    assert len(specs) == 1
+    spec = specs[0]
+    assert len(spec.frame_ids) == 10
+    assert spec.input_offsets == [0, 2, 4]
+    assert spec.eval_offsets == list(range(10))
+    assert spec.input_frame_ids == [102, 104, 106]
+    assert spec.eval_frame_ids == list(range(102, 112))
 
 
 class _StartAtDataset:
