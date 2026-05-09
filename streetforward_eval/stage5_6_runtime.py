@@ -300,6 +300,7 @@ def build_stage5_6_eval_train_batch(
     allow_partial_nearby: bool,
     block_order: str,
     step_major_switch_interval_steps: int,
+    enable_nearby_feedback: bool = True,
 ) -> Dict[str, Any]:
     target_frame_policy = str(target_frame_policy).strip() or "visited_episode_frames"
     if target_frame_policy != "visited_episode_frames":
@@ -323,14 +324,17 @@ def build_stage5_6_eval_train_batch(
     base_frames = [int(source_frame)] + [int(input_frame_ids[b]) for b in selected_blocks]
     base_roles = ["source"] + ["visited" for _ in base_frames[1:]]
     visited_frames_full = [int(source_frame)] + [int(input_frame_ids[b]) for b in sorted(int(x) for x in visited_blocks)]
-    near_frames = nearby_frames_for_block(
-        spec=spec,
-        input_offset=int(spec.input_offsets[int(block_idx)]),
-        existing_target_frames=[int(x) for x in (base_frames + visited_frames_full)],
-        input_frame_ids=[int(x) for x in input_frame_ids],
-        nearby_policy=str(nearby_policy),
-        allow_partial_nearby=bool(allow_partial_nearby),
-    )
+    nearby_enabled = bool(enable_nearby_feedback)
+    near_frames: List[int] = []
+    if nearby_enabled:
+        near_frames = nearby_frames_for_block(
+            spec=spec,
+            input_offset=int(spec.input_offsets[int(block_idx)]),
+            existing_target_frames=[int(x) for x in (base_frames + visited_frames_full)],
+            input_frame_ids=[int(x) for x in input_frame_ids],
+            nearby_policy=str(nearby_policy),
+            allow_partial_nearby=bool(allow_partial_nearby),
+        )
     target_frames = [int(x) for x in base_frames] + [int(x) for x in near_frames]
     role_name = str(nearby_role_name)
     target_frame_roles = [str(x) for x in base_roles] + [role_name for _ in near_frames]
@@ -371,10 +375,12 @@ def build_stage5_6_eval_train_batch(
             "source_frame_idx": int(source_frame),
             "near_random_frame_indices": [int(x) for x in near_frames],
             f"{role_name}_frame_indices": [int(x) for x in near_frames],
-            "near_random_supervision_enable": True,
-            "scheduler/near_random/enabled": 1.0,
+            "near_random_supervision_enable": bool(nearby_enabled),
+            "scheduler/near_random/enabled": 1.0 if bool(nearby_enabled) else 0.0,
             "scheduler/near_random/num_frames": float(len(near_frames)),
-            "scheduler/near_random/skip_ratio": 0.0 if len(near_frames) > 0 else 1.0,
+            "scheduler/near_random/skip_ratio": (
+                0.0 if (not bool(nearby_enabled) or len(near_frames) > 0) else 1.0
+            ),
             "scheduler/near_random/num_candidate_frames_mean": float(len(near_frames)),
             "scheduler/near_random/sampled_blocks": 1.0 if len(near_frames) > 0 else 0.0,
         }

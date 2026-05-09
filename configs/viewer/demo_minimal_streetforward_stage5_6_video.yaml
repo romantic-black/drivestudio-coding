@@ -43,7 +43,7 @@ batch_eval:
     update_hidden_state: true
     update_view_transient: true
   stage5_6_eval:
-    enable_nearby_feedback: true
+    enable_nearby_feedback: false
     nearby_policy: adjacent_non_input
     nearby_role_name: near_random
     allow_partial_nearby: true
@@ -62,6 +62,35 @@ batch_eval:
     update_step_norm_ema: true
     record_support_residual_on_input_exit: true
     record_each_step: false
+
+scheduler_v8:
+  episode:
+    # 当前帧 + 最多 5 个已访问历史帧。
+    total_target_frames: 6
+
+validation_v8:
+  episode:
+    total_target_frames: 6
+
+nearby_direct:
+  enable: false
+  weight: 0.0
+
+nearby_error_feedback:
+  enable: false
+  error_pred:
+    enable: false
+  cache:
+    enable: false
+  fusion:
+    enable: false
+  loss:
+    error_weight: 0.0
+
+losses:
+  target_view_weights:
+    near_random:
+      weight: 0.0
 
 logging:
   output_root: /root/autodl-tmp/outputs
@@ -93,7 +122,7 @@ demo:
     steps_per_input: 18
     block_order: block_major
     step_major_switch_interval_steps: 1
-    max_target_frames_including_source: 4
+    max_target_frames_including_source: 6
     window_policy: sliding
     stride: 4
     require_full_window: true
@@ -140,8 +169,8 @@ video:
     input_gap_frames: 0
     # 留空表示按 input_gap_frames 自动推导；若手动填写，会覆盖自动推导。
     input_offsets: []
-    steps_per_input: 16
-    max_target_frames_including_source: 8
+    steps_per_input: 18
+    max_target_frames_including_source: 4
     block_order: block_major
     step_major_switch_interval_steps: 1
     require_full_window: true
@@ -173,6 +202,6 @@ video:
     write_combined: true  
     write_separate_per_camera: false
     show_camera_labels: false
-    # 额外输出所有渲染图像，包括前后 transition 帧；主视频只写非 transition 帧。
+    # 额外输出所有渲染图像，包括每段开头 transition 帧；主视频只写非 transition 帧。
     save_all_images: true
     save_png_frames: false

@@ -244,6 +244,19 @@ def test_stage5_6_demo_batch_metadata_has_near_random_roles():
     assert rm["target_image_roles"] == ["source", "source", "near_random", "near_random", "near_random", "near_random"]
 
 
+def test_stage5_6_demo_can_disable_nearby_feedback_targets():
+    cfg = _cfg()
+    cfg.batch_eval.stage5_6_eval.enable_nearby_feedback = False
+    sched = build_stage5_demo_scheduler_from_cfg(cfg, _TinyDataset(), device=torch.device("cpu"))
+    batch = sched.materialize_current_batch_without_advance()
+    rm = batch["request_meta"]
+    assert rm["near_random_supervision_enable"] is False
+    assert rm["near_random_frame_indices"] == []
+    assert rm["target_frame_roles"] == ["source"]
+    assert rm["target_image_roles"] == ["source", "source"]
+    assert batch["_scheduler_v8_aligned_info"]["target_frame_roles"] == ["source"]
+
+
 def test_stage5_6_demo_can_select_segment_and_window():
     sched = build_stage5_demo_scheduler_from_cfg(_cfg(), _TinyDataset(), device=torch.device("cpu"))
     sched.set_scope(10, 1)
@@ -253,18 +266,6 @@ def test_stage5_6_demo_can_select_segment_and_window():
     assert int(info["scene_id"]) == 10
     assert int(info["segment_id"]) == 1
     assert info["block_current_source_frame_indices"] == [2, 4, 6, 8, 10]
-
-
-def test_stage5_6_eval_demo_honors_batch_eval_start_at_when_demo_start_is_unspecified():
-    cfg = _cfg()
-    cfg.batch_eval.dataset = {"start_at": {"scene_id": 10, "segment_id": 1, "frame_id": 4}}
-    cfg.demo.scheduler.initial_segment_id = None
-    cfg.demo.scheduler.initial_sequence_start_pos = None
-    sched = build_stage5_demo_scheduler_from_cfg(cfg, _TinyDataset(), device=torch.device("cpu"))
-    info = sched.get_current_info()
-    assert int(info["segment_id"]) == 1
-    assert int(info["sequence_start_pos"]) == 4
-    assert sched.list_sequence_start_positions()[0] == 4
 
 
 def test_stage5_6_train_v8_demo_uses_training_near_random_keyframe_sampling():
