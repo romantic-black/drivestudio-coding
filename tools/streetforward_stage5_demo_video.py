@@ -12,8 +12,6 @@ import numpy as np
 import torch
 from PIL import Image, ImageDraw
 
-from datasets.multi_scene_dataset_v4 import BatchRequestV4
-
 logger = logging.getLogger(__name__)
 
 ImageRef = Tuple[int, int]
@@ -422,25 +420,22 @@ class Stage5DemoVideoExporter:
         refs = [(int(f), int(c)) for f in frame_ids for c in self.camera_ids]
         if len(refs) == 0:
             raise ValueError("cannot load render views for empty frame/camera refs")
-        raw = self.dataset.get_segment_batch_from_image_refs(
-            BatchRequestV4(
-                scene_id=int(scene_id),
-                segment_id=int(segment_id),
-                source_image_ref=(int(refs[0][0]), int(refs[0][1])),
-                source_image_refs=[(int(refs[0][0]), int(refs[0][1]))],
-                target_image_refs=[(int(f), int(c)) for f, c in refs],
-                include_test=False,
-            ),
-            enforce_target0_equals_source=False,
-        )
-        target = raw.get("target")
-        if not isinstance(target, dict):
-            raise ValueError("dataset render view batch missing target role")
+        if not hasattr(self.dataset, "_load_image_meta") or not hasattr(self.dataset, "_resolve_segment_bundle"):
+            raise ValueError("Stage5 demo video requires MultiSceneDatasetV4 metadata loaders")
+        bundle = self.dataset._resolve_segment_bundle(int(scene_id), int(segment_id))
+        world_to_seg0 = bundle.segment_pose["world_to_seg0"].to(device=self.device, dtype=torch.float32)
         out: Dict[ImageRef, RenderViewRecord] = {}
-        for idx, ref in enumerate(refs):
-            img = target["image"][idx]
-            h, w = int(img.shape[0]), int(img.shape[1])
-            K = target["intrinsics"][idx][:3, :3].to(device=self.device, dtype=torch.float32)
+        for ref in refs:
+            if hasattr(self.dataset, "validate_image_ref"):
+                self.dataset.validate_image_ref(int(scene_id), int(segment_id), tuple(ref), purpose="train")
+            meta = self.dataset._load_image_meta(int(scene_id), int(segment_id), tuple(ref))
+            h, w = int(meta["height"]), int(meta["width"])
+            K = torch.as_tensor(meta["intrinsic_4x4"], dtype=torch.float32, device=self.device)[:3, :3]
+            c2w = world_to_seg0 @ torch.as_tensor(
+                meta["camera_to_world"],
+                dtype=torch.float32,
+                device=self.device,
+            )
             if self.render_height is not None and self.render_width is not None:
                 K = _scale_intrinsics(
                     K,
@@ -454,7 +449,7 @@ class Stage5DemoVideoExporter:
             out[(int(ref[0]), int(ref[1]))] = RenderViewRecord(
                 frame_idx=int(ref[0]),
                 cam_id=int(ref[1]),
-                c2w=target["extrinsics"][idx].to(device=self.device, dtype=torch.float32),
+                c2w=c2w,
                 K=K,
                 height=h,
                 width=w,

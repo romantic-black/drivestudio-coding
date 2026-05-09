@@ -187,6 +187,61 @@ def _set_camera_cfg(cfg: Any, ids: List[int], names: List[str]) -> None:
     cfg.batch_eval.update_cameras = payload
 
 
+def _configured_scene_ids(cfg: Any) -> List[int]:
+    scheduler_cfg = (cfg.get("demo") or {}).get("scheduler") or {}
+    batch_dataset_cfg = (cfg.get("batch_eval") or {}).get("dataset") or {}
+    raw = scheduler_cfg.get("scene_ids")
+    if raw is None:
+        raw = batch_dataset_cfg.get("scene_ids")
+    if raw is None and cfg.get("data") is not None:
+        raw = cfg.data.get("train_scene_ids")
+    return [int(x) for x in _as_list(raw)]
+
+
+def _resolve_initial_scope_from_cfg(cfg: Any, dataset: Any) -> Tuple[int, int]:
+    scheduler_cfg = (cfg.get("demo") or {}).get("scheduler") or {}
+    batch_dataset_cfg = (cfg.get("batch_eval") or {}).get("dataset") or {}
+    start_at = batch_dataset_cfg.get("start_at") or {}
+    scene_ids = _configured_scene_ids(cfg)
+    raw_scene = scheduler_cfg.get("initial_scene_id")
+    if raw_scene is None and hasattr(start_at, "get"):
+        raw_scene = start_at.get("scene_id")
+    if raw_scene is None and not scene_ids:
+        raise ValueError("demo.scheduler.scene_ids or batch_eval.dataset.scene_ids must be set for demo video")
+    scene_id = int(raw_scene if raw_scene is not None else scene_ids[0])
+    raw_segment = scheduler_cfg.get("initial_segment_id")
+    if raw_segment is None and hasattr(start_at, "get"):
+        raw_segment = start_at.get("segment_id")
+    if raw_segment is None:
+        seg_ids = [int(x) for x in dataset.list_segment_ids(int(scene_id))]
+        if not seg_ids:
+            raise ValueError(f"scene_id={scene_id} has no registered segments")
+        segment_id = int(seg_ids[0])
+    else:
+        segment_id = int(raw_segment)
+    return int(scene_id), int(segment_id)
+
+
+def _initialize_dataset_for_video(cfg: Any, dataset: Any) -> None:
+    video_cfg = cfg.get("video") or {}
+    init_scope = str(video_cfg.get("dataset_init_scope", "active_segment")).strip().lower()
+    if init_scope in ("all", "full", "training_assets"):
+        dataset.initialize()
+        return
+    if init_scope not in ("active_segment", "current_segment", "demo_segment"):
+        raise ValueError("video.dataset_init_scope must be active_segment or all")
+    scene_id, segment_id = _resolve_initial_scope_from_cfg(cfg, dataset)
+    # Avoid MultiSceneDatasetV4.initialize(), which validates every segment in
+    # data.train_scene_ids. For demo video we only need the selected segment.
+    dataset.get_segment_index(int(scene_id), int(segment_id))
+    setattr(dataset, "_initialized", True)
+    logger.info(
+        "Demo video dataset initialized only for active segment: scene_id=%d segment_id=%d",
+        int(scene_id),
+        int(segment_id),
+    )
+
+
 def _patch_cfg_for_video(cfg: Any, args: argparse.Namespace) -> None:
     if cfg.get("model") is None:
         cfg.model = {}
@@ -245,6 +300,12 @@ def _patch_cfg_for_video(cfg: Any, args: argparse.Namespace) -> None:
     cfg.batch_eval.dataset.stride = int(window_stride)
     cfg.batch_eval.dataset.require_full_window = bool(cfg.demo.scheduler.require_full_window)
     cfg.batch_eval.dataset.window_policy = str(cfg.demo.scheduler.window_policy)
+    configured_scene_ids = _configured_scene_ids(cfg)
+    if configured_scene_ids:
+        cfg.demo.scheduler.scene_ids = [int(x) for x in configured_scene_ids]
+        cfg.batch_eval.dataset.scene_ids = [int(x) for x in configured_scene_ids]
+        cfg.data.train_scene_ids = [int(x) for x in configured_scene_ids]
+        cfg.data.eval_scene_ids = []
 
     if args.scene_id is not None:
         cfg.demo.scheduler.scene_ids = [int(args.scene_id)]
@@ -296,7 +357,7 @@ def main() -> None:
         raise ValueError("Stage5_6 demo video requires CUDA because gsplat rasterization is CUDA-only.")
 
     dataset = build_multi_scene_dataset_v4_for_demo(cfg, device)
-    dataset.initialize()
+    _initialize_dataset_for_video(cfg, dataset)
     scheduler = build_stage5_demo_scheduler_from_cfg(cfg, dataset, device=device)
     trainer = MinimalStreetForwardStage5_6_Production(config=cfg, device=device).to(device)
     if hasattr(trainer, "bind_eval_dataset"):
