@@ -93,4 +93,4 @@ batch_eval:
       sequence_length: 10
       input_offsets: [0, 2, 4, 6, 8]
       eval_offsets: all
-      steps_per_input: 12
+      steps_per_input: 16

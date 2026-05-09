@@ -255,6 +255,18 @@ def test_stage5_6_demo_can_select_segment_and_window():
     assert info["block_current_source_frame_indices"] == [2, 4, 6, 8, 10]
 
 
+def test_stage5_6_eval_demo_honors_batch_eval_start_at_when_demo_start_is_unspecified():
+    cfg = _cfg()
+    cfg.batch_eval.dataset = {"start_at": {"scene_id": 10, "segment_id": 1, "frame_id": 4}}
+    cfg.demo.scheduler.initial_segment_id = None
+    cfg.demo.scheduler.initial_sequence_start_pos = None
+    sched = build_stage5_demo_scheduler_from_cfg(cfg, _TinyDataset(), device=torch.device("cpu"))
+    info = sched.get_current_info()
+    assert int(info["segment_id"]) == 1
+    assert int(info["sequence_start_pos"]) == 4
+    assert sched.list_sequence_start_positions()[0] == 4
+
+
 def test_stage5_6_train_v8_demo_uses_training_near_random_keyframe_sampling():
     sched = build_stage5_demo_scheduler_from_cfg(_train_v8_cfg(), _TinyDataset(), device=torch.device("cpu"))
     batch = sched.materialize_current_batch_without_advance()
@@ -358,6 +370,27 @@ def test_stage5_6_demo_viewer_accepts_classic_rasterization_override():
     assert controller.viewer_rasterize_mode == "classic"
 
 
+def test_stage5_demo_forward_render_cache_is_opt_in_and_captures_forward_params():
+    cfg = _train_v8_cfg()
+    cfg.demo.viewer = {"use_forward_render_cache": True}
+    sched = build_stage5_demo_scheduler_from_cfg(cfg, _TinyDataset(), device=torch.device("cpu"))
+    trainer = _ForwardRenderTrainer()
+    controller = Stage5DemoController(
+        cfg=cfg,
+        dataset=_TinyDataset(),
+        scheduler=sched,
+        trainer=trainer,
+        device=torch.device("cpu"),
+        stage="5_6",
+    )
+    controller.prime()
+    cache = controller._display_render_cache
+    assert isinstance(cache, dict)
+    assert cache["key"] == (10, 0)
+    assert cache["render_bg"]["means_r"].shape == (1, 3)
+    assert trainer.seen["forward_batch_key"] == (10, 0)
+
+
 def test_stage5_6_demo_render_initializes_node_state_from_primed_batch():
     cfg = _train_v8_cfg()
     sched = build_stage5_demo_scheduler_from_cfg(cfg, _TinyDataset(), device=torch.device("cpu"))
@@ -413,6 +446,20 @@ class _Trainer(torch.nn.Module):
 
     def reset_node_state(self):
         self.seen["reset_node_state"] = True
+
+
+class _ForwardRenderTrainer(_Trainer):
+    def forward(self, batch):
+        self.seen["forward_batch_key"] = (int(batch["scene_id"]), int(batch["segment_id"]))
+        return {
+            "render_params": {
+                "means_r": torch.zeros((1, 3), dtype=torch.float32),
+                "scales_r": torch.ones((1, 3), dtype=torch.float32),
+                "quats_r": torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.float32),
+                "opacities_r": torch.ones((1,), dtype=torch.float32),
+                "colors_r": torch.zeros((1, 1, 3), dtype=torch.float32),
+            }
+        }
 
 
 def test_stage5_6_demo_controller_uses_runtime_policy_and_history_on_block_exit():

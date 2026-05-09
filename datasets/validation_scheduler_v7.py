@@ -48,12 +48,15 @@ def build_validation_episode_specs_v7(
     eval_scene_ids: List[int],
     blocks_per_episode: int,
     total_target_frames: int,
+    min_window_keyframes: int | None = None,
 ) -> List[ValidationEpisodeSpecV7]:
     if blocks_per_episode < 1:
         raise ValueError("blocks_per_episode must be >= 1")
     if total_target_frames != 3:
         raise ValueError("validation_v7 expects scheduler_v7.episode.total_target_frames=3")
-    episode_window_keyframes = int(blocks_per_episode + 2)
+    episode_window_keyframes = int(blocks_per_episode + int(total_target_frames) - 1)
+    if min_window_keyframes is not None:
+        episode_window_keyframes = max(int(episode_window_keyframes), int(min_window_keyframes))
     out: List[ValidationEpisodeSpecV7] = []
     for scene_id in [int(x) for x in eval_scene_ids]:
         seg_ids = [int(x) for x in dataset.list_segment_ids(int(scene_id))]
@@ -91,4 +94,3 @@ def build_validation_episode_specs_v7(
                 )
             )
     return out
-

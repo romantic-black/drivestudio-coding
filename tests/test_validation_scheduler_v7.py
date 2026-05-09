@@ -55,3 +55,19 @@ def test_build_validation_episode_specs_middle_episode_and_view_count():
     assert len(spec.block_windows) == 3
     assert len(spec.eval_image_refs) == 10  # (E+2) * num_cams
 
+
+def test_build_validation_episode_specs_can_extend_window_for_eval_protocol():
+    ds = _DummyDataset()
+    specs = build_validation_episode_specs_v7(
+        dataset=ds,
+        eval_scene_ids=[10],
+        blocks_per_episode=3,
+        total_target_frames=3,
+        min_window_keyframes=6,
+    )
+    assert len(specs) == 1
+    spec = specs[0]
+    assert spec.episode_start_keyframe_pos == 0
+    assert len(spec.frame_chain) == 6
+    assert len(spec.block_windows) == 3
+    assert len(spec.eval_image_refs) == 12

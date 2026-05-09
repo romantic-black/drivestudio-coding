@@ -57,6 +57,9 @@ class Stage5DemoController:
         self.viewer_rasterize_mode = str(viewer_cfg.get("rasterize_mode", "auto")).strip().lower()
         if self.viewer_rasterize_mode not in ("auto", "classic", "antialiased"):
             raise ValueError("demo.viewer.rasterize_mode must be one of: auto, classic, antialiased")
+        self.use_forward_render_cache = bool(viewer_cfg.get("use_forward_render_cache", False))
+        self._display_render_cache: Optional[Dict[str, Any]] = None
+        self._display_render_cache_warned = False
         mode = str(demo_cfg.get("mode", "frozen_recurrent_inference")).strip()
         self.mode = mode
         mode_norm = mode.lower()
@@ -189,6 +192,7 @@ class Stage5DemoController:
             events=events,
             scheduler_info=info,
         )
+        self._capture_display_render_cache(minimal, scheduler_info=info)
         return dict(self.display.last_stats)
 
     def _make_block_exit_event_for_recording(self, scheduler_info: Dict[str, Any], reason: str) -> Dict[str, Any]:
@@ -309,6 +313,188 @@ class Stage5DemoController:
         }
         out.update(stats)
         return out
+
+    @staticmethod
+    def _detach_render_pack(pack: Any) -> Optional[Dict[str, torch.Tensor]]:
+        if not isinstance(pack, dict):
+            return None
+        keys = ("means_r", "scales_r", "quats_r", "opacities_r", "colors_r")
+        if not all(torch.is_tensor(pack.get(k)) for k in keys):
+            return None
+        return {k: pack[k].detach() for k in keys}
+
+    def _clear_display_render_cache(self) -> None:
+        self._display_render_cache = None
+
+    @staticmethod
+    def _snapshot_transient_value(value: Any) -> Any:
+        if isinstance(value, dict):
+            return dict(value)
+        if isinstance(value, list):
+            return list(value)
+        return value
+
+    def _snapshot_display_forward_transients(self) -> Dict[str, Any]:
+        sentinel = object()
+        names = (
+            "_stage5_2_last_full_inputs",
+            "_stage5_6_active_cache",
+            "_stage5_6_active_fusion_scale",
+            "_stage5_6_fusion_delta_norm_terms",
+            "_stage5_6_last_fused_features",
+            "_stage5_6_last_nearby_debug_images",
+            "_stage5_6_last_error_debug_images",
+        )
+        snap: Dict[str, Any] = {"__sentinel__": sentinel}
+        for name in names:
+            snap[name] = self._snapshot_transient_value(getattr(self.trainer, name, sentinel))
+        return snap
+
+    def _restore_display_forward_transients(self, snap: Dict[str, Any]) -> None:
+        sentinel = snap.get("__sentinel__")
+        for name, value in snap.items():
+            if name == "__sentinel__":
+                continue
+            if value is sentinel:
+                if hasattr(self.trainer, name):
+                    delattr(self.trainer, name)
+            else:
+                setattr(self.trainer, name, value)
+
+    def _capture_display_render_cache(
+        self,
+        minimal_batch: Optional[Dict[str, Any]],
+        *,
+        scheduler_info: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if not bool(getattr(self, "use_forward_render_cache", False)):
+            self._display_render_cache = None
+            return
+        if not isinstance(minimal_batch, dict):
+            self._display_render_cache = None
+            return
+        forward_fn = getattr(self.trainer, "forward", None)
+        if forward_fn is None:
+            self._display_render_cache = None
+            return
+        was_training = bool(getattr(self.trainer, "training", False))
+        transients = self._snapshot_display_forward_transients()
+        try:
+            self.trainer.eval()
+            with torch.no_grad():
+                out = self.trainer.forward(minimal_batch)
+        except Exception as exc:
+            self._display_render_cache = None
+            if not bool(self._display_render_cache_warned):
+                print(f"[stage5-demo] forward render cache unavailable for current batch: {exc}")
+                self._display_render_cache_warned = True
+            return
+        finally:
+            if was_training:
+                self.trainer.train()
+            self._restore_display_forward_transients(transients)
+        if not isinstance(out, dict):
+            self._display_render_cache = None
+            return
+
+        info = dict(scheduler_info or self._extract_scheduler_info(minimal_batch))
+        render_bg = self._detach_render_pack(out.get("_render_params_bg") or out.get("render_params"))
+        render_distant = self._detach_render_pack(out.get("_render_params_distant"))
+        render_rigid_local = self._detach_render_pack(out.get("_render_params_rigid_local"))
+        rigid_u = out.get("_rigid_writeback_idx")
+        if torch.is_tensor(rigid_u):
+            rigid_u = rigid_u.detach().to(device=self.device, dtype=torch.long)
+        else:
+            rigid_u = None
+        self._display_render_cache = {
+            "key": (
+                int(info.get("scene_id", minimal_batch.get("scene_id", -1))),
+                int(info.get("segment_id", minimal_batch.get("segment_id", -1))),
+            ),
+            "source_frame_idx": int(info.get("source_frame_idx", minimal_batch.get("source_frame_idx", -1))),
+            "render_bg": render_bg,
+            "render_distant": render_distant,
+            "render_rigid_local": render_rigid_local,
+            "rigid_u": rigid_u,
+            "node_state_rigid": out.get("_node_state_rigid"),
+        }
+
+    def _append_render_pack(
+        self,
+        pack: Optional[Dict[str, torch.Tensor]],
+        means_list: List[torch.Tensor],
+        scales_list: List[torch.Tensor],
+        quats_list: List[torch.Tensor],
+        opacities_list: List[torch.Tensor],
+        colors_list: List[torch.Tensor],
+    ) -> bool:
+        if not isinstance(pack, dict):
+            return False
+        keys = ("means_r", "scales_r", "quats_r", "opacities_r", "colors_r")
+        if not all(torch.is_tensor(pack.get(k)) for k in keys):
+            return False
+        if int(pack["means_r"].shape[0]) <= 0:
+            return False
+        means_list.append(pack["means_r"].to(self.device))
+        scales_list.append(pack["scales_r"].to(self.device))
+        quats_list.append(pack["quats_r"].to(self.device))
+        opacities_list.append(pack["opacities_r"].reshape(-1).to(self.device))
+        colors_list.append(pack["colors_r"].to(self.device))
+        return True
+
+    def _cached_rigid_world_render_pack(
+        self,
+        cache: Dict[str, Any],
+        *,
+        frame_idx: Optional[int],
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        node_state_rigid = cache.get("node_state_rigid")
+        render_rigid_local = cache.get("render_rigid_local")
+        rigid_u = cache.get("rigid_u")
+        if node_state_rigid is None or not isinstance(render_rigid_local, dict) or not torch.is_tensor(rigid_u):
+            return None
+        render_frame = frame_idx
+        if render_frame is None:
+            render_frame = int(cache.get("source_frame_idx", -1))
+        if int(render_frame) < 0:
+            return None
+        if hasattr(self.trainer, "_build_rigid_world_for_frame") and hasattr(self.trainer, "_rigid_point_valid_mask"):
+            target_valid = torch.nonzero(
+                self.trainer._rigid_point_valid_mask(node_state_rigid, int(render_frame)),
+                as_tuple=False,
+            ).squeeze(1).to(device=self.device, dtype=torch.long)
+            if int(target_valid.numel()) == 0:
+                return None
+            n_rigid = int(node_state_rigid.means.shape[0])
+            u = rigid_u.to(device=self.device, dtype=torch.long)
+            if int(u.numel()) > 0 and (
+                bool((u < 0).any().item()) or bool((u >= n_rigid).any().item())
+            ):
+                return None
+            is_updated = torch.zeros((n_rigid,), dtype=torch.bool, device=self.device)
+            if int(u.numel()) > 0:
+                is_updated[u] = True
+            idx_train = target_valid[is_updated[target_valid]]
+            idx_frozen = target_valid[~is_updated[target_valid]]
+            if int(idx_train.numel()) > 0 and int(render_rigid_local["means_r"].shape[0]) <= 0:
+                return None
+            return self.trainer._build_rigid_world_for_frame(
+                node_state_rigid,
+                int(render_frame),
+                idx_train,
+                idx_frozen,
+                render_rigid_local,
+                u,
+            )
+        if hasattr(self.trainer, "_rigid_local_to_world_render_params") and int(rigid_u.numel()) > 0:
+            point_ids = node_state_rigid.point_ids[rigid_u.to(device=self.device, dtype=torch.long), 0]
+            return self.trainer._rigid_local_to_world_render_params(
+                node_state_rigid,
+                render_rigid_local,
+                int(render_frame),
+                point_ids_subset=point_ids,
+            )
+        return None
 
     def _stage5_6_scheduler_node_sync_from_events(
         self,
@@ -496,8 +682,18 @@ class Stage5DemoController:
             if did_train_step:
                 self.train_steps_total += 1
                 self.train_steps_since_param_reset += 1
-            info_after = self.scheduler.get_current_info()
-            self.display.current_scheduler_info = dict(info_after)
+            live_info = self.scheduler.get_current_info()
+            status_info = dict(info)
+            if bool(live_info.get("episode_done", False)):
+                status_info["episode_done"] = True
+            stats = dict(stats or {})
+            stats["next_source_frame_idx"] = float(live_info.get("source_frame_idx", -1))
+            stats["next_block_idx_in_episode"] = float(live_info.get("block_idx_in_episode", -1))
+            if bool(stats.get("deferred_node_state_reset", False)):
+                self._clear_display_render_cache()
+            else:
+                self._capture_display_render_cache(minimal, scheduler_info=status_info)
+            self.display.current_scheduler_info = dict(status_info)
             self.display.last_events = list(all_events)
             self.display.last_raw_batch = raw_batch
             self.display.last_minimal_batch = minimal
@@ -505,7 +701,7 @@ class Stage5DemoController:
                 stats=stats,
                 minimal_batch=minimal,
                 events=all_events,
-                scheduler_info=info_after,
+                scheduler_info=status_info,
             )
             return dict(self.display.last_stats)
         finally:
@@ -593,14 +789,14 @@ class Stage5DemoController:
             self.busy = False
 
     def run_current_chunk(self) -> Dict[str, Any]:
-        info = self._current_scheduler_info()
+        info = self.scheduler.get_current_info()
         start_block = int(info.get("block_idx_in_episode", -1))
         last: Dict[str, Any] = dict(self.display.last_stats or {})
         steps = 0
         while start_block >= 0 and not bool(getattr(self.scheduler, "is_episode_done", lambda: False)()):
             last = self.step_current_block_once()
             steps += 1
-            cur = self._current_scheduler_info()
+            cur = self.scheduler.get_current_info()
             if bool(cur.get("episode_done", False)) or int(cur.get("block_idx_in_episode", -1)) != start_block:
                 break
         last = dict(last)
@@ -610,7 +806,7 @@ class Stage5DemoController:
 
     def run_episode(self) -> Dict[str, Any]:
         last: Dict[str, Any] = dict(self.display.last_stats or {})
-        max_steps = int((self._current_scheduler_info() or {}).get("visit_total", 0))
+        max_steps = int((self.scheduler.get_current_info() or {}).get("visit_total", 0))
         steps = 0
         while not bool(getattr(self.scheduler, "is_episode_done", lambda: False)()):
             last = self.step_current_block_once()
@@ -693,9 +889,11 @@ class Stage5DemoController:
         stale_keys = [k for k in self._recorded_block_update_counts if int(k[0]) == scene_id and int(k[1]) == segment_id]
         for k in stale_keys:
             self._recorded_block_update_counts.pop(k, None)
+        self._clear_display_render_cache()
         return key
 
     def _clear_all_runtime_state(self) -> None:
+        self._clear_display_render_cache()
         if hasattr(self.trainer, "reset_node_state"):
             self.trainer.reset_node_state()
         for name in (
@@ -750,6 +948,7 @@ class Stage5DemoController:
         setattr(self.trainer, "global_step", int(self._initial_optimizer_global_step))
         self.train_steps_since_param_reset = 0
         self.train_param_reset_count += 1
+        self._clear_display_render_cache()
         return len(missing_keys), len(unexpected_keys)
 
     def _reset_for_eval_scope_change(self) -> Dict[str, float]:
@@ -783,6 +982,7 @@ class Stage5DemoController:
             events=events,
             scheduler_info=info,
         )
+        self._capture_display_render_cache(minimal, scheduler_info=info)
         return dict(self.display.last_stats)
 
     def reset_all_demo_state(self) -> Dict[str, Any]:
@@ -797,6 +997,7 @@ class Stage5DemoController:
             events=self.display.last_events,
             scheduler_info=info,
         )
+        self._capture_display_render_cache(minimal, scheduler_info=info)
         return dict(self.display.last_stats)
 
     def reset_training_parameters(self) -> Dict[str, Any]:
@@ -822,6 +1023,7 @@ class Stage5DemoController:
                 events=self.display.last_events,
                 scheduler_info=info,
             )
+            self._capture_display_render_cache(minimal, scheduler_info=info)
             return dict(self.display.last_stats)
         finally:
             self.busy = False
@@ -954,22 +1156,60 @@ class Stage5DemoController:
         quats_list: List[torch.Tensor] = []
         opacities_list: List[torch.Tensor] = []
         colors_list: List[torch.Tensor] = []
+        cache = self._display_render_cache if bool(getattr(self, "use_forward_render_cache", False)) else None
+        cache_key = cache.get("key") if isinstance(cache, dict) else None
+        if isinstance(cache, dict) and (
+            not isinstance(cache_key, tuple) or len(cache_key) != 2 or (int(cache_key[0]), int(cache_key[1])) != key
+        ):
+            cache = None
+        used_cache_bg = False
+        used_cache_distant = False
+        used_cache_rigid = False
+        if isinstance(cache, dict):
+            if show_bg:
+                used_cache_bg = self._append_render_pack(
+                    cache.get("render_bg"),
+                    means_list,
+                    scales_list,
+                    quats_list,
+                    opacities_list,
+                    colors_list,
+                )
+            if show_distant:
+                used_cache_distant = self._append_render_pack(
+                    cache.get("render_distant"),
+                    means_list,
+                    scales_list,
+                    quats_list,
+                    opacities_list,
+                    colors_list,
+                )
+            if show_rigid:
+                rigid_pack = self._cached_rigid_world_render_pack(cache, frame_idx=rigid_frame_idx)
+                used_cache_rigid = self._append_render_pack(
+                    rigid_pack,
+                    means_list,
+                    scales_list,
+                    quats_list,
+                    opacities_list,
+                    colors_list,
+                )
 
-        if show_bg and node_state_bg is not None and int(node_state_bg.means.shape[0]) > 0:
+        if show_bg and not used_cache_bg and node_state_bg is not None and int(node_state_bg.means.shape[0]) > 0:
             means_list.append(node_state_bg.means)
             scales_list.append(torch.exp(node_state_bg.scales_log))
             quats_list.append(node_state_bg.quats)
             opacities_list.append(torch.sigmoid(node_state_bg.opacity_logit).squeeze(-1))
             colors_list.append(torch.cat([node_state_bg.sh_dc[:, None, :], node_state_bg.sh_rest], dim=1))
 
-        if show_distant and node_state_distant is not None and int(node_state_distant.means.shape[0]) > 0:
+        if show_distant and not used_cache_distant and node_state_distant is not None and int(node_state_distant.means.shape[0]) > 0:
             means_list.append(node_state_distant.means)
             scales_list.append(torch.exp(node_state_distant.scales_log))
             quats_list.append(node_state_distant.quats)
             opacities_list.append(torch.sigmoid(node_state_distant.opacity_logit).squeeze(-1))
             colors_list.append(torch.cat([node_state_distant.sh_dc[:, None, :], node_state_distant.sh_rest], dim=1))
 
-        if show_rigid and node_state_rigid is not None and int(node_state_rigid.means.shape[0]) > 0:
+        if show_rigid and not used_cache_rigid and node_state_rigid is not None and int(node_state_rigid.means.shape[0]) > 0:
             render_rigid_frame = rigid_frame_idx
             if render_rigid_frame is None:
                 render_rigid_frame = int(self._current_scheduler_info().get("source_frame_idx", -1))
