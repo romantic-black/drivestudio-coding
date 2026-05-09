@@ -1,0 +1,147 @@
+base_config_file: /root/autodl-tmp/outputs/minimal_sf_stage5_6_multi_scene_v8_adamw_warmcos/experiment002_60w_40w_block16/config.yaml
+
+output_name: stage5_6_demo_video
+
+model:
+  stage: "5_6"
+  production_training: true
+
+batch_eval:
+  checkpoint:
+    path: "/root/autodl-tmp/outputs/minimal_sf_stage5_6_multi_scene_v8_adamw_warmcos/experiment002_60w_40w_block16/checkpoints/minimal_sf_stage5_6_multi_scene_v8_step250000.pt"
+    strict: true
+  dataset:
+    scene_ids: [10]
+    segment_policy: all
+    start_at:
+      scene_id: 10
+      segment_id: 1
+      frame_id: 108
+    require_full_window: true
+    stride: 8
+    window_policy: sliding
+  cameras:
+    ids: [0, 1, 2]
+    names: ["front", "front_left", "front_right"]
+  update_cameras:
+    ids: [0, 1, 2]
+    names: ["front", "front_left", "front_right"]
+  runtime:
+    mode: segment_finetune_train
+    amp: false
+    reset_state_per_episode: true
+    align_with_scheduler_v8: true
+    override_scheduler_execution: true
+    block_order: block_major
+    step_major_switch_interval_steps: 1
+    update_node_state: true
+    update_hidden_state: true
+    update_view_transient: true
+  stage5_6_eval:
+    enable_nearby_feedback: true
+    nearby_policy: adjacent_non_input
+    nearby_role_name: near_random
+    allow_partial_nearby: true
+  sky_eval:
+    enable: false
+    compose_for_metrics: false
+  finetune:
+    enable: true
+    lr: 2.0e-5
+    weight_decay: 1.0e-5
+    train_feedback_fuser: false
+    freeze_error_predictor: true
+    freeze_sky_branch: true
+    freeze_dino: true
+  history:
+    update_step_norm_ema: true
+    record_support_residual_on_input_exit: true
+    record_each_step: false
+
+logging:
+  output_root: /root/autodl-tmp/outputs
+  project: minimal_sf_stage5_6_demo_video
+  log_dir: null
+  use_tensorboard: false
+
+demo:
+  mode: segment_finetune_train
+  reset_train_params_on_scope_change: true
+  checkpoint:
+    path: "/root/autodl-tmp/outputs/minimal_sf_stage5_6_multi_scene_v8_adamw_warmcos/experiment002_60w_40w_block16/checkpoints/minimal_sf_stage5_6_multi_scene_v8_step250000.pt"
+    strict: true
+    load_mode: full_state
+  scheduler:
+    type: eval_v8_stage5_6
+    name: stage5_6_demo_video_eval_v8
+    scene_ids: [10]
+    initial_scene_id: 10
+    initial_segment_id: 1
+    sequence_length: 8
+    input_offsets: [0, 2, 4, 6]
+    eval_offsets: all
+    steps_per_input: 18
+    block_order: block_major
+    step_major_switch_interval_steps: 1
+    max_target_frames_including_source: 4
+    window_policy: sliding
+    stride: 8
+    require_full_window: true
+    wrap_scene: true
+    wrap_segment: true
+    wrap_episode: true
+  cameras:
+    ids: [0, 1, 2]
+    names: ["front", "front_left", "front_right"]
+  update_cameras:
+    ids: [0, 1, 2]
+    names: ["front", "front_left", "front_right"]
+  display_branches: ["bg", "distant", "rigid"]
+  hide_rigid: false
+  inference:
+    update_node_state: true
+    update_hidden_state: true
+    update_history_memory: true
+    update_view_transient: true
+    record_block_history_on_block_exit: true
+  train_infer:
+    state_write_interval_steps: 1
+    reset_node_state_after_block: false
+  viewer:
+    use_forward_render_cache: false
+
+video:
+  camera_mode: three_front
+  cameras:
+    ids: [0, 1, 2]
+    names: ["front", "front_left", "front_right"]
+  reconstruction:
+    window_size: 8
+    window_stride: 8
+    input_gap_frames: 1
+    input_offsets: []
+    steps_per_input: 18
+    max_target_frames_including_source: 4
+    block_order: block_major
+    step_major_switch_interval_steps: 1
+    require_full_window: true
+    window_policy: sliding
+    max_windows: 4
+    sequence_start_positions: []
+  interpolation:
+    source_fps: 10.0
+    subframes_per_source_interval: 2
+    include_window_tail_interval: true
+    rigid_frame_policy: nearest
+  render:
+    height: null
+    width: null
+  output:
+    dir: null
+    name: stage5_6_three_front_20hz_demo
+    fps: 20
+    layout: horizontal
+    write_combined: true
+    write_separate_per_camera: false
+    show_camera_labels: false
+    save_png_frames: false
