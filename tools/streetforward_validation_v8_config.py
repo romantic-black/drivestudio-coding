@@ -17,6 +17,7 @@ class ValidationV8Config:
     step_major_switch_interval_steps: int
     reset_policy: str
     target_policy: str
+    history_target_policy: str
     episode_selection_policy: str
     save_images: bool
     save_dir: str
@@ -79,6 +80,7 @@ def parse_validation_v8_config(cfg: Any) -> ValidationV8Config:
             step_major_switch_interval_steps=1,
             reset_policy="block_end",
             target_policy="visited_episode_frames",
+            history_target_policy="nearest_visited",
             episode_selection_policy="middle",
             save_images=False,
             save_dir="validation/episodes",
@@ -124,6 +126,12 @@ def parse_validation_v8_config(cfg: Any) -> ValidationV8Config:
     target_policy = str(_cfg_get(episode_cfg, "target_policy", "visited_episode_frames")).strip()
     if target_policy != "visited_episode_frames":
         raise ValueError("validation_v8.episode.target_policy must be visited_episode_frames")
+    history_target_policy = str(_cfg_get(episode_cfg, "history_target_policy", "nearest_visited")).strip()
+    if history_target_policy not in ("nearest_visited", "random_visited"):
+        raise ValueError(
+            "validation_v8.episode.history_target_policy must be one of "
+            "['nearest_visited', 'random_visited']"
+        )
     blocks_per_episode: Optional[int]
     total_target_frames: Optional[int]
     if blocks_per_episode_raw is None:
@@ -194,6 +202,7 @@ def parse_validation_v8_config(cfg: Any) -> ValidationV8Config:
         step_major_switch_interval_steps=step_major_switch_interval_steps,
         reset_policy=reset_policy,
         target_policy=target_policy,
+        history_target_policy=history_target_policy,
         episode_selection_policy=policy,
         save_images=save_images,
         save_dir=save_dir,
@@ -203,4 +212,3 @@ def parse_validation_v8_config(cfg: Any) -> ValidationV8Config:
         min_valid_pixels_per_region=min_valid_pixels_per_region,
         require_sky_mask=require_sky_mask,
     )
-

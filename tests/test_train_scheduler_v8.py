@@ -99,6 +99,7 @@ def _build_scheduler(ds: MagicMock, **kwargs) -> TrainSchedulerV8:
         block_order=str(kwargs.get("block_order", "block_major")),
         step_major_switch_interval_steps=int(kwargs.get("step_major_switch_interval_steps", 1)),
         target_policy="visited_episode_frames",
+        history_target_policy=str(kwargs.get("history_target_policy", "nearest_visited")),
         reset_policy="episode_end",
         aux_feature_splat_targets_cfg=kwargs.get("aux_feature_splat_targets_cfg"),
     )
@@ -137,6 +138,28 @@ def test_v8_step_major_targets_expand_after_first_round():
     assert targets[12] == (10, (10, 11, 12))
     assert targets[16] == (11, (11, 10, 12))
     assert targets[20] == (12, (12, 11, 10))
+
+
+def test_v8_random_history_targets_sample_from_visited_blocks():
+    ds = _make_mock_dataset()
+    sch = _build_scheduler(
+        ds,
+        steps_per_block=2,
+        block_order="step_major",
+        step_major_switch_interval_steps=1,
+        history_target_policy="random_visited",
+    )
+
+    with patch(
+        "datasets.train_scheduler_v8.random.sample",
+        side_effect=lambda population, k: sorted([int(x) for x in population])[: int(k)],
+    ):
+        batches = [sch.next_batch() for _ in range(3)]
+
+    aligned = batches[-1]["_scheduler_v8_aligned_info"]
+    assert str(aligned["history_target_policy"]) == "random_visited"
+    assert int(aligned["source_frame_idx"]) == 12
+    assert [int(x) for x in aligned["target_frame_indices"]] == [12, 10, 11]
 
 
 def test_v8_fast_fail_total_target_frames_larger_than_blocks():

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import random
 from typing import Dict, List, Protocol, Tuple
 
 
@@ -74,22 +75,32 @@ def build_visit_target_windows_v8(
     frame_chain: List[int],
     block_visit_order: List[int],
     max_target_frames: int,
+    history_target_policy: str = "nearest_visited",
 ) -> List[List[int]]:
+    if history_target_policy not in ("nearest_visited", "random_visited"):
+        raise ValueError(
+            "history_target_policy must be one of ['nearest_visited', 'random_visited']"
+        )
     visited: set[int] = set()
     out: List[List[int]] = []
     for bcur in block_visit_order:
         source = int(frame_chain[int(bcur)])
+        candidates = sorted(int(b) for b in visited if int(b) != int(bcur))
         prev_blocks = sorted([b for b in visited if b < int(bcur)], reverse=True)
         next_blocks = sorted([b for b in visited if b > int(bcur)])
         selected: List[int] = []
-        for b in prev_blocks:
-            if len(selected) >= int(max_target_frames) - 1:
-                break
-            selected.append(int(b))
-        for b in next_blocks:
-            if len(selected) >= int(max_target_frames) - 1:
-                break
-            selected.append(int(b))
+        max_history_frames = max(int(max_target_frames) - 1, 0)
+        if history_target_policy == "random_visited":
+            selected = [int(x) for x in random.sample(candidates, min(max_history_frames, len(candidates)))]
+        else:
+            for b in prev_blocks:
+                if len(selected) >= max_history_frames:
+                    break
+                selected.append(int(b))
+            for b in next_blocks:
+                if len(selected) >= max_history_frames:
+                    break
+                selected.append(int(b))
         out.append([int(source)] + [int(frame_chain[b]) for b in selected])
         visited.add(int(bcur))
     return out
@@ -104,6 +115,7 @@ def build_validation_episode_specs_v8(
     steps_per_block: int = 1,
     block_order: str = "block_major",
     step_major_switch_interval_steps: int = 1,
+    history_target_policy: str = "nearest_visited",
 ) -> List[ValidationEpisodeSpecV8]:
     if blocks_per_episode < 1:
         raise ValueError("blocks_per_episode must be >= 1")
@@ -117,6 +129,10 @@ def build_validation_episode_specs_v8(
         raise ValueError("block_order must be one of ['block_major', 'step_major']")
     if step_major_switch_interval_steps < 1:
         raise ValueError("step_major_switch_interval_steps must be >= 1")
+    if history_target_policy not in ("nearest_visited", "random_visited"):
+        raise ValueError(
+            "history_target_policy must be one of ['nearest_visited', 'random_visited']"
+        )
 
     episode_window_keyframes = int(blocks_per_episode)
     out: List[ValidationEpisodeSpecV8] = []
@@ -146,6 +162,7 @@ def build_validation_episode_specs_v8(
                 frame_chain=[int(x) for x in frame_chain],
                 block_visit_order=[int(x) for x in block_visit_order],
                 max_target_frames=int(total_target_frames),
+                history_target_policy=str(history_target_policy),
             )
             eval_image_refs: List[Tuple[int, int]] = []
             for frame_idx in frame_chain:
@@ -164,4 +181,3 @@ def build_validation_episode_specs_v8(
                 )
             )
     return out
-

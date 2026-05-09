@@ -1,4 +1,4 @@
-output_name: experiment002_60w_40w_block16
+output_name: experiment003_resume250k_ep18_block8_random_history
 
 data:
   data_root: "/root/autodl-tmp/nuScenes/"
@@ -89,12 +89,13 @@ dataset:
 scheduler_v8:
   enable: true
   block:
-    steps_per_block: 16
+    steps_per_block: 8
   episode:
-    blocks_per_episode: 5
+    blocks_per_episode: 18
     total_target_frames: 3
     include_source_frame: true
     target_policy: visited_episode_frames
+    history_target_policy: random_visited
     block_source_frame_policy: fixed_once_per_episode
     frame_within_keyframe_policy: random_once_per_episode
     min_keyframes_required_policy: skip_if_less_than_window
@@ -133,11 +134,12 @@ validation_v8:
   eval_enable: false
   mode: inference_only  # segment_finetune_train
   block:
-    steps_per_block: 16
+    steps_per_block: 8
   episode:
-    blocks_per_episode: 5
+    blocks_per_episode: 18
     total_target_frames: 3
     target_policy: visited_episode_frames
+    history_target_policy: random_visited
   execution:
     block_order: step_major
     step_major_switch_interval_steps: 4

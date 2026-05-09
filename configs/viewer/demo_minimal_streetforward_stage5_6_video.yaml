@@ -146,28 +146,32 @@ video:
     step_major_switch_interval_steps: 1
     require_full_window: true
     window_policy: sliding
-    # 下一段沿用上一段 node state，但丢弃 GRU hidden/history/support 等历史缓存。
-    state_carryover: node_state
+    # 每段恢复原始行为：切换窗口时重置 demo runtime state，不沿用上一段 node state。
+    state_carryover: reset
     discard_history_between_windows: true
     # 默认只导出 4 个窗口便于快速看效果；需要完整视频可设为 null。
     max_windows: 4
     sequence_start_positions: []
   interpolation:
-    # nuScenes 数据帧按 10Hz 读取；subframes=2 后输出 20Hz。
+    # nuScenes 数据帧按 10Hz 读取；target_fps=20 会自动推导 2 个子帧。
+    # 若要输出 50Hz，只需覆盖 video.interpolation.target_fps=50，会自动推导 5 个子帧。
     source_fps: 10.0
-    subframes_per_source_interval: 2
+    target_fps: 20
+    subframes_per_source_interval: auto
     # true 表示每个窗口最后一帧会继续插值到下一窗口首帧，减少窗口边界顿挫。
     include_window_tail_interval: true
     # 动态刚体无法连续插值时，按最近真实帧选择刚体姿态。
     rigid_frame_policy: nearest
   render:
-    # null 表示使用数据原始分辨率；若要降采样，height/width 必须一起设置。
-    height: null
-    width: null
+    # base 训练配置按 downscale_when_loading=3 载入图像；demo 视频提升到 nuScenes 原始前摄分辨率。
+    # three_front 横拼后为 4800x900；front 单相机为 1600x900。
+    height: 900
+    width: 1600
   output:
     dir: null
-    name: stage5_6_three_front_20hz_demo
-    fps: 20
+    name: stage5_6_three_front_demo
+    # null 表示和 interpolation.target_fps 使用同一时间基；也可手动设为相同数值。
+    fps: null
     # 三前摄默认横向拼接；front 单相机建议改成 single。
     layout: horizontal
     write_combined: true

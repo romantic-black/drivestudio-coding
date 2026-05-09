@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from unittest.mock import patch
+
 from datasets.multi_scene_dataset_v4 import SegmentIndexV4
 from datasets.validation_scheduler_v8 import (
     build_segment_episode_starts,
@@ -63,3 +65,21 @@ def test_build_validation_episode_specs_v8_middle_episode_and_visit_targets():
     assert spec.visit_target_windows[8] == [105, 104, 103]
     assert spec.visit_target_windows[12] == [103, 104, 105]
 
+
+def test_build_validation_episode_specs_v8_random_history_policy():
+    ds = _DummyDataset()
+    with patch(
+        "datasets.validation_scheduler_v8.random.sample",
+        side_effect=lambda population, k: sorted([int(x) for x in population])[: int(k)],
+    ):
+        specs = build_validation_episode_specs_v8(
+            dataset=ds,
+            eval_scene_ids=[10],
+            blocks_per_episode=3,
+            total_target_frames=3,
+            steps_per_block=8,
+            block_order="step_major",
+            step_major_switch_interval_steps=4,
+            history_target_policy="random_visited",
+        )
+    assert specs[0].visit_target_windows[8] == [105, 103, 104]
