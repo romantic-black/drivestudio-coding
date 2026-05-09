@@ -52,6 +52,7 @@ def _build_validation_specs_v8_proxy(
     steps_per_block = int(getattr(vcfg, "steps_per_block", 1))
     block_order = str(getattr(vcfg, "block_order", "block_major"))
     switch_steps = int(getattr(vcfg, "step_major_switch_interval_steps", 1))
+    history_target_policy = str(getattr(vcfg, "history_target_policy", "nearest_visited"))
     return build_validation_episode_specs_v8(
         dataset=dataset,
         eval_scene_ids=[int(x) for x in eval_scene_ids],
@@ -60,6 +61,7 @@ def _build_validation_specs_v8_proxy(
         steps_per_block=int(steps_per_block),
         block_order=str(block_order),
         step_major_switch_interval_steps=int(switch_steps),
+        history_target_policy=history_target_policy,
     )
 
 

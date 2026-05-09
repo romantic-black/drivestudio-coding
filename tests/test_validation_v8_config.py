@@ -29,6 +29,7 @@ def _base_cfg() -> dict:
                 "blocks_per_episode": 3,
                 "total_target_frames": 3,
                 "target_policy": "visited_episode_frames",
+                "history_target_policy": "random_visited",
             },
             "execution": {"block_order": "block_major", "reset_policy": "block_end"},
             "episode_selection": {"policy": "middle"},
@@ -49,6 +50,7 @@ def test_parse_validation_v8_config_success():
     assert cfg.total_target_frames == 3
     assert cfg.block_order == "block_major"
     assert cfg.target_policy == "visited_episode_frames"
+    assert cfg.history_target_policy == "random_visited"
 
 
 def test_parse_validation_v8_config_fast_fail_on_target_policy():
@@ -64,3 +66,9 @@ def test_parse_validation_v8_config_fast_fail_on_target_frames_vs_blocks():
     with pytest.raises(ValueError, match="must be <= blocks_per_episode"):
         parse_validation_v8_config(raw)
 
+
+def test_parse_validation_v8_config_fast_fail_on_history_target_policy():
+    raw = _base_cfg()
+    raw["validation_v8"]["episode"]["history_target_policy"] = "latest_only"
+    with pytest.raises(ValueError, match="history_target_policy"):
+        parse_validation_v8_config(raw)

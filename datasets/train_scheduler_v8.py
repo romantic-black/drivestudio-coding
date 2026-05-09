@@ -41,6 +41,7 @@ class TrainSchedulerV8(TrainSchedulerV7):
         block_order: str = "block_major",
         step_major_switch_interval_steps: int = 1,
         target_policy: str = "visited_episode_frames",
+        history_target_policy: str = "nearest_visited",
         reset_policy: str = "episode_end",
         near_random_supervision_cfg: Optional[Any] = None,
         aux_feature_splat_targets_cfg: Optional[Any] = None,
@@ -63,6 +64,12 @@ class TrainSchedulerV8(TrainSchedulerV7):
         # epoch/window state is initialized exactly once with V8 semantics (W = E).
         self._skip_next_start_new_epoch = True
         self.target_policy = str(target_policy)
+        self.history_target_policy = str(history_target_policy)
+        if self.history_target_policy not in ("nearest_visited", "random_visited"):
+            raise ValueError(
+                "scheduler_v8.episode.history_target_policy must be one of "
+                "['nearest_visited', 'random_visited']"
+            )
         self.reset_policy = str(reset_policy)
         self.block_source_frame_policy = str(block_source_frame_policy)
         if self.block_source_frame_policy not in ("fixed_once_per_episode", "random_within_keyframe_per_visit"):
@@ -402,18 +409,22 @@ class TrainSchedulerV8(TrainSchedulerV7):
     ) -> List[int]:
         chain = [int(x) for x in frame_chain]
         sources = [int(x) for x in block_source_frames]
-        candidates = [int(b) for b in visited_block_indices if int(b) != int(block_idx)]
+        candidates = sorted(int(b) for b in visited_block_indices if int(b) != int(block_idx))
         prev_blocks = sorted([b for b in candidates if b < int(block_idx)], reverse=True)
         next_blocks = sorted([b for b in candidates if b > int(block_idx)])
         selected_blocks: List[int] = []
-        for b in prev_blocks:
-            if len(selected_blocks) >= int(max_target_frames) - 1:
-                break
-            selected_blocks.append(int(b))
-        for b in next_blocks:
-            if len(selected_blocks) >= int(max_target_frames) - 1:
-                break
-            selected_blocks.append(int(b))
+        max_history_frames = max(int(max_target_frames) - 1, 0)
+        if self.history_target_policy == "random_visited":
+            selected_blocks = self._sample_no_replace(candidates, min(max_history_frames, len(candidates)))
+        else:
+            for b in prev_blocks:
+                if len(selected_blocks) >= max_history_frames:
+                    break
+                selected_blocks.append(int(b))
+            for b in next_blocks:
+                if len(selected_blocks) >= max_history_frames:
+                    break
+                selected_blocks.append(int(b))
         return [int(source_frame)] + [
             int(
                 self._resolve_block_source_frame_at_index(
@@ -845,6 +856,7 @@ class TrainSchedulerV8(TrainSchedulerV7):
         info = dict(super()._aligned_info(st))
         info["scheduler_version"] = "v8"
         info["target_policy"] = str(self.target_policy)
+        info["history_target_policy"] = str(self.history_target_policy)
         info["block_source_frame_policy"] = str(self.block_source_frame_policy)
         info["visited_block_indices"] = sorted(int(x) for x in st.get("visited_block_indices", set()))
         info["block_current_source_frame_indices"] = [

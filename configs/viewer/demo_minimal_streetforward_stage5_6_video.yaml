@@ -163,9 +163,10 @@ video:
     # 动态刚体无法连续插值时，按最近真实帧选择刚体姿态。
     rigid_frame_policy: nearest
   render:
-    # null 表示使用数据原始分辨率；若要降采样，height/width 必须一起设置。
-    height: null
-    width: null
+    # base 训练配置按 downscale_when_loading=3 载入图像；demo 视频提升到 nuScenes 原始前摄分辨率。
+    # three_front 横拼后为 4800x900；front 单相机为 1600x900。
+    height: 900
+    width: 1600
   output:
     dir: null
     name: stage5_6_three_front_demo
