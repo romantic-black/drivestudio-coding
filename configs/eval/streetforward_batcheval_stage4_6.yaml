@@ -66,8 +66,8 @@ batch_eval:
     names: ["front", "front_left", "front_right"]
 
   runtime:
-    mode: inference_only
-    no_grad: true
+    mode: segment_finetune_train
+    no_grad: false
     amp: false
     reset_state_per_episode: true
     align_with_scheduler_v7: false
@@ -76,13 +76,15 @@ batch_eval:
     update_hidden_state: true
     update_view_transient: true
     block_order: step_major
-    step_major_switch_interval_steps: 4
+    step_major_switch_interval_steps: 8
     reset_policy: episode_end
     target_frame_policy: visited_episode_frames
     max_target_frames_including_source: 3
 
   sky_eval:
-    enable: false
+    # Stage4_6 has no internal sky branch and training excludes sky-region
+    # photometric loss. Compose the frozen SkyBranch for full-image metrics.
+    enable: true
     config_file: configs/skybranch_stage5_4_exp002.yaml
     checkpoint: "/root/autodl-tmp/outputs/skybranch_stage5_4_exp002/checkpoints/skybranch_resume_step_100000.pth"
     strict: true
