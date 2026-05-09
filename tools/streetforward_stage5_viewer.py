@@ -157,7 +157,10 @@ class StreetForwardStage5Viewer(Viewer):
                 initial_value=bool(viewer_cfg.get("show_rigid", False)),
             )
             rigid_frame = self.server.gui.add_number("Rigid Frame", initial_value=int(initial_source_frame))
-            lock_rigid_frame = self.server.gui.add_checkbox("Lock Rigid Frame", initial_value=False)
+            lock_rigid_frame = self.server.gui.add_checkbox(
+                "Lock Rigid Frame",
+                initial_value=bool(viewer_cfg.get("lock_rigid_frame", False)),
+            )
 
             def _refresh_scope_dropdowns_from_stats() -> None:
                 stats = self.controller.display.last_stats or {}

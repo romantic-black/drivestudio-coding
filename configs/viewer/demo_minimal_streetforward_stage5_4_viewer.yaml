@@ -103,9 +103,11 @@ demo:
     align_gaussians_to_nerfview: true
     coord_align_mode: gaussian
     rasterize_mode: auto
+    use_forward_render_cache: true
     show_bg: true
     show_distant: true
     show_rigid: true
+    lock_rigid_frame: true
     viewer_res: 1280
     default_render_mode: rgb
     default_max_sh_degree: 1
