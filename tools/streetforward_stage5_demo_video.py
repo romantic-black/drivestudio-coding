@@ -59,6 +59,7 @@ class _VideoWriterSet:
             self.paths["combined"] = path
             self._writers["combined"] = imageio.get_writer(
                 str(path),
+                format="FFMPEG",
                 mode="I",
                 fps=int(fps),
                 codec="libx264",
@@ -73,6 +74,7 @@ class _VideoWriterSet:
                 self.paths[key] = path
                 self._writers[key] = imageio.get_writer(
                     str(path),
+                    format="FFMPEG",
                     mode="I",
                     fps=int(fps),
                     codec="libx264",
@@ -82,16 +84,31 @@ class _VideoWriterSet:
         if not self._writers:
             raise ValueError("video.output must enable write_combined or write_separate_per_camera")
 
+    @staticmethod
+    def _pad_even_hw(frame: np.ndarray) -> np.ndarray:
+        if frame.ndim != 3 or int(frame.shape[-1]) != 3:
+            raise ValueError(f"video frame must be HWC RGB, got shape={tuple(frame.shape)}")
+        h, w = int(frame.shape[0]), int(frame.shape[1])
+        pad_h = int(h % 2)
+        pad_w = int(w % 2)
+        if pad_h == 0 and pad_w == 0:
+            return frame
+        return np.pad(
+            frame,
+            ((0, pad_h), (0, pad_w), (0, 0)),
+            mode="edge",
+        )
+
     def append(self, *, combined: Optional[np.ndarray], per_camera: Dict[int, np.ndarray]) -> None:
         if "combined" in self._writers and combined is not None:
-            self._writers["combined"].append_data(combined)
+            self._writers["combined"].append_data(self._pad_even_hw(combined))
         for key, writer in self._writers.items():
             if not key.startswith("cam_"):
                 continue
             cam_id = int(key.split("_", 1)[1])
             frame = per_camera.get(cam_id)
             if frame is not None:
-                writer.append_data(frame)
+                writer.append_data(self._pad_even_hw(frame))
 
     def close(self) -> None:
         first_exc: Optional[BaseException] = None
