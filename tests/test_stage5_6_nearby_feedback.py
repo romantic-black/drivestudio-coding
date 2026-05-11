@@ -89,6 +89,31 @@ def test_stage5_6_fast_fail_when_rgb_residual_enabled(monkeypatch: pytest.Monkey
         stage._validate_stage5_3_config(cfg)
 
 
+def test_stage5_6_allows_disabled_feedback_without_near_random_scheduler(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        MinimalStreetForwardStage5_4,
+        "_validate_stage5_3_config",
+        lambda self, config: None,
+    )
+    stage = MinimalStreetForwardStage5_6.__new__(MinimalStreetForwardStage5_6)
+    cfg = {
+        "model": {"stage": "5_6"},
+        "feature_splat_uncertainty": {
+            "bridge": {"enable": False},
+            "head": {"predict_rgb_residual": False},
+        },
+        "nearby_error_feedback": {
+            "enable": False,
+            "target_role": "near_random",
+            "error_pred": {"enable": False, "target_role": "near_random"},
+            "cache": {"mode": "frame_bank", "store_age": False},
+            "fusion": {"type": "flatten_frame_slots", "input_feedback_age": False},
+        },
+        "scheduler_v8": {"near_random_supervision": {"enable": False}},
+    }
+    stage._validate_stage5_3_config(cfg)
+
+
 def test_stage4_5_parent_init_allows_stage5_6_v4_direct_path(monkeypatch: pytest.MonkeyPatch):
     def _super_init(self, config, device, **kwargs):
         _ = (config, kwargs)

@@ -114,8 +114,8 @@ demo:
   scheduler:
     type: eval_v8_stage5_6
     name: stage5_6_demo_video_eval_v8
-    scene_ids: [10]
-    initial_scene_id: 10 
+    scene_ids: [24]
+    initial_scene_id: 24 
     # 视频生成固定当前 segment；不会像 batch eval 那样遍历所有 segment。
     initial_segment_id: 0
     # 一个重建窗口只覆盖 8 个 nuScenes 10Hz 数据帧。

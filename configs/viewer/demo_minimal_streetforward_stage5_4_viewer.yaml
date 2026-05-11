@@ -9,7 +9,7 @@ model:
   use_fused_cuda_backproject_v4: true
 
 data:
-  train_scene_ids: [10]
+  train_scene_ids: [114, 0,1,2,3,4,5,6,7,8]
   eval_scene_ids: []
   preload:
     enable: false
@@ -70,8 +70,8 @@ demo:
   scheduler:
     type: train_v8_stage5_4
     name: stage5_4_demo_train_v8
-    scene_ids: [10]
-    initial_scene_id: 10
+    scene_ids: [0,1,2,3,4,5,6,7,8]
+    initial_scene_id: 0
     initial_segment_id: 0
     # In train_v8_stage5_4 mode this is the training episode_start_keyframe_pos,
     # not a dense eval-frame window offset.
@@ -103,11 +103,9 @@ demo:
     align_gaussians_to_nerfview: true
     coord_align_mode: gaussian
     rasterize_mode: auto
-    use_forward_render_cache: true
     show_bg: true
     show_distant: true
     show_rigid: true
-    lock_rigid_frame: true
     viewer_res: 1280
     default_render_mode: rgb
     default_max_sh_degree: 1

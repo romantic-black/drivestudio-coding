@@ -296,7 +296,9 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
             raise ValueError("Stage5_6 nearby_error_feedback.fusion.input_feedback_age must be false.")
         target_role = str(nef_cfg.get("target_role", error_pred_cfg.get("target_role", "nearby_direct")))
         scheduler_cfg = config.get("scheduler_v8", {}) if hasattr(config, "get") else {}
-        if hasattr(scheduler_cfg, "get") and target_role == "near_random":
+        feedback_enable_raw = nef_cfg.get("enable", None) if hasattr(nef_cfg, "get") else None
+        feedback_explicitly_disabled = feedback_enable_raw is False
+        if (not feedback_explicitly_disabled) and hasattr(scheduler_cfg, "get") and target_role == "near_random":
             aux_cfg = scheduler_cfg.get("aux_feature_splat_targets", {}) or {}
             near_random_cfg = scheduler_cfg.get("near_random_supervision", {}) or {}
             if bool(aux_cfg.get("enable", False)):
@@ -358,7 +360,9 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
         legacy_cache = fsu.get("short_cycle_feedback", {}) if hasattr(fsu, "get") else {}
 
         self.stage5_6_feedback_enabled = bool(nef.get("enable", fsu.get("enable", False)))
-        self.stage5_6_error_enabled = bool(error_pred_cfg.get("enable", self.stage5_6_feedback_enabled))
+        self.stage5_6_error_enabled = bool(self.stage5_6_feedback_enabled) and bool(
+            error_pred_cfg.get("enable", True)
+        )
         self.stage5_6_error_target_role = str(nef.get("target_role", error_pred_cfg.get("target_role", "nearby_direct")))
         self.stage5_6_error_input_feature = str(error_pred_cfg.get("input_feature", "post_gru_hidden")).strip().lower()
         if self.stage5_6_error_input_feature not in {"post_gru_hidden", "post_update_node_feature", "post_struct"}:
@@ -445,11 +449,13 @@ class MinimalStreetForwardStage5_6(MinimalStreetForwardStage5_4):
         self.stage5_6_fusion_warmup_steps = int(warm_cfg.get("fusion_warmup_steps", 3000))
         self.stage5_6_fusion_start_scale = float(warm_cfg.get("fusion_start_scale", 0.0))
         self.stage5_6_fusion_end_scale = float(warm_cfg.get("fusion_end_scale", 1.0))
-        self.stage5_6_cache_enable = bool(cache_cfg.get("enable", legacy_cache.get("enable", True)))
+        self.stage5_6_cache_enable = bool(self.stage5_6_feedback_enabled) and bool(
+            cache_cfg.get("enable", legacy_cache.get("enable", True))
+        )
         self.stage5_6_cache_max_age = int(cache_cfg.get("max_age", legacy_cache.get("max_age", 1)))
         self.stage5_6_cache_keep_only_current_scope = bool(cache_cfg.get("keep_only_current_scope", True))
 
-        self.stage5_6_fusion_enabled = bool(fusion_cfg.get("enable", True))
+        self.stage5_6_fusion_enabled = bool(self.stage5_6_feedback_enabled) and bool(fusion_cfg.get("enable", True))
         self.stage5_6_fusion_apply_to_bg = bool(fusion_cfg.get("apply_to_bg", True))
         self.stage5_6_fusion_apply_to_distant = bool(fusion_cfg.get("apply_to_distant", True))
         self.stage5_6_fusion_apply_to_rigid = bool(fusion_cfg.get("apply_to_rigid", True))

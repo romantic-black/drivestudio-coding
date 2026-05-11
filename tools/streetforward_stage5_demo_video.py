@@ -43,6 +43,14 @@ class RenderSample:
     is_transition: bool
 
 
+@dataclass(frozen=True)
+class WindowPlan:
+    scene_id: int
+    segment_id: int
+    sequence_start_pos: int
+    timeline_start_pos: float
+
+
 class _VideoWriterSet:
     def __init__(
         self,
@@ -199,6 +207,34 @@ def _frames_for_segment(dataset: Any, scene_id: int, segment_id: int) -> List[in
         train_set = set(int(x) for x in train_frame_set)
         frames = [int(f) for f in frames if int(f) in train_set]
     return frames
+
+
+def _window_starts_for_frames(
+    *,
+    num_frames: int,
+    window_size: int,
+    window_stride: int,
+    require_full_window: bool,
+    window_policy: str,
+) -> List[int]:
+    if int(num_frames) <= 0:
+        return []
+    if int(window_size) < 1:
+        raise ValueError("video.reconstruction.window_size must be >= 1")
+    if int(window_stride) < 1:
+        raise ValueError("video.reconstruction.window_stride must be >= 1")
+    policy = str(window_policy).strip().lower()
+    if policy == "middle":
+        if bool(require_full_window) and int(num_frames) < int(window_size):
+            return []
+        return [max(0, (int(num_frames) - int(window_size)) // 2)]
+    if policy == "sliding":
+        if bool(require_full_window):
+            if int(num_frames) < int(window_size):
+                return []
+            return list(range(0, int(num_frames) - int(window_size) + 1, int(window_stride)))
+        return list(range(0, int(num_frames), int(window_stride)))
+    raise ValueError("video.reconstruction.window_policy must be one of: sliding, middle")
 
 
 def _select_sequence_starts(
@@ -379,21 +415,33 @@ class Stage5DemoVideoExporter:
         controller: Any,
         device: torch.device,
         output_dir: Path,
+        sky_branch: Optional[Any] = None,
     ) -> None:
         self.cfg = cfg
         self.dataset = dataset
         self.controller = controller
         self.device = device
         self.output_dir = Path(output_dir)
+        self.sky_branch = sky_branch
+        self._single_sky_state: Optional[Any] = None
         video_cfg = _cfg_get(cfg, "video", {}) or {}
         recon_cfg = _cfg_get(video_cfg, "reconstruction", {}) or {}
         interp_cfg = _cfg_get(video_cfg, "interpolation", {}) or {}
         output_cfg = _cfg_get(video_cfg, "output", {}) or {}
         render_cfg = _cfg_get(video_cfg, "render", {}) or {}
         cameras_cfg = _cfg_get(video_cfg, "cameras", {}) or {}
+        sky_cfg = _cfg_get(video_cfg, "sky", {}) or {}
 
         self.window_size = int(_cfg_get(recon_cfg, "window_size", _cfg_get(cfg.demo.scheduler, "sequence_length", 8)))
         self.window_stride = int(_cfg_get(recon_cfg, "window_stride", self.window_size))
+        self.require_full_window = bool(_cfg_get(recon_cfg, "require_full_window", False))
+        self.window_policy = str(_cfg_get(recon_cfg, "window_policy", "sliding")).strip().lower()
+        self.multi_segment = bool(_cfg_get(recon_cfg, "multi_segment", False))
+        self.segment_policy = str(
+            _cfg_get(recon_cfg, "segment_policy", "from_initial" if self.multi_segment else "current")
+        ).strip().lower()
+        if self.segment_policy not in {"current", "all", "from_initial"}:
+            raise ValueError("video.reconstruction.segment_policy must be one of: current, all, from_initial")
         self.input_offsets = derive_input_offsets(
             window_size=int(self.window_size),
             input_gap_frames=int(_cfg_get(recon_cfg, "input_gap_frames", 1)),
@@ -470,6 +518,18 @@ class Stage5DemoVideoExporter:
         self.save_all_images = bool(_cfg_get(output_cfg, "save_all_images", self.save_png_frames))
         self.show_labels = bool(_cfg_get(output_cfg, "show_camera_labels", False))
         self.base_name = _safe_stem(str(_cfg_get(output_cfg, "name", "stage5_6_demo_video")))
+
+        self.sky_enabled = bool(self.sky_branch is not None and _cfg_get(sky_cfg, "enable", True))
+        self.sky_reuse_single_state = bool(_cfg_get(sky_cfg, "reuse_single_state", True))
+        self.sky_update_during_video = bool(_cfg_get(sky_cfg, "update_during_video", False))
+        self.sky_compose_mode = str(_cfg_get(sky_cfg, "compose_mode", "alpha_gap")).strip().lower()
+        self.sky_alpha_scale = float(_cfg_get(sky_cfg, "alpha_scale", 1.0))
+        if self.sky_compose_mode not in {"alpha_gap", "replace"}:
+            raise ValueError("video.sky.compose_mode must be one of: alpha_gap, replace")
+        if self.sky_update_during_video:
+            raise ValueError("video.sky.update_during_video=true is not supported; demo video sky is render-only.")
+        if self.sky_enabled:
+            self._single_sky_state = self._select_single_sky_state()
 
         self.camera_ids = [int(x) for x in _as_list(_cfg_get(cameras_cfg, "ids", [0]))]
         camera_names = [str(x) for x in _as_list(_cfg_get(cameras_cfg, "names", []))]
@@ -550,6 +610,14 @@ class Stage5DemoVideoExporter:
             choice = sorted(valid)[0]
         return int(choice)
 
+    def _effective_transition_bounds(self, actual_window_len: int) -> Tuple[float, float]:
+        n = int(actual_window_len)
+        if n <= 1:
+            return 0.0, float(max(n, 1))
+        before = min(int(self.transition_frames_before), max(0, n - 1))
+        after = min(int(self.transition_frames_after), max(0, n - before - 1))
+        return float(before), float(n - after)
+
     def _build_render_samples(
         self,
         *,
@@ -557,6 +625,7 @@ class Stage5DemoVideoExporter:
         next_frame_id: Optional[int],
         window_index: int,
         sequence_start_pos: int,
+        timeline_start_pos: Optional[float] = None,
     ) -> List[RenderSample]:
         frames = [int(x) for x in window_frame_ids]
         if len(frames) < 1:
@@ -567,8 +636,8 @@ class Stage5DemoVideoExporter:
         if bool(self.include_tail_interval) and next_frame_id is not None:
             interval_pairs.append((len(frames) - 1, int(frames[-1]), int(next_frame_id)))
         input_offsets = sorted({int(x) for x in self.input_offsets})
-        stitch_start = float(self.transition_frames_before)
-        stitch_end = float(int(self.window_size) - int(self.transition_frames_after))
+        stitch_start, stitch_end = self._effective_transition_bounds(actual_window_len=len(frames))
+        timeline_base = float(sequence_start_pos if timeline_start_pos is None else timeline_start_pos)
         for interval_offset, f0, f1 in interval_pairs:
             for sub in range(int(self.subframes_per_interval)):
                 alpha = float(sub) / float(self.subframes_per_interval)
@@ -577,9 +646,8 @@ class Stage5DemoVideoExporter:
                 if not anchors:
                     continue
                 anchor_input_offset = int(anchors[-1])
-                global_source_pos = float(sequence_start_pos) + float(local_source_pos)
-                global_frame_value = (1.0 - float(alpha)) * float(f0) + float(alpha) * float(f1)
-                global_time_seconds = float(global_frame_value) / float(self.source_fps)
+                global_source_pos = float(timeline_base) + float(local_source_pos)
+                global_time_seconds = float(global_source_pos) / float(self.source_fps)
                 global_output_time_index = int(round(global_time_seconds * float(self.fps)))
                 is_transition = bool(local_source_pos < stitch_start or local_source_pos >= stitch_end)
                 samples.append(
@@ -608,7 +676,8 @@ class Stage5DemoVideoExporter:
             anchors = [int(x) for x in input_offsets if float(x) <= local_source_pos]
             if not anchors:
                 return samples
-            global_time_seconds = float(frames[-1]) / float(self.source_fps)
+            global_source_pos = float(timeline_base) + float(local_source_pos)
+            global_time_seconds = float(global_source_pos) / float(self.source_fps)
             samples.append(
                 RenderSample(
                     frame0=int(frames[-1]),
@@ -618,7 +687,7 @@ class Stage5DemoVideoExporter:
                     window_index=int(window_index),
                     sequence_start_pos=int(sequence_start_pos),
                     local_source_pos=float(local_source_pos),
-                    global_source_pos=float(sequence_start_pos) + float(local_source_pos),
+                    global_source_pos=float(global_source_pos),
                     global_time_seconds=float(global_time_seconds),
                     global_output_time_index=int(round(global_time_seconds * float(self.fps))),
                     anchor_input_offset=int(anchors[-1]),
@@ -668,11 +737,79 @@ class Stage5DemoVideoExporter:
         if not isinstance(minimal, dict):
             raise ValueError("controller has no current minimal batch for rendering")
         items = self._make_render_items(records=records, sample=sample)
-        rgb, _alpha = self.controller.trainer._render_scene_views_from_current_state(minimal, items)
+        rgb, alpha = self.controller.trainer._render_scene_views_from_current_state(minimal, items)
+        if bool(self.sky_enabled):
+            rgb = self._compose_sky_rgb(minimal=minimal, items=items, scene_rgb=rgb, scene_alpha=alpha)
         out: Dict[int, np.ndarray] = {}
         for idx, cam_id in enumerate(self.camera_ids):
             out[int(cam_id)] = _to_uint8(rgb[idx])
         return out
+
+    def _select_single_sky_state(self) -> Optional[Any]:
+        if self.sky_branch is None:
+            return None
+        states = getattr(self.sky_branch, "node_states_sky", None)
+        if isinstance(states, dict) and states:
+            key = sorted(states.keys(), key=lambda x: str(x))[0]
+            state = states[key]
+            if bool(self.sky_reuse_single_state):
+                states.clear()
+                states[key] = state
+                h_cache = getattr(self.sky_branch, "h_cache_sky", None)
+                if isinstance(h_cache, dict):
+                    h = h_cache.get(key)
+                    h_cache.clear()
+                    if h is not None:
+                        h_cache[key] = h
+            return state
+        return None
+
+    def _get_single_sky_state(self, minimal: Dict[str, Any]) -> Any:
+        if self.sky_branch is None:
+            raise ValueError("sky_branch is not loaded")
+        if bool(self.sky_reuse_single_state) and self._single_sky_state is not None:
+            return self._single_sky_state
+        if self._single_sky_state is None:
+            if hasattr(self.sky_branch, "get_or_init_node_state"):
+                self._single_sky_state = self.sky_branch.get_or_init_node_state(minimal)
+            else:
+                raise ValueError("sky_branch lacks get_or_init_node_state()")
+        return self._single_sky_state
+
+    @torch.no_grad()
+    def _compose_sky_rgb(
+        self,
+        *,
+        minimal: Dict[str, Any],
+        items: List[Dict[str, Any]],
+        scene_rgb: torch.Tensor,
+        scene_alpha: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.sky_branch is None:
+            return scene_rgb
+        state = self._get_single_sky_state(minimal)
+        render_params = self.sky_branch.state_to_render_params(state)
+        sky_rgbs: List[torch.Tensor] = []
+        for item in items:
+            sky_rgb, _sky_alpha = self.sky_branch.render_sky_single_view(
+                render_params,
+                item["view"],
+                int(item["height"]),
+                int(item["width"]),
+            )
+            sky_rgbs.append(sky_rgb.to(device=scene_rgb.device, dtype=scene_rgb.dtype))
+        sky_rgb_stack = torch.stack(sky_rgbs, dim=0)
+        if self.sky_compose_mode == "replace":
+            return sky_rgb_stack.clamp(0.0, 1.0)
+        alpha = scene_alpha.to(device=scene_rgb.device, dtype=scene_rgb.dtype)
+        if alpha.dim() == 3:
+            alpha = alpha.unsqueeze(-1)
+        if alpha.dim() == 4 and int(alpha.shape[-1]) != 1 and int(alpha.shape[1]) == 1:
+            alpha = alpha.permute(0, 2, 3, 1).contiguous()
+        if alpha.dim() != 4 or int(alpha.shape[-1]) != 1:
+            raise ValueError(f"scene_alpha must be [V,H,W,1], got {tuple(scene_alpha.shape)}")
+        sky_weight = (1.0 - alpha.clamp(0.0, 1.0)).mul(float(self.sky_alpha_scale)).clamp(0.0, 1.0)
+        return (scene_rgb + sky_rgb_stack * sky_weight).clamp(0.0, 1.0)
 
     def _discard_history_keep_node_state(self) -> None:
         if not bool(self.discard_history_between_windows):
@@ -716,19 +853,158 @@ class Stage5DemoVideoExporter:
         if hasattr(self.controller, "_clear_display_render_cache"):
             self.controller._clear_display_render_cache()
 
-    def _set_sequence_start_for_window(self, *, window_index: int, start: int) -> None:
+    def _list_scene_ids_for_export(self) -> List[int]:
+        scheduler = self.controller.scheduler
+        if hasattr(scheduler, "list_scene_ids"):
+            return [int(x) for x in scheduler.list_scene_ids()]
+        info = scheduler.get_current_info()
+        return [int(info.get("scene_id", -1))]
+
+    def _list_segment_ids_for_export(self, scene_id: int) -> List[int]:
+        scheduler = self.controller.scheduler
+        if hasattr(scheduler, "list_segment_ids"):
+            return [int(x) for x in scheduler.list_segment_ids(int(scene_id))]
+        info = scheduler.get_current_info()
+        if int(info.get("scene_id", -1)) != int(scene_id):
+            return []
+        return [int(info.get("segment_id", -1))]
+
+    def _select_window_plans(self) -> List[WindowPlan]:
         cur_info = self.controller.scheduler.get_current_info()
+        cur_scene = int(cur_info.get("scene_id", -1))
+        cur_segment = int(cur_info.get("segment_id", -1))
+        cur_start = int(cur_info.get("sequence_start_pos", 0))
+
+        if self.explicit_sequence_starts:
+            plans = [
+                WindowPlan(
+                    scene_id=int(cur_scene),
+                    segment_id=int(cur_segment),
+                    sequence_start_pos=int(start),
+                    timeline_start_pos=float(i * int(self.window_stride)),
+                )
+                for i, start in enumerate(self.explicit_sequence_starts)
+            ]
+            return plans[: int(self.max_windows)] if self.max_windows is not None and int(self.max_windows) > 0 else plans
+
+        if not bool(self.multi_segment) or self.segment_policy == "current":
+            frames = _frames_for_segment(self.dataset, cur_scene, cur_segment)
+            starts = _window_starts_for_frames(
+                num_frames=len(frames),
+                window_size=int(self.window_size),
+                window_stride=int(self.window_stride),
+                require_full_window=bool(self.require_full_window),
+                window_policy=str(self.window_policy),
+            )
+            if (
+                int(cur_start) not in set(int(x) for x in starts)
+                and int(cur_start) >= 0
+                and len(frames[int(cur_start) : int(cur_start) + int(self.window_size)]) > 0
+                and (
+                    not bool(self.require_full_window)
+                    or len(frames[int(cur_start) : int(cur_start) + int(self.window_size)]) >= int(self.window_size)
+                )
+            ):
+                stop = (
+                    len(frames) - int(self.window_size) + 1
+                    if bool(self.require_full_window)
+                    else len(frames)
+                )
+                starts = list(range(int(cur_start), int(stop), int(self.window_stride)))
+            else:
+                starts = [int(x) for x in starts if int(x) >= int(cur_start)]
+            plans = [
+                WindowPlan(
+                    scene_id=int(cur_scene),
+                    segment_id=int(cur_segment),
+                    sequence_start_pos=int(start),
+                    timeline_start_pos=float(int(start) - int(cur_start)),
+                )
+                for start in starts
+            ]
+            return plans[: int(self.max_windows)] if self.max_windows is not None and int(self.max_windows) > 0 else plans
+
+        plans: List[WindowPlan] = []
+        timeline_cursor = 0.0
+        reached_initial = self.segment_policy != "from_initial"
+        scene_ids = self._list_scene_ids_for_export()
+        for scene_id in scene_ids:
+            segment_ids = self._list_segment_ids_for_export(int(scene_id))
+            for segment_id in segment_ids:
+                if self.segment_policy == "from_initial" and not reached_initial:
+                    if int(scene_id) != int(cur_scene) or int(segment_id) != int(cur_segment):
+                        continue
+                    reached_initial = True
+                frames = _frames_for_segment(self.dataset, int(scene_id), int(segment_id))
+                starts = _window_starts_for_frames(
+                    num_frames=len(frames),
+                    window_size=int(self.window_size),
+                    window_stride=int(self.window_stride),
+                    require_full_window=bool(self.require_full_window),
+                    window_policy=str(self.window_policy),
+                )
+                if self.segment_policy == "from_initial" and int(scene_id) == int(cur_scene) and int(segment_id) == int(cur_segment):
+                    if (
+                        int(cur_start) not in set(int(x) for x in starts)
+                        and int(cur_start) >= 0
+                        and len(frames[int(cur_start) : int(cur_start) + int(self.window_size)]) > 0
+                        and (
+                            not bool(self.require_full_window)
+                            or len(frames[int(cur_start) : int(cur_start) + int(self.window_size)]) >= int(self.window_size)
+                        )
+                    ):
+                        stop = (
+                            len(frames) - int(self.window_size) + 1
+                            if bool(self.require_full_window)
+                            else len(frames)
+                        )
+                        starts = list(range(int(cur_start), int(stop), int(self.window_stride)))
+                    else:
+                        starts = [int(x) for x in starts if int(x) >= int(cur_start)]
+                    segment_origin = int(cur_start)
+                else:
+                    starts = [int(x) for x in starts]
+                    segment_origin = int(starts[0]) if starts else 0
+                for start in starts:
+                    plans.append(
+                        WindowPlan(
+                            scene_id=int(scene_id),
+                            segment_id=int(segment_id),
+                            sequence_start_pos=int(start),
+                            timeline_start_pos=float(timeline_cursor + (int(start) - int(segment_origin))),
+                        )
+                    )
+                    if self.max_windows is not None and int(self.max_windows) > 0 and len(plans) >= int(self.max_windows):
+                        return plans
+                if starts:
+                    timeline_cursor += float(max(0, len(frames) - int(segment_origin)))
+        return plans
+
+    def _set_window_scope(self, *, window_index: int, plan: WindowPlan) -> None:
+        cur_info = self.controller.scheduler.get_current_info()
+        cur_scene = int(cur_info.get("scene_id", -1))
+        cur_segment = int(cur_info.get("segment_id", -1))
         cur_start = int(cur_info.get("sequence_start_pos", -1))
-        if int(window_index) == 0 and int(cur_start) == int(start):
+        same_scope = int(cur_scene) == int(plan.scene_id) and int(cur_segment) == int(plan.segment_id)
+        if int(window_index) == 0 and bool(same_scope) and int(cur_start) == int(plan.sequence_start_pos):
             return
-        if str(self.state_carryover) != "node_state":
-            self.controller.set_sequence_start_pos(int(start))
+        if str(self.state_carryover) != "node_state" or not bool(same_scope):
+            if hasattr(self.controller, "set_scope_and_sequence_start_pos"):
+                self.controller.set_scope_and_sequence_start_pos(
+                    int(plan.scene_id),
+                    int(plan.segment_id),
+                    int(plan.sequence_start_pos),
+                )
+            else:
+                if not bool(same_scope):
+                    self.controller.set_scope(int(plan.scene_id), int(plan.segment_id))
+                self.controller.set_sequence_start_pos(int(plan.sequence_start_pos))
             return
         if getattr(self.controller, "busy", False):
             raise ValueError("controller is busy")
         self.controller.busy = True
         try:
-            raw_batch = self.controller.scheduler.set_sequence_start_pos(int(start))
+            raw_batch = self.controller.scheduler.set_sequence_start_pos(int(plan.sequence_start_pos))
             self._discard_history_keep_node_state()
             self.controller._refresh_display_from_raw_batch(
                 raw_batch,
@@ -764,11 +1040,9 @@ class Stage5DemoVideoExporter:
 
     def export(self) -> Dict[str, Any]:
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        starts = _select_sequence_starts(
-            controller=self.controller,
-            explicit_starts=self.explicit_sequence_starts,
-            max_windows=self.max_windows,
-        )
+        plans = self._select_window_plans()
+        if len(plans) == 0:
+            raise ValueError("no valid video windows for export")
         writers = _VideoWriterSet(
             output_dir=self.output_dir,
             base_name=self.base_name,
@@ -789,14 +1063,30 @@ class Stage5DemoVideoExporter:
             "subframes_per_source_interval": int(self.subframes_per_interval),
             "window_size": int(self.window_size),
             "window_stride": int(self.window_stride),
+            "require_full_window": bool(self.require_full_window),
+            "window_policy": str(self.window_policy),
+            "multi_segment": bool(self.multi_segment),
+            "segment_policy": str(self.segment_policy),
             "transition_frames_before": int(self.transition_frames_before),
             "transition_frames_after": int(self.transition_frames_after),
             "state_carryover": str(self.state_carryover),
             "discard_history_between_windows": bool(self.discard_history_between_windows),
+            "sky_enabled": bool(self.sky_enabled),
+            "sky_reuse_single_state": bool(self.sky_reuse_single_state),
+            "sky_update_during_video": bool(self.sky_update_during_video),
+            "sky_compose_mode": str(self.sky_compose_mode),
             "input_offsets": [int(x) for x in self.input_offsets],
             "camera_ids": [int(x) for x in self.camera_ids],
             "camera_names": [str(x) for x in self.camera_names],
-            "sequence_starts": [int(x) for x in starts],
+            "windows": [
+                {
+                    "scene_id": int(plan.scene_id),
+                    "segment_id": int(plan.segment_id),
+                    "sequence_start_pos": int(plan.sequence_start_pos),
+                    "timeline_start_pos": float(plan.timeline_start_pos),
+                }
+                for plan in plans
+            ],
             "videos": {k: str(v) for k, v in writers.paths.items()},
             "all_frames_dir": str(all_frames_dir) if self.save_all_images else None,
             "samples": [],
@@ -804,20 +1094,23 @@ class Stage5DemoVideoExporter:
         total_rendered_samples = 0
         total_stitched_samples = 0
         try:
-            for window_index, start in enumerate(starts):
-                self._set_sequence_start_for_window(window_index=int(window_index), start=int(start))
+            for window_index, plan in enumerate(plans):
+                self._set_window_scope(window_index=int(window_index), plan=plan)
                 stats = self.controller.run_episode()
                 scene_id = int(stats.get("scene_id", self.controller.scheduler.get_current_info().get("scene_id", -1)))
                 segment_id = int(
                     stats.get("segment_id", self.controller.scheduler.get_current_info().get("segment_id", -1))
                 )
-                segment_frames = _frames_for_segment(self.dataset, scene_id, segment_id)
-                window_frames = segment_frames[int(start) : int(start) + int(self.window_size)]
-                if len(window_frames) < int(self.window_size):
+                if int(scene_id) != int(plan.scene_id) or int(segment_id) != int(plan.segment_id):
                     raise ValueError(
-                        f"sequence_start_pos={start} only has {len(window_frames)} frames, "
-                        f"expected window_size={self.window_size}"
+                        "scheduler scope mismatch after selecting video window: "
+                        f"expected scene={plan.scene_id} segment={plan.segment_id}, got scene={scene_id} segment={segment_id}"
                     )
+                segment_frames = _frames_for_segment(self.dataset, scene_id, segment_id)
+                start = int(plan.sequence_start_pos)
+                window_frames = segment_frames[int(start) : int(start) + int(self.window_size)]
+                if len(window_frames) == 0:
+                    raise ValueError(f"sequence_start_pos={start} has no frames")
                 next_frame_id = None
                 tail_pos = int(start) + int(self.window_size)
                 if bool(self.include_tail_interval) and tail_pos < len(segment_frames):
@@ -835,14 +1128,16 @@ class Stage5DemoVideoExporter:
                     next_frame_id=next_frame_id,
                     window_index=int(window_index),
                     sequence_start_pos=int(start),
+                    timeline_start_pos=float(plan.timeline_start_pos),
                 )
                 logger.info(
-                    "video window %d/%d scene=%d segment=%d start=%d frames=%s samples=%d",
+                    "video window %d/%d scene=%d segment=%d start=%d timeline=%.3f frames=%s samples=%d",
                     int(window_index) + 1,
-                    len(starts),
+                    len(plans),
                     scene_id,
                     segment_id,
                     int(start),
+                    float(plan.timeline_start_pos),
                     [int(x) for x in window_frames],
                     len(samples),
                 )
@@ -875,7 +1170,10 @@ class Stage5DemoVideoExporter:
                             "rendered_index": int(total_rendered_samples),
                             "stitched_frame_index": stitched_frame_index,
                             "window_index": int(sample.window_index),
+                            "scene_id": int(scene_id),
+                            "segment_id": int(segment_id),
                             "sequence_start_pos": int(sample.sequence_start_pos),
+                            "timeline_start_pos": float(plan.timeline_start_pos),
                             "frame0": int(sample.frame0),
                             "frame1": int(sample.frame1),
                             "alpha": float(sample.alpha),

@@ -162,6 +162,45 @@ def test_v8_random_history_targets_sample_from_visited_blocks():
     assert [int(x) for x in aligned["target_frame_indices"]] == [12, 10, 11]
 
 
+def test_v8_segment_frame_source_mode_visits_every_segment_frame():
+    ds = _make_mock_dataset()
+    sidx = _make_sidx_multi_frame_per_keyframe(scene_id=1, segment_id=0, base_frame=10)
+    ds.get_segment_index = MagicMock(return_value=sidx)
+    sch = TrainSchedulerV8(
+        dataset=ds,
+        steps_per_block=1,
+        blocks_per_episode=len(sidx.frame_indices),
+        total_target_frames=3,
+        include_source_frame=True,
+        frame_within_keyframe_policy="middle_frame",
+        min_keyframes_required_policy="skip_if_less_than_window",
+        traversal_mode="linear_scene_segment",
+        switch_after_episode=True,
+        segment_order="ascending",
+        scene_order="ascending",
+        include_test=False,
+        fixed_scene_id=1,
+        fixed_segment_id=0,
+        emit_preload_hints=False,
+        warm_next_block_exact=False,
+        warm_next_episode_chain=False,
+        block_order="block_major",
+        target_policy="visited_episode_frames",
+        history_target_policy="random_visited",
+        reset_policy="episode_end",
+        episode_source_mode="segment_frames",
+    )
+
+    seen_sources = []
+    for _ in range(len(sidx.frame_indices)):
+        batch = sch.next_batch()
+        info = batch["_scheduler_v8_aligned_info"]
+        seen_sources.append(int(info["source_frame_idx"]))
+
+    assert seen_sources == [int(x) for x in sidx.frame_indices]
+    assert str(info["episode_source_mode"]) == "segment_frames"
+
+
 def test_v8_fast_fail_total_target_frames_larger_than_blocks():
     ds = _make_mock_dataset()
     with pytest.raises(ValueError, match="total_target_frames must be <= blocks_per_episode"):

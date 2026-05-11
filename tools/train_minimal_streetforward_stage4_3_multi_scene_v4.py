@@ -83,6 +83,8 @@ current_time = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
 CKPT_PREFIX = "minimal_sf_stage4_3_multi_scene_v4"
 TRAINER_CLASS = MinimalStreetForwardStage4_3
 DEFAULT_CONFIG_FILE = "configs/minimal_streetforward_stage4_3_multi_scene_v4.yaml"
+ALLOW_ONE_SEGMENT = False
+EPISODE_END_HOOK = None
 
 
 def _scene_dir_str(scene_id: Any) -> str:
@@ -1272,19 +1274,25 @@ def main() -> None:
             int(train_monitor_min_valid_pixels),
         )
 
-    if cfg.get("one_segment") is not None:
+    allow_one_segment = bool(globals().get("ALLOW_ONE_SEGMENT", False))
+    if cfg.get("one_segment") is not None and not allow_one_segment:
         raise ValueError(
             "multi_scene training: remove `one_segment` from config; "
             f"use {DEFAULT_CONFIG_FILE}."
         )
     train_ids = list(cfg.data.train_scene_ids)
-    if len(train_ids) < 2:
+    if len(train_ids) < 2 and not allow_one_segment:
         raise ValueError("multi_scene training requires len(data.train_scene_ids) >= 2")
     fixed_scene_id, fixed_segment_id = resolve_fixed_scene_segment(cfg)
-    if fixed_scene_id is not None or fixed_segment_id is not None:
+    if (fixed_scene_id is not None or fixed_segment_id is not None) and not allow_one_segment:
         raise ValueError(
             "multi_scene training requires scheduler traversal fixed_scene_id and fixed_segment_id to be null "
             "(unset one_segment and traversal overrides)."
+        )
+    if allow_one_segment and (fixed_scene_id is None or fixed_segment_id is None):
+        raise ValueError(
+            "one-segment training requires one_segment.scene_id/segment_id or "
+            "scheduler traversal fixed_scene_id/fixed_segment_id."
         )
 
     logger.info(
@@ -1609,6 +1617,7 @@ def main() -> None:
     enable_block_exit_record = bool(model_stage in {"5_2", "5_3"}) and bool(
         str(history_cfg.get("record_on", "")) == "block_exit"
     )
+    episode_end_hook = globals().get("EPISODE_END_HOOK")
 
     try:
         metrics_fh = _open_metrics_history(
@@ -1649,9 +1658,12 @@ def main() -> None:
 
             step_events = scheduler.pop_events()
             validation_due_episode_counters: List[int] = []
+            hook_due_episode_counters: List[int] = []
             for ev in step_events:
                 if ev.get("type") == "episode_end":
                     train_episode_counter += 1
+                    if callable(episode_end_hook):
+                        hook_due_episode_counters.append(int(train_episode_counter))
                     if bool(validation_v7_cfg.eval_enable):
                         if train_episode_counter % int(validation_v7_cfg.validate_every_n_episodes) == 0:
                             validation_due_episode_counters.append(int(train_episode_counter))
@@ -1659,6 +1671,7 @@ def main() -> None:
             if scheduler_node_sync is None:
                 scheduler_node_sync = _build_scheduler_node_sync_v8_fallback(cfg, scheduler_info, step_events)
             defer_node_state_reset_for_block_exit_record = False
+            defer_node_state_reset_for_episode_hook = False
             if (
                 enable_block_exit_record
                 and scheduler_node_sync is not None
@@ -1669,6 +1682,15 @@ def main() -> None:
                 scheduler_node_sync = dict(scheduler_node_sync)
                 scheduler_node_sync["reset_after_block"] = False
                 defer_node_state_reset_for_block_exit_record = True
+            if (
+                callable(episode_end_hook)
+                and scheduler_node_sync is not None
+                and bool(scheduler_node_sync.get("reset_after_block", False))
+                and any(ev.get("type") == "episode_end" for ev in step_events)
+            ):
+                scheduler_node_sync = dict(scheduler_node_sync)
+                scheduler_node_sync["reset_after_block"] = False
+                defer_node_state_reset_for_episode_hook = True
             for ev in step_events:
                 if ev.get("type") == "segment_begin":
                     logger.info(
@@ -1857,7 +1879,7 @@ def main() -> None:
                             float(rec_metrics.get("stage5_2_history_rigid_error_mean", 0.0)),
                             tb_step,
                         )
-                if defer_node_state_reset_for_block_exit_record:
+                if defer_node_state_reset_for_block_exit_record and not defer_node_state_reset_for_episode_hook:
                     model.reset_node_state()
             loss_val = float(result["loss"])
             pred_rgbs = result["pred_rgbs"]
@@ -2378,6 +2400,26 @@ def main() -> None:
                 block_end_monitor_ms += float((time.perf_counter() - block_end_t0) * 1000.0)
 
             validation_ms = 0.0
+            if callable(episode_end_hook) and len(hook_due_episode_counters) > 0:
+                val_t0 = time.perf_counter()
+                for ep_counter in hook_due_episode_counters:
+                    episode_end_hook(
+                        cfg=cfg,
+                        dataset=dataset,
+                        model=model,
+                        device=device,
+                        trigger_train_episode_counter=int(ep_counter),
+                        trigger_step=int(step),
+                        minimal_batch=minimal_batch,
+                        scheduler_info=scheduler_info,
+                        step_events=step_events,
+                        psnr_metric=psnr_metric,
+                        ssim_metric=ssim_metric,
+                        lpips_metric=lpips_metric,
+                        metrics_fh=metrics_fh,
+                        writer=writer,
+                    )
+                validation_ms += float((time.perf_counter() - val_t0) * 1000.0)
             if bool(validation_v7_cfg.eval_enable) and len(validation_due_episode_counters) > 0:
                 val_t0 = time.perf_counter()
                 for ep_counter in validation_due_episode_counters:
@@ -2396,7 +2438,9 @@ def main() -> None:
                         metrics_fh=metrics_fh,
                         writer=writer,
                     )
-                validation_ms = float((time.perf_counter() - val_t0) * 1000.0)
+                validation_ms += float((time.perf_counter() - val_t0) * 1000.0)
+            if defer_node_state_reset_for_episode_hook:
+                model.reset_node_state()
 
             checkpoint_ms = 0.0
             if save_every and step > 0 and step % save_every == 0:

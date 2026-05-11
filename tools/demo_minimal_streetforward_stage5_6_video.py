@@ -5,7 +5,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from omegaconf import OmegaConf
@@ -126,6 +126,80 @@ def _load_checkpoint(model: torch.nn.Module, ckpt_path: str, *, mode: str, stric
     return int(ckpt_step)
 
 
+def _collapse_sky_runtime_to_single_state(sky_branch: Any) -> Optional[Any]:
+    states = getattr(sky_branch, "node_states_sky", None)
+    if not isinstance(states, dict) or len(states) == 0:
+        return None
+    key = sorted(states.keys(), key=lambda x: str(x))[0]
+    state = states[key]
+    states.clear()
+    states[key] = state
+    h_cache = getattr(sky_branch, "h_cache_sky", None)
+    if isinstance(h_cache, dict):
+        h = h_cache.get(key)
+        h_cache.clear()
+        if h is not None:
+            h_cache[key] = h
+    return state
+
+
+def _load_video_sky_branch_from_cfg(cfg: Any, device: torch.device) -> Optional[Any]:
+    video_cfg = cfg.get("video") or {}
+    sky_cfg = video_cfg.get("sky") or {}
+    if not bool(sky_cfg.get("enable", False)):
+        return None
+    config_file = str(sky_cfg.get("config_file") or "")
+    checkpoint = str(sky_cfg.get("checkpoint") or sky_cfg.get("path") or "")
+    if not config_file:
+        raise ValueError("video.sky.config_file is required when video.sky.enable=true")
+    if not checkpoint:
+        raise ValueError("video.sky.checkpoint is required when video.sky.enable=true")
+
+    from models.streetforward.sky_branch import SkyBranchV0
+
+    sky_model_cfg = OmegaConf.load(config_file)
+    sky_branch = SkyBranchV0(sky_model_cfg, device=device).to(device)
+    payload = torch.load(checkpoint, map_location="cpu")
+    if not isinstance(payload, dict):
+        raise TypeError(f"SkyBranch checkpoint must be dict-like, got {type(payload).__name__}")
+    state = payload.get("sky_branch_state_dict") or payload.get("model_state_dict") or payload.get("state_dict") or payload
+    if not isinstance(state, dict):
+        raise TypeError(f"SkyBranch checkpoint state must be dict-like, got {type(state).__name__}")
+    strict = bool(sky_cfg.get("strict", True))
+    incompatible = sky_branch.load_state_dict(state, strict=strict)
+    missing = list(getattr(incompatible, "missing_keys", []))
+    unexpected = list(getattr(incompatible, "unexpected_keys", []))
+    if bool(sky_cfg.get("freeze_params", True)):
+        for p in sky_branch.parameters():
+            p.requires_grad_(False)
+    sky_branch.eval()
+
+    loaded_runtime = False
+    if bool(sky_cfg.get("load_runtime_state", True)):
+        if payload.get("node_states_sky"):
+            sky_branch.load_runtime_state_dict(payload)
+            loaded_runtime = True
+        elif bool(sky_cfg.get("require_runtime_state", True)):
+            raise ValueError(
+                "video.sky.load_runtime_state=true but checkpoint has no node_states_sky. "
+                "Use a skybranch_resume checkpoint or set video.sky.require_runtime_state=false."
+            )
+    else:
+        sky_branch.reset_runtime_state()
+    single_state = _collapse_sky_runtime_to_single_state(sky_branch) if bool(sky_cfg.get("reuse_single_state", True)) else None
+    logger.info(
+        "Loaded frozen SkyBranch for demo video checkpoint=%s strict=%s missing=%d unexpected=%d "
+        "runtime_state=%s single_state=%s",
+        checkpoint,
+        strict,
+        len(missing),
+        len(unexpected),
+        loaded_runtime,
+        single_state is not None,
+    )
+    return sky_branch
+
+
 def _load_cfg(args: argparse.Namespace) -> Any:
     cfg = OmegaConf.load(args.config_file)
     base_cfg_file = cfg.get("base_config_file")
@@ -198,6 +272,16 @@ def _configured_scene_ids(cfg: Any) -> List[int]:
     return [int(x) for x in _as_list(raw)]
 
 
+def _train_frames_for_segment(dataset: Any, scene_id: int, segment_id: int) -> List[int]:
+    sidx = dataset.get_segment_index(int(scene_id), int(segment_id))
+    frames = [int(x) for x in sorted(sidx.frame_indices)]
+    train_frame_set = getattr(sidx, "train_frame_set", None)
+    if train_frame_set is not None:
+        train_set = set(int(x) for x in train_frame_set)
+        frames = [int(f) for f in frames if int(f) in train_set]
+    return frames
+
+
 def _resolve_initial_scope_from_cfg(cfg: Any, dataset: Any) -> Tuple[int, int]:
     scheduler_cfg = (cfg.get("demo") or {}).get("scheduler") or {}
     batch_dataset_cfg = (cfg.get("batch_eval") or {}).get("dataset") or {}
@@ -222,14 +306,80 @@ def _resolve_initial_scope_from_cfg(cfg: Any, dataset: Any) -> Tuple[int, int]:
     return int(scene_id), int(segment_id)
 
 
+def _patch_initial_sequence_start_from_cfg(cfg: Any, dataset: Any) -> None:
+    if cfg.get("demo") is None:
+        cfg.demo = {}
+    if cfg.demo.get("scheduler") is None:
+        cfg.demo.scheduler = {}
+    scheduler_cfg = cfg.demo.scheduler
+    if scheduler_cfg.get("initial_sequence_start_pos") is not None:
+        return
+    batch_dataset_cfg = (cfg.get("batch_eval") or {}).get("dataset") or {}
+    start_at = batch_dataset_cfg.get("start_at") or {}
+    if not hasattr(start_at, "get"):
+        return
+    raw_scene = start_at.get("scene_id")
+    raw_segment = start_at.get("segment_id")
+    if raw_scene is None or raw_segment is None:
+        return
+    start_scene = int(raw_scene)
+    start_segment = int(raw_segment)
+    configured_initial_scene = scheduler_cfg.get("initial_scene_id")
+    configured_initial_segment = scheduler_cfg.get("initial_segment_id")
+    if configured_initial_scene is not None and int(configured_initial_scene) != int(start_scene):
+        return
+    if configured_initial_segment is not None and int(configured_initial_segment) != int(start_segment):
+        return
+    if start_at.get("sequence_start_pos") is not None:
+        start_pos = int(start_at.get("sequence_start_pos"))
+    elif start_at.get("frame_id") is not None:
+        frame_id = int(start_at.get("frame_id"))
+        frames = _train_frames_for_segment(dataset, start_scene, start_segment)
+        if frame_id not in set(frames):
+            preview = frames[:5] + (["..."] if len(frames) > 10 else []) + frames[-5:]
+            raise ValueError(
+                "batch_eval.dataset.start_at.frame_id is not in train frames: "
+                f"scene={start_scene} segment={start_segment} frame_id={frame_id} "
+                f"available_count={len(frames)} available_preview={preview}"
+            )
+        start_pos = [int(x) for x in frames].index(int(frame_id))
+    else:
+        return
+    scheduler_cfg.initial_scene_id = int(start_scene)
+    scheduler_cfg.initial_segment_id = int(start_segment)
+    scheduler_cfg.initial_sequence_start_pos = int(start_pos)
+    logger.info(
+        "Demo video initial start resolved from batch_eval.dataset.start_at: scene_id=%d segment_id=%d start_pos=%d",
+        int(start_scene),
+        int(start_segment),
+        int(start_pos),
+    )
+
+
 def _initialize_dataset_for_video(cfg: Any, dataset: Any) -> None:
     video_cfg = cfg.get("video") or {}
     init_scope = str(video_cfg.get("dataset_init_scope", "active_segment")).strip().lower()
     if init_scope in ("all", "full", "training_assets"):
         dataset.initialize()
         return
+    if init_scope in ("selected_segments", "video_segments", "configured_segments"):
+        scene_ids = _configured_scene_ids(cfg)
+        if not scene_ids:
+            scene_ids = [int(x) for x in dataset.list_training_scene_ids()]
+        count = 0
+        for scene_id in scene_ids:
+            for segment_id in dataset.list_segment_ids(int(scene_id)):
+                dataset.get_segment_index(int(scene_id), int(segment_id))
+                count += 1
+        setattr(dataset, "_initialized", True)
+        logger.info(
+            "Demo video dataset initialized for selected segments: scenes=%s segments=%d",
+            [int(x) for x in scene_ids],
+            int(count),
+        )
+        return
     if init_scope not in ("active_segment", "current_segment", "demo_segment"):
-        raise ValueError("video.dataset_init_scope must be active_segment or all")
+        raise ValueError("video.dataset_init_scope must be active_segment, selected_segments, or all")
     scene_id, segment_id = _resolve_initial_scope_from_cfg(cfg, dataset)
     # Avoid MultiSceneDatasetV4.initialize(), which validates every segment in
     # data.train_scene_ids. For demo video we only need the selected segment.
@@ -273,7 +423,7 @@ def _patch_cfg_for_video(cfg: Any, args: argparse.Namespace) -> None:
     cfg.demo.scheduler.input_offsets = [int(x) for x in input_offsets]
     cfg.demo.scheduler.eval_offsets = "all"
     cfg.demo.scheduler.stride = int(window_stride)
-    cfg.demo.scheduler.require_full_window = bool(recon_cfg.get("require_full_window", True))
+    cfg.demo.scheduler.require_full_window = bool(recon_cfg.get("require_full_window", False))
     cfg.demo.scheduler.window_policy = str(recon_cfg.get("window_policy", "sliding"))
     cfg.demo.scheduler.steps_per_input = int(steps_per_input)
     cfg.demo.scheduler.block_order = str(recon_cfg.get("block_order", cfg.demo.scheduler.get("block_order", "block_major")))
@@ -358,6 +508,8 @@ def main() -> None:
 
     dataset = build_multi_scene_dataset_v4_for_demo(cfg, device)
     _initialize_dataset_for_video(cfg, dataset)
+    _patch_initial_sequence_start_from_cfg(cfg, dataset)
+    OmegaConf.save(config=cfg, f=os.path.join(str(cfg.log_dir), "config.yaml"))
     scheduler = build_stage5_demo_scheduler_from_cfg(cfg, dataset, device=device)
     trainer = MinimalStreetForwardStage5_6_Production(config=cfg, device=device).to(device)
     if hasattr(trainer, "bind_eval_dataset"):
@@ -391,6 +543,7 @@ def main() -> None:
         for p in trainer.parameters():
             p.requires_grad_(False)
         trainer.eval()
+    sky_branch = _load_video_sky_branch_from_cfg(cfg, device)
 
     controller = Stage5DemoController(
         cfg=cfg,
@@ -412,6 +565,7 @@ def main() -> None:
         controller=controller,
         device=device,
         output_dir=out_dir,
+        sky_branch=sky_branch,
     )
     metadata = exporter.export()
     logger.info("Stage5_6 demo video complete: %s", metadata.get("videos"))

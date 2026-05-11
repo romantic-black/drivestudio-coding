@@ -908,7 +908,10 @@ class Stage5_6EvalDemoScheduler:
             return int(starts[0])
         start = int(initial_start)
         if start not in set(starts):
-            raise ValueError(f"initial_sequence_start_pos={start} is invalid, valid starts begin {starts[:12]}")
+            frames = self._frames_for_segment(int(self.scene_id), int(self.segment_id))
+            window_len = len(frames[int(start) : int(start) + int(self.sequence_length)]) if int(start) >= 0 else 0
+            if window_len == 0 or (self.require_full_window and window_len < int(self.sequence_length)):
+                raise ValueError(f"initial_sequence_start_pos={start} is invalid, valid starts begin {starts[:12]}")
         return int(start)
 
     def _make_refs(self, frames: List[int], camera_ids: List[int]) -> List[ImageRef]:
@@ -922,18 +925,29 @@ class Stage5_6EvalDemoScheduler:
             raise ValueError(
                 f"window start={start} has len={len(window_frames)} < sequence_length={self.sequence_length}"
             )
+        if len(window_frames) == 0:
+            raise ValueError(f"window start={start} has no frames")
         frame_offsets = list(range(len(window_frames)))
-        eval_offsets = resolve_eval_offsets(self.eval_offsets_any, sequence_length=int(self.sequence_length))
+        eval_sequence_length = int(self.sequence_length) if self.require_full_window else int(len(window_frames))
+        eval_offsets = resolve_eval_offsets(self.eval_offsets_any, sequence_length=int(eval_sequence_length))
         input_offsets: List[int] = []
         for off in self.input_offsets:
             if int(off) < 0 or int(off) >= len(window_frames):
-                raise ValueError(f"input offset={off} out of range for window len={len(window_frames)}")
+                if self.require_full_window:
+                    raise ValueError(f"input offset={off} out of range for window len={len(window_frames)}")
+                continue
             input_offsets.append(int(off))
+        if len(input_offsets) == 0:
+            input_offsets = [0]
         mapped_eval_offsets: List[int] = []
         for off in eval_offsets:
             if int(off) < 0 or int(off) >= len(window_frames):
-                raise ValueError(f"eval offset={off} out of range for window len={len(window_frames)}")
+                if self.require_full_window:
+                    raise ValueError(f"eval offset={off} out of range for window len={len(window_frames)}")
+                continue
             mapped_eval_offsets.append(int(off))
+        if len(mapped_eval_offsets) == 0:
+            mapped_eval_offsets = [int(x) for x in frame_offsets]
         input_frame_ids = [int(window_frames[o]) for o in input_offsets]
         eval_frame_ids = [int(window_frames[o]) for o in mapped_eval_offsets]
         uid = f"scene{int(self.scene_id):03d}_seg{int(self.segment_id):03d}_start{int(start):06d}"
@@ -1085,9 +1099,6 @@ class Stage5_6EvalDemoScheduler:
         self._visited_blocks.add(int(block_idx))
         self._global_model_update_step += 1
         self._block_idx_global = int(self._spec.episode_idx) * int(max(len(self._spec.input_frame_ids), 1)) + int(block_idx)
-        next_cursor = int(self._visit_cursor) + 1
-        next_block = int(self._visit_order[next_cursor]) if next_cursor < len(self._visit_order) else None
-        block_exit = next_block is None or int(next_block) != int(block_idx)
         self._emit(
             {
                 "type": "demo_step",
@@ -1097,32 +1108,60 @@ class Stage5_6EvalDemoScheduler:
                 "block_idx_in_episode": int(block_idx),
                 "block_repeat_step": int(self._local_step_by_block[block_idx]),
                 "segment_local_step": int(self._global_model_update_step),
-                "block_exit": bool(block_exit),
+                "block_exit": False,
             }
         )
-        if block_exit:
+        self._last_info = self._build_info(reason="mark_updated")
+
+    def _set_manual_block(self, block_idx: int, *, reason: str) -> Dict[str, Any]:
+        if len(self._visit_order) == 0:
+            raise ValueError("cannot navigate block in empty eval episode")
+        num_blocks = int(len(self._spec.input_frame_ids))
+        if num_blocks < 1:
+            raise ValueError("cannot navigate block in eval episode with no input frames")
+        target = int(block_idx) % int(num_blocks)
+        old_block = int(self._current_block_idx())
+        if old_block >= 0:
             self._emit(
                 {
                     "type": "demo_block_exit",
                     "manual": True,
-                    "model_update": True,
-                    "consumed_step": True,
-                    "block_idx_in_episode": int(block_idx),
-                    "block_repeat_step": int(self._local_step_by_block[block_idx]),
-                }
-            )
-        self._visit_cursor = int(next_cursor)
-        if block_exit and not self.is_episode_done():
-            self._emit(
-                {
-                    "type": "demo_block_enter",
-                    "manual": True,
                     "model_update": False,
                     "consumed_step": False,
-                    "block_idx_in_episode": int(self._current_block_idx()),
+                    "block_idx_in_episode": int(old_block),
+                    "block_repeat_step": int(self._local_step_by_block[old_block])
+                    if old_block < len(self._local_step_by_block)
+                    else 0,
+                    "reason": str(reason),
                 }
             )
-        self._last_info = self._build_info(reason="mark_updated")
+        matches = [i for i, b in enumerate(self._visit_order) if int(b) == int(target)]
+        if len(matches) == 0:
+            raise ValueError(f"block_idx={target} is not present in eval visit order")
+        self._visit_cursor = int(matches[0])
+        self._block_idx_global = int(self._spec.episode_idx) * int(max(len(self._spec.input_frame_ids), 1)) + int(target)
+        self._last_batch = None
+        self._last_info = self._build_info(reason=str(reason))
+        self._emit(
+            {
+                "type": "demo_block_enter",
+                "manual": True,
+                "model_update": False,
+                "consumed_step": False,
+                "block_idx_in_episode": int(target),
+                "block_repeat_step": int(self._local_step_by_block[target])
+                if target < len(self._local_step_by_block)
+                else 0,
+                "reason": str(reason),
+            }
+        )
+        return self.materialize_current_batch_without_advance()
+
+    def next_block(self) -> Dict[str, Any]:
+        return self._set_manual_block(int(self._current_block_idx()) + 1, reason="manual_next_block")
+
+    def prev_block(self) -> Dict[str, Any]:
+        return self._set_manual_block(int(self._current_block_idx()) - 1, reason="manual_prev_block")
 
     def pop_events(self) -> List[Dict[str, Any]]:
         out = [dict(x) for x in self._events]
@@ -1149,7 +1188,14 @@ class Stage5_6EvalDemoScheduler:
             raise ValueError(f"segment_id={segment_id} is invalid for scene_id={scene_id}, valid={seg_ids}")
         starts = self._window_starts(int(scene_id), int(segment_id))
         if int(sequence_start_pos) not in set(starts):
-            raise ValueError(f"sequence_start_pos={sequence_start_pos} is invalid, valid starts begin {starts[:12]}")
+            frames = self._frames_for_segment(int(scene_id), int(segment_id))
+            window_len = (
+                len(frames[int(sequence_start_pos) : int(sequence_start_pos) + int(self.sequence_length)])
+                if int(sequence_start_pos) >= 0
+                else 0
+            )
+            if window_len == 0 or (self.require_full_window and window_len < int(self.sequence_length)):
+                raise ValueError(f"sequence_start_pos={sequence_start_pos} is invalid, valid starts begin {starts[:12]}")
         old_scene = int(self.scene_id)
         old_segment = int(self.segment_id)
         old_start = int(self.sequence_start_pos)
@@ -1190,6 +1236,19 @@ class Stage5_6EvalDemoScheduler:
             segment_id=int(self.segment_id),
             sequence_start_pos=int(sequence_start_pos),
             reason="set_sequence_start_pos",
+        )
+
+    def set_scope_and_sequence_start_pos(
+        self,
+        scene_id: int,
+        segment_id: int,
+        sequence_start_pos: int,
+    ) -> Dict[str, Any]:
+        return self._set_scope_and_start(
+            scene_id=int(scene_id),
+            segment_id=int(segment_id),
+            sequence_start_pos=int(sequence_start_pos),
+            reason="set_scope_and_sequence_start_pos",
         )
 
     def set_scene(self, scene_id: int) -> Dict[str, Any]:
@@ -1490,11 +1549,92 @@ class Stage5_6TrainV8DemoScheduler:
         batch = self.scheduler.materialize_current_batch_without_advance()
         return self._decorate_batch(batch, reason="materialize")
 
+    def _mark_current_block_updated_without_advance(self) -> Dict[str, Any]:
+        st = self.scheduler.current_episode_state
+        if st is None:
+            raise ValueError("TrainSchedulerV8 internal state is not initialized")
+        key = (int(st["scene_id"]), int(st["segment_id"]))
+        rt = self.scheduler._segment_runtime[key]
+        rt["segment_local_step"] = int(rt["segment_local_step"]) + 1
+        block_idx = int(st["block_cursor"])
+        if str(self.scheduler.block_order) == "step_major":
+            st["block_update_counts"][block_idx] = int(st["block_update_counts"][block_idx]) + 1
+            st["block_repeat_step"] = int(st["block_update_counts"][block_idx])
+        else:
+            st["block_repeat_step"] = int(st["block_repeat_step"]) + 1
+            if isinstance(st.get("block_update_counts"), list) and block_idx < len(st["block_update_counts"]):
+                st["block_update_counts"][block_idx] = int(st["block_update_counts"][block_idx]) + 1
+        st["episode_step_cursor"] = int(st.get("episode_step_cursor", 0)) + 1
+        st["visited_block_indices"].add(int(block_idx))
+        self.scheduler.global_step += 1
+        aligned = self.scheduler._aligned_info(st)
+        self._emit(
+            {
+                "type": "demo_step",
+                "manual": True,
+                "model_update": True,
+                "consumed_step": True,
+                "block_idx_in_episode": int(block_idx),
+                "block_repeat_step": int(st["block_repeat_step"]),
+                "segment_local_step": int(rt["segment_local_step"]),
+                "block_exit": False,
+            }
+        )
+        return dict(aligned)
+
     def next_batch_for_update(self) -> Dict[str, Any]:
         if self.is_episode_done():
             raise ValueError("current train-v8 demo episode is done; use Next Episode / Reset Segment.")
-        batch = self.scheduler.next_batch()
+        batch = self.scheduler.materialize_current_batch_without_advance()
+        aligned = self._mark_current_block_updated_without_advance()
+        batch["_scheduler_v4_aligned_info"] = dict(aligned)
+        batch["_scheduler_v7_aligned_info"] = dict(aligned)
+        batch["_scheduler_v8_aligned_info"] = dict(aligned)
+        batch.pop("_scheduler_v7_peek", None)
+        batch.pop("_scheduler_v8_peek", None)
         return self._decorate_batch(batch, reason="next_batch")
+
+    def _move_block(self, delta: int, *, reason: str) -> Dict[str, Any]:
+        st = self.scheduler.current_episode_state
+        if st is None:
+            raise ValueError("current train-v8 demo episode is done; use Next Episode / Reset Segment.")
+        num_blocks = int(getattr(self.scheduler, "blocks_per_episode", 0))
+        if num_blocks < 1:
+            raise ValueError("cannot navigate block in train-v8 episode with no blocks")
+        old_block = int(st["block_cursor"])
+        target = int(old_block + int(delta)) % int(num_blocks)
+        self._emit(
+            {
+                "type": "demo_block_exit",
+                "manual": True,
+                "model_update": False,
+                "consumed_step": False,
+                "block_idx_in_episode": int(old_block),
+                "block_repeat_step": int(st.get("block_repeat_step", 0)),
+                "reason": str(reason),
+            }
+        )
+        self.scheduler._select_block(int(target))
+        self._last_raw_batch = None
+        self._last_info = self._build_info(reason=str(reason))
+        self._emit(
+            {
+                "type": "demo_block_enter",
+                "manual": True,
+                "model_update": False,
+                "consumed_step": False,
+                "block_idx_in_episode": int(target),
+                "block_repeat_step": int(st.get("block_repeat_step", 0)),
+                "reason": str(reason),
+            }
+        )
+        return self.materialize_current_batch_without_advance()
+
+    def next_block(self) -> Dict[str, Any]:
+        return self._move_block(+1, reason="manual_next_block")
+
+    def prev_block(self) -> Dict[str, Any]:
+        return self._move_block(-1, reason="manual_prev_block")
 
     def pop_events(self) -> List[Dict[str, Any]]:
         out = [dict(x) for x in self._events]

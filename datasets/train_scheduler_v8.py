@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import random
-from typing import Any, Dict, List, Optional, Sequence, Set
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from datasets.train_scheduler_v7 import SegmentIndexLike, TrainSchedulerDatasetV7, TrainSchedulerV7
 
@@ -46,6 +46,7 @@ class TrainSchedulerV8(TrainSchedulerV7):
         near_random_supervision_cfg: Optional[Any] = None,
         aux_feature_splat_targets_cfg: Optional[Any] = None,
         block_source_frame_policy: str = "fixed_once_per_episode",
+        episode_source_mode: str = "keyframes",
     ) -> None:
         if total_target_frames < 1:
             raise ValueError("scheduler_v8.episode.total_target_frames must be >= 1")
@@ -72,10 +73,20 @@ class TrainSchedulerV8(TrainSchedulerV7):
             )
         self.reset_policy = str(reset_policy)
         self.block_source_frame_policy = str(block_source_frame_policy)
+        self.episode_source_mode = str(episode_source_mode).strip().lower()
+        if self.episode_source_mode not in ("keyframes", "segment_frames"):
+            raise ValueError(
+                "scheduler_v8.episode.source_mode must be one of ['keyframes', 'segment_frames']"
+            )
         if self.block_source_frame_policy not in ("fixed_once_per_episode", "random_within_keyframe_per_visit"):
             raise ValueError(
                 "scheduler_v8.episode.block_source_frame_policy must be one of "
                 "['fixed_once_per_episode', 'random_within_keyframe_per_visit']"
+            )
+        if self.episode_source_mode == "segment_frames" and self.block_source_frame_policy != "fixed_once_per_episode":
+            raise ValueError(
+                "scheduler_v8.episode.source_mode=segment_frames requires "
+                "block_source_frame_policy=fixed_once_per_episode"
             )
         self.near_random_cfg = near_random_supervision_cfg or {}
         self.near_random_enable = bool(self._cfg_get(self.near_random_cfg, "enable", False))
@@ -180,6 +191,8 @@ class TrainSchedulerV8(TrainSchedulerV7):
         keyframe_window: List[int],
         frame_chain: List[int],
     ) -> List[int]:
+        if str(getattr(self, "episode_source_mode", "keyframes")) == "segment_frames":
+            return [int(x) for x in frame_chain]
         if self.block_source_frame_policy == "fixed_once_per_episode":
             return [int(x) for x in frame_chain]
         out: List[int] = []
@@ -247,6 +260,73 @@ class TrainSchedulerV8(TrainSchedulerV7):
             return
         super().start_new_epoch()
 
+    def _build_epoch_plan(self) -> None:
+        if str(getattr(self, "episode_source_mode", "keyframes")) != "segment_frames":
+            super()._build_epoch_plan()
+            return
+
+        self.epoch_plan = []
+        self.episode_cursor_plan = []
+        self.plan_cursor = 0
+        self._segment_runtime = {}
+
+        sidx_cache: Dict[Tuple[int, int], SegmentIndexLike] = {}
+        ordered_episode_keys: List[Tuple[int, int, int]] = []
+        for scene_id in self._ordered_scene_ids():
+            for segment_id in self._ordered_segment_ids(int(scene_id)):
+                sidx = self.dataset.get_segment_index(int(scene_id), int(segment_id))
+                frames = [int(x) for x in list(getattr(sidx, "frame_indices", []))]
+                if len(frames) == 0:
+                    continue
+                if len(frames) != int(self.blocks_per_episode):
+                    raise ValueError(
+                        "scheduler_v8.episode.source_mode=segment_frames requires "
+                        "blocks_per_episode to equal len(segment.frame_indices). "
+                        f"scene={int(scene_id)} segment={int(segment_id)} "
+                        f"blocks_per_episode={int(self.blocks_per_episode)} frames={len(frames)}"
+                    )
+                key = (int(scene_id), int(segment_id))
+                sidx_cache[key] = sidx
+                total_blocks = int(self.blocks_per_episode)
+                total_steps = int(total_blocks * self.steps_per_block)
+                self.epoch_plan.append(
+                    {
+                        "scene_id": int(scene_id),
+                        "segment_id": int(segment_id),
+                        "num_keyframes": int(len(sidx.keyframe_indices)),
+                        "num_frames": int(len(frames)),
+                        "num_cams": int(sidx.num_cams),
+                        "episode_starts": [0],
+                        "num_episodes": 1,
+                        "total_blocks": int(total_blocks),
+                        "segment_step_budget": int(total_steps),
+                    }
+                )
+                self._segment_runtime[key] = {
+                    "segment_local_step": 0,
+                    "block_idx_in_segment": 0,
+                    "episodes_total": 1,
+                    "episodes_started": 0,
+                    "episodes_completed": 0,
+                    "segment_begun": False,
+                    "segment_ended": False,
+                }
+                ordered_episode_keys.append((int(scene_id), int(segment_id), 0))
+
+        if self.traversal_mode == "round_robin_episode_interleave" and self.scene_order == "shuffle_per_epoch":
+            random.shuffle(ordered_episode_keys)
+
+        for scene_id, segment_id, start_pos in ordered_episode_keys:
+            key = (int(scene_id), int(segment_id))
+            self.episode_cursor_plan.append(
+                self._build_episode_plan(
+                    sidx_cache[key],
+                    scene_id=int(scene_id),
+                    segment_id=int(segment_id),
+                    episode_start_keyframe_pos=int(start_pos),
+                )
+            )
+
     def _emit(self, event: Dict[str, Any]) -> None:
         out = dict(event)
         if str(out.get("scheduler_version", "")) == "v7":
@@ -261,6 +341,26 @@ class TrainSchedulerV8(TrainSchedulerV7):
         segment_id: int,
         episode_start_keyframe_pos: int,
     ) -> EpisodePlanV8:
+        if str(getattr(self, "episode_source_mode", "keyframes")) == "segment_frames":
+            if int(episode_start_keyframe_pos) != 0:
+                raise ValueError("segment_frames episode mode supports only episode_start_keyframe_pos=0")
+            frames = [int(x) for x in list(getattr(sidx, "frame_indices", []))]
+            if len(frames) != int(self.blocks_per_episode):
+                raise ValueError(
+                    "segment_frames episode frame count mismatch: "
+                    f"frames={len(frames)} blocks_per_episode={int(self.blocks_per_episode)}"
+                )
+            frame_to_keyframe = getattr(sidx, "frame_to_keyframe", {}) or {}
+            keyframe_window = [int(frame_to_keyframe.get(int(f), -1)) for f in frames]
+            return EpisodePlanV8(
+                scene_id=int(scene_id),
+                segment_id=int(segment_id),
+                episode_start_keyframe_pos=0,
+                keyframe_window=keyframe_window,
+                frame_chain=[int(x) for x in frames],
+                num_cams=int(sidx.num_cams),
+            )
+
         kfs = list(sidx.keyframe_indices)
         st = int(episode_start_keyframe_pos)
         ed = st + int(self.blocks_per_episode)
@@ -858,6 +958,7 @@ class TrainSchedulerV8(TrainSchedulerV7):
         info["target_policy"] = str(self.target_policy)
         info["history_target_policy"] = str(self.history_target_policy)
         info["block_source_frame_policy"] = str(self.block_source_frame_policy)
+        info["episode_source_mode"] = str(getattr(self, "episode_source_mode", "keyframes"))
         info["visited_block_indices"] = sorted(int(x) for x in st.get("visited_block_indices", set()))
         info["block_current_source_frame_indices"] = [
             int(x) for x in st.get("block_current_source_frame_indices", st.get("frame_chain", []))

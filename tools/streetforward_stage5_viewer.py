@@ -139,6 +139,8 @@ class StreetForwardStage5Viewer(Viewer):
             next_scene = self.server.gui.add_button("Next Scene")
             prev_segment = self.server.gui.add_button("Prev Segment")
             next_segment = self.server.gui.add_button("Next Segment")
+            prev_block = self.server.gui.add_button("Prev Block")
+            next_block = self.server.gui.add_button("Next Block")
             next_step = self.server.gui.add_button("Next Step", color="blue")
             run_chunk = self.server.gui.add_button("Run Current Chunk")
             run_episode = self.server.gui.add_button("Run Episode")
@@ -274,6 +276,24 @@ class StreetForwardStage5Viewer(Viewer):
                 if self.controller.busy:
                     return
                 self.controller.next_segment()
+                self.rerender(None)
+                _refresh_scope_dropdowns_from_stats()
+                self.refresh_panel_state()
+
+            @prev_block.on_click
+            def _(_) -> None:
+                if self.controller.busy:
+                    return
+                self.controller.prev_block()
+                self.rerender(None)
+                _refresh_scope_dropdowns_from_stats()
+                self.refresh_panel_state()
+
+            @next_block.on_click
+            def _(_) -> None:
+                if self.controller.busy:
+                    return
+                self.controller.next_block()
                 self.rerender(None)
                 _refresh_scope_dropdowns_from_stats()
                 self.refresh_panel_state()

@@ -2267,6 +2267,7 @@ class MultiSceneDatasetV4:
         near_random_supervision_cfg: Optional[Any] = None,
         aux_feature_splat_targets_cfg: Optional[Any] = None,
         block_source_frame_policy: str = "fixed_once_per_episode",
+        episode_source_mode: str = "keyframes",
     ) -> TrainSchedulerV8:
         return TrainSchedulerV8(
             dataset=self,
@@ -2294,6 +2295,7 @@ class MultiSceneDatasetV4:
             near_random_supervision_cfg=near_random_supervision_cfg,
             aux_feature_splat_targets_cfg=aux_feature_splat_targets_cfg,
             block_source_frame_policy=str(block_source_frame_policy),
+            episode_source_mode=str(episode_source_mode),
         )
 
     # Preload worker hooks

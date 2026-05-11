@@ -710,6 +710,34 @@ class Stage5DemoController:
     def step_once(self) -> Dict[str, Any]:
         return self.step_current_block_once()
 
+    def _steps_per_current_block(self) -> int:
+        for obj in (self.scheduler, getattr(self.scheduler, "scheduler", None)):
+            if obj is None:
+                continue
+            for name in ("steps_per_block", "steps_per_input"):
+                if hasattr(obj, name):
+                    value = int(getattr(obj, name))
+                    if value > 0:
+                        return int(value)
+        return 1
+
+    def _num_blocks_current_episode(self) -> int:
+        info = self.scheduler.get_current_info()
+        for key in ("sequence_length",):
+            value = int(info.get(key, 0))
+            if value > 0:
+                return int(value)
+        for key in ("input_offsets", "input_frame_ids", "frame_chain", "keyframe_window"):
+            value = info.get(key)
+            if isinstance(value, (list, tuple)) and len(value) > 0:
+                return int(len(value))
+        for obj in (self.scheduler, getattr(self.scheduler, "scheduler", None)):
+            if obj is not None and hasattr(obj, "blocks_per_episode"):
+                value = int(getattr(obj, "blocks_per_episode"))
+                if value > 0:
+                    return int(value)
+        return 1
+
     def _navigate_without_update(self, op_name: str, *, stats: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         if self.busy:
             raise ValueError("controller is busy")
@@ -788,16 +816,65 @@ class Stage5DemoController:
         finally:
             self.busy = False
 
+    def set_scope_and_sequence_start_pos(
+        self,
+        scene_id: int,
+        segment_id: int,
+        sequence_start_pos: int,
+    ) -> Dict[str, Any]:
+        if self.busy:
+            raise ValueError("controller is busy")
+        self.busy = True
+        try:
+            rec_stats = self._maybe_record_current_block_history(reason="set_scope_and_sequence_start_pos")
+            if hasattr(self.scheduler, "set_scope_and_sequence_start_pos"):
+                raw_batch = self.scheduler.set_scope_and_sequence_start_pos(
+                    int(scene_id),
+                    int(segment_id),
+                    int(sequence_start_pos),
+                )
+            elif hasattr(self.scheduler, "_set_scope_and_start"):
+                raw_batch = self.scheduler._set_scope_and_start(
+                    scene_id=int(scene_id),
+                    segment_id=int(segment_id),
+                    sequence_start_pos=int(sequence_start_pos),
+                    reason="set_scope_and_sequence_start_pos",
+                )
+            else:
+                if not hasattr(self.scheduler, "set_scope") or not hasattr(self.scheduler, "set_sequence_start_pos"):
+                    raise ValueError("scheduler does not support set_scope_and_sequence_start_pos")
+                raw_batch = self.scheduler.set_scope(int(scene_id), int(segment_id))
+                info = self.scheduler.get_current_info()
+                if int(info.get("sequence_start_pos", -1)) != int(sequence_start_pos):
+                    raw_batch = self.scheduler.set_sequence_start_pos(int(sequence_start_pos))
+            rec_stats.update(
+                {
+                    "manual_set_scope": 1.0,
+                    "manual_set_sequence_start_pos": 1.0,
+                }
+            )
+            if self._is_v8_scope_managed_demo():
+                rec_stats.update(self._reset_for_eval_scope_change())
+            return self._refresh_display_from_raw_batch(raw_batch, stats=rec_stats)
+        finally:
+            self.busy = False
+
     def run_current_chunk(self) -> Dict[str, Any]:
         info = self.scheduler.get_current_info()
         start_block = int(info.get("block_idx_in_episode", -1))
+        if bool(info.get("episode_done", False)):
+            last = dict(self.display.last_stats or {})
+            last["run_current_chunk_steps"] = 0
+            self.display.last_stats.update(last)
+            return last
+        max_steps = max(1, int(self._steps_per_current_block()))
         last: Dict[str, Any] = dict(self.display.last_stats or {})
         steps = 0
-        while start_block >= 0 and not bool(getattr(self.scheduler, "is_episode_done", lambda: False)()):
+        while start_block >= 0 and steps < max_steps:
             last = self.step_current_block_once()
             steps += 1
             cur = self.scheduler.get_current_info()
-            if bool(cur.get("episode_done", False)) or int(cur.get("block_idx_in_episode", -1)) != start_block:
+            if int(cur.get("block_idx_in_episode", -1)) != start_block:
                 break
         last = dict(last)
         last["run_current_chunk_steps"] = int(steps)
@@ -806,13 +883,16 @@ class Stage5DemoController:
 
     def run_episode(self) -> Dict[str, Any]:
         last: Dict[str, Any] = dict(self.display.last_stats or {})
-        max_steps = int((self.scheduler.get_current_info() or {}).get("visit_total", 0))
+        num_blocks = max(1, int(self._num_blocks_current_episode()))
         steps = 0
-        while not bool(getattr(self.scheduler, "is_episode_done", lambda: False)()):
-            last = self.step_current_block_once()
-            steps += 1
-            if max_steps > 0 and steps > max_steps:
-                raise RuntimeError("run_episode exceeded scheduler visit_total")
+        for block_i in range(num_blocks):
+            last = self.run_current_chunk()
+            steps += int(last.get("run_current_chunk_steps", 0))
+            if block_i + 1 >= num_blocks:
+                break
+            if not hasattr(self.scheduler, "next_block"):
+                break
+            last = self.next_block()
         last = dict(last)
         last["run_episode_steps"] = int(steps)
         self.display.last_stats.update(last)
