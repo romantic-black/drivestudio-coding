@@ -143,6 +143,25 @@ def _psnr(pred: torch.Tensor, gt: torch.Tensor) -> float:
     return float(-10.0 * np.log10(max(mse, 1.0e-12)))
 
 
+def _masked_psnr(pred: torch.Tensor, gt: torch.Tensor, mask_hw: torch.Tensor) -> Optional[float]:
+    if pred.shape[:2] != gt.shape[:2]:
+        raise ValueError(f"masked PSNR shape mismatch: pred={tuple(pred.shape)} gt={tuple(gt.shape)}")
+    if mask_hw.shape != pred.shape[:2]:
+        raise ValueError(
+            f"masked PSNR mask shape mismatch: mask={tuple(mask_hw.shape)} pred_hw={tuple(pred.shape[:2])}"
+        )
+    mask = mask_hw.to(pred.device).float().clamp(0.0, 1.0)
+    if float(mask.sum().item()) <= 0.0:
+        return None
+    pred_c = torch.clamp(pred.detach().float(), 0.0, 1.0)
+    gt_c = torch.clamp(gt.detach().float(), 0.0, 1.0)
+    diff2 = ((pred_c - gt_c) ** 2) * mask.unsqueeze(-1)
+    mse = float((diff2.sum() / (mask.sum() * 3.0)).item())
+    if mse <= 0.0:
+        return float("inf")
+    return float(-10.0 * np.log10(max(mse, 1.0e-12)))
+
+
 def _node_state_to_cpu_dict(state: Any) -> Dict[str, torch.Tensor]:
     keys = ("means", "scales_log", "quats", "opacity_logit", "sh_dc", "sh_rest")
     return {k: getattr(state, k).detach().cpu() for k in keys if hasattr(state, k)}
@@ -250,6 +269,18 @@ class OverfitSegmentEpisodeEvaluator:
             chunk_size = len(eval_refs)
         if not save_dir.strip():
             raise ValueError("overfit_segment_eval.render.save_dir must be non-empty")
+        metrics_cfg = _cfg_get(raw, "metrics", {}) or {}
+        metric_scope = str(_cfg_get(metrics_cfg, "scope", "auto")).strip().lower()
+        if metric_scope == "auto":
+            losses_cfg = _cfg_get(cfg, "losses", {}) or {}
+            photometric_cfg = _cfg_get(losses_cfg, "photometric", {}) or {}
+            metric_scope = "non_sky" if bool(_cfg_get(photometric_cfg, "exclude_sky_region", False)) else "full_image"
+        if metric_scope not in ("full_image", "non_sky"):
+            raise ValueError("overfit_segment_eval.metrics.scope must be one of ['auto', 'full_image', 'non_sky']")
+        min_valid_pixels = int(_cfg_get(metrics_cfg, "min_valid_pixels_per_region", 32))
+        if min_valid_pixels < 1:
+            raise ValueError("overfit_segment_eval.metrics.min_valid_pixels_per_region must be >= 1")
+        require_sky_mask = bool(_cfg_get(metrics_cfg, "require_sky_mask", metric_scope == "non_sky"))
         root = os.path.join(str(cfg.log_dir), save_dir)
         out_dir = os.path.join(
             root,
@@ -274,6 +305,9 @@ class OverfitSegmentEpisodeEvaluator:
 
         per_view_rows: List[Dict[str, Any]] = []
         psnr_vals: List[float] = []
+        psnr_full_vals: List[float] = []
+        psnr_non_sky_vals: List[float] = []
+        sky_coverage_vals: List[float] = []
         prev_mode = model.training
         try:
             model.eval()
@@ -321,8 +355,43 @@ class OverfitSegmentEpisodeEvaluator:
                     gt = tgt["gt_image"]
                     if gt.dim() == 4:
                         gt = gt.squeeze(0)
-                    psnr_v = _psnr(pred, gt)
+                    psnr_full_v = _psnr(pred, gt)
+                    psnr_non_sky_v: Optional[float] = None
+                    sky_coverage: Optional[float] = None
+                    sky_mask = tgt.get("sky_mask")
+                    if sky_mask is None and require_sky_mask:
+                        raise ValueError(
+                            "overfit_segment_eval.metrics.require_sky_mask=true but target missing sky_mask "
+                            f"(frame={chunk_refs[local_idx][0]} cam={chunk_refs[local_idx][1]})"
+                        )
+                    if sky_mask is not None:
+                        sm = sky_mask.to(device).float()
+                        if sm.dim() == 3:
+                            sm = sm.squeeze(-1)
+                        if sm.shape != gt.shape[:2]:
+                            raise ValueError(
+                                "overfit_segment_eval sky_mask shape mismatch: "
+                                f"sky_mask={tuple(sm.shape)} gt_hw={tuple(gt.shape[:2])}"
+                            )
+                        sky_coverage = float(sm.mean().item())
+                        non_sky = (1.0 - sm).clamp(0.0, 1.0)
+                        if int((non_sky > 0.5).sum().item()) >= int(min_valid_pixels):
+                            psnr_non_sky_v = _masked_psnr(pred, gt, non_sky)
+                    if metric_scope == "non_sky":
+                        if psnr_non_sky_v is None:
+                            raise ValueError(
+                                "overfit_segment_eval metrics scope=non_sky but no valid non-sky pixels for "
+                                f"frame={chunk_refs[local_idx][0]} cam={chunk_refs[local_idx][1]}"
+                            )
+                        psnr_v = float(psnr_non_sky_v)
+                    else:
+                        psnr_v = float(psnr_full_v)
                     psnr_vals.append(float(psnr_v))
+                    psnr_full_vals.append(float(psnr_full_v))
+                    if psnr_non_sky_v is not None:
+                        psnr_non_sky_vals.append(float(psnr_non_sky_v))
+                    if sky_coverage is not None:
+                        sky_coverage_vals.append(float(sky_coverage))
                     frame_idx = int(tgt.get("frame_idx", chunk_refs[local_idx][0]))
                     cam_idx = int(tgt.get("cam_idx", chunk_refs[local_idx][1]))
                     row = {
@@ -330,6 +399,10 @@ class OverfitSegmentEpisodeEvaluator:
                         "frame_idx": int(frame_idx),
                         "cam_idx": int(cam_idx),
                         "psnr": float(psnr_v),
+                        "psnr_full": float(psnr_full_v),
+                        "psnr_non_sky": float(psnr_non_sky_v) if psnr_non_sky_v is not None else None,
+                        "sky_mask_coverage": float(sky_coverage) if sky_coverage is not None else None,
+                        "metric_scope": str(metric_scope),
                     }
                     per_view_rows.append(row)
                     if save_images:
@@ -346,6 +419,8 @@ class OverfitSegmentEpisodeEvaluator:
                 model.train()
 
         mean_psnr = float(np.mean(psnr_vals)) if psnr_vals else 0.0
+        mean_psnr_full = float(np.mean(psnr_full_vals)) if psnr_full_vals else 0.0
+        mean_psnr_non_sky = float(np.mean(psnr_non_sky_vals)) if psnr_non_sky_vals else 0.0
         best_before = float(self.best_psnr)
         row = {
             "split": "overfit_segment_eval",
@@ -355,8 +430,11 @@ class OverfitSegmentEpisodeEvaluator:
             "segment_id": int(segment_id),
             "num_images": int(len(per_view_rows)),
             "psnr": float(mean_psnr),
-            "psnr_full": float(mean_psnr),
-            "metric_scope": "full_image",
+            "psnr_full": float(mean_psnr_full),
+            "psnr_non_sky": float(mean_psnr_non_sky),
+            "num_images_non_sky_metric": int(len(psnr_non_sky_vals)),
+            "sky_mask_coverage": float(np.mean(sky_coverage_vals)) if sky_coverage_vals else 0.0,
+            "metric_scope": str(metric_scope),
             "node_state_exported": False,
             "node_state_export_path": None,
             "best_psnr_before": best_before if bool(np.isfinite(best_before)) else None,
@@ -410,19 +488,25 @@ class OverfitSegmentEpisodeEvaluator:
             _write_metrics_history(metrics_fh, row)
         if writer is not None:
             writer.add_scalar("overfit_segment_eval/psnr", float(row["psnr"]), int(trigger_step))
+            writer.add_scalar("overfit_segment_eval/psnr_full", float(row["psnr_full"]), int(trigger_step))
+            writer.add_scalar("overfit_segment_eval/psnr_non_sky", float(row["psnr_non_sky"]), int(trigger_step))
             writer.add_scalar(
                 "overfit_segment_eval/num_images",
                 float(row["num_images"]),
                 int(trigger_step),
             )
         logger.info(
-            "OVERFIT_SEGMENT_EVAL_END episode=%s step=%s scene_id=%s segment_id=%s images=%s psnr=%.4f exported=%s",
+            "OVERFIT_SEGMENT_EVAL_END episode=%s step=%s scene_id=%s segment_id=%s images=%s "
+            "metric_scope=%s psnr=%.4f psnr_full=%.4f psnr_non_sky=%.4f exported=%s",
             int(trigger_train_episode_counter),
             int(trigger_step),
             int(scene_id),
             int(segment_id),
             int(row["num_images"]),
+            str(row["metric_scope"]),
             float(row["psnr"]),
+            float(row["psnr_full"]),
+            float(row["psnr_non_sky"]),
             bool(row["node_state_exported"]),
         )
 

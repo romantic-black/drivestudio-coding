@@ -639,6 +639,10 @@ overfit_segment_eval:
     save_images: false
     save_dir: validation/overfit_segment_all_images
     chunk_size_images: 24
+  metrics:
+    scope: non_sky
+    min_valid_pixels_per_region: 32
+    require_sky_mask: true
   export_node_state:
     enable: true
     min_psnr: 25.0
