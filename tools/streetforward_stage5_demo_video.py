@@ -424,6 +424,7 @@ class Stage5DemoVideoExporter:
         self.output_dir = Path(output_dir)
         self.sky_branch = sky_branch
         self._single_sky_state: Optional[Any] = None
+        self._sky_pre_render_done = False
         video_cfg = _cfg_get(cfg, "video", {}) or {}
         recon_cfg = _cfg_get(video_cfg, "reconstruction", {}) or {}
         interp_cfg = _cfg_get(video_cfg, "interpolation", {}) or {}
@@ -431,6 +432,9 @@ class Stage5DemoVideoExporter:
         render_cfg = _cfg_get(video_cfg, "render", {}) or {}
         cameras_cfg = _cfg_get(video_cfg, "cameras", {}) or {}
         sky_cfg = _cfg_get(video_cfg, "sky", {}) or {}
+        camera_path_cfg = _cfg_get(video_cfg, "camera_path", None)
+        if camera_path_cfg is None:
+            camera_path_cfg = _cfg_get(video_cfg, "route", {}) or {}
 
         self.window_size = int(_cfg_get(recon_cfg, "window_size", _cfg_get(cfg.demo.scheduler, "sequence_length", 8)))
         self.window_stride = int(_cfg_get(recon_cfg, "window_stride", self.window_size))
@@ -524,11 +528,22 @@ class Stage5DemoVideoExporter:
         self.sky_update_during_video = bool(_cfg_get(sky_cfg, "update_during_video", False))
         self.sky_compose_mode = str(_cfg_get(sky_cfg, "compose_mode", "alpha_gap")).strip().lower()
         self.sky_alpha_scale = float(_cfg_get(sky_cfg, "alpha_scale", 1.0))
+        self.sky_pre_render_update_steps = int(
+            _cfg_get(sky_cfg, "pre_render_update_steps", _cfg_get(sky_cfg, "warmup_steps", 0))
+        )
+        self.sky_pre_render_update_each_window = bool(_cfg_get(sky_cfg, "pre_render_update_each_window", True))
+        self.sky_reset_runtime_before_export = bool(_cfg_get(sky_cfg, "reset_runtime_before_export", False))
+        self.sky_reset_runtime_per_window = bool(_cfg_get(sky_cfg, "reset_runtime_per_window", False))
+        self.sky_pre_render_fail_on_error = bool(_cfg_get(sky_cfg, "pre_render_fail_on_error", False))
         if self.sky_compose_mode not in {"alpha_gap", "replace"}:
             raise ValueError("video.sky.compose_mode must be one of: alpha_gap, replace")
         if self.sky_update_during_video:
             raise ValueError("video.sky.update_during_video=true is not supported; demo video sky is render-only.")
+        if self.sky_pre_render_update_steps < 0:
+            raise ValueError("video.sky.pre_render_update_steps must be >= 0")
         if self.sky_enabled:
+            if bool(self.sky_reset_runtime_before_export) and hasattr(self.sky_branch, "reset_runtime_state"):
+                self.sky_branch.reset_runtime_state()
             self._single_sky_state = self._select_single_sky_state()
 
         self.camera_ids = [int(x) for x in _as_list(_cfg_get(cameras_cfg, "ids", [0]))]
@@ -538,6 +553,45 @@ class Stage5DemoVideoExporter:
         if len(camera_names) != len(self.camera_ids):
             raise ValueError("video.cameras.ids and video.cameras.names must have the same length")
         self.camera_names = camera_names
+        if not self.camera_ids:
+            raise ValueError("video.cameras.ids must not be empty")
+
+        self.camera_path_mode = str(_cfg_get(camera_path_cfg, "mode", "original")).strip().lower()
+        if self.camera_path_mode in {"", "none", "off", "dataset"}:
+            self.camera_path_mode = "original"
+        if self.camera_path_mode in {"yaw_sine", "sine_rotate", "sine_rotation"}:
+            self.camera_path_mode = "sine_yaw"
+        if self.camera_path_mode in {"lateral_sine", "sine_translate", "sine_translation"}:
+            self.camera_path_mode = "sine_lateral"
+        if self.camera_path_mode in {"yaw_lateral_sine", "sine_yaw_lateral"}:
+            self.camera_path_mode = "sine_yaw_lateral"
+        if self.camera_path_mode not in {"original", "sine_yaw", "sine_lateral", "sine_yaw_lateral"}:
+            raise ValueError("video.camera_path.mode must be one of: original, sine_yaw, sine_lateral, sine_yaw_lateral")
+        self.camera_path_source_camera_id = int(_cfg_get(camera_path_cfg, "source_camera_id", self.camera_ids[0]))
+        self.camera_path_left_camera_id = int(_cfg_get(camera_path_cfg, "left_camera_id", 1))
+        self.camera_path_right_camera_id = int(_cfg_get(camera_path_cfg, "right_camera_id", 2))
+        self.camera_path_amplitude = float(_cfg_get(camera_path_cfg, "amplitude", 1.0))
+        self.camera_path_cycles = float(_cfg_get(camera_path_cfg, "cycles", 1.0))
+        self.camera_path_phase = float(_cfg_get(camera_path_cfg, "phase", 0.0))
+        self.camera_path_period_frames = _cfg_get(camera_path_cfg, "period_frames", None)
+        self.camera_path_period_frames = (
+            None if self.camera_path_period_frames is None else float(self.camera_path_period_frames)
+        )
+        self.camera_path_clamp_to_side_cameras = bool(_cfg_get(camera_path_cfg, "clamp_to_side_cameras", True))
+        self.camera_path_max_yaw_degrees = _cfg_get(camera_path_cfg, "max_yaw_degrees", None)
+        self.camera_path_max_yaw_degrees = (
+            None if self.camera_path_max_yaw_degrees is None else float(self.camera_path_max_yaw_degrees)
+        )
+        self.camera_path_fallback_yaw_degrees = float(_cfg_get(camera_path_cfg, "fallback_yaw_degrees", 20.0))
+        self.camera_path_lateral_meters = _cfg_get(camera_path_cfg, "lateral_meters", None)
+        self.camera_path_lateral_meters = (
+            None if self.camera_path_lateral_meters is None else float(self.camera_path_lateral_meters)
+        )
+        self.camera_path_fallback_lateral_meters = float(_cfg_get(camera_path_cfg, "fallback_lateral_meters", 0.35))
+        route_ref_ids = [int(x) for x in _as_list(_cfg_get(camera_path_cfg, "reference_camera_ids", []))]
+        if self.camera_path_mode != "original" and self.camera_path_clamp_to_side_cameras:
+            route_ref_ids.extend([self.camera_path_source_camera_id, self.camera_path_left_camera_id, self.camera_path_right_camera_id])
+        self.render_camera_ids = list(dict.fromkeys([int(x) for x in self.camera_ids] + [int(x) for x in route_ref_ids]))
 
         self.render_height = _cfg_get(render_cfg, "height", None)
         self.render_width = _cfg_get(render_cfg, "width", None)
@@ -557,7 +611,7 @@ class Stage5DemoVideoExporter:
         segment_id: int,
         frame_ids: Sequence[int],
     ) -> Dict[ImageRef, RenderViewRecord]:
-        refs = [(int(f), int(c)) for f in frame_ids for c in self.camera_ids]
+        refs = [(int(f), int(c)) for f in frame_ids for c in self.render_camera_ids]
         if len(refs) == 0:
             raise ValueError("cannot load render views for empty frame/camera refs")
         if not hasattr(self.dataset, "_load_image_meta") or not hasattr(self.dataset, "_resolve_segment_bundle"):
@@ -595,6 +649,148 @@ class Stage5DemoVideoExporter:
                 width=w,
             )
         return out
+
+    def _interpolated_camera_record(
+        self,
+        *,
+        records: Dict[ImageRef, RenderViewRecord],
+        sample: RenderSample,
+        cam_id: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
+        rec0 = records[(int(sample.frame0), int(cam_id))]
+        rec1 = records[(int(sample.frame1), int(cam_id))]
+        c2w = interpolate_c2w(rec0.c2w, rec1.c2w, float(sample.alpha))
+        K = (1.0 - float(sample.alpha)) * rec0.K + float(sample.alpha) * rec1.K
+        return c2w, K, int(rec0.height), int(rec0.width)
+
+    def _camera_path_signal(self, sample: RenderSample) -> float:
+        period = self.camera_path_period_frames
+        if period is None or float(period) <= 0.0:
+            period = float(max(int(self.window_size), 1))
+        phase = 2.0 * math.pi * float(self.camera_path_cycles) * float(sample.global_source_pos) / float(period)
+        phase += float(self.camera_path_phase)
+        return float(self.camera_path_amplitude) * math.sin(float(phase))
+
+    @staticmethod
+    def _local_yaw_matrix(angle_rad: float, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        c = math.cos(float(angle_rad))
+        s = math.sin(float(angle_rad))
+        return torch.tensor(
+            [
+                [c, 0.0, s],
+                [0.0, 1.0, 0.0],
+                [-s, 0.0, c],
+            ],
+            device=device,
+            dtype=dtype,
+        )
+
+    @staticmethod
+    def _relative_local_yaw(base_c2w: torch.Tensor, side_c2w: torch.Tensor) -> float:
+        rel = base_c2w[:3, :3].transpose(0, 1) @ side_c2w[:3, :3]
+        return float(torch.atan2(rel[0, 2], rel[2, 2]).detach().cpu().item())
+
+    def _side_camera_yaw_bound(
+        self,
+        *,
+        records: Dict[ImageRef, RenderViewRecord],
+        sample: RenderSample,
+        base_c2w: torch.Tensor,
+    ) -> float:
+        bounds: List[float] = []
+        for side_id in (int(self.camera_path_left_camera_id), int(self.camera_path_right_camera_id)):
+            try:
+                side_c2w, _side_K, _side_h, _side_w = self._interpolated_camera_record(
+                    records=records,
+                    sample=sample,
+                    cam_id=int(side_id),
+                )
+            except KeyError:
+                continue
+            yaw = abs(self._relative_local_yaw(base_c2w, side_c2w))
+            if yaw > 1.0e-6:
+                bounds.append(float(yaw))
+        if bounds:
+            bound = min(bounds)
+        else:
+            bound = math.radians(float(self.camera_path_fallback_yaw_degrees))
+        if self.camera_path_max_yaw_degrees is not None:
+            bound = min(float(bound), math.radians(float(self.camera_path_max_yaw_degrees)))
+        return max(float(bound), 0.0)
+
+    def _side_camera_lateral_bound(
+        self,
+        *,
+        records: Dict[ImageRef, RenderViewRecord],
+        sample: RenderSample,
+        base_c2w: torch.Tensor,
+    ) -> float:
+        if self.camera_path_lateral_meters is not None:
+            requested = abs(float(self.camera_path_lateral_meters))
+        else:
+            requested = float("inf")
+        bounds: List[float] = []
+        right_axis = base_c2w[:3, 0]
+        base_t = base_c2w[:3, 3]
+        for side_id in (int(self.camera_path_left_camera_id), int(self.camera_path_right_camera_id)):
+            try:
+                side_c2w, _side_K, _side_h, _side_w = self._interpolated_camera_record(
+                    records=records,
+                    sample=sample,
+                    cam_id=int(side_id),
+                )
+            except KeyError:
+                continue
+            offset = float(torch.dot(side_c2w[:3, 3] - base_t, right_axis).detach().cpu().item())
+            if abs(offset) > 1.0e-6:
+                bounds.append(abs(offset))
+        if bool(self.camera_path_clamp_to_side_cameras) and bounds:
+            requested = min(float(requested), min(bounds))
+        if not math.isfinite(requested):
+            requested = float(self.camera_path_fallback_lateral_meters)
+        return max(float(requested), 0.0)
+
+    def _apply_camera_path(
+        self,
+        *,
+        records: Dict[ImageRef, RenderViewRecord],
+        sample: RenderSample,
+        c2w: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        if self.camera_path_mode == "original":
+            return c2w, {"signal": 0.0, "yaw_degrees": 0.0, "lateral_meters": 0.0}
+        signal = self._camera_path_signal(sample)
+        out = c2w.clone()
+        yaw_rad = 0.0
+        lateral_m = 0.0
+        if self.camera_path_mode in {"sine_yaw", "sine_yaw_lateral"}:
+            yaw_bound = self._side_camera_yaw_bound(records=records, sample=sample, base_c2w=c2w)
+            yaw_rad = float(np.clip(float(signal), -1.0, 1.0)) * float(yaw_bound)
+            out[:3, :3] = out[:3, :3] @ self._local_yaw_matrix(yaw_rad, device=out.device, dtype=out.dtype)
+        if self.camera_path_mode in {"sine_lateral", "sine_yaw_lateral"}:
+            lateral_bound = self._side_camera_lateral_bound(records=records, sample=sample, base_c2w=c2w)
+            lateral_m = float(np.clip(float(signal), -1.0, 1.0)) * float(lateral_bound)
+            out[:3, 3] = out[:3, 3] + out[:3, 0] * float(lateral_m)
+        return out, {
+            "signal": float(signal),
+            "yaw_degrees": float(math.degrees(float(yaw_rad))),
+            "lateral_meters": float(lateral_m),
+        }
+
+    def _sample_camera_path_metadata(
+        self,
+        *,
+        records: Dict[ImageRef, RenderViewRecord],
+        sample: RenderSample,
+    ) -> Dict[str, float]:
+        if self.camera_path_mode == "original":
+            return {"signal": 0.0, "yaw_degrees": 0.0, "lateral_meters": 0.0}
+        cam_id = int(self.camera_path_source_camera_id)
+        if (int(sample.frame0), cam_id) not in records:
+            cam_id = int(self.camera_ids[0])
+        c2w, _K, _h, _w = self._interpolated_camera_record(records=records, sample=sample, cam_id=cam_id)
+        _out, meta = self._apply_camera_path(records=records, sample=sample, c2w=c2w)
+        return dict(meta)
 
     def _rigid_frame_for_sample(self, *, f0: int, f1: int, alpha: float, valid_frames: Iterable[int]) -> int:
         valid = set(int(x) for x in valid_frames)
@@ -704,10 +900,12 @@ class Stage5DemoVideoExporter:
     ) -> List[Dict[str, Any]]:
         items: List[Dict[str, Any]] = []
         for cam_id in self.camera_ids:
-            rec0 = records[(int(sample.frame0), int(cam_id))]
-            rec1 = records[(int(sample.frame1), int(cam_id))]
-            c2w = interpolate_c2w(rec0.c2w, rec1.c2w, float(sample.alpha))
-            K = (1.0 - float(sample.alpha)) * rec0.K + float(sample.alpha) * rec1.K
+            c2w, K, height, width = self._interpolated_camera_record(
+                records=records,
+                sample=sample,
+                cam_id=int(cam_id),
+            )
+            c2w, path_meta = self._apply_camera_path(records=records, sample=sample, c2w=c2w)
             view = type(
                 "View",
                 (),
@@ -719,9 +917,10 @@ class Stage5DemoVideoExporter:
             items.append(
                 {
                     "view": view,
-                    "height": int(rec0.height),
-                    "width": int(rec0.width),
+                    "height": int(height),
+                    "width": int(width),
                     "frame_idx": int(sample.rigid_frame_idx),
+                    "camera_path": dict(path_meta),
                 }
             )
         return items
@@ -775,6 +974,103 @@ class Stage5DemoVideoExporter:
             else:
                 raise ValueError("sky_branch lacks get_or_init_node_state()")
         return self._single_sky_state
+
+    def _build_scene_pack_for_sky_update(self, minimal: Dict[str, Any]) -> Any:
+        from models.streetforward.sky_branch.scene_render_provider import SceneRenderPack
+
+        source_views = list(minimal.get("source_views") or [])
+        source_images = list(minimal.get("source_images") or [])
+        targets = list(minimal.get("targets") or [])
+        if len(source_views) == 0 or len(source_images) == 0 or len(targets) == 0:
+            raise ValueError("sky pre-render update requires source_views/source_images and targets in the minimal batch")
+        if len(source_views) != len(source_images):
+            raise ValueError(f"source_views/source_images length mismatch: {len(source_views)} vs {len(source_images)}")
+        source_frame_idx = int(minimal.get("source_frame_idx", 0))
+        source_items = [
+            {
+                "view": view,
+                "gt_image": image,
+                "frame_idx": int(source_frame_idx),
+            }
+            for view, image in zip(source_views, source_images)
+        ]
+        target_items = []
+        for target in targets:
+            item = {
+                "view": target["view"],
+                "gt_image": target["gt_image"],
+                "frame_idx": int(target.get("frame_idx", target.get("target_frame_idx", source_frame_idx))),
+            }
+            if target.get("cam_idx") is not None:
+                item["cam_idx"] = int(target.get("cam_idx"))
+            target_items.append(item)
+        trainer = self.controller.trainer
+        src_rgb, src_alpha = trainer._render_scene_views_from_current_state(minimal, source_items)
+        tgt_rgb, tgt_alpha = trainer._render_scene_views_from_current_state(minimal, target_items)
+        return SceneRenderPack(
+            source_rgb=src_rgb.detach(),
+            source_alpha=src_alpha.detach(),
+            target_rgb=tgt_rgb.detach(),
+            target_alpha=tgt_alpha.detach(),
+        )
+
+    @torch.no_grad()
+    def _pre_render_update_sky(self, *, minimal: Dict[str, Any], window_index: int) -> Dict[str, Any]:
+        if not bool(self.sky_enabled) or self.sky_branch is None:
+            return {}
+        if int(self.sky_pre_render_update_steps) <= 0:
+            return {}
+        if self._sky_pre_render_done and not bool(self.sky_pre_render_update_each_window):
+            return {}
+        if bool(self.sky_reset_runtime_per_window) and hasattr(self.sky_branch, "reset_runtime_state"):
+            self.sky_branch.reset_runtime_state()
+            self._single_sky_state = None
+        logs: Dict[str, Any] = {
+            "window_index": int(window_index),
+            "steps": int(self.sky_pre_render_update_steps),
+        }
+        try:
+            for step_idx in range(int(self.sky_pre_render_update_steps)):
+                scene_pack = self._build_scene_pack_for_sky_update(minimal)
+                out = self.sky_branch.forward_scene_batch(minimal, scene_pack, writeback=True)
+                if bool(self.sky_reuse_single_state):
+                    self._single_sky_state = out.node_state_sky
+                logs.update(
+                    {
+                        "last_step_index": int(step_idx),
+                        "last_loss": float(out.loss.detach().item()),
+                        "last_skip_step": float(
+                            out.logs.get("skip_step", 0.0).detach().item()
+                            if torch.is_tensor(out.logs.get("skip_step", 0.0))
+                            else out.logs.get("skip_step", 0.0)
+                        ),
+                    }
+                )
+                for key in ("sky_support_ratio", "sky_updated_node_ratio", "target_sky_valid_ratio"):
+                    value = out.logs.get(key)
+                    if value is not None:
+                        logs[f"last_{key}"] = float(value.detach().item() if torch.is_tensor(value) else value)
+                del out
+                del scene_pack
+            self._sky_pre_render_done = True
+            logger.info(
+                "sky pre-render update window=%d steps=%d loss=%.6f skip=%.3f support=%.4f",
+                int(window_index),
+                int(self.sky_pre_render_update_steps),
+                float(logs.get("last_loss", 0.0)),
+                float(logs.get("last_skip_step", 0.0)),
+                float(logs.get("last_sky_support_ratio", 0.0)),
+            )
+            return logs
+        except Exception as exc:
+            if bool(self.sky_pre_render_fail_on_error):
+                raise
+            logger.warning("sky pre-render update failed for window=%d: %s", int(window_index), exc)
+            return {
+                "window_index": int(window_index),
+                "steps": int(self.sky_pre_render_update_steps),
+                "error": str(exc),
+            }
 
     @torch.no_grad()
     def _compose_sky_rgb(
@@ -1075,9 +1371,23 @@ class Stage5DemoVideoExporter:
             "sky_reuse_single_state": bool(self.sky_reuse_single_state),
             "sky_update_during_video": bool(self.sky_update_during_video),
             "sky_compose_mode": str(self.sky_compose_mode),
+            "sky_pre_render_update_steps": int(self.sky_pre_render_update_steps),
+            "sky_pre_render_update_each_window": bool(self.sky_pre_render_update_each_window),
             "input_offsets": [int(x) for x in self.input_offsets],
             "camera_ids": [int(x) for x in self.camera_ids],
             "camera_names": [str(x) for x in self.camera_names],
+            "camera_path": {
+                "mode": str(self.camera_path_mode),
+                "source_camera_id": int(self.camera_path_source_camera_id),
+                "left_camera_id": int(self.camera_path_left_camera_id),
+                "right_camera_id": int(self.camera_path_right_camera_id),
+                "amplitude": float(self.camera_path_amplitude),
+                "cycles": float(self.camera_path_cycles),
+                "period_frames": self.camera_path_period_frames,
+                "clamp_to_side_cameras": bool(self.camera_path_clamp_to_side_cameras),
+                "max_yaw_degrees": self.camera_path_max_yaw_degrees,
+                "lateral_meters": self.camera_path_lateral_meters,
+            },
             "windows": [
                 {
                     "scene_id": int(plan.scene_id),
@@ -1089,6 +1399,7 @@ class Stage5DemoVideoExporter:
             ],
             "videos": {k: str(v) for k, v in writers.paths.items()},
             "all_frames_dir": str(all_frames_dir) if self.save_all_images else None,
+            "sky_pre_render_updates": [],
             "samples": [],
         }
         total_rendered_samples = 0
@@ -1106,6 +1417,11 @@ class Stage5DemoVideoExporter:
                         "scheduler scope mismatch after selecting video window: "
                         f"expected scene={plan.scene_id} segment={plan.segment_id}, got scene={scene_id} segment={segment_id}"
                     )
+                minimal_for_sky = self.controller.display.last_minimal_batch
+                if isinstance(minimal_for_sky, dict):
+                    sky_update = self._pre_render_update_sky(minimal=minimal_for_sky, window_index=int(window_index))
+                    if sky_update:
+                        metadata["sky_pre_render_updates"].append(dict(sky_update))
                 segment_frames = _frames_for_segment(self.dataset, scene_id, segment_id)
                 start = int(plan.sequence_start_pos)
                 window_frames = segment_frames[int(start) : int(start) + int(self.window_size)]
@@ -1142,6 +1458,7 @@ class Stage5DemoVideoExporter:
                     len(samples),
                 )
                 for sample in samples:
+                    camera_path_meta = self._sample_camera_path_metadata(records=records, sample=sample)
                     per_camera = self._render_sample(records=records, sample=sample)
                     frames = [per_camera[int(c)] for c in self.camera_ids]
                     combined = _tile_frames(
@@ -1184,6 +1501,7 @@ class Stage5DemoVideoExporter:
                             "global_output_time_index": int(sample.global_output_time_index),
                             "anchor_input_offset": int(sample.anchor_input_offset),
                             "is_transition": bool(sample.is_transition),
+                            "camera_path": dict(camera_path_meta),
                         }
                     )
                     total_rendered_samples += 1

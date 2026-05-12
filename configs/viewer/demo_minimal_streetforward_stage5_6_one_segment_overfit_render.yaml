@@ -1,0 +1,190 @@
+base_config_file: /root/autodl-tmp/outputs/minimal_sf_stage5_6_multi_scene_v8_adamw_warmcos/experiment002_60w_40w_block16/config.yaml
+
+output_name: stage5_6_one_segment_overfit_v8_render
+
+data:
+  train_scene_ids: [114]
+  eval_scene_ids: []
+  preload:
+    enable: false
+
+model:
+  stage: "5_6"
+  production_training: true
+
+batch_eval:
+  checkpoint:
+    path: /root/autodl-tmp/outputs/minimal_sf_stage5_6_one_segment_overfit_v8/stage5_6_one_segment_overfit_v8_scene001_segment000/checkpoints/minimal_sf_stage5_6_one_segment_overfit_v8_step20000.pt
+    strict: true
+  dataset:
+    scene_ids: [114]
+    segment_policy: all
+    start_at:
+      scene_id: 114
+      segment_id: 0
+      frame_id: 0
+    require_full_window: true
+    stride: 26
+    window_policy: sliding
+  cameras:
+    ids: [0]
+    names: ["front"]
+  update_cameras:
+    ids: [0, 1, 2]
+    names: ["front", "front_left", "front_right"]
+  runtime:
+    mode: inference_only
+    amp: false
+    reset_state_per_episode: true
+    align_with_scheduler_v8: true
+    override_scheduler_execution: true
+    update_node_state: true
+    update_hidden_state: true
+    update_view_transient: true
+  stage5_6_eval:
+    enable_nearby_feedback: false
+    nearby_policy: adjacent_non_input
+    nearby_role_name: near_random
+    allow_partial_nearby: true
+  finetune:
+    enable: false
+  history:
+    record_support_residual_on_input_exit: true
+    record_each_step: false
+
+nearby_direct:
+  enable: false
+  weight: 0.0
+
+nearby_error_feedback:
+  enable: false
+  error_pred:
+    enable: false
+  cache:
+    enable: false
+  fusion:
+    enable: false
+  loss:
+    error_weight: 0.0
+
+losses:
+  target_view_weights:
+    near_random:
+      weight: 0.0
+
+logging:
+  output_root: /root/autodl-tmp/outputs
+  project: minimal_sf_stage5_6_demo_video
+  log_dir: null
+  use_tensorboard: false
+
+demo:
+  mode: frozen_recurrent_inference
+  reset_train_params_on_scope_change: true
+  checkpoint:
+    path: /root/autodl-tmp/outputs/minimal_sf_stage5_6_one_segment_overfit_v8/stage5_6_one_segment_overfit_v8_scene001_segment000/checkpoints/minimal_sf_stage5_6_one_segment_overfit_v8_step20000.pt
+    strict: true
+    load_mode: full_state
+  scheduler:
+    type: eval_v8_stage5_6
+    name: stage5_6_one_segment_overfit_render_eval_v8
+    scene_ids: [114]
+    initial_scene_id: 114
+    initial_segment_id: 0
+    initial_sequence_start_pos: 0
+    sequence_length: 26
+    input_offsets: []
+    eval_offsets: all
+    steps_per_input: 4
+    block_order: step_major
+    step_major_switch_interval_steps: 4
+    max_target_frames_including_source: 26
+    window_policy: sliding
+    stride: 26
+    require_full_window: true
+    wrap_scene: true
+    wrap_segment: true
+    wrap_episode: true
+    cameras:
+      ids: [0]
+      names: ["front"]
+    update_cameras:
+      ids: [0, 1, 2]
+      names: ["front", "front_left", "front_right"]
+  cameras:
+    ids: [0]
+    names: ["front"]
+  update_cameras:
+    ids: [0, 1, 2]
+    names: ["front", "front_left", "front_right"]
+  display_branches: ["bg", "distant", "rigid"]
+  hide_rigid: false
+  inference:
+    update_node_state: true
+    update_hidden_state: true
+    update_history_memory: true
+    update_view_transient: true
+    record_block_history_on_block_exit: true
+  viewer:
+    use_forward_render_cache: false
+
+video:
+  dataset_init_scope: active_segment
+  camera_mode: front
+  cameras:
+    ids: [0]
+    names: ["front"]
+  update_cameras:
+    ids: [0, 1, 2]
+    names: ["front", "front_left", "front_right"]
+  reconstruction:
+    window_size: 26
+    window_stride: 26
+    transition_frames_before: 0
+    transition_frames_after: 0
+    input_gap_frames: 0
+    input_offsets: []
+    steps_per_input: 4
+    max_target_frames_including_source: 26
+    block_order: step_major
+    step_major_switch_interval_steps: 4
+    require_full_window: true
+    window_policy: sliding
+    state_carryover: reset
+    discard_history_between_windows: true
+    max_windows: 1
+    sequence_start_positions: []
+  interpolation:
+    source_fps: 10.0
+    subframes_per_source_interval: 4
+    include_window_tail_interval: true
+    rigid_frame_policy: nearest
+  render:
+    height: null
+    width: null
+  sky:
+    enable: true
+    config_file: configs/skybranch_stage5_4_exp002.yaml
+    checkpoint: /root/autodl-tmp/outputs/skybranch_stage5_4_exp002/checkpoints/skybranch_resume_step_100000.pth
+    strict: true
+    freeze_params: true
+    load_runtime_state: false
+    require_runtime_state: false
+    reuse_single_state: true
+    compose_mode: alpha_gap
+    alpha_scale: 1.0
+    pre_render_update_steps: 24
+    pre_render_update_each_window: true
+    reset_runtime_before_export: true
+    reset_runtime_per_window: false
+    pre_render_fail_on_error: false
+  output:
+    dir: /root/autodl-tmp/outputs/minimal_sf_stage5_6_one_segment_overfit_v8/stage5_6_one_segment_overfit_v8_scene001_segment000/render_step20000_normal_sky24
+    name: stage5_6_one_segment_overfit_step20000_normal_sky24
+    fps: null
+    layout: single
+    write_combined: true
+    write_separate_per_camera: false
+    show_camera_labels: false
+    save_all_images: true
+    save_png_frames: false

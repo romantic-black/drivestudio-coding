@@ -32,6 +32,7 @@ sky_masks/
 fine_dynamic_masks_example/
 *.sh
 !scripts/run_stage5_6_one_segment_overfit_v8.sh
+!scripts/render_stage5_6_one_segment_overfit_v8.sh
 pandaset-devkit/
 
 # C extensions

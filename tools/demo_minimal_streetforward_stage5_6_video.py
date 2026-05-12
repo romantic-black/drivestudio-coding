@@ -261,6 +261,23 @@ def _set_camera_cfg(cfg: Any, ids: List[int], names: List[str]) -> None:
     cfg.batch_eval.update_cameras = payload
 
 
+def _set_update_camera_cfg(cfg: Any, ids: List[int], names: Optional[List[str]] = None) -> None:
+    payload = {"ids": [int(x) for x in ids]}
+    if names is not None and len(names) > 0:
+        if len(names) != len(ids):
+            raise ValueError("update camera ids/names length mismatch")
+        payload["names"] = [str(x) for x in names]
+    if cfg.get("demo") is None:
+        cfg.demo = {}
+    cfg.demo.update_cameras = payload
+    if cfg.demo.get("scheduler") is None:
+        cfg.demo.scheduler = {}
+    cfg.demo.scheduler.update_cameras = payload
+    if cfg.get("batch_eval") is None:
+        cfg.batch_eval = {}
+    cfg.batch_eval.update_cameras = payload
+
+
 def _configured_scene_ids(cfg: Any) -> List[int]:
     scheduler_cfg = (cfg.get("demo") or {}).get("scheduler") or {}
     batch_dataset_cfg = (cfg.get("batch_eval") or {}).get("dataset") or {}
@@ -471,6 +488,12 @@ def _patch_cfg_for_video(cfg: Any, args: argparse.Namespace) -> None:
     camera_mode = str(args.camera_mode or video_cfg.get("camera_mode", "three_front"))
     camera_ids, camera_names = _camera_preset(camera_mode, cfg)
     _set_camera_cfg(cfg, camera_ids, camera_names)
+    video_cfg = cfg.get("video") or {}
+    update_cameras_cfg = video_cfg.get("update_cameras")
+    if update_cameras_cfg is not None:
+        update_ids = [int(x) for x in _as_list(update_cameras_cfg.get("ids", camera_ids))]
+        update_names = [str(x) for x in _as_list(update_cameras_cfg.get("names", []))]
+        _set_update_camera_cfg(cfg, update_ids, update_names if update_names else None)
 
 
 def main() -> None:
@@ -482,6 +505,7 @@ def main() -> None:
         help="Path to Stage5_6 demo video config YAML.",
     )
     parser.add_argument("--ckpt", type=str, default="", help="Checkpoint path override.")
+    parser.add_argument("--init_checkpoint", type=str, default="", help="Alias for --ckpt, kept for overfit render scripts.")
     parser.add_argument("--scene_id", type=int, default=None, help="Scene id override.")
     parser.add_argument("--segment_id", type=int, default=None, help="Segment id override.")
     parser.add_argument("--sequence_start_pos", type=int, default=None, help="Initial sequence start override.")
@@ -519,7 +543,7 @@ def main() -> None:
 
     demo_checkpoint = (cfg.get("demo") or {}).get("checkpoint") or {}
     batch_eval_checkpoint = (cfg.get("batch_eval") or {}).get("checkpoint") or {}
-    ckpt_path = str(args.ckpt or demo_checkpoint.get("path") or batch_eval_checkpoint.get("path") or "")
+    ckpt_path = str(args.ckpt or args.init_checkpoint or demo_checkpoint.get("path") or batch_eval_checkpoint.get("path") or "")
     ckpt_mode = str(args.ckpt_load_mode or demo_checkpoint.get("load_mode", "full_state"))
     ckpt_strict = bool(demo_checkpoint.get("strict", batch_eval_checkpoint.get("strict", True)))
     ckpt_step = _load_checkpoint(trainer, ckpt_path, mode=ckpt_mode, strict=ckpt_strict)
