@@ -28,6 +28,7 @@ class LiDARRGBPointCloudGenerator(RGBPointCloudGenerator):
         device: torch.device = torch.device("cpu"),
         static_instance_motion_enable: bool = False,
         static_instance_motion_traj_length_thresh_m: Optional[float] = None,
+        dynamic_bbox_expand_xyz_m: Optional[List[float]] = None,
     ):
         super().__init__(
             sparsity=sparsity,
@@ -43,6 +44,15 @@ class LiDARRGBPointCloudGenerator(RGBPointCloudGenerator):
                 "LiDARRGBPointCloudGenerator: static_instance_motion_enable=true requires "
                 "static_instance_motion_traj_length_thresh_m."
             )
+        if dynamic_bbox_expand_xyz_m is None:
+            self.dynamic_bbox_expand_xyz_m = np.zeros((3,), dtype=np.float32)
+        else:
+            expand = np.asarray(dynamic_bbox_expand_xyz_m, dtype=np.float32).reshape(-1)
+            if expand.shape[0] != 3:
+                raise ValueError("dynamic_bbox_expand_xyz_m must contain 3 values: [dx, dy, dz].")
+            if np.any(expand < 0):
+                raise ValueError("dynamic_bbox_expand_xyz_m must be non-negative.")
+            self.dynamic_bbox_expand_xyz_m = expand
 
     def generate_pointcloud(
         self,
@@ -107,6 +117,7 @@ class LiDARRGBPointCloudGenerator(RGBPointCloudGenerator):
                 colors_frame,
                 frame_instances,
                 skip_instance_intids=skip_instance_intids,
+                bbox_expand_xyz_m=self.dynamic_bbox_expand_xyz_m,
             )
             all_backgrounds.append(background_frame)
             for intid, pts in dynamic_frame.items():
@@ -147,6 +158,7 @@ class LiDARRGBPointCloudGenerator(RGBPointCloudGenerator):
             "sparsity": self.sparsity,
             "static_instance_motion_enable": self.static_instance_motion_enable,
             "static_instance_intids": static_list,
+            "dynamic_bbox_expand_xyz_m": self.dynamic_bbox_expand_xyz_m.tolist(),
         }
 
         return {

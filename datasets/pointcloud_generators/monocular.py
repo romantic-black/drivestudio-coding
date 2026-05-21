@@ -1,11 +1,12 @@
 import logging
 from collections import defaultdict
-from typing import Dict, List, Literal, Optional, Tuple, TYPE_CHECKING
+from typing import Dict, List, Literal, Optional, Set, Tuple, TYPE_CHECKING
 
 import numpy as np
 import torch
 
 from .base import RGBPointCloudGenerator
+from .motion_utils import compute_static_instance_intids
 
 if TYPE_CHECKING:
     from datasets.multi_scene_dataset import MultiSceneDataset
@@ -36,6 +37,8 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
         dynamic_recovery_bbox_expand_xyz_m: Optional[List[float]] = None,
         dynamic_recovery_max_points_per_instance: Optional[int] = None,
         dynamic_recovery_assignment: Literal["first_hit", "nearest_center"] = "first_hit",
+        static_instance_motion_enable: bool = False,
+        static_instance_motion_traj_length_thresh_m: Optional[float] = None,
         device: torch.device = torch.device("cpu"),
     ):
         super().__init__(
@@ -51,6 +54,13 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
         self.dynamic_mask_key = "dynamic_masks"
         self.dynamic_recovery_enable = bool(dynamic_recovery_enable)
         self.dynamic_recovery_assignment = str(dynamic_recovery_assignment)
+        self.static_instance_motion_enable = bool(static_instance_motion_enable)
+        self.static_instance_motion_traj_length_thresh_m = static_instance_motion_traj_length_thresh_m
+        if self.static_instance_motion_enable and self.static_instance_motion_traj_length_thresh_m is None:
+            raise ValueError(
+                "MonocularRGBPointCloudGenerator: static_instance_motion_enable=true requires "
+                "static_instance_motion_traj_length_thresh_m."
+            )
         if self.dynamic_recovery_assignment not in ("first_hit", "nearest_center"):
             raise ValueError(
                 "dynamic_recovery_assignment must be one of ['first_hit', 'nearest_center']."
@@ -96,6 +106,16 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
         frame_indices = self._apply_sparsity_filter(frame_indices)
         if len(frame_indices) == 0:
             raise ValueError("No frames selected after sparsity filtering")
+
+        scene_dataset = scene_data["dataset"]
+        pixel_source = getattr(scene_dataset, "pixel_source", None)
+        static_instance_intids: Set[int] = set()
+        if self.static_instance_motion_enable:
+            static_instance_intids = compute_static_instance_intids(
+                pixel_source,
+                frame_indices,
+                float(self.static_instance_motion_traj_length_thresh_m),
+            )
 
         frame_data_by_camera: Dict[int, List[Tuple[int, Dict]]] = {
             cam_id: [] for cam_id in self.chosen_cam_ids
@@ -144,7 +164,8 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
         dynamic_recovery_frame_count = 0
         dynamic_recovered_points_before_cap = 0
 
-        if self.dynamic_recovery_enable:
+        use_instance_policy = bool(self.dynamic_recovery_enable or self.static_instance_motion_enable)
+        if use_instance_policy:
             instance_mapping, instances_by_frame = self._get_instances_for_segment(
                 dataset, scene_id, segment_id, frame_indices, world_to_seg0
             )
@@ -156,10 +177,16 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
             frame_to_instances = {}
 
         for frame_idx in frame_indices:
-            frame_points_world: List[np.ndarray] = []
+            frame_points_seg0: List[np.ndarray] = []
             frame_colors: List[np.ndarray] = []
-            frame_points_world_for_dynamic: List[np.ndarray] = []
+            frame_points_seg0_for_dynamic: List[np.ndarray] = []
             frame_colors_for_dynamic: List[np.ndarray] = []
+            frame_instances = frame_to_instances.get(frame_idx, [])
+            moving_instances, _ = self._split_instances_by_static_intids(
+                frame_instances,
+                static_instance_intids,
+            )
+            use_instance_background_policy = len(frame_instances) > 0
 
             for cam_id, frames_sorted in sorted_frame_data_by_camera.items():
                 if not frames_sorted:
@@ -169,51 +196,70 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
                     if fi != frame_idx:
                         continue
                     consistency_mask = masks[order] if order < len(masks) else None
-                    points_w, colors = self._generate_points_from_frame_data(
-                        frame_data,
-                        consistency_mask,
-                        downscale_mask,
-                        apply_dynamic_filter=True,
-                    )
-                    if points_w is not None and len(points_w) > 0:
-                        frame_points_world.append(points_w)
-                        frame_colors.append(colors)
-                    if self.dynamic_recovery_enable:
-                        points_w_dyn, colors_dyn = self._generate_points_from_frame_data(
+                    if use_instance_background_policy:
+                        points_w_all, colors_all, pixels_yx = self._generate_points_from_frame_data(
                             frame_data,
                             consistency_mask,
                             downscale_mask,
                             apply_dynamic_filter=False,
+                            include_pixels=True,
                         )
-                        if points_w_dyn is not None and len(points_w_dyn) > 0:
-                            frame_points_world_for_dynamic.append(points_w_dyn)
-                            frame_colors_for_dynamic.append(colors_dyn)
+                        if points_w_all is None or len(points_w_all) == 0:
+                            continue
+                        points_seg0_all = self._transform_points_np(points_w_all, world_to_seg0)
+                        bg_points, bg_colors = self._filter_background_points_with_instance_policy(
+                            points_seg0_all,
+                            colors_all,
+                            pixels_yx,
+                            frame_data,
+                            frame_instances,
+                            static_instance_intids,
+                        )
+                        if bg_points is not None and len(bg_points) > 0:
+                            frame_points_seg0.append(bg_points)
+                            frame_colors.append(bg_colors)
+                        if self.dynamic_recovery_enable:
+                            frame_points_seg0_for_dynamic.append(points_seg0_all)
+                            frame_colors_for_dynamic.append(colors_all)
+                    else:
+                        points_w, colors = self._generate_points_from_frame_data(
+                            frame_data,
+                            consistency_mask,
+                            downscale_mask,
+                            apply_dynamic_filter=True,
+                        )
+                        if points_w is not None and len(points_w) > 0:
+                            frame_points_seg0.append(self._transform_points_np(points_w, world_to_seg0))
+                            frame_colors.append(colors)
+                        if self.dynamic_recovery_enable:
+                            points_w_dyn, colors_dyn = self._generate_points_from_frame_data(
+                                frame_data,
+                                consistency_mask,
+                                downscale_mask,
+                                apply_dynamic_filter=False,
+                            )
+                            if points_w_dyn is not None and len(points_w_dyn) > 0:
+                                frame_points_seg0_for_dynamic.append(
+                                    self._transform_points_np(points_w_dyn, world_to_seg0)
+                                )
+                                frame_colors_for_dynamic.append(colors_dyn)
 
-            if len(frame_points_world) == 0:
-                continue
+            if len(frame_points_seg0) > 0:
+                points_seg0 = np.concatenate(frame_points_seg0, axis=0)
+                colors = np.concatenate(frame_colors, axis=0)
+                if len(points_seg0) > 0:
+                    background_frame = np.concatenate([points_seg0, colors], axis=1).astype(
+                        np.float32, copy=False
+                    )
+                    all_backgrounds.append(background_frame)
 
-            points_world = np.concatenate(frame_points_world, axis=0)
-            colors = np.concatenate(frame_colors, axis=0)
-            points_world = self._transform_points_np(points_world, world_to_seg0)
-
-            if len(points_world) == 0:
-                continue
-            background_frame = (
-                np.concatenate([points_world, colors], axis=1).astype(np.float32, copy=False)
-                if len(points_world) > 0
-                else np.zeros((0, 6), dtype=np.float32)
-            )
-            all_backgrounds.append(background_frame)
-
-            if self.dynamic_recovery_enable and len(frame_points_world_for_dynamic) > 0:
-                dynamic_points_world = np.concatenate(frame_points_world_for_dynamic, axis=0)
+            if self.dynamic_recovery_enable and len(frame_points_seg0_for_dynamic) > 0:
+                dynamic_points_seg0 = np.concatenate(frame_points_seg0_for_dynamic, axis=0)
                 dynamic_colors = np.concatenate(frame_colors_for_dynamic, axis=0)
-                dynamic_points_world = self._transform_points_np(dynamic_points_world, world_to_seg0)
-                frame_instances = frame_to_instances.get(frame_idx, [])
                 dynamic_frame, frame_recovered_before_cap = self._recover_dynamic_points_by_3d_bbox(
-                    dynamic_points_world,
+                    dynamic_points_seg0,
                     dynamic_colors,
-                    frame_instances,
+                    moving_instances,
                 )
                 if len(dynamic_frame) > 0:
                     dynamic_recovery_frame_count += 1
@@ -256,6 +302,8 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
             "dynamic_recovered_points_total": int(
                 sum(int(points.shape[0]) for points in dynamic_objects.values())
             ),
+            "static_instance_motion_enable": self.static_instance_motion_enable,
+            "static_instance_intids": sorted(int(x) for x in static_instance_intids),
         }
 
         return {
@@ -451,7 +499,8 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
         downscale_mask: Optional[np.ndarray],
         *,
         apply_dynamic_filter: bool,
-    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        include_pixels: bool = False,
+    ):
         rgb = frame_data["image"]
         depth = frame_data["depth"]
         extrinsic = frame_data["extrinsic"]
@@ -503,12 +552,16 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
 
         kept = np.argwhere(final_mask)
         if len(kept) == 0:
+            if include_pixels:
+                return None, None, None
             return None, None
 
         depth_values = depth_np[kept[:, 0], kept[:, 1]]
         rgb_values = rgb_np[kept[:, 0], kept[:, 1]]
         valid_depth_mask = np.isfinite(depth_values) & (depth_values > 0)
         if not np.any(valid_depth_mask):
+            if include_pixels:
+                return None, None, None
             return None, None
 
         depth_values = depth_values[valid_depth_mask]
@@ -522,26 +575,124 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
         coordinates = np.stack([x_cam, y_cam, z_cam], axis=1)
         valid_coords_mask = np.isfinite(coordinates).all(axis=1)
         if not np.any(valid_coords_mask):
+            if include_pixels:
+                return None, None, None
             return None, None
 
         coordinates = coordinates[valid_coords_mask]
         rgb_values = rgb_values[valid_coords_mask]
+        kept_valid = kept_valid[valid_coords_mask]
         coordinates_homo = np.column_stack([coordinates, np.ones(len(coordinates))])
         worlds = (extrinsic_np @ coordinates_homo.T).T[:, :3]
 
         valid_worlds_mask = np.isfinite(worlds).all(axis=1)
         if not np.any(valid_worlds_mask):
+            if include_pixels:
+                return None, None, None
             return None, None
 
         worlds = worlds[valid_worlds_mask]
         rgb_values = rgb_values[valid_worlds_mask]
+        kept_valid = kept_valid[valid_worlds_mask]
 
         # Ensure colors are in [0, 255]
         if rgb_values.max() <= 1.0 + 1e-3:
             rgb_values = rgb_values * 255.0
         rgb_values = rgb_values.astype(np.float32)
 
+        if include_pixels:
+            return worlds.astype(np.float32), rgb_values, kept_valid.astype(np.int64, copy=False)
         return worlds.astype(np.float32), rgb_values
+
+    @staticmethod
+    def _split_instances_by_static_intids(
+        instances: List[Dict],
+        static_instance_intids: Set[int],
+    ) -> Tuple[List[Dict], List[Dict]]:
+        static_ids = {int(x) for x in static_instance_intids}
+        moving: List[Dict] = []
+        stationary: List[Dict] = []
+        for instance in instances:
+            if int(instance["intid"]) in static_ids:
+                stationary.append(instance)
+            else:
+                moving.append(instance)
+        return moving, stationary
+
+    def _points_inside_any_instance_mask(
+        self,
+        points_world: np.ndarray,
+        instances: List[Dict],
+    ) -> np.ndarray:
+        n = int(points_world.shape[0])
+        mask_any = np.zeros((n,), dtype=bool)
+        if n == 0 or len(instances) == 0:
+            return mask_any
+
+        points_world = points_world.astype(np.float32, copy=False)
+        points_h = np.concatenate(
+            [points_world, np.ones((n, 1), dtype=np.float32)],
+            axis=1,
+        )
+        for instance in instances:
+            T_ow = np.asarray(instance["T_ow"], dtype=np.float32)
+            size_lwh = np.asarray(instance["size_lwh"], dtype=np.float32)
+            if T_ow.shape == (3, 4):
+                T_ow = np.vstack([T_ow, np.array([0, 0, 0, 1], dtype=np.float32)])
+            if T_ow.shape != (4, 4):
+                continue
+            if size_lwh.shape != (3,):
+                size_lwh = size_lwh.reshape(3)
+            try:
+                T_wo = np.linalg.inv(T_ow)
+            except np.linalg.LinAlgError:
+                continue
+
+            local_all = (T_wo @ points_h.T).T[:, :3]
+            half = 0.5 * size_lwh + self.dynamic_recovery_bbox_expand_xyz_m
+            mask_any |= (np.abs(local_all) <= (half[None, :] + 1e-6)).all(axis=1)
+        return mask_any
+
+    def _filter_background_points_with_instance_policy(
+        self,
+        points_world: np.ndarray,
+        colors: np.ndarray,
+        pixels_yx: Optional[np.ndarray],
+        frame_data: Dict,
+        instances: List[Dict],
+        static_instance_intids: Set[int],
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        if points_world is None or len(points_world) == 0:
+            return None, None
+
+        moving_instances, stationary_instances = self._split_instances_by_static_intids(
+            instances,
+            static_instance_intids,
+        )
+        moving_bbox_mask = self._points_inside_any_instance_mask(points_world, moving_instances)
+        stationary_bbox_mask = self._points_inside_any_instance_mask(points_world, stationary_instances)
+        keep = ~moving_bbox_mask
+
+        if self.dynamic_filter:
+            dynamic_mask = frame_data.get("dynamic_mask")
+            if dynamic_mask is None:
+                raise ValueError(
+                    "dynamic_filter is enabled but dynamic_mask is missing in frame_data."
+                )
+            if pixels_yx is None:
+                raise ValueError("pixels_yx is required for instance-aware dynamic mask filtering.")
+            if isinstance(dynamic_mask, torch.Tensor):
+                dynamic_mask = dynamic_mask.cpu().numpy()
+            pixels_yx = np.asarray(pixels_yx, dtype=np.int64)
+            is_dynamic_pixel = dynamic_mask[pixels_yx[:, 0], pixels_yx[:, 1]] > 0.5
+            keep &= (~is_dynamic_pixel) | stationary_bbox_mask
+
+        if not np.any(keep):
+            return None, None
+        return (
+            points_world[keep].astype(np.float32, copy=False),
+            colors[keep].astype(np.float32, copy=False),
+        )
 
     def _stride_limit_points6(self, points6: np.ndarray, max_count: Optional[int]) -> np.ndarray:
         if max_count is None:

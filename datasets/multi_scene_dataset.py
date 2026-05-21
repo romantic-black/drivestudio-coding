@@ -389,6 +389,7 @@ class MultiSceneDataset:
             dyn_rec_enable, dyn_rec_bbox_expand, dyn_rec_max_pts, dyn_rec_assignment = (
                 _parse_monocular_dynamic_recovery_cfg(pointcloud_config)
             )
+            sim_enable, sim_thresh = _parse_static_instance_motion_cfg(pointcloud_config)
 
             # Require pixel_source to load dynamic masks (fast-fail)
             if (
@@ -410,6 +411,8 @@ class MultiSceneDataset:
                 dynamic_recovery_bbox_expand_xyz_m=dyn_rec_bbox_expand,
                 dynamic_recovery_max_points_per_instance=dyn_rec_max_pts,
                 dynamic_recovery_assignment=dyn_rec_assignment,
+                static_instance_motion_enable=sim_enable,
+                static_instance_motion_traj_length_thresh_m=sim_thresh,
                 device=device,
             )
         elif generator_type == "lidar":

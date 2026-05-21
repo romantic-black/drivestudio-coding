@@ -60,6 +60,7 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
             device=device,
             static_instance_motion_enable=static_instance_motion_enable,
             static_instance_motion_traj_length_thresh_m=static_instance_motion_traj_length_thresh_m,
+            dynamic_bbox_expand_xyz_m=monocular_dynamic_recovery_bbox_expand_xyz_m,
         )
 
         # 创建单目生成器
@@ -74,6 +75,8 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
             dynamic_recovery_bbox_expand_xyz_m=monocular_dynamic_recovery_bbox_expand_xyz_m,
             dynamic_recovery_max_points_per_instance=monocular_dynamic_recovery_max_points_per_instance,
             dynamic_recovery_assignment="first_hit",
+            static_instance_motion_enable=static_instance_motion_enable,
+            static_instance_motion_traj_length_thresh_m=static_instance_motion_traj_length_thresh_m,
             device=device,
         )
 
@@ -206,8 +209,6 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
             )
             result = monocular_result.copy()
             result["metadata"]["type"] = "hybrid_monocular_fallback"
-            result["metadata"]["static_instance_motion_enable"] = False
-            result["metadata"]["static_instance_intids"] = []
             return result
 
         if monocular_result is None:
@@ -222,10 +223,27 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
         lidar_background = lidar_result["background"]  # [N1, 6]
         lidar_dynamic = lidar_result["dynamic"]  # Dict[int, np.ndarray]
         lidar_instance_mapping = lidar_result["instance_mapping"]
+        lidar_meta = lidar_result.get("metadata") or {}
 
         monocular_background = monocular_result["background"]  # [N2, 6]
         monocular_dynamic = monocular_result["dynamic"]  # Dict[int, np.ndarray]
         monocular_instance_mapping = monocular_result["instance_mapping"]
+        monocular_meta = monocular_result.get("metadata") or {}
+
+        static_instance_intids = {
+            int(x)
+            for x in list(lidar_meta.get("static_instance_intids", []) or [])
+            + list(monocular_meta.get("static_instance_intids", []) or [])
+        }
+        if len(static_instance_intids) > 0:
+            lidar_dynamic = {
+                int(k): v for k, v in lidar_dynamic.items() if int(k) not in static_instance_intids
+            }
+            monocular_dynamic = {
+                int(k): v
+                for k, v in monocular_dynamic.items()
+                if int(k) not in static_instance_intids
+            }
 
         # 统一实例映射（使用LiDAR的映射，因为它是更稳定的来源）
         instance_mapping = lidar_instance_mapping
@@ -244,7 +262,6 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
 
         # 构建元数据
         dynamic_count = sum(len(points) for points in fused_dynamic.values())
-        lidar_meta = lidar_result.get("metadata") or {}
         metadata = {
             "type": "hybrid",
             "lidar_count": len(lidar_background),
@@ -256,9 +273,10 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
             "lidar_frames_used": lidar_meta.get("frames_used", 0),
             "monocular_frames_used": monocular_result["metadata"].get("frames_used", 0),
             "static_instance_motion_enable": lidar_meta.get(
-                "static_instance_motion_enable", False
+                "static_instance_motion_enable",
+                monocular_meta.get("static_instance_motion_enable", False),
             ),
-            "static_instance_intids": list(lidar_meta.get("static_instance_intids", [])),
+            "static_instance_intids": sorted(static_instance_intids),
         }
 
         return {

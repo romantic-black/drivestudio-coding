@@ -230,6 +230,7 @@ class RGBPointCloudGenerator(ABC):
         colors: np.ndarray,
         instances: List[Dict],
         skip_instance_intids: Optional[Set[int]] = None,
+        bbox_expand_xyz_m: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, Dict[int, np.ndarray]]:
         """
         Split a single-frame point cloud into static background and dynamic objects.
@@ -251,6 +252,11 @@ class RGBPointCloudGenerator(ABC):
         dynamic_points_dict: Dict[int, np.ndarray] = {}
 
         skip = skip_instance_intids if skip_instance_intids is not None else set()
+        expand = (
+            np.asarray(bbox_expand_xyz_m, dtype=np.float32).reshape(3)
+            if bbox_expand_xyz_m is not None
+            else np.zeros((3,), dtype=np.float32)
+        )
 
         for instance in instances:
             intid = int(instance["intid"])
@@ -258,6 +264,12 @@ class RGBPointCloudGenerator(ABC):
                 continue
             T_ow = np.asarray(instance["T_ow"], dtype=np.float32)
             size_lwh = np.asarray(instance["size_lwh"], dtype=np.float32)
+            if T_ow.shape == (3, 4):
+                T_ow = np.vstack([T_ow, np.array([0, 0, 0, 1], dtype=np.float32)])
+            if T_ow.shape != (4, 4):
+                continue
+            if size_lwh.shape != (3,):
+                size_lwh = size_lwh.reshape(3)
 
             T_wo = np.linalg.inv(T_ow)
             points_homo = np.concatenate(
@@ -265,7 +277,7 @@ class RGBPointCloudGenerator(ABC):
             )
             points_local = (T_wo @ points_homo.T).T[:, :3]
 
-            half = size_lwh / 2.0
+            half = size_lwh / 2.0 + expand
             mask = (np.abs(points_local) <= (half + 1e-6)).all(axis=1)
             if not np.any(mask):
                 continue

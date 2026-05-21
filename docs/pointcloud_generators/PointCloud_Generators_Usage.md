@@ -187,7 +187,7 @@ pointcloud_config = {
 | | `monocular_dynamic_recovery_assignment` | Literal | "first_hit" | 固定 `first_hit`（不再暴露配置）。 |
 | **融合参数** | - | - | - | 融合策略固定：背景 merge，动态 fuse；不再暴露额外配置。 |
 
-### MultiScene：`static_instance_motion`（仅 `lidar` / `hybrid` 内 LiDAR 分支）
+### MultiScene：`static_instance_motion`（`monocular` / `lidar` / `hybrid`）
 
 在 [`datasets/multi_scene_dataset.py`](../../datasets/multi_scene_dataset.py) 的 `dataset.pointcloud` 下可配置（与 `DrivingDataset.get_init_objects(..., only_moving=True)` 的轨迹阈值语义对齐）：
 
@@ -199,8 +199,10 @@ pointcloud_config = {
 行为：
 
 - **LiDAR 分割**：静止实例不再从 background 抠入 `dynamic`（[`_separate_static_dynamic`](../../datasets/pointcloud_generators/base.py) 跳过对应 intid），框内点留在 **background**（世界坐标）。
+- **单目背景**：背景候选点会同时使用 2D `dynamic_masks` 和 3D moving bbox 清理。moving bbox 内点从 background 剔除；静止实例 bbox 内点即使被 2D mask 标为 dynamic，也保留为 **background**。
+- **单目 dynamic recovery**：只对 moving 实例回收 per-instance `dynamic` 点；静止实例不会出现在 `dynamic` 字典里。
 - **`dynamic_info`**：[`_build_dynamic_info`](../../datasets/multi_scene_dataset.py) 会排除 `metadata.static_instance_intids` 中的 intid，与点云 `dynamic` 字典一致。
-- **单目**：若启用 `dynamic_recovery.enable=true`，会输出 per-instance `dynamic`；否则仍仅有背景。`hybrid` 默认以 LiDAR 动态为主。
+- **Hybrid**：LiDAR 与单目分支共用同一组静止实例判定，融合 dynamic 时会再次过滤 `metadata.static_instance_intids`。
 
 若设置 `static_instance_motion` 块，则必须包含 `enable`；`enable=true` 时必须包含 `traj_length_thresh_m`（fast-fail）。
 
