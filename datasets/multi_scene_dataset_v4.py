@@ -4,6 +4,7 @@ import logging
 import threading
 import time
 from collections import OrderedDict
+import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, FrozenSet, List, Literal, Optional, Sequence, Tuple
@@ -32,6 +33,7 @@ from datasets.streetforward_assets import StreetForwardAssetStore
 from datasets.train_scheduler_v6 import TrainSchedulerV6
 from datasets.train_scheduler_v7 import TrainSchedulerV7
 from datasets.train_scheduler_v8 import TrainSchedulerV8
+from datasets.train_scheduler_v9 import TrainSchedulerV9, ViewSetRolloutBatchV9
 
 ImageRef = Tuple[int, int]
 
@@ -1700,6 +1702,7 @@ class MultiSceneDatasetV4:
         source_image_refs: Sequence[ImageRef],
         target_image_refs: Sequence[ImageRef],
         aux_image_refs: Optional[Sequence[ImageRef]] = None,
+        query_label_image_refs: Optional[Sequence[ImageRef]] = None,
         *,
         include_test: bool,
         test_image_refs: Optional[Sequence[ImageRef]],
@@ -1717,6 +1720,9 @@ class MultiSceneDatasetV4:
             self.validate_image_ref(scene_id, segment_id, tuple(ref), purpose=target_ref_purpose)
         if aux_image_refs is not None:
             for ref in aux_image_refs:
+                self.validate_image_ref(scene_id, segment_id, tuple(ref), purpose="train")
+        if query_label_image_refs is not None:
+            for ref in query_label_image_refs:
                 self.validate_image_ref(scene_id, segment_id, tuple(ref), purpose="train")
         if enforce_target0_equals_source and tuple(target_image_refs[0]) != tuple(source_image_refs[0]):
             raise ValueError("target_image_refs[0] must equal source_image_ref when enforce_target0_equals_source=True")
@@ -1805,9 +1811,17 @@ class MultiSceneDatasetV4:
                 aux_image_refs,
                 allow_missing_keyframe=False,
             )
+        query_label = None
+        if query_label_image_refs is not None and len(query_label_image_refs) > 0:
+            query_label = _load_role(
+                query_label_image_refs,
+                allow_missing_keyframe=False,
+            )
         all_frames = set(source["frame_indices"].tolist()) | set(target["frame_indices"].tolist())
         if aux_target is not None:
             all_frames = all_frames | set(aux_target["frame_indices"].tolist())
+        if query_label is not None:
+            all_frames = all_frames | set(query_label["frame_indices"].tolist())
 
         pointcloud = bundle.pointcloud
         knn_init = bundle.knn_init
@@ -2022,6 +2036,9 @@ class MultiSceneDatasetV4:
                 "source_image_refs": [tuple(r) for r in source_image_refs],
                 "target_image_refs": [tuple(r) for r in target_image_refs],
                 "aux_image_refs": [tuple(r) for r in aux_image_refs] if aux_image_refs is not None else [],
+                "query_label_refs": [tuple(r) for r in query_label_image_refs]
+                if query_label_image_refs is not None
+                else [],
                 "test_image_refs": None,
                 "assembly_mode": "image_ref_v4",
             },
@@ -2031,6 +2048,8 @@ class MultiSceneDatasetV4:
         }
         if aux_target is not None:
             batch["aux_target"] = aux_target
+        if query_label is not None:
+            batch["query_label"] = query_label
         if dynamic_info is not None:
             batch["dynamic_info"] = dynamic_info
         if knn_init_batch is not None:
@@ -2082,6 +2101,115 @@ class MultiSceneDatasetV4:
             enforce_target0_equals_source=enforce_target0_equals_source,
             target_ref_purpose="train",
         )
+
+    @staticmethod
+    def _flatten_v9_ref_groups(ref_groups: Sequence[Sequence[ImageRef]]) -> List[ImageRef]:
+        out: List[ImageRef] = []
+        for group in ref_groups:
+            for ref in group:
+                out.append((int(ref[0]), int(ref[1])))
+        return out
+
+    @staticmethod
+    def _dedupe_v9_refs_keep_order(refs: Sequence[ImageRef]) -> List[ImageRef]:
+        seen: set[ImageRef] = set()
+        out: List[ImageRef] = []
+        for ref in refs:
+            r = (int(ref[0]), int(ref[1]))
+            if r in seen:
+                continue
+            seen.add(r)
+            out.append(r)
+        return out
+
+    @staticmethod
+    def _dedupe_v9_refs_roles_keep_order(
+        refs: Sequence[ImageRef],
+        roles: Sequence[str],
+    ) -> tuple[List[ImageRef], List[str]]:
+        if len(refs) != len(roles):
+            raise ValueError(f"V9 refs/roles length mismatch: {len(refs)} vs {len(roles)}")
+        seen: set[ImageRef] = set()
+        out_refs: List[ImageRef] = []
+        out_roles: List[str] = []
+        for ref, role in zip(refs, roles):
+            r = (int(ref[0]), int(ref[1]))
+            if r in seen:
+                continue
+            seen.add(r)
+            out_refs.append(r)
+            out_roles.append(str(role))
+        return out_refs, out_roles
+
+    def _assemble_segment_batch_from_v9_request(
+        self,
+        *,
+        scene_id: int,
+        segment_id: int,
+        v9_plan: ViewSetRolloutBatchV9,
+        include_test: bool = False,
+    ) -> Dict[str, Any]:
+        if str(v9_plan.scheduler_version) != "v9":
+            raise ValueError("expected ViewSetRolloutBatchV9.scheduler_version == 'v9'")
+        if int(scene_id) != int(v9_plan.scene_id) or int(segment_id) != int(v9_plan.segment_id):
+            raise ValueError(
+                "V9 request scene/segment mismatch: "
+                f"request=({int(scene_id)},{int(segment_id)}) "
+                f"plan=({int(v9_plan.scene_id)},{int(v9_plan.segment_id)})"
+            )
+
+        evidence_refs = self._dedupe_v9_refs_keep_order(
+            self._flatten_v9_ref_groups(v9_plan.evidence_refs_by_step)
+        )
+        block_refs = self._flatten_v9_ref_groups(v9_plan.block_loss_refs_by_step)
+        nearby_refs = self._flatten_v9_ref_groups(v9_plan.nearby_loss_refs_by_step)
+        prefix_refs = self._flatten_v9_ref_groups(v9_plan.prefix_loss_refs_by_step)
+        raw_loss_refs = block_refs + nearby_refs + prefix_refs
+        raw_loss_roles = (
+            ["block_loss" for _ in block_refs]
+            + ["nearby_loss" for _ in nearby_refs]
+            + ["prefix_loss" for _ in prefix_refs]
+        )
+        loss_refs, loss_roles = self._dedupe_v9_refs_roles_keep_order(raw_loss_refs, raw_loss_roles)
+        query_refs = self._dedupe_v9_refs_keep_order(v9_plan.query_label_refs)
+        aux_refs = self._dedupe_v9_refs_keep_order(v9_plan.aux_loss_refs)
+        if len(evidence_refs) == 0:
+            raise ValueError("V9 request requires non-empty evidence refs")
+        if len(loss_refs) == 0:
+            raise ValueError("V9 request requires non-empty render loss refs for batch['target']")
+        for ref in evidence_refs + loss_refs + query_refs + aux_refs:
+            self.validate_image_ref(int(scene_id), int(segment_id), tuple(ref), purpose="train")
+
+        batch = self._assemble_segment_batch_from_image_refs(
+            int(scene_id),
+            int(segment_id),
+            evidence_refs,
+            loss_refs,
+            aux_image_refs=aux_refs,
+            query_label_image_refs=query_refs,
+            include_test=bool(include_test),
+            test_image_refs=None,
+            enforce_target0_equals_source=False,
+            target_ref_purpose="train",
+        )
+        plan_dict = dataclasses.asdict(v9_plan)
+        request_meta = dict(batch.get("request_meta") or {})
+        request_meta.update(dict(v9_plan.request_meta or {}))
+        request_meta["source_image_refs"] = [tuple(x) for x in evidence_refs]
+        request_meta["source_image_ref"] = tuple(evidence_refs[0])
+        request_meta["target_image_refs"] = [tuple(x) for x in loss_refs]
+        request_meta["target_image_roles"] = [str(x) for x in loss_roles]
+        request_meta["query_label_refs"] = [tuple(x) for x in query_refs]
+        request_meta["aux_image_refs"] = [tuple(x) for x in aux_refs]
+        request_meta["assembly_mode"] = "image_ref_v9"
+        if len(request_meta["target_image_refs"]) != len(request_meta["target_image_roles"]):
+            raise ValueError(
+                "V9 target_image_refs/target_image_roles mismatch after assembly: "
+                f"{len(request_meta['target_image_refs'])} vs {len(request_meta['target_image_roles'])}"
+            )
+        batch["request_meta"] = request_meta
+        batch["_scheduler_v9"] = plan_dict
+        return batch
 
     def get_segment_eval_batch_from_image_refs(self, request: EvalRequestV4) -> Dict[str, Any]:
         raw = self._assemble_segment_batch_from_image_refs(
@@ -2296,6 +2424,66 @@ class MultiSceneDatasetV4:
             aux_feature_splat_targets_cfg=aux_feature_splat_targets_cfg,
             block_source_frame_policy=str(block_source_frame_policy),
             episode_source_mode=str(episode_source_mode),
+        )
+
+    def create_train_scheduler_v9(
+        self,
+        *,
+        phase: str,
+        steps_per_block: int,
+        blocks_per_episode: int,
+        include_source_frame: bool,
+        frame_within_keyframe_policy: str,
+        min_keyframes_required_policy: str,
+        traversal_mode: str,
+        switch_after_episode: bool,
+        segment_order: str,
+        scene_order: str,
+        include_test: bool,
+        fixed_scene_id: Optional[int],
+        fixed_segment_id: Optional[int],
+        emit_preload_hints: bool,
+        warm_next_block_exact: bool,
+        warm_next_episode_chain: bool,
+        block_order: str = "block_major",
+        step_major_switch_interval_steps: int = 1,
+        target_policy: str = "visited_episode_frames",
+        reset_policy: str = "episode_end",
+        block_source_frame_policy: str = "random_within_keyframe_per_visit",
+        episode_source_mode: str = "keyframes",
+        phase_a_cfg: Optional[Any] = None,
+        phase_b_cfg: Optional[Any] = None,
+        leakage_check_cfg: Optional[Any] = None,
+        fail_fast: bool = True,
+    ) -> TrainSchedulerV9:
+        return TrainSchedulerV9(
+            dataset=self,
+            phase=phase,  # type: ignore[arg-type]
+            steps_per_block=int(steps_per_block),
+            blocks_per_episode=int(blocks_per_episode),
+            include_source_frame=bool(include_source_frame),
+            frame_within_keyframe_policy=str(frame_within_keyframe_policy),
+            min_keyframes_required_policy=str(min_keyframes_required_policy),
+            traversal_mode=str(traversal_mode),
+            switch_after_episode=bool(switch_after_episode),
+            segment_order=str(segment_order),
+            scene_order=str(scene_order),
+            include_test=bool(include_test),
+            fixed_scene_id=fixed_scene_id,
+            fixed_segment_id=fixed_segment_id,
+            emit_preload_hints=bool(emit_preload_hints),
+            warm_next_block_exact=bool(warm_next_block_exact),
+            warm_next_episode_chain=bool(warm_next_episode_chain),
+            block_order=str(block_order),
+            step_major_switch_interval_steps=int(step_major_switch_interval_steps),
+            target_policy=str(target_policy),
+            reset_policy=str(reset_policy),
+            block_source_frame_policy=str(block_source_frame_policy),
+            episode_source_mode=str(episode_source_mode),
+            phase_a_cfg=phase_a_cfg,
+            phase_b_cfg=phase_b_cfg,
+            leakage_check_cfg=leakage_check_cfg,
+            fail_fast=bool(fail_fast),
         )
 
     # Preload worker hooks

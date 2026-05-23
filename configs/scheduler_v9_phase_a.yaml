@@ -1,0 +1,96 @@
+scheduler_v9:
+  enable: true
+  phase: phase_A_block_local_unroll
+  fail_fast: true
+
+  block:
+    steps_per_block: 1
+
+  episode:
+    blocks_per_episode: 8
+    include_source_frame: true
+    target_policy: visited_episode_frames
+    reset_policy: episode_end
+    block_source_frame_policy: random_within_keyframe_per_visit
+    frame_within_keyframe_policy: random_once_per_episode
+    min_keyframes_required_policy: skip_if_less_than_window
+    source_mode: keyframes
+
+  traversal:
+    mode: round_robin_episode_interleave
+    switch_after_episode: true
+    fixed_scene_id: null
+    fixed_segment_id: null
+    segment_order: ascending
+    scene_order: shuffle_per_epoch
+
+  execution:
+    block_order: step_major
+    step_major_switch_interval_steps: 4
+    reset_policy: episode_end
+
+  preload:
+    emit_hints: true
+    warm_next_block_exact: true
+    warm_next_episode_chain: true
+    warm_v9_role_refs: true
+
+  phase_A:
+    mode: block_local_unroll
+    block:
+      repeat_block_iteration: true
+      inner_K_choices: [2, 4, 6]
+      inner_K_probs: [0.45, 0.40, 0.15]
+      source_frame_policy: fixed_for_scheduler_step
+      block_loss_policy: source_frame_all_cams
+    nearby_supervision:
+      enable: true
+      role_name: phaseA_nearby
+      policy: adjacent_then_random_same_keyframe
+      same_keyframe_only: true
+      frames_per_block: 2
+      adjacent_radius: 1
+      random_fill: true
+      exclude_source_frame: true
+      exclude_existing_block_loss_frames: true
+      insufficient_policy: skip
+      camera_policy: all_cams
+      add_to_evidence_refs: false
+      add_to_source_image_refs: false
+      add_to_history_record_views: false
+      apply_every_step: false
+      apply_final_step_only: true
+      loss_weight: 0.25
+      loss_warmup_steps: 2000
+      max_refs_per_step: 12
+    masks:
+      block_loss_mask: non_sky_non_egocar
+      nearby_loss_mask: non_sky_non_egocar
+
+  phase_B:
+    rollout:
+      K_choices: [2, 4]
+      K_probs: [0.65, 0.35]
+      sample_event_frames: random_blocks_in_episode
+      event_order: chronological
+      distinct_event_frames: true
+    prefix_render:
+      policy: current_plus_random_previous
+      intermediate_views: 2
+      final_views: 3
+      max_refs_per_step: 18
+    query_observation:
+      enable: true
+      query_frame_policy: heldout_inside_event_span
+      frames_per_rollout: 1
+      cameras_per_frame: all_cams
+      exclude_event_frames: true
+
+  leakage_check:
+    enable: true
+    nearby_not_in_evidence: true
+    query_not_in_evidence: true
+    aux_not_in_evidence: true
+    same_scene_segment_required: true
+    role_count_match_required: true
+    forbid_test_refs_in_train: true

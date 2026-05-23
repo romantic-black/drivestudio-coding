@@ -31,8 +31,8 @@ data:
     enable: false
   pixel_source:
     type: datasets.nuscenes.nuscenes_sourceloader.NuScenesPixelSource
-    cameras: [0, 1, 2, 3, 4, 5]
-    downscale_when_loading: [3, 3, 3, 3, 3, 3]
+    cameras: [0, 1, 2]
+    downscale_when_loading: [3, 3, 3]
     downscale: 1
     undistort: false
     test_image_stride: 0
@@ -53,12 +53,12 @@ data:
     lidar_downsample_factor: 1
     lidar_percentile: 0.02
   assets:
-    root: "/root/autodl-tmp/streetforward_assets_pt60w_40w"
+    root: "/root/autodl-tmp/streetforward_assets_pt40w_40w"
 
 dataset:
   num_source_keyframes: 1
   num_target_keyframes: 3
-  segment_overlap_ratio: 0.2
+  segment_overlap_ratio: 0.5
   min_keyframes_per_scene: 2
   min_keyframes_per_segment: 2
   preload_scene_count: 2
@@ -67,19 +67,19 @@ dataset:
     min_count: 1
     min_length: 3.0
   segment_aabb:
-    - [-20.0, -10.0, -20.0]
-    - [20.0, 4.8, 40.0]
+    - [-20.0, -10.0, 0.0]
+    - [20.0, 4.8, 60.0]
   pointcloud:
     type: "hybrid"
     lidar_sparsity: full
-    monocular_chosen_cam_ids: [0, 1, 2, 3, 4, 5]
+    monocular_chosen_cam_ids: [0, 1, 2]
     monocular_sparsity: full
     monocular_filter_sky: true
     monocular_depth_consistency: false
     monocular_downscale: 1
     monocular_dynamic_recovery_bbox_expand_xyz_m: [0.5, 0.2, 0.5]
-    monocular_dynamic_recovery_max_points_per_instance: 20000
-    near_max_points: 600000
+    monocular_dynamic_recovery_max_points_per_instance: 5000
+    near_max_points: 400000
     distant_max_points: 400000
     static_instance_motion:
       enable: true

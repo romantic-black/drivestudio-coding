@@ -8,6 +8,7 @@ from PIL import Image
 
 from datasets.multi_scene_dataset_v4 import BatchRequestV4, MultiSceneDatasetV4
 from datasets.streetforward_assets import StreetForwardAssetStore
+from datasets.train_scheduler_v9 import StepPlanV9, ViewSetRolloutBatchV9
 
 
 def _prepare_demo_assets(
@@ -347,6 +348,75 @@ def test_v4_never_uses_runtime_scene_loader(tmp_path):
     )
     batch = ds.get_segment_batch_from_image_refs(req)
     assert batch["target"]["frame_indices"].tolist() == [0, 1]
+
+
+def test_v4_v9_request_materializes_role_batches(tmp_path):
+    store = _prepare_demo_assets(tmp_path)
+    data_cfg, dataset_cfg = _build_cfg(tmp_path)
+    ds = MultiSceneDatasetV4(
+        dataset_cfg=dataset_cfg,
+        data_cfg=data_cfg,
+        device=torch.device("cpu"),
+        asset_store=store,
+    )
+    ds.initialize()
+    step = StepPlanV9(
+        step_idx=0,
+        source_keyframe_idx=0,
+        source_frame_idx=0,
+        block_idx=0,
+        evidence_refs=[(0, 0)],
+        block_loss_refs=[(0, 0)],
+        nearby_loss_refs=[],
+        prefix_loss_refs=[],
+        query_label_refs=[(1, 0)],
+        aux_loss_refs=[],
+        evidence_frame_indices=[0],
+        loss_frame_indices=[0],
+        nearby_frame_indices=[],
+        query_frame_indices=[1],
+    )
+    plan = ViewSetRolloutBatchV9(
+        scheduler_version="v9",
+        phase="phase_B_viewset_rollout",
+        scene_id=1,
+        segment_id=0,
+        episode_id=0,
+        episode_start_keyframe_pos=0,
+        keyframe_window=[0, 1],
+        frame_chain=[0, 1],
+        num_cams=1,
+        inner_K=1,
+        steps=[step],
+        evidence_refs_by_step=[[(0, 0)]],
+        block_loss_refs_by_step=[[(0, 0)]],
+        nearby_loss_refs_by_step=[[]],
+        prefix_loss_refs_by_step=[[]],
+        query_label_refs=[(1, 0)],
+        aux_loss_refs=[],
+        request_meta={
+            "scheduler_version": "v9",
+            "scheduler_phase": "phase_B_viewset_rollout",
+            "target_image_refs": [(0, 0)],
+            "target_image_roles": ["block_loss"],
+            "query_label_refs": [(1, 0)],
+        },
+    )
+    batch = ds._assemble_segment_batch_from_v9_request(
+        scene_id=1,
+        segment_id=0,
+        v9_plan=plan,
+        include_test=False,
+    )
+    assert batch["source"]["image"].shape == (1, 4, 5, 3)
+    assert batch["target"]["image"].shape == (1, 4, 5, 3)
+    assert batch["query_label"]["image"].shape == (1, 4, 5, 3)
+    assert batch["_scheduler_v9"]["scheduler_version"] == "v9"
+    assert batch["request_meta"]["assembly_mode"] == "image_ref_v9"
+    assert batch["request_meta"]["source_image_refs"] == [(0, 0)]
+    assert batch["request_meta"]["target_image_refs"] == [(0, 0)]
+    assert batch["request_meta"]["target_image_roles"] == ["block_loss"]
+    assert batch["request_meta"]["query_label_refs"] == [(1, 0)]
 
 
 def test_v4_segment_aabb_mismatch_raises(tmp_path):

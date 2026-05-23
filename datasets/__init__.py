@@ -15,6 +15,8 @@ _LAZY_EXPORTS: Dict[str, Tuple[str, str]] = {
     "TrainSchedulerV6": ("datasets.train_scheduler_v6", "TrainSchedulerV6"),
     "TrainSchedulerV7": ("datasets.train_scheduler_v7", "TrainSchedulerV7"),
     "TrainSchedulerV8": ("datasets.train_scheduler_v8", "TrainSchedulerV8"),
+    "TrainSchedulerV9": ("datasets.train_scheduler_v9", "TrainSchedulerV9"),
+    "BatchRequestV9": ("datasets.train_scheduler_v9", "BatchRequestV9"),
     "MultiSceneDatasetV4": ("datasets.multi_scene_dataset_v4", "MultiSceneDatasetV4"),
 }
 
@@ -30,4 +32,3 @@ def __getattr__(name: str):
     value = getattr(module, attr_name)
     globals()[name] = value
     return value
-

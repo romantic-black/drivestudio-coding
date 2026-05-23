@@ -291,7 +291,13 @@ def convert_batch_to_minimal_format(
             passthrough["request_meta"] = dict(request_meta_batch)
         else:
             passthrough["request_meta"] = request_meta_batch
-    for k in ("_scheduler_v4_aligned_info", "_scheduler_v7_aligned_info", "_scheduler_v8_aligned_info"):
+    for k in (
+        "_scheduler_v4_aligned_info",
+        "_scheduler_v7_aligned_info",
+        "_scheduler_v8_aligned_info",
+        "_scheduler_v9_aligned_info",
+        "_scheduler_v9",
+    ):
         if batch.get(k) is not None:
             passthrough[k] = batch.get(k)
     if isinstance(pointcloud, dict):
@@ -470,6 +476,9 @@ def convert_batch_to_minimal_format(
     aux_target_data = batch.get("aux_target")
     if isinstance(aux_target_data, dict) and int(aux_target_data.get("image", torch.zeros((0,))).shape[0]) > 0:
         result["aux_targets"] = _role_dict_to_minimal_targets(aux_target_data, device=device)
+    query_label_data = batch.get("query_label")
+    if isinstance(query_label_data, dict) and int(query_label_data.get("image", torch.zeros((0,))).shape[0]) > 0:
+        result["query_targets"] = _role_dict_to_minimal_targets(query_label_data, device=device)
     result.update(passthrough)
     if include_source_for_2d:
         source_data = batch.get("source")
