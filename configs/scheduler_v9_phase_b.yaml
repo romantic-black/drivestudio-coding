@@ -13,7 +13,7 @@ scheduler_v9:
     reset_policy: episode_end
     block_source_frame_policy: random_within_keyframe_per_visit
     frame_within_keyframe_policy: random_once_per_episode
-    min_keyframes_required_policy: skip_if_less_than_window
+    min_keyframes_required_policy: use_available_if_less_than_window
     source_mode: keyframes
 
   traversal:

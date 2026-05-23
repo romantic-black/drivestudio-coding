@@ -10,13 +10,15 @@ from models.streetforward.minimal_trainer_stage5_4 import MinimalStreetForwardSt
 from models.streetforward.minimal_trainer_stage6_0 import MinimalStreetForwardStage6_0
 from models.streetforward.node_states import NodeStateBackground
 from models.streetforward.stage6_0 import (
-    CurrentContextAdapter,
     LocalGSState,
-    Stage6EventEncoder,
-    Stage6ParamEncoder,
     Stage6PosteriorUpdater,
+    Stage6ParamObsCodec,
+    Stage6RoutedStructEventDecoder,
+    Stage6StructInput,
     resolve_v9_phase_a_batch,
 )
+from models.streetforward.stage6_0.phase_a_losses import delta_regularization
+from models.streetforward.stage6_0.phase_a_losses import masked_rgb_loss
 from models.streetforward.stage6_0.phase_a_losses import target_valid_mask
 from models.streetforward.stage6_0.posterior_updater import BranchDelta, DeltaPack
 
@@ -50,6 +52,50 @@ def _phase_a_batch():
     }
 
 
+def _route_empty():
+    return type(
+        "Route",
+        (),
+        {
+            "S": torch.zeros((0,), dtype=torch.long),
+            "S_in": torch.zeros((0,), dtype=torch.long),
+            "S_out": torch.zeros((0,), dtype=torch.long),
+            "inside_mask_S": torch.zeros((0,), dtype=torch.bool),
+            "means_world_S": torch.zeros((0, 3)),
+        },
+    )()
+
+
+def _param_dict(n: int, *, requires_grad: bool = False):
+    return {
+        "means": torch.zeros(n, 3, requires_grad=requires_grad),
+        "scales_log": torch.zeros(n, 3, requires_grad=requires_grad),
+        "quats": torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(n, 1).requires_grad_(requires_grad),
+        "opacity_logit": torch.zeros(n, 1, requires_grad=requires_grad),
+        "sh_dc": torch.zeros(n, 3, requires_grad=requires_grad),
+        "sh_rest": torch.zeros(n, 3, 3, requires_grad=requires_grad),
+    }
+
+
+def _stage6_decoder(*, feat_dim: int = 4, event_dim: int = 8, token_dim: int = 8) -> Stage6RoutedStructEventDecoder:
+    if int(event_dim) != int(token_dim):
+        raise ValueError("test Stage6 decoder requires event_dim==token_dim")
+    return Stage6RoutedStructEventDecoder(
+        feat_2d_dim=feat_dim,
+        event_dim=event_dim,
+        token_dim=token_dim,
+        param_obs_dim=6,
+        support_embed_dim=4,
+        branch_embed_dim=4,
+        near_num_blocks=1,
+        near_voxel_size=0.5,
+        near_sparse_backend="fallback_neighbor_mean",
+        far_hidden_dim=token_dim,
+        far_num_layers=2,
+        param_obs_codec_cfg={"output_dim": 6, "branch_embed_dim": 4},
+    )
+
+
 def test_phase_a_resolver_maps_indices():
     roles = resolve_v9_phase_a_batch(_phase_a_batch())
     assert roles.inner_K == 2
@@ -77,70 +123,150 @@ def test_phase_a_resolver_rejects_bad_batches(mutate, match):
         resolve_v9_phase_a_batch(batch)
 
 
-def test_stage6_event_and_updater_receive_gradients():
-    encoder = Stage6EventEncoder(z_dim=4, output_dim=8, hidden_dim=16, param_embed_dim=3)
-    adapter = CurrentContextAdapter(event_dim=8, ctx_dim=8, hidden_dim=16)
+def test_stage6_struct_event_and_updater_receive_gradients():
+    decoder = _stage6_decoder(feat_dim=4, event_dim=8)
     updater = Stage6PosteriorUpdater(event_dim=8, ctx_dim=8, hidden_dim=16, stage_hidden_dim=5, sh_degree=1)
-    assert updater.trunk[0].in_features == 8
-    z = torch.randn(6, 4)
-    acc = torch.rand(6)
-    obs = torch.randn(6, 2)
-    view = torch.zeros(6, 2)
-    param = torch.randn(6, 3)
-    event = encoder(
-        z_bg=z,
-        acc_w_bg=acc,
-        obs_code_bg=obs,
-        view_code_bg=view,
-        param_embed_bg=param,
+    feat = torch.randn(6, 4, requires_grad=True)
+    near_in = Stage6StructInput(
+        feat_2d=feat,
+        acc_w=torch.ones(6),
+        obs_code=torch.randn(6, 2),
+        coords=torch.rand(6, 3) * 1.6 - 0.8,
+        branch_id=torch.zeros(6, dtype=torch.long),
+        params_for_embed=_param_dict(6, requires_grad=True),
+        split_0=6,
+        split_1=0,
+        meta={"support_threshold_bg": 0.0, "support_threshold_rigid": 0.0},
     )
-    ctx = adapter(event)
-    delta, _ = updater(event=event, ctx_current=ctx, ctx_vsm=None)
+    far_in = Stage6StructInput(
+        feat_2d=torch.zeros(0, 4),
+        acc_w=torch.zeros(0),
+        obs_code=torch.zeros(0, 2),
+        coords=torch.zeros(0, 3),
+        branch_id=torch.zeros(0, dtype=torch.long),
+        params_for_embed=_param_dict(0),
+        split_0=0,
+        split_1=0,
+    )
+    event = decoder(
+        near_in=near_in,
+        far_in=far_in,
+        route=_route_empty(),
+        aabb_min=torch.tensor([-1.0, -1.0, -1.0]),
+        aabb_max=torch.tensor([1.0, 1.0, 1.0]),
+    )
+    delta, _ = updater(event=event, ctx_current=None, ctx_vsm=None)
     loss = delta.bg.means.pow(2).mean() + delta.bg.sh.pow(2).mean()
     loss.backward()
-    assert any(p.grad is not None for p in encoder.parameters())
+    assert any(p.grad is not None for p in decoder.parameters())
     assert any(p.grad is not None for p in updater.parameters())
+    assert feat.grad is not None
+    assert near_in.params_for_embed["means"].grad is None
     measurement_frontend = nn.Linear(2, 2)
     for p in measurement_frontend.parameters():
         p.requires_grad_(False)
     assert all(p.grad is None for p in measurement_frontend.parameters())
 
 
-def test_stage6_event_encoder_rejects_feature_dim_mismatch():
-    encoder = Stage6EventEncoder(z_dim=4, output_dim=8, hidden_dim=16, param_embed_dim=3)
-    z = torch.randn(2, 4)
-    kwargs = {
-        "z_bg": z,
-        "acc_w_bg": torch.ones(2),
-        "obs_code_bg": torch.zeros(2, 2),
-        "view_code_bg": torch.zeros(2, 2),
-        "param_embed_bg": torch.zeros(2, 3),
-    }
-    bad_z = dict(kwargs)
-    bad_z["z_bg"] = torch.randn(2, 5)
-    with pytest.raises(ValueError, match="z dim mismatch"):
-        encoder(**bad_z)
-    bad_param = dict(kwargs)
-    bad_param["param_embed_bg"] = torch.zeros(2, 2)
-    with pytest.raises(ValueError, match="param_embed dim mismatch"):
-        encoder(**bad_param)
+def test_stage6_struct_event_rejects_obs_code_shape():
+    codec = Stage6ParamObsCodec(output_dim=6, branch_embed_dim=4)
+    with pytest.raises(ValueError, match="obs_code"):
+        codec(
+            params_for_embed=_param_dict(2),
+            obs_code=torch.zeros(2, 3),
+            acc_w=torch.ones(2),
+            branch_id=torch.zeros(2, dtype=torch.long),
+            aabb_min=torch.tensor([-1.0, -1.0, -1.0]),
+            aabb_max=torch.tensor([1.0, 1.0, 1.0]),
+        )
 
 
-def test_stage6_param_encoder_uses_compact_summaries():
-    bg = NodeStateBackground(
-        means=torch.zeros(4, 3),
-        scales_log=torch.zeros(4, 3),
-        quats=torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(4, 1),
-        opacity_logit=torch.zeros(4, 1),
-        sh_dc=torch.zeros(4, 3),
-        sh_rest=torch.zeros(4, 3, 3),
+def test_stage6_param_obs_codec_uses_obs_code_and_detaches_params():
+    params = _param_dict(4, requires_grad=True)
+    obs = torch.randn(4, 2)
+    encoder = Stage6ParamObsCodec(output_dim=6, branch_embed_dim=4)
+    out = encoder(
+        params_for_embed=params,
+        obs_code=obs,
+        acc_w=torch.ones(4),
+        branch_id=torch.zeros(4, dtype=torch.long),
+        aabb_min=torch.tensor([-1.0, -1.0, -1.0]),
+        aabb_max=torch.tensor([1.0, 1.0, 1.0]),
     )
-    encoder = Stage6ParamEncoder(sh_rest_input_dim=9, quat_scales_summary_dim=4, sh_rest_summary_dim=8)
-    out = encoder(branch=bg, aabb_min=torch.tensor([-1.0, -1.0, -1.0]), aabb_max=torch.tensor([1.0, 1.0, 1.0]))
-    assert out.shape == (4, 19)
+    assert out.shape == (4, 6)
     out.sum().backward()
     assert any(p.grad is not None for p in encoder.parameters())
-    assert bg.means.grad is None
+    assert params["means"].grad is None
+
+
+def test_stage6_param_obs_codec_uses_thresholded_valid_mask():
+    encoder = Stage6ParamObsCodec(
+        output_dim=25,
+        branch_embed_dim=4,
+        norm="none",
+        activation="none",
+    )
+    encoder.net = nn.Identity()
+    out = encoder(
+        params_for_embed=_param_dict(2),
+        obs_code=torch.zeros(2, 2),
+        acc_w=torch.tensor([0.1, 0.1]),
+        branch_id=torch.zeros(2, dtype=torch.long),
+        aabb_min=torch.tensor([-1.0, -1.0, -1.0]),
+        aabb_max=torch.tensor([1.0, 1.0, 1.0]),
+        valid_mask=torch.tensor([False, True]),
+    )
+    valid_support_column = 17 + 2 + 1
+    assert out[0, valid_support_column].item() == 0.0
+    assert out[1, valid_support_column].item() == 1.0
+
+
+def test_stage6_aabb_requires_explicit_bounds():
+    model = MinimalStreetForwardStage6_0.__new__(MinimalStreetForwardStage6_0)
+    nn.Module.__init__(model)
+    with pytest.raises(RuntimeError, match="segment AABB"):
+        MinimalStreetForwardStage6_0._stage6_aabb(model, torch.zeros(1, 3))
+
+
+def test_stage6_rigid_reassembly_validates_route_counts():
+    decoder = _stage6_decoder(feat_dim=4, event_dim=8)
+    near_in = Stage6StructInput(
+        feat_2d=torch.randn(3, 4),
+        acc_w=torch.ones(3),
+        obs_code=torch.zeros(3, 2),
+        coords=torch.zeros(3, 3),
+        branch_id=torch.tensor([0, 0, 1], dtype=torch.long),
+        params_for_embed=_param_dict(3),
+        split_0=2,
+        split_1=1,
+        meta={"support_threshold_bg": 0.0, "support_threshold_rigid": 0.0},
+    )
+    far_in = Stage6StructInput(
+        feat_2d=torch.zeros(0, 4),
+        acc_w=torch.zeros(0),
+        obs_code=torch.zeros(0, 2),
+        coords=torch.zeros(0, 3),
+        branch_id=torch.zeros(0, dtype=torch.long),
+        params_for_embed=_param_dict(0),
+        split_0=0,
+        split_1=0,
+    )
+    route = type(
+        "Route",
+        (),
+        {
+            "S": torch.tensor([0]),
+            "inside_mask_S": torch.tensor([False]),
+        },
+    )()
+    with pytest.raises(RuntimeError, match="true count"):
+        decoder(
+            near_in=near_in,
+            far_in=far_in,
+            route=route,
+            aabb_min=torch.tensor([-1.0, -1.0, -1.0]),
+            aabb_max=torch.tensor([1.0, 1.0, 1.0]),
+        )
 
 
 def _stage6_encode_update_test_model(*, detach_v4_outputs: bool):
@@ -148,12 +274,17 @@ def _stage6_encode_update_test_model(*, detach_v4_outputs: bool):
     nn.Module.__init__(model)
     model.device = torch.device("cpu")
     model.sh_degree = 1
+    model.num_sh_bases = 4
     model.stage6_hidden_dim = 5
-    model.stage6_param_embed_dim = 10
-    model.stage6_param_encoder = None
     model.stage6_detach_v4_outputs = bool(detach_v4_outputs)
-    model.stage6_event_encoder = Stage6EventEncoder(z_dim=4, output_dim=8, hidden_dim=16, param_embed_dim=10)
-    model.stage6_current_context_adapter = CurrentContextAdapter(event_dim=8, ctx_dim=8, hidden_dim=16)
+    model.stage6_feat_2d_dim = 4
+    model.stage6_event_dim = 8
+    model.bbx_min = torch.tensor([-1.0, -1.0, -1.0])
+    model.bbx_max = torch.tensor([1.0, 1.0, 1.0])
+    model.bg_src_backproject_support_min = 0.0
+    model.distant_src_backproject_support_min = 0.0
+    model.rigid_src_backproject_support_min = 0.0
+    model.stage6_struct_event_decoder = _stage6_decoder(feat_dim=4, event_dim=8)
     model.stage6_posterior_updater = Stage6PosteriorUpdater(
         event_dim=8,
         ctx_dim=8,
@@ -161,7 +292,6 @@ def _stage6_encode_update_test_model(*, detach_v4_outputs: bool):
         stage_hidden_dim=5,
         sh_degree=1,
     )
-    model.stage6_view_code_policy = "zero_phase_a_debug"
     model.stage6_branch_scope = {
         "bg": {
             "update_means": True,
@@ -200,10 +330,11 @@ def test_stage6_from_scratch_keeps_2d_measurement_gradient_path():
     local = LocalGSState.from_node_states(bg=bg, distant=None, rigid=None, hidden_dim=5)
     z = torch.randn(3, 4, requires_grad=True)
     measurement = {
-        "route": type("Route", (), {"S": torch.zeros((0,), dtype=torch.long)})(),
+        "route": _route_empty(),
         "feat_2d_bg": z,
         "acc_w_bg": torch.ones(3),
         "obs_bg": torch.zeros(3, 2),
+        "source_frame_idx": 0,
     }
     model = _stage6_encode_update_test_model(detach_v4_outputs=False)
     updated, _delta, _aux = MinimalStreetForwardStage6_0._encode_and_update(
@@ -227,10 +358,11 @@ def test_stage6_updater_only_detaches_measurement_outputs():
     local = LocalGSState.from_node_states(bg=bg, distant=None, rigid=None, hidden_dim=5)
     z = torch.randn(3, 4, requires_grad=True)
     measurement = {
-        "route": type("Route", (), {"S": torch.zeros((0,), dtype=torch.long)})(),
+        "route": _route_empty(),
         "feat_2d_bg": z,
         "acc_w_bg": torch.ones(3),
         "obs_bg": torch.zeros(3, 2),
+        "source_frame_idx": 0,
     }
     model = _stage6_encode_update_test_model(detach_v4_outputs=True)
     updated, _delta, _aux = MinimalStreetForwardStage6_0._encode_and_update(
@@ -291,12 +423,28 @@ def _valid_stage6_config():
                     "source_evidence_grad_mode": "no_grad_v4",
                     "detach_v4_outputs": True,
                 },
-                "event_encoder": {
-                    "param_embed_dim": 10,
-                    "view_code_policy": "zero_phase_a_debug",
-                    "allow_zero_view_code_phase_a": False,
+                "struct_event_decoder": {
+                    "enable": True,
+                    "event_dim": 8,
+                    "feat_2d_dim": 4,
+                    "token": {"token_dim": 8},
+                    "param_obs_codec": {"output_dim": 6, "branch_embed_dim": 4},
+                    "near": {
+                        "type": "xcpe",
+                        "sparse_backend": "fallback_neighbor_mean",
+                        "num_blocks": 1,
+                        "voxel_size": 0.5,
+                    },
+                    "far": {"type": "point_mlp", "hidden_dim": 8, "num_layers": 2},
                 },
+                "event_encoder": {
+                    "enable": False,
+                    "mode": "disabled_direct_concat_mlp",
+                },
+                "current_context_adapter": {"enable": False},
                 "posterior_updater": {
+                    "event_dim": 8,
+                    "input_current_ctx": False,
                     "branch_scope": {
                         "distant": {
                             "update_means": False,
@@ -337,6 +485,10 @@ def _validate_with_parent_noop(cfg, monkeypatch):
         (("model", "stage6_0", "base_measurement", "type"), "other"),
         (("model", "stage6_0", "base_measurement", "require_fused_v4"), False),
         (("model", "stage6_0", "base_measurement", "source_evidence_grad_mode"), "full_debug"),
+        (("model", "stage6_0", "event_encoder", "enable"), True),
+        (("model", "stage6_0", "event_encoder", "mode"), "direct_concat_mlp"),
+        (("model", "stage6_0", "current_context_adapter", "enable"), True),
+        (("model", "stage6_0", "posterior_updater", "input_current_ctx"), True),
         (("model", "history_memory", "enable"), True),
         (("model", "update_gate", "enable"), True),
         (("model", "view_transient", "enable"), True),
@@ -415,8 +567,9 @@ def test_stage6_parent_bootstrap_uses_stage5_4_compat_config(monkeypatch):
     cfg["optimizer"] = {
         "type": "adamw",
         "lr": {
-            "event_encoder": 1.0e-4,
-            "current_context_adapter": 1.0e-4,
+            "struct_event_decoder_near": 1.0e-4,
+            "struct_event_decoder_far": 1.0e-4,
+            "param_obs_codec": 1.0e-4,
             "posterior_updater": 1.0e-4,
         },
     }
@@ -495,6 +648,139 @@ def test_phase_a_target_valid_mask_combines_valid_sky_egocar_and_dynamic():
     assert torch.equal(mask, torch.tensor([[1.0, 0.0], [0.0, 0.0]]))
 
 
+def test_phase_a_target_valid_mask_requires_sky_and_egocar_masks():
+    with pytest.raises(ValueError, match="sky_mask"):
+        target_valid_mask(
+            {"egocar_mask": torch.zeros(2, 2)},
+            mask_policy="non_sky_non_egocar",
+            device=torch.device("cpu"),
+        )
+    with pytest.raises(ValueError, match="egocar_mask"):
+        target_valid_mask(
+            {"sky_mask": torch.zeros(2, 2)},
+            mask_policy="non_sky_non_egocar",
+            device=torch.device("cpu"),
+        )
+
+
+def test_phase_a_zero_valid_mask_skips_rgb_loss():
+    pred = torch.ones(2, 2, 3)
+    gt = torch.zeros(2, 2, 3)
+    loss, stats = masked_rgb_loss(
+        pred,
+        gt,
+        mask=torch.zeros(2, 2),
+        l1_weight=1.0,
+        ssim_weight=0.0,
+    )
+    assert loss.item() == 0.0
+    assert stats["skipped_no_valid_pixels"] == 1.0
+
+
+def test_stage6_delta_regularization_uses_extra_weights_and_scale_barrier():
+    delta = DeltaPack(bg=_branch_delta(1.0))
+    bg = NodeStateBackground(
+        means=torch.zeros(2, 3),
+        scales_log=torch.full((2, 3), 10.0),
+        quats=torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(2, 1),
+        opacity_logit=torch.zeros(2, 1),
+        sh_dc=torch.zeros(2, 3),
+        sh_rest=torch.zeros(2, 3, 3),
+    )
+    local = LocalGSState.from_node_states(bg=bg, distant=None, rigid=None, hidden_dim=5)
+    loss, stats = delta_regularization(
+        delta,
+        weight=0.0,
+        local_state=local,
+        opacity_delta_l2_weight=0.5,
+        sh_delta_l2_weight=0.25,
+        scale_barrier_weight=0.1,
+        scale_log_min=-1.0,
+        scale_log_max=1.0,
+    )
+    assert loss.item() > 0.0
+    assert stats["delta_opacity_l2"] > 0.0
+    assert stats["delta_sh_l2"] > 0.0
+    assert stats["scale_barrier"] > 0.0
+
+
+def test_stage6_required_group_grad_fast_fails():
+    model = MinimalStreetForwardStage6_0.__new__(MinimalStreetForwardStage6_0)
+    nn.Module.__init__(model)
+    param = nn.Parameter(torch.ones(1))
+    with pytest.raises(RuntimeError, match="zero gradient"):
+        MinimalStreetForwardStage6_0._assert_group_nonzero_grad(
+            model,
+            group_name="test_group",
+            params=[param],
+            required=True,
+        )
+    param.grad = torch.ones_like(param)
+    assert MinimalStreetForwardStage6_0._assert_group_nonzero_grad(
+        model,
+        group_name="test_group",
+        params=[param],
+        required=True,
+    ) == 1.0
+
+
+def test_stage6_optimizer_splits_measurement_groups_and_no_weight_decay():
+    model = MinimalStreetForwardStage6_0.__new__(MinimalStreetForwardStage6_0)
+    nn.Module.__init__(model)
+    model.stage6_struct_event_decoder = _stage6_decoder(feat_dim=4, event_dim=8)
+    model.stage6_posterior_updater = Stage6PosteriorUpdater(
+        event_dim=8,
+        ctx_dim=8,
+        hidden_dim=16,
+        stage_hidden_dim=5,
+        sh_degree=1,
+    )
+    model.image_feature_extractor = nn.Module()
+    model.image_feature_extractor.residual_unet = nn.Sequential(nn.Linear(2, 2), nn.LayerNorm(2))
+    model.image_feature_extractor.fusion_neck = nn.Linear(2, 2)
+    for _name, param in model.named_parameters():
+        param.requires_grad_(True)
+    model.stage6_measurement_trainable_param_names = {
+        name
+        for name, _param in model.named_parameters()
+        if name.startswith("image_feature_extractor.")
+    }
+    cfg = {
+        "optimizer": {
+            "type": "adamw",
+            "lr": {
+                "struct_event_decoder_near": 1.0e-4,
+                "struct_event_decoder_far": 1.0e-4,
+                "param_obs_codec": 1.0e-4,
+                "posterior_updater": 1.0e-4,
+                "measurement_frontend": 5.0e-5,
+                "default": 1.0e-4,
+            },
+            "weight_decay": 0.1,
+            "no_weight_decay": {"enable": True, "name_keywords": ["bias", "norm"], "ndim_leq": 1},
+            "groups": {
+                "residual_unet": {
+                    "match": {"prefixes": ["image_feature_extractor.residual_unet"]},
+                    "lr": 1.0e-3,
+                    "weight_decay": 0.2,
+                },
+                "fusion_neck": {
+                    "match": {"prefixes": ["image_feature_extractor.fusion_neck"]},
+                    "lr": 1.5e-3,
+                    "weight_decay": 0.3,
+                },
+            },
+        }
+    }
+    MinimalStreetForwardStage6_0._rebuild_stage6_optimizer(model, cfg)
+    groups = model.optimizer.param_groups
+    residual = [g for g in groups if g.get("logical_name", "").startswith("stage6_measurement_frontend_residual_unet")]
+    fusion = [g for g in groups if g.get("logical_name", "").startswith("stage6_measurement_frontend_fusion_neck")]
+    assert residual and {float(g["lr"]) for g in residual} == {1.0e-3}
+    assert fusion and {float(g["lr"]) for g in fusion} == {1.5e-3}
+    assert any(g.get("logical_name", "").endswith("_no_weight_decay") and float(g["weight_decay"]) == 0.0 for g in groups)
+
+
 def test_stage6_nonfinite_grad_fast_fails():
     model = MinimalStreetForwardStage6_0.__new__(MinimalStreetForwardStage6_0)
     nn.Module.__init__(model)
@@ -504,8 +790,8 @@ def test_stage6_nonfinite_grad_fast_fails():
             "bad_step": {"fail_on_nonfinite_grad": True, "fail_on_grad_norm_gt": 100.0},
         }
     }
-    model.stage6_event_encoder = nn.Linear(1, 1)
-    param = next(model.stage6_event_encoder.parameters())
+    model.stage6_struct_event_decoder = nn.Linear(1, 1)
+    param = next(model.stage6_struct_event_decoder.parameters())
     param.requires_grad_(True)
     param.grad = torch.full_like(param, float("inf"))
     with pytest.raises(RuntimeError, match="non-finite"):
@@ -517,8 +803,9 @@ def test_stage6_phase_b_export_contains_required_keys():
     nn.Module.__init__(model)
     model.image_feature_extractor = nn.Linear(1, 1)
     model.stage5_2_gate_mlp = nn.Linear(1, 1)
-    model.stage6_event_encoder = Stage6EventEncoder(z_dim=4, output_dim=8, hidden_dim=16, param_embed_dim=3)
-    model.stage6_current_context_adapter = CurrentContextAdapter(event_dim=8, ctx_dim=8, hidden_dim=16)
+    model.stage6_event_dim = 8
+    model.stage6_feat_2d_dim = 4
+    model.stage6_struct_event_decoder = _stage6_decoder(feat_dim=4, event_dim=8)
     model.stage6_posterior_updater = Stage6PosteriorUpdater(
         event_dim=8,
         ctx_dim=8,
@@ -530,13 +817,16 @@ def test_stage6_phase_b_export_contains_required_keys():
     assert payload["export_type"] == "stage6_0_phase_a_for_phase_b"
     for key in (
         "measurement_frontend",
-        "event_encoder",
+        "struct_event_decoder",
+        "param_obs_codec",
         "posterior_updater_base",
-        "current_context_adapter",
         "normalizer_stats",
+        "event_schema",
     ):
         assert key in payload
     assert "image_feature_extractor.weight" in payload["measurement_frontend"]
     assert not any(k.startswith("stage5_2_gate_mlp") for k in payload["measurement_frontend"])
+    assert payload["event_schema"]["near_path"] == "bg+rigid_in:xCPE"
+    assert payload["legacy_event_encoder"] is None
     assert "vsm" not in payload
     assert "query_decoder" not in payload

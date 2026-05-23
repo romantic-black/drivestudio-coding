@@ -7,16 +7,17 @@ import torch
 import torch.nn as nn
 
 from models.streetforward.minimal_trainer_stage4_0 import spatial_hw_from_image_tensor
-from models.streetforward.math_utils import _num_sh_bases
 from models.streetforward.minimal_trainer_stage5_4 import MinimalStreetForwardStage5_4
 from models.streetforward.node_states import NodeStateBackground, NodeStateDistant, NodeStateRigid
+from models.streetforward.struct_decoders.common import cat_param_dict
 from models.streetforward.stage6_0 import (
-    CurrentContextAdapter,
     LocalGSState,
-    Stage6EventEncoder,
-    Stage6ParamEncoder,
     Stage6PosteriorUpdater,
+    Stage6RoutedStructEventDecoder,
+    Stage6StructInput,
+    empty_stage6_struct_input,
     resolve_v9_phase_a_batch,
+    stage6_to_struct_decoder_input,
 )
 from models.streetforward.stage6_0.phase_a_losses import (
     delta_regularization,
@@ -140,10 +141,12 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             raise ValueError("Stage6_0 Phase A requires model.phase=phase_A_block_local_unroll.")
 
         stage6 = self._require_key(model_cfg, "stage6_0", "model")
-        phase_a_mode = str(self._cfg_get(stage6, "phase_a_mode", "updater_only")).strip()
+        base_measurement = self._require_key(stage6, "base_measurement", "model.stage6_0")
+        phase_a_mode = str(
+            self._cfg_get(stage6, "phase_a_mode", self._cfg_get(base_measurement, "mode", "updater_only"))
+        ).strip()
         if phase_a_mode not in {"updater_only", "from_scratch"}:
             raise ValueError("Stage6_0 Phase A requires phase_a_mode to be 'updater_only' or 'from_scratch'.")
-        base_measurement = self._require_key(stage6, "base_measurement", "model.stage6_0")
         if str(self._cfg_get(base_measurement, "type", "")) != "stage5_4_v4":
             raise ValueError("Stage6_0 Phase A requires base_measurement.type=stage5_4_v4.")
         if bool(self._cfg_get(base_measurement, "require_fused_v4", True)) is not True:
@@ -190,6 +193,39 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             raise ValueError("Stage6_0 Phase A must not enable VSM.")
         if bool(self._cfg_get(self._cfg_get(stage6, "query_decoder", {}) or {}, "enable", False)):
             raise ValueError("Stage6_0 Phase A must not enable QueryDecoder.")
+        struct_cfg = self._require_key(stage6, "struct_event_decoder", "model.stage6_0")
+        if bool(self._cfg_get(struct_cfg, "enable", False)) is not True:
+            raise ValueError("Stage6_0 Phase A requires struct_event_decoder.enable=true.")
+        event_cfg = self._cfg_get(stage6, "event_encoder", {}) or {}
+        if bool(self._cfg_get(event_cfg, "enable", False)):
+            raise ValueError("Stage6_0 Phase A forbids direct concat EventEncoder as the main event path.")
+        if str(self._cfg_get(event_cfg, "mode", "disabled_direct_concat_mlp")) == "direct_concat_mlp":
+            raise ValueError("Stage6_0 Phase A forbids direct concat EventEncoder as the main event path.")
+        near_cfg = self._cfg_get(struct_cfg, "near", {}) or {}
+        far_cfg = self._cfg_get(struct_cfg, "far", {}) or {}
+        token_cfg = self._cfg_get(struct_cfg, "token", {}) or {}
+        for token_key in ("zero_invalid_2d_feat", "use_2d_feat", "use_support", "use_branch_embed", "use_param_obs_embed"):
+            if bool(self._cfg_get(token_cfg, token_key, True)) is not True:
+                raise ValueError(f"Stage6_0 Phase A P0 requires struct_event_decoder.token.{token_key}=true.")
+        codec_cfg = self._cfg_get(struct_cfg, "param_obs_codec", {}) or {}
+        if bool(self._cfg_get(codec_cfg, "enable", True)) is not True:
+            raise ValueError("Stage6_0 Phase A requires param_obs_codec.enable=true.")
+        if str(self._cfg_get(codec_cfg, "raw_param_mode", "stage5_normalize_params_17")) != "stage5_normalize_params_17":
+            raise ValueError("Stage6_0 Phase A P0 requires param_obs_codec.raw_param_mode=stage5_normalize_params_17.")
+        if str(self._cfg_get(near_cfg, "type", "xcpe")) != "xcpe":
+            raise ValueError("Stage6_0 Phase A requires struct_event_decoder.near.type=xcpe.")
+        if str(self._cfg_get(far_cfg, "type", "point_mlp")) not in {"point_mlp", "mlp"}:
+            raise ValueError("Stage6_0 Phase A requires struct_event_decoder.far.type=point_mlp.")
+        token_dim = int(self._cfg_get(token_cfg, "token_dim", 48))
+        event_dim = int(self._cfg_get(struct_cfg, "event_dim", self._cfg_get(self._cfg_get(stage6, "posterior_updater", {}) or {}, "event_dim", 48)))
+        if int(event_dim) != int(token_dim):
+            raise ValueError(
+                f"Stage6_0 Phase A requires struct_event_decoder.event_dim==token.token_dim, "
+                f"got event_dim={int(event_dim)} token_dim={int(token_dim)}."
+            )
+        ctx_cfg = self._cfg_get(stage6, "current_context_adapter", {}) or {}
+        if bool(self._cfg_get(ctx_cfg, "enable", False)):
+            raise ValueError("Phase A should not enable current_context_adapter; use event_only updater.")
         if bool(self._cfg_get(self._cfg_get(model_cfg, "history_memory", {}) or {}, "enable", False)):
             raise ValueError("Stage6_0 Phase A forbids model.history_memory.enable=true")
         if bool(self._cfg_get(self._cfg_get(model_cfg, "update_gate", {}) or {}, "enable", False)):
@@ -213,6 +249,8 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             raise ValueError("Phase A must disable prefix_render.")
 
         updater_cfg = self._cfg_get(stage6, "posterior_updater", {}) or {}
+        if bool(self._cfg_get(updater_cfg, "input_current_ctx", False)):
+            raise ValueError("Stage6_0 Phase A requires posterior_updater.input_current_ctx=false.")
         branch_scope = self._cfg_get(updater_cfg, "branch_scope", {}) or {}
         distant_scope = self._cfg_get(branch_scope, "distant", {}) or {}
         if bool(self._cfg_get(distant_scope, "update_means", False)):
@@ -226,7 +264,9 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         model_cfg = self._require_key(config, "model", "config")
         stage6 = self._require_key(model_cfg, "stage6_0", "model")
         base_measurement = self._require_key(stage6, "base_measurement", "model.stage6_0")
-        self.stage6_phase_a_mode = str(self._cfg_get(stage6, "phase_a_mode", "updater_only")).strip()
+        self.stage6_phase_a_mode = str(
+            self._cfg_get(stage6, "phase_a_mode", self._cfg_get(base_measurement, "mode", "updater_only"))
+        ).strip()
         self.stage6_source_evidence_grad_mode = str(
             self._cfg_get(base_measurement, "source_evidence_grad_mode", "no_grad_v4")
         ).strip()
@@ -269,56 +309,65 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
     def _init_stage6_modules(self, config: Any) -> None:
         model_cfg = self._require_key(config, "model", "config")
         stage6 = self._require_key(model_cfg, "stage6_0", "model")
-        event_cfg = self._cfg_get(stage6, "event_encoder", {}) or {}
-        param_encoder_cfg = self._cfg_get(stage6, "param_encoder", {}) or {}
-        ctx_cfg = self._cfg_get(stage6, "current_context_adapter", {}) or {}
+        struct_cfg = self._require_key(stage6, "struct_event_decoder", "model.stage6_0")
+        token_cfg = self._cfg_get(struct_cfg, "token", {}) or {}
+        codec_cfg = self._cfg_get(struct_cfg, "param_obs_codec", {}) or {}
+        near_cfg = self._cfg_get(struct_cfg, "near", {}) or {}
+        far_cfg = self._cfg_get(struct_cfg, "far", {}) or {}
         updater_cfg = self._cfg_get(stage6, "posterior_updater", {}) or {}
         clamp_cfg = self._cfg_get(updater_cfg, "clamps", {}) or {}
-        self.stage6_view_code_policy = str(self._cfg_get(event_cfg, "view_code_policy", "zero_phase_a_debug"))
-        if self.stage6_view_code_policy != "zero_phase_a_debug":
-            raise ValueError("Stage6_0 Phase A P0 only supports event_encoder.view_code_policy=zero_phase_a_debug")
-        self.stage6_event_dim = int(self._cfg_get(event_cfg, "output_dim", 96))
-        self.stage6_ctx_dim = int(self._cfg_get(ctx_cfg, "ctx_dim", self.stage6_event_dim))
-        self.stage6_hidden_dim = int(self._cfg_get(updater_cfg, "stage_hidden_dim", 32))
-        self.stage6_param_encoder: Optional[Stage6ParamEncoder]
-        param_encoder_enable = bool(self._cfg_get(param_encoder_cfg, "enable", True))
-        if param_encoder_enable:
-            sh_rest_input_dim = max(int(_num_sh_bases(int(self.sh_degree)) - 1), 0) * 3
-            self.stage6_param_encoder = Stage6ParamEncoder(
-                sh_rest_input_dim=sh_rest_input_dim,
-                quat_scales_summary_dim=int(self._cfg_get(param_encoder_cfg, "quat_scales_summary_dim", 4)),
-                sh_rest_summary_dim=int(self._cfg_get(param_encoder_cfg, "sh_rest_summary_dim", 8)),
-                detach_inputs=bool(self._cfg_get(param_encoder_cfg, "detach_inputs", True)),
-            ).to(self.device)
-            param_embed_dim = int(self.stage6_param_encoder.output_dim)
-        else:
-            self.stage6_param_encoder = None
-            param_embed_dim = int(self._cfg_get(event_cfg, "param_embed_dim", 10))
-        inputs_cfg = self._cfg_get(event_cfg, "inputs", {}) or {}
-        if not param_encoder_enable and self._cfg_get(inputs_cfg, "param_embed", None) is not None:
-            param_embed_dim = int(self._cfg_get(event_cfg, "param_embed_dim", param_embed_dim))
-        self.stage6_param_embed_dim = int(param_embed_dim)
-        self.stage6_event_encoder = Stage6EventEncoder(
-            z_dim=int(getattr(self, "stage5_2_feat_2d_channels", getattr(self, "feat_2d_channels", 32))),
-            output_dim=self.stage6_event_dim,
-            hidden_dim=int(self._cfg_get(event_cfg, "hidden_dim", 128)),
-            num_layers=int(self._cfg_get(event_cfg, "num_layers", 2)),
-            obs_code_dim=2,
-            view_code_dim=2,
-            param_embed_dim=self.stage6_param_embed_dim,
-            branch_embed_dim=int(self._cfg_get(event_cfg, "branch_embed_dim", 8)),
-            allow_missing_view_code=bool(self._cfg_get(event_cfg, "allow_zero_view_code_phase_a", False)),
-        ).to(self.device)
-        self.stage6_current_context_adapter = CurrentContextAdapter(
-            event_dim=self.stage6_event_dim,
-            ctx_dim=self.stage6_ctx_dim,
-            hidden_dim=int(self._cfg_get(ctx_cfg, "hidden_dim", 128)),
+        token_dim = int(self._cfg_get(token_cfg, "token_dim", 48))
+        self.stage6_event_dim = int(self._cfg_get(struct_cfg, "event_dim", self._cfg_get(updater_cfg, "event_dim", token_dim)))
+        if int(self.stage6_event_dim) != int(token_dim):
+            raise ValueError(
+                f"Stage6_0 struct_event_decoder.event_dim must equal token.token_dim ({int(token_dim)}), "
+                f"got {int(self.stage6_event_dim)}."
+            )
+        self.stage6_ctx_dim = self.stage6_event_dim
+        self.stage6_hidden_dim = int(self._cfg_get(updater_cfg, "stage_hidden_dim", self.stage6_event_dim))
+        self.stage6_feat_2d_dim = int(
+            self._cfg_get(
+                struct_cfg,
+                "feat_2d_dim",
+                getattr(self, "stage5_2_feat_2d_channels", getattr(self, "feat_2d_channels", 32)),
+            )
+        )
+        if int(self.stage6_feat_2d_dim) != int(getattr(self, "stage5_2_feat_2d_channels", self.stage6_feat_2d_dim)):
+            raise ValueError(
+                "Stage6_0 Phase A P0 expects struct_event_decoder.feat_2d_dim to match the V4 lifted feature dim."
+            )
+        param_obs_cfg = {
+            "obs_code_dim": int(self._cfg_get(codec_cfg, "obs_code_dim", 2)),
+            "support_dim": int(self._cfg_get(codec_cfg, "support_dim", 2)),
+            "branch_embed_dim": int(self._cfg_get(codec_cfg, "branch_embed_dim", 4)),
+            "output_dim": int(self._cfg_get(codec_cfg, "output_dim", 24)),
+            "detach_params": bool(self._cfg_get(codec_cfg, "detach_params", True)),
+            "detach_obs_code": bool(self._cfg_get(codec_cfg, "detach_obs_code", True)),
+            "detach_acc_w": bool(self._cfg_get(codec_cfg, "detach_acc_w", True)),
+            "norm": str(self._cfg_get(codec_cfg, "norm", "layernorm")),
+            "activation": str(self._cfg_get(codec_cfg, "activation", "gelu")),
+        }
+        self.stage6_struct_event_decoder = Stage6RoutedStructEventDecoder(
+            feat_2d_dim=int(self.stage6_feat_2d_dim),
+            event_dim=int(self.stage6_event_dim),
+            token_dim=token_dim,
+            param_obs_dim=int(param_obs_cfg["output_dim"]),
+            support_embed_dim=int(self._cfg_get(struct_cfg, "support_embed_dim", self._cfg_get(token_cfg, "support_embed_dim", 4))),
+            branch_embed_dim=int(self._cfg_get(struct_cfg, "branch_embed_dim", self._cfg_get(token_cfg, "branch_embed_dim", 4))),
+            near_num_blocks=int(self._cfg_get(near_cfg, "num_blocks", 2)),
+            near_kernel_size=int(self._cfg_get(near_cfg, "kernel_size", 3)),
+            near_voxel_size=float(self._cfg_get(near_cfg, "voxel_size", 0.25)),
+            near_residual_scale_init=float(self._cfg_get(near_cfg, "residual_scale_init", 5.0e-3)),
+            near_sparse_backend=str(self._cfg_get(near_cfg, "sparse_backend", "spconv")),
+            far_hidden_dim=int(self._cfg_get(far_cfg, "hidden_dim", self.stage6_event_dim)),
+            far_num_layers=int(self._cfg_get(far_cfg, "num_layers", 2)),
+            param_obs_codec_cfg=param_obs_cfg,
         ).to(self.device)
         phase_b_hooks = self._cfg_get(updater_cfg, "phase_b_hooks", {}) or {}
         self.stage6_posterior_updater = Stage6PosteriorUpdater(
             event_dim=self.stage6_event_dim,
-            ctx_dim=self.stage6_ctx_dim,
-            hidden_dim=int(self._cfg_get(updater_cfg, "hidden_dim", 128)),
+            ctx_dim=self.stage6_event_dim,
+            hidden_dim=int(self._cfg_get(updater_cfg, "hidden_dim", 96)),
             stage_hidden_dim=self.stage6_hidden_dim,
             sh_degree=int(self.sh_degree),
             means_max_step_m=float(self._cfg_get(clamp_cfg, "means_max_step_m", 0.25)),
@@ -328,7 +377,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             sh_max_step=float(self._cfg_get(clamp_cfg, "sh_max_step", 0.10)),
             hidden_max_step=float(self._cfg_get(clamp_cfg, "hidden_max_step", 1.0)),
             accept_vsm_ctx=bool(self._cfg_get(phase_b_hooks, "accept_vsm_ctx", True)),
-            vsm_ctx_dim=int(self._cfg_get(phase_b_hooks, "vsm_ctx_dim", self.stage6_ctx_dim)),
+            vsm_ctx_dim=int(self._cfg_get(phase_b_hooks, "vsm_ctx_dim", self.stage6_event_dim)),
         ).to(self.device)
 
         losses_cfg = self._cfg_get(config, "losses", {}) or {}
@@ -345,6 +394,13 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         self.stage6_nearby_final_step_only = bool(self._cfg_get(nearby_render, "final_step_only", True))
         self.stage6_nearby_mask_policy = str(self._cfg_get(nearby_render, "mask_policy", "non_sky_non_egocar"))
         self.stage6_delta_l2_weight = float(self._cfg_get(regularization, "delta_l2_weight", 1.0e-3))
+        self.stage6_opacity_delta_l2_weight = float(
+            self._cfg_get(regularization, "opacity_delta_l2_weight", 0.0)
+        )
+        self.stage6_sh_delta_l2_weight = float(self._cfg_get(regularization, "sh_delta_l2_weight", 0.0))
+        self.stage6_scale_barrier_weight = float(self._cfg_get(regularization, "scale_barrier_weight", 0.0))
+        self.stage6_scale_log_min = float(self._cfg_get(regularization, "scale_log_min", -10.0))
+        self.stage6_scale_log_max = float(self._cfg_get(regularization, "scale_log_max", 4.0))
         self.stage6_writeback_policy = str(
             self._cfg_get(self._cfg_get(stage6, "local_rollout", {}) or {}, "writeback_policy", "block_end_detached")
         )
@@ -390,62 +446,178 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         weight_decay = float(self._cfg_get(opt_cfg, "weight_decay", 0.0))
         betas = tuple(float(x) for x in list(self._cfg_get(opt_cfg, "betas", [0.9, 0.95])))
         eps = float(self._cfg_get(opt_cfg, "eps", 1.0e-8))
+        groups_cfg = self._cfg_get(opt_cfg, "groups", {}) or {}
+        no_wd_cfg = self._cfg_get(opt_cfg, "no_weight_decay", {}) or {}
+        no_wd_enable = bool(self._cfg_get(no_wd_cfg, "enable", False))
+        no_wd_keywords = [str(x) for x in list(self._cfg_get(no_wd_cfg, "name_keywords", []) or [])]
+        no_wd_ndim_leq = int(self._cfg_get(no_wd_cfg, "ndim_leq", 1))
 
         def lr_for(name: str) -> float:
             if hasattr(lr_cfg, "get"):
                 return float(lr_cfg.get(name, lr_cfg.get("default", 1.0e-4)))
             return float(lr_cfg)
 
-        groups = [
-            {
-                "params": list(self.stage6_event_encoder.parameters()),
-                "lr": lr_for("event_encoder"),
-                "weight_decay": weight_decay,
-                "logical_name": "stage6_event_encoder",
-            },
-            {
-                "params": list(self.stage6_current_context_adapter.parameters()),
-                "lr": lr_for("current_context_adapter"),
-                "weight_decay": weight_decay,
-                "logical_name": "stage6_current_context_adapter",
-            },
-            {
-                "params": list(self.stage6_posterior_updater.parameters()),
-                "lr": lr_for("posterior_updater"),
-                "weight_decay": weight_decay,
-                "logical_name": "stage6_posterior_updater",
-            },
-        ]
-        if self.stage6_param_encoder is not None:
-            groups.append(
-                {
-                    "params": list(self.stage6_param_encoder.parameters()),
-                    "lr": lr_for("param_encoder"),
-                    "weight_decay": weight_decay,
-                    "logical_name": "stage6_param_encoder",
-                }
-            )
-        measurement_params = [
-            p
-            for name, p in self.named_parameters()
-            if name in getattr(self, "stage6_measurement_trainable_param_names", set()) and p.requires_grad
-        ]
-        measurement_lr = lr_for("measurement_frontend")
-        if len(measurement_params) > 0:
-            if float(measurement_lr) <= 0.0:
-                raise ValueError(
-                    "Stage6_0 Phase A from_scratch enabled trainable 2D frontend params but "
-                    "optimizer.lr.measurement_frontend <= 0."
+        def group_cfg(name: str) -> Any:
+            return self._cfg_get(groups_cfg, name, {}) or {}
+
+        def group_lr(name: str, fallback_lr_name: str) -> float:
+            cfg = group_cfg(name)
+            raw = self._cfg_get(cfg, "lr", None)
+            return float(raw) if raw is not None else lr_for(fallback_lr_name)
+
+        def group_wd(name: str) -> float:
+            cfg = group_cfg(name)
+            raw = self._cfg_get(cfg, "weight_decay", None)
+            return float(raw) if raw is not None else weight_decay
+
+        def group_prefixes(name: str, defaults: List[str]) -> List[str]:
+            cfg = group_cfg(name)
+            match = self._cfg_get(cfg, "match", {}) or {}
+            raw = self._cfg_get(match, "prefixes", None)
+            return [str(x) for x in list(raw)] if raw is not None else list(defaults)
+
+        def split_decay(named_params: List[tuple[str, torch.nn.Parameter]]) -> tuple[List[torch.nn.Parameter], List[torch.nn.Parameter]]:
+            decay: List[torch.nn.Parameter] = []
+            no_decay: List[torch.nn.Parameter] = []
+            for name, param in named_params:
+                if not param.requires_grad:
+                    continue
+                lower = str(name).lower()
+                keyword_match = any(str(kw).lower() in lower for kw in no_wd_keywords)
+                if no_wd_enable and (int(param.ndim) <= no_wd_ndim_leq or keyword_match):
+                    no_decay.append(param)
+                else:
+                    decay.append(param)
+            return decay, no_decay
+
+        groups: List[Dict[str, Any]] = []
+        seen_param_ids: set[int] = set()
+
+        def add_group(
+            *,
+            logical_name: str,
+            named_params: List[tuple[str, torch.nn.Parameter]],
+            lr: float,
+            wd: float,
+        ) -> None:
+            if float(lr) <= 0.0:
+                return
+            unique_named: List[tuple[str, torch.nn.Parameter]] = []
+            for name, param in named_params:
+                if not param.requires_grad:
+                    continue
+                pid = id(param)
+                if pid in seen_param_ids:
+                    continue
+                seen_param_ids.add(pid)
+                unique_named.append((name, param))
+            if len(unique_named) == 0:
+                return
+            decay, no_decay = split_decay(unique_named)
+            if decay:
+                groups.append(
+                    {
+                        "params": decay,
+                        "lr": float(lr),
+                        "weight_decay": float(wd),
+                        "logical_name": logical_name,
+                    }
                 )
-            groups.append(
-                {
-                    "params": measurement_params,
-                    "lr": measurement_lr,
-                    "weight_decay": weight_decay,
-                    "logical_name": "stage6_measurement_frontend",
-                }
+            if no_decay:
+                groups.append(
+                    {
+                        "params": no_decay,
+                        "lr": float(lr),
+                        "weight_decay": 0.0,
+                        "logical_name": f"{logical_name}_no_weight_decay",
+                    }
+                )
+
+        add_group(
+            logical_name="stage6_struct_event_decoder_near",
+            named_params=[
+                (f"stage6_struct_event_decoder.near.{name}", param)
+                for name, param in self.stage6_struct_event_decoder.near.named_parameters()
+                if not name.startswith("param_obs_codec.")
+            ],
+            lr=lr_for("struct_event_decoder_near"),
+            wd=weight_decay,
+        )
+        add_group(
+            logical_name="stage6_struct_event_decoder_far",
+            named_params=[
+                (f"stage6_struct_event_decoder.far.{name}", param)
+                for name, param in self.stage6_struct_event_decoder.far.named_parameters()
+                if not name.startswith("param_obs_codec.")
+            ],
+            lr=lr_for("struct_event_decoder_far"),
+            wd=weight_decay,
+        )
+        add_group(
+            logical_name="stage6_param_obs_codec",
+            named_params=[
+                (f"stage6_struct_event_decoder.param_obs_codec.{name}", param)
+                for name, param in self.stage6_struct_event_decoder.param_obs_codec.named_parameters()
+            ],
+            lr=lr_for("param_obs_codec"),
+            wd=weight_decay,
+        )
+        add_group(
+            logical_name="stage6_posterior_updater",
+            named_params=[
+                (f"stage6_posterior_updater.{name}", param)
+                for name, param in self.stage6_posterior_updater.named_parameters()
+            ],
+            lr=lr_for("posterior_updater"),
+            wd=weight_decay,
+        )
+
+        measurement_named = [
+            (name, param)
+            for name, param in self.named_parameters()
+            if name in getattr(self, "stage6_measurement_trainable_param_names", set()) and param.requires_grad
+        ]
+        residual_prefixes = group_prefixes(
+            "residual_unet",
+            ["image_feature_extractor.residual", "image_feature_extractor.residual_unet"],
+        )
+        fusion_prefixes = group_prefixes(
+            "fusion_neck",
+            ["image_feature_extractor.fusion", "image_feature_extractor.fusion_neck"],
+        )
+        residual_named = [(n, p) for n, p in measurement_named if any(n.startswith(prefix) for prefix in residual_prefixes)]
+        fusion_named = [
+            (n, p)
+            for n, p in measurement_named
+            if any(n.startswith(prefix) for prefix in fusion_prefixes)
+            and id(p) not in {id(param) for _, param in residual_named}
+        ]
+        assigned_measurement_ids = {id(param) for _, param in residual_named + fusion_named}
+        remaining_measurement_named = [(n, p) for n, p in measurement_named if id(p) not in assigned_measurement_ids]
+
+        if measurement_named and float(lr_for("measurement_frontend")) <= 0.0:
+            raise ValueError(
+                "Stage6_0 Phase A from_scratch enabled trainable 2D frontend params but "
+                "optimizer.lr.measurement_frontend <= 0."
             )
-        groups = [g for g in groups if float(g["lr"]) > 0.0 and len(g["params"]) > 0]
+        add_group(
+            logical_name="stage6_measurement_frontend_residual_unet",
+            named_params=residual_named,
+            lr=group_lr("residual_unet", "measurement_frontend"),
+            wd=group_wd("residual_unet"),
+        )
+        add_group(
+            logical_name="stage6_measurement_frontend_fusion_neck",
+            named_params=fusion_named,
+            lr=group_lr("fusion_neck", "measurement_frontend"),
+            wd=group_wd("fusion_neck"),
+        )
+        add_group(
+            logical_name="stage6_measurement_frontend",
+            named_params=remaining_measurement_named,
+            lr=lr_for("measurement_frontend"),
+            wd=weight_decay,
+        )
         if not groups:
             raise ValueError("Stage6_0 optimizer has no trainable parameter groups.")
         opt_type = str(self._cfg_get(opt_cfg, "type", "adamw")).lower()
@@ -475,6 +647,10 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         sub_images = [images[int(i)] for i in indices]
         sub_sky = [sky[int(i)] for i in indices] if sky is not None else None
         sub_ego = [ego[int(i)] for i in indices] if ego is not None else None
+        if sub_sky is None:
+            raise ValueError("Stage6 Phase A requires source_sky_masks for V4 evidence.")
+        if sub_ego is None:
+            raise ValueError("Stage6 Phase A requires source_egocar_masks for V4 evidence.")
         return sub_views, sub_images, sub_sky, sub_ego
 
     def _local_to_node_states_detached(self, local_state: LocalGSState) -> tuple[NodeStateBackground, Optional[NodeStateDistant], Optional[NodeStateRigid]]:
@@ -544,59 +720,8 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 "obs_bg": obs_bg,
                 "obs_distant": obs_distant,
                 "obs_rigid_S": obs_rigid_s,
+                "source_frame_idx": int(source_frame_idx),
             }
-
-    def _param_embed(
-        self,
-        branch: Optional[Any],
-        n: int,
-        dtype: torch.dtype,
-        indices: Optional[torch.Tensor] = None,
-    ) -> Optional[torch.Tensor]:
-        if branch is None:
-            return None
-        if int(n) == 0:
-            return torch.zeros((0, self.stage6_param_embed_dim), device=self.device, dtype=dtype)
-        if getattr(self, "stage6_param_encoder", None) is not None:
-            out = self.stage6_param_encoder(
-                branch=branch,
-                indices=indices,
-                aabb_min=getattr(self, "bbx_min", None),
-                aabb_max=getattr(self, "bbx_max", None),
-                dtype=dtype,
-            )
-            if int(out.shape[0]) != int(n):
-                raise ValueError(f"param_embed row mismatch: got {int(out.shape[0])}, expected {int(n)}")
-            if int(out.shape[1]) != int(self.stage6_param_embed_dim):
-                raise ValueError(
-                    "Stage6 param_embed dim mismatch: "
-                    f"got {int(out.shape[1])}, expected {int(self.stage6_param_embed_dim)}"
-                )
-            return out
-        raw = torch.cat(
-            [
-                branch.means,
-                branch.scales_log,
-                branch.opacity_logit,
-                branch.sh_dc,
-            ],
-            dim=-1,
-        )
-        if indices is not None:
-            raw = raw[indices]
-        if int(raw.shape[0]) != int(n):
-            raise ValueError(f"param_embed row mismatch: got {int(raw.shape[0])}, expected {int(n)}")
-        if int(raw.shape[1]) != int(self.stage6_param_embed_dim):
-            raise ValueError(
-                "Stage6 param_embed dim mismatch: "
-                f"got {int(raw.shape[1])}, expected {int(self.stage6_param_embed_dim)}"
-            )
-        return raw.detach()
-
-    def _view_code(self, n: int, ref: torch.Tensor) -> torch.Tensor:
-        if self.stage6_view_code_policy != "zero_phase_a_debug":
-            raise ValueError(f"unsupported Stage6 view_code_policy={self.stage6_view_code_policy!r}")
-        return ref.new_zeros((int(n), 2))
 
     @staticmethod
     def _mask_branch_delta(delta: BranchDelta, scope: Dict[str, bool]) -> BranchDelta:
@@ -656,6 +781,173 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             noop=fill(delta.noop),
         )
 
+    def _stage6_aabb(self, ref: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        lo = getattr(self, "bbx_min", None)
+        hi = getattr(self, "bbx_max", None)
+        if lo is None or hi is None:
+            raise RuntimeError(
+                "Stage6_0 Phase A requires segment AABB: self.bbx_min/self.bbx_max missing."
+            )
+        return lo.to(device=ref.device, dtype=ref.dtype), hi.to(device=ref.device, dtype=ref.dtype)
+
+    @staticmethod
+    def _maybe_detach_feature(x: Optional[torch.Tensor], *, detach: bool) -> Optional[torch.Tensor]:
+        if x is None:
+            return None
+        return x.detach() if bool(detach) else x
+
+    @staticmethod
+    def _detach_optional(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        return None if x is None else x.detach()
+
+    def _build_stage6_struct_input_near(
+        self,
+        *,
+        local_state: LocalGSState,
+        rigid_node: Optional[NodeStateRigid],
+        route: Any,
+        measurement: Dict[str, Any],
+        source_frame_idx: int,
+    ) -> Stage6StructInput:
+        detach_features = bool(getattr(self, "stage6_detach_v4_outputs", True))
+        feat_2d_bg = self._maybe_detach_feature(measurement["feat_2d_bg"], detach=detach_features)
+        if feat_2d_bg is None:
+            raise RuntimeError("Stage6 near input requires feat_2d_bg")
+        acc_w_bg = self._detach_optional(measurement["acc_w_bg"])
+        obs_bg = self._detach_optional(measurement["obs_bg"])
+        if acc_w_bg is None or obs_bg is None:
+            raise RuntimeError("Stage6 near input requires acc_w_bg and obs_bg")
+        num_bg = int(local_state.bg.means.shape[0])
+        if int(feat_2d_bg.shape[0]) != num_bg:
+            raise ValueError(f"Stage6 near bg feature row mismatch: {int(feat_2d_bg.shape[0])} vs {num_bg}")
+        if obs_bg.dim() != 2 or int(obs_bg.shape[0]) != num_bg or int(obs_bg.shape[1]) != 2:
+            raise ValueError(f"Stage6 near obs_bg must be [N_bg,2], got {tuple(obs_bg.shape)}")
+
+        feat_parts = [feat_2d_bg]
+        acc_parts = [acc_w_bg.reshape(-1)]
+        obs_parts = [obs_bg]
+        coords_parts = [local_state.bg.means]
+        branch_ids = [torch.zeros((num_bg,), dtype=torch.long, device=self.device)]
+        params_bg = self._build_params_for_embed(local_state.bg, coord_space="world")
+
+        num_rigid_in = int(route.S_in.numel()) if route is not None and hasattr(route, "S_in") else 0
+        params_rigid_in = None
+        if num_rigid_in > 0:
+            feat_2d_rigid_s = self._maybe_detach_feature(measurement.get("feat_2d_rigid_S"), detach=detach_features)
+            acc_w_rigid_s = self._detach_optional(measurement.get("acc_w_rigid_S"))
+            obs_rigid_s = self._detach_optional(measurement.get("obs_rigid_S"))
+            if rigid_node is None or feat_2d_rigid_s is None or acc_w_rigid_s is None or obs_rigid_s is None:
+                raise RuntimeError("Stage6 near input requires rigid source tensors when S_in > 0")
+            rows_in_s = torch.nonzero(route.inside_mask_S, as_tuple=False).squeeze(1)
+            feat_parts.append(feat_2d_rigid_s[rows_in_s])
+            acc_parts.append(acc_w_rigid_s.reshape(-1)[rows_in_s])
+            obs_parts.append(obs_rigid_s[rows_in_s])
+            coords_parts.append(route.means_world_S[route.inside_mask_S])
+            branch_ids.append(torch.ones((num_rigid_in,), dtype=torch.long, device=self.device))
+            params_rigid_in = self._build_rigid_params_for_embed_source_world(
+                rigid_node,
+                int(source_frame_idx),
+                route.S_in,
+            )
+
+        return Stage6StructInput(
+            feat_2d=torch.cat(feat_parts, dim=0),
+            acc_w=torch.cat(acc_parts, dim=0),
+            obs_code=torch.cat(obs_parts, dim=0),
+            coords=torch.cat(coords_parts, dim=0),
+            branch_id=torch.cat(branch_ids, dim=0),
+            params_for_embed=cat_param_dict(params_bg, params_rigid_in),
+            split_0=num_bg,
+            split_1=num_rigid_in,
+            meta={
+                "path": "near",
+                "support_threshold_bg": float(getattr(self, "bg_src_backproject_support_min", 0.0)),
+                "support_threshold_rigid": float(getattr(self, "rigid_src_backproject_support_min", 0.0)),
+            },
+        )
+
+    def _build_stage6_struct_input_far(
+        self,
+        *,
+        local_state: LocalGSState,
+        rigid_node: Optional[NodeStateRigid],
+        route: Any,
+        measurement: Dict[str, Any],
+        source_frame_idx: int,
+    ) -> Stage6StructInput:
+        detach_features = bool(getattr(self, "stage6_detach_v4_outputs", True))
+        ref = measurement["feat_2d_bg"]
+        num_distant = int(local_state.distant.means.shape[0]) if local_state.distant is not None else 0
+        num_rigid_out = int(route.S_out.numel()) if route is not None and hasattr(route, "S_out") else 0
+        if num_distant + num_rigid_out == 0:
+            return empty_stage6_struct_input(
+                ref=ref,
+                feat_2d_dim=int(getattr(self, "stage6_feat_2d_dim", int(ref.shape[-1]))),
+                sh_rest_bases=int(local_state.bg.sh_rest.shape[1]),
+                path="far",
+            )
+
+        feat_parts: List[torch.Tensor] = []
+        acc_parts: List[torch.Tensor] = []
+        obs_parts: List[torch.Tensor] = []
+        coords_parts: List[torch.Tensor] = []
+        branch_ids: List[torch.Tensor] = []
+        params_for_embed = None
+        if num_distant > 0:
+            feat_2d_distant = self._maybe_detach_feature(measurement.get("feat_2d_distant"), detach=detach_features)
+            acc_w_distant = self._detach_optional(measurement.get("acc_w_distant"))
+            obs_distant = self._detach_optional(measurement.get("obs_distant"))
+            if local_state.distant is None or feat_2d_distant is None or acc_w_distant is None or obs_distant is None:
+                raise RuntimeError("Stage6 far input expected distant tensors")
+            feat_parts.append(feat_2d_distant)
+            acc_parts.append(acc_w_distant.reshape(-1))
+            obs_parts.append(obs_distant)
+            coords_parts.append(local_state.distant.means)
+            branch_ids.append(torch.zeros((num_distant,), dtype=torch.long, device=self.device))
+            params_for_embed = self._build_params_for_embed(local_state.distant, coord_space="world")
+
+        params_rigid_out = None
+        if num_rigid_out > 0:
+            feat_2d_rigid_s = self._maybe_detach_feature(measurement.get("feat_2d_rigid_S"), detach=detach_features)
+            acc_w_rigid_s = self._detach_optional(measurement.get("acc_w_rigid_S"))
+            obs_rigid_s = self._detach_optional(measurement.get("obs_rigid_S"))
+            if rigid_node is None or feat_2d_rigid_s is None or acc_w_rigid_s is None or obs_rigid_s is None:
+                raise RuntimeError("Stage6 far input expected rigid tensors for S_out")
+            rows_out_s = torch.nonzero(~route.inside_mask_S, as_tuple=False).squeeze(1)
+            feat_parts.append(feat_2d_rigid_s[rows_out_s])
+            acc_parts.append(acc_w_rigid_s.reshape(-1)[rows_out_s])
+            obs_parts.append(obs_rigid_s[rows_out_s])
+            coords_parts.append(route.means_world_S[~route.inside_mask_S])
+            branch_ids.append(torch.ones((num_rigid_out,), dtype=torch.long, device=self.device))
+            params_rigid_out = self._build_rigid_params_for_embed_source_world(
+                rigid_node,
+                int(source_frame_idx),
+                route.S_out,
+            )
+
+        if params_for_embed is None:
+            params_for_embed = params_rigid_out
+        elif params_rigid_out is not None:
+            params_for_embed = cat_param_dict(params_for_embed, params_rigid_out)
+        if params_for_embed is None:
+            raise RuntimeError("Stage6 far input internal empty params_for_embed")
+
+        return Stage6StructInput(
+            feat_2d=torch.cat(feat_parts, dim=0),
+            acc_w=torch.cat(acc_parts, dim=0),
+            obs_code=torch.cat(obs_parts, dim=0),
+            coords=torch.cat(coords_parts, dim=0),
+            branch_id=torch.cat(branch_ids, dim=0),
+            params_for_embed=params_for_embed,
+            split_0=num_distant,
+            split_1=num_rigid_out,
+            meta={
+                "path": "far",
+                "support_threshold_distant": float(getattr(self, "distant_src_backproject_support_min", 0.0)),
+                "support_threshold_rigid_out": float(getattr(self, "rigid_src_backproject_support_min", 0.0)),
+            },
+        )
+
     def _encode_and_update(
         self,
         *,
@@ -663,59 +955,33 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         measurement: Dict[str, Any],
     ) -> tuple[LocalGSState, DeltaPack, Dict[str, Any]]:
         route = measurement["route"]
-        detach_features = bool(getattr(self, "stage6_detach_v4_outputs", True))
-
-        def maybe_detach_feature(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-            if x is None:
-                return None
-            return x.detach() if detach_features else x
-
-        def detach_alpha(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-            return None if x is None else x.detach()
-
-        z_bg = maybe_detach_feature(measurement["feat_2d_bg"])
-        acc_bg = detach_alpha(measurement["acc_w_bg"])
-        obs_bg = detach_alpha(measurement["obs_bg"])
-        z_distant = measurement.get("feat_2d_distant")
-        acc_distant = measurement.get("acc_w_distant")
-        obs_distant = measurement.get("obs_distant")
-        z_rigid = measurement.get("feat_2d_rigid_S")
-        acc_rigid = measurement.get("acc_w_rigid_S")
-        obs_rigid = measurement.get("obs_rigid_S")
-        z_distant = maybe_detach_feature(z_distant)
-        acc_distant = detach_alpha(acc_distant)
-        obs_distant = detach_alpha(obs_distant)
-        z_rigid = maybe_detach_feature(z_rigid)
-        acc_rigid = detach_alpha(acc_rigid)
-        obs_rigid = detach_alpha(obs_rigid)
-
-        event = self.stage6_event_encoder(
-            z_bg=z_bg,
-            acc_w_bg=acc_bg,
-            obs_code_bg=obs_bg,
-            view_code_bg=self._view_code(int(z_bg.shape[0]), z_bg),
-            param_embed_bg=self._param_embed(local_state.bg, int(z_bg.shape[0]), z_bg.dtype),
-            z_distant=z_distant,
-            acc_w_distant=acc_distant,
-            obs_code_distant=obs_distant,
-            view_code_distant=self._view_code(int(z_distant.shape[0]), z_distant) if z_distant is not None else None,
-            param_embed_distant=(
-                self._param_embed(local_state.distant, int(z_distant.shape[0]), z_distant.dtype)
-                if z_distant is not None
-                else None
-            ),
-            z_rigid=z_rigid,
-            acc_w_rigid=acc_rigid,
-            obs_code_rigid=obs_rigid,
-            view_code_rigid=self._view_code(int(z_rigid.shape[0]), z_rigid) if z_rigid is not None else None,
-            param_embed_rigid=(
-                self._param_embed(local_state.rigid, int(z_rigid.shape[0]), z_rigid.dtype, indices=route.S)
-                if z_rigid is not None and local_state.rigid is not None
-                else None
-            ),
+        rigid_node = self._local_rigid_node_state(local_state)
+        source_frame_idx = int(measurement.get("source_frame_idx", 0))
+        near_in = self._build_stage6_struct_input_near(
+            local_state=local_state,
+            rigid_node=rigid_node,
+            route=route,
+            measurement=measurement,
+            source_frame_idx=source_frame_idx,
         )
-        ctx = self.stage6_current_context_adapter(event)
-        delta, aux = self.stage6_posterior_updater(event=event, ctx_current=ctx, ctx_vsm=None)
+        far_in = self._build_stage6_struct_input_far(
+            local_state=local_state,
+            rigid_node=rigid_node,
+            route=route,
+            measurement=measurement,
+            source_frame_idx=source_frame_idx,
+        )
+        aabb_min, aabb_max = self._stage6_aabb(measurement["feat_2d_bg"])
+        event = self.stage6_struct_event_decoder(
+            near_in=near_in,
+            far_in=far_in,
+            route=route,
+            aabb_min=aabb_min,
+            aabb_max=aabb_max,
+            near_batch_offsets=self._build_struct_batch_offsets(stage6_to_struct_decoder_input(near_in), device=self.device),
+            far_batch_offsets=self._build_struct_batch_offsets(stage6_to_struct_decoder_input(far_in), device=self.device),
+        )
+        delta, aux = self.stage6_posterior_updater(event=event, ctx_current=None, ctx_vsm=None)
         if delta.rigid is not None and local_state.rigid is not None:
             delta = DeltaPack(
                 bg=delta.bg,
@@ -728,7 +994,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 aux=delta.aux,
             )
         delta = self._apply_branch_scope(delta)
-        return local_state.apply_delta(delta), delta, {**event.aux, **(ctx.aux or {}), **aux}
+        return local_state.apply_delta(delta), delta, {**event.aux, **aux}
 
     @staticmethod
     def _branch_render_params(branch: Any) -> Dict[str, torch.Tensor]:
@@ -800,11 +1066,21 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         gt_images_out: Optional[List[torch.Tensor]] = None,
     ) -> tuple[torch.Tensor, Dict[str, float]]:
         if len(target_indices) == 0:
-            return local_state.bg.means.new_tensor(0.0), {"num_refs": 0.0}
+            return local_state.bg.means.new_tensor(0.0), {
+                "num_refs": 0.0,
+                "psnr": 0.0,
+                "l1": 0.0,
+                "ssim": 0.0,
+                "valid_ratio": 0.0,
+                "skipped_no_valid_pixels": 0.0,
+            }
         losses: List[torch.Tensor] = []
         stats: Dict[str, float] = {"num_refs": float(len(target_indices))}
         psnr_vals: List[float] = []
         l1_vals: List[float] = []
+        ssim_vals: List[float] = []
+        valid_ratios: List[float] = []
+        skip_count = 0.0
         for idx in target_indices:
             target = batch["targets"][int(idx)]
             pred, _alpha = self._render_target(local_state=local_state, target=target)
@@ -824,8 +1100,14 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             losses.append(loss_i)
             psnr_vals.append(float(stat_i["psnr"]))
             l1_vals.append(float(stat_i["l1"]))
+            ssim_vals.append(float(stat_i.get("ssim", 0.0)))
+            valid_ratios.append(float(stat_i.get("valid_ratio", 0.0)))
+            skip_count += float(stat_i.get("skipped_no_valid_pixels", 0.0))
         stats["psnr"] = float(sum(psnr_vals) / max(len(psnr_vals), 1))
         stats["l1"] = float(sum(l1_vals) / max(len(l1_vals), 1))
+        stats["ssim"] = float(sum(ssim_vals) / max(len(ssim_vals), 1))
+        stats["valid_ratio"] = float(sum(valid_ratios) / max(len(valid_ratios), 1))
+        stats["skipped_no_valid_pixels"] = float(skip_count)
         return torch.stack(losses).mean(), stats
 
     def forward(self, batch: Dict[str, Any]) -> Dict[str, Any]:
@@ -873,7 +1155,16 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 pred_rgbs_out=pred_rgbs if int(k) == roles.inner_K - 1 else None,
                 gt_images_out=gt_images if int(k) == roles.inner_K - 1 else None,
             )
-            reg_loss, reg_stats = delta_regularization(delta, weight=self.stage6_delta_l2_weight)
+            reg_loss, reg_stats = delta_regularization(
+                delta,
+                weight=self.stage6_delta_l2_weight,
+                local_state=local_state,
+                opacity_delta_l2_weight=self.stage6_opacity_delta_l2_weight,
+                sh_delta_l2_weight=self.stage6_sh_delta_l2_weight,
+                scale_barrier_weight=self.stage6_scale_barrier_weight,
+                scale_log_min=self.stage6_scale_log_min,
+                scale_log_max=self.stage6_scale_log_max,
+            )
             near_weight = self._nearby_weight(global_step=step, k=int(k), K=roles.inner_K)
             step_weight = float(self.stage6_step_gamma) ** float(roles.inner_K - 1 - int(k))
             loss_k = step_weight * (self.stage6_block_weight * block_loss + near_weight * nearby_loss + reg_loss)
@@ -888,6 +1179,12 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                     "nearby_weight": float(near_weight),
                     "block_psnr": float(block_stats.get("psnr", 0.0)),
                     "nearby_psnr": float(nearby_stats.get("psnr", 0.0)),
+                    "block_valid_ratio": float(block_stats.get("valid_ratio", 0.0)),
+                    "nearby_valid_ratio": float(nearby_stats.get("valid_ratio", 0.0)),
+                    "block_skipped": float(block_stats.get("skipped_no_valid_pixels", 0.0)),
+                    "nearby_skipped": float(nearby_stats.get("skipped_no_valid_pixels", 0.0)),
+                    "block_ssim": float(block_stats.get("ssim", 0.0)),
+                    "nearby_ssim": float(nearby_stats.get("ssim", 0.0)),
                     **{k2: float(v) for k2, v in reg_stats.items()},
                     **{k2: float(v) for k2, v in update_aux.items() if isinstance(v, (int, float))},
                 }
@@ -923,6 +1220,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         out = self.forward(batch)
         loss = out["loss"]
         loss.backward()
+        grad_group_sums = self._stage6_assert_required_group_grads(out)
         grad_norm = self._stage6_compute_and_check_grad_norm()
         self.optimizer.step()
         if self.stage6_writeback_policy == "block_end_detached":
@@ -951,14 +1249,120 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "phaseA/loss_nearby_final": float(final.get("loss_nearby", 0.0)),
             "phaseA/block_psnr_final": float(final.get("block_psnr", 0.0)),
             "phaseA/nearby_psnr_final": float(final.get("nearby_psnr", 0.0)),
+            "mask/block_valid_ratio_final": float(final.get("block_valid_ratio", 0.0)),
+            "mask/nearby_valid_ratio_final": float(final.get("nearby_valid_ratio", 0.0)),
+            "mask/block_skipped_no_valid_pixels_final": float(final.get("block_skipped", 0.0)),
+            "mask/nearby_skipped_no_valid_pixels_final": float(final.get("nearby_skipped", 0.0)),
             "phaseA/grad_norm_total": float(grad_norm.detach().item()),
+            **grad_group_sums,
         }
         for item in per_step:
             k = int(item["k"])
             logs[f"phaseA/loss_block_k{k}"] = float(item.get("loss_block", 0.0))
             logs[f"phaseA/loss_nearby_k{k}"] = float(item.get("loss_nearby", 0.0))
             logs[f"phaseA/block_psnr_k{k}"] = float(item.get("block_psnr", 0.0))
+            logs[f"mask/block_valid_ratio_k{k}"] = float(item.get("block_valid_ratio", 0.0))
+            logs[f"mask/nearby_valid_ratio_k{k}"] = float(item.get("nearby_valid_ratio", 0.0))
+            logs[f"mask/block_skipped_no_valid_pixels_k{k}"] = float(item.get("block_skipped", 0.0))
+            logs[f"mask/nearby_skipped_no_valid_pixels_k{k}"] = float(item.get("nearby_skipped", 0.0))
         return logs
+
+    def _assert_group_nonzero_grad(
+        self,
+        *,
+        group_name: str,
+        params: List[torch.nn.Parameter],
+        required: bool = True,
+    ) -> float:
+        total = 0.0
+        seen = 0
+        for param in params:
+            if not param.requires_grad:
+                continue
+            seen += 1
+            if param.grad is not None:
+                total += float(param.grad.detach().abs().sum().item())
+        if required and (seen == 0 or total == 0.0):
+            raise RuntimeError(f"{group_name} has zero gradient in Stage6_0 Phase A.")
+        return float(total)
+
+    def _stage6_assert_required_group_grads(self, out: Dict[str, Any]) -> Dict[str, float]:
+        per_step = list(out.get("per_step") or [])
+        required_far = any(
+            float(item.get("stage6/struct/far_num_distant", 0.0)) > 0.0
+            or float(item.get("stage6/struct/far_num_rigid_out", 0.0)) > 0.0
+            for item in per_step
+        )
+        near_params = [
+            param
+            for name, param in self.stage6_struct_event_decoder.near.named_parameters()
+            if not name.startswith("param_obs_codec.")
+        ]
+        far_params = [
+            param
+            for name, param in self.stage6_struct_event_decoder.far.named_parameters()
+            if not name.startswith("param_obs_codec.")
+        ]
+        param_obs_params = list(self.stage6_struct_event_decoder.param_obs_codec.parameters())
+        posterior_params = list(self.stage6_posterior_updater.parameters())
+        sums: Dict[str, float] = {
+            "grad/stage6_struct_event_decoder_near_sum": self._assert_group_nonzero_grad(
+                group_name="stage6_struct_event_decoder.near",
+                params=near_params,
+                required=True,
+            ),
+            "grad/stage6_struct_event_decoder_far_sum": self._assert_group_nonzero_grad(
+                group_name="stage6_struct_event_decoder.far",
+                params=far_params,
+                required=bool(required_far),
+            ),
+            "grad/stage6_param_obs_codec_sum": self._assert_group_nonzero_grad(
+                group_name="stage6_param_obs_codec",
+                params=param_obs_params,
+                required=True,
+            ),
+            "grad/stage6_posterior_updater_sum": self._assert_group_nonzero_grad(
+                group_name="stage6_posterior_updater",
+                params=posterior_params,
+                required=True,
+            ),
+        }
+        if str(getattr(self, "stage6_phase_a_mode", "updater_only")) == "from_scratch":
+            named = [
+                (name, param)
+                for name, param in self.named_parameters()
+                if name in getattr(self, "stage6_measurement_trainable_param_names", set())
+            ]
+            sums["grad/stage6_measurement_frontend_sum"] = self._assert_group_nonzero_grad(
+                group_name="stage6_measurement_frontend",
+                params=[param for _, param in named],
+                required=True,
+            )
+            residual_params = [
+                param
+                for name, param in named
+                if name.startswith("image_feature_extractor.residual")
+                or name.startswith("image_feature_extractor.residual_unet")
+            ]
+            fusion_params = [
+                param
+                for name, param in named
+                if name.startswith("image_feature_extractor.fusion")
+                or name.startswith("image_feature_extractor.fusion_neck")
+            ]
+            if residual_params:
+                sums["grad/measurement_frontend_residual_unet_sum"] = self._assert_group_nonzero_grad(
+                    group_name="image_feature_extractor.residual_unet",
+                    params=residual_params,
+                    required=True,
+                )
+            if fusion_params:
+                sums["grad/measurement_frontend_fusion_neck_sum"] = self._assert_group_nonzero_grad(
+                    group_name="image_feature_extractor.fusion_neck",
+                    params=fusion_params,
+                    required=True,
+                )
+        return sums
 
     def _stage6_params_with_grads(self) -> List[torch.nn.Parameter]:
         return [
@@ -974,7 +1378,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         bad_step_cfg = self._cfg_get(training_cfg, "bad_step", {}) or {}
         max_norm = float(self._cfg_get(grad_clip_cfg, "max_norm", 1.0))
         if len(params) == 0:
-            ref_param = next(self.stage6_event_encoder.parameters())
+            ref_param = next(self.stage6_struct_event_decoder.parameters())
             total_norm = ref_param.new_tensor(0.0)
         elif bool(self._cfg_get(grad_clip_cfg, "enable", True)):
             total_norm = torch.nn.utils.clip_grad_norm_(params, max_norm)
@@ -996,12 +1400,6 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
 
     def build_phase_b_export_checkpoint(self) -> Dict[str, Any]:
         normalizer_stats = {}
-        if hasattr(self.stage6_event_encoder, "state_dict"):
-            normalizer_stats["event_encoder_buffers"] = {
-                k: v.detach().cpu()
-                for k, v in self.stage6_event_encoder.state_dict().items()
-                if "running" in k or "normalizer" in k
-            }
         measurement_prefixes = (
             "image_feature_extractor.",
             "feature_backprojector.",
@@ -1015,13 +1413,29 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 for k, v in self.state_dict().items()
                 if k.startswith(measurement_prefixes)
             },
-            "event_encoder": self.stage6_event_encoder.state_dict(),
+            "struct_event_decoder": {
+                k: v.detach().cpu()
+                for k, v in self.stage6_struct_event_decoder.state_dict().items()
+            },
+            "param_obs_codec": {
+                k: v.detach().cpu()
+                for k, v in self.stage6_struct_event_decoder.param_obs_codec.state_dict().items()
+            },
             "posterior_updater_base": self.stage6_posterior_updater.base_state_dict(),
-            "current_context_adapter": self.stage6_current_context_adapter.state_dict(),
+            "legacy_event_encoder": None,
+            "current_context_adapter": None,
             "normalizer_stats": normalizer_stats,
+            "event_schema": {
+                "event_dim": int(self.stage6_event_dim),
+                "feat_2d_dim": int(self.stage6_feat_2d_dim),
+                "param_obs_dim": int(self.stage6_struct_event_decoder.param_obs_codec.output_dim),
+                "obs_code_dim": 2,
+                "near_path": "bg+rigid_in:xCPE",
+                "far_path": "distant+rigid_out:MLP",
+            },
             "phase_b_init_policy": {
                 "freeze_measurement_frontend": True,
-                "freeze_event_encoder": True,
+                "freeze_struct_event_decoder": True,
                 "freeze_posterior_updater_base": True,
                 "init_vsm_tokens": "zeros_or_small_random",
                 "init_query_decoder": "new",

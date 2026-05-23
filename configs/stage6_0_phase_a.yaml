@@ -100,7 +100,7 @@ scheduler_v9:
     reset_policy: episode_end
     block_source_frame_policy: random_within_keyframe_per_visit
     frame_within_keyframe_policy: random_once_per_episode
-    min_keyframes_required_policy: skip_if_less_than_window
+    min_keyframes_required_policy: use_available_if_less_than_window
     source_mode: keyframes
   traversal:
     mode: round_robin_episode_interleave
@@ -122,8 +122,8 @@ scheduler_v9:
     mode: block_local_unroll
     block:
       repeat_block_iteration: true
-      inner_K_choices: [2, 4, 6]
-      inner_K_probs: [0.45, 0.40, 0.15]
+      inner_K_choices: [2, 4, 6, 8]
+      inner_K_probs: [0.25, 0.25, 0.25, 0.25]
       source_frame_policy: fixed_for_scheduler_step
       block_loss_policy: source_frame_all_cams
     nearby_supervision:
@@ -254,6 +254,7 @@ model:
     phase_a_mode: "from_scratch"
     base_measurement:
       type: "stage5_4_v4"
+      mode: from_scratch
       require_fused_v4: true
       require_obs_code: true
       obs_code_dim: 2
@@ -272,42 +273,60 @@ model:
       writeback_policy: "block_end_detached"
       writeback_after_optimizer_step: true
       reset_local_state_on_nan: true
+    struct_event_decoder:
+      enable: true
+      event_dim: 48
+      feat_2d_dim: 32
+      support_embed_dim: 4
+      branch_embed_dim: 4
+      token:
+        token_dim: 48
+        zero_invalid_2d_feat: true
+        use_2d_feat: true
+        use_support: true
+        use_branch_embed: true
+        use_param_obs_embed: true
+      param_obs_codec:
+        enable: true
+        raw_param_mode: stage5_normalize_params_17
+        obs_code_dim: 2
+        support_dim: 2
+        branch_embed_dim: 4
+        output_dim: 24
+        detach_params: true
+        detach_obs_code: true
+        detach_acc_w: true
+        norm: layernorm
+        activation: gelu
+      near:
+        type: xcpe
+        sparse_backend: spconv
+        num_blocks: 2
+        kernel_size: 3
+        voxel_size: 0.25
+        residual_scale_init: 5.0e-3
+        support_threshold_bg: ${model.branches.bg.src_backproject_support_min}
+        support_threshold_rigid: ${model.branches.rigid.src_backproject_support_min}
+      far:
+        type: point_mlp
+        hidden_dim: 48
+        num_layers: 2
+        support_threshold_distant: ${model.branches.distant.src_backproject_support_min}
+        support_threshold_rigid_out: ${model.branches.rigid.src_backproject_support_min}
     event_encoder:
-      enable: true
-      output_dim: 96
-      hidden_dim: 128
-      num_layers: 2
-      branch_embed_dim: 8
-      view_code_policy: zero_phase_a_debug
-      allow_zero_view_code_phase_a: false
-      inputs:
-        z: true
-        acc_w: true
-        obs_code: true
-        view_code: true
-        param_embed: true
-        branch_embed: true
-      normalization:
-        enable_running_stats: true
-        fast_fail_on_nan: true
-    param_encoder:
-      enable: true
-      quat_scales_summary_dim: 4
-      sh_rest_summary_dim: 8
-      detach_inputs: true
+      enable: false
+      mode: disabled_direct_concat_mlp
     current_context_adapter:
-      enable: true
-      ctx_dim: 96
-      hidden_dim: 128
-      init: "identity_small"
-      phase_b_reserved_ctx_dim: 96
+      enable: false
+      reserve_for_phase_b: true
     posterior_updater:
       enable: true
       input_event: true
-      input_current_ctx: true
+      input_current_ctx: false
       input_vsm_ctx: false
-      hidden_dim: 128
-      stage_hidden_dim: 32
+      hidden_dim: 96
+      event_dim: 48
+      stage_hidden_dim: 48
       split_heads:
         geometry: true
         density: true
@@ -316,7 +335,7 @@ model:
       noop_head: true
       phase_b_hooks:
         accept_vsm_ctx: true
-        vsm_ctx_dim: 96
+        vsm_ctx_dim: 48
         vsm_ctx_adapter_init: "zero_last"
         residual_scale_init: 0.0
       branch_scope:
@@ -579,11 +598,11 @@ losses:
 optimizer:
   type: adamw
   lr:
-    event_encoder: 1.0e-4
-    param_encoder: 1.0e-4
-    current_context_adapter: 1.0e-4
+    struct_event_decoder_near: 1.0e-4
+    struct_event_decoder_far: 1.0e-4
+    param_obs_codec: 1.0e-4
     posterior_updater: 1.0e-4
-    measurement_frontend: 1.0e-4
+    measurement_frontend: 5.0e-5
     default: 1.0e-4
   betas: [0.9, 0.95]
   eps: 1.0e-8

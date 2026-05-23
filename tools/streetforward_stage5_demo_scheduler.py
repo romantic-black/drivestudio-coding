@@ -1111,6 +1111,21 @@ class Stage5_6EvalDemoScheduler:
                 "block_exit": False,
             }
         )
+        self._visit_cursor += 1
+        next_block_idx = int(self._visit_order[int(self._visit_cursor)]) if not self.is_episode_done() else -1
+        if int(next_block_idx) != int(block_idx):
+            self._emit(
+                {
+                    "type": "demo_block_exit",
+                    "manual": True,
+                    "model_update": True,
+                    "consumed_step": True,
+                    "block_idx_in_episode": int(block_idx),
+                    "block_repeat_step": int(self._local_step_by_block[block_idx]),
+                    "reason": "visit_order_advance",
+                }
+            )
+        self._last_batch = None
         self._last_info = self._build_info(reason="mark_updated")
 
     def _set_manual_block(self, block_idx: int, *, reason: str) -> Dict[str, Any]:
@@ -1524,11 +1539,13 @@ class Stage5_6TrainV8DemoScheduler:
             "visited_block_indices": [int(x) for x in raw_info.get("visited_block_indices", [])],
             "updated_block_counts": {i: int(v) for i, v in enumerate(updated)} if isinstance(updated, list) else {},
             "sequence_start_pos": int(self.sequence_start_pos),
-            "sequence_length": int(getattr(self.scheduler, "blocks_per_episode", 0)),
-            "input_offsets": list(range(int(getattr(self.scheduler, "blocks_per_episode", 0)))),
+            "sequence_length": int((st or {}).get("episode_num_blocks", getattr(self.scheduler, "blocks_per_episode", 0))),
+            "input_offsets": list(
+                range(int((st or {}).get("episode_num_blocks", getattr(self.scheduler, "blocks_per_episode", 0))))
+            ),
             "input_frame_ids": [int(x) for x in (st or {}).get("frame_chain", [])],
             "visit_cursor": int(raw_info.get("episode_step_cursor", getattr(self.scheduler, "total_episode_steps", 0))),
-            "visit_total": int(getattr(self.scheduler, "total_episode_steps", 0)),
+            "visit_total": int((st or {}).get("episode_total_steps", getattr(self.scheduler, "total_episode_steps", 0))),
             "episode_done": bool(self.scheduler.current_episode_state is None),
             "block_order": str(getattr(self.scheduler, "block_order", "")),
             "step_major_switch_interval_steps": int(getattr(self.scheduler, "step_major_switch_interval_steps", 1)),
@@ -1557,7 +1574,12 @@ class Stage5_6TrainV8DemoScheduler:
         rt = self.scheduler._segment_runtime[key]
         rt["segment_local_step"] = int(rt["segment_local_step"]) + 1
         block_idx = int(st["block_cursor"])
-        if str(self.scheduler.block_order) == "step_major":
+        uses_visit_order = (
+            bool(self.scheduler._block_order_uses_episode_visit_order())
+            if hasattr(self.scheduler, "_block_order_uses_episode_visit_order")
+            else str(self.scheduler.block_order) == "step_major"
+        )
+        if uses_visit_order:
             st["block_update_counts"][block_idx] = int(st["block_update_counts"][block_idx]) + 1
             st["block_repeat_step"] = int(st["block_update_counts"][block_idx])
         else:
@@ -1580,6 +1602,46 @@ class Stage5_6TrainV8DemoScheduler:
                 "block_exit": False,
             }
         )
+        if uses_visit_order:
+            if (
+                int(st["block_update_counts"][block_idx]) >= int(self.scheduler.steps_per_block)
+                and not bool(st["block_ended"][block_idx])
+            ):
+                self.scheduler._emit_block_end_for_block(st, block_idx)
+                st["block_ended"][block_idx] = True
+            episode_total_steps = (
+                int(self.scheduler._episode_total_steps_from_state(st))
+                if hasattr(self.scheduler, "_episode_total_steps_from_state")
+                else int(getattr(self.scheduler, "total_episode_steps", 0))
+            )
+            if int(st.get("episode_step_cursor", 0)) >= int(episode_total_steps):
+                if hasattr(self.scheduler, "_emit_block_exit_for_block"):
+                    self.scheduler._emit_block_exit_for_block(st, block_idx)
+                self.scheduler._finalize_episode_if_needed()
+            else:
+                order = (
+                    self.scheduler._episode_visit_order_from_state(st)
+                    if hasattr(self.scheduler, "_episode_visit_order_from_state")
+                    else list(getattr(self.scheduler, "_episode_block_visit_order", []))
+                )
+                next_block_idx = int(order[int(st["episode_step_cursor"])])
+                if int(next_block_idx) != int(block_idx) and hasattr(self.scheduler, "_emit_block_exit_for_block"):
+                    self.scheduler._emit_block_exit_for_block(st, block_idx)
+                self.scheduler._select_block(next_block_idx)
+        else:
+            episode_num_blocks = int(st.get("episode_num_blocks", getattr(self.scheduler, "blocks_per_episode", 0)))
+            if int(st["block_repeat_step"]) >= int(self.scheduler.steps_per_block):
+                if hasattr(self.scheduler, "_emit_block_exit_for_block"):
+                    self.scheduler._emit_block_exit_for_block(st, block_idx)
+                self.scheduler._emit_block_end_for_block(st, block_idx)
+                rt["block_idx_in_segment"] = int(rt["block_idx_in_segment"]) + 1
+                st["block_idx_in_segment"] = int(rt["block_idx_in_segment"])
+                st["block_cursor"] = int(st["block_cursor"]) + 1
+                st["block_repeat_step"] = 0
+                if int(st["block_cursor"]) < int(episode_num_blocks):
+                    self.scheduler._start_block()
+                else:
+                    self.scheduler._finalize_episode_if_needed()
         return dict(aligned)
 
     def next_batch_for_update(self) -> Dict[str, Any]:
@@ -1598,7 +1660,7 @@ class Stage5_6TrainV8DemoScheduler:
         st = self.scheduler.current_episode_state
         if st is None:
             raise ValueError("current train-v8 demo episode is done; use Next Episode / Reset Segment.")
-        num_blocks = int(getattr(self.scheduler, "blocks_per_episode", 0))
+        num_blocks = int(st.get("episode_num_blocks", getattr(self.scheduler, "blocks_per_episode", 0)))
         if num_blocks < 1:
             raise ValueError("cannot navigate block in train-v8 episode with no blocks")
         old_block = int(st["block_cursor"])

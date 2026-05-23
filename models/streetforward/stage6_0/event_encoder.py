@@ -13,11 +13,24 @@ class EventPack:
     event_bg: torch.Tensor
     event_distant: Optional[torch.Tensor] = None
     event_rigid: Optional[torch.Tensor] = None
+    support_bg: Optional[torch.Tensor] = None
+    support_distant: Optional[torch.Tensor] = None
+    support_rigid: Optional[torch.Tensor] = None
+    valid_bg: Optional[torch.Tensor] = None
+    valid_distant: Optional[torch.Tensor] = None
+    valid_rigid: Optional[torch.Tensor] = None
     view_code_bg: Optional[torch.Tensor] = None
     obs_code_bg: Optional[torch.Tensor] = None
+    obs_code_distant: Optional[torch.Tensor] = None
+    obs_code_rigid: Optional[torch.Tensor] = None
     acc_w_bg: Optional[torch.Tensor] = None
+    route: Optional[Any] = None
     branch_slices: Dict[str, slice] = field(default_factory=dict)
     aux: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def event_rigid_S(self) -> Optional[torch.Tensor]:
+        return self.event_rigid
 
 
 def _empty_like_rows(reference: torch.Tensor, cols: int) -> torch.Tensor:

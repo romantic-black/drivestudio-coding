@@ -55,6 +55,10 @@ def _iter_episode_block_indices(
     block_order: str,
     step_major_switch_interval_steps: int = 1,
 ) -> List[int]:
+    if int(blocks_per_episode) < 1:
+        raise ValueError("blocks_per_episode must be >= 1")
+    if int(steps_per_block) < 1:
+        raise ValueError("steps_per_block must be >= 1")
     if block_order == "block_major":
         return [
             int(b)
@@ -71,6 +75,18 @@ def _iter_episode_block_indices(
             for b in range(int(blocks_per_episode)):
                 out.extend([int(b)] * int(chunk))
         return out
+    if block_order == "random_without_replacement":
+        out = []
+        for _ in range(int(steps_per_block)):
+            blocks = list(range(int(blocks_per_episode)))
+            random.shuffle(blocks)
+            out.extend(int(b) for b in blocks)
+        return out
+    if block_order == "random_with_replacement":
+        return [
+            int(random.randrange(int(blocks_per_episode)))
+            for _ in range(int(blocks_per_episode) * int(steps_per_block))
+        ]
     raise ValueError(f"unsupported block_order={block_order!r}")
 
 
@@ -110,16 +126,27 @@ class TrainSchedulerV7:
             raise ValueError(
                 "frame_within_keyframe_policy must be one of {random_once_per_episode,middle_frame}"
             )
-        if min_keyframes_required_policy != "skip_if_less_than_window":
-            raise ValueError("min_keyframes_required_policy must be skip_if_less_than_window")
+        if min_keyframes_required_policy not in ("skip_if_less_than_window", "use_available_if_less_than_window"):
+            raise ValueError(
+                "min_keyframes_required_policy must be one of "
+                "['skip_if_less_than_window', 'use_available_if_less_than_window']"
+            )
         if traversal_mode not in ("linear_scene_segment", "round_robin_episode_interleave"):
             raise ValueError("traversal.mode must be linear_scene_segment or round_robin_episode_interleave")
         if segment_order != "ascending":
             raise ValueError("traversal.segment_order must be ascending")
         if scene_order not in ("ascending", "shuffle_per_epoch"):
             raise ValueError("traversal.scene_order must be ascending or shuffle_per_epoch")
-        if block_order not in ("block_major", "step_major"):
-            raise ValueError("execution.block_order must be block_major or step_major")
+        if block_order not in (
+            "block_major",
+            "step_major",
+            "random_without_replacement",
+            "random_with_replacement",
+        ):
+            raise ValueError(
+                "execution.block_order must be one of "
+                "['block_major', 'step_major', 'random_without_replacement', 'random_with_replacement']"
+            )
         if step_major_switch_interval_steps < 1:
             raise ValueError("execution.step_major_switch_interval_steps must be >= 1")
         if not switch_after_episode:
@@ -147,12 +174,7 @@ class TrainSchedulerV7:
 
         self.episode_window_keyframes = int(self.blocks_per_episode + self.total_target_frames - 1)
         self.total_episode_steps = int(self.blocks_per_episode * self.steps_per_block)
-        self._episode_block_visit_order = _iter_episode_block_indices(
-            blocks_per_episode=int(self.blocks_per_episode),
-            steps_per_block=int(self.steps_per_block),
-            block_order=str(self.block_order),
-            step_major_switch_interval_steps=int(self.step_major_switch_interval_steps),
-        )
+        self._episode_block_visit_order = self._build_episode_block_visit_order(int(self.blocks_per_episode))
         if len(self._episode_block_visit_order) != int(self.total_episode_steps):
             raise ValueError(
                 "internal error: episode visit order length mismatch "
@@ -198,6 +220,24 @@ class TrainSchedulerV7:
                 refs.append((int(frame_idx), int(cam_idx)))
         return refs
 
+    def _block_order_uses_episode_visit_order(self) -> bool:
+        return str(self.block_order) in {
+            "step_major",
+            "random_without_replacement",
+            "random_with_replacement",
+        }
+
+    def _block_order_requires_all_blocks_completed(self) -> bool:
+        return str(self.block_order) != "random_with_replacement"
+
+    def _build_episode_block_visit_order(self, num_blocks: int) -> List[int]:
+        return _iter_episode_block_indices(
+            blocks_per_episode=int(num_blocks),
+            steps_per_block=int(self.steps_per_block),
+            block_order=str(self.block_order),
+            step_major_switch_interval_steps=int(self.step_major_switch_interval_steps),
+        )
+
     @staticmethod
     def _build_segment_episode_starts(num_keyframes: int, e_blocks: int, window_keyframes: int) -> List[int]:
         if num_keyframes < window_keyframes:
@@ -207,6 +247,39 @@ class TrainSchedulerV7:
         if starts[-1] != tail:
             starts.append(tail)
         return starts
+
+    def _build_segment_episode_starts_for_policy(self, *, num_keyframes: int) -> List[int]:
+        starts = self._build_segment_episode_starts(
+            num_keyframes=int(num_keyframes),
+            e_blocks=int(self.blocks_per_episode),
+            window_keyframes=int(self.episode_window_keyframes),
+        )
+        if starts or str(self.min_keyframes_required_policy) == "skip_if_less_than_window":
+            return [int(x) for x in starts]
+        if int(num_keyframes) <= 0:
+            return []
+        return [0]
+
+    def _episode_num_blocks_for_start(self, *, num_keyframes: int, episode_start_keyframe_pos: int) -> int:
+        available = int(num_keyframes) - int(episode_start_keyframe_pos)
+        if available <= 0:
+            return 0
+        if str(self.min_keyframes_required_policy) == "skip_if_less_than_window":
+            return int(self.blocks_per_episode)
+        usable = int(available) - int(self.total_target_frames) + 1
+        return int(max(0, min(int(self.blocks_per_episode), int(usable))))
+
+    @staticmethod
+    def _episode_num_blocks_from_state(st: Dict[str, Any]) -> int:
+        return int(st.get("episode_num_blocks", len(st.get("block_update_counts", []))))
+
+    @staticmethod
+    def _episode_total_steps_from_state(st: Dict[str, Any]) -> int:
+        return int(st.get("episode_total_steps", len(st.get("episode_block_visit_order", []))))
+
+    @staticmethod
+    def _episode_visit_order_from_state(st: Dict[str, Any]) -> List[int]:
+        return [int(x) for x in list(st.get("episode_block_visit_order", []))]
 
     def _ordered_scene_ids(self) -> List[int]:
         if self.fixed_scene_id is not None:
@@ -247,16 +320,31 @@ class TrainSchedulerV7:
             for segment_id in segment_ids:
                 sidx = self.dataset.get_segment_index(int(scene_id), int(segment_id))
                 sidx_cache[(int(scene_id), int(segment_id))] = sidx
-                starts = self._build_segment_episode_starts(
+                starts = self._build_segment_episode_starts_for_policy(
                     num_keyframes=len(sidx.keyframe_indices),
-                    e_blocks=self.blocks_per_episode,
-                    window_keyframes=self.episode_window_keyframes,
                 )
+                starts = [
+                    int(st)
+                    for st in starts
+                    if self._episode_num_blocks_for_start(
+                        num_keyframes=len(sidx.keyframe_indices),
+                        episode_start_keyframe_pos=int(st),
+                    )
+                    > 0
+                ]
                 if len(starts) == 0:
                     continue
                 key = (int(scene_id), int(segment_id))
                 per_segment_episode_starts[key] = [int(st) for st in starts]
-                total_blocks = int(len(starts) * self.blocks_per_episode)
+                total_blocks = int(
+                    sum(
+                        self._episode_num_blocks_for_start(
+                            num_keyframes=len(sidx.keyframe_indices),
+                            episode_start_keyframe_pos=int(st),
+                        )
+                        for st in starts
+                    )
+                )
                 total_steps = int(total_blocks * self.steps_per_block)
                 self.epoch_plan.append(
                     {
@@ -339,7 +427,16 @@ class TrainSchedulerV7:
     ) -> EpisodePlanV7:
         kfs = list(sidx.keyframe_indices)
         st = int(episode_start_keyframe_pos)
-        ed = st + self.episode_window_keyframes
+        episode_blocks = self._episode_num_blocks_for_start(
+            num_keyframes=len(kfs),
+            episode_start_keyframe_pos=int(st),
+        )
+        if episode_blocks <= 0:
+            raise ValueError(
+                "episode has no usable blocks: "
+                f"start={st}, num_kf={len(kfs)}, total_target_frames={int(self.total_target_frames)}"
+            )
+        ed = st + int(episode_blocks) + int(self.total_target_frames) - 1
         if ed > len(kfs):
             raise ValueError(
                 f"episode window out of range: start={st}, W={self.episode_window_keyframes}, num_kf={len(kfs)}"
@@ -351,7 +448,7 @@ class TrainSchedulerV7:
         ]
         block_windows = [
             [int(x) for x in frame_chain[b : b + self.total_target_frames]]
-            for b in range(self.blocks_per_episode)
+            for b in range(int(episode_blocks))
         ]
         return EpisodePlanV7(
             scene_id=int(scene_id),
@@ -486,13 +583,18 @@ class TrainSchedulerV7:
         keyframe_window = [int(x) for x in plan.keyframe_window]
         frame_chain = [int(x) for x in plan.frame_chain]
         block_windows = [[int(x) for x in window] for window in plan.block_windows]
+        episode_num_blocks = int(len(block_windows))
+        if episode_num_blocks <= 0:
+            raise ValueError("episode must contain at least one block")
+        episode_block_visit_order = self._build_episode_block_visit_order(episode_num_blocks)
+        episode_total_steps = int(len(episode_block_visit_order))
         rt = self._segment_runtime[key]
         rt["episodes_started"] = int(rt["episodes_started"]) + 1
         episode_base_block_idx_global = int(self._block_idx_global)
         episode_base_block_idx_in_segment = int(rt["block_idx_in_segment"])
-        if self.block_order == "step_major":
+        if self._block_order_uses_episode_visit_order():
             # Reserve logical block ids once per episode; revisits in step-major must keep ids stable.
-            self._block_idx_global = int(self._block_idx_global) + int(self.blocks_per_episode)
+            self._block_idx_global = int(self._block_idx_global) + int(episode_num_blocks)
 
         self.current_episode_state = {
             "scene_id": scene_id,
@@ -502,12 +604,15 @@ class TrainSchedulerV7:
             "keyframe_window": keyframe_window,
             "frame_chain": frame_chain,
             "block_windows": block_windows,
-            "block_cursor": int(self._episode_block_visit_order[0]) if self.block_order == "step_major" else 0,
+            "episode_num_blocks": int(episode_num_blocks),
+            "episode_total_steps": int(episode_total_steps),
+            "episode_block_visit_order": [int(x) for x in episode_block_visit_order],
+            "block_cursor": int(episode_block_visit_order[0]) if self._block_order_uses_episode_visit_order() else 0,
             "block_repeat_step": 0,
             "episode_step_cursor": 0,
-            "block_update_counts": [0 for _ in range(int(self.blocks_per_episode))],
-            "block_started": [False for _ in range(int(self.blocks_per_episode))],
-            "block_ended": [False for _ in range(int(self.blocks_per_episode))],
+            "block_update_counts": [0 for _ in range(int(episode_num_blocks))],
+            "block_started": [False for _ in range(int(episode_num_blocks))],
+            "block_ended": [False for _ in range(int(episode_num_blocks))],
             "current_source_frame_idx": -1,
             "current_target_frame_indices": [],
             "source_keyframe_idx": -1,
@@ -530,13 +635,13 @@ class TrainSchedulerV7:
                 "reset_episode_idx": int(self._episode_idx_global),
                 "reason": "episode_begin",
                 "window_keyframes": list(keyframe_window),
-                "num_pairs": int(self.blocks_per_episode),
+                "num_pairs": int(episode_num_blocks),
                 "scheduler_version": "v7",
             }
         )
         self._episode_idx_global += 1
 
-        if self.block_order == "step_major":
+        if self._block_order_uses_episode_visit_order():
             refs = self._frame_targets_to_image_refs(
                 int(plan.num_cams),
                 [int(x) for x in frame_chain],
@@ -610,8 +715,10 @@ class TrainSchedulerV7:
         if self.warm_next_block_exact:
             block_windows = st["block_windows"]
             num_cams = int(st["num_cams"])
-            if self.block_order == "step_major":
-                nb = (bcur + 1) % len(block_windows)
+            if self._block_order_uses_episode_visit_order():
+                order = self._episode_visit_order_from_state(st)
+                pos = int(st.get("episode_step_cursor", 0))
+                nb = int(order[pos + 1]) if pos + 1 < len(order) else -1
             else:
                 nb = bcur + 1
                 if nb >= len(block_windows):
@@ -636,7 +743,7 @@ class TrainSchedulerV7:
         num_cams = int(st["num_cams"])
         source_image_ref = (int(source_frame), 0)
         target_image_refs = self._frame_targets_to_image_refs(num_cams, target_frames)
-        if self.block_order == "step_major":
+        if self._block_order_uses_episode_visit_order():
             block_idx_global = int(st["episode_base_block_idx_global"]) + int(block_idx)
             block_idx_in_segment = int(st["episode_base_block_idx_in_segment"]) + int(block_idx)
         else:
@@ -695,7 +802,7 @@ class TrainSchedulerV7:
         st["source_image_refs"] = [tuple(x) for x in source_image_refs]
         st["target_image_refs"] = [tuple(x) for x in target_image_refs]
 
-        if self.block_order == "step_major":
+        if self._block_order_uses_episode_visit_order():
             st["block_repeat_step"] = int(st["block_update_counts"][bcur])
             st["block_idx_global"] = int(st["episode_base_block_idx_global"]) + int(bcur)
             st["block_idx_in_segment"] = int(st["episode_base_block_idx_in_segment"]) + int(bcur)
@@ -787,19 +894,23 @@ class TrainSchedulerV7:
         st = self.current_episode_state
         if st is None:
             return
-        if self.block_order == "step_major":
-            if int(st.get("episode_step_cursor", 0)) < int(self.total_episode_steps):
+        episode_num_blocks = int(self._episode_num_blocks_from_state(st))
+        episode_total_steps = int(self._episode_total_steps_from_state(st))
+        if self._block_order_uses_episode_visit_order():
+            if int(st.get("episode_step_cursor", 0)) < int(episode_total_steps):
                 return
-            if any(int(x) < int(self.steps_per_block) for x in st.get("block_update_counts", [])):
+            if self._block_order_requires_all_blocks_completed() and any(
+                int(x) < int(self.steps_per_block) for x in st.get("block_update_counts", [])
+            ):
                 return
         else:
             bcur = int(st["block_cursor"])
-            if bcur < self.blocks_per_episode:
+            if bcur < int(episode_num_blocks):
                 return
         key = (int(st["scene_id"]), int(st["segment_id"]))
         rt = self._segment_runtime[key]
-        if self.block_order == "step_major":
-            rt["block_idx_in_segment"] = int(st["episode_base_block_idx_in_segment"]) + int(self.blocks_per_episode)
+        if self._block_order_uses_episode_visit_order():
+            rt["block_idx_in_segment"] = int(st["episode_base_block_idx_in_segment"]) + int(episode_num_blocks)
         rt["episodes_completed"] = int(rt["episodes_completed"]) + 1
         self._emit(
             {
@@ -840,7 +951,7 @@ class TrainSchedulerV7:
 
         rt["segment_local_step"] = int(rt["segment_local_step"]) + 1
         current_block_idx = int(st["block_cursor"])
-        if self.block_order == "step_major":
+        if self._block_order_uses_episode_visit_order():
             st["block_update_counts"][current_block_idx] = int(st["block_update_counts"][current_block_idx]) + 1
             st["block_repeat_step"] = int(st["block_update_counts"][current_block_idx])
             st["episode_step_cursor"] = int(st.get("episode_step_cursor", 0)) + 1
@@ -852,7 +963,7 @@ class TrainSchedulerV7:
         batch["_scheduler_v4_aligned_info"] = dict(aligned)
         batch["_scheduler_v7_aligned_info"] = dict(aligned)
 
-        if self.block_order == "step_major":
+        if self._block_order_uses_episode_visit_order():
             if (
                 int(st["block_update_counts"][current_block_idx]) >= self.steps_per_block
                 and not bool(st["block_ended"][current_block_idx])
@@ -863,10 +974,11 @@ class TrainSchedulerV7:
                     int(rt["block_idx_in_segment"]),
                     int(st["episode_base_block_idx_in_segment"]) + int(current_block_idx) + 1,
                 )
-            if int(st.get("episode_step_cursor", 0)) >= int(self.total_episode_steps):
+            episode_total_steps = int(self._episode_total_steps_from_state(st))
+            if int(st.get("episode_step_cursor", 0)) >= int(episode_total_steps):
                 self._finalize_episode_if_needed()
             else:
-                next_block_idx = int(self._episode_block_visit_order[int(st["episode_step_cursor"])])
+                next_block_idx = int(self._episode_visit_order_from_state(st)[int(st["episode_step_cursor"])])
                 self._select_block(next_block_idx)
         else:
             if int(st["block_repeat_step"]) >= self.steps_per_block:
@@ -875,7 +987,7 @@ class TrainSchedulerV7:
                 st["block_idx_in_segment"] = int(rt["block_idx_in_segment"])
                 st["block_cursor"] = int(st["block_cursor"]) + 1
                 st["block_repeat_step"] = 0
-                if int(st["block_cursor"]) < self.blocks_per_episode:
+                if int(st["block_cursor"]) < int(self._episode_num_blocks_from_state(st)):
                     self._start_block()
                 else:
                     self._finalize_episode_if_needed()

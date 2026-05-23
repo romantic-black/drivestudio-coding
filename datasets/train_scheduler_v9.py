@@ -486,12 +486,14 @@ class TrainSchedulerV9(TrainSchedulerV8):
         return self._make_batch_plan(st=st, inner_K=int(inner_K), steps=steps, query_label_refs=[], aux_loss_refs=[])
 
     def _sample_event_blocks(self, st: Dict[str, Any], K: int) -> List[int]:
-        blocks = list(range(int(self.blocks_per_episode)))
+        blocks = list(range(int(self._episode_num_blocks_from_state(st))))
+        if len(blocks) == 0:
+            raise ValueError("Phase B rollout requires non-empty episode blocks")
         if self.phase_b_sample_event_frames != "random_blocks_in_episode":
             raise ValueError(f"unsupported Phase B sample_event_frames={self.phase_b_sample_event_frames!r}")
         if bool(self.phase_b_distinct_event_frames):
             if int(K) > len(blocks):
-                raise ValueError(f"Phase B K={int(K)} exceeds blocks_per_episode={len(blocks)}")
+                K = int(len(blocks))
             out = self._sample_no_replace(blocks, int(K))
         else:
             out = [int(random.choice(blocks)) for _ in range(int(K))]
@@ -564,6 +566,7 @@ class TrainSchedulerV9(TrainSchedulerV8):
         sidx = self.dataset.get_segment_index(int(st["scene_id"]), int(st["segment_id"]))
         inner_K = self._sample_inner_K(self.phase_b_K_choices, self.phase_b_K_probs)
         selected_blocks = self._sample_event_blocks(st, inner_K)
+        inner_K = int(len(selected_blocks))
         num_cams = int(st["num_cams"])
         self._last_num_cams = int(num_cams)
         written_frames: List[int] = []
@@ -962,7 +965,7 @@ class TrainSchedulerV9(TrainSchedulerV8):
         rt = self._segment_runtime[key]
         rt["segment_local_step"] = int(rt["segment_local_step"]) + 1
         current_block_idx = int(st["block_cursor"])
-        if self.block_order == "step_major":
+        if self._block_order_uses_episode_visit_order():
             st["block_update_counts"][current_block_idx] = int(st["block_update_counts"][current_block_idx]) + 1
             st["block_repeat_step"] = int(st["block_update_counts"][current_block_idx])
             st["episode_step_cursor"] = int(st.get("episode_step_cursor", 0)) + 1
@@ -977,7 +980,7 @@ class TrainSchedulerV9(TrainSchedulerV8):
         batch["_scheduler_v8_aligned_info"] = dict(aligned)
         batch["_scheduler_v9_aligned_info"] = dict(aligned)
 
-        if self.block_order == "step_major":
+        if self._block_order_uses_episode_visit_order():
             if (
                 int(st["block_update_counts"][current_block_idx]) >= self.steps_per_block
                 and not bool(st["block_ended"][current_block_idx])
@@ -988,11 +991,12 @@ class TrainSchedulerV9(TrainSchedulerV8):
                     int(rt["block_idx_in_segment"]),
                     int(st["episode_base_block_idx_in_segment"]) + int(current_block_idx) + 1,
                 )
-            if int(st.get("episode_step_cursor", 0)) >= int(self.total_episode_steps):
+            episode_total_steps = int(self._episode_total_steps_from_state(st))
+            if int(st.get("episode_step_cursor", 0)) >= int(episode_total_steps):
                 self._emit_block_exit_for_block(st, current_block_idx)
                 self._finalize_episode_if_needed()
             else:
-                next_block_idx = int(self._episode_block_visit_order[int(st["episode_step_cursor"])])
+                next_block_idx = int(self._episode_visit_order_from_state(st)[int(st["episode_step_cursor"])])
                 if int(next_block_idx) != int(current_block_idx):
                     self._emit_block_exit_for_block(st, current_block_idx)
                 self._select_block(next_block_idx)
@@ -1004,7 +1008,7 @@ class TrainSchedulerV9(TrainSchedulerV8):
                 st["block_idx_in_segment"] = int(rt["block_idx_in_segment"])
                 st["block_cursor"] = int(st["block_cursor"]) + 1
                 st["block_repeat_step"] = 0
-                if int(st["block_cursor"]) < self.blocks_per_episode:
+                if int(st["block_cursor"]) < int(self._episode_num_blocks_from_state(st)):
                     self._start_block()
                 else:
                     self._finalize_episode_if_needed()

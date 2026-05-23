@@ -83,10 +83,10 @@ class Stage6PosteriorUpdater(nn.Module):
     def __init__(
         self,
         *,
-        event_dim: int = 96,
-        ctx_dim: int = 96,
-        hidden_dim: int = 128,
-        stage_hidden_dim: int = 32,
+        event_dim: int = 48,
+        ctx_dim: int = 48,
+        hidden_dim: int = 96,
+        stage_hidden_dim: int = 48,
         sh_degree: int = 1,
         means_max_step_m: float = 0.25,
         scales_log_max_step: float = 0.08,
@@ -95,7 +95,7 @@ class Stage6PosteriorUpdater(nn.Module):
         sh_max_step: float = 0.10,
         hidden_max_step: float = 1.0,
         accept_vsm_ctx: bool = True,
-        vsm_ctx_dim: int = 96,
+        vsm_ctx_dim: int = 48,
     ) -> None:
         super().__init__()
         self.event_dim = int(event_dim)
@@ -108,7 +108,7 @@ class Stage6PosteriorUpdater(nn.Module):
         self.opacity_logit_max_step = float(opacity_logit_max_step)
         self.sh_max_step = float(sh_max_step)
         self.hidden_max_step = float(hidden_max_step)
-        in_dim = int(ctx_dim)
+        in_dim = int(event_dim)
         self.trunk = nn.Sequential(
             nn.Linear(in_dim, int(hidden_dim)),
             nn.LayerNorm(int(hidden_dim)),
@@ -127,7 +127,7 @@ class Stage6PosteriorUpdater(nn.Module):
         self.accept_vsm_ctx = bool(accept_vsm_ctx)
         self.vsm_ctx_adapter: Optional[nn.Linear]
         if self.accept_vsm_ctx:
-            self.vsm_ctx_adapter = nn.Linear(int(vsm_ctx_dim), int(ctx_dim))
+            self.vsm_ctx_adapter = nn.Linear(int(vsm_ctx_dim), int(event_dim))
             nn.init.zeros_(self.vsm_ctx_adapter.weight)
             nn.init.zeros_(self.vsm_ctx_adapter.bias)
         else:
@@ -142,16 +142,17 @@ class Stage6PosteriorUpdater(nn.Module):
     ) -> Optional[BranchDelta]:
         if event is None:
             return None
-        if ctx_current is None:
-            raise ValueError("ctx_current is required for every event branch")
-        if int(ctx_current.shape[-1]) != int(self.ctx_dim):
-            raise ValueError(
-                f"ctx_current dim mismatch: got {int(ctx_current.shape[-1])}, expected {int(self.ctx_dim)}"
-            )
-        if int(ctx_current.shape[0]) != int(event.shape[0]):
-            raise ValueError(
-                f"event/ctx_current row mismatch: {int(event.shape[0])} vs {int(ctx_current.shape[0])}"
-            )
+        if event.dim() != 2 or int(event.shape[-1]) != int(self.event_dim):
+            raise ValueError(f"event must be [N,{self.event_dim}], got {tuple(event.shape)}")
+        if ctx_current is not None:
+            if int(ctx_current.shape[-1]) != int(self.event_dim):
+                raise ValueError(
+                    f"ctx_current dim mismatch: got {int(ctx_current.shape[-1])}, expected {int(self.event_dim)}"
+                )
+            if int(ctx_current.shape[0]) != int(event.shape[0]):
+                raise ValueError(
+                    f"event/ctx_current row mismatch: {int(event.shape[0])} vs {int(ctx_current.shape[0])}"
+                )
         if event.numel() == 0:
             n = int(event.shape[0])
             z3 = event.new_zeros((n, 3))
@@ -166,7 +167,7 @@ class Stage6PosteriorUpdater(nn.Module):
                 confidence=z1,
                 noop=z1,
             )
-        ctx_in = ctx_current
+        ctx_in = event if ctx_current is None else ctx_current
         if ctx_vsm is not None:
             if self.vsm_ctx_adapter is None:
                 raise ValueError("ctx_vsm was provided but vsm ctx adapter is disabled")
@@ -193,24 +194,24 @@ class Stage6PosteriorUpdater(nn.Module):
         self,
         *,
         event: EventPack,
-        ctx_current: ContextPack,
+        ctx_current: Optional[ContextPack] = None,
         ctx_vsm: Optional[ContextPack] = None,
     ) -> tuple[DeltaPack, Dict[str, Any]]:
         bg = self._branch_forward(
             event=event.event_bg,
-            ctx_current=ctx_current.ctx_bg,
+            ctx_current=None if ctx_current is None else ctx_current.ctx_bg,
             ctx_vsm=None if ctx_vsm is None else ctx_vsm.ctx_bg,
         )
         if bg is None:
             raise RuntimeError("EventPack.event_bg is required")
         distant = self._branch_forward(
             event=event.event_distant,
-            ctx_current=ctx_current.ctx_distant,
+            ctx_current=None if ctx_current is None else ctx_current.ctx_distant,
             ctx_vsm=None if ctx_vsm is None else ctx_vsm.ctx_distant,
         )
         rigid = self._branch_forward(
             event=event.event_rigid,
-            ctx_current=ctx_current.ctx_rigid,
+            ctx_current=None if ctx_current is None else ctx_current.ctx_rigid,
             ctx_vsm=None if ctx_vsm is None else ctx_vsm.ctx_rigid,
         )
         aux = {

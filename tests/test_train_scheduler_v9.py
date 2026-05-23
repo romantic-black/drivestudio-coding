@@ -8,8 +8,14 @@ from datasets.multi_scene_dataset_v4 import MultiSceneDatasetV4, SegmentIndexV4
 from datasets.train_scheduler_v9 import TrainSchedulerV9
 
 
-def _make_sidx_multi_frame_per_keyframe(*, scene_id: int, segment_id: int, base_frame: int = 10) -> SegmentIndexV4:
-    keyframes = [0, 1, 2, 3, 4, 5]
+def _make_sidx_multi_frame_per_keyframe(
+    *,
+    scene_id: int,
+    segment_id: int,
+    base_frame: int = 10,
+    num_keyframes: int = 6,
+) -> SegmentIndexV4:
+    keyframes = list(range(int(num_keyframes)))
     keyframe_to_frames = {
         int(k): [int(base_frame + k * 10 + i) for i in range(3)]
         for k in keyframes
@@ -126,11 +132,11 @@ def _build_scheduler(ds: MagicMock, **kwargs) -> TrainSchedulerV9:
     return TrainSchedulerV9(
         dataset=ds,
         phase=phase,  # type: ignore[arg-type]
-        steps_per_block=1,
-        blocks_per_episode=3,
+        steps_per_block=int(kwargs.get("steps_per_block", 1)),
+        blocks_per_episode=int(kwargs.get("blocks_per_episode", 3)),
         include_source_frame=True,
         frame_within_keyframe_policy="middle_frame",
-        min_keyframes_required_policy="skip_if_less_than_window",
+        min_keyframes_required_policy=str(kwargs.get("min_keyframes_required_policy", "skip_if_less_than_window")),
         traversal_mode="linear_scene_segment",
         switch_after_episode=True,
         segment_order="ascending",
@@ -277,6 +283,52 @@ def test_v9_preload_hint_can_disable_role_refs():
         call.kwargs["hint_scope"] != "v9_role_refs"
         for call in ds.submit_preload_hint.call_args_list
     )
+
+
+def test_v9_use_available_keyframes_when_segment_shorter_than_episode():
+    sidx = _make_sidx_multi_frame_per_keyframe(scene_id=1, segment_id=0, num_keyframes=2)
+    sch = _build_scheduler(
+        _make_mock_dataset(sidx),
+        blocks_per_episode=8,
+        min_keyframes_required_policy="use_available_if_less_than_window",
+    )
+    assert sch.epoch_plan[0]["total_blocks"] == 2
+    batch0 = sch.next_batch()
+    assert batch0["_scheduler_v9"]["keyframe_window"] == [0, 1]
+    assert len(batch0["_scheduler_v9"]["frame_chain"]) == 2
+    assert batch0["_scheduler_v9"]["steps"][0]["block_idx"] == 0
+    batch1 = sch.next_batch()
+    assert batch1["_scheduler_v9"]["steps"][0]["block_idx"] == 1
+
+
+def test_v9_random_without_replacement_block_order_visits_each_block_once_per_round():
+    sidx = _make_sidx_multi_frame_per_keyframe(scene_id=1, segment_id=0)
+    sch = _build_scheduler(
+        _make_mock_dataset(sidx),
+        blocks_per_episode=4,
+        steps_per_block=2,
+        block_order="random_without_replacement",
+    )
+    sch._ensure_episode_state()
+    order = list(sch.current_episode_state["episode_block_visit_order"])  # type: ignore[index]
+    assert len(order) == 8
+    assert sorted(order[:4]) == [0, 1, 2, 3]
+    assert sorted(order[4:]) == [0, 1, 2, 3]
+
+
+def test_v9_random_with_replacement_block_order_allows_repeats():
+    sidx = _make_sidx_multi_frame_per_keyframe(scene_id=1, segment_id=0)
+    sch = _build_scheduler(
+        _make_mock_dataset(sidx),
+        blocks_per_episode=3,
+        steps_per_block=3,
+        block_order="random_with_replacement",
+    )
+    sch._ensure_episode_state()
+    order = list(sch.current_episode_state["episode_block_visit_order"])  # type: ignore[index]
+    assert len(order) == 9
+    assert all(0 <= int(x) < 3 for x in order)
+    assert sch._block_order_requires_all_blocks_completed() is False
 
 
 @pytest.mark.parametrize(
