@@ -1415,7 +1415,7 @@ class MultiSceneDatasetV4:
         t = torch.as_tensor(arr, dtype=torch.float32)
         if t.shape[0] != int(height) or t.shape[1] != int(width):
             t = self._resize_2d_tensor_to_hw(t, int(height), int(width), mode="bilinear")
-        return t.to(device=self.device)
+        return t
 
     def _load_mask_from_asset_path(self, path_str: str, height: int, width: int) -> Tensor:
         arr = np.asarray(Image.open(path_str))
@@ -1424,7 +1424,6 @@ class MultiSceneDatasetV4:
         mask = torch.as_tensor(arr, dtype=torch.float32)
         if mask.shape[0] != int(height) or mask.shape[1] != int(width):
             mask = self._resize_2d_tensor_to_hw(mask, int(height), int(width), mode="nearest")
-        mask = mask.to(device=self.device)
         if mask.max().item() > 1.0:
             mask = (mask > 0.0).float()
         return mask
@@ -1494,10 +1493,11 @@ class MultiSceneDatasetV4:
         return normalize_sky_mask_to_one_is_sky((mask > 0.5).float(), semantics)
 
     def _compute_viewdirs(self, height: int, width: int, intrinsic: Tensor, camera_to_world: Tensor) -> Tensor:
+        device = intrinsic.device
         intr = intrinsic[:3, :3]
         c2w = camera_to_world[:3, :3]
-        xs = torch.arange(int(width), device=self.device, dtype=torch.float32)
-        ys = torch.arange(int(height), device=self.device, dtype=torch.float32)
+        xs = torch.arange(int(width), device=device, dtype=torch.float32)
+        ys = torch.arange(int(height), device=device, dtype=torch.float32)
         grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
         x = grid_x.reshape(-1)
         y = grid_y.reshape(-1)
@@ -1537,12 +1537,12 @@ class MultiSceneDatasetV4:
                 resample = Image.BILINEAR  # type: ignore[attr-defined]
             pil_img = pil_img.resize((width, height), resample=resample)
         image_arr = np.asarray(pil_img, dtype=np.float32)
-        image = torch.as_tensor(image_arr / 255.0, dtype=torch.float32, device=self.device)
+        image = torch.as_tensor(image_arr / 255.0, dtype=torch.float32)
 
         if depth_path:
             depth = self._load_depth_from_asset_path(depth_path, height, width)
         else:
-            depth = torch.ones((height, width), dtype=torch.float32, device=self.device) * 10.0
+            depth = torch.ones((height, width), dtype=torch.float32) * 10.0
 
         sky_mask = None
         if self._load_sky_mask and sky_mask_path:
@@ -1562,14 +1562,14 @@ class MultiSceneDatasetV4:
         viewdirs = self._compute_viewdirs(
             height,
             width,
-            torch.as_tensor(meta["intrinsic_4x4"], dtype=torch.float32, device=self.device),
-            torch.as_tensor(meta["camera_to_world"], dtype=torch.float32, device=self.device),
+            torch.as_tensor(meta["intrinsic_4x4"], dtype=torch.float32),
+            torch.as_tensor(meta["camera_to_world"], dtype=torch.float32),
         )
 
         return {
             "image": image,
-            "extrinsic": torch.as_tensor(meta["camera_to_world"], dtype=torch.float32, device=self.device),
-            "intrinsic": torch.as_tensor(meta["intrinsic_4x4"], dtype=torch.float32, device=self.device),
+            "extrinsic": torch.as_tensor(meta["camera_to_world"], dtype=torch.float32),
+            "intrinsic": torch.as_tensor(meta["intrinsic_4x4"], dtype=torch.float32),
             "depth": depth,
             "sky_mask": sky_mask,
             "viewdirs": viewdirs,
@@ -1585,7 +1585,14 @@ class MultiSceneDatasetV4:
         with self._lock:
             return key in self._view_pack_cache
 
-    def _get_cached_or_load_view(self, scene_id: int, segment_id: int, image_ref: ImageRef) -> Dict[str, Any]:
+    def _get_cached_or_load_view(
+        self,
+        scene_id: int,
+        segment_id: int,
+        image_ref: ImageRef,
+        *,
+        materialize: bool = True,
+    ) -> Dict[str, Any]:
         ds_name = self._asset_dataset_name()
         key = (ds_name, int(scene_id), int(segment_id), int(image_ref[0]), int(image_ref[1]))
         created_inflight = False
@@ -1593,6 +1600,8 @@ class MultiSceneDatasetV4:
             with self._lock:
                 cached = self._cache_get(self._view_pack_cache, key)
                 if cached is not None:
+                    if not materialize:
+                        return {}
                     return loaded_view_pack_to_device_v2(cached, self.device)
             inflight = self._wait_on_inflight(self._view_pack_inflight, self._view_pack_inflight_lock, key)
             if inflight is not None:
@@ -1600,6 +1609,8 @@ class MultiSceneDatasetV4:
                 with self._lock:
                     cached = self._cache_get(self._view_pack_cache, key)
                     if cached is not None:
+                        if not materialize:
+                            return {}
                         return loaded_view_pack_to_device_v2(cached, self.device)
                 raise ValueError(f"view pack inflight missing after wait for {key}")
             created_inflight = True
@@ -1608,6 +1619,8 @@ class MultiSceneDatasetV4:
             pack = self._load_view_from_asset_paths(scene_id, image_ref, meta)
             lvp = dict_to_loaded_view_pack_v2(pack)
             if not self._enable_view_pack_cache:
+                if not materialize:
+                    return {}
                 return loaded_view_pack_to_device_v2(lvp, self.device)
             with self._lock:
                 cached = self._cache_set(
@@ -1616,6 +1629,8 @@ class MultiSceneDatasetV4:
                     lvp,
                     max_items=self._view_pack_cache_max_items,
                 )
+                if not materialize:
+                    return {}
                 if cached:
                     return loaded_view_pack_to_device_v2(self._view_pack_cache[key], self.device)
                 return loaded_view_pack_to_device_v2(lvp, self.device)
@@ -2445,6 +2460,7 @@ class MultiSceneDatasetV4:
         emit_preload_hints: bool,
         warm_next_block_exact: bool,
         warm_next_episode_chain: bool,
+        warm_v9_role_refs: bool = True,
         block_order: str = "block_major",
         step_major_switch_interval_steps: int = 1,
         target_policy: str = "visited_episode_frames",
@@ -2474,6 +2490,7 @@ class MultiSceneDatasetV4:
             emit_preload_hints=bool(emit_preload_hints),
             warm_next_block_exact=bool(warm_next_block_exact),
             warm_next_episode_chain=bool(warm_next_episode_chain),
+            warm_v9_role_refs=bool(warm_v9_role_refs),
             block_order=str(block_order),
             step_major_switch_interval_steps=int(step_major_switch_interval_steps),
             target_policy=str(target_policy),
@@ -2505,4 +2522,4 @@ class MultiSceneDatasetV4:
         self, scene_id: int, segment_id: int, image_ref: ImageRef, meta: Dict[str, Any]
     ) -> None:
         _ = (meta,)
-        self._get_cached_or_load_view(scene_id, segment_id, image_ref)
+        self._get_cached_or_load_view(scene_id, segment_id, image_ref, materialize=False)

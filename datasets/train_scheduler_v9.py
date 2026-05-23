@@ -116,6 +116,7 @@ class TrainSchedulerV9(TrainSchedulerV8):
         emit_preload_hints: bool,
         warm_next_block_exact: bool,
         warm_next_episode_chain: bool,
+        warm_v9_role_refs: bool = True,
         block_order: str = "block_major",
         step_major_switch_interval_steps: int = 1,
         target_policy: str = "visited_episode_frames",
@@ -134,10 +135,20 @@ class TrainSchedulerV9(TrainSchedulerV8):
         self.phase_b_cfg = phase_b_cfg or {}
         self.v9_leakage_check_cfg = leakage_check_cfg or {}
         self.v9_fail_fast = bool(fail_fast)
+        self.warm_v9_role_refs = bool(warm_v9_role_refs)
+        self._v9_prefetched_plan: Optional[ViewSetRolloutBatchV9] = None
+        self._v9_prefetched_plan_key: Optional[Tuple[int, int, int, int, int, int]] = None
 
         phase_a_block = self._cfg_get(self.phase_a_cfg, "block", {}) or {}
         phase_a_near = self._cfg_get(self.phase_a_cfg, "nearby_supervision", {}) or {}
         phase_a_masks = self._cfg_get(self.phase_a_cfg, "masks", {}) or {}
+        self.phase_a_mode = str(self._cfg_get(self.phase_a_cfg, "mode", "block_local_unroll"))
+        self.phase_a_repeat_block_iteration = bool(
+            self._cfg_get(phase_a_block, "repeat_block_iteration", True)
+        )
+        self.phase_a_source_frame_policy = str(
+            self._cfg_get(phase_a_block, "source_frame_policy", "fixed_for_scheduler_step")
+        )
         self.phase_a_inner_K_choices = [
             int(x) for x in list(self._cfg_get(phase_a_block, "inner_K_choices", [2, 4, 6]) or [2, 4, 6])
         ]
@@ -159,7 +170,17 @@ class TrainSchedulerV9(TrainSchedulerV8):
             self._cfg_get(phase_a_near, "exclude_existing_block_loss_frames", True)
         )
         self.phase_a_nearby_camera_policy = str(self._cfg_get(phase_a_near, "camera_policy", "all_cams"))
+        self.phase_a_nearby_apply_every_step = bool(self._cfg_get(phase_a_near, "apply_every_step", False))
         self.phase_a_nearby_final_step_only = bool(self._cfg_get(phase_a_near, "apply_final_step_only", True))
+        self.phase_a_nearby_add_to_evidence_refs = bool(
+            self._cfg_get(phase_a_near, "add_to_evidence_refs", False)
+        )
+        self.phase_a_nearby_add_to_source_image_refs = bool(
+            self._cfg_get(phase_a_near, "add_to_source_image_refs", False)
+        )
+        self.phase_a_nearby_add_to_history_record_views = bool(
+            self._cfg_get(phase_a_near, "add_to_history_record_views", False)
+        )
         self.phase_a_nearby_role_name = str(self._cfg_get(phase_a_near, "role_name", "phaseA_nearby"))
         self.phase_a_nearby_max_refs_per_step = int(self._cfg_get(phase_a_near, "max_refs_per_step", 12))
         self.phase_a_nearby_loss_weight = float(self._cfg_get(phase_a_near, "loss_weight", 0.25))
@@ -168,9 +189,13 @@ class TrainSchedulerV9(TrainSchedulerV8):
         self.phase_a_nearby_loss_mask = str(self._cfg_get(phase_a_masks, "nearby_loss_mask", "non_sky_non_egocar"))
 
         phase_b_rollout = self._cfg_get(self.phase_b_cfg, "rollout", {}) or {}
+        phase_b_episode = self._cfg_get(self.phase_b_cfg, "episode", {}) or {}
         phase_b_prefix = self._cfg_get(self.phase_b_cfg, "prefix_render", {}) or {}
         phase_b_query = self._cfg_get(self.phase_b_cfg, "query_observation", {}) or {}
         phase_b_masks = self._cfg_get(self.phase_b_cfg, "masks", {}) or {}
+        self.phase_b_reset_vsm_on_episode_end = bool(
+            self._cfg_get(phase_b_episode, "reset_vsm_on_episode_end", True)
+        )
         self.phase_b_K_choices = [
             int(x) for x in list(self._cfg_get(phase_b_rollout, "K_choices", [2, 4]) or [2, 4])
         ]
@@ -191,6 +216,7 @@ class TrainSchedulerV9(TrainSchedulerV8):
         self.phase_b_query_frames_per_rollout = int(self._cfg_get(phase_b_query, "frames_per_rollout", 1))
         self.phase_b_query_cameras_per_frame = str(self._cfg_get(phase_b_query, "cameras_per_frame", "all_cams"))
         self.phase_b_query_exclude_event_frames = bool(self._cfg_get(phase_b_query, "exclude_event_frames", True))
+        self.phase_b_vsm_scope = str(self._cfg_get(phase_b_masks, "vsm_scope", "bg_static"))
         self.phase_b_evidence_mask = str(
             self._cfg_get(phase_b_masks, "evidence_mask", "valid_non_sky_non_egocar_non_dynamic")
         )
@@ -201,6 +227,10 @@ class TrainSchedulerV9(TrainSchedulerV8):
             self._cfg_get(phase_b_masks, "query_label_mask", "valid_non_sky_non_egocar_non_dynamic")
         )
 
+        self.v9_leakage_check_enable = bool(self._cfg_get(self.v9_leakage_check_cfg, "enable", True))
+        self.v9_same_scene_segment_required = bool(
+            self._cfg_get(self.v9_leakage_check_cfg, "same_scene_segment_required", True)
+        )
         self.v9_query_not_in_evidence = bool(self._cfg_get(self.v9_leakage_check_cfg, "query_not_in_evidence", True))
         self.v9_nearby_not_in_evidence = bool(self._cfg_get(self.v9_leakage_check_cfg, "nearby_not_in_evidence", True))
         self.v9_aux_not_in_evidence = bool(self._cfg_get(self.v9_leakage_check_cfg, "aux_not_in_evidence", True))
@@ -211,6 +241,32 @@ class TrainSchedulerV9(TrainSchedulerV8):
             self._cfg_get(self.v9_leakage_check_cfg, "forbid_test_refs_in_train", True)
         )
 
+        if self.phase_a_mode != "block_local_unroll":
+            raise ValueError("scheduler_v9 P0 requires phase_A.mode=block_local_unroll")
+        if not self.v9_leakage_check_enable:
+            raise ValueError("scheduler_v9 P0 requires leakage_check.enable=true")
+        if not self.v9_same_scene_segment_required:
+            raise ValueError("scheduler_v9 P0 requires leakage_check.same_scene_segment_required=true")
+        if not self.phase_a_repeat_block_iteration:
+            raise ValueError("scheduler_v9 P0 requires phase_A.block.repeat_block_iteration=true")
+        if self.phase_a_source_frame_policy != "fixed_for_scheduler_step":
+            raise ValueError("scheduler_v9 P0 requires phase_A.block.source_frame_policy=fixed_for_scheduler_step")
+        if self.phase_a_block_loss_policy != "source_frame_all_cams":
+            raise ValueError(
+                "scheduler_v9 P0 only supports phase_A.block.block_loss_policy=source_frame_all_cams"
+            )
+        if self.phase_a_nearby_apply_every_step:
+            raise ValueError("scheduler_v9 Phase A P0 requires nearby_supervision.apply_every_step=false")
+        if not self.phase_a_nearby_final_step_only:
+            raise ValueError("scheduler_v9 Phase A P0 requires nearby_supervision.apply_final_step_only=true")
+        if self.phase_a_nearby_add_to_evidence_refs:
+            raise ValueError("scheduler_v9 Phase A P0 requires nearby_supervision.add_to_evidence_refs=false")
+        if self.phase_a_nearby_add_to_source_image_refs:
+            raise ValueError("scheduler_v9 Phase A P0 requires nearby_supervision.add_to_source_image_refs=false")
+        if self.phase_a_nearby_add_to_history_record_views:
+            raise ValueError(
+                "scheduler_v9 Phase A P0 requires nearby_supervision.add_to_history_record_views=false"
+            )
         if self.phase_a_nearby_enable:
             if not self.phase_a_nearby_same_keyframe_only:
                 raise ValueError("scheduler_v9.phase_A.nearby_supervision.same_keyframe_only must be true")
@@ -226,6 +282,10 @@ class TrainSchedulerV9(TrainSchedulerV8):
             raise ValueError("scheduler_v9 P0 supports prefix_render.policy=current_plus_random_previous only")
         if self.phase_b_query_cameras_per_frame != "all_cams":
             raise ValueError("scheduler_v9 P0 supports query_observation.cameras_per_frame=all_cams only")
+        if self.phase_b_vsm_scope != "bg_static":
+            raise ValueError("scheduler_v9 P0 requires phase_B.masks.vsm_scope=bg_static")
+        if not self.phase_b_reset_vsm_on_episode_end:
+            raise ValueError("scheduler_v9 Phase B requires phase_B.episode.reset_vsm_on_episode_end=true")
 
         # V9 owns role split semantics. Disable V8 target-role extensions and pass a
         # minimal V8 target window only to reuse its episode traversal/state machine.
@@ -618,16 +678,30 @@ class TrainSchedulerV9(TrainSchedulerV8):
         render_refs, render_roles = self._dedupe_refs_roles_keep_order(render_refs_raw, render_roles_raw)
         query_refs = self._dedupe_image_refs_keep_order([tuple(x) for x in plan.query_label_refs])
         aux_refs = self._dedupe_image_refs_keep_order([tuple(x) for x in plan.aux_loss_refs])
+        non_evidence_refs = self._dedupe_image_refs_keep_order(render_refs + query_refs + aux_refs)
         nearby_frames = sorted({int(ref[0]) for ref in nearby_refs_raw})
         query_frames = sorted({int(ref[0]) for ref in query_refs})
         leakage_check = {
             "nearby_evidence_overlap": int(len(set(nearby_refs_raw) & set(evidence_refs))),
             "query_evidence_overlap": int(len(set(query_refs) & set(evidence_refs))),
             "aux_evidence_overlap": int(len(set(aux_refs) & set(evidence_refs))),
+            "same_scene_segment_required": bool(self.v9_same_scene_segment_required),
             "num_evidence_refs": int(len(evidence_refs)),
             "num_render_loss_refs": int(len(render_refs)),
             "num_query_label_refs": int(len(query_refs)),
             "target_role_count_match": bool(len(render_refs) == len(render_roles)),
+        }
+        mask_policy = {
+            "phase_a_block_loss_mask": str(self.phase_a_block_loss_mask),
+            "phase_a_nearby_loss_mask": str(self.phase_a_nearby_loss_mask),
+            "phase_b_vsm_scope": str(self.phase_b_vsm_scope),
+            "phase_b_evidence_mask": str(self.phase_b_evidence_mask),
+            "phase_b_prefix_loss_mask": str(self.phase_b_prefix_loss_mask),
+            "phase_b_query_label_mask": str(self.phase_b_query_label_mask),
+        }
+        vsm_reset_policy = {
+            "reset_vsm_on_episode_end": bool(self.phase_b_reset_vsm_on_episode_end),
+            "episode_id": int(plan.episode_id),
         }
         return {
             "scheduler_version": "v9",
@@ -646,7 +720,10 @@ class TrainSchedulerV9(TrainSchedulerV8):
             "aux_loss_refs": [tuple(x) for x in aux_refs],
             "flat_evidence_refs": [tuple(x) for x in evidence_refs],
             "flat_render_loss_refs": [tuple(x) for x in render_refs],
-            "flat_loss_refs": self._dedupe_image_refs_keep_order(render_refs + query_refs + aux_refs),
+            "flat_non_evidence_refs": [tuple(x) for x in non_evidence_refs],
+            # Compatibility only. Trainers should use flat_render_loss_refs/query_label_refs
+            # or the by-step role refs instead of treating this as render supervision.
+            "flat_loss_refs": [tuple(x) for x in non_evidence_refs],
             "source_image_refs": [tuple(x) for x in evidence_refs],
             "source_image_ref": tuple(evidence_refs[0]) if evidence_refs else None,
             "target_image_refs": [tuple(x) for x in render_refs],
@@ -662,6 +739,8 @@ class TrainSchedulerV9(TrainSchedulerV8):
                 "query_label": "label_only",
                 "aux_loss": "loss_only",
             },
+            "mask_policy": mask_policy,
+            "vsm_reset_policy": vsm_reset_policy,
             "role_groups": [
                 {
                     "role": "evidence",
@@ -670,6 +749,7 @@ class TrainSchedulerV9(TrainSchedulerV8):
                     "allow_update_evidence": True,
                     "allow_render_loss": False,
                     "allow_query_label": False,
+                    "mask_policy": str(self.phase_b_evidence_mask),
                 },
                 {
                     "role": "render_loss",
@@ -678,6 +758,7 @@ class TrainSchedulerV9(TrainSchedulerV8):
                     "allow_update_evidence": False,
                     "allow_render_loss": True,
                     "allow_query_label": False,
+                    "mask_policy": mask_policy,
                 },
                 {
                     "role": "query_label",
@@ -686,6 +767,7 @@ class TrainSchedulerV9(TrainSchedulerV8):
                     "allow_update_evidence": False,
                     "allow_render_loss": False,
                     "allow_query_label": True,
+                    "mask_policy": str(self.phase_b_query_label_mask),
                 },
             ],
             "leakage_check": leakage_check,
@@ -757,36 +839,84 @@ class TrainSchedulerV9(TrainSchedulerV8):
                 self.dataset.validate_image_ref(int(plan.scene_id), int(plan.segment_id), tuple(ref), purpose="train")
 
     def _batch_from_v9_plan(self, plan: ViewSetRolloutBatchV9) -> Dict[str, Any]:
-        if hasattr(self.dataset, "_assemble_segment_batch_from_v9_request"):
-            return self.dataset._assemble_segment_batch_from_v9_request(
-                scene_id=int(plan.scene_id),
-                segment_id=int(plan.segment_id),
-                v9_plan=plan,
-                include_test=bool(self.include_test),
-            )
-        meta = self._build_request_meta_v9(plan)
-        source_refs = [tuple(x) for x in meta["flat_evidence_refs"]]
-        target_refs = [tuple(x) for x in meta["flat_render_loss_refs"]]
-        if not hasattr(self.dataset, "_assemble_segment_batch_from_image_refs"):
-            raise ValueError("dataset must implement _assemble_segment_batch_from_v9_request for TrainSchedulerV9")
-        return self.dataset._assemble_segment_batch_from_image_refs(
-            int(plan.scene_id),
-            int(plan.segment_id),
-            source_refs,
-            target_refs,
-            aux_image_refs=[],
+        if not hasattr(self.dataset, "_assemble_segment_batch_from_v9_request"):
+            raise ValueError("TrainSchedulerV9 requires dataset._assemble_segment_batch_from_v9_request")
+        return self.dataset._assemble_segment_batch_from_v9_request(
+            scene_id=int(plan.scene_id),
+            segment_id=int(plan.segment_id),
+            v9_plan=plan,
             include_test=bool(self.include_test),
-            test_image_refs=None,
-            enforce_target0_equals_source=False,
-            target_ref_purpose="train",
         )
 
-    def _plan_from_state(self, st: Dict[str, Any]) -> ViewSetRolloutBatchV9:
+    def _preload_refs_from_v9_plan(self, plan: ViewSetRolloutBatchV9) -> List[ImageRef]:
+        return self._dedupe_image_refs_keep_order(
+            self._flatten(plan.evidence_refs_by_step)
+            + self._flatten(plan.block_loss_refs_by_step)
+            + self._flatten(plan.nearby_loss_refs_by_step)
+            + self._flatten(plan.prefix_loss_refs_by_step)
+            + [tuple(x) for x in plan.query_label_refs]
+            + [tuple(x) for x in plan.aux_loss_refs]
+        )
+
+    def _emit_v9_role_preload_hint(self, plan: ViewSetRolloutBatchV9) -> None:
+        if not self.emit_preload_hints or not self.warm_v9_role_refs:
+            return
+        refs = self._preload_refs_from_v9_plan(plan)
+        if not refs:
+            return
+        self._emit_preload_hint(
+            scene_id=int(plan.scene_id),
+            segment_id=int(plan.segment_id),
+            future_image_refs=refs,
+            hint_scope="v9_role_refs",
+            block_idx_global=int(self.current_episode_state.get("block_idx_global", 0))
+            if self.current_episode_state is not None
+            else 0,
+        )
+
+    @staticmethod
+    def _state_plan_key(st: Dict[str, Any]) -> Tuple[int, int, int, int, int, int]:
+        return (
+            int(st["scene_id"]),
+            int(st["segment_id"]),
+            int(st["episode_idx_global"]),
+            int(st["block_cursor"]),
+            int(st.get("block_repeat_step", 0)),
+            int(st.get("episode_step_cursor", 0)),
+        )
+
+    def _build_plan_from_state(self, st: Dict[str, Any]) -> ViewSetRolloutBatchV9:
         if self.phase == "phase_A_block_local_unroll":
             return self._build_phase_a_block_unroll_plan(st)
         if self.phase == "phase_B_viewset_rollout":
             return self._build_phase_b_rollout_plan(st)
         raise ValueError(f"unsupported scheduler_v9.phase={self.phase!r}")
+
+    def _plan_from_state(self, st: Dict[str, Any]) -> ViewSetRolloutBatchV9:
+        return self._build_plan_from_state(st)
+
+    def _take_plan_for_state(self, st: Dict[str, Any]) -> ViewSetRolloutBatchV9:
+        key = self._state_plan_key(st)
+        if self._v9_prefetched_plan is not None and self._v9_prefetched_plan_key == key:
+            plan = self._v9_prefetched_plan
+            self._v9_prefetched_plan = None
+            self._v9_prefetched_plan_key = None
+            return plan
+        self._v9_prefetched_plan = None
+        self._v9_prefetched_plan_key = None
+        return self._build_plan_from_state(st)
+
+    def _prefetch_v9_plan_for_current_state(self) -> None:
+        st = self.current_episode_state
+        if st is None or not self.emit_preload_hints or not self.warm_v9_role_refs:
+            self._v9_prefetched_plan = None
+            self._v9_prefetched_plan_key = None
+            return
+        plan = self._build_plan_from_state(st)
+        self._validate_v9_plan(plan)
+        self._emit_v9_role_preload_hint(plan)
+        self._v9_prefetched_plan = plan
+        self._v9_prefetched_plan_key = self._state_plan_key(st)
 
     def _aligned_info(self, st: Dict[str, Any]) -> Dict[str, Any]:
         info = dict(super()._aligned_info(st))
@@ -820,7 +950,7 @@ class TrainSchedulerV9(TrainSchedulerV8):
         st = self.current_episode_state
         if st is None:
             raise ValueError("TrainSchedulerV9 internal state is not initialized")
-        plan = self._plan_from_state(st)
+        plan = self._take_plan_for_state(st)
         self._validate_v9_plan(plan)
         batch = self._batch_from_v9_plan(plan)
         request_meta = dict(batch.get("request_meta") or {})
@@ -879,6 +1009,7 @@ class TrainSchedulerV9(TrainSchedulerV8):
                 else:
                     self._finalize_episode_if_needed()
 
+        self._prefetch_v9_plan_for_current_state()
         if hasattr(self.dataset, "maybe_log_preload_stats"):
             self.dataset.maybe_log_preload_stats(int(self.global_step))
         if hasattr(self.dataset, "maybe_log_overlap_stats"):

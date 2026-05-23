@@ -115,6 +115,12 @@ def _build_scheduler(ds: MagicMock, **kwargs) -> TrainSchedulerV9:
                 "cameras_per_frame": "all_cams",
                 "exclude_event_frames": True,
             },
+            "episode": {
+                "reset_vsm_on_episode_end": True,
+            },
+            "masks": {
+                "vsm_scope": "bg_static",
+            },
         },
     )
     return TrainSchedulerV9(
@@ -132,9 +138,10 @@ def _build_scheduler(ds: MagicMock, **kwargs) -> TrainSchedulerV9:
         include_test=False,
         fixed_scene_id=1,
         fixed_segment_id=0,
-        emit_preload_hints=False,
+        emit_preload_hints=bool(kwargs.get("emit_preload_hints", False)),
         warm_next_block_exact=False,
         warm_next_episode_chain=False,
+        warm_v9_role_refs=bool(kwargs.get("warm_v9_role_refs", True)),
         block_order=str(kwargs.get("block_order", "block_major")),
         step_major_switch_interval_steps=1,
         target_policy="visited_episode_frames",
@@ -222,6 +229,125 @@ def test_role_count_match():
     meta = batch["request_meta"]
     assert len(meta["target_image_refs"]) == len(meta["target_image_roles"])
     assert meta["leakage_check"]["target_role_count_match"] is True
+
+
+def test_v9_emits_mask_reset_and_flat_non_evidence_metadata():
+    sidx = _make_sidx_multi_frame_per_keyframe(scene_id=1, segment_id=0)
+    sch = _build_scheduler(_make_mock_dataset(sidx), phase="phase_B_viewset_rollout")
+    batch = sch.next_batch()
+    meta = batch["request_meta"]
+    assert meta["mask_policy"]["phase_b_vsm_scope"] == "bg_static"
+    assert meta["vsm_reset_policy"]["reset_vsm_on_episode_end"] is True
+    assert "flat_non_evidence_refs" in meta
+    assert set(tuple(x) for x in meta["flat_loss_refs"]) == set(tuple(x) for x in meta["flat_non_evidence_refs"])
+
+
+def test_v9_preload_hint_includes_actual_role_refs():
+    sidx = _make_sidx_multi_frame_per_keyframe(scene_id=1, segment_id=0)
+    ds = _make_mock_dataset(sidx)
+    sch = _build_scheduler(ds, block_order="step_major", emit_preload_hints=True)
+    sch.next_batch()
+    assert sch._v9_prefetched_plan is not None
+    expected = set(sch._preload_refs_from_v9_plan(sch._v9_prefetched_plan))
+    role_hint_calls = [
+        call
+        for call in ds.submit_preload_hint.call_args_list
+        if call.kwargs["hint_scope"] == "v9_role_refs"
+    ]
+    assert role_hint_calls
+    hinted = {
+        tuple(x)
+        for call in role_hint_calls
+        for x in call.kwargs["hint"]["future_image_refs"]
+    }
+    assert expected <= hinted
+
+
+def test_v9_preload_hint_can_disable_role_refs():
+    sidx = _make_sidx_multi_frame_per_keyframe(scene_id=1, segment_id=0)
+    ds = _make_mock_dataset(sidx)
+    sch = _build_scheduler(
+        ds,
+        block_order="step_major",
+        emit_preload_hints=True,
+        warm_v9_role_refs=False,
+    )
+    sch.next_batch()
+    assert all(
+        call.kwargs["hint_scope"] != "v9_role_refs"
+        for call in ds.submit_preload_hint.call_args_list
+    )
+
+
+@pytest.mark.parametrize(
+    "phase_a_cfg",
+    [
+        {"mode": "other", "block": {"inner_K_choices": [2], "inner_K_probs": [1.0]}},
+        {
+            "block": {
+                "inner_K_choices": [2],
+                "inner_K_probs": [1.0],
+                "block_loss_policy": "unsupported",
+            }
+        },
+        {
+            "block": {"inner_K_choices": [2], "inner_K_probs": [1.0], "repeat_block_iteration": False}
+        },
+        {
+            "block": {
+                "inner_K_choices": [2],
+                "inner_K_probs": [1.0],
+                "source_frame_policy": "moving",
+            }
+        },
+        {
+            "block": {"inner_K_choices": [2], "inner_K_probs": [1.0]},
+            "nearby_supervision": {"apply_every_step": True},
+        },
+        {
+            "block": {"inner_K_choices": [2], "inner_K_probs": [1.0]},
+            "nearby_supervision": {"add_to_evidence_refs": True},
+        },
+    ],
+)
+def test_phase_a_rejects_unsupported_p0_config_values(phase_a_cfg):
+    sidx = _make_sidx_multi_frame_per_keyframe(scene_id=1, segment_id=0)
+    with pytest.raises(ValueError):
+        _build_scheduler(_make_mock_dataset(sidx), phase_a_cfg=phase_a_cfg)
+
+
+def test_phase_b_rejects_non_bg_static_vsm_scope():
+    sidx = _make_sidx_multi_frame_per_keyframe(scene_id=1, segment_id=0)
+    bad_phase_b = {
+        "rollout": {"K_choices": [2], "K_probs": [1.0]},
+        "prefix_render": {"policy": "current_plus_random_previous"},
+        "query_observation": {"cameras_per_frame": "all_cams"},
+        "masks": {"vsm_scope": "all"},
+    }
+    with pytest.raises(ValueError):
+        _build_scheduler(_make_mock_dataset(sidx), phase_b_cfg=bad_phase_b)
+
+
+def test_phase_b_rejects_disabled_episode_vsm_reset():
+    sidx = _make_sidx_multi_frame_per_keyframe(scene_id=1, segment_id=0)
+    bad_phase_b = {
+        "rollout": {"K_choices": [2], "K_probs": [1.0]},
+        "prefix_render": {"policy": "current_plus_random_previous"},
+        "query_observation": {"cameras_per_frame": "all_cams"},
+        "episode": {"reset_vsm_on_episode_end": False},
+        "masks": {"vsm_scope": "bg_static"},
+    }
+    with pytest.raises(ValueError):
+        _build_scheduler(_make_mock_dataset(sidx), phase_b_cfg=bad_phase_b)
+
+
+def test_v9_requires_native_dataset_assembly():
+    sidx = _make_sidx_multi_frame_per_keyframe(scene_id=1, segment_id=0)
+    ds = _make_mock_dataset(sidx)
+    delattr(ds, "_assemble_segment_batch_from_v9_request")
+    sch = _build_scheduler(ds)
+    with pytest.raises(ValueError, match="_assemble_segment_batch_from_v9_request"):
+        sch.next_batch()
 
 
 def test_no_test_refs_in_train():

@@ -225,6 +225,33 @@ def test_v4_batch_from_assets_strict_success(tmp_path):
     assert "dynamic_info" in batch
 
 
+def test_v4_preload_worker_warms_cpu_view_cache_without_materializing(tmp_path, monkeypatch):
+    store = _prepare_demo_assets(tmp_path)
+    data_cfg, dataset_cfg = _build_cfg(tmp_path)
+    ds = MultiSceneDatasetV4(
+        dataset_cfg=dataset_cfg,
+        data_cfg=data_cfg,
+        device=torch.device("cpu"),
+        asset_store=store,
+    )
+    ds.initialize()
+
+    def _fail_materialize(*_args, **_kwargs):
+        raise AssertionError("preload worker should not materialize cached view packs")
+
+    monkeypatch.setattr(
+        "datasets.multi_scene_dataset_v4.loaded_view_pack_to_device_v2",
+        _fail_materialize,
+    )
+    ds._preload_worker_view_pack(1, 0, (0, 0), {})
+    assert len(ds._view_pack_cache) == 1
+    cached = next(iter(ds._view_pack_cache.values()))
+    assert cached.image.device.type == "cpu"
+    assert cached.depth.device.type == "cpu"
+    assert cached.viewdirs is not None
+    assert cached.viewdirs.device.type == "cpu"
+
+
 def test_v4_loads_egocar_mask_from_static_template(tmp_path, monkeypatch):
     store = _prepare_demo_assets(tmp_path)
     data_cfg, dataset_cfg = _build_cfg(tmp_path)

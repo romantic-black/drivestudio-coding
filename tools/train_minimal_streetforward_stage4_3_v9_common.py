@@ -90,6 +90,7 @@ def build_train_scheduler_v9_from_cfg(cfg: Any, dataset: MultiSceneDatasetV4) ->
         emit_preload_hints=bool(_cfg_get(preload, "emit_hints", True)),
         warm_next_block_exact=bool(_cfg_get(preload, "warm_next_block_exact", True)),
         warm_next_episode_chain=bool(_cfg_get(preload, "warm_next_episode_chain", True)),
+        warm_v9_role_refs=bool(_cfg_get(preload, "warm_v9_role_refs", True)),
         block_order=block_order,
         step_major_switch_interval_steps=step_major_switch_interval_steps,
         target_policy=str(_cfg_get(ep, "target_policy", "visited_episode_frames")),

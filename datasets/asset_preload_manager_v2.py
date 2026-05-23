@@ -211,11 +211,15 @@ class AssetPreloadManagerV2:
     def stop(self, *, timeout: float = 5.0) -> None:
         self._stop.set()
         with self._lock:
+            self._heap.clear()
+            self._queued_dedupe.clear()
             self._lock.notify_all()
         if self._thread is not None:
             self._thread.join(timeout=timeout)
             if not self._thread.is_alive():
                 self._thread = None
+            else:
+                logger.warning("asset preload worker did not stop within %.2fs; current task may still be running", timeout)
 
     def pop_stats(self) -> Dict[str, Any]:
         with self._stats_lock:
@@ -257,9 +261,9 @@ class AssetPreloadManagerV2:
                 victim = self._heap.pop(victim_idx)
                 heapq.heapify(self._heap)
                 vk = (
+                    int(victim[4]),
                     int(victim[2]),
                     int(victim[3]),
-                    int(victim[4]),
                     int(victim[5][0]),
                     int(victim[5][1]),
                 )
@@ -358,7 +362,7 @@ class AssetPreloadManagerV2:
                 segment_id,
                 meta={"hint_scope": hint_scope},
             )
-        if hint_scope == "next_block_exact":
+        if hint_scope in ("next_block_exact", "v9_role_refs"):
             if self._cfg.warm_next_block_exact:
                 for ref in refs:
                     self.submit_view_meta(PRIORITY_NEXT_BLOCK_EXACT, scene_id, segment_id, ref, meta={})
