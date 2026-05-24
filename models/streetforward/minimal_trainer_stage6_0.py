@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import copy
+import logging
+import os
+from dataclasses import replace
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -25,6 +28,9 @@ from models.streetforward.stage6_0.phase_a_losses import (
     target_valid_mask,
 )
 from models.streetforward.stage6_0.posterior_updater import BranchDelta, DeltaPack
+
+
+logger = logging.getLogger(__name__)
 
 
 class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
@@ -63,6 +69,20 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             value = getattr(node, key)
             return default if value is None else value
         return default
+
+    @staticmethod
+    def _mem_debug_enabled() -> bool:
+        return str(os.environ.get("STAGE6_MEM_DEBUG", "")).lower() in {"1", "true", "yes", "on"}
+
+    def _mem_debug(self, label: str, **extra: Any) -> None:
+        if not self._mem_debug_enabled() or not torch.cuda.is_available():
+            return
+        torch.cuda.synchronize()
+        alloc = float(torch.cuda.memory_allocated() / (1024.0 ** 3))
+        reserved = float(torch.cuda.memory_reserved() / (1024.0 ** 3))
+        peak = float(torch.cuda.max_memory_allocated() / (1024.0 ** 3))
+        extras = " ".join(f"{k}={v}" for k, v in extra.items())
+        logger.info("STAGE6_MEM %s alloc_gb=%.3f reserved_gb=%.3f peak_gb=%.3f %s", label, alloc, reserved, peak, extras)
 
     def _compat_stage5_4_config(self, config: Any) -> Any:
         cfg = copy.deepcopy(config)
@@ -125,6 +145,12 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                     "warm_next_episode_chain": bool(self._cfg_get(preload, "warm_next_episode_chain", True)),
                 },
             }
+        optimizer_cfg = self._cfg_get(cfg, "optimizer", None)
+        if optimizer_cfg is not None:
+            raw_lr = self._cfg_get(optimizer_cfg, "lr", 1.0e-3)
+            if hasattr(raw_lr, "get") and not isinstance(raw_lr, (str, bytes)):
+                raw_lr = self._cfg_get(raw_lr, "default", self._cfg_get(raw_lr, "measurement_frontend", 1.0e-3))
+            optimizer_cfg["lr"] = float(raw_lr)
         return cfg
 
     def _validate_stage5_3_config(self, config) -> None:
@@ -667,7 +693,14 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         grad_enabled = str(getattr(self, "stage6_source_evidence_grad_mode", "no_grad_v4")) != "no_grad_v4"
         ctx_mgr = torch.enable_grad() if grad_enabled else torch.no_grad()
         with ctx_mgr:
+            self._mem_debug("observe/begin", grad_enabled=int(grad_enabled), source_frame_idx=int(source_frame_idx))
             bg_m, distant_m, rigid_m = self._local_to_node_states_detached(local_state)
+            self._mem_debug(
+                "observe/after_detached_clone",
+                num_bg=int(bg_m.means.shape[0]),
+                num_distant=int(distant_m.means.shape[0]) if distant_m is not None else 0,
+                num_rigid=int(rigid_m.means.shape[0]) if rigid_m is not None else 0,
+            )
             route = None
             if rigid_m is not None:
                 mask_src_rigid = self._rigid_point_valid_mask(rigid_m, int(source_frame_idx))
@@ -693,6 +726,12 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                     int(source_frame_idx),
                     torch.zeros((0,), dtype=torch.long, device=self.device),
                 )
+            self._mem_debug(
+                "observe/after_route",
+                num_rigid_s=int(route.S.numel()),
+                num_rigid_in=int(route.S_in.numel()),
+                num_rigid_out=int(route.S_out.numel()),
+            )
             source_views, source_images, source_sky_masks, source_egocar_masks = self._source_subset(batch, source_indices)
             height, width = spatial_hw_from_image_tensor(source_images[0])
             one_pass = self._compute_2d_features_all_branches_once_routed(
@@ -706,6 +745,12 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 source_egocar_masks=source_egocar_masks,
                 height=height,
                 width=width,
+            )
+            self._mem_debug(
+                "observe/after_v4_measurement",
+                feat_bg=tuple(one_pass["feat_2d_bg"].shape),
+                feat_distant=tuple(one_pass["feat_2d_distant"].shape) if one_pass.get("feat_2d_distant") is not None else None,
+                feat_rigid=tuple(one_pass["feat_2d_rigid_S"].shape) if one_pass.get("feat_2d_rigid_S") is not None else None,
             )
             obs_bg, obs_distant, obs_rigid_s = self._split_obs_code(
                 num_bg=int(one_pass["num_bg"]),
@@ -759,6 +804,13 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             ),
             aux=delta.aux,
         )
+
+    def _constrain_local_state_after_delta(self, local_state: LocalGSState) -> LocalGSState:
+        aabb_min, aabb_max = self._stage6_aabb(local_state.bg.means)
+        bg_means = torch.clamp(local_state.bg.means, min=aabb_min, max=aabb_max)
+        if not torch.isfinite(bg_means).all():
+            raise RuntimeError("Stage6 local bg means contain NaN/Inf after AABB constraint.")
+        return replace(local_state, bg=replace(local_state.bg, means=bg_means))
 
     def _expand_branch_delta(self, delta: BranchDelta, *, indices: torch.Tensor, total: int) -> BranchDelta:
         if int(delta.means.shape[0]) == int(total) and int(indices.numel()) == int(total):
@@ -957,6 +1009,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         route = measurement["route"]
         rigid_node = self._local_rigid_node_state(local_state)
         source_frame_idx = int(measurement.get("source_frame_idx", 0))
+        self._mem_debug("encode/begin", source_frame_idx=source_frame_idx)
         near_in = self._build_stage6_struct_input_near(
             local_state=local_state,
             rigid_node=rigid_node,
@@ -964,6 +1017,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             measurement=measurement,
             source_frame_idx=source_frame_idx,
         )
+        self._mem_debug("encode/after_near_input", near_n=int(near_in.coords.shape[0]))
         far_in = self._build_stage6_struct_input_far(
             local_state=local_state,
             rigid_node=rigid_node,
@@ -971,6 +1025,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             measurement=measurement,
             source_frame_idx=source_frame_idx,
         )
+        self._mem_debug("encode/after_far_input", far_n=int(far_in.coords.shape[0]))
         aabb_min, aabb_max = self._stage6_aabb(measurement["feat_2d_bg"])
         event = self.stage6_struct_event_decoder(
             near_in=near_in,
@@ -981,7 +1036,9 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             near_batch_offsets=self._build_struct_batch_offsets(stage6_to_struct_decoder_input(near_in), device=self.device),
             far_batch_offsets=self._build_struct_batch_offsets(stage6_to_struct_decoder_input(far_in), device=self.device),
         )
+        self._mem_debug("encode/after_struct_event")
         delta, aux = self.stage6_posterior_updater(event=event, ctx_current=None, ctx_vsm=None)
+        self._mem_debug("encode/after_posterior")
         if delta.rigid is not None and local_state.rigid is not None:
             delta = DeltaPack(
                 bg=delta.bg,
@@ -994,7 +1051,9 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 aux=delta.aux,
             )
         delta = self._apply_branch_scope(delta)
-        return local_state.apply_delta(delta), delta, {**event.aux, **aux}
+        next_state = local_state.apply_delta(delta)
+        next_state = self._constrain_local_state_after_delta(next_state)
+        return next_state, delta, {**event.aux, **aux}
 
     @staticmethod
     def _branch_render_params(branch: Any) -> Dict[str, torch.Tensor]:
@@ -1112,24 +1171,33 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
 
     def forward(self, batch: Dict[str, Any]) -> Dict[str, Any]:
         roles = resolve_v9_phase_a_batch(batch)
+        self._mem_debug("forward/begin", inner_K=int(roles.inner_K))
         if len(batch.get("source_views", [])) == 0:
             raise ValueError("Stage6_0 Phase A requires non-empty source_views.")
         if len(batch.get("targets", [])) == 0:
             raise ValueError("Stage6_0 Phase A requires non-empty targets.")
 
         node_state_bg, node_state_rigid, node_state_distant = self._get_or_init_node_states_bg_rigid_distant(batch)
+        self._mem_debug(
+            "forward/after_node_state",
+            num_bg=int(node_state_bg.means.shape[0]),
+            num_distant=int(node_state_distant.means.shape[0]) if node_state_distant is not None else 0,
+            num_rigid=int(node_state_rigid.means.shape[0]) if node_state_rigid is not None else 0,
+        )
         local_state = LocalGSState.from_node_states(
             bg=node_state_bg,
             distant=node_state_distant,
             rigid=node_state_rigid,
             hidden_dim=self.stage6_hidden_dim,
         )
+        self._mem_debug("forward/after_local_state_clone")
         total_loss = local_state.bg.means.new_tensor(0.0)
         per_step: List[Dict[str, float]] = []
         pred_rgbs: List[torch.Tensor] = []
         gt_images: List[torch.Tensor] = []
         step = int(batch.get("global_step", 0) or 0)
         for k in range(roles.inner_K):
+            self._mem_debug("forward/k_begin", k=int(k))
             evidence_refs = roles.evidence_refs_by_step[int(k)]
             source_frame_idx = int(evidence_refs[0][0])
             measurement = self._observe_v4_measurement(
@@ -1139,6 +1207,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 source_frame_idx=source_frame_idx,
             )
             local_state, delta, update_aux = self._encode_and_update(local_state=local_state, measurement=measurement)
+            self._mem_debug("forward/after_encode_update", k=int(k))
             block_loss, block_stats = self._render_loss_for_indices(
                 local_state=local_state,
                 batch=batch,
@@ -1147,6 +1216,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 pred_rgbs_out=pred_rgbs if int(k) == roles.inner_K - 1 else None,
                 gt_images_out=gt_images if int(k) == roles.inner_K - 1 else None,
             )
+            self._mem_debug("forward/after_block_loss", k=int(k))
             nearby_loss, nearby_stats = self._render_loss_for_indices(
                 local_state=local_state,
                 batch=batch,
@@ -1155,6 +1225,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 pred_rgbs_out=pred_rgbs if int(k) == roles.inner_K - 1 else None,
                 gt_images_out=gt_images if int(k) == roles.inner_K - 1 else None,
             )
+            self._mem_debug("forward/after_nearby_loss", k=int(k))
             reg_loss, reg_stats = delta_regularization(
                 delta,
                 weight=self.stage6_delta_l2_weight,
@@ -1171,6 +1242,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             if not torch.isfinite(loss_k).all():
                 raise RuntimeError("Stage6_0 Phase A loss became NaN/Inf.")
             total_loss = total_loss + loss_k
+            self._mem_debug("forward/k_end", k=int(k))
             per_step.append(
                 {
                     "k": float(k),
@@ -1202,6 +1274,33 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "pred_rgbs": pred_rgbs,
             "gt_images": gt_images,
         }
+
+    @torch.no_grad()
+    def validate_v9_phase_a(
+        self,
+        batch: Dict[str, Any],
+        *,
+        k_values: List[int],
+        max_K: int,
+        mask_cfg: Optional[Dict[str, Any]] = None,
+        save_images: bool = False,
+        save_dir: Optional[str] = None,
+        save_image_k_values: Optional[List[int]] = None,
+        max_saved_cams: int = 1,
+    ) -> Dict[str, Any]:
+        from models.streetforward.validation_v9_runner import validate_v9_phase_a
+
+        return validate_v9_phase_a(
+            self,
+            batch,
+            k_values=[int(x) for x in k_values],
+            max_K=int(max_K),
+            mask_cfg=mask_cfg,
+            save_images=bool(save_images),
+            save_dir=save_dir,
+            save_image_k_values=save_image_k_values,
+            max_saved_cams=int(max_saved_cams),
+        )
 
     def train_step(
         self,

@@ -7,14 +7,7 @@ data:
   end_timestep: -1
   preload_device: cpu
   sky_mask_semantics: one_is_sky
-  train_scene_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9,14, 16, 24, 32, 40, 99, 107, 115, 123, 131, 139, 147, 155, 163, 171, 179, 195, 214,
-    17, 25, 33, 41, 49, 100, 108, 116, 124, 132, 140, 148, 156, 164, 172, 180, 188, 196, 215,
-    10, 18, 26, 34, 42, 93, 101, 109, 117, 125, 133, 141, 149, 157, 165, 173, 181, 189, 197, 216,
-    11, 19, 27, 35, 43, 94, 102, 110, 118, 126, 134, 142, 150, 158, 166, 174, 182, 190, 198, 217,
-    12, 20, 36, 44, 95, 103, 111, 119, 127, 135, 143, 151, 159, 167, 175, 183, 191, 199, 218,
-    13, 21, 29, 37, 45, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200,
-    22, 30, 38, 46, 97, 105, 113, 121, 129, 137, 145, 153, 161, 169, 177, 185, 193, 201,
-    15, 23, 31, 39, 47, 98, 106, 114, 122, 130, 138, 146, 154, 162, 170, 178, 186, 194]
+  train_scene_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
   eval_scene_ids: []
   preload:
     enable: true
@@ -125,8 +118,8 @@ scheduler_v9:
     mode: block_local_unroll
     block:
       repeat_block_iteration: true
-      inner_K_choices: [2, 4, 6, 8]
-      inner_K_probs: [0.25, 0.25, 0.25, 0.25]
+      inner_K_choices: [2, 4, 6]
+      inner_K_probs: [0.25, 0.25, 0.25]
       source_frame_policy: fixed_for_scheduler_step
       block_loss_policy: source_frame_all_cams
     nearby_supervision:
@@ -216,6 +209,62 @@ validation_v8:
     require_sky_mask: true
   near_random_supervision:
     enable: false
+
+validation_v9:
+  enable: false
+  phase: phase_A_block_local_unroll
+  fail_fast: true
+  trigger:
+    by: train_episode_interval
+    validate_every_n_episodes: 100
+    run_at_train_start: false
+  selection:
+    seed: 20260524
+    eval_scene_ids_from_data: true
+    segments_per_scene: 1
+    segment_policy: random_seeded
+    resample_segments_every_validation: false
+    episode_policy: random_seeded
+    resample_episode_every_validation: false
+    blocks_per_segment: 2
+    block_policy: random_without_replacement
+    resample_blocks_every_validation: false
+    source_frame_policy: middle_in_keyframe
+  phase_A:
+    k_values: [0, 4, 8, 16]
+    max_K: 16
+    nearby:
+      enable: true
+      frames_per_block: 1
+      policy: adjacent_then_random_same_keyframe
+      same_keyframe_only: true
+      camera_policy: all_cams
+    metrics:
+      render_at_k_values_only: true
+      compute_block_metrics: true
+      compute_nearby_metrics: true
+      compute_delta_stats: true
+      compute_runtime_stats: true
+      compute_memory_stats: true
+      compute_struct_stats: false
+    render:
+      save_images: false
+      save_image_k_values: [0, 8, 16]
+      max_saved_blocks: 2
+      max_saved_cams: 1
+      save_dir: validation_v9/phase_a
+  masks:
+    block_loss_mask: non_sky_non_egocar
+    nearby_loss_mask: non_sky_non_egocar
+    min_valid_pixels: 32
+    require_sky_mask: true
+    require_egocar_mask: true
+  phase_B:
+    reserved: true
+    prefix_render:
+      enable: false
+    query_observation:
+      enable: false
 
 model:
   stage: "6_0"
@@ -680,7 +729,7 @@ optimizer:
       weight_decay: 1.0e-4
 
 lr_scheduler:
-  enable: false
+  enable: true
   type: cosine
   interval: step
   total_steps: ${training.max_iterations}

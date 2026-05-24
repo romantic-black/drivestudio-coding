@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import logging
+import os
 from typing import Any, Dict, Optional
 
 import torch
@@ -15,6 +17,34 @@ from models.streetforward.struct_decoders.common import (
 )
 from models.streetforward.struct_decoders.xcpe_decoder import _SPCONV_AVAILABLE, _XCPEResidualLayer
 from models.streetforward.stage6_0.event_encoder import EventPack
+
+
+logger = logging.getLogger(__name__)
+
+
+def _all_finite_chunked(x: torch.Tensor, *, max_elements: int = 1_000_000) -> bool:
+    if int(x.numel()) == 0:
+        return True
+    flat = x.reshape(-1)
+    for chunk in flat.split(int(max_elements)):
+        if not bool(torch.isfinite(chunk).all().item()):
+            return False
+    return True
+
+
+def _mem_debug_enabled() -> bool:
+    return str(os.environ.get("STAGE6_MEM_DEBUG", "")).lower() in {"1", "true", "yes", "on"}
+
+
+def _mem_debug(label: str, **extra: Any) -> None:
+    if not _mem_debug_enabled() or not torch.cuda.is_available():
+        return
+    torch.cuda.synchronize()
+    alloc = float(torch.cuda.memory_allocated() / (1024.0 ** 3))
+    reserved = float(torch.cuda.memory_reserved() / (1024.0 ** 3))
+    peak = float(torch.cuda.max_memory_allocated() / (1024.0 ** 3))
+    extras = " ".join(f"{k}={v}" for k, v in extra.items())
+    logger.info("STAGE6_MEM %s alloc_gb=%.3f reserved_gb=%.3f peak_gb=%.3f %s", label, alloc, reserved, peak, extras)
 
 
 @dataclass
@@ -367,6 +397,7 @@ class Stage6NearXcpeEventDecoder(nn.Module):
         batch_offsets: Optional[torch.Tensor] = None,
     ) -> Stage6StructEventOutput:
         n = int(x.coords.shape[0])
+        _mem_debug("near/begin", n=n)
         if int(x.split_0 + x.split_1) != n:
             raise ValueError("Stage6 near split mismatch with total points")
         if n == 0:
@@ -385,6 +416,7 @@ class Stage6NearXcpeEventDecoder(nn.Module):
         feat_2d = x.feat_2d
         if self.zero_invalid_2d_feat:
             feat_2d = feat_2d * valid.to(dtype=feat_2d.dtype).unsqueeze(-1)
+        _mem_debug("near/after_valid_feat", n=n, valid=float(valid.float().mean().item()) if n > 0 else 0.0)
         param_obs = self.param_obs_codec(
             params_for_embed=x.params_for_embed,
             obs_code=x.obs_code,
@@ -394,6 +426,7 @@ class Stage6NearXcpeEventDecoder(nn.Module):
             aabb_min=aabb_min,
             aabb_max=aabb_max,
         )
+        _mem_debug("near/after_param_obs", n=n)
         point_feat = self.token_builder(
             feat_2d=feat_2d,
             param_obs=param_obs,
@@ -401,10 +434,13 @@ class Stage6NearXcpeEventDecoder(nn.Module):
             branch_id=x.branch_id,
             valid_mask=valid,
         )
+        _mem_debug("near/after_token", n=n)
         layout = self._build_voxel_layout(x.coords, aabb_min=aabb_min, aabb_max=aabb_max, batch_offsets=batch_offsets)
+        _mem_debug("near/after_layout", n=n, voxels=int(layout.unique_key.shape[0]))
         batch_size = int(batch_offsets.numel() if batch_offsets is not None else 1)
-        for layer in self.layers:
+        for layer_idx, layer in enumerate(self.layers):
             voxel_feat = scatter_mean(point_feat, layout.inverse, dim_size=int(layout.unique_key.shape[0]))
+            _mem_debug("near/after_scatter", layer=layer_idx, voxels=int(layout.unique_key.shape[0]))
             voxel_delta = layer(
                 voxel_feat=voxel_feat,
                 unique_key_bxyz=layout.unique_key,
@@ -413,9 +449,14 @@ class Stage6NearXcpeEventDecoder(nn.Module):
                 batch_size=batch_size,
                 debug_check_output_order=bool(x.meta.get("debug_check_spconv_order", False)),
             )
-            point_feat = point_feat + layer.residual_scale.to(dtype=point_feat.dtype) * voxel_delta[layout.inverse]
+            _mem_debug("near/after_layer", layer=layer_idx)
+            point_delta = voxel_delta[layout.inverse]
+            point_feat = point_feat + layer.residual_scale.to(dtype=point_feat.dtype) * point_delta
+            del voxel_feat, voxel_delta, point_delta
+            _mem_debug("near/after_point_update", layer=layer_idx)
         event = self.event_norm(point_feat)
-        if not torch.isfinite(event).all():
+        _mem_debug("near/after_event_norm", n=n)
+        if not _all_finite_chunked(event):
             raise RuntimeError("Stage6 near xCPE event contains NaN/Inf")
         return Stage6StructEventOutput(
             event=event,
@@ -480,6 +521,7 @@ class Stage6FarMLPEventDecoder(nn.Module):
     ) -> Stage6StructEventOutput:
         _ = batch_offsets
         n = int(x.coords.shape[0])
+        _mem_debug("far/begin", n=n)
         if int(x.split_0 + x.split_1) != n:
             raise ValueError("Stage6 far split mismatch with total points")
         if n == 0:
@@ -502,6 +544,7 @@ class Stage6FarMLPEventDecoder(nn.Module):
         feat_2d = x.feat_2d
         if self.zero_invalid_2d_feat:
             feat_2d = feat_2d * valid.to(dtype=feat_2d.dtype).unsqueeze(-1)
+        _mem_debug("far/after_valid_feat", n=n, valid=float(valid.float().mean().item()) if n > 0 else 0.0)
         param_obs = self.param_obs_codec(
             params_for_embed=x.params_for_embed,
             obs_code=x.obs_code,
@@ -511,6 +554,7 @@ class Stage6FarMLPEventDecoder(nn.Module):
             aabb_min=aabb_min,
             aabb_max=aabb_max,
         )
+        _mem_debug("far/after_param_obs", n=n)
         token = self.token_builder(
             feat_2d=feat_2d,
             param_obs=param_obs,
@@ -518,8 +562,10 @@ class Stage6FarMLPEventDecoder(nn.Module):
             branch_id=x.branch_id,
             valid_mask=valid,
         )
+        _mem_debug("far/after_token", n=n)
         event = self.net(token)
-        if not torch.isfinite(event).all():
+        _mem_debug("far/after_event", n=n)
+        if not _all_finite_chunked(event):
             raise RuntimeError("Stage6 far MLP event contains NaN/Inf")
         return Stage6StructEventOutput(
             event=event,

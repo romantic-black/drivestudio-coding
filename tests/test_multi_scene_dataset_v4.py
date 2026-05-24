@@ -315,6 +315,35 @@ def test_v4_loads_egocar_mask_from_static_template(tmp_path, monkeypatch):
     assert torch.allclose(batch["target"]["egocar_mask"][1], expected)
 
 
+def test_v4_materializes_zero_egocar_mask_when_template_missing(tmp_path, monkeypatch):
+    store = _prepare_demo_assets(tmp_path)
+    data_cfg, dataset_cfg = _build_cfg(tmp_path)
+    data_cfg["pixel_source"]["load_egocar_mask"] = True
+
+    monkeypatch.chdir(tmp_path)
+    ds = MultiSceneDatasetV4(
+        dataset_cfg=dataset_cfg,
+        data_cfg=data_cfg,
+        device=torch.device("cpu"),
+        asset_store=store,
+    )
+    ds.initialize()
+    req = BatchRequestV4(
+        scene_id=1,
+        segment_id=0,
+        source_image_ref=(0, 0),
+        target_image_refs=[(0, 0), (1, 0)],
+        include_test=False,
+    )
+    batch = ds.get_segment_batch_from_image_refs(req, enforce_target0_equals_source=True)
+    assert "egocar_mask" in batch["source"]
+    assert "egocar_mask" in batch["target"]
+    assert batch["source"]["egocar_mask"].shape == (1, 4, 5)
+    assert batch["target"]["egocar_mask"].shape == (2, 4, 5)
+    assert torch.count_nonzero(batch["source"]["egocar_mask"]).item() == 0
+    assert torch.count_nonzero(batch["target"]["egocar_mask"]).item() == 0
+
+
 def test_v4_reconcile_drops_invisible_dynamic_instances(tmp_path):
     store = _prepare_demo_assets(tmp_path, tracks_all_invisible=True)
     data_cfg, dataset_cfg = _build_cfg(tmp_path)

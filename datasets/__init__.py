@@ -17,6 +17,8 @@ _LAZY_EXPORTS: Dict[str, Tuple[str, str]] = {
     "TrainSchedulerV8": ("datasets.train_scheduler_v8", "TrainSchedulerV8"),
     "TrainSchedulerV9": ("datasets.train_scheduler_v9", "TrainSchedulerV9"),
     "BatchRequestV9": ("datasets.train_scheduler_v9", "BatchRequestV9"),
+    "ValidationBlockSpecV9": ("datasets.validation_scheduler_v9", "ValidationBlockSpecV9"),
+    "ValidationPlanV9": ("datasets.validation_scheduler_v9", "ValidationPlanV9"),
     "MultiSceneDatasetV4": ("datasets.multi_scene_dataset_v4", "MultiSceneDatasetV4"),
 }
 

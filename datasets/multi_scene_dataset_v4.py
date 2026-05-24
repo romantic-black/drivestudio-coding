@@ -260,6 +260,7 @@ class MultiSceneDatasetV4:
 
         self._scene_asset_cache: "OrderedDict[Tuple[str, int], Any]" = OrderedDict()
         self._segment_static_cache: "OrderedDict[Tuple[str, int, int], SegmentStaticBundle]" = OrderedDict()
+        self._segment_index_cache: Dict[Tuple[str, int, int], SegmentIndexV4] = {}
         self._image_meta_cache: "OrderedDict[Tuple[str, int, int, int], Dict[str, Any]]" = OrderedDict()
         self._view_pack_cache: "OrderedDict[Tuple[str, int, int, int, int], LoadedViewPackV2]" = OrderedDict()
         self._pair_score_cache: Dict[Tuple[str, ImageRef, ImageRef, str], float] = {}
@@ -1010,6 +1011,7 @@ class MultiSceneDatasetV4:
                         "segment_index scene/segment_id mismatch vs registry: "
                         f"expected=({scene_id},{segment_id}) got=({seg_idx['scene_id']},{seg_idx['segment_id']})"
                     )
+                self._cache_segment_index_from_payload(ds_name, int(scene_id), int(segment_id), seg_idx)
                 self._assert_knn_runtime_caps_match(
                     segment_manifest=segment_manifest,
                     scene_id=int(scene_id),
@@ -1158,6 +1160,7 @@ class MultiSceneDatasetV4:
                     context="_resolve_segment_bundle/pre_runtime_cap_check",
                 )
             sidx = self._build_segment_index_from_asset_payload(segment_payload)
+            self._cache_segment_index(ds_name, int(scene_id), int(segment_id), sidx)
 
             asset_aabb = segment_manifest.get("segment_aabb")
             if asset_aabb is None:
@@ -1426,8 +1429,82 @@ class MultiSceneDatasetV4:
             test_image_refs=test_refs,
         )
 
+    def _cache_segment_index(
+        self,
+        ds_name: str,
+        scene_id: int,
+        segment_id: int,
+        sidx: SegmentIndexV4,
+    ) -> SegmentIndexV4:
+        key = (str(ds_name), int(scene_id), int(segment_id))
+        with self._lock:
+            self._segment_index_cache[key] = sidx
+        return sidx
+
+    def _cache_segment_index_from_payload(
+        self,
+        ds_name: str,
+        scene_id: int,
+        segment_id: int,
+        payload: Dict[str, Any],
+    ) -> SegmentIndexV4:
+        return self._cache_segment_index(
+            str(ds_name),
+            int(scene_id),
+            int(segment_id),
+            self._build_segment_index_from_asset_payload(payload),
+        )
+
+    def _load_segment_index_light(self, scene_id: int, segment_id: int) -> SegmentIndexV4:
+        ds_name = self._asset_dataset_name()
+        key = (ds_name, int(scene_id), int(segment_id))
+        with self._lock:
+            bundle = self._cache_get(self._segment_static_cache, key)
+            if bundle is not None:
+                self._segment_index_cache[key] = bundle.segment_index
+                return bundle.segment_index
+            cached = self._segment_index_cache.get(key)
+        if cached is not None:
+            return cached
+
+        resolved = self.asset_store.resolve_segment_scene_assets_registry_first(
+            ds_name, int(scene_id), int(segment_id)
+        )
+        segment_manifest = resolved["segment_manifest"]
+        self._validate_segment_coordinate_metadata(
+            segment_manifest,
+            scene_id=int(scene_id),
+            segment_id=int(segment_id),
+            context="get_segment_index",
+        )
+        asset_aabb = segment_manifest.get("segment_aabb")
+        if asset_aabb is None:
+            raise ValueError(
+                f"segment manifest missing segment_aabb (dataset={ds_name} scene={scene_id} seg={segment_id})"
+            )
+        segment_aabb = torch.as_tensor(asset_aabb, dtype=torch.float32)
+        if segment_aabb.shape != (2, 3):
+            raise ValueError(
+                f"segment manifest segment_aabb must have shape [2,3] "
+                f"(dataset={ds_name} scene={scene_id} seg={segment_id}), got {tuple(segment_aabb.shape)}"
+            )
+        if not torch.allclose(segment_aabb, self.segment_aabb, atol=1e-6, rtol=1e-6):
+            raise ValueError(
+                "segment_aabb mismatch between dataset config and segment manifest: "
+                f"config={self.segment_aabb.tolist()} asset={segment_aabb.tolist()} "
+                f"(dataset={ds_name} scene={scene_id} seg={segment_id})"
+            )
+        segment_payload = resolved["segment_handle"].load_segment_index()
+        if int(segment_payload["scene_id"]) != int(scene_id) or int(segment_payload["segment_id"]) != int(segment_id):
+            raise ValueError(
+                "segment_index scene/segment_id mismatch vs registry: "
+                f"expected=({scene_id},{segment_id}) "
+                f"got=({segment_payload['scene_id']},{segment_payload['segment_id']})"
+            )
+        return self._cache_segment_index_from_payload(ds_name, int(scene_id), int(segment_id), segment_payload)
+
     def get_segment_index(self, scene_id: int, segment_id: int) -> SegmentIndexV4:
-        return self._resolve_segment_bundle(scene_id, segment_id).segment_index
+        return self._load_segment_index_light(scene_id, segment_id)
 
     def validate_image_ref(
         self,
@@ -1801,8 +1878,9 @@ class MultiSceneDatasetV4:
         *,
         as_viewdirs: bool,
         device: torch.device,
+        force_zeros_if_all_missing: bool = False,
     ) -> Optional[Tensor]:
-        if not any(x is not None for x in items):
+        if not any(x is not None for x in items) and not force_zeros_if_all_missing:
             return None
         out: List[Tensor] = []
         for val, image in zip(items, fallback_images):
@@ -1927,7 +2005,11 @@ class MultiSceneDatasetV4:
             if dyn is not None:
                 out["dynamic_mask"] = dyn
             ego = self._stack_optional_masks(
-                egocar_masks, images, as_viewdirs=False, device=self.device
+                egocar_masks,
+                images,
+                as_viewdirs=False,
+                device=self.device,
+                force_zeros_if_all_missing=bool(self._load_egocar_mask),
             )
             if ego is not None:
                 out["egocar_mask"] = ego

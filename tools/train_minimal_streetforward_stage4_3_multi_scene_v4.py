@@ -85,6 +85,7 @@ TRAINER_CLASS = MinimalStreetForwardStage4_3
 DEFAULT_CONFIG_FILE = "configs/minimal_streetforward_stage4_3_multi_scene_v4.yaml"
 ALLOW_ONE_SEGMENT = False
 EPISODE_END_HOOK = None
+TRAIN_START_HOOK = None
 
 
 def _scene_dir_str(scene_id: Any) -> str:
@@ -1618,6 +1619,7 @@ def main() -> None:
         str(history_cfg.get("record_on", "")) == "block_exit"
     )
     episode_end_hook = globals().get("EPISODE_END_HOOK")
+    train_start_hook = globals().get("TRAIN_START_HOOK")
 
     try:
         metrics_fh = _open_metrics_history(
@@ -1636,6 +1638,20 @@ def main() -> None:
                 model=model,
                 specs=validation_specs,
                 validation_cfg=validation_v7_cfg,
+                device=device,
+                trigger_train_episode_counter=0,
+                trigger_step=-1,
+                psnr_metric=psnr_metric,
+                ssim_metric=ssim_metric,
+                lpips_metric=lpips_metric,
+                metrics_fh=metrics_fh,
+                writer=writer,
+            )
+        if callable(train_start_hook):
+            train_start_hook(
+                cfg=cfg,
+                dataset=dataset,
+                model=model,
                 device=device,
                 trigger_train_episode_counter=0,
                 trigger_step=-1,

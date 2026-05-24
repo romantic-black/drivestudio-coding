@@ -52,6 +52,97 @@ def _phase_a_batch():
     }
 
 
+def _validation_v9_minimal_batch(*, zero_valid_mask: bool = False):
+    meta = _phase_a_batch_meta()
+    meta["nearby_loss_refs_by_step"] = [[(11, 0)], [(11, 0)]]
+    valid = torch.zeros(2, 2) if bool(zero_valid_mask) else torch.ones(2, 2)
+    target_common = {
+        "gt_image": torch.ones(2, 2, 3),
+        "sky_mask": torch.zeros(2, 2),
+        "egocar_mask": torch.zeros(2, 2),
+        "valid_mask": valid,
+    }
+    return {
+        "scene_id": 1,
+        "segment_id": 0,
+        "request_meta": meta,
+        "_scheduler_v9": {
+            "scheduler_version": "v9",
+            "phase": "phase_A_block_local_unroll",
+            "inner_K": 2,
+        },
+        "source_views": [object()],
+        "targets": [
+            dict(target_common, frame_idx=10, cam_idx=0),
+            dict(target_common, frame_idx=11, cam_idx=0),
+        ],
+    }
+
+
+def _validation_v9_runner_model(flags=None):
+    bg = NodeStateBackground(
+        means=torch.zeros(2, 3),
+        scales_log=torch.zeros(2, 3),
+        quats=torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(2, 1),
+        opacity_logit=torch.zeros(2, 1),
+        sh_dc=torch.zeros(2, 3),
+        sh_rest=torch.zeros(2, 3, 3),
+    )
+    model = MinimalStreetForwardStage6_0.__new__(MinimalStreetForwardStage6_0)
+    nn.Module.__init__(model)
+    model.device = torch.device("cpu")
+    model.stage6_hidden_dim = 5
+    model.loss_w_ssim = 0.0
+    model.stage6_block_mask_policy = "none"
+    model.stage6_nearby_mask_policy = "none"
+    model.node_states_bg = {(1, 0): bg}
+    model.node_states_distant = {}
+    model.node_states_rigid = {}
+    model.node_states_sky = {}
+    model.h_cache_bg = {}
+    model.h_cache_distant = {}
+    model.h_cache_rigid = {}
+    model.h_cache_sky = {}
+
+    def _get_or_init(_batch):
+        return bg, None, None
+
+    def _observe_v4_measurement(*, local_state, batch, source_indices, source_frame_idx):
+        _ = local_state, batch, source_indices, source_frame_idx
+        if flags is not None:
+            flags.append(bool(torch.is_grad_enabled()))
+        return {"source_frame_idx": int(source_frame_idx)}
+
+    def _encode_and_update(*, local_state, measurement):
+        _ = measurement
+        if flags is not None:
+            flags.append(bool(torch.is_grad_enabled()))
+        n = int(local_state.bg.means.shape[0])
+        zeros3 = local_state.bg.means.new_zeros((n, 3))
+        delta = BranchDelta(
+            means=local_state.bg.means.new_full((n, 3), 0.1),
+            scales_log=zeros3,
+            quat_axis_angle=zeros3,
+            opacity_logit=local_state.bg.means.new_zeros((n, 1)),
+            sh=local_state.bg.means.new_zeros((n, 12)),
+            hidden=local_state.bg.means.new_zeros((n, 5)),
+            confidence=local_state.bg.means.new_full((n, 1), 0.75),
+            noop=local_state.bg.means.new_full((n, 1), 0.25),
+        )
+        return local_state.apply_delta(DeltaPack(bg=delta)), DeltaPack(bg=delta), {}
+
+    def _render_target(*, local_state, target):
+        gt = target["gt_image"]
+        val = local_state.bg.means[:, 0].mean().clamp(0.0, 1.0)
+        return torch.ones_like(gt) * val, torch.ones(gt.shape[:2])
+
+    model._get_or_init_node_states_bg_rigid_distant = _get_or_init
+    model._observe_v4_measurement = _observe_v4_measurement
+    model._encode_and_update = _encode_and_update
+    model._render_target = _render_target
+    return model, bg
+
+
 def _route_empty():
     return type(
         "Route",
@@ -374,6 +465,55 @@ def test_stage6_updater_only_detaches_measurement_outputs():
     assert z.grad is None
 
 
+def test_stage6_encode_update_clamps_bg_means_to_segment_aabb():
+    bg = NodeStateBackground(
+        means=torch.tensor([[0.95, 0.0, 0.0], [-0.95, 0.0, 0.0]]),
+        scales_log=torch.zeros(2, 3),
+        quats=torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(2, 1),
+        opacity_logit=torch.zeros(2, 1),
+        sh_dc=torch.zeros(2, 3),
+        sh_rest=torch.zeros(2, 3, 3),
+    )
+    local = LocalGSState.from_node_states(bg=bg, distant=None, rigid=None, hidden_dim=5)
+    measurement = {
+        "route": _route_empty(),
+        "feat_2d_bg": torch.randn(2, 4),
+        "acc_w_bg": torch.ones(2),
+        "obs_bg": torch.zeros(2, 2),
+        "source_frame_idx": 0,
+    }
+    model = _stage6_encode_update_test_model(detach_v4_outputs=True)
+
+    class FixedUpdater(nn.Module):
+        def forward(self, *, event, ctx_current=None, ctx_vsm=None):
+            _ = ctx_current, ctx_vsm
+            n = int(event.event_bg.shape[0])
+            zeros3 = event.event_bg.new_zeros((n, 3))
+            delta = BranchDelta(
+                means=event.event_bg.new_tensor([[0.2, 0.0, 0.0], [-0.2, 0.0, 0.0]]),
+                scales_log=zeros3,
+                quat_axis_angle=zeros3,
+                opacity_logit=event.event_bg.new_zeros((n, 1)),
+                sh=event.event_bg.new_zeros((n, 12)),
+                hidden=event.event_bg.new_zeros((n, 5)),
+                confidence=event.event_bg.new_zeros((n, 1)),
+                noop=event.event_bg.new_zeros((n, 1)),
+            )
+            return DeltaPack(bg=delta), {}
+
+    model.stage6_posterior_updater = FixedUpdater()
+    updated, delta, _aux = MinimalStreetForwardStage6_0._encode_and_update(
+        model,
+        local_state=local,
+        measurement=measurement,
+    )
+    assert torch.allclose(delta.bg.means[:, 0], torch.tensor([0.2, -0.2]))
+    assert torch.allclose(
+        updated.bg.means,
+        torch.tensor([[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]]),
+    )
+
+
 def test_stage6_local_writeback_is_detached():
     bg = NodeStateBackground(
         means=torch.zeros(4, 3),
@@ -403,6 +543,68 @@ def test_stage6_local_writeback_is_detached():
         if torch.is_tensor(value):
             assert value.requires_grad is False
     assert torch.allclose(bg.means, torch.ones(4, 3) * 0.01)
+
+
+def test_validation_v9_runner_no_grad():
+    flags = []
+    model, _bg = _validation_v9_runner_model(flags)
+    _ = MinimalStreetForwardStage6_0.validate_v9_phase_a(
+        model,
+        _validation_v9_minimal_batch(),
+        k_values=[0, 2],
+        max_K=2,
+        mask_cfg={"block_loss_mask": "none", "nearby_loss_mask": "none", "min_valid_pixels": 1},
+    )
+    assert flags
+    assert all(flag is False for flag in flags)
+
+
+def test_validation_v9_runner_no_writeback():
+    model, bg = _validation_v9_runner_model()
+    before = bg.means.detach().clone()
+    _ = MinimalStreetForwardStage6_0.validate_v9_phase_a(
+        model,
+        _validation_v9_minimal_batch(),
+        k_values=[0, 2],
+        max_K=2,
+        mask_cfg={"block_loss_mask": "none", "nearby_loss_mask": "none", "min_valid_pixels": 1},
+    )
+    assert torch.allclose(bg.means, before)
+
+
+def test_validation_v9_k_curve_outputs_all_k_values():
+    model, _bg = _validation_v9_runner_model()
+    row = MinimalStreetForwardStage6_0.validate_v9_phase_a(
+        model,
+        _validation_v9_minimal_batch(),
+        k_values=[0, 1, 2],
+        max_K=2,
+        mask_cfg={"block_loss_mask": "none", "nearby_loss_mask": "none", "min_valid_pixels": 1},
+    )
+    for k in (0, 1, 2):
+        assert f"val_v9/phaseA/block_psnr@{k}" in row
+        assert f"val_v9/phaseA/nearby_psnr@{k}" in row
+    assert "val_v9/phaseA/block_psnr_gain@2" in row
+    assert "val_v9/phaseA/time_per_iter_ms" in row
+
+
+def test_validation_v9_mask_skip_is_logged():
+    model, _bg = _validation_v9_runner_model()
+    model.stage6_block_mask_policy = "non_sky_non_egocar"
+    model.stage6_nearby_mask_policy = "non_sky_non_egocar"
+    row = MinimalStreetForwardStage6_0.validate_v9_phase_a(
+        model,
+        _validation_v9_minimal_batch(zero_valid_mask=True),
+        k_values=[0, 2],
+        max_K=2,
+        mask_cfg={
+            "block_loss_mask": "non_sky_non_egocar",
+            "nearby_loss_mask": "non_sky_non_egocar",
+            "min_valid_pixels": 32,
+        },
+    )
+    assert row["val_v9/phaseA/block_skipped_no_valid_pixels@0"] == 1.0
+    assert row["val_v9/phaseA/nearby_skipped_no_valid_pixels@0"] == 1.0
 
 
 def _valid_stage6_config():
@@ -556,6 +758,7 @@ def test_stage6_parent_bootstrap_uses_stage5_4_compat_config(monkeypatch):
         captured["history_enable"] = bool(config["model"]["history_memory"]["enable"])
         captured["update_gate_enable"] = bool(config["model"]["update_gate"]["enable"])
         captured["view_transient_enable"] = bool(config["model"]["view_transient"]["enable"])
+        captured["optimizer_lr"] = float(config["optimizer"]["lr"])
         self.config = config
         self.device = device
         self.sh_degree = 1
@@ -580,6 +783,7 @@ def test_stage6_parent_bootstrap_uses_stage5_4_compat_config(monkeypatch):
         "history_enable": True,
         "update_gate_enable": True,
         "view_transient_enable": True,
+        "optimizer_lr": 1.0e-3,
     }
     assert model.config["model"]["stage"] == "6_0"
     assert model.config["model"]["history_memory"]["enable"] is False
