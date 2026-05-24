@@ -7,8 +7,15 @@ data:
   end_timestep: -1
   preload_device: cpu
   sky_mask_semantics: one_is_sky
-  train_scene_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
-  eval_scene_ids: []
+  train_scene_ids: [14, 16, 24, 32, 40, 99, 107, 115, 123, 131, 139, 147, 155, 163, 171, 179, 195, 214,
+    17, 25, 33, 41, 49, 100, 108, 116, 124, 132, 140, 148, 156, 164, 172, 180, 188, 196, 215,
+    10, 18, 26, 34, 42, 93, 101, 109, 117, 125, 133, 141, 149, 157, 165, 173, 181, 189, 197, 216,
+    11, 19, 27, 35, 43, 94, 102, 110, 118, 126, 134, 142, 150, 158, 166, 174, 182, 190, 198, 217,
+    12, 20, 36, 44, 95, 103, 111, 119, 127, 135, 143, 151, 159, 167, 175, 183, 191, 199, 218,
+    13, 21, 29, 37, 45, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200,
+    22, 30, 38, 46, 97, 105, 113, 121, 129, 137, 145, 153, 161, 169, 177, 185, 193, 201,
+    15, 23, 31, 39, 47, 98, 106, 114, 122, 130, 138, 146, 154, 162, 170, 178, 186, 194]
+  eval_scene_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9,]
   preload:
     enable: true
     num_workers: 1
@@ -119,7 +126,7 @@ scheduler_v9:
     block:
       repeat_block_iteration: true
       inner_K_choices: [2, 4, 6]
-      inner_K_probs: [0.25, 0.25, 0.25]
+      inner_K_probs: [0.33, 0.33, 0.34]
       source_frame_policy: fixed_for_scheduler_step
       block_loss_policy: source_frame_all_cams
     nearby_supervision:
@@ -211,7 +218,7 @@ validation_v8:
     enable: false
 
 validation_v9:
-  enable: false
+  enable: true
   phase: phase_A_block_local_unroll
   fail_fast: true
   trigger:
@@ -274,8 +281,8 @@ model:
   scale_init_value: 0.1
   sh_degree: 1
   voxel_size: 0.2
-  sparseConv_outdim: 32
-  feat_2d_channels: 32
+  sparseConv_outdim: 24
+  feat_2d_channels: 24
   feat_2d_downscale: 1
   feature_extractor:
     type: dinov2_unet_fusion
@@ -284,19 +291,19 @@ model:
       pretrained: true
       freeze: true
       weights_path: null
-      out_channels: 32
+      out_channels: 24
       intermediate_layers: [4, 8, 11]
       pad_to_patch_multiple: 14
     residual_unet:
       in_channels: 6
-      feat_channels: 32
-      base_channels: 32
+      feat_channels: 24
+      base_channels: 24
       feature_downscale: 1
       depth: 4
       bilinear: true
     fusion:
-      hidden_channels: 64
-      out_channels: 32
+      hidden_channels: 48
+      out_channels: 24
   use_fused_cuda_backproject_v2: true
   use_fused_cuda_backproject_v3: true
   use_fused_cuda_backproject_v4: true
@@ -328,7 +335,7 @@ model:
     struct_event_decoder:
       enable: true
       event_dim: 48
-      feat_2d_dim: 32
+      feat_2d_dim: 24
       support_embed_dim: 4
       branch_embed_dim: 4
       token:
@@ -376,7 +383,7 @@ model:
       input_event: true
       input_current_ctx: false
       input_vsm_ctx: false
-      hidden_dim: 96
+      hidden_dim: 48
       event_dim: 48
       stage_hidden_dim: 48
       split_heads:
@@ -443,7 +450,7 @@ model:
     include_distant: true
     include_rigid_in: true
     include_rigid_out: true
-    feat_2d_channels: 32
+    feat_2d_channels: 24
     param_embed_dim: 32
     branch_embed_dim: 8
     support_embed_dim: 8
@@ -459,7 +466,7 @@ model:
     near:
       type: "xcpe"
       branches: ["bg", "rigid_in"]
-      channels: 64
+      channels: 48
       voxel_size: 0.20
       sparse_backend: "spconv"
       clamp_grid_coord: false
@@ -472,8 +479,8 @@ model:
     far:
       type: "mlp"
       branches: ["distant", "rigid_out"]
-      channels: 64
-      hidden_dim: 64
+      channels: 48
+      hidden_dim: 48
       num_layers: 2
       norm: "layernorm"
       act: "gelu"
@@ -511,7 +518,7 @@ model:
   update_gate:
     enable: false
     type: attribute_5
-    hidden_dim: 64
+    hidden_dim: 48
     require_initialized_in_input: true
     include_visible_now: true
     bind_with_mask_update: true
@@ -568,7 +575,7 @@ model:
       init: {scale_init: {mode: knn, isotropic_log_value: -2.30, knn_k: 8, knn_log_scale_bias: -1.5}, opacity_init: 0.1}
       limits: {offset_max: 0.1, scale_max: 0.1, omega_max: 0.1, opacity_max: 0.15, sh_dc_max: 0.15, sh_rest_max: 0.08}
       eta: {means: 1.0, scales: 1.0, opacity: 1.0, sh_dc: 1.0, sh_rest: 1.0}
-      mlp: {hidden_dim: 64, use_3d_feat: true, use_2d_feat: true}
+      mlp: {hidden_dim: 48, use_3d_feat: true, use_2d_feat: true}
     distant:
       src_backproject_support_min: 1e-2
       enable_selective_update: false
@@ -576,7 +583,7 @@ model:
       init: {scale_init: {mode: isotropic, isotropic_log_value: -1.70, knn_k: 8, knn_log_scale_bias: -1.2}, opacity_init: 0.05}
       limits: {offset_max: 0.02, scale_max: 0.08, omega_max: 0.01, opacity_max: 0.08, sh_dc_max: 0.12, sh_rest_max: 0.03}
       eta: {means: 0.2, scales: 0.7, opacity: 0.8, sh_dc: 1.0, sh_rest: 0.6}
-      mlp: {hidden_dim: 64, use_3d_feat: false, use_2d_feat: true, freeze_quat: true}
+      mlp: {hidden_dim: 48, use_3d_feat: false, use_2d_feat: true, freeze_quat: true}
     rigid:
       src_backproject_support_min: 1e-2
       init: {scale_init: {mode: knn, isotropic_log_value: -2.90, knn_k: 8, knn_log_scale_bias: -1.5}, opacity_init: 0.2}

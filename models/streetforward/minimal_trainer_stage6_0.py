@@ -3,8 +3,9 @@ from __future__ import annotations
 import copy
 import logging
 import os
+from collections import defaultdict
 from dataclasses import replace
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -1090,11 +1091,16 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         return rigid
 
     def _render_target(self, *, local_state: LocalGSState, target: Dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
+        render_params = self._render_params_for_frame(local_state=local_state, frame_idx=int(target.get("frame_idx", 0)))
+        gt = target["gt_image"]
+        height, width = spatial_hw_from_image_tensor(gt)
+        return self._render_single_view(render_params, target["view"], height, width)
+
+    def _render_params_for_frame(self, *, local_state: LocalGSState, frame_idx: int) -> Dict[str, torch.Tensor]:
         parts = [self._branch_render_params(local_state.bg)]
-        frame_idx = int(target.get("frame_idx", 0))
         rigid_node = self._local_rigid_node_state(local_state)
         if local_state.rigid is not None and rigid_node is not None:
-            valid = self._rigid_point_valid_mask(rigid_node, frame_idx)
+            valid = self._rigid_point_valid_mask(rigid_node, int(frame_idx))
             idx = torch.nonzero(valid, as_tuple=False).squeeze(1)
             if idx.numel() > 0:
                 rigid_local_all = self._branch_render_params(local_state.rigid)
@@ -1104,15 +1110,49 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                     self._rigid_local_to_world_render_params(
                         rigid_node,
                         rigid_local,
-                        frame_idx,
+                        int(frame_idx),
                         point_ids_subset=point_ids,
                     )
                 )
         if local_state.distant is not None:
             parts.append(self._branch_render_params(local_state.distant))
-        gt = target["gt_image"]
-        height, width = spatial_hw_from_image_tensor(gt)
-        return self._render_single_view(self._cat_render_params(parts), target["view"], height, width)
+        return self._cat_render_params(parts)
+
+    def _render_targets_grouped_by_frame(
+        self,
+        *,
+        local_state: LocalGSState,
+        targets_with_indices: List[Tuple[int, Dict[str, Any]]],
+    ) -> Dict[int, Tuple[torch.Tensor, torch.Tensor]]:
+        by_frame: Dict[int, List[Tuple[int, Dict[str, Any]]]] = defaultdict(list)
+        for idx, target in targets_with_indices:
+            by_frame[int(target.get("frame_idx", 0))].append((int(idx), target))
+
+        pred_by_idx: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+        for frame_idx in sorted(by_frame.keys()):
+            group = by_frame[int(frame_idx)]
+            targets_f = [target for _, target in group]
+            render_params = self._render_params_for_frame(local_state=local_state, frame_idx=int(frame_idx))
+
+            heights: List[int] = []
+            widths: List[int] = []
+            for target in targets_f:
+                height, width = spatial_hw_from_image_tensor(target["gt_image"])
+                heights.append(int(height))
+                widths.append(int(width))
+            h0, w0 = int(heights[0]), int(widths[0])
+            if all(int(h) == h0 and int(w) == w0 for h, w in zip(heights, widths)):
+                multi_result = self._render_multi_view(render_params, targets_f)
+                if multi_result is not None:
+                    for (orig_idx, _target), (rgb, acc) in zip(group, multi_result):
+                        pred_by_idx[int(orig_idx)] = (rgb, acc.squeeze(-1) if acc.dim() == 3 else acc)
+                    continue
+
+            for orig_idx, target in group:
+                height, width = spatial_hw_from_image_tensor(target["gt_image"])
+                pred_rgb, acc = self._render_single_view(render_params, target["view"], int(height), int(width))
+                pred_by_idx[int(orig_idx)] = (pred_rgb, acc.squeeze(-1) if acc.dim() == 3 else acc)
+        return pred_by_idx
 
     def _render_loss_for_indices(
         self,
@@ -1140,9 +1180,14 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         ssim_vals: List[float] = []
         valid_ratios: List[float] = []
         skip_count = 0.0
+        targets_with_indices = [(int(idx), batch["targets"][int(idx)]) for idx in target_indices]
+        pred_by_idx = self._render_targets_grouped_by_frame(
+            local_state=local_state,
+            targets_with_indices=targets_with_indices,
+        )
         for idx in target_indices:
             target = batch["targets"][int(idx)]
-            pred, _alpha = self._render_target(local_state=local_state, target=target)
+            pred, _alpha = pred_by_idx[int(idx)]
             gt = target["gt_image"].to(device=pred.device, dtype=pred.dtype)
             mask = target_valid_mask(target, mask_policy=mask_policy, device=pred.device)
             loss_i, stat_i = masked_rgb_loss(

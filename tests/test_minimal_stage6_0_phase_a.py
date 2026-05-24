@@ -545,6 +545,62 @@ def test_stage6_local_writeback_is_detached():
     assert torch.allclose(bg.means, torch.ones(4, 3) * 0.01)
 
 
+def test_stage6_render_loss_batches_targets_per_frame():
+    bg = NodeStateBackground(
+        means=torch.zeros(1, 3),
+        scales_log=torch.zeros(1, 3),
+        quats=torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+        opacity_logit=torch.zeros(1, 1),
+        sh_dc=torch.zeros(1, 3),
+        sh_rest=torch.zeros(1, 3, 3),
+    )
+    local = LocalGSState.from_node_states(bg=bg, distant=None, rigid=None, hidden_dim=5)
+    model = MinimalStreetForwardStage6_0.__new__(MinimalStreetForwardStage6_0)
+    nn.Module.__init__(model)
+    model.device = torch.device("cpu")
+    model.sh_degree = 1
+    model.loss_w_ssim = 0.0
+    calls = []
+
+    def fake_multi_view(render_params, targets):
+        assert "means_r" in render_params
+        calls.append([int(t["frame_idx"]) for t in targets])
+        out = []
+        for target in targets:
+            gt = target["gt_image"]
+            out.append((torch.full_like(gt, float(target["pred_value"])), torch.ones(gt.shape[:2])))
+        return out
+
+    def fail_single_view(*args, **kwargs):
+        raise AssertionError("Stage6 Phase A should batch same-frame target cameras.")
+
+    model._render_multi_view = fake_multi_view
+    model._render_single_view = fail_single_view
+    targets = [
+        {"frame_idx": 10, "cam_idx": 0, "view": object(), "gt_image": torch.zeros(2, 2, 3), "pred_value": 0.1},
+        {"frame_idx": 10, "cam_idx": 1, "view": object(), "gt_image": torch.zeros(2, 2, 3), "pred_value": 0.2},
+        {"frame_idx": 11, "cam_idx": 0, "view": object(), "gt_image": torch.zeros(2, 2, 3), "pred_value": 0.3},
+    ]
+
+    pred_rgbs = []
+    gt_images = []
+    loss, stats = MinimalStreetForwardStage6_0._render_loss_for_indices(
+        model,
+        local_state=local,
+        batch={"targets": targets},
+        target_indices=[0, 1, 2],
+        mask_policy="none",
+        pred_rgbs_out=pred_rgbs,
+        gt_images_out=gt_images,
+    )
+
+    assert calls == [[10, 10], [11]]
+    assert stats["num_refs"] == 3.0
+    assert torch.isclose(loss, torch.tensor(0.2), atol=1.0e-6)
+    assert [float(x[0, 0, 0]) for x in pred_rgbs] == pytest.approx([0.1, 0.2, 0.3])
+    assert len(gt_images) == 3
+
+
 def test_validation_v9_runner_no_grad():
     flags = []
     model, _bg = _validation_v9_runner_model(flags)
