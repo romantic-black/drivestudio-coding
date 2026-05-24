@@ -225,6 +225,31 @@ def test_v4_batch_from_assets_strict_success(tmp_path):
     assert "dynamic_info" in batch
 
 
+def test_v4_filters_segments_with_too_many_dynamic_points(tmp_path):
+    store = _prepare_demo_assets(
+        tmp_path,
+        pointcloud_payload={
+            "background": np.zeros((2, 6), dtype=np.float32),
+            "dynamic": {9: np.ones((3, 6), dtype=np.float32)},
+            "instance_mapping": {1009: 9},
+            "metadata": {"static_instance_intids": []},
+        },
+    )
+    data_cfg, dataset_cfg = _build_cfg(
+        tmp_path,
+        pointcloud={"max_dynamic_points_per_segment": 2},
+    )
+    ds = MultiSceneDatasetV4(
+        dataset_cfg=dataset_cfg,
+        data_cfg=data_cfg,
+        device=torch.device("cpu"),
+        asset_store=store,
+    )
+    assert ds.list_segment_ids(1) == []
+    with pytest.raises(ValueError, match="No training scenes remain after filtering segments"):
+        ds.list_training_scene_ids()
+
+
 def test_v4_preload_worker_warms_cpu_view_cache_without_materializing(tmp_path, monkeypatch):
     store = _prepare_demo_assets(tmp_path)
     data_cfg, dataset_cfg = _build_cfg(tmp_path)

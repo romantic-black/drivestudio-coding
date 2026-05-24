@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -235,6 +236,9 @@ class MultiSceneDatasetV4:
         self._runtime_pointcloud_cfg: Optional[Dict[str, Any]] = (
             dict(runtime_pc) if isinstance(runtime_pc, dict) else None
         )
+        self._max_dynamic_points_per_segment = self._parse_max_dynamic_points_per_segment()
+        self._segment_dynamic_point_count_cache: Dict[Tuple[str, int, int], int] = {}
+        self._dynamic_point_filter_logged_scenes: set[Tuple[str, int]] = set()
         self._knn_requirements = _parse_knn_validation_requirements(knn_requirements)
 
         pixel_source_cfg = self._cfg_get(self.data_cfg, "pixel_source", {}) or {}
@@ -740,6 +744,24 @@ class MultiSceneDatasetV4:
             )
         return s
 
+    def _parse_max_dynamic_points_per_segment(self) -> Optional[int]:
+        pointcloud_cfg = self._cfg_get(self.dataset_cfg, "pointcloud", {}) or {}
+        raw = self._cfg_get(pointcloud_cfg, "max_dynamic_points_per_segment")
+        if raw is None:
+            segment_filter_cfg = self._cfg_get(self.dataset_cfg, "segment_filter", {}) or {}
+            raw = self._cfg_get(segment_filter_cfg, "max_dynamic_points")
+        if raw is None:
+            raw = self._cfg_get(self.dataset_cfg, "max_dynamic_points_per_segment")
+        if raw is None:
+            return None
+        limit = int(raw)
+        if limit <= 0:
+            raise ValueError(
+                "dataset.pointcloud.max_dynamic_points_per_segment must be > 0 when set, "
+                f"got {raw!r}"
+            )
+        return int(limit)
+
     def _asset_dataset_name(self) -> str:
         ds = self._cfg_get(self.data_cfg, "dataset")
         if ds is None:
@@ -753,13 +775,22 @@ class MultiSceneDatasetV4:
         if len(configured) == 0:
             if len(registered) == 0:
                 raise ValueError("No training scenes: train_scene_ids empty and segment registry has no rows")
-            return registered
-        reg_set = set(registered)
-        out = [sid for sid in configured if sid in reg_set] if len(reg_set) > 0 else list(configured)
-        if len(out) == 0:
-            raise ValueError(
-                f"No train scenes from config exist in segment registry (dataset={ds_name}, configured={configured})"
-            )
+            out = registered
+        else:
+            reg_set = set(registered)
+            out = [sid for sid in configured if sid in reg_set] if len(reg_set) > 0 else list(configured)
+            if len(out) == 0:
+                raise ValueError(
+                    f"No train scenes from config exist in segment registry (dataset={ds_name}, configured={configured})"
+                )
+        if self._max_dynamic_points_per_segment is not None:
+            out = [int(sid) for sid in out if len(self.list_segment_ids(int(sid))) > 0]
+            if len(out) == 0:
+                raise ValueError(
+                    "No training scenes remain after filtering segments by "
+                    "dataset.pointcloud.max_dynamic_points_per_segment="
+                    f"{int(self._max_dynamic_points_per_segment)}"
+                )
         return out
 
     def list_segment_ids(self, scene_id: int) -> List[int]:
@@ -769,7 +800,94 @@ class MultiSceneDatasetV4:
             raise ValueError(
                 f"No registered segments for dataset={ds_name} scene_id={int(scene_id)} in segment_registry"
             )
+        if self._max_dynamic_points_per_segment is not None:
+            seg_ids = self._filter_segment_ids_by_dynamic_points(
+                ds_name=ds_name,
+                scene_id=int(scene_id),
+                segment_ids=seg_ids,
+            )
         return seg_ids
+
+    @staticmethod
+    def _dynamic_point_count_from_stats(stats: Any) -> Optional[int]:
+        if not isinstance(stats, dict):
+            return None
+        for key in ("dynamic_points", "dynamic_point_count", "num_dynamic_points"):
+            if stats.get(key) is not None:
+                return int(stats[key])
+        return None
+
+    def _load_segment_dynamic_point_count(self, ds_name: str, scene_id: int, segment_id: int) -> int:
+        key = (str(ds_name), int(scene_id), int(segment_id))
+        cached = self._segment_dynamic_point_count_cache.get(key)
+        if cached is not None:
+            return int(cached)
+
+        handle = self.asset_store.get_segment_asset_registry_first(str(ds_name), int(scene_id), int(segment_id))
+        manifest = handle.load_manifest()
+        count = self._dynamic_point_count_from_stats(manifest.get("stats"))
+
+        if count is None:
+            stats_path = handle.asset_dir / "stats.json"
+            if stats_path.exists():
+                with stats_path.open("r", encoding="utf-8") as f:
+                    count = self._dynamic_point_count_from_stats(json.load(f))
+
+        if count is None:
+            dyn_path = handle.asset_dir / "pointcloud_dynamic.npz"
+            if dyn_path.exists():
+                with np.load(str(dyn_path), allow_pickle=False) as z:
+                    offsets = np.asarray(z["dynamic_points_offsets"], dtype=np.int64).reshape(-1)
+                    count = int(offsets[-1]) if int(offsets.shape[0]) > 0 else 0
+
+        if count is None:
+            raise ValueError(
+                "dataset.pointcloud.max_dynamic_points_per_segment requires segment dynamic point counts, "
+                "but none were found in manifest stats, stats.json, or pointcloud_dynamic.npz "
+                f"(dataset={ds_name} scene_id={int(scene_id)} segment_id={int(segment_id)})"
+            )
+        self._segment_dynamic_point_count_cache[key] = int(count)
+        return int(count)
+
+    def _filter_segment_ids_by_dynamic_points(
+        self,
+        *,
+        ds_name: str,
+        scene_id: int,
+        segment_ids: Sequence[int],
+    ) -> List[int]:
+        limit = self._max_dynamic_points_per_segment
+        if limit is None:
+            return [int(x) for x in segment_ids]
+        kept: List[int] = []
+        skipped: List[Tuple[int, int]] = []
+        for segment_id in segment_ids:
+            count = self._load_segment_dynamic_point_count(
+                str(ds_name),
+                int(scene_id),
+                int(segment_id),
+            )
+            if int(count) > int(limit):
+                skipped.append((int(segment_id), int(count)))
+                continue
+            kept.append(int(segment_id))
+
+        if skipped:
+            log_key = (str(ds_name), int(scene_id))
+            if log_key not in self._dynamic_point_filter_logged_scenes:
+                self._dynamic_point_filter_logged_scenes.add(log_key)
+                logger.warning(
+                    "Skipping StreetForward segments with too many dynamic points: "
+                    "dataset=%s scene_id=%d max_dynamic_points_per_segment=%d skipped_count=%d "
+                    "skipped_preview=%s kept=%d",
+                    str(ds_name),
+                    int(scene_id),
+                    int(limit),
+                    int(len(skipped)),
+                    skipped[:20],
+                    int(len(kept)),
+                )
+        return kept
 
     def _cache_get(
         self,
