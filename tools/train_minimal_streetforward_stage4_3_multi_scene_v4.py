@@ -20,6 +20,7 @@ scheduler_v4.overlap（见 docs/trainers/TrainScheduler_V4_Overlap_Pointcloud_To
 from __future__ import annotations
 
 import argparse
+import gc
 import inspect
 import io
 import json
@@ -506,6 +507,93 @@ def _build_scheduler_node_sync_v8_fallback(
     }
 
 
+def _build_scheduler_node_sync_v9_fallback(
+    cfg: Any,
+    scheduler_info: Dict[str, Any],
+    step_events: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    sv9 = cfg.get("scheduler_v9")
+    if sv9 is None or not bool(sv9.get("enable", False)):
+        return None
+    execution = sv9.get("execution") if hasattr(sv9, "get") else None
+    block_order = str(scheduler_info.get("block_order", "step_major")).strip()
+    if execution is not None and hasattr(execution, "get"):
+        reset_policy = str(execution.get("reset_policy", "episode_end")).strip()
+    else:
+        reset_policy = "episode_end"
+    if reset_policy not in ("episode_end", "never"):
+        raise ValueError("scheduler_v9.execution.reset_policy must be one of ['episode_end', 'never']")
+    should_reset = any(ev.get("type") == "episode_end" for ev in step_events) if reset_policy == "episode_end" else False
+    U = int(scheduler_info.get("U", 1))
+    seg = int(scheduler_info.get("segment_local_step", 0))
+    if U < 1:
+        raise ValueError("scheduler_v9 scheduler_info.U must be >= 1 for model_node_state sync.")
+    return {
+        "U": int(U),
+        "segment_local_step": int(seg),
+        "reset_after_block": bool(should_reset),
+        "reset_policy": str(reset_policy),
+        "scheduler_version": "v9",
+        "block_order": str(block_order),
+    }
+
+
+def _node_state_cache_sizes(model: Any) -> Dict[str, int]:
+    return {
+        "bg": int(len(getattr(model, "node_states_bg", {}) or {})),
+        "distant": int(len(getattr(model, "node_states_distant", {}) or {})),
+        "rigid": int(len(getattr(model, "node_states_rigid", {}) or {})),
+        "sky": int(len(getattr(model, "node_states_sky", {}) or {})),
+    }
+
+
+def _reset_model_node_state_and_release_cuda(
+    model: Any,
+    *,
+    reason: str,
+    step: int,
+    scheduler_info: Optional[Dict[str, Any]] = None,
+) -> Dict[str, int]:
+    before = _node_state_cache_sizes(model)
+    model.reset_node_state()
+    empty_cache = str(os.environ.get("STAGE6_EMPTY_CACHE_ON_RESET", "")).lower() in {"1", "true", "yes", "on"}
+    if empty_cache:
+        gc.collect()
+    if empty_cache and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    after = _node_state_cache_sizes(model)
+    scheduler_info = scheduler_info or {}
+    logger.info(
+        "NODE_STATE_RESET step=%s reason=%s scene_id=%s scene_dir=%s segment=%s "
+        "before=%s after=%s cuda_empty_cache=%s",
+        int(step),
+        str(reason),
+        scheduler_info.get("scene_id", -1),
+        _scene_dir_str(scheduler_info.get("scene_id", -1)),
+        scheduler_info.get("segment_id", -1),
+        before,
+        after,
+        bool(empty_cache and torch.cuda.is_available()),
+    )
+    return after
+
+
+def _drop_result_tensor_payloads(result: Optional[Dict[str, Any]]) -> None:
+    if result is None:
+        return
+    for key, value in list(result.items()):
+        if torch.is_tensor(value):
+            if value.dim() == 0:
+                continue
+            result[key] = None
+        elif isinstance(value, list) and any(torch.is_tensor(x) for x in value):
+            result[key] = []
+        elif isinstance(value, tuple) and any(torch.is_tensor(x) for x in value):
+            result[key] = ()
+        elif isinstance(value, dict) and any(torch.is_tensor(x) for x in value.values()):
+            result[key] = {}
+
+
 @dataclass(frozen=True)
 class _BatchRequestValidationV7:
     scene_id: int
@@ -715,7 +803,15 @@ def _run_validation_v7_round(
             if use_train_finetune:
                 _restore_train_checkpoint_bytes(model, base_ckpt_bytes, device)
 
-            model.reset_node_state()
+            _reset_model_node_state_and_release_cuda(
+                model,
+                reason="validation_v7_episode_begin",
+                step=int(trigger_step),
+                scheduler_info={
+                    "scene_id": int(spec.scene_id),
+                    "segment_id": int(spec.segment_id),
+                },
+            )
             validation_local_step = 0
             last_minimal: Optional[Dict[str, Any]] = None
             block_payloads: List[Dict[str, Any]] = []
@@ -1196,7 +1292,12 @@ def _run_validation_v7_round(
             float(global_summary["ssim"]),
             float(global_summary["lpips"]),
         )
-    model.reset_node_state()
+    _reset_model_node_state_and_release_cuda(
+        model,
+        reason="validation_v7_end",
+        step=int(trigger_step),
+        scheduler_info=None,
+    )
 
 
 def main() -> None:
@@ -1458,6 +1559,13 @@ def main() -> None:
             "model.update_node_state_interval / reset_node_state_interval are ignored.",
             rp,
         )
+    sv9 = cfg.get("scheduler_v9")
+    if sv9 is not None and bool(sv9.get("enable", False)):
+        sv9_execution = sv9.get("execution") or {}
+        logger.info(
+            "scheduler_v9 node_state sync active: reset_node_state() controlled by execution.reset_policy=%s.",
+            str(sv9_execution.get("reset_policy", "episode_end")),
+        )
 
     max_iterations = args.max_steps or cfg.training.get("max_iterations", 1000)
     log_interval = cfg.training.get("log_interval", 50)
@@ -1685,6 +1793,8 @@ def main() -> None:
                             validation_due_episode_counters.append(int(train_episode_counter))
             scheduler_node_sync = _build_scheduler_node_sync(cfg, scheduler_info, step_events)
             if scheduler_node_sync is None:
+                scheduler_node_sync = _build_scheduler_node_sync_v9_fallback(cfg, scheduler_info, step_events)
+            if scheduler_node_sync is None:
                 scheduler_node_sync = _build_scheduler_node_sync_v8_fallback(cfg, scheduler_info, step_events)
             defer_node_state_reset_for_block_exit_record = False
             defer_node_state_reset_for_episode_hook = False
@@ -1833,6 +1943,10 @@ def main() -> None:
 
             if result is None:
                 raise ValueError("train_step returned None")
+            if defer_node_state_reset_for_block_exit_record or defer_node_state_reset_for_episode_hook:
+                result = dict(result)
+                result["node_state_sync_reset"] = True
+                result["node_state_sync_reset_deferred"] = True
             if enable_block_exit_record:
                 if not hasattr(model, "record_block_history"):
                     raise ValueError(
@@ -1896,7 +2010,12 @@ def main() -> None:
                             tb_step,
                         )
                 if defer_node_state_reset_for_block_exit_record and not defer_node_state_reset_for_episode_hook:
-                    model.reset_node_state()
+                    _reset_model_node_state_and_release_cuda(
+                        model,
+                        reason="deferred_block_exit_record",
+                        step=int(step),
+                        scheduler_info=scheduler_info,
+                    )
             loss_val = float(result["loss"])
             pred_rgbs = result["pred_rgbs"]
             gt_images = result["gt_images"]
@@ -2368,9 +2487,13 @@ def main() -> None:
                     "error_pred/",
                     "feedback/",
                     "branch/",
+                    "phaseA/",
+                    "stage6/",
+                    "mask/",
+                    "node_state_",
+                    "grad/",
                     "monitor/aux_",
                     "perf/aux_",
-                    "grad/aux",
                 )
                 for k, v in result.items():
                     if k.startswith("_") or k in row:
@@ -2456,7 +2579,16 @@ def main() -> None:
                     )
                 validation_ms += float((time.perf_counter() - val_t0) * 1000.0)
             if defer_node_state_reset_for_episode_hook:
-                model.reset_node_state()
+                _reset_model_node_state_and_release_cuda(
+                    model,
+                    reason="deferred_episode_hook",
+                    step=int(step),
+                    scheduler_info=scheduler_info,
+                )
+
+            _drop_result_tensor_payloads(result)
+            pred_rgbs = []
+            gt_images = []
 
             checkpoint_ms = 0.0
             if save_every and step > 0 and step % save_every == 0:

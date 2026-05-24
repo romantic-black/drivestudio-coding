@@ -62,6 +62,44 @@ class _DummyDataset:
         return self._segments[int(segment_id)]
 
 
+class _ShortEpisodeDataset(_DummyDataset):
+    def __init__(self) -> None:
+        self._segments = {0: self._make_short_sidx()}
+        self._assemble_segment_batch_from_v9_request = MagicMock(
+            side_effect=lambda **kwargs: {"request_meta": dict(kwargs["v9_plan"].request_meta)}
+        )
+
+    @staticmethod
+    def _make_short_sidx() -> SegmentIndexV4:
+        keyframes = list(range(4))
+        keyframe_to_frames = {int(k): [int(k * 10 + i) for i in range(3)] for k in keyframes}
+        frames = []
+        frame_to_keyframe = {}
+        for k, vals in keyframe_to_frames.items():
+            for f in vals:
+                frames.append(int(f))
+                frame_to_keyframe[int(f)] = int(k)
+        return SegmentIndexV4(
+            scene_id=10,
+            segment_id=0,
+            num_cams=2,
+            frame_indices=frames,
+            test_frame_indices=[],
+            train_frame_set=frozenset(frames),
+            test_frame_set=frozenset(),
+            keyframe_indices=keyframes,
+            keyframe_to_frames=keyframe_to_frames,
+            frame_to_keyframe=frame_to_keyframe,
+            segment_first_frame_idx=frames[0],
+            train_image_refs=tuple((int(f), 0) for f in frames),
+            test_image_refs=tuple(),
+        )
+
+    def list_segment_ids(self, scene_id: int):
+        assert int(scene_id) == 10
+        return [0]
+
+
 def _cfg(**overrides):
     out = {
         "phase": "phase_A_block_local_unroll",
@@ -101,6 +139,20 @@ def test_validation_v9_selects_one_segment_per_scene():
     segments = {int(s.segment_id) for s in plan.block_specs}
     assert len(segments) == 1
     assert len(plan.block_specs) == 2
+
+
+def test_validation_v9_uses_available_keyframes_when_episode_window_is_short():
+    plan = build_validation_plan_v9(
+        dataset=_ShortEpisodeDataset(),
+        eval_scene_ids=[10],
+        cfg=_cfg(),
+        blocks_per_episode=8,
+    )
+    assert len(plan.block_specs) == 2
+    assert all(len(spec.keyframe_window) == 4 for spec in plan.block_specs)
+    assert all(0 <= int(spec.block_idx) < 4 for spec in plan.block_specs)
+    assert all(int(spec.meta["requested_blocks_per_episode"]) == 8 for spec in plan.block_specs)
+    assert all(int(spec.meta["effective_blocks_per_episode"]) == 4 for spec in plan.block_specs)
 
 
 def test_validation_v9_random_blocks_without_replacement():

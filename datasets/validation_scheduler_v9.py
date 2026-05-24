@@ -157,8 +157,10 @@ def _middle_frame(frames: Sequence[int]) -> int:
 
 def _episode_starts(num_keyframes: int, blocks_per_episode: int) -> List[int]:
     window = int(blocks_per_episode)
-    if int(num_keyframes) < window:
+    if int(num_keyframes) < 1:
         return []
+    if int(num_keyframes) < window:
+        return [0]
     starts = list(range(0, int(num_keyframes) - window + 1, int(blocks_per_episode)))
     tail = int(num_keyframes) - window
     if starts[-1] != tail:
@@ -634,6 +636,7 @@ def build_validation_plan_v9(
             continue
         sidx = dataset.get_segment_index(int(scene_id), int(segment_id))
         kfs = [int(x) for x in list(sidx.keyframe_indices)]
+        effective_blocks_per_episode = min(int(blocks_per_episode_i), int(len(kfs)))
         start = choose_episode_start(
             num_keyframes=len(kfs),
             blocks_per_episode=int(blocks_per_episode_i),
@@ -651,8 +654,8 @@ def build_validation_plan_v9(
             if bool(fail_fast):
                 raise ValueError(msg)
             continue
-        keyframe_window = [int(x) for x in kfs[int(start) : int(start) + int(blocks_per_episode_i)]]
-        if len(keyframe_window) < int(blocks_per_episode_i):
+        keyframe_window = [int(x) for x in kfs[int(start) : int(start) + int(effective_blocks_per_episode)]]
+        if len(keyframe_window) < int(effective_blocks_per_episode):
             if bool(fail_fast):
                 raise ValueError("not enough keyframes for validation episode.")
             continue
@@ -668,7 +671,7 @@ def build_validation_plan_v9(
             for kf in keyframe_window
         ]
         block_indices = choose_blocks(
-            blocks_per_episode=int(blocks_per_episode_i),
+            blocks_per_episode=int(effective_blocks_per_episode),
             n=int(blocks_per_segment),
             seed=int(seed),
             scene_id=int(scene_id),
@@ -724,6 +727,8 @@ def build_validation_plan_v9(
                         "episode_policy": str(episode_policy),
                         "block_policy": str(block_policy),
                         "source_frame_policy": str(source_frame_policy),
+                        "requested_blocks_per_episode": int(blocks_per_episode_i),
+                        "effective_blocks_per_episode": int(effective_blocks_per_episode),
                     },
                 )
             )

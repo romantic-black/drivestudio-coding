@@ -106,6 +106,9 @@ def _run_validation_v9_round(
                 "nearby_loss_mask": str(validation_cfg.nearby_loss_mask),
                 "min_valid_pixels": int(validation_cfg.min_valid_pixels),
             },
+            compute_delta_stats=bool(validation_cfg.compute_delta_stats),
+            compute_runtime_stats=bool(validation_cfg.compute_runtime_stats),
+            compute_memory_stats=bool(validation_cfg.compute_memory_stats),
             save_images=bool(save_dir),
             save_dir=save_dir,
             save_image_k_values=[int(x) for x in validation_cfg.save_image_k_values],
@@ -136,6 +139,7 @@ def _run_validation_v9_round(
             int(plan.max_K),
             float(row.get(f"nearby_psnr@{int(plan.max_K)}", 0.0)),
         )
+        del minimal_batch, raw_batch
     summary: Dict[str, Any] = aggregate_validation_v9_phase_a_rows(rows, k_values=[int(x) for x in plan.k_values])
     summary.update(
         {

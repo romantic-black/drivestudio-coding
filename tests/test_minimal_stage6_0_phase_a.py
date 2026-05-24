@@ -8,7 +8,7 @@ import torch.nn as nn
 
 from models.streetforward.minimal_trainer_stage5_4 import MinimalStreetForwardStage5_4
 from models.streetforward.minimal_trainer_stage6_0 import MinimalStreetForwardStage6_0
-from models.streetforward.node_states import NodeStateBackground
+from models.streetforward.node_states import NodeStateBackground, NodeStateRigid
 from models.streetforward.stage6_0 import (
     LocalGSState,
     Stage6PosteriorUpdater,
@@ -155,6 +155,29 @@ def _route_empty():
             "means_world_S": torch.zeros((0, 3)),
         },
     )()
+
+
+def test_stage6_missing_rigid_frame_is_invisible_not_fatal():
+    model = MinimalStreetForwardStage6_0.__new__(MinimalStreetForwardStage6_0)
+    state = NodeStateRigid(
+        means=torch.zeros(2, 3),
+        scales_log=torch.zeros(2, 3),
+        quats=torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(2, 1),
+        opacity_logit=torch.zeros(2, 1),
+        sh_dc=torch.zeros(2, 3),
+        sh_rest=torch.zeros(2, 3, 3),
+        point_ids=torch.zeros(2, 1, dtype=torch.long),
+        instances_quats=torch.tensor([[[1.0, 0.0, 0.0, 0.0]]]),
+        instances_trans=torch.zeros(1, 1, 3),
+        instances_fv=torch.ones(1, 1, dtype=torch.bool),
+        instance_ids=[0],
+        frame_ids=[7],
+        cur_frame=7,
+    )
+    valid = model._stage6_rigid_point_valid_mask(state, frame_idx=93)
+    assert valid.shape == (2,)
+    assert valid.dtype == torch.bool
+    assert not bool(valid.any())
 
 
 def _param_dict(n: int, *, requires_grad: bool = False):
@@ -560,6 +583,7 @@ def test_stage6_render_loss_batches_targets_per_frame():
     model.device = torch.device("cpu")
     model.sh_degree = 1
     model.loss_w_ssim = 0.0
+    model.stage6_render_grouped_multiview_train = True
     calls = []
 
     def fake_multi_view(render_params, targets):
@@ -599,6 +623,53 @@ def test_stage6_render_loss_batches_targets_per_frame():
     assert torch.isclose(loss, torch.tensor(0.2), atol=1.0e-6)
     assert [float(x[0, 0, 0]) for x in pred_rgbs] == pytest.approx([0.1, 0.2, 0.3])
     assert len(gt_images) == 3
+
+
+def test_stage6_render_loss_can_disable_grouped_multiview():
+    bg = NodeStateBackground(
+        means=torch.zeros(1, 3),
+        scales_log=torch.zeros(1, 3),
+        quats=torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+        opacity_logit=torch.zeros(1, 1),
+        sh_dc=torch.zeros(1, 3),
+        sh_rest=torch.zeros(1, 3, 3),
+    )
+    local = LocalGSState.from_node_states(bg=bg, distant=None, rigid=None, hidden_dim=5)
+    model = MinimalStreetForwardStage6_0.__new__(MinimalStreetForwardStage6_0)
+    nn.Module.__init__(model)
+    model.device = torch.device("cpu")
+    model.sh_degree = 1
+    model.loss_w_ssim = 0.0
+    model.stage6_render_grouped_multiview_train = False
+    calls = []
+
+    def fail_multi_view(*args, **kwargs):
+        raise AssertionError("grouped multiview render should be disabled")
+
+    def fake_single_view(render_params, view, height, width):
+        assert "means_r" in render_params
+        calls.append((int(height), int(width)))
+        value = 0.1 * float(len(calls))
+        return torch.full((int(height), int(width), 3), value), torch.ones(int(height), int(width))
+
+    model._render_multi_view = fail_multi_view
+    model._render_single_view = fake_single_view
+    targets = [
+        {"frame_idx": 10, "cam_idx": 0, "view": object(), "gt_image": torch.zeros(2, 2, 3)},
+        {"frame_idx": 10, "cam_idx": 1, "view": object(), "gt_image": torch.zeros(2, 2, 3)},
+    ]
+
+    loss, stats = MinimalStreetForwardStage6_0._render_loss_for_indices(
+        model,
+        local_state=local,
+        batch={"targets": targets},
+        target_indices=[0, 1],
+        mask_policy="none",
+    )
+
+    assert calls == [(2, 2), (2, 2)]
+    assert stats["num_refs"] == 2.0
+    assert torch.isclose(loss, torch.tensor(0.15), atol=1.0e-6)
 
 
 def test_validation_v9_runner_no_grad():

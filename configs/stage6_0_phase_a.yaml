@@ -1,4 +1,4 @@
-output_name: stage6_0_phase_a_v9_block_local_unroll
+output_name: experiment001
 
 data:
   data_root: "/root/autodl-tmp/nuScenes/"
@@ -84,8 +84,8 @@ dataset:
     monocular_dynamic_recovery_bbox_expand_xyz_m: [0.5, 0.2, 0.5]
     monocular_dynamic_recovery_max_points_per_instance: 5000
     near_max_points: 400000
-    distant_max_points: 400000
-    max_dynamic_points_per_segment: 200000
+    distant_max_points: 200000
+    max_dynamic_points_per_segment: 150000
     static_instance_motion:
       enable: true
       traj_length_thresh_m: 0.5
@@ -125,8 +125,8 @@ scheduler_v9:
     mode: block_local_unroll
     block:
       repeat_block_iteration: true
-      inner_K_choices: [2, 4, 6]
-      inner_K_probs: [0.33, 0.33, 0.34]
+      inner_K_choices: [2, 4, 6, 8]
+      inner_K_probs: [0.25, 0.25, 0.25, 0.25]
       source_frame_policy: fixed_for_scheduler_step
       block_loss_policy: source_frame_all_cams
     nearby_supervision:
@@ -238,8 +238,8 @@ validation_v9:
     resample_blocks_every_validation: false
     source_frame_policy: middle_in_keyframe
   phase_A:
-    k_values: [0, 4, 8, 16]
-    max_K: 16
+    k_values: [0, 4, 8, 16, 32]
+    max_K: 32
     nearby:
       enable: true
       frames_per_block: 1
@@ -251,8 +251,8 @@ validation_v9:
       compute_block_metrics: true
       compute_nearby_metrics: true
       compute_delta_stats: true
-      compute_runtime_stats: true
-      compute_memory_stats: true
+      compute_runtime_stats: false
+      compute_memory_stats: false
       compute_struct_stats: false
     render:
       save_images: false
@@ -332,6 +332,8 @@ model:
       writeback_policy: "block_end_detached"
       writeback_after_optimizer_step: true
       reset_local_state_on_nan: true
+    render:
+      grouped_multiview_train: true
     struct_event_decoder:
       enable: true
       event_dim: 48
@@ -580,7 +582,7 @@ model:
       src_backproject_support_min: 1e-2
       enable_selective_update: false
       freeze_means: true
-      init: {scale_init: {mode: isotropic, isotropic_log_value: -1.70, knn_k: 8, knn_log_scale_bias: -1.2}, opacity_init: 0.05}
+      init: {scale_init: {mode: isotropic, isotropic_log_value: -1.90, knn_k: 8, knn_log_scale_bias: -1.2}, opacity_init: 0.05}
       limits: {offset_max: 0.02, scale_max: 0.08, omega_max: 0.01, opacity_max: 0.08, sh_dc_max: 0.12, sh_rest_max: 0.03}
       eta: {means: 0.2, scales: 0.7, opacity: 0.8, sh_dc: 1.0, sh_rest: 0.6}
       mlp: {hidden_dim: 48, use_3d_feat: false, use_2d_feat: true, freeze_quat: true}
@@ -600,7 +602,7 @@ current_observation:
   input_to_history_gate: false
   record_to_history_memory: false
   debug:
-    log_stats: true
+    log_stats: false
     log_interval_steps: 50
 
 training_recipe:
@@ -744,7 +746,7 @@ lr_scheduler:
 
 training:
   max_iterations: 3000010
-  log_interval: 100
+  log_interval: 1000
   save_checkpoint_freq: 10000
   seed: 41
   amp:
@@ -770,10 +772,10 @@ logging:
   output_root: /root/autodl-tmp/outputs
   project: minimal_sf_stage6_0_phase_a_v9
   log_dir: null
-  image_interval_blocks: 300
+  image_interval_blocks: 1000
   train_monitor:
     enable_heavy_metrics: false
-    include_per_view_metrics: true
+    include_per_view_metrics: false
     include_extra_result_metrics: false
     enable_low_psnr_image_dump: false
   low_psnr_train_images_subdir: train_low_psnr

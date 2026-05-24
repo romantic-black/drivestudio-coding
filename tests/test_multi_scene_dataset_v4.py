@@ -619,6 +619,93 @@ def test_v4_runtime_cap_mismatch_random_downsamples(tmp_path):
     assert bundle.pointcloud["dynamic"][9].shape[0] == 5
 
 
+def test_v4_knn_strict_caps_allow_non_knn_distant_runtime_cap(tmp_path):
+    background = np.zeros((2, 6), dtype=np.float32)
+    background[1, 0] = 3.0
+    store = _prepare_demo_assets(
+        tmp_path,
+        pointcloud_config_normalized={
+            "type": "hybrid",
+            "near_max_points": 1000,
+            "distant_max_points": 400,
+            "monocular_dynamic_recovery_max_points_per_instance": 1000,
+        },
+        pointcloud_payload={
+            "background": background,
+            "dynamic": {9: np.ones((1, 6), dtype=np.float32)},
+            "instance_mapping": {1009: 9},
+            "metadata": {"static_instance_intids": []},
+        },
+        knn_payload={
+            "background_avg_dist_by_k": {4: np.ones((2,), dtype=np.float32)},
+            "dynamic_avg_dist_by_k": {4: {9: np.ones((1,), dtype=np.float32)}},
+        },
+    )
+    data_cfg, dataset_cfg = _build_cfg(
+        tmp_path,
+        pointcloud={
+            "type": "hybrid",
+            "near_max_points": 1000,
+            "distant_max_points": 200,
+            "monocular_dynamic_recovery_max_points_per_instance": 1000,
+        },
+    )
+    ds = MultiSceneDatasetV4(
+        dataset_cfg=dataset_cfg,
+        data_cfg=data_cfg,
+        device=torch.device("cpu"),
+        asset_store=store,
+        knn_requirements={
+            "enabled": True,
+            "background_ks": [4],
+            "dynamic_ks": [4],
+            "required_branches": ["bg", "rigid"],
+        },
+    )
+    ds.initialize()
+    bundle = ds._resolve_segment_bundle(1, 0)
+    assert bundle.pointcloud["background"].shape[0] == 2
+
+
+def test_v4_knn_strict_caps_reject_knn_backed_runtime_cap_mismatch(tmp_path):
+    store = _prepare_demo_assets(
+        tmp_path,
+        pointcloud_config_normalized={
+            "type": "hybrid",
+            "near_max_points": 1000,
+            "distant_max_points": 400,
+            "monocular_dynamic_recovery_max_points_per_instance": 1000,
+        },
+        knn_payload={
+            "background_avg_dist_by_k": {4: np.ones((2,), dtype=np.float32)},
+            "dynamic_avg_dist_by_k": {4: {9: np.ones((1,), dtype=np.float32)}},
+        },
+    )
+    data_cfg, dataset_cfg = _build_cfg(
+        tmp_path,
+        pointcloud={
+            "type": "hybrid",
+            "near_max_points": 999,
+            "distant_max_points": 200,
+            "monocular_dynamic_recovery_max_points_per_instance": 1000,
+        },
+    )
+    ds = MultiSceneDatasetV4(
+        dataset_cfg=dataset_cfg,
+        data_cfg=data_cfg,
+        device=torch.device("cpu"),
+        asset_store=store,
+        knn_requirements={
+            "enabled": True,
+            "background_ks": [4],
+            "dynamic_ks": [4],
+            "required_branches": ["bg", "rigid"],
+        },
+    )
+    with pytest.raises(ValueError, match="checked_cap_keys=.*near_max_points"):
+        ds.initialize()
+
+
 def test_v4_matching_pointcloud_caps_skips_runtime_downsample(tmp_path):
     inside_pts = np.zeros((60, 6), dtype=np.float32)
     outside_pts = np.zeros((80, 6), dtype=np.float32)

@@ -130,8 +130,12 @@ def _extract_pointcloud_caps(d: Dict[str, Any]) -> Dict[str, Optional[int]]:
     return {k: _cap_int_or_none(d, k) for k in _POINTCLOUD_CAP_KEYS}
 
 
-def _pointcloud_cap_triplet_differs(asset_pc: Dict[str, Any], runtime_pc: Dict[str, Any]) -> bool:
-    for key in _POINTCLOUD_CAP_KEYS:
+def _pointcloud_cap_keys_differ(
+    asset_pc: Dict[str, Any],
+    runtime_pc: Dict[str, Any],
+    keys: Sequence[str],
+) -> bool:
+    for key in keys:
         if _cap_int_or_none(asset_pc, key) != _cap_int_or_none(runtime_pc, key):
             return True
     return False
@@ -297,6 +301,20 @@ class MultiSceneDatasetV4:
             return "fixed_cached" if self._knn_requirements.fixed_neighbor_enabled else "unknown"
         return ",".join(self._knn_requirements.required_branches)
 
+    def _knn_strict_pointcloud_cap_keys(self) -> Tuple[str, ...]:
+        branches = set(str(x) for x in self._knn_requirements.required_branches)
+        if len(branches) == 0:
+            return tuple(_POINTCLOUD_CAP_KEYS)
+
+        keys: List[str] = []
+        if "bg" in branches:
+            keys.append("near_max_points")
+        if "distant" in branches:
+            keys.append("distant_max_points")
+        if "rigid" in branches:
+            keys.append("monocular_dynamic_recovery_max_points_per_instance")
+        return tuple(k for k in _POINTCLOUD_CAP_KEYS if k in set(keys))
+
     @staticmethod
     def _stride_keep_indices(num_points: int, max_count: Optional[int]) -> np.ndarray:
         n = int(num_points)
@@ -424,12 +442,15 @@ class MultiSceneDatasetV4:
                 "Strict asset alignment requires segment manifest pointcloud_config_normalized for cap checks, "
                 f"but it is missing/invalid (context={context} scene_id={int(scene_id)} segment_id={int(segment_id)})"
             )
-        if not _pointcloud_cap_triplet_differs(asset_pc, runtime_pc):
+        strict_cap_keys = self._knn_strict_pointcloud_cap_keys()
+        if not _pointcloud_cap_keys_differ(asset_pc, runtime_pc, strict_cap_keys):
             return
         raise ValueError(
-            "Runtime pointcloud caps must exactly match exported asset caps; runtime cap downsample is disabled in strict mode. "
+            "Runtime pointcloud caps for KNN-backed branches must match exported asset caps; "
+            "runtime cap downsample is disabled for KNN-backed branches in strict mode. "
             f"(context={context} branches={self._knn_required_branches_label()} "
             f"scene_id={int(scene_id)} segment_id={int(segment_id)} "
+            f"checked_cap_keys={list(strict_cap_keys)} "
             f"asset_caps={_extract_pointcloud_caps(asset_pc)} runtime_caps={_extract_pointcloud_caps(runtime_pc)}). "
             "Re-export assets (segment + segment_knn) with the current pointcloud config."
         )

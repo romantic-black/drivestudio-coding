@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import gc
 import logging
 import os
 from collections import defaultdict
@@ -343,6 +344,10 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         far_cfg = self._cfg_get(struct_cfg, "far", {}) or {}
         updater_cfg = self._cfg_get(stage6, "posterior_updater", {}) or {}
         clamp_cfg = self._cfg_get(updater_cfg, "clamps", {}) or {}
+        render_cfg = self._cfg_get(stage6, "render", {}) or {}
+        self.stage6_render_grouped_multiview_train = bool(
+            self._cfg_get(render_cfg, "grouped_multiview_train", True)
+        )
         token_dim = int(self._cfg_get(token_cfg, "token_dim", 48))
         self.stage6_event_dim = int(self._cfg_get(struct_cfg, "event_dim", self._cfg_get(updater_cfg, "event_dim", token_dim)))
         if int(self.stage6_event_dim) != int(token_dim):
@@ -680,6 +685,35 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             raise ValueError("Stage6 Phase A requires source_egocar_masks for V4 evidence.")
         return sub_views, sub_images, sub_sky, sub_ego
 
+    def _stage6_rigid_point_valid_mask(self, node_state_rigid: NodeStateRigid, frame_idx: int) -> torch.Tensor:
+        resolved = self._resolve_rigid_frame_idx(node_state_rigid, int(frame_idx))
+        if resolved is not None:
+            return self._rigid_point_valid_mask(node_state_rigid, int(frame_idx))
+
+        warned = getattr(self, "_stage6_missing_rigid_frame_warned", set())
+        key = int(frame_idx)
+        if key not in warned:
+            if len(warned) < 8:
+                logger.warning(
+                    "Stage6_0 rigid frame_idx=%s missing in dynamic_info frame_ids=%s; "
+                    "treat rigid branch as invisible for this frame.",
+                    int(frame_idx),
+                    list(node_state_rigid.frame_ids),
+                )
+            elif len(warned) == 8:
+                logger.warning(
+                    "Stage6_0 encountered more rigid frames missing from dynamic_info; "
+                    "further missing-rigid-frame warnings are suppressed."
+                )
+            warned = set(warned)
+            warned.add(key)
+            self._stage6_missing_rigid_frame_warned = warned
+        return torch.zeros(
+            (int(node_state_rigid.means.shape[0]),),
+            dtype=torch.bool,
+            device=node_state_rigid.means.device,
+        )
+
     def _local_to_node_states_detached(self, local_state: LocalGSState) -> tuple[NodeStateBackground, Optional[NodeStateDistant], Optional[NodeStateRigid]]:
         return local_state.to_node_states_detached()
 
@@ -704,7 +738,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             )
             route = None
             if rigid_m is not None:
-                mask_src_rigid = self._rigid_point_valid_mask(rigid_m, int(source_frame_idx))
+                mask_src_rigid = self._stage6_rigid_point_valid_mask(rigid_m, int(source_frame_idx))
                 S = torch.nonzero(mask_src_rigid, as_tuple=False).squeeze(1)
                 route = self._route_rigid_source_points(rigid_m, int(source_frame_idx), S)
             else:
@@ -1100,7 +1134,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         parts = [self._branch_render_params(local_state.bg)]
         rigid_node = self._local_rigid_node_state(local_state)
         if local_state.rigid is not None and rigid_node is not None:
-            valid = self._rigid_point_valid_mask(rigid_node, int(frame_idx))
+            valid = self._stage6_rigid_point_valid_mask(rigid_node, int(frame_idx))
             idx = torch.nonzero(valid, as_tuple=False).squeeze(1)
             if idx.numel() > 0:
                 rigid_local_all = self._branch_render_params(local_state.rigid)
@@ -1141,7 +1175,8 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 heights.append(int(height))
                 widths.append(int(width))
             h0, w0 = int(heights[0]), int(widths[0])
-            if all(int(h) == h0 and int(w) == w0 for h, w in zip(heights, widths)):
+            use_grouped_multiview = bool(getattr(self, "stage6_render_grouped_multiview_train", True))
+            if use_grouped_multiview and all(int(h) == h0 and int(w) == w0 for h, w in zip(heights, widths)):
                 multi_result = self._render_multi_view(render_params, targets_f)
                 if multi_result is not None:
                     for (orig_idx, _target), (rgb, acc) in zip(group, multi_result):
@@ -1328,6 +1363,9 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         k_values: List[int],
         max_K: int,
         mask_cfg: Optional[Dict[str, Any]] = None,
+        compute_delta_stats: bool = True,
+        compute_runtime_stats: bool = True,
+        compute_memory_stats: bool = True,
         save_images: bool = False,
         save_dir: Optional[str] = None,
         save_image_k_values: Optional[List[int]] = None,
@@ -1341,6 +1379,9 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             k_values=[int(x) for x in k_values],
             max_K=int(max_K),
             mask_cfg=mask_cfg,
+            compute_delta_stats=bool(compute_delta_stats),
+            compute_runtime_stats=bool(compute_runtime_stats),
+            compute_memory_stats=bool(compute_memory_stats),
             save_images=bool(save_images),
             save_dir=save_dir,
             save_image_k_values=save_image_k_values,
@@ -1373,8 +1414,11 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 distant=out["node_state_distant"],
                 rigid=out["node_state_rigid"],
             )
+        did_reset_node_state = False
         if scheduler_node_sync is not None and bool(scheduler_node_sync.get("reset_after_block", False)):
             self.reset_node_state()
+            did_reset_node_state = True
+        self.optimizer.zero_grad(set_to_none=True)
         per_step = list(out.get("per_step") or [])
         final = per_step[-1] if per_step else {}
         logs: Dict[str, Any] = {
@@ -1398,6 +1442,10 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "mask/block_skipped_no_valid_pixels_final": float(final.get("block_skipped", 0.0)),
             "mask/nearby_skipped_no_valid_pixels_final": float(final.get("nearby_skipped", 0.0)),
             "phaseA/grad_norm_total": float(grad_norm.detach().item()),
+            "node_state_sync_reset": bool(did_reset_node_state),
+            "node_state_cache_segments_bg": int(len(getattr(self, "node_states_bg", {}))),
+            "node_state_cache_segments_distant": int(len(getattr(self, "node_states_distant", {}))),
+            "node_state_cache_segments_rigid": int(len(getattr(self, "node_states_rigid", {}))),
             **grad_group_sums,
         }
         for item in per_step:
@@ -1409,6 +1457,18 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             logs[f"mask/nearby_valid_ratio_k{k}"] = float(item.get("nearby_valid_ratio", 0.0))
             logs[f"mask/block_skipped_no_valid_pixels_k{k}"] = float(item.get("block_skipped", 0.0))
             logs[f"mask/nearby_skipped_no_valid_pixels_k{k}"] = float(item.get("nearby_skipped", 0.0))
+        if did_reset_node_state:
+            del out, loss
+            empty_cache = str(os.environ.get("STAGE6_EMPTY_CACHE_ON_RESET", "")).lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            if empty_cache:
+                gc.collect()
+            if empty_cache and torch.cuda.is_available():
+                torch.cuda.empty_cache()
         return logs
 
     def _assert_group_nonzero_grad(

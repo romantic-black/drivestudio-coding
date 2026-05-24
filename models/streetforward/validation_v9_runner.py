@@ -291,6 +291,9 @@ def validate_v9_phase_a(
     k_values: Sequence[int],
     max_K: int,
     mask_cfg: Optional[Dict[str, Any]] = None,
+    compute_delta_stats: bool = True,
+    compute_runtime_stats: bool = True,
+    compute_memory_stats: bool = True,
     save_images: bool = False,
     save_dir: Optional[str] = None,
     save_image_k_values: Optional[Sequence[int]] = None,
@@ -325,9 +328,16 @@ def validate_v9_phase_a(
         "update_ms": 0.0,
         "render_metric_ms": 0.0,
     }
-    if torch.cuda.is_available():
+    if bool(compute_memory_stats) and torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
-    total_t0 = time.perf_counter()
+    total_t0 = time.perf_counter() if bool(compute_runtime_stats) else 0.0
+    local_state = None
+    measurement = None
+    delta = None
+    update_aux = None
+    node_state_bg = None
+    node_state_rigid = None
+    node_state_distant = None
     try:
         model.eval()
         with torch.no_grad():
@@ -357,7 +367,7 @@ def validate_v9_phase_a(
                     )
 
             def record_at(k: int) -> None:
-                render_t0 = time.perf_counter()
+                render_t0 = time.perf_counter() if bool(compute_runtime_stats) else 0.0
                 save_this = block_save_dir if int(k) in save_ks else None
                 block_stats = _render_metrics_for_indices(
                     model,
@@ -387,7 +397,8 @@ def validate_v9_phase_a(
                     save_k=int(k),
                     max_saved_cams=int(max_saved_cams),
                 )
-                timings["render_metric_ms"] += float((time.perf_counter() - render_t0) * 1000.0)
+                if bool(compute_runtime_stats):
+                    timings["render_metric_ms"] += float((time.perf_counter() - render_t0) * 1000.0)
                 for prefix, stats in (("block", block_stats), ("nearby", nearby_stats)):
                     row[f"{prefix}_psnr@{int(k)}"] = float(stats.get("psnr", 0.0))
                     row[f"{prefix}_l1@{int(k)}"] = float(stats.get("l1", 0.0))
@@ -406,33 +417,37 @@ def validate_v9_phase_a(
                 gap = float(row[f"block_psnr@{int(k)}"]) - float(row[f"nearby_psnr@{int(k)}"])
                 row[f"generalization_gap@{int(k)}"] = gap
                 row[f"val_v9/phaseA/generalization_gap@{int(k)}"] = gap
-                for name, value in _collect_state_stats(local_state, k=int(k)).items():
-                    if name == "k":
-                        continue
-                    row[f"{name}@{int(k)}"] = float(value)
-                    row[f"val_v9/phaseA/{name}@{int(k)}"] = float(value)
+                if bool(compute_delta_stats):
+                    for name, value in _collect_state_stats(local_state, k=int(k)).items():
+                        if name == "k":
+                            continue
+                        row[f"{name}@{int(k)}"] = float(value)
+                        row[f"val_v9/phaseA/{name}@{int(k)}"] = float(value)
 
             record_at(0)
             delta_by_k: Dict[int, Dict[str, float]] = {}
             for k in range(1, int(max_K) + 1):
                 evidence_refs = roles.evidence_refs_by_step[int(k) - 1]
                 source_frame_idx = int(evidence_refs[0][0])
-                observe_t0 = time.perf_counter()
+                observe_t0 = time.perf_counter() if bool(compute_runtime_stats) else 0.0
                 measurement = model._observe_v4_measurement(
                     local_state=local_state,
                     batch=batch,
                     source_indices=roles.evidence_source_indices_by_step[int(k) - 1],
                     source_frame_idx=int(source_frame_idx),
                 )
-                timings["observe_ms"] += float((time.perf_counter() - observe_t0) * 1000.0)
-                update_t0 = time.perf_counter()
+                if bool(compute_runtime_stats):
+                    timings["observe_ms"] += float((time.perf_counter() - observe_t0) * 1000.0)
+                update_t0 = time.perf_counter() if bool(compute_runtime_stats) else 0.0
                 local_state, delta, update_aux = model._encode_and_update(
                     local_state=local_state,
                     measurement=measurement,
                 )
-                timings["update_ms"] += float((time.perf_counter() - update_t0) * 1000.0)
-                delta_by_k[int(k)] = _collect_delta_stats(delta, update_aux, k=int(k))
-                if int(k) in k_values_i:
+                if bool(compute_runtime_stats):
+                    timings["update_ms"] += float((time.perf_counter() - update_t0) * 1000.0)
+                if bool(compute_delta_stats):
+                    delta_by_k[int(k)] = _collect_delta_stats(delta, update_aux, k=int(k))
+                if bool(compute_delta_stats) and int(k) in k_values_i:
                     for name, value in delta_by_k[int(k)].items():
                         if name == "k":
                             continue
@@ -461,33 +476,43 @@ def validate_v9_phase_a(
     finally:
         if snap is not None and hasattr(model, "_restore_runtime_state"):
             model._restore_runtime_state(key, snap)
+        snap = None
         _drop_runtime_key(model, key, had_key)
         if prev_training:
             model.train()
+        local_state = None
+        measurement = None
+        delta = None
+        update_aux = None
+        node_state_bg = None
+        node_state_rigid = None
+        node_state_distant = None
 
-    total_ms = float((time.perf_counter() - total_t0) * 1000.0)
-    row["time_total_ms"] = total_ms
-    row["time_per_block_ms"] = total_ms
-    row["time_observe_ms_per_iter"] = float(timings["observe_ms"] / max(int(max_K), 1))
-    row["time_struct_event_ms_per_iter"] = float(timings["update_ms"] / max(int(max_K), 1))
-    row["time_updater_ms_per_iter"] = float(timings["update_ms"] / max(int(max_K), 1))
-    row["time_render_metric_ms"] = float(timings["render_metric_ms"])
-    row["time_ms_per_iter"] = float((timings["observe_ms"] + timings["update_ms"]) / max(int(max_K), 1))
-    row["val_v9/phaseA/time_total_ms"] = float(row["time_total_ms"])
-    row["val_v9/phaseA/time_per_block_ms"] = float(row["time_per_block_ms"])
-    row["val_v9/phaseA/time_observe_ms_per_iter"] = float(row["time_observe_ms_per_iter"])
-    row["val_v9/phaseA/time_struct_event_ms_per_iter"] = float(row["time_struct_event_ms_per_iter"])
-    row["val_v9/phaseA/time_updater_ms_per_iter"] = float(row["time_updater_ms_per_iter"])
-    row["val_v9/phaseA/time_per_iter_ms"] = float(row["time_ms_per_iter"])
-    row["val_v9/phaseA/time_render_metric_ms"] = float(row["time_render_metric_ms"])
-    if torch.cuda.is_available():
-        row["cuda_max_allocated_mb"] = float(torch.cuda.max_memory_allocated() / (1024.0 * 1024.0))
-        row["cuda_max_reserved_mb"] = float(torch.cuda.max_memory_reserved() / (1024.0 * 1024.0))
-    else:
-        row["cuda_max_allocated_mb"] = 0.0
-        row["cuda_max_reserved_mb"] = 0.0
-    row["val_v9/phaseA/cuda_max_allocated_mb"] = float(row["cuda_max_allocated_mb"])
-    row["val_v9/phaseA/cuda_max_reserved_mb"] = float(row["cuda_max_reserved_mb"])
+    if bool(compute_runtime_stats):
+        total_ms = float((time.perf_counter() - total_t0) * 1000.0)
+        row["time_total_ms"] = total_ms
+        row["time_per_block_ms"] = total_ms
+        row["time_observe_ms_per_iter"] = float(timings["observe_ms"] / max(int(max_K), 1))
+        row["time_struct_event_ms_per_iter"] = float(timings["update_ms"] / max(int(max_K), 1))
+        row["time_updater_ms_per_iter"] = float(timings["update_ms"] / max(int(max_K), 1))
+        row["time_render_metric_ms"] = float(timings["render_metric_ms"])
+        row["time_ms_per_iter"] = float((timings["observe_ms"] + timings["update_ms"]) / max(int(max_K), 1))
+        row["val_v9/phaseA/time_total_ms"] = float(row["time_total_ms"])
+        row["val_v9/phaseA/time_per_block_ms"] = float(row["time_per_block_ms"])
+        row["val_v9/phaseA/time_observe_ms_per_iter"] = float(row["time_observe_ms_per_iter"])
+        row["val_v9/phaseA/time_struct_event_ms_per_iter"] = float(row["time_struct_event_ms_per_iter"])
+        row["val_v9/phaseA/time_updater_ms_per_iter"] = float(row["time_updater_ms_per_iter"])
+        row["val_v9/phaseA/time_per_iter_ms"] = float(row["time_ms_per_iter"])
+        row["val_v9/phaseA/time_render_metric_ms"] = float(row["time_render_metric_ms"])
+    if bool(compute_memory_stats):
+        if torch.cuda.is_available():
+            row["cuda_max_allocated_mb"] = float(torch.cuda.max_memory_allocated() / (1024.0 * 1024.0))
+            row["cuda_max_reserved_mb"] = float(torch.cuda.max_memory_reserved() / (1024.0 * 1024.0))
+        else:
+            row["cuda_max_allocated_mb"] = 0.0
+            row["cuda_max_reserved_mb"] = 0.0
+        row["val_v9/phaseA/cuda_max_allocated_mb"] = float(row["cuda_max_allocated_mb"])
+        row["val_v9/phaseA/cuda_max_reserved_mb"] = float(row["cuda_max_reserved_mb"])
     return row
 
 

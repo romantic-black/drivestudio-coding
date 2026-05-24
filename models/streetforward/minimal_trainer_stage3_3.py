@@ -289,6 +289,20 @@ class MinimalStreetForwardStage3_3(MinimalStreetForwardStage3_2):
         fg_points, fg_colors = points[in_crop], colors[in_crop]
         distant_points, distant_colors = points[~in_crop], colors[~in_crop]
 
+        def _limit_region(
+            pts: np.ndarray,
+            cols: np.ndarray,
+            max_count: Optional[int],
+        ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+            if max_count is None or max_count <= 0 or len(pts) <= max_count:
+                idx = np.arange(len(pts), dtype=np.int64)
+                return pts, cols, idx
+            step = max(1, len(pts) // int(max_count))
+            idx = np.arange(0, len(pts), dtype=np.int64)[::step]
+            if len(idx) > int(max_count):
+                idx = idx[: int(max_count)]
+            return pts[idx], cols[idx], idx
+
         bg_knn_avg: Optional[np.ndarray] = None
         distant_knn_avg: Optional[np.ndarray] = None
         need_bg_knn = str(self.bg_cfg["init"]["scale_init_mode"]) == "knn"
@@ -323,6 +337,21 @@ class MinimalStreetForwardStage3_3(MinimalStreetForwardStage3_2):
                 bg_knn_avg = _fetch_bg_knn(int(self.bg_cfg["init"]["knn_k"]), "bg")[in_crop]
             if need_distant_knn:
                 distant_knn_avg = _fetch_bg_knn(int(self.distant_cfg["init"]["knn_k"]), "distant")[~in_crop]
+
+        fg_points, fg_colors, fg_keep = _limit_region(
+            fg_points,
+            fg_colors,
+            getattr(self, "near_max_points", None),
+        )
+        distant_points, distant_colors, distant_keep = _limit_region(
+            distant_points,
+            distant_colors,
+            getattr(self, "distant_max_points", None),
+        )
+        if bg_knn_avg is not None:
+            bg_knn_avg = np.ascontiguousarray(bg_knn_avg[fg_keep], dtype=np.float32)
+        if distant_knn_avg is not None:
+            distant_knn_avg = np.ascontiguousarray(distant_knn_avg[distant_keep], dtype=np.float32)
 
         if len(fg_points) == 0:
             raise ValueError("No points inside segment_aabb for stage3_3 bg node-state init.")

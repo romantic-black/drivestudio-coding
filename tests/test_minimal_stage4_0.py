@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numpy as np
 import pytest
 import torch
 
@@ -75,6 +76,51 @@ def test_rigid_invalid_instance_filtered():
     valid = trainer._rigid_point_valid_mask(state, frame_idx=7)
     assert valid.shape[0] == 1
     assert bool(valid[0]) is False
+
+
+def test_stage4_bg_distant_init_applies_runtime_point_caps():
+    trainer = MinimalStreetForwardStage4_0.__new__(MinimalStreetForwardStage4_0)
+    trainer.device = torch.device("cpu")
+    trainer.bbx_min = torch.tensor([-1.0, -1.0, -1.0])
+    trainer.bbx_max = torch.tensor([1.0, 1.0, 1.0])
+    trainer.sh_degree = 1
+    trainer.near_max_points = 3
+    trainer.distant_max_points = 2
+    trainer.node_states_bg = {}
+    trainer.node_states_distant = {}
+    trainer.bg_cfg = {
+        "init": {
+            "scale_init_mode": "isotropic",
+            "isotropic_log_value": -2.3,
+            "knn_k": 8,
+            "knn_log_scale_bias": -1.5,
+            "opacity_init": 0.1,
+        }
+    }
+    trainer.distant_cfg = {
+        "init": {
+            "scale_init_mode": "isotropic",
+            "isotropic_log_value": -1.7,
+            "knn_k": 8,
+            "knn_log_scale_bias": -1.2,
+            "opacity_init": 0.05,
+        }
+    }
+
+    near = np.zeros((5, 6), dtype=np.float32)
+    distant = np.zeros((4, 6), dtype=np.float32)
+    distant[:, 0] = 3.0
+    batch = {
+        "scene_id": 1,
+        "segment_id": 0,
+        "pointcloud": {"background": np.concatenate([near, distant], axis=0)},
+    }
+
+    node_state_bg, node_state_distant = trainer._get_or_init_node_states_bg_distant(batch)
+
+    assert int(node_state_bg.means.shape[0]) == 3
+    assert node_state_distant is not None
+    assert int(node_state_distant.means.shape[0]) == 2
 
 
 def test_rigid_row_space_metadata_accepts_matching_layout():
