@@ -1,0 +1,960 @@
+output_name: experiment001
+
+initialization:
+  phase_b_from_phase_a:
+    enable: true
+    # Fill this with a checkpoint produced by
+    # MinimalStreetForwardStage6_0.build_phase_b_export_checkpoint().
+    # A normal Phase A resume checkpoint is intentionally rejected by default,
+    # because Phase B needs only frozen measurement/lifting/updater-base weights
+    # plus fresh VSM/QueryDecoder/ctx-adapter state.
+    checkpoint: "/root/autodl-tmp/outputs/minimal_sf_stage6_0_phase_a_v9/experiment001/checkpoints/minimal_sf_stage6_0_phase_a_v9_step60000.pt"
+    required: true
+    weights_only: true
+    export_type: stage6_0_phase_a_for_phase_b
+    reject_plain_model_state_dict: false
+    load_modules:
+      measurement_frontend: true
+      struct_event_decoder: true
+      param_obs_codec: true
+      posterior_updater_base: true
+      vsm: false
+      query_decoder: false
+      optimizer: false
+    freeze_after_load:
+      measurement_frontend: true
+      struct_event_decoder: true
+      posterior_updater_base: true
+    train_new_modules:
+      vsm: true
+      query_decoder: true
+      posterior_updater_vsm_ctx_adapter: true
+
+data:
+  data_root: "/root/autodl-tmp/nuScenes/"
+  dataset: "nuscenes"
+  start_timestep: 0
+  end_timestep: -1
+  preload_device: cpu
+  sky_mask_semantics: one_is_sky
+  train_scene_ids: [14, 16, 24, 32, 40, 99, 107, 115, 123, 131, 139, 147, 155, 163, 171, 179, 195, 214,
+    17, 25, 33, 41, 49, 100, 108, 116, 124, 132, 140, 148, 156, 164, 172, 180, 188, 196, 215,
+    10, 18, 26, 34, 42, 93, 101, 109, 117, 125, 133, 141, 149, 157, 165, 173, 181, 189, 197, 216,
+    11, 19, 27, 35, 43, 94, 102, 110, 118, 126, 134, 142, 150, 158, 166, 174, 182, 190, 198, 217,
+    12, 20, 36, 44, 95, 103, 111, 119, 127, 135, 143, 151, 159, 167, 175, 183, 191, 199, 218,
+    13, 21, 29, 37, 45, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200,
+    22, 30, 38, 46, 97, 105, 113, 121, 129, 137, 145, 153, 161, 169, 177, 185, 193, 201,
+    15, 23, 31, 39, 47, 98, 106, 114, 122, 130, 138, 146, 154, 162, 170, 178, 186, 194]
+  eval_scene_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9,]
+  preload:
+    enable: true
+    num_workers: 1
+    max_pending_tasks: 64
+    enable_view_pack_cache: true
+    view_cache_max_items_total: 32
+    view_cache_max_items_per_scene: 16
+    view_cache_device: cpu
+    dedupe_tasks: true
+    drop_stale_hints: true
+    warm_scene_meta: true
+    warm_segment_static: true
+    warm_segment_pointcloud: true
+    warm_next_block_exact: true
+    warm_test_refs: false
+    warm_episode_source_superset: true
+    warm_overlap_pairs_episode_superset: true
+    warm_overlap_pairs_next_block_exact: true
+    stats_log_interval_steps: 0
+  pixel_source:
+    type: datasets.nuscenes.nuscenes_sourceloader.NuScenesPixelSource
+    cameras: [0, 1, 2]
+    downscale_when_loading: [3, 3, 3]
+    downscale: 1
+    undistort: false
+    test_image_stride: 0
+    max_test_images: 0
+    load_sky_mask: true
+    load_dynamic_mask: true
+    load_egocar_mask: true
+    load_depth_maps: true
+    load_objects: true
+    load_smpl: false
+    sampler:
+      buffer_downscale: 8
+      buffer_ratio: 0.5
+      start_enhance_weight: 3
+  lidar_source:
+    type: datasets.nuscenes.nuscenes_sourceloader.NuScenesLiDARSource
+    load_lidar: true
+    lidar_downsample_factor: 1
+    lidar_percentile: 0.02
+  assets:
+    root: "/root/autodl-tmp/streetforward_assets_pt40w_40w"
+  scene_asset_cache_max_items: 16
+  segment_static_cache_max_items: 32
+  image_meta_cache_max_items: 4096
+  view_pack_cache_max_items: 512
+
+dataset:
+  num_source_keyframes: 1
+  num_target_keyframes: 3
+  segment_overlap_ratio: 0.5
+  min_keyframes_per_scene: 2
+  min_keyframes_per_segment: 2
+  preload_scene_count: 2
+  keyframe_split_config:
+    num_splits: 0
+    min_count: 1
+    min_length: 3.0
+  segment_aabb:
+    - [-20.0, -10.0, 0.0]
+    - [20.0, 4.8, 60.0]
+  pointcloud:
+    type: "hybrid"
+    lidar_sparsity: full
+    monocular_chosen_cam_ids: [0, 1, 2]
+    monocular_sparsity: full
+    monocular_filter_sky: true
+    monocular_depth_consistency: false
+    monocular_downscale: 1
+    monocular_dynamic_recovery_bbox_expand_xyz_m: [0.5, 0.2, 0.5]
+    monocular_dynamic_recovery_max_points_per_instance: 5000
+    near_max_points: 400000
+    distant_max_points: 160000
+    max_dynamic_points_per_segment: 120000
+    static_instance_motion:
+      enable: true
+      traj_length_thresh_m: 0.5
+
+scheduler_v9:
+  enable: true
+  phase: phase_B_viewset_rollout
+  fail_fast: true
+  block:
+    steps_per_block: 1
+  episode:
+    blocks_per_episode: 12
+    include_source_frame: true
+    target_policy: visited_episode_frames
+    reset_policy: episode_end
+    block_source_frame_policy: random_within_keyframe_per_visit
+    frame_within_keyframe_policy: random_once_per_episode
+    min_keyframes_required_policy: use_available_if_less_than_window
+    source_mode: keyframes
+  traversal:
+    mode: round_robin_episode_interleave
+    switch_after_episode: true
+    fixed_scene_id: null
+    fixed_segment_id: null
+    segment_order: ascending
+    scene_order: shuffle_per_epoch
+  execution:
+    block_order: step_major
+    step_major_switch_interval_steps: 4
+    reset_policy: episode_end
+  preload:
+    emit_hints: true
+    warm_next_block_exact: true
+    warm_next_episode_chain: true
+    warm_v9_role_refs: true
+  phase_A:
+    mode: block_local_unroll
+    block:
+      repeat_block_iteration: true
+      inner_K_choices: [2, 4, 6, 8]
+      inner_K_probs: [0.25, 0.25, 0.25, 0.25]
+      source_frame_policy: fixed_for_scheduler_step
+      block_loss_policy: source_frame_all_cams
+    nearby_supervision:
+      enable: true
+      role_name: phaseA_nearby
+      policy: adjacent_then_random_same_keyframe
+      same_keyframe_only: true
+      frames_per_block: 2
+      adjacent_radius: 1
+      random_fill: true
+      exclude_source_frame: true
+      exclude_existing_block_loss_frames: true
+      insufficient_policy: skip
+      camera_policy: all_cams
+      add_to_evidence_refs: false
+      add_to_source_image_refs: false
+      add_to_history_record_views: false
+      apply_every_step: false
+      apply_final_step_only: true
+      loss_weight: 0.25
+      loss_warmup_steps: 2000
+      max_refs_per_step: 12
+    masks:
+      block_loss_mask: non_sky_non_egocar
+      nearby_loss_mask: non_sky_non_egocar
+  phase_B:
+    episode:
+      reset_vsm_on_episode_end: true
+    rollout:
+      mode: episode_grouped_repeat_tbptt
+      repeat_patterns:
+        - name: r2_b4
+          repeats_per_block: 2
+          blocks_per_chunk: 4
+          prob: 0.80
+        - name: r4_b2
+          repeats_per_block: 4
+          blocks_per_chunk: 2
+          prob: 0.20
+      max_inner_K: 12
+      curriculum:
+        - start_step: 0
+          repeat_patterns:
+            - name: r6_b2
+              repeats_per_block: 6
+              blocks_per_chunk: 2
+              prob: 1.0
+        - start_step: 20000
+          repeat_patterns:
+            - name: r6_b2
+              repeats_per_block: 6
+              blocks_per_chunk: 2
+              prob: 0.5
+            - name: r4_b3
+              repeats_per_block: 4
+              blocks_per_chunk: 3
+              prob: 0.5
+        - start_step: 40000
+          repeat_patterns:
+            - name: r6_b2
+              repeats_per_block: 6
+              blocks_per_chunk: 2
+              prob: 0.4
+            - name: r4_b3
+              repeats_per_block: 4
+              blocks_per_chunk: 3
+              prob: 0.4
+            - name: r2_b4
+              repeats_per_block: 2
+              blocks_per_chunk: 4
+              prob: 0.2
+
+      sample_event_frames: sequential_blocks_in_episode
+      event_order: chronological
+      distinct_event_frames: true
+      repeat_source_frame_policy: fixed_within_block
+      repeat_memory_write_policy: first_repeat_only
+      evidence_recompute_policy: every_repeat
+      allow_short_final_chunk: true
+    prefix_render:
+      policy: current_plus_random_previous
+      intermediate_views: 2
+      final_views: 3
+      max_refs_per_step: 18
+    query_observation:
+      enable: true
+      query_frame_policy: heldout_inside_event_span
+      frames_per_rollout: 1
+      cameras_per_frame: all_cams
+      exclude_event_frames: true
+      allow_empty_on_last_chunk: false
+    masks:
+      vsm_scope: bg_rigid
+      evidence_mask: non_sky_non_egocar
+      prefix_loss_mask: non_sky_non_egocar
+      query_label_mask: non_sky_non_egocar
+  leakage_check:
+    enable: true
+    nearby_not_in_evidence: true
+    query_not_in_evidence: true
+    aux_not_in_evidence: true
+    same_scene_segment_required: true
+    role_count_match_required: true
+    forbid_test_refs_in_train: true
+
+validation_v8:
+  eval_enable: false
+  mode: inference_only  # segment_finetune_train
+  block:
+    steps_per_block: 16
+  episode:
+    blocks_per_episode: 5
+    total_target_frames: 3
+    target_policy: visited_episode_frames
+  execution:
+    block_order: step_major
+    step_major_switch_interval_steps: 4
+    reset_policy: episode_end
+  trigger:
+    by: train_episode_interval
+    validate_every_n_episodes: 100
+    run_at_train_start: false
+  episode_selection:
+    policy: middle
+  render:
+    save_images: true
+    save_dir: validation/episodes
+  cache:
+    persist_across_training: true
+  metrics:
+    use_sky_mask_regions: true
+    min_valid_pixels_per_region: 32
+    require_sky_mask: true
+  near_random_supervision:
+    enable: false
+
+validation_v9:
+  enable: false
+  phase: phase_B_viewset_rollout
+  fail_fast: true
+  trigger:
+    by: train_episode_interval
+    validate_every_n_episodes: 100
+    run_at_train_start: false
+  selection:
+    seed: 20260524
+    eval_scene_ids_from_data: true
+    segments_per_scene: 1
+    segment_policy: random_seeded
+    resample_segments_every_validation: false
+    episode_policy: random_seeded
+    resample_episode_every_validation: false
+    blocks_per_segment: 2
+    block_policy: random_without_replacement
+    resample_blocks_every_validation: false
+    source_frame_policy: middle_in_keyframe
+  phase_A:
+    k_values: [0, 4, 8, 16, 32]
+    max_K: 32
+    nearby:
+      enable: true
+      frames_per_block: 1
+      policy: adjacent_then_random_same_keyframe
+      same_keyframe_only: true
+      camera_policy: all_cams
+    metrics:
+      render_at_k_values_only: true
+      compute_block_metrics: true
+      compute_nearby_metrics: true
+      compute_delta_stats: true
+      compute_runtime_stats: false
+      compute_memory_stats: false
+      compute_struct_stats: false
+    render:
+      save_images: false
+      save_image_k_values: [0, 8, 16]
+      max_saved_blocks: 2
+      max_saved_cams: 1
+      save_dir: validation_v9/phase_a
+  masks:
+    block_loss_mask: non_sky_non_egocar
+    nearby_loss_mask: non_sky_non_egocar
+    min_valid_pixels: 32
+    require_sky_mask: true
+    require_egocar_mask: true
+  phase_B:
+    reserved: true
+    prefix_render:
+      enable: false
+    query_observation:
+      enable: false
+
+model:
+  stage: "6_0"
+  phase: "phase_B_viewset_rollout"
+  production_training: false
+  backprojector_version: "v4"
+  scale_init_value: 0.1
+  sh_degree: 1
+  voxel_size: 0.2
+  sparseConv_outdim: 24
+  feat_2d_channels: 24
+  feat_2d_downscale: 1
+  feature_extractor:
+    type: dinov2_unet_fusion
+    dino:
+      model_name: vit_base_patch14_reg4_dinov2
+      pretrained: true
+      freeze: true
+      weights_path: null
+      out_channels: 24
+      intermediate_layers: [4, 8, 11]
+      pad_to_patch_multiple: 14
+    residual_unet:
+      in_channels: 6
+      feat_channels: 24
+      base_channels: 24
+      feature_downscale: 1
+      depth: 4
+      bilinear: true
+    fusion:
+      hidden_channels: 48
+      out_channels: 24
+  use_fused_cuda_backproject_v2: true
+  use_fused_cuda_backproject_v3: true
+  use_fused_cuda_backproject_v4: true
+  fused_cuda_backproject_v4_force_fallback: false
+  stage6_0:
+    fail_fast: true
+    phase_a_mode: "phase_b_frozen"
+    base_measurement:
+      type: "stage5_4_v4"
+      mode: frozen
+      require_fused_v4: true
+      require_obs_code: true
+      obs_code_dim: 2
+      source_evidence_grad_mode: "no_grad_v4"
+      train_2d_frontend: false
+      train_residual_unet: false
+      train_fusion_neck: false
+      train_v4_lift: false
+      train_dinov2: false
+      detach_v4_outputs: true
+    local_rollout:
+      source: "scheduler_v9"
+      use_scheduler_inner_K: true
+      local_G_no_detach_between_steps: true
+      detach_persistent_state_at_block_start: true
+      writeback_policy: "tbptt_cache_only"
+      writeback_after_optimizer_step: true
+      reset_local_state_on_nan: true
+    render:
+      grouped_multiview_train: true
+    struct_event_decoder:
+      enable: true
+      freeze: true
+      event_dim: 48
+      feat_2d_dim: 24
+      support_embed_dim: 4
+      branch_embed_dim: 4
+      token:
+        token_dim: 48
+        zero_invalid_2d_feat: true
+        use_2d_feat: true
+        use_support: true
+        use_branch_embed: true
+        use_param_obs_embed: true
+      param_obs_codec:
+        enable: true
+        raw_param_mode: stage5_normalize_params_17
+        obs_code_dim: 2
+        support_dim: 2
+        branch_embed_dim: 4
+        output_dim: 24
+        detach_params: true
+        detach_obs_code: true
+        detach_acc_w: true
+        norm: layernorm
+        activation: gelu
+      near:
+        type: xcpe
+        sparse_backend: spconv
+        num_blocks: 2
+        kernel_size: 3
+        voxel_size: 0.25
+        residual_scale_init: 5.0e-3
+        support_threshold_bg: ${model.branches.bg.src_backproject_support_min}
+        support_threshold_rigid: ${model.branches.rigid.src_backproject_support_min}
+      far:
+        type: point_mlp
+        hidden_dim: 48
+        num_layers: 2
+        support_threshold_distant: ${model.branches.distant.src_backproject_support_min}
+        support_threshold_rigid_out: ${model.branches.rigid.src_backproject_support_min}
+    event_encoder:
+      enable: false
+      mode: disabled_direct_concat_mlp
+    current_context_adapter:
+      enable: false
+      reserve_for_phase_b: true
+    posterior_updater:
+      enable: true
+      input_event: true
+      input_current_ctx: false
+      input_vsm_ctx: true
+      freeze_base: true
+      train_vsm_ctx_adapter: true
+      hidden_dim: 48
+      event_dim: 48
+      stage_hidden_dim: 48
+      split_heads:
+        geometry: true
+        density: true
+        appearance: true
+      confidence_head: true
+      noop_head: true
+      phase_b_hooks:
+        accept_vsm_ctx: true
+        vsm_ctx_dim: 48
+        vsm_ctx_adapter_init: "zero_last"
+        residual_scale_init: 0.0
+      branch_scope:
+        bg:
+          enable: true
+          update_means: true
+          update_scales: true
+          update_quat: true
+          update_opacity: true
+          update_sh: true
+        distant:
+          enable: false
+          update_means: false
+          update_scales: false
+          update_quat: false
+          update_opacity: false
+          update_sh: false
+        rigid:
+          enable: true
+          update_means: true
+          update_scales: true
+          update_quat: true
+          update_opacity: true
+          update_sh: true
+          update_hidden: true
+          history_memory: false
+          vsm: true
+      clamps:
+        means_max_step_m: 0.25
+        scales_log_max_step: 0.08
+        quat_axis_angle_max_step_rad: 0.08
+        opacity_logit_max_step: 0.25
+        sh_max_step: 0.10
+        hidden_max_step: 1.0
+      branch_clamps:
+        rigid:
+          means_max_step_m: 0.02
+          scales_log_max_step: 0.02
+          quat_axis_angle_max_step_rad: 0.002
+          opacity_logit_max_step: 0.10
+          sh_max_step: 0.05
+          hidden_max_step: 0.25
+    vsm:
+      enable: true
+      scope: bg_rigid
+      branches: [bg, rigid]
+      share_branch_weights: false
+      num_tokens: 4
+      token_dim: 48
+      proto_dim: 8
+      global_dim: 48
+      ctx_dim: 48
+      bg:
+        num_tokens: 4
+        token_dim: 48
+        proto_dim: 8
+        global_dim: 48
+        ctx_dim: 48
+      rigid:
+        num_tokens: 4
+        token_dim: 48
+        proto_dim: 8
+        global_dim: 48
+        ctx_dim: 48
+        update_by_indices: route_S
+        zero_unseen_ctx: true
+      router: learned_soft_assignment
+      update: gated_token_mlp
+      query: token_attention
+      persistent_dtype: bf16
+      reset_on_episode_end: true
+      tbptt:
+        enable: true
+        max_items: 8
+        strict: true
+        forbid_cache_eviction: true
+    query_decoder:
+      enable: true
+      branches: [bg, rigid]
+      share_branch_weights: false
+      input_dim: 48
+      hidden_dim: 96
+      obs_code_dim: 2
+      predict_event: true
+      predict_visible: true
+      predict_support_log: true
+      predict_obs_code: true
+  param_embed_dim: 48
+  offset_gru_hidden_dim: 48
+  offset_gru_use_reset_gate: true
+  rigid_routed:
+    route_space: source_frame_world
+    route_aabb: segment_aabb
+    inside_decoder: bg
+    outside_decoder: distant
+    update_means: true
+    update_quat: true
+  struct_decoder:
+    enable: true
+    type: "routed_near_far"
+    scope: "full_routed"
+    output_role: "gru_input"
+    point_preserving: true
+    include_bg: true
+    include_distant: true
+    include_rigid_in: true
+    include_rigid_out: true
+    feat_2d_channels: 24
+    param_embed_dim: 32
+    branch_embed_dim: 8
+    support_embed_dim: 8
+    history_embed_dim: 16
+    token:
+      use_2d_feat: true
+      use_support: true
+      use_branch_embed: true
+      use_param_embed: true
+      use_anchor_rgb: false
+      use_hidden_state: false
+      zero_invalid_2d_feat: true
+    near:
+      type: "xcpe"
+      branches: ["bg", "rigid_in"]
+      channels: 48
+      voxel_size: 0.20
+      sparse_backend: "spconv"
+      clamp_grid_coord: false
+      xcpe:
+        num_layers: 2
+        kernel_size: 3
+        residual_scale_init: 5.0e-3
+        norm: "layernorm"
+        act: "gelu"
+    far:
+      type: "mlp"
+      branches: ["distant", "rigid_out"]
+      channels: 48
+      hidden_dim: 48
+      num_layers: 2
+      norm: "layernorm"
+      act: "gelu"
+      history_embed:
+        enable: false
+  history_memory:
+    enable: false
+    record_on: "block_exit"
+    record_views: "source_image_refs"
+    support:
+      fast_ema_beta_visible: 0.35
+      fast_ema_beta_invisible: 0.60
+      slow_ema_beta_visible: 0.90
+      slow_ema_beta_invisible: 0.95
+    residual:
+      fast_error_beta: 0.35
+      slow_error_beta: 0.9
+      error_eps: 1.0e-6
+    update:
+      fast_ema_beta: 0.45
+      slow_ema_beta: 0.92
+      apply_in_eval: true
+  view_transient:
+    enable: false
+    source: ego_to_point
+    input_to_gate: true
+    input_to_struct_decoder: false
+    use_delta_xyz: true
+    use_delta_norm: true
+    use_angle_delta: false
+    use_initialized_flag: false
+    detach: true
+    update_in_train: true
+    update_in_eval: true
+  update_gate:
+    enable: false
+    type: attribute_5
+    hidden_dim: 48
+    require_initialized_in_input: true
+    include_visible_now: true
+    bind_with_mask_update: true
+    min_gate:
+      means: 0.03
+      scales: 0.03
+      quat: 0.01
+      opacity: 0.05
+      sh: 0.05
+    init_bias:
+      means: -1.40
+      scales: -1.70
+      quat: -2.00
+      opacity: -0.40
+      sh: 0.40
+    branch_bias:
+      bg:
+        means: 0.0
+        scales: 0.0
+        quat: -0.2
+        opacity: 0.0
+        sh: 0.1
+      distant:
+        means: -1.0
+        scales: -0.3
+        quat: -1.0
+        opacity: 0.0
+        sh: 0.0
+      rigid_in:
+        means: -0.2
+        scales: -0.2
+        quat: -0.3
+        opacity: 0.1
+        sh: 0.2
+      rigid_out:
+        means: -0.8
+        scales: -0.3
+        quat: -0.8
+        opacity: 0.0
+        sh: 0.0
+    hidden_gate:
+      mode: weighted_sum
+      weights:
+        means: 0.2
+        scales: 0.0
+        quat: 0.0
+        opacity: 0.3
+        sh: 0.5
+  branches:
+    bg:
+      src_backproject_support_min: 1e-2
+      enable_selective_update: false
+      freeze_means: false
+      init: {scale_init: {mode: knn, isotropic_log_value: -2.30, knn_k: 8, knn_log_scale_bias: -1.5}, opacity_init: 0.1}
+      limits: {offset_max: 0.1, scale_max: 0.1, omega_max: 0.1, opacity_max: 0.15, sh_dc_max: 0.15, sh_rest_max: 0.08}
+      eta: {means: 1.0, scales: 1.0, opacity: 1.0, sh_dc: 1.0, sh_rest: 1.0}
+      mlp: {hidden_dim: 48, use_3d_feat: true, use_2d_feat: true}
+    distant:
+      src_backproject_support_min: 1e-2
+      enable_selective_update: false
+      freeze_means: true
+      init: {scale_init: {mode: isotropic, isotropic_log_value: -1.90, knn_k: 8, knn_log_scale_bias: -1.2}, opacity_init: 0.05}
+      limits: {offset_max: 0.02, scale_max: 0.08, omega_max: 0.01, opacity_max: 0.08, sh_dc_max: 0.12, sh_rest_max: 0.03}
+      eta: {means: 0.2, scales: 0.7, opacity: 0.8, sh_dc: 1.0, sh_rest: 0.6}
+      mlp: {hidden_dim: 48, use_3d_feat: false, use_2d_feat: true, freeze_quat: true}
+    rigid:
+      src_backproject_support_min: 1e-2
+      init: {scale_init: {mode: knn, isotropic_log_value: -2.90, knn_k: 8, knn_log_scale_bias: -1.5}, opacity_init: 0.2}
+      eta: {means: 0.5, scales: 0.8, opacity: 1.0, sh_dc: 1.0, sh_rest: 0.6}
+
+current_observation:
+  enable: true
+  dim: 2
+  rho_source: feature
+  eps: 1.0e-6
+  input_to_struct_decoder: false
+  input_to_far_mlp: false
+  input_to_gru: false
+  input_to_history_gate: false
+  record_to_history_memory: false
+  debug:
+    log_stats: false
+    log_interval_steps: 50
+
+training_recipe:
+  name: stage6_0_phase_b_tbptt_v1
+
+losses:
+  phase_a:
+    block_render:
+      enable: true
+      weight: 1.0
+      step_gamma: 0.8
+      mask_policy: "non_sky_non_egocar"
+    nearby_render:
+      enable: true
+      weight: 0.25
+      warmup_steps: 2000
+      final_step_only: true
+      mask_policy: "non_sky_non_egocar"
+    regularization:
+      delta_l2_weight: 0.001
+      opacity_delta_l2_weight: 0.0005
+      sh_delta_l2_weight: 0.0005
+      scale_barrier_weight: 0.002
+      nan_guard: true
+    disabled:
+      query_observation: true
+      prefix_render: true
+      repeat_noop: true
+      trust_drift: true
+      render_lock: true
+      fisher_nullspace: true
+  phase_b:
+    prefix_render:
+      enable: true
+      weight: 1.0
+      l1_weight: 0.8
+      ssim_weight: 0.2
+      mask_policy: non_sky_non_egocar
+      step_weight: late_heavy_linear
+    query_observation:
+      enable: true
+      weight: 0.05
+      warmup_steps: 5000
+      event_weight: 1.0
+      visible_weight: 0.2
+      support_weight: 0.2
+      obs_code_weight: 0.1
+    regularization:
+      delta_norm_weight: 0.001
+      vsm_token_entropy_min: 0.0
+      drift_lock: false
+      fisher_nullspace: false
+      render_lock: false
+  photometric:
+    exclude_sky_region: true
+  rgb: {w: 1.0}
+  ssim: {w: 0.05}
+  mask: {w: 0.02, opacity_loss_type: bce, require_sky_mask: true}
+  opacity_entropy: {w: 0.0}
+  target_view_weights:
+    enable: true
+    normalize_by_weight_sum: true
+    source:
+      weight: 1.0
+    visited:
+      weight: 0.7
+    near_random:
+      weight: 0.7
+      schedule:
+        enable: false
+        type: warmup_linear
+        start_weight: 0.3
+        end_weight: 0.5
+        warmup_steps: 20000
+
+optimizer:
+  type: adamw
+  lr:
+    struct_event_decoder_near: 0.0
+    struct_event_decoder_far: 0.0
+    param_obs_codec: 0.0
+    posterior_updater: 0.0
+    measurement_frontend: 0.0
+    vsm: 1.0e-3
+    query_decoder: 1.0e-3
+    vsm_ctx_adapter: 3.0e-4
+    posterior_updater_base: 0.0
+    default: 0.0
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 0.01
+  filter_frozen: true
+  no_weight_decay:
+    enable: true
+    name_keywords:
+      - ".bias"
+      - "bias"
+      - "norm"
+      - "Norm"
+      - "ln"
+      - "LayerNorm"
+      - "embedding"
+      - "Embedding"
+    ndim_leq: 1
+  groups:
+    dino:
+      match:
+        prefixes:
+          - "image_feature_extractor.dino_adapter.backbone"
+      lr: 0.0
+      weight_decay: 0.0
+    residual_unet:
+      match:
+        prefixes:
+          - "image_feature_extractor.residual"
+          - "image_feature_extractor.residual_unet"
+      lr: 0.0
+      weight_decay: 1.0e-4
+    fusion_neck:
+      match:
+        prefixes:
+          - "image_feature_extractor.fusion"
+          - "image_feature_extractor.fusion_neck"
+      lr: 0.0
+      weight_decay: 1.0e-4
+    struct_near_xcpe:
+      match:
+        prefixes:
+          - "struct_decoder.near_decoder"
+      lr: 0.0
+      weight_decay: 1.0e-4
+    struct_far_mlp:
+      match:
+        prefixes:
+          - "struct_decoder.far_decoder"
+      lr: 0.0
+      weight_decay: 1.0e-4
+    gate_history:
+      match:
+        prefixes:
+          - "stage5_2_history_proj"
+          - "stage5_2_gate_branch_embed"
+          - "stage5_2_gate_mlp"
+      lr: 0.0
+      weight_decay: 0.0
+    recurrent_update:
+      match:
+        contains:
+          - "offset_gru"
+          - "mlp_offset"
+          - "mlp_conv"
+          - "mlp_opacity"
+          - "gaussion_decoder"
+          - "gaussian_decoder"
+      lr: 0.0
+      weight_decay: 5.0e-5
+    default:
+      lr: 0.0
+      weight_decay: 1.0e-4
+
+lr_scheduler:
+  enable: true
+  type: cosine
+  interval: step
+  total_steps: ${training.max_iterations}
+  min_lr_ratio: 0.05
+
+training:
+  max_iterations: 3000010
+  log_interval: 1000
+  save_checkpoint_freq: 10000
+  seed: 41
+  amp:
+    enable: false
+    dtype: fp16
+  grad_clip:
+    enable: true
+    max_norm: 1.0
+    norm_type: 2.0
+  bad_step:
+    policy: fast_fail
+    fail_on_nonfinite_loss: true
+    fail_on_nonfinite_grad: true
+    fail_on_amp_overflow: false
+    fail_on_grad_norm_gt: 100.0
+
+eval:
+  enable_psnr: true
+  save_train_views_psnr_below: null
+  run_test_at_end: false
+
+logging:
+  output_root: /root/autodl-tmp/outputs
+  project: minimal_sf_stage6_0_phase_b_v9
+  log_dir: null
+  image_interval_blocks: 1000
+  train_monitor:
+    enable_heavy_metrics: false
+    include_per_view_metrics: false
+    include_extra_result_metrics: false
+    enable_low_psnr_image_dump: false
+  low_psnr_train_images_subdir: train_low_psnr
+  enable_jsonl_metrics: true
+  metrics_history_append: false
+  use_tensorboard: true
+  offset_monitor:
+    enable: false
+    near_radius_m: 5.0
+    saturation_tanh_threshold: 0.95
+  diagnostics:
+    enable: false
+    interval: 500
+    window_size: 50
+    save_branch_renders: false
+  performance:
+    enable: false
+    phase_timing: false
+    cuda_memory: false

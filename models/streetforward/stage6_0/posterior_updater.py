@@ -96,6 +96,7 @@ class Stage6PosteriorUpdater(nn.Module):
         hidden_max_step: float = 1.0,
         accept_vsm_ctx: bool = True,
         vsm_ctx_dim: int = 48,
+        branch_clamps: Optional[Dict[str, Dict[str, float]]] = None,
     ) -> None:
         super().__init__()
         self.event_dim = int(event_dim)
@@ -108,6 +109,22 @@ class Stage6PosteriorUpdater(nn.Module):
         self.opacity_logit_max_step = float(opacity_logit_max_step)
         self.sh_max_step = float(sh_max_step)
         self.hidden_max_step = float(hidden_max_step)
+        base_clamps = {
+            "means_max_step_m": self.means_max_step_m,
+            "scales_log_max_step": self.scales_log_max_step,
+            "quat_axis_angle_max_step_rad": self.quat_axis_angle_max_step_rad,
+            "opacity_logit_max_step": self.opacity_logit_max_step,
+            "sh_max_step": self.sh_max_step,
+            "hidden_max_step": self.hidden_max_step,
+        }
+        self.branch_clamps: Dict[str, Dict[str, float]] = {}
+        raw_branch_clamps = dict(branch_clamps or {})
+        for branch in ("bg", "distant", "rigid"):
+            cfg = dict(raw_branch_clamps.get(branch, {}) or {})
+            self.branch_clamps[branch] = {
+                key: float(cfg.get(key, default))
+                for key, default in base_clamps.items()
+            }
         in_dim = int(event_dim)
         self.trunk = nn.Sequential(
             nn.Linear(in_dim, int(hidden_dim)),
@@ -136,6 +153,7 @@ class Stage6PosteriorUpdater(nn.Module):
     def _branch_forward(
         self,
         *,
+        branch_name: str,
         event: Optional[torch.Tensor],
         ctx_current: Optional[torch.Tensor],
         ctx_vsm: Optional[torch.Tensor],
@@ -175,13 +193,14 @@ class Stage6PosteriorUpdater(nn.Module):
         h = self.trunk(ctx_in)
         noop = torch.sigmoid(self.head_noop(h))
         gate = 1.0 - noop
+        clamps = self.branch_clamps.get(str(branch_name), self.branch_clamps["bg"])
         delta = BranchDelta(
-            means=gate * self.means_max_step_m * torch.tanh(self.head_means(h)),
-            scales_log=gate * self.scales_log_max_step * torch.tanh(self.head_scales(h)),
-            quat_axis_angle=gate * self.quat_axis_angle_max_step_rad * torch.tanh(self.head_quat(h)),
-            opacity_logit=gate * self.opacity_logit_max_step * torch.tanh(self.head_opacity(h)),
-            sh=gate * self.sh_max_step * torch.tanh(self.head_sh(h)),
-            hidden=gate * self.hidden_max_step * torch.tanh(self.head_hidden(h)),
+            means=gate * float(clamps["means_max_step_m"]) * torch.tanh(self.head_means(h)),
+            scales_log=gate * float(clamps["scales_log_max_step"]) * torch.tanh(self.head_scales(h)),
+            quat_axis_angle=gate * float(clamps["quat_axis_angle_max_step_rad"]) * torch.tanh(self.head_quat(h)),
+            opacity_logit=gate * float(clamps["opacity_logit_max_step"]) * torch.tanh(self.head_opacity(h)),
+            sh=gate * float(clamps["sh_max_step"]) * torch.tanh(self.head_sh(h)),
+            hidden=gate * float(clamps["hidden_max_step"]) * torch.tanh(self.head_hidden(h)),
             confidence=torch.sigmoid(self.head_confidence(h)),
             noop=noop,
         )
@@ -198,6 +217,7 @@ class Stage6PosteriorUpdater(nn.Module):
         ctx_vsm: Optional[ContextPack] = None,
     ) -> tuple[DeltaPack, Dict[str, Any]]:
         bg = self._branch_forward(
+            branch_name="bg",
             event=event.event_bg,
             ctx_current=None if ctx_current is None else ctx_current.ctx_bg,
             ctx_vsm=None if ctx_vsm is None else ctx_vsm.ctx_bg,
@@ -205,11 +225,13 @@ class Stage6PosteriorUpdater(nn.Module):
         if bg is None:
             raise RuntimeError("EventPack.event_bg is required")
         distant = self._branch_forward(
+            branch_name="distant",
             event=event.event_distant,
             ctx_current=None if ctx_current is None else ctx_current.ctx_distant,
             ctx_vsm=None if ctx_vsm is None else ctx_vsm.ctx_distant,
         )
         rigid = self._branch_forward(
+            branch_name="rigid",
             event=event.event_rigid,
             ctx_current=None if ctx_current is None else ctx_current.ctx_rigid,
             ctx_vsm=None if ctx_vsm is None else ctx_vsm.ctx_rigid,

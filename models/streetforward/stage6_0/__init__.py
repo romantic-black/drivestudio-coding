@@ -11,7 +11,15 @@ from .struct_event_decoder import (
     empty_stage6_struct_input,
     stage6_to_struct_decoder_input,
 )
-from .v9_role_resolver import PHASE_A_NAME, ResolvedV9PhaseABatch, resolve_v9_phase_a_batch
+from .v9_role_resolver import (
+    PHASE_A_NAME,
+    PHASE_B_NAME,
+    ResolvedV9PhaseABatch,
+    ResolvedV9PhaseBBatch,
+    resolve_v9_phase_a_batch,
+    resolve_v9_phase_b_batch,
+)
+from .vsm import Stage6BranchQueryPred, Stage6QueryDecoder, Stage6QueryPred, Stage6VSMState, Stage6ViewSetMemory
 
 __all__ = [
     "ContextPack",
@@ -20,7 +28,12 @@ __all__ = [
     "EventPack",
     "LocalGSState",
     "PHASE_A_NAME",
+    "PHASE_B_NAME",
     "ResolvedV9PhaseABatch",
+    "ResolvedV9PhaseBBatch",
+    "Stage6QueryDecoder",
+    "Stage6BranchQueryPred",
+    "Stage6QueryPred",
     "Stage6EventEncoder",
     "Stage6FarMLPEventDecoder",
     "Stage6NearXcpeEventDecoder",
@@ -33,4 +46,7 @@ __all__ = [
     "empty_stage6_struct_input",
     "stage6_to_struct_decoder_input",
     "resolve_v9_phase_a_batch",
+    "resolve_v9_phase_b_batch",
+    "Stage6VSMState",
+    "Stage6ViewSetMemory",
 ]

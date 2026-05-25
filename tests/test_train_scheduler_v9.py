@@ -125,7 +125,7 @@ def _build_scheduler(ds: MagicMock, **kwargs) -> TrainSchedulerV9:
                 "reset_vsm_on_episode_end": True,
             },
             "masks": {
-                "vsm_scope": "bg_static",
+                "vsm_scope": "bg_rigid",
             },
         },
     )
@@ -149,7 +149,7 @@ def _build_scheduler(ds: MagicMock, **kwargs) -> TrainSchedulerV9:
         warm_next_episode_chain=False,
         warm_v9_role_refs=bool(kwargs.get("warm_v9_role_refs", True)),
         block_order=str(kwargs.get("block_order", "block_major")),
-        step_major_switch_interval_steps=1,
+        step_major_switch_interval_steps=int(kwargs.get("step_major_switch_interval_steps", 1)),
         target_policy="visited_episode_frames",
         reset_policy="episode_end",
         block_source_frame_policy=str(kwargs.get("block_source_frame_policy", "fixed_once_per_episode")),
@@ -164,6 +164,79 @@ def _build_scheduler(ds: MagicMock, **kwargs) -> TrainSchedulerV9:
             "forbid_test_refs_in_train": True,
         },
     )
+
+
+def _strict_tbptt_phase_b_cfg(k: int = 2) -> dict:
+    return {
+        "rollout": {
+            "mode": "episode_stream_tbptt",
+            "K_choices": [int(k)],
+            "K_probs": [1.0],
+            "sample_event_frames": "sequential_blocks_in_episode",
+            "event_order": "chronological",
+            "distinct_event_frames": True,
+        },
+        "prefix_render": {
+            "policy": "current_plus_random_previous",
+            "intermediate_views": 2,
+            "final_views": 3,
+            "max_refs_per_step": 12,
+        },
+        "query_observation": {
+            "enable": True,
+            "query_frame_policy": "heldout_inside_event_span",
+            "frames_per_rollout": 1,
+            "cameras_per_frame": "all_cams",
+            "exclude_event_frames": True,
+        },
+        "episode": {"reset_vsm_on_episode_end": True},
+        "masks": {"vsm_scope": "bg_rigid"},
+    }
+
+
+def _grouped_repeat_phase_b_cfg(
+    *,
+    repeats_per_block: int = 2,
+    blocks_per_chunk: int = 4,
+    allow_short_final_chunk: bool = True,
+) -> dict:
+    return {
+        "rollout": {
+            "mode": "episode_grouped_repeat_tbptt",
+            "repeat_patterns": [
+                {
+                    "name": f"r{int(repeats_per_block)}_b{int(blocks_per_chunk)}",
+                    "repeats_per_block": int(repeats_per_block),
+                    "blocks_per_chunk": int(blocks_per_chunk),
+                    "prob": 1.0,
+                }
+            ],
+            "max_inner_K": 8,
+            "sample_event_frames": "sequential_blocks_in_episode",
+            "event_order": "chronological",
+            "distinct_event_frames": True,
+            "repeat_source_frame_policy": "fixed_within_block",
+            "repeat_memory_write_policy": "first_repeat_only",
+            "evidence_recompute_policy": "every_repeat",
+            "allow_short_final_chunk": bool(allow_short_final_chunk),
+        },
+        "prefix_render": {
+            "policy": "current_plus_random_previous",
+            "intermediate_views": 2,
+            "final_views": 3,
+            "max_refs_per_step": 12,
+        },
+        "query_observation": {
+            "enable": True,
+            "query_frame_policy": "heldout_inside_event_span",
+            "frames_per_rollout": 1,
+            "cameras_per_frame": "all_cams",
+            "exclude_event_frames": True,
+            "allow_empty_on_last_chunk": False,
+        },
+        "episode": {"reset_vsm_on_episode_end": True},
+        "masks": {"vsm_scope": "bg_rigid"},
+    }
 
 
 def test_phase_a_nearby_same_keyframe():
@@ -242,8 +315,11 @@ def test_v9_emits_mask_reset_and_flat_non_evidence_metadata():
     sch = _build_scheduler(_make_mock_dataset(sidx), phase="phase_B_viewset_rollout")
     batch = sch.next_batch()
     meta = batch["request_meta"]
-    assert meta["mask_policy"]["phase_b_vsm_scope"] == "bg_static"
+    assert meta["mask_policy"]["phase_b_vsm_scope"] == "bg_rigid"
     assert meta["vsm_reset_policy"]["reset_vsm_on_episode_end"] is True
+    render_group = next(group for group in meta["role_groups"] if group["role"] == "render_loss")
+    assert render_group["mask_policy"] == "non_sky_non_egocar"
+    assert isinstance(meta["mask_policy"], dict)
     assert "flat_non_evidence_refs" in meta
     assert set(tuple(x) for x in meta["flat_loss_refs"]) == set(tuple(x) for x in meta["flat_non_evidence_refs"])
 
@@ -368,7 +444,7 @@ def test_phase_a_rejects_unsupported_p0_config_values(phase_a_cfg):
         _build_scheduler(_make_mock_dataset(sidx), phase_a_cfg=phase_a_cfg)
 
 
-def test_phase_b_rejects_non_bg_static_vsm_scope():
+def test_phase_b_rejects_non_bg_rigid_vsm_scope():
     sidx = _make_sidx_multi_frame_per_keyframe(scene_id=1, segment_id=0)
     bad_phase_b = {
         "rollout": {"K_choices": [2], "K_probs": [1.0]},
@@ -380,6 +456,22 @@ def test_phase_b_rejects_non_bg_static_vsm_scope():
         _build_scheduler(_make_mock_dataset(sidx), phase_b_cfg=bad_phase_b)
 
 
+def test_phase_b_rejects_dynamic_mask_policy():
+    sidx = _make_sidx_multi_frame_per_keyframe(scene_id=1, segment_id=0)
+    bad_phase_b = {
+        "rollout": {"K_choices": [2], "K_probs": [1.0]},
+        "prefix_render": {"policy": "current_plus_random_previous"},
+        "query_observation": {"cameras_per_frame": "all_cams"},
+        "episode": {"reset_vsm_on_episode_end": True},
+        "masks": {
+            "vsm_scope": "bg_rigid",
+            "prefix_loss_mask": "valid_non_sky_non_egocar_non_dynamic",
+        },
+    }
+    with pytest.raises(ValueError, match="dynamic mask"):
+        _build_scheduler(_make_mock_dataset(sidx), phase_b_cfg=bad_phase_b)
+
+
 def test_phase_b_rejects_disabled_episode_vsm_reset():
     sidx = _make_sidx_multi_frame_per_keyframe(scene_id=1, segment_id=0)
     bad_phase_b = {
@@ -387,10 +479,229 @@ def test_phase_b_rejects_disabled_episode_vsm_reset():
         "prefix_render": {"policy": "current_plus_random_previous"},
         "query_observation": {"cameras_per_frame": "all_cams"},
         "episode": {"reset_vsm_on_episode_end": False},
-        "masks": {"vsm_scope": "bg_static"},
+        "masks": {"vsm_scope": "bg_rigid"},
     }
     with pytest.raises(ValueError):
         _build_scheduler(_make_mock_dataset(sidx), phase_b_cfg=bad_phase_b)
+
+
+def test_phase_b_rejects_distinct_k_above_blocks_per_episode():
+    sidx = _make_sidx_multi_frame_per_keyframe(scene_id=1, segment_id=0)
+    bad_phase_b = {
+        "rollout": {
+            "K_choices": [4],
+            "K_probs": [1.0],
+            "sample_event_frames": "random_blocks_in_episode",
+            "event_order": "chronological",
+            "distinct_event_frames": True,
+        },
+        "prefix_render": {"policy": "current_plus_random_previous"},
+        "query_observation": {"cameras_per_frame": "all_cams"},
+        "episode": {"reset_vsm_on_episode_end": True},
+        "masks": {"vsm_scope": "bg_rigid"},
+    }
+    with pytest.raises(ValueError, match="K_choices greater than blocks_per_episode"):
+        _build_scheduler(_make_mock_dataset(sidx), phase="phase_B_viewset_rollout", blocks_per_episode=3, phase_b_cfg=bad_phase_b)
+
+
+def test_phase_b_curriculum_controls_rollout_k():
+    sidx = _make_sidx_multi_frame_per_keyframe(scene_id=1, segment_id=0)
+    phase_b_cfg = {
+        "rollout": {
+            "K_choices": [2],
+            "K_probs": [1.0],
+            "curriculum": [{"start_step": 0, "K_choices": [3], "K_probs": [1.0]}],
+            "sample_event_frames": "random_blocks_in_episode",
+            "event_order": "chronological",
+            "distinct_event_frames": True,
+        },
+        "prefix_render": {"policy": "current_plus_random_previous"},
+        "query_observation": {"enable": True, "cameras_per_frame": "all_cams"},
+        "episode": {"reset_vsm_on_episode_end": True},
+        "masks": {"vsm_scope": "bg_rigid"},
+    }
+    sch = _build_scheduler(
+        _make_mock_dataset(sidx),
+        phase="phase_B_viewset_rollout",
+        blocks_per_episode=3,
+        phase_b_cfg=phase_b_cfg,
+    )
+    batch = sch.next_batch()
+    assert int(batch["request_meta"]["inner_K"]) == 3
+
+
+def test_phase_b_episode_stream_tbptt_emits_contiguous_chunks_and_excludes_prior_query():
+    sidx = _make_sidx_multi_frame_per_keyframe(scene_id=1, segment_id=0, num_keyframes=4)
+    sch = _build_scheduler(
+        _make_mock_dataset(sidx),
+        phase="phase_B_viewset_rollout",
+        blocks_per_episode=4,
+        phase_b_cfg=_strict_tbptt_phase_b_cfg(k=2),
+    )
+    batch0 = sch.next_batch()
+    meta0 = batch0["request_meta"]["tbptt"]
+    assert meta0["chunk_idx"] == 0
+    assert meta0["is_first_chunk"] is True
+    assert meta0["is_last_chunk"] is False
+    assert meta0["event_block_indices"] == [0, 1]
+    assert meta0["event_frame_indices"] == sorted(meta0["event_frame_indices"])
+    assert meta0["prior_written_frames"] == []
+
+    batch1 = sch.next_batch()
+    meta1 = batch1["request_meta"]["tbptt"]
+    assert meta1["chunk_idx"] == 1
+    assert meta1["is_first_chunk"] is False
+    assert meta1["is_last_chunk"] is True
+    assert meta1["event_block_indices"] == [2, 3]
+    assert set(meta1["prior_written_frames"]) == set(meta0["event_frame_indices"])
+    query_frames = {int(ref[0]) for ref in batch1["request_meta"]["query_label_refs"]}
+    assert query_frames.isdisjoint(set(meta1["prior_written_frames"]))
+    assert query_frames.isdisjoint(set(meta1["event_frame_indices"]))
+
+
+def test_phase_b_episode_stream_tbptt_rejects_random_sampling():
+    sidx = _make_sidx_multi_frame_per_keyframe(scene_id=1, segment_id=0, num_keyframes=4)
+    bad = _strict_tbptt_phase_b_cfg(k=2)
+    bad["rollout"]["sample_event_frames"] = "random_blocks_in_episode"
+    with pytest.raises(ValueError, match="sequential_blocks_in_episode"):
+        _build_scheduler(
+            _make_mock_dataset(sidx),
+            phase="phase_B_viewset_rollout",
+            blocks_per_episode=4,
+            phase_b_cfg=bad,
+        )
+
+
+def test_phase_b_grouped_repeat_tbptt_emits_repeated_steps_and_unique_tbptt_frames():
+    sidx = _make_sidx_multi_frame_per_keyframe(scene_id=1, segment_id=0, num_keyframes=6)
+    phase_b_cfg = _grouped_repeat_phase_b_cfg(repeats_per_block=2, blocks_per_chunk=4)
+    sch = _build_scheduler(
+        _make_mock_dataset(sidx),
+        phase="phase_B_viewset_rollout",
+        blocks_per_episode=6,
+        steps_per_block=1,
+        block_order="step_major",
+        step_major_switch_interval_steps=1,
+        phase_b_cfg=phase_b_cfg,
+    )
+    batch0 = sch.next_batch()
+    meta0 = batch0["request_meta"]
+    repeat0 = meta0["phase_b_repeat"]
+    tbptt0 = meta0["tbptt"]
+    assert int(meta0["inner_K"]) == 8
+    assert repeat0["step_block_indices"] == [0, 0, 1, 1, 2, 2, 3, 3]
+    assert repeat0["step_repeat_indices"] == [0, 1, 0, 1, 0, 1, 0, 1]
+    assert repeat0["step_memory_write_flags"] == [True, False, True, False, True, False, True, False]
+    assert tbptt0["event_block_indices"] == [0, 1, 2, 3]
+    assert tbptt0["event_frame_indices"] == repeat0["unique_event_frame_indices"]
+    assert tbptt0["step_event_frame_indices"] == repeat0["step_source_frame_indices"]
+    assert len(set(tbptt0["event_frame_indices"])) == 4
+    assert len(tbptt0["step_event_frame_indices"]) == 8
+    assert meta0["evidence_refs_by_step"][0] == meta0["evidence_refs_by_step"][1]
+    assert meta0["evidence_refs_by_step"][2] == meta0["evidence_refs_by_step"][3]
+    st_after_chunk0 = sch.current_episode_state
+    assert st_after_chunk0 is not None
+    assert [int(x) for x in st_after_chunk0["block_update_counts"][:4]] == [1, 1, 1, 1]
+    assert [bool(x) for x in st_after_chunk0["block_ended"][:4]] == [True, True, True, True]
+    assert int(st_after_chunk0["episode_step_cursor"]) == 4
+    assert int(st_after_chunk0["block_cursor"]) == 4
+
+    batch1 = sch.next_batch()
+    meta1 = batch1["request_meta"]
+    assert meta1["tbptt"]["event_block_indices"] == [4, 5]
+    assert set(meta1["tbptt"]["prior_written_frames"]) == set(tbptt0["event_frame_indices"])
+    assert int(meta1["inner_K"]) == 4
+
+
+def test_phase_b_grouped_repeat_tbptt_rejects_nonchronological_cross_chunk_source_frame():
+    sidx = _make_sidx_multi_frame_per_keyframe(scene_id=1, segment_id=0, num_keyframes=6)
+    phase_b_cfg = _grouped_repeat_phase_b_cfg(repeats_per_block=2, blocks_per_chunk=2)
+    sch = _build_scheduler(
+        _make_mock_dataset(sidx),
+        phase="phase_B_viewset_rollout",
+        blocks_per_episode=6,
+        steps_per_block=1,
+        block_order="step_major",
+        step_major_switch_interval_steps=1,
+        phase_b_cfg=phase_b_cfg,
+    )
+    batch0 = sch.next_batch()
+    prior_last = max(int(x) for x in batch0["request_meta"]["tbptt"]["event_frame_indices"])
+    st = sch.current_episode_state
+    assert st is not None
+    st["frame_chain"][2] = int(prior_last)
+    with pytest.raises(ValueError, match="chronological across chunks"):
+        sch.next_batch()
+
+
+def test_phase_b_grouped_repeat_tbptt_rejects_short_final_chunk_when_disabled():
+    sidx = _make_sidx_multi_frame_per_keyframe(scene_id=1, segment_id=0, num_keyframes=6)
+    phase_b_cfg = _grouped_repeat_phase_b_cfg(
+        repeats_per_block=2,
+        blocks_per_chunk=4,
+        allow_short_final_chunk=False,
+    )
+    sch = _build_scheduler(
+        _make_mock_dataset(sidx),
+        phase="phase_B_viewset_rollout",
+        blocks_per_episode=6,
+        steps_per_block=1,
+        block_order="step_major",
+        phase_b_cfg=phase_b_cfg,
+    )
+    sch.next_batch()
+    with pytest.raises(ValueError, match="shorter than blocks_per_chunk"):
+        sch.next_batch()
+
+
+def test_phase_b_episode_block_repeat_tbptt_is_deprecated():
+    sidx = _make_sidx_multi_frame_per_keyframe(scene_id=1, segment_id=0, num_keyframes=4)
+    bad = _strict_tbptt_phase_b_cfg(k=1)
+    bad["rollout"]["mode"] = "episode_block_repeat_tbptt"
+    with pytest.raises(ValueError, match="use episode_grouped_repeat_tbptt"):
+        _build_scheduler(
+            _make_mock_dataset(sidx),
+            phase="phase_B_viewset_rollout",
+            blocks_per_episode=4,
+            phase_b_cfg=bad,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutator,match",
+    [
+        (lambda cfg: cfg["rollout"].__setitem__("sample_event_frames", "random_blocks_in_episode"), "sequential_blocks_in_episode"),
+        (lambda cfg: cfg["rollout"].__setitem__("event_order", "sampled"), "event_order=chronological"),
+        (lambda cfg: cfg["rollout"].__setitem__("distinct_event_frames", False), "distinct_event_frames=true"),
+        (lambda cfg: cfg["rollout"]["repeat_patterns"][0].__setitem__("repeats_per_block", 0), "must be >= 1"),
+        (lambda cfg: cfg["rollout"]["repeat_patterns"][0].__setitem__("blocks_per_chunk", 5), "blocks_per_chunk cannot exceed"),
+        (lambda cfg: cfg["rollout"].__setitem__("max_inner_K", 3), "inner_K exceeds max_inner_K"),
+    ],
+)
+def test_phase_b_grouped_repeat_tbptt_rejects_invalid_config(mutator, match):
+    sidx = _make_sidx_multi_frame_per_keyframe(scene_id=1, segment_id=0, num_keyframes=4)
+    bad = _grouped_repeat_phase_b_cfg(repeats_per_block=2, blocks_per_chunk=4)
+    mutator(bad)
+    with pytest.raises(ValueError, match=match):
+        _build_scheduler(
+            _make_mock_dataset(sidx),
+            phase="phase_B_viewset_rollout",
+            blocks_per_episode=4,
+            steps_per_block=1,
+            phase_b_cfg=bad,
+        )
+
+
+def test_phase_b_grouped_repeat_tbptt_rejects_outer_steps_per_block_repeat():
+    sidx = _make_sidx_multi_frame_per_keyframe(scene_id=1, segment_id=0, num_keyframes=4)
+    with pytest.raises(ValueError, match="steps_per_block=1"):
+        _build_scheduler(
+            _make_mock_dataset(sidx),
+            phase="phase_B_viewset_rollout",
+            blocks_per_episode=4,
+            steps_per_block=2,
+            phase_b_cfg=_grouped_repeat_phase_b_cfg(repeats_per_block=2, blocks_per_chunk=4),
+        )
 
 
 def test_v9_requires_native_dataset_assembly():

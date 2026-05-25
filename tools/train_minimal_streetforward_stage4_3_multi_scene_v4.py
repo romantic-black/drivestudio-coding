@@ -63,6 +63,7 @@ from tools.train_minimal_streetforward_stage4_1 import (
 from tools.train_minimal_streetforward_stage4_1_one_segment_v3 import (
     _build_scheduler_node_sync,
     _load_init_checkpoint,
+    _resolve_init_checkpoint_cfg,
 )
 from tools.train_minimal_streetforward_stage4_3_v4_common import (
     build_multi_scene_dataset_v3,
@@ -1694,11 +1695,13 @@ def main() -> None:
                     "validation_v7.mode=segment_finetune_train requires trainer.optimizer to exist."
                 )
     model.train()
+    init_checkpoint, init_weights_only, require_export_type = _resolve_init_checkpoint_cfg(cfg, args)
     _load_init_checkpoint(
-        args.init_checkpoint,
+        init_checkpoint,
         model,
         device,
-        weights_only=bool(args.init_weights_only),
+        weights_only=init_weights_only,
+        require_export_type=require_export_type,
     )
 
     psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
@@ -2488,6 +2491,7 @@ def main() -> None:
                     "feedback/",
                     "branch/",
                     "phaseA/",
+                    "phase_b/",
                     "stage6/",
                     "mask/",
                     "node_state_",

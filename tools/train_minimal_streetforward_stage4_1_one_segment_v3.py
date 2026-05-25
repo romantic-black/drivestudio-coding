@@ -21,7 +21,7 @@ import logging
 import os
 import time
 from collections import deque
-from typing import Any, Dict, List, Optional, TextIO
+from typing import Any, Dict, List, Optional, TextIO, Tuple
 
 
 # Match stage4_1 OMP normalization
@@ -88,6 +88,7 @@ def _load_init_checkpoint(
     device: torch.device,
     *,
     weights_only: bool,
+    require_export_type: Optional[str] = None,
 ) -> None:
     """Load `model_state_dict` (and optionally optimizer) from a v3 training checkpoint."""
     if not path:
@@ -95,6 +96,26 @@ def _load_init_checkpoint(
     if not os.path.isfile(path):
         raise FileNotFoundError(f"init_checkpoint not found: {path}")
     ckpt = torch.load(path, map_location=device)
+    if require_export_type:
+        actual_export_type = str(ckpt.get("export_type", ""))
+        if actual_export_type != str(require_export_type):
+            raise ValueError(
+                "init_checkpoint has incompatible export_type for this config: "
+                f"expected {require_export_type!r}, got {actual_export_type!r}. "
+                "Use a Phase A payload produced by build_phase_b_export_checkpoint(), "
+                "not a plain resume/model_state_dict checkpoint."
+            )
+    payload_loader = getattr(model, "load_init_checkpoint_payload", None)
+    if callable(payload_loader):
+        loaded = bool(payload_loader(ckpt, device=device, weights_only=weights_only, path=path))
+        if loaded:
+            logger.info(
+                "Loaded init_checkpoint payload from %s (saved_step=%s, weights_only=%s)",
+                path,
+                ckpt.get("step"),
+                weights_only,
+            )
+            return
     sd = ckpt.get("model_state_dict")
     if sd is None:
         raise ValueError(f"Checkpoint missing model_state_dict: {path}")
@@ -117,6 +138,43 @@ def _load_init_checkpoint(
         ckpt.get("step"),
         weights_only,
     )
+
+
+def _cfg_get(mapping: Any, key: str, default: Any = None) -> Any:
+    if mapping is None:
+        return default
+    if hasattr(mapping, "get"):
+        return mapping.get(key, default)
+    return getattr(mapping, key, default)
+
+
+def _resolve_init_checkpoint_cfg(cfg: Any, args: argparse.Namespace) -> Tuple[str, bool, Optional[str]]:
+    init_cfg = _cfg_get(cfg, "initialization", {}) or {}
+    phase_b_cfg = _cfg_get(init_cfg, "phase_b_from_phase_a", {}) or {}
+    phase_b_enabled = bool(_cfg_get(phase_b_cfg, "enable", False))
+
+    cli_path = str(getattr(args, "init_checkpoint", "") or "")
+    cfg_path = str(_cfg_get(phase_b_cfg, "checkpoint", "") or _cfg_get(init_cfg, "init_checkpoint", "") or "")
+    init_path = cli_path or cfg_path
+
+    if phase_b_enabled:
+        weights_only = bool(getattr(args, "init_weights_only", False)) or bool(_cfg_get(phase_b_cfg, "weights_only", True))
+    elif cli_path:
+        weights_only = bool(getattr(args, "init_weights_only", False))
+    else:
+        weights_only = bool(_cfg_get(init_cfg, "init_weights_only", False))
+
+    require_export_type: Optional[str] = None
+    if phase_b_enabled and bool(_cfg_get(phase_b_cfg, "reject_plain_model_state_dict", True)):
+        require_export_type = str(_cfg_get(phase_b_cfg, "export_type", "stage6_0_phase_a_for_phase_b"))
+
+    if phase_b_enabled and bool(_cfg_get(phase_b_cfg, "required", False)) and not init_path:
+        raise ValueError(
+            "initialization.phase_b_from_phase_a.required=true but no checkpoint was provided. "
+            "Set initialization.phase_b_from_phase_a.checkpoint in the config or pass --init_checkpoint."
+        )
+
+    return init_path, weights_only, require_export_type
 
 
 def _build_multi_scene_dataset(cfg: Any, device: torch.device) -> MultiSceneDatasetV2:
@@ -318,11 +376,13 @@ def main() -> None:
 
     model = MinimalStreetForwardStage4_1(config=cfg, device=device)
     model.train()
+    init_checkpoint, init_weights_only, require_export_type = _resolve_init_checkpoint_cfg(cfg, args)
     _load_init_checkpoint(
-        args.init_checkpoint,
+        init_checkpoint,
         model,
         device,
-        weights_only=bool(args.init_weights_only),
+        weights_only=init_weights_only,
+        require_export_type=require_export_type,
     )
 
     psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
