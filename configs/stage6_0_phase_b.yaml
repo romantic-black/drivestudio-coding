@@ -206,34 +206,24 @@ scheduler_v9:
       curriculum:
         - start_step: 0
           repeat_patterns:
-            - name: r6_b2
-              repeats_per_block: 6
+            - name: r4_b2
+              repeats_per_block: 4
               blocks_per_chunk: 2
-              prob: 1.0
+              prob: 0.5
+            - name: r2_b2
+              repeats_per_block: 2
+              blocks_per_chunk: 2
+              prob: 0.5
         - start_step: 20000
           repeat_patterns:
-            - name: r6_b2
-              repeats_per_block: 6
+            - name: r4_b2
+              repeats_per_block: 4
               blocks_per_chunk: 2
               prob: 0.5
-            - name: r4_b3
-              repeats_per_block: 4
-              blocks_per_chunk: 3
-              prob: 0.5
-        - start_step: 40000
-          repeat_patterns:
-            - name: r6_b2
-              repeats_per_block: 6
-              blocks_per_chunk: 2
-              prob: 0.4
-            - name: r4_b3
-              repeats_per_block: 4
-              blocks_per_chunk: 3
-              prob: 0.4
             - name: r2_b4
               repeats_per_block: 2
-              blocks_per_chunk: 4
-              prob: 0.2
+              blocks_per_chunk: 3
+              prob: 0.5
 
       sample_event_frames: sequential_blocks_in_episode
       event_order: chronological
@@ -540,6 +530,7 @@ model:
         proto_dim: 8
         global_dim: 48
         ctx_dim: 48
+        zero_unseen_ctx: true
       rigid:
         num_tokens: 4
         token_dim: 48

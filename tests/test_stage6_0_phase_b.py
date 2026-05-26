@@ -347,6 +347,35 @@ def test_stage6_vsm_query_decoder_shapes_finite_and_gradients():
     assert sum(float(p.grad.abs().sum()) for p in decoder.parameters() if p.grad is not None) > 0.0
 
 
+def test_stage6_vsm_update_uses_token_specific_proposals_and_reports_diagnostics():
+    torch.manual_seed(7)
+    memory = Stage6ViewSetMemory(
+        event_dim=8,
+        view_code_dim=2,
+        num_tokens=4,
+        token_dim=8,
+        proto_dim=3,
+        global_dim=8,
+        ctx_dim=8,
+        hidden_dim=16,
+    )
+    state = memory.init_state(num_bg=3, num_rigid=0, device=torch.device("cpu"), dtype=torch.float32)
+    state, aux = memory.update_bg(
+        state=state,
+        event_bg=torch.randn(3, 8),
+        view_code_bg=torch.randn(3, 2),
+        valid_bg=torch.ones(3, 1),
+        support_bg=torch.ones(3, 1),
+        return_aux=True,
+    )
+    assert "vsm_update_assign_entropy" in aux
+    assert "vsm_bg_vsm_update_assign_entropy" in aux
+    assert aux["vsm_update_token_delta_norm"] > 0.0
+    assert aux["vsm_update_proto_delta_norm"] > 0.0
+    assert aux["vsm_token_pair_cosine_max"] <= 1.0
+    assert not torch.allclose(state.tokens_bg[:, 0], state.tokens_bg[:, 1])
+
+
 def test_stage6_vsm_no_rigid_state_uses_zero_length_tensors():
     memory = Stage6ViewSetMemory(event_dim=8, view_code_dim=2, num_tokens=4, token_dim=8, proto_dim=3, global_dim=8, ctx_dim=8)
     state = memory.init_state(num_bg=2, num_rigid=0, device=torch.device("cpu"), dtype=torch.float32)
@@ -355,6 +384,27 @@ def test_stage6_vsm_no_rigid_state_uses_zero_length_tensors():
     assert ctx.shape == (0, 8)
     assert aux["vsm_rigid_vsm_ctx_norm"] == 0.0
     state.assert_finite()
+
+
+def test_stage6_vsm_zero_unseen_bg_ctx_masks_biases():
+    torch.manual_seed(4)
+    memory = Stage6ViewSetMemory(
+        event_dim=8,
+        view_code_dim=2,
+        num_tokens=4,
+        token_dim=8,
+        proto_dim=3,
+        global_dim=8,
+        ctx_dim=8,
+        bg_zero_unseen_ctx=True,
+    )
+    with torch.no_grad():
+        memory.bg_memory.ctx_norm.bias.fill_(0.5)
+        memory.bg_memory.global_to_ctx.bias.fill_(1.0)
+    state = memory.init_state(num_bg=3, num_rigid=0, device=torch.device("cpu"), dtype=torch.float32)
+    ctx_empty, aux_empty = memory.query(state=state, view_code_bg=torch.zeros(3, 2))
+    assert torch.equal(ctx_empty, torch.zeros_like(ctx_empty))
+    assert aux_empty["vsm_seen_ratio"] == 0.0
 
 
 def test_stage6_vsm_zero_unseen_rigid_ctx_masks_biases():
@@ -739,6 +789,11 @@ def test_phase_b_grouped_repeat_writes_memory_once_per_block_and_keeps_gradients
     assert set(out["written_refs"]) == {(10, 0), (11, 0)}
     assert out["tbptt_meta"]["event_frame_indices"] == [10, 11]
     assert out["tbptt_meta"]["step_event_frame_indices"] == [10, 10, 11, 11]
+    assert out["loss_total_norm_by_weight"] > 0.0
+    assert out["loss_total_norm_by_K"] > 0.0
+    final = out["per_step"][-1]
+    assert final["vsm_update_assign_entropy"] > 0.0
+    assert final["vsm_update_token_delta_norm"] > 0.0
     out["loss"].backward()
     adapter_grad = sum(
         float(p.grad.abs().sum())

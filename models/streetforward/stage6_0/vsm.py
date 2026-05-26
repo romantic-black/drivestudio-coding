@@ -120,21 +120,25 @@ class BranchViewSetMemory(nn.Module):
         self.zero_unseen_ctx = bool(zero_unseen_ctx)
 
         in_dim = int(event_dim) + int(view_code_dim) + 2
+        tokenwise_dim = int(in_dim) + int(token_dim) + int(token_dim) + int(token_dim)
+        protowise_dim = int(view_code_dim) + 2 + int(proto_dim) + int(token_dim) + int(token_dim)
         self.router = nn.Sequential(
             nn.Linear(in_dim, int(hidden_dim)),
             nn.LayerNorm(int(hidden_dim)),
             nn.GELU(),
             nn.Linear(int(hidden_dim), int(num_tokens)),
         )
+        self.token_id_embed = nn.Embedding(int(num_tokens), int(token_dim))
+        self.proto_to_token = nn.Linear(int(proto_dim), int(token_dim))
         self.token_update = nn.Sequential(
-            nn.Linear(in_dim, int(hidden_dim)),
+            nn.Linear(tokenwise_dim, int(hidden_dim)),
             nn.LayerNorm(int(hidden_dim)),
             nn.GELU(),
             nn.Linear(int(hidden_dim), int(token_dim)),
         )
-        self.token_gate = nn.Linear(in_dim, int(num_tokens))
+        self.token_gate = nn.Linear(tokenwise_dim, 1)
         self.proto_update = nn.Sequential(
-            nn.Linear(int(view_code_dim) + 2, int(hidden_dim)),
+            nn.Linear(protowise_dim, int(hidden_dim)),
             nn.GELU(),
             nn.Linear(int(hidden_dim), int(proto_dim)),
         )
@@ -203,7 +207,7 @@ class BranchViewSetMemory(nn.Module):
         view_code: Optional[torch.Tensor],
         valid: Optional[torch.Tensor],
         support: Optional[torch.Tensor],
-    ) -> _BranchRows:
+    ) -> tuple[_BranchRows, Dict[str, float]]:
         if event.dim() != 2 or int(event.shape[1]) != self.event_dim:
             raise ValueError(f"{self.branch_name} event must be [N,{self.event_dim}], got {tuple(event.shape)}")
         n = int(event.shape[0])
@@ -212,27 +216,117 @@ class BranchViewSetMemory(nn.Module):
                 f"{self.branch_name} VSM row mismatch: state={int(rows.tokens.shape[0])} event={n}"
             )
         if n == 0:
-            return rows
+            return rows, self._empty_update_aux(device=rows.tokens.device, dtype=rows.tokens.dtype)
         view = self._coerce_view_code(view_code, event)
         valid_f, support_log = self._coerce_valid_support(event=event, valid=valid, support=support)
         x = torch.cat([event, view, support_log, valid_f], dim=-1)
         if not torch.isfinite(x).all():
             raise RuntimeError(f"Stage6ViewSetMemory {self.branch_name} update input contains NaN/Inf")
         assign = torch.softmax(self.router(x), dim=-1)
-        gate = torch.sigmoid(self.token_gate(x)).unsqueeze(-1)
-        token_prop = self.token_update(x).unsqueeze(1)
+        x_m = x.unsqueeze(1).expand(-1, self.num_tokens, -1)
+        token_id = self.token_id_embed.weight.to(device=event.device, dtype=event.dtype).unsqueeze(0).expand(n, -1, -1)
+        proto_projected = self.proto_to_token(rows.proto.to(device=event.device, dtype=event.dtype))
+        token_in = torch.cat(
+            [
+                x_m,
+                rows.tokens.to(device=event.device, dtype=event.dtype),
+                proto_projected,
+                token_id,
+            ],
+            dim=-1,
+        )
+        gate = torch.sigmoid(self.token_gate(token_in))
+        token_prop = self.token_update(token_in)
         valid3 = valid_f.unsqueeze(-1)
         tokens = rows.tokens + valid3 * assign.unsqueeze(-1) * gate * (token_prop - rows.tokens)
 
         proto_x = torch.cat([view, support_log, valid_f], dim=-1)
-        proto_prop = self.proto_update(proto_x).unsqueeze(1)
+        proto_in = torch.cat(
+            [
+                proto_x.unsqueeze(1).expand(-1, self.num_tokens, -1),
+                rows.proto.to(device=event.device, dtype=event.dtype),
+                rows.tokens.to(device=event.device, dtype=event.dtype),
+                token_id,
+            ],
+            dim=-1,
+        )
+        proto_prop = self.proto_update(proto_in)
         proto = rows.proto + valid3 * assign.unsqueeze(-1) * (proto_prop - rows.proto)
 
         global_prop = self.global_update(x)
         global_gate = torch.sigmoid(self.global_gate(x))
         global_token = rows.global_token + valid_f * global_gate * (global_prop - rows.global_token)
         valid_count = rows.valid_count + valid_f
-        return _BranchRows(tokens=tokens, proto=proto, global_token=global_token, valid_count=valid_count)
+        out = _BranchRows(tokens=tokens, proto=proto, global_token=global_token, valid_count=valid_count)
+        return out, self._update_aux(
+            assign=assign,
+            old_tokens=rows.tokens,
+            new_tokens=tokens,
+            old_proto=rows.proto,
+            new_proto=proto,
+            old_global=rows.global_token,
+            new_global=global_token,
+        )
+
+    def _empty_update_aux(self, *, device: torch.device, dtype: torch.dtype) -> Dict[str, float]:
+        _ = device, dtype
+        return {
+            "vsm_update_assign_entropy": 0.0,
+            "vsm_update_assign_max": 0.0,
+            "vsm_update_assign_usage_max": 0.0,
+            "vsm_update_token_delta_norm": 0.0,
+            "vsm_update_proto_delta_norm": 0.0,
+            "vsm_update_global_delta_norm": 0.0,
+            "vsm_token_pair_cosine_mean": 0.0,
+            "vsm_token_pair_cosine_max": 0.0,
+            "vsm_token_variance_mean": 0.0,
+            "vsm_proto_pair_distance_mean": 0.0,
+        }
+
+    def _update_aux(
+        self,
+        *,
+        assign: torch.Tensor,
+        old_tokens: torch.Tensor,
+        new_tokens: torch.Tensor,
+        old_proto: torch.Tensor,
+        new_proto: torch.Tensor,
+        old_global: torch.Tensor,
+        new_global: torch.Tensor,
+    ) -> Dict[str, float]:
+        entropy = -(assign * assign.clamp_min(1.0e-8).log()).sum(dim=-1).mean()
+        assign_max = assign.max(dim=-1).values.mean()
+        usage_max = assign.mean(dim=0).max()
+        token_delta = new_tokens - old_tokens
+        proto_delta = new_proto - old_proto
+        global_delta = new_global - old_global
+        token_cos_mean = new_tokens.new_tensor(0.0)
+        token_cos_max = new_tokens.new_tensor(0.0)
+        proto_pair_dist_mean = new_proto.new_tensor(0.0)
+        if int(new_tokens.shape[1]) > 1:
+            normed = F.normalize(new_tokens, dim=-1, eps=1.0e-6)
+            cosine = torch.matmul(normed, normed.transpose(1, 2))
+            mask = ~torch.eye(int(new_tokens.shape[1]), device=new_tokens.device, dtype=torch.bool)
+            cos_vals = cosine[:, mask]
+            token_cos_mean = cos_vals.mean() if cos_vals.numel() else token_cos_mean
+            token_cos_max = cos_vals.max() if cos_vals.numel() else token_cos_max
+
+            proto_dist = torch.linalg.vector_norm(new_proto.unsqueeze(2) - new_proto.unsqueeze(1), dim=-1)
+            dist_vals = proto_dist[:, mask]
+            proto_pair_dist_mean = dist_vals.mean() if dist_vals.numel() else proto_pair_dist_mean
+        token_variance = new_tokens.var(dim=1, unbiased=False).mean() if new_tokens.numel() else new_tokens.new_tensor(0.0)
+        return {
+            "vsm_update_assign_entropy": float(entropy.detach().item()),
+            "vsm_update_assign_max": float(assign_max.detach().item()),
+            "vsm_update_assign_usage_max": float(usage_max.detach().item()),
+            "vsm_update_token_delta_norm": float(token_delta.detach().norm(dim=-1).mean().item()) if token_delta.numel() else 0.0,
+            "vsm_update_proto_delta_norm": float(proto_delta.detach().norm(dim=-1).mean().item()) if proto_delta.numel() else 0.0,
+            "vsm_update_global_delta_norm": float(global_delta.detach().norm(dim=-1).mean().item()) if global_delta.numel() else 0.0,
+            "vsm_token_pair_cosine_mean": float(token_cos_mean.detach().item()),
+            "vsm_token_pair_cosine_max": float(token_cos_max.detach().item()),
+            "vsm_token_variance_mean": float(token_variance.detach().item()),
+            "vsm_proto_pair_distance_mean": float(proto_pair_dist_mean.detach().item()),
+        }
 
     def query_rows(
         self,
@@ -414,8 +508,9 @@ class Stage6ViewSetMemory(nn.Module):
         view_code_bg: Optional[torch.Tensor],
         valid_bg: Optional[torch.Tensor],
         support_bg: Optional[torch.Tensor],
-    ) -> Stage6VSMState:
-        rows = self.bg_memory.update_rows(
+        return_aux: bool = False,
+    ) -> Stage6VSMState | tuple[Stage6VSMState, Dict[str, float]]:
+        rows, aux = self.bg_memory.update_rows(
             self._bg_rows(state),
             event=event_bg,
             view_code=view_code_bg,
@@ -430,6 +525,8 @@ class Stage6ViewSetMemory(nn.Module):
             valid_count_bg=rows.valid_count,
         )
         out.assert_finite("vsm_after_bg_update")
+        if return_aux:
+            return out, _prefix_aux(aux, "vsm_bg", include_legacy=True)
         return out
 
     def query_bg(
@@ -450,7 +547,8 @@ class Stage6ViewSetMemory(nn.Module):
         view_code_rigid: Optional[torch.Tensor],
         valid_rigid: Optional[torch.Tensor],
         support_rigid: Optional[torch.Tensor],
-    ) -> Stage6VSMState:
+        return_aux: bool = False,
+    ) -> Stage6VSMState | tuple[Stage6VSMState, Dict[str, float]]:
         idx = self._normalize_indices(
             indices.to(device=state.tokens_rigid.device),
             total=int(state.tokens_rigid.shape[0]),
@@ -469,6 +567,12 @@ class Stage6ViewSetMemory(nn.Module):
             cols=self.view_code_dim,
         )
         if int(idx.numel()) == 0:
+            if return_aux:
+                return state, _prefix_aux(
+                    self.rigid_memory._empty_update_aux(device=state.tokens_rigid.device, dtype=state.tokens_rigid.dtype),
+                    "vsm_rigid",
+                    include_legacy=False,
+                )
             return state
         idx_event = idx.to(device=event_rigid.device)
         rows = _BranchRows(
@@ -477,7 +581,7 @@ class Stage6ViewSetMemory(nn.Module):
             global_token=state.global_rigid.index_select(0, idx).to(device=event_rigid.device, dtype=event_rigid.dtype),
             valid_count=state.valid_count_rigid.index_select(0, idx).to(device=event_rigid.device, dtype=event_rigid.dtype),
         )
-        updated = self.rigid_memory.update_rows(
+        updated, aux = self.rigid_memory.update_rows(
             rows,
             event=event_rigid,
             view_code=view_code_rigid,
@@ -502,6 +606,8 @@ class Stage6ViewSetMemory(nn.Module):
         )
         out.assert_finite("vsm_after_rigid_update")
         _ = idx_event
+        if return_aux:
+            return out, _prefix_aux(aux, "vsm_rigid", include_legacy=False)
         return out
 
     def query_rigid(

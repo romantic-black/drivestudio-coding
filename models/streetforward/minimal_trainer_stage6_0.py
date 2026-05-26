@@ -2246,9 +2246,12 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         if set(roles.query_label_refs) & set(written_refs):
             raise ValueError("query_label_refs already written into persistent VSM in this episode.")
         total_loss = local_state.bg.means.new_tensor(0.0)
+        rollout_loss = local_state.bg.means.new_tensor(0.0)
+        step_weight_sum = 0.0
         per_step: List[Dict[str, float]] = []
         pred_rgbs: List[torch.Tensor] = []
         gt_images: List[torch.Tensor] = []
+        latest_vsm_update_aux: Dict[str, float] = {}
         step = int(batch.get("global_step", 0) or 0)
         step_repeat_indices = [int(x) for x in list(getattr(roles, "step_repeat_indices", []) or [])]
         step_block_indices = [int(x) for x in list(getattr(roles, "step_block_indices", []) or [])]
@@ -2274,13 +2277,15 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             if not torch.isfinite(event.event_bg).all():
                 raise RuntimeError("Stage6_0 Phase B event_bg contains NaN/Inf.")
             rigid_indices = self._phase_b_rigid_route_indices(event=event, local_state=local_state, label=f"step {int(k)}")
+            vsm_update_aux_bg: Dict[str, float] = {}
             if memory_write:
-                vsm_state = self.stage6_vsm.update_bg(
+                vsm_state, vsm_update_aux_bg = self.stage6_vsm.update_bg(
                     state=vsm_state,
                     event_bg=event.event_bg,
                     view_code_bg=getattr(event, "view_code_bg", None),
                     valid_bg=getattr(event, "valid_bg", None),
                     support_bg=getattr(event, "support_bg", None),
+                    return_aux=True,
                 )
             ctx_bg, vsm_aux_bg = self.stage6_vsm.query_bg(
                 state=vsm_state,
@@ -2288,15 +2293,17 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             )
             ctx_rigid = None
             vsm_aux_rigid: Dict[str, float] = {}
+            vsm_update_aux_rigid: Dict[str, float] = {}
             if int(rigid_indices.numel()) > 0:
                 if memory_write:
-                    vsm_state = self.stage6_vsm.update_rigid(
+                    vsm_state, vsm_update_aux_rigid = self.stage6_vsm.update_rigid(
                         state=vsm_state,
                         indices=rigid_indices,
                         event_rigid=event.event_rigid,
                         view_code_rigid=getattr(event, "view_code_rigid", getattr(event, "obs_code_rigid", None)),
                         valid_rigid=getattr(event, "valid_rigid", None),
                         support_rigid=getattr(event, "support_rigid", None),
+                        return_aux=True,
                     )
                 ctx_rigid, vsm_aux_rigid = self.stage6_vsm.query_rigid(
                     state=vsm_state,
@@ -2315,7 +2322,9 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                     "Stage6_0 Phase B-R ctx_rigid shape mismatch: "
                     f"ctx={tuple(ctx_rigid.shape)} route={int(rigid_indices.numel())}"
                 )
-            vsm_aux = {**vsm_aux_bg, **vsm_aux_rigid}
+            if memory_write:
+                latest_vsm_update_aux = {**vsm_update_aux_bg, **vsm_update_aux_rigid}
+            vsm_aux = {**latest_vsm_update_aux, **vsm_aux_bg, **vsm_aux_rigid}
             self._mem_debug(
                 "forward_phase_b/after_vsm",
                 k=int(k),
@@ -2364,6 +2373,8 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             if not torch.isfinite(loss_k).all():
                 raise RuntimeError("Stage6_0 Phase B prefix loss became NaN/Inf.")
             total_loss = total_loss + loss_k
+            rollout_loss = rollout_loss + loss_k
+            step_weight_sum += float(step_weight)
             if memory_write:
                 written_refs.update(set(evidence_refs))
             vsm_state = replace(vsm_state, written_refs=set(written_refs))
@@ -2460,6 +2471,18 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "query_weight": float(query_weight),
             "query_loss": float(query_loss.detach().item()) if torch.is_tensor(query_loss) else float(query_loss),
             "query_stats": query_stats,
+            "rollout_loss": float(rollout_loss.detach().item()),
+            "loss_total_norm_by_weight": (
+                float((rollout_loss / max(float(step_weight_sum), 1.0e-8)).detach().item())
+                if torch.is_tensor(rollout_loss)
+                else 0.0
+            ),
+            "loss_total_norm_by_K": (
+                float((rollout_loss / max(int(roles.inner_K), 1)).detach().item())
+                if torch.is_tensor(rollout_loss)
+                else 0.0
+            ),
+            "step_weight_sum": float(step_weight_sum),
             "leak/query_evidence_overlap": float(len(set(roles.query_label_refs) & set(_ref for group in roles.evidence_refs_by_step for _ref in group))),
             "leak/query_written_overlap": float(len(set(roles.query_label_refs) & set(written_refs))),
         }
@@ -2654,6 +2677,12 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         logs: Dict[str, Any] = {
             "loss": float(loss.detach().item()),
             "phase_b/loss_total": float(loss.detach().item()),
+            "phase_b/loss_total_norm_by_weight": float(out.get("loss_total_norm_by_weight", 0.0)),
+            "phase_b/loss_total_norm_by_K": float(out.get("loss_total_norm_by_K", 0.0)),
+            f"phase_b/K{int(out['roles'].inner_K)}/loss_total_norm_by_weight": float(
+                out.get("loss_total_norm_by_weight", 0.0)
+            ),
+            f"phase_b/K{int(out['roles'].inner_K)}/loss_total_norm_by_K": float(out.get("loss_total_norm_by_K", 0.0)),
             "stage6/phase": "B",
             "stage6/inner_K": float(out["roles"].inner_K),
             "phase_b/rollout_K": float(out["roles"].inner_K),
@@ -2672,6 +2701,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "phase_b/prefix_final_static_psnr": float(final.get("prefix_psnr", 0.0)),
             "phase_b/prefix_valid_ratio_final": float(final.get("prefix_valid_ratio", 0.0)),
             "phase_b/query_loss": float(out.get("query_loss", 0.0)),
+            f"phase_b/K{int(out['roles'].inner_K)}/query_loss": float(out.get("query_loss", 0.0)),
             "phase_b/query_weight": float(out.get("query_weight", 0.0)),
             "phase_b/query_event_l1": float(query_stats.get("query_event_l1", 0.0)),
             "phase_b/query_visible_acc": float(query_stats.get("query_visible_acc", 0.0)),
@@ -2684,7 +2714,20 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "phase_b/query_rows_all": float(query_stats.get("query_rows_all", 0.0)),
             "phase_b/vsm_token_usage_mean": float(final.get("vsm_token_usage_mean", 0.0)),
             "phase_b/vsm_router_entropy": float(final.get("vsm_router_entropy", 0.0)),
-            "phase_b/vsm_update_norm": float(final.get("vsm_update_count_mean", 0.0)),
+            f"phase_b/K{int(out['roles'].inner_K)}/vsm_router_entropy": float(final.get("vsm_router_entropy", 0.0)),
+            f"phase_b/K{int(out['roles'].inner_K)}/vsm_token_usage_mean": float(final.get("vsm_token_usage_mean", 0.0)),
+            "phase_b/vsm_update_norm": float(final.get("vsm_update_token_delta_norm", 0.0)),
+            "phase_b/vsm_update_count_mean": float(final.get("vsm_update_count_mean", 0.0)),
+            "phase_b/vsm_update_token_delta_norm": float(final.get("vsm_update_token_delta_norm", 0.0)),
+            "phase_b/vsm_update_proto_delta_norm": float(final.get("vsm_update_proto_delta_norm", 0.0)),
+            "phase_b/vsm_update_global_delta_norm": float(final.get("vsm_update_global_delta_norm", 0.0)),
+            "phase_b/vsm_update_assign_entropy": float(final.get("vsm_update_assign_entropy", 0.0)),
+            "phase_b/vsm_update_assign_max": float(final.get("vsm_update_assign_max", 0.0)),
+            "phase_b/vsm_update_assign_usage_max": float(final.get("vsm_update_assign_usage_max", 0.0)),
+            "phase_b/vsm_token_pair_cosine_mean": float(final.get("vsm_token_pair_cosine_mean", 0.0)),
+            "phase_b/vsm_token_pair_cosine_max": float(final.get("vsm_token_pair_cosine_max", 0.0)),
+            "phase_b/vsm_token_variance_mean": float(final.get("vsm_token_variance_mean", 0.0)),
+            "phase_b/vsm_proto_pair_distance_mean": float(final.get("vsm_proto_pair_distance_mean", 0.0)),
             "phase_b/vsm_ctx_norm": float(final.get("vsm_ctx_norm", 0.0)),
             "phase_b/vsm_ctx_norm_bg": float(final.get("vsm_bg_vsm_ctx_norm", final.get("vsm_ctx_norm", 0.0))),
             "phase_b/vsm_ctx_norm_rigid": float(final.get("vsm_rigid_vsm_ctx_norm", 0.0)),
@@ -2721,11 +2764,17 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 logs["phase_b/vsm_ctx_adapter_weight_norm"] = float(weight.detach().norm().item())
         for item in per_step:
             k = int(item["k"])
+            logs[f"phase_b/memory_write_k{k}"] = float(item.get("memory_write", 0.0))
+            logs[f"phase_b/repeat_idx_k{k}"] = float(item.get("repeat_idx", 0.0))
+            logs[f"phase_b/block_idx_k{k}"] = float(item.get("block_idx", -1.0))
             logs[f"phase_b/prefix_loss_k{k}"] = float(item.get("loss_prefix", 0.0))
             logs[f"phase_b/prefix_rgb_l1_k{k}"] = float(item.get("prefix_l1", 0.0))
             logs[f"phase_b/prefix_static_psnr_k{k}"] = float(item.get("prefix_psnr", 0.0))
             logs[f"phase_b/prefix_valid_ratio_k{k}"] = float(item.get("prefix_valid_ratio", 0.0))
             logs[f"phase_b/vsm_ctx_norm_k{k}"] = float(item.get("vsm_ctx_norm", 0.0))
+            logs[f"phase_b/vsm_update_assign_entropy_k{k}"] = float(item.get("vsm_update_assign_entropy", 0.0))
+            logs[f"phase_b/vsm_update_token_delta_norm_k{k}"] = float(item.get("vsm_update_token_delta_norm", 0.0))
+            logs[f"phase_b/vsm_token_pair_cosine_mean_k{k}"] = float(item.get("vsm_token_pair_cosine_mean", 0.0))
             logs[f"phase_b/vsm_ctx_norm_rigid_k{k}"] = float(item.get("vsm_rigid_vsm_ctx_norm", 0.0))
             logs[f"phase_b/delta_bg_means_norm_k{k}"] = float(item.get("delta_bg_means_norm", 0.0))
             logs[f"phase_b/rigid_delta_means_norm_k{k}"] = float(item.get("rigid_delta_means_norm", 0.0))
