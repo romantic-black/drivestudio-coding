@@ -116,14 +116,6 @@ dataset:
     monocular_downscale: 1
     monocular_dynamic_recovery_bbox_expand_xyz_m: [0.5, 0.2, 0.5]
     monocular_dynamic_recovery_max_points_per_instance: 5000
-    dynamic_point_balance:
-      enable: true
-      mode: bbox_volume
-      reference_volume_m3: 13.0
-      volume_exponent: 0.5
-      min_scale: 0.25
-      max_scale: 3.0
-      min_points_per_instance: 512
     near_max_points: 400000
     distant_max_points: 160000
     max_dynamic_points_per_segment: 120000
@@ -145,7 +137,7 @@ scheduler_long_phase_b:
   rollout_shapes_schedule:
     - start_step: 0
       shapes:
-        - {name: r4_a3, repeats_per_anchor: 4, anchors_per_rollout: 3, prob: 1.0}
+        - {name: r4_a4, repeats_per_anchor: 4, anchors_per_rollout: 4, prob: 1.0}
   anchor_sampling:
     policy: random_without_replacement
     order_policy: random_permutation
@@ -874,7 +866,7 @@ lr_scheduler:
 
 training:
   max_iterations: 3000010
-  log_interval: 1000
+  log_interval: 50
   save_checkpoint_freq: 10000
   seed: 41
   amp:
@@ -901,6 +893,10 @@ logging:
   project: minimal_sf_stage6_0_phase_b_long_v1
   log_dir: null
   image_interval_blocks: 1000
+  train_step_metrics_interval: 50
+  disable_stage6_mem_debug_env: true
+  log_node_state_reset: false
+  write_node_state_reset_metrics: false
   train_monitor:
     enable_heavy_metrics: false
     include_per_view_metrics: false
@@ -920,6 +916,6 @@ logging:
     window_size: 50
     save_branch_renders: false
   performance:
-    enable: false
+    enable: true
     phase_timing: false
     cuda_memory: false

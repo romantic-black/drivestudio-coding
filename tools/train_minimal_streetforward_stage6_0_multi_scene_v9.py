@@ -8,6 +8,24 @@ import os
 import sys
 from typing import Any, Dict, Optional
 
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+
+
+def _normalize_omp_num_threads_silent(*, fallback: int = 8) -> None:
+    raw = os.environ.get("OMP_NUM_THREADS")
+    if raw is None:
+        return
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        os.environ["OMP_NUM_THREADS"] = str(fallback)
+        return
+    if value <= 0:
+        os.environ["OMP_NUM_THREADS"] = str(fallback)
+
+
+_normalize_omp_num_threads_silent()
+
 import tools.train_minimal_streetforward_stage4_3_multi_scene_v4 as base
 from datasets.validation_scheduler_v9 import (
     build_validation_plan_v9,

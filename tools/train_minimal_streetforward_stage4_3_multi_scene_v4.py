@@ -583,6 +583,7 @@ def _reset_model_node_state_and_release_cuda(
     reason: str,
     step: int,
     scheduler_info: Optional[Dict[str, Any]] = None,
+    log_reset: bool = True,
 ) -> Dict[str, Any]:
     before = _node_state_cache_sizes(model)
     model.reset_node_state()
@@ -593,18 +594,19 @@ def _reset_model_node_state_and_release_cuda(
         torch.cuda.empty_cache()
     after = _node_state_cache_sizes(model)
     scheduler_info = scheduler_info or {}
-    logger.info(
-        "NODE_STATE_RESET step=%s reason=%s scene_id=%s scene_dir=%s segment=%s "
-        "before=%s after=%s cuda_empty_cache=%s",
-        int(step),
-        str(reason),
-        scheduler_info.get("scene_id", -1),
-        _scene_dir_str(scheduler_info.get("scene_id", -1)),
-        scheduler_info.get("segment_id", -1),
-        before,
-        after,
-        bool(empty_cache and torch.cuda.is_available()),
-    )
+    if bool(log_reset):
+        logger.info(
+            "NODE_STATE_RESET step=%s reason=%s scene_id=%s scene_dir=%s segment=%s "
+            "before=%s after=%s cuda_empty_cache=%s",
+            int(step),
+            str(reason),
+            scheduler_info.get("scene_id", -1),
+            _scene_dir_str(scheduler_info.get("scene_id", -1)),
+            scheduler_info.get("segment_id", -1),
+            before,
+            after,
+            bool(empty_cache and torch.cuda.is_available()),
+        )
     return {
         "before": before,
         "after": after,
@@ -845,6 +847,7 @@ def _run_validation_v7_round(
                     "scene_id": int(spec.scene_id),
                     "segment_id": int(spec.segment_id),
                 },
+                log_reset=bool((cfg.get("logging") or {}).get("log_node_state_reset", True)),
             )
             validation_local_step = 0
             last_minimal: Optional[Dict[str, Any]] = None
@@ -1331,6 +1334,7 @@ def _run_validation_v7_round(
         reason="validation_v7_end",
         step=int(trigger_step),
         scheduler_info=None,
+        log_reset=bool((cfg.get("logging") or {}).get("log_node_state_reset", True)),
     )
 
 
@@ -1364,6 +1368,9 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = setup(args)
+    logging_cfg = cfg.get("logging") or {}
+    if bool(logging_cfg.get("disable_stage6_mem_debug_env", False)):
+        os.environ["STAGE6_MEM_DEBUG"] = "0"
     cfg.data.train_scene_ids = [int(x) for x in list(cfg.data.train_scene_ids)]
     cfg.data.eval_scene_ids = [int(x) for x in list(cfg.data.get("eval_scene_ids", []) or [])]
     if parse_view_selection(cfg.training.get("view_selection")) is not None:
@@ -1608,6 +1615,9 @@ def main() -> None:
     train_step_metrics_interval = int(cfg.logging.get("train_step_metrics_interval", 0))
     if train_step_metrics_interval < 0:
         raise ValueError("logging.train_step_metrics_interval must be >= 0")
+    log_node_state_reset = bool(cfg.logging.get("log_node_state_reset", True))
+    write_node_state_reset_metrics = bool(cfg.logging.get("write_node_state_reset_metrics", True))
+    node_state_reset_cuda_memory = bool(cfg.logging.get("node_state_reset_cuda_memory", False))
     train_monitor_cfg = cfg.logging.get("train_monitor") or {}
     train_monitor_enable_heavy_metrics = bool(train_monitor_cfg.get("enable_heavy_metrics", True))
     train_monitor_include_per_view_metrics = bool(train_monitor_cfg.get("include_per_view_metrics", True))
@@ -2057,6 +2067,7 @@ def main() -> None:
                         reason="deferred_block_exit_record",
                         step=int(step),
                         scheduler_info=scheduler_info,
+                        log_reset=bool(log_node_state_reset),
                     )
             loss_val = float(result["loss"])
             pred_rgbs = result["pred_rgbs"]
@@ -2696,6 +2707,7 @@ def main() -> None:
                     reason="deferred_episode_hook",
                     step=int(step),
                     scheduler_info=scheduler_info,
+                    log_reset=bool(log_node_state_reset),
                 )
                 reset_before = dict(reset_info.get("before") or {})
                 reset_after = dict(reset_info.get("after") or {})
@@ -2720,11 +2732,12 @@ def main() -> None:
                     "node_state_cache_segments_sky_after": int(reset_after.get("sky", 0)),
                     "cuda_empty_cache": bool(reset_info.get("cuda_empty_cache", False)),
                 }
-                if torch.cuda.is_available():
+                if bool(node_state_reset_cuda_memory) and torch.cuda.is_available():
                     reset_row["memory/allocated_gb"] = float(torch.cuda.memory_allocated() / (1024.0 ** 3))
                     reset_row["memory/reserved_gb"] = float(torch.cuda.memory_reserved() / (1024.0 ** 3))
                     reset_row["memory/peak_gb"] = float(torch.cuda.max_memory_allocated() / (1024.0 ** 3))
-                _write_metrics_history(metrics_fh, reset_row)
+                if bool(write_node_state_reset_metrics):
+                    _write_metrics_history(metrics_fh, reset_row)
 
             _drop_result_tensor_payloads(result)
             pred_rgbs = []
