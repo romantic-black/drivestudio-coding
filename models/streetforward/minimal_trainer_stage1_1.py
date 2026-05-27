@@ -50,6 +50,48 @@ except ImportError:
     _sparse_to_dense_volume = None
 
 
+class _FallbackSparseTensor:
+    def __init__(self, coords: torch.Tensor, feats: torch.Tensor) -> None:
+        self.coords = coords
+        self.feats = feats
+
+
+class _FallbackSparseCostRegNet(nn.Module):
+    """Last-resort legacy sparse-volume shim for phases that do not use 3D cost features."""
+
+    def __init__(self, d_in: int, d_out: int) -> None:
+        super().__init__()
+        self.d_out = int(d_out)
+
+    def forward(self, sparse_tensor: _FallbackSparseTensor) -> torch.Tensor:  # type: ignore[override]
+        feats = sparse_tensor.feats
+        n = int(feats.shape[0]) if feats is not None and feats.dim() > 0 else 0
+        return feats.new_zeros((n, int(self.d_out)))
+
+
+def _fallback_construct_sparse_tensor(
+    raw_coords: torch.Tensor,
+    feats: torch.Tensor,
+    Bbx_min: torch.Tensor,
+    Bbx_max: torch.Tensor,
+    voxel_size: float,
+    device: torch.device,
+) -> Tuple[_FallbackSparseTensor, torch.Tensor, torch.Tensor]:
+    _ = (Bbx_min, Bbx_max, voxel_size)
+    vol_dim = torch.tensor([2, 2, 2], dtype=torch.long, device=device)
+    return _FallbackSparseTensor(raw_coords.to(device), feats.to(device)), vol_dim, raw_coords.to(device)
+
+
+def _fallback_sparse_to_dense_volume(
+    sparse_tensor: torch.Tensor,
+    coords: torch.Tensor,
+    vol_dim: torch.Tensor,
+) -> torch.Tensor:
+    _ = coords
+    feat_dim = int(sparse_tensor.shape[-1]) if sparse_tensor.dim() > 1 else 1
+    return sparse_tensor.new_zeros((int(vol_dim[0]), int(vol_dim[1]), int(vol_dim[2]), int(feat_dim)))
+
+
 def _get_grid_coords(
     position_w: torch.Tensor,
     bbx_min: torch.Tensor,
@@ -174,16 +216,26 @@ class MinimalStreetForwardStage1_1(nn.Module):
 
         outdim = int(model_cfg.get("sparseConv_outdim", 32))
         self.feat_3d_dim = outdim
+        allow_sparse_fallback = bool(model_cfg.get("allow_missing_legacy_sparse_conv", False))
 
         if sparse_conv is not None:
             self.sparse_conv = sparse_conv.to(device)
         elif _SparseCostRegNet is not None:
             self.sparse_conv = _SparseCostRegNet(d_in=3, d_out=outdim).to(device)
+        elif allow_sparse_fallback:
+            logger.warning(
+                "SparseCostRegNet unavailable; using zero-feature legacy sparse fallback. "
+                "This is intended only for phases that do not consume legacy 3D cost features."
+            )
+            self.sparse_conv = _FallbackSparseCostRegNet(d_in=3, d_out=outdim).to(device)
         else:
             raise ImportError("SparseCostRegNet not available; install models.evol_splat.")
 
         self.construct_sparse_tensor = construct_sparse_tensor_fn or _construct_sparse_tensor
         self.sparse_to_dense_volume = sparse_to_dense_volume_fn or _sparse_to_dense_volume
+        if allow_sparse_fallback:
+            self.construct_sparse_tensor = self.construct_sparse_tensor or _fallback_construct_sparse_tensor
+            self.sparse_to_dense_volume = self.sparse_to_dense_volume or _fallback_sparse_to_dense_volume
         if self.construct_sparse_tensor is None or self.sparse_to_dense_volume is None:
             raise ImportError("evol_splat construct_sparse_tensor / sparse_to_dense_volume required.")
 

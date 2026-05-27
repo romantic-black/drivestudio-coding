@@ -122,6 +122,19 @@ def _parse_monocular_dynamic_recovery_cfg(
     return True, bbox_expand, max_points, assignment
 
 
+def _parse_dynamic_point_balance_cfg(pointcloud_config: Dict) -> Optional[Dict[str, Any]]:
+    block = pointcloud_config.get("dynamic_point_balance")
+    if block is None:
+        return None
+    if OmegaConf.is_config(block):
+        block = OmegaConf.to_container(block, resolve=True)
+    if not isinstance(block, dict):
+        raise TypeError(
+            f"dataset.pointcloud.dynamic_point_balance must be a mapping, got {type(block)}"
+        )
+    return dict(block)
+
+
 def _safe_json_serialize(obj):
     """
     Safely serialize an object to JSON, handling Mock objects and other non-serializable types.
@@ -390,6 +403,7 @@ class MultiSceneDataset:
                 _parse_monocular_dynamic_recovery_cfg(pointcloud_config)
             )
             sim_enable, sim_thresh = _parse_static_instance_motion_cfg(pointcloud_config)
+            dyn_balance_cfg = _parse_dynamic_point_balance_cfg(pointcloud_config)
 
             # Require pixel_source to load dynamic masks (fast-fail)
             if (
@@ -413,6 +427,7 @@ class MultiSceneDataset:
                 dynamic_recovery_assignment=dyn_rec_assignment,
                 static_instance_motion_enable=sim_enable,
                 static_instance_motion_traj_length_thresh_m=sim_thresh,
+                dynamic_point_balance=dyn_balance_cfg,
                 device=device,
             )
         elif generator_type == "lidar":
@@ -420,11 +435,15 @@ class MultiSceneDataset:
                 raise ValueError("dataset.pointcloud.lidar_sparsity is required for lidar generator.")
             lidar_sparsity = pointcloud_config["lidar_sparsity"]
             sim_enable, sim_thresh = _parse_static_instance_motion_cfg(pointcloud_config)
+            dyn_balance_cfg = _parse_dynamic_point_balance_cfg(pointcloud_config)
+            dynamic_max_points = pointcloud_config.get("dynamic_max_points_per_instance")
             return LiDARRGBPointCloudGenerator(
                 sparsity=lidar_sparsity,
                 device=device,
                 static_instance_motion_enable=sim_enable,
                 static_instance_motion_traj_length_thresh_m=sim_thresh,
+                dynamic_max_points_per_instance=dynamic_max_points,
+                dynamic_point_balance=dyn_balance_cfg,
             )
         elif generator_type == "hybrid":
             # LiDAR生成器参数
@@ -464,6 +483,7 @@ class MultiSceneDataset:
             near_max_points = pointcloud_config.get("near_max_points", None)
             distant_max_points = pointcloud_config.get("distant_max_points", None)
             sim_enable, sim_thresh = _parse_static_instance_motion_cfg(pointcloud_config)
+            dyn_balance_cfg = _parse_dynamic_point_balance_cfg(pointcloud_config)
             mono_rec_bbox_expand = pointcloud_config["monocular_dynamic_recovery_bbox_expand_xyz_m"]
             mono_rec_max_pts = pointcloud_config["monocular_dynamic_recovery_max_points_per_instance"]
 
@@ -524,6 +544,7 @@ class MultiSceneDataset:
                 distant_max_points=distant_max_points,
                 static_instance_motion_enable=sim_enable,
                 static_instance_motion_traj_length_thresh_m=sim_thresh,
+                dynamic_point_balance=dyn_balance_cfg,
                 device=device,
             )
         else:

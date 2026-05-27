@@ -5,6 +5,7 @@ import gc
 import logging
 import os
 from collections import defaultdict
+from contextlib import nullcontext
 from dataclasses import replace
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -20,15 +21,23 @@ from models.streetforward.stage6_0 import (
     ContextPack,
     LocalGSState,
     PHASE_B_NAME,
+    PHASE_B_LONG_NAME,
+    LongStreamingVSM,
+    PhaseBOffsetState,
     Stage6QueryDecoder,
     Stage6PosteriorUpdater,
     Stage6RoutedStructEventDecoder,
     Stage6StructInput,
     Stage6VSMState,
     Stage6ViewSetMemory,
+    VSMOffsetDecoder,
     empty_stage6_struct_input,
+    materialize_phase_b_state,
+    offset_regularization as phase_b_long_offset_regularization,
+    phase_b_long_final_render_loss,
     resolve_v9_phase_a_batch,
     resolve_v9_phase_b_batch,
+    resolve_long_phase_b_batch,
     stage6_to_struct_decoder_input,
 )
 from models.streetforward.stage6_0.phase_a_losses import (
@@ -36,6 +45,7 @@ from models.streetforward.stage6_0.phase_a_losses import (
     masked_rgb_loss,
     target_valid_mask,
 )
+from models.streetforward.stage6_0.phase_b_long.streaming_vsm import DISTANT_MODE_APPEARANCE_SCALE, DISTANT_MODE_FROZEN
 from models.streetforward.stage6_0.posterior_updater import BranchDelta, DeltaPack
 from models.streetforward.stage6_0.vsm import Stage6QueryPred, masked_smooth_l1
 
@@ -109,19 +119,38 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         if view_transient is not None:
             view_transient["enable"] = True
         if self._cfg_get(cfg, "scheduler_v8", None) is None:
-            sv9 = self._require_key(cfg, "scheduler_v9", "config")
-            ep = self._require_key(sv9, "episode", "scheduler_v9")
-            execution = self._cfg_get(sv9, "execution", {}) or {}
-            block = self._cfg_get(sv9, "block", {}) or {}
-            traversal = self._cfg_get(sv9, "traversal", {}) or {}
-            preload = self._cfg_get(sv9, "preload", {}) or {}
+            sv9 = self._cfg_get(cfg, "scheduler_v9", None)
+            slong = self._cfg_get(cfg, "scheduler_long_phase_b", None)
+            use_long = slong is not None and bool(self._cfg_get(slong, "enable", False))
+            sched_src = slong if use_long else sv9
+            sched_label = "scheduler_long_phase_b" if use_long else "scheduler_v9"
+            if sched_src is None:
+                raise ValueError("Stage6_0 requires scheduler_v9 or scheduler_long_phase_b for Stage5_4 compatibility.")
+            if use_long:
+                ep_window = self._cfg_get(sched_src, "episode_window", {}) or {}
+                ep = {
+                    "blocks_per_episode": int(self._cfg_get(ep_window, "frames_per_window", 2)),
+                    "include_source_frame": True,
+                    "target_policy": "visited_episode_frames",
+                    "block_source_frame_policy": "random_within_keyframe_per_visit",
+                    "frame_within_keyframe_policy": "random_once_per_episode",
+                    "min_keyframes_required_policy": "use_available_if_less_than_window",
+                }
+                execution = {"block_order": "step_major", "step_major_switch_interval_steps": 1, "reset_policy": "episode_end"}
+                block = {"steps_per_block": 1}
+            else:
+                ep = self._require_key(sched_src, "episode", sched_label)
+                execution = self._cfg_get(sched_src, "execution", {}) or {}
+                block = self._cfg_get(sched_src, "block", {}) or {}
+            traversal = self._cfg_get(sched_src, "traversal", {}) or {}
+            preload = self._cfg_get(sched_src, "preload", {}) or {}
             cfg["scheduler_v8"] = {
                 "enable": True,
                 "block": {
                     "steps_per_block": int(self._cfg_get(block, "steps_per_block", 1)),
                 },
                 "episode": {
-                    "blocks_per_episode": int(self._require_key(ep, "blocks_per_episode", "scheduler_v9.episode")),
+                    "blocks_per_episode": int(self._require_key(ep, "blocks_per_episode", f"{sched_label}.episode")),
                     "total_target_frames": 1,
                     "include_source_frame": bool(self._cfg_get(ep, "include_source_frame", True)),
                     "target_policy": str(self._cfg_get(ep, "target_policy", "visited_episode_frames")),
@@ -181,6 +210,9 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             return
         if phase == PHASE_B_NAME:
             self._validate_stage6_0_phase_b_config(config)
+            return
+        if phase == PHASE_B_LONG_NAME:
+            self._validate_stage6_0_phase_b_long_config(config)
             return
         raise ValueError(f"unsupported Stage6_0 model.phase={phase!r}")
 
@@ -502,6 +534,80 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         if "dynamic" in prefix_mask:
             raise ValueError("Stage6_0 Phase B-R must not use dynamic mask policies.")
 
+    def _validate_stage6_0_phase_b_long_config(self, config) -> None:
+        model_cfg = self._require_key(config, "model", "config")
+        if str(self._require_key(model_cfg, "stage", "model")) != "6_0":
+            raise ValueError("6_0_phase_b requires model.stage='6_0'.")
+        if str(self._cfg_get(model_cfg, "phase", "")) != PHASE_B_LONG_NAME:
+            raise ValueError("6_0_phase_b requires model.phase='6_0_phase_b'.")
+        stage6 = self._require_key(model_cfg, "stage6_0", "model")
+        long_cfg = self._require_key(stage6, "phase_b_long", "model.stage6_0")
+        if bool(self._cfg_get(long_cfg, "enable", False)) is not True:
+            raise ValueError("6_0_phase_b requires model.stage6_0.phase_b_long.enable=true.")
+        sensor_cfg = self._cfg_get(long_cfg, "sensor", {}) or self._cfg_get(stage6, "base_measurement", {}) or {}
+        base_measurement = self._require_key(stage6, "base_measurement", "model.stage6_0")
+        if str(self._cfg_get(base_measurement, "type", self._cfg_get(sensor_cfg, "base_measurement_type", ""))) != "stage5_4_v4":
+            raise ValueError("6_0_phase_b requires base_measurement.type=stage5_4_v4.")
+        if bool(self._cfg_get(base_measurement, "require_fused_v4", self._cfg_get(sensor_cfg, "require_fused_v4", True))) is not True:
+            raise ValueError("6_0_phase_b requires fused V4 measurement.")
+        if str(self._cfg_get(base_measurement, "source_evidence_grad_mode", self._cfg_get(sensor_cfg, "source_evidence_grad_mode", "no_grad_v4"))) != "no_grad_v4":
+            raise ValueError("6_0_phase_b V1 requires source_evidence_grad_mode=no_grad_v4.")
+        if bool(self._cfg_get(base_measurement, "detach_v4_outputs", self._cfg_get(sensor_cfg, "detach_v4_outputs", True))) is not True:
+            raise ValueError("6_0_phase_b V1 requires detach_v4_outputs=true.")
+        if bool(self._cfg_get(base_measurement, "train_2d_frontend", self._cfg_get(sensor_cfg, "train_2d_frontend", False))):
+            raise ValueError("6_0_phase_b V1 freezes the measurement frontend.")
+
+        struct_cfg = self._require_key(stage6, "struct_event_decoder", "model.stage6_0")
+        if bool(self._cfg_get(struct_cfg, "enable", False)) is not True:
+            raise ValueError("6_0_phase_b requires struct_event_decoder.enable=true.")
+        q_cfg = self._cfg_get(long_cfg, "query_decoder", self._cfg_get(stage6, "query_decoder", {}) or {}) or {}
+        if bool(self._cfg_get(q_cfg, "enable", False)):
+            raise ValueError("6_0_phase_b V1 requires query_decoder.enable=false.")
+        vsm_cfg = self._require_key(long_cfg, "vsm", "model.stage6_0.phase_b_long")
+        if str(self._cfg_get(vsm_cfg, "type", "streaming_selective_ssm")) != "streaming_selective_ssm":
+            raise ValueError("6_0_phase_b V1 requires streaming_selective_ssm VSM.")
+        for forbidden in ("use_spatial_mamba", "use_cell_memory", "use_global_memory"):
+            if bool(self._cfg_get(vsm_cfg, forbidden, False)):
+                raise ValueError(f"6_0_phase_b V1 forbids vsm.{forbidden}=true.")
+        distant_cfg = self._cfg_get(vsm_cfg, "distant", {}) or {}
+        distant_mode = str(self._cfg_get(distant_cfg, "mode", DISTANT_MODE_FROZEN))
+        if distant_mode not in {DISTANT_MODE_FROZEN, DISTANT_MODE_APPEARANCE_SCALE}:
+            raise ValueError("6_0_phase_b requires distant.mode=frozen_render_only or appearance_scale_only.")
+        if bool(self._cfg_get(distant_cfg, "update_means", False)):
+            raise ValueError("6_0_phase_b distant VSM must keep distant.update_means=false.")
+        if bool(self._cfg_get(distant_cfg, "update_quat", False)):
+            raise ValueError("6_0_phase_b distant VSM must keep distant.update_quat=false.")
+        if distant_mode == DISTANT_MODE_APPEARANCE_SCALE:
+            for key in ("update_scales", "update_opacity", "update_sh_dc"):
+                if bool(self._cfg_get(distant_cfg, key, False)) is not True:
+                    raise ValueError(f"6_0_phase_b distant appearance_scale_only requires distant.{key}=true.")
+        dec_cfg = self._require_key(long_cfg, "offset_decoder", "model.stage6_0.phase_b_long")
+        if str(self._cfg_get(dec_cfg, "input_source", "vsm_readout_only")) != "vsm_readout_only":
+            raise ValueError("6_0_phase_b requires offset_decoder.input_source=vsm_readout_only.")
+        if bool(self._cfg_get(dec_cfg, "allow_event_bypass", False)):
+            raise ValueError("6_0_phase_b forbids offset_decoder.allow_event_bypass.")
+
+        sched = self._require_key(config, "scheduler_long_phase_b", "config")
+        if bool(self._cfg_get(sched, "enable", False)) is not True:
+            raise ValueError("6_0_phase_b requires scheduler_long_phase_b.enable=true.")
+        if str(self._cfg_get(sched, "version", "long_v1")) != "long_v1":
+            raise ValueError("6_0_phase_b requires scheduler_long_phase_b.version=long_v1.")
+        if str(self._cfg_get(sched, "phase", PHASE_B_LONG_NAME)) != PHASE_B_LONG_NAME:
+            raise ValueError("6_0_phase_b requires scheduler_long_phase_b.phase=6_0_phase_b.")
+        for key in ("episode_window", "anchor_sampling", "final_supervision"):
+            self._require_key(sched, key, "scheduler_long_phase_b")
+        if not (list(self._cfg_get(sched, "rollout_shapes", []) or []) or list(self._cfg_get(sched, "rollout_shapes_schedule", []) or [])):
+            raise ValueError("6_0_phase_b requires scheduler_long_phase_b.rollout_shapes or rollout_shapes_schedule.")
+        validation_v9 = self._cfg_get(config, "validation_v9", {}) or {}
+        if bool(self._cfg_get(validation_v9, "enable", False)):
+            raise ValueError("6_0_phase_b uses validation_long_phase_b; validation_v9 must stay disabled for this phase.")
+        losses_cfg = self._cfg_get(config, "losses", {}) or {}
+        phase_b_long = self._require_key(losses_cfg, "phase_b_long", "losses")
+        for key in ("query_observation", "nearby_render", "per_step_prefix_render"):
+            node = self._cfg_get(phase_b_long, key, {}) or {}
+            if bool(self._cfg_get(node, "enable", False)):
+                raise ValueError(f"6_0_phase_b V1 requires losses.phase_b_long.{key}.enable=false.")
+
     def _configure_measurement_frontend_trainability(self, config: Any) -> None:
         model_cfg = self._require_key(config, "model", "config")
         self.stage6_phase = str(self._cfg_get(model_cfg, "phase", "phase_A_block_local_unroll"))
@@ -519,7 +625,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         for param in self.parameters():
             param.requires_grad_(False)
 
-        if self.stage6_phase == PHASE_B_NAME:
+        if self.stage6_phase in {PHASE_B_NAME, PHASE_B_LONG_NAME}:
             self.stage6_phase_a_mode = "phase_b_frozen"
             self.stage6_source_evidence_grad_mode = "no_grad_v4"
             self.stage6_detach_v4_outputs = True
@@ -617,6 +723,9 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             param_obs_codec_cfg=param_obs_cfg,
         ).to(self.device)
         phase_b_hooks = self._cfg_get(updater_cfg, "phase_b_hooks", {}) or {}
+        if str(getattr(self, "stage6_phase", "")) == PHASE_B_LONG_NAME:
+            phase_b_hooks = dict(phase_b_hooks)
+            phase_b_hooks["accept_vsm_ctx"] = False
         clamp_keys = (
             "means_max_step_m",
             "scales_log_max_step",
@@ -654,6 +763,8 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         query_cfg = self._cfg_get(stage6, "query_decoder", {}) or {}
         self.stage6_vsm: Optional[Stage6ViewSetMemory] = None
         self.stage6_query_decoder: Optional[Stage6QueryDecoder] = None
+        self.stage6_long_vsm: Optional[LongStreamingVSM] = None
+        self.stage6_long_offset_decoder: Optional[VSMOffsetDecoder] = None
         self.stage6_phase_b_tbptt_cache: Dict[Tuple[int, int, int, str], Dict[str, Any]] = {}
         if bool(self._cfg_get(vsm_cfg, "enable", False)):
             vsm_bg_cfg = self._cfg_get(vsm_cfg, "bg", {}) or {}
@@ -682,6 +793,65 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 event_dim=int(self.stage6_event_dim),
                 obs_code_dim=int(self._cfg_get(query_cfg, "obs_code_dim", 2)),
                 hidden_dim=int(self._cfg_get(query_cfg, "hidden_dim", max(96, self.stage6_event_dim))),
+            ).to(self.device)
+        long_cfg = self._cfg_get(stage6, "phase_b_long", {}) or {}
+        if bool(self._cfg_get(long_cfg, "enable", False)):
+            long_vsm_cfg = self._cfg_get(long_cfg, "vsm", {}) or {}
+            long_bg_cfg = self._cfg_get(long_vsm_cfg, "bg", {}) or {}
+            long_rigid_cfg = self._cfg_get(long_vsm_cfg, "rigid", {}) or {}
+            long_distant_cfg = self._cfg_get(long_vsm_cfg, "distant", {}) or {}
+            mem_long_cfg = self._cfg_get(self._cfg_get(config, "memory", {}) or {}, "phase_b_long", {}) or {}
+            self.stage6_phase_b_long_distant_mode = str(
+                self._cfg_get(long_distant_cfg, "mode", "frozen_render_only")
+            )
+            self.stage6_phase_b_long_vsm_dtype = str(self._cfg_get(long_vsm_cfg, "dtype", "bf16"))
+            self.stage6_phase_b_long_amp_dtype = str(
+                self._cfg_get(mem_long_cfg, "amp_dtype", self.stage6_phase_b_long_vsm_dtype)
+            )
+            self._phase_b_long_autocast_torch_dtype(self.stage6_phase_b_long_amp_dtype)
+            self.stage6_long_vsm = LongStreamingVSM(
+                event_dim=int(self.stage6_event_dim),
+                view_dim=2,
+                bg_mem_dim=int(self._cfg_get(long_bg_cfg, "mem_dim", 64)),
+                rigid_mem_dim=int(self._cfg_get(long_rigid_cfg, "mem_dim", 64)),
+                distant_mem_dim=int(self._cfg_get(long_distant_cfg, "mem_dim", 32)),
+                input_dim=int(self._cfg_get(long_vsm_cfg, "input_dim", max(96, self.stage6_event_dim))),
+                dtype=str(self.stage6_phase_b_long_vsm_dtype),
+                distant_mode=str(self.stage6_phase_b_long_distant_mode),
+                support_fallback_when_no_valid=bool(
+                    self._cfg_get(long_vsm_cfg, "support_fallback_when_no_valid", False)
+                ),
+                support_fallback_min=float(self._cfg_get(long_vsm_cfg, "support_fallback_min", 0.0)),
+                support_fallback_scale=float(self._cfg_get(long_vsm_cfg, "support_fallback_scale", 1.0)),
+                bg_active_sparse=bool(self._cfg_get(long_bg_cfg, "active_sparse", True)),
+            ).to(self.device)
+            dec_cfg = self._cfg_get(long_cfg, "offset_decoder", {}) or {}
+            clamps = self._cfg_get(dec_cfg, "clamps", {}) or {}
+            self.stage6_phase_b_long_offset_dtype = str(
+                self._cfg_get(mem_long_cfg, "offset_state_dtype", self._cfg_get(long_vsm_cfg, "dtype", "bf16"))
+            )
+            dec_update_scope = self._cfg_get(dec_cfg, "update_scope", {}) or {}
+            dec_distant_scope = self._cfg_get(dec_update_scope, "distant", {}) or {}
+            distant_sh_rest_bases = max(int(self.sh_degree + 1) ** 2 - 1, 0)
+            self.stage6_long_offset_decoder = VSMOffsetDecoder(
+                bg_mem_dim=int(self._cfg_get(long_bg_cfg, "mem_dim", 64)),
+                rigid_mem_dim=int(self._cfg_get(long_rigid_cfg, "mem_dim", 64)),
+                distant_mem_dim=int(self._cfg_get(long_distant_cfg, "mem_dim", 32)),
+                distant_sh_rest_bases=int(distant_sh_rest_bases),
+                distant_sh_rest_update_bases=int(
+                    self._cfg_get(
+                        dec_distant_scope,
+                        "sh_rest_lowfreq_bases",
+                        self._cfg_get(
+                            long_distant_cfg,
+                            "sh_rest_lowfreq_bases",
+                            min(int(distant_sh_rest_bases), 3),
+                        ),
+                    )
+                ),
+                hidden_dim=int(self._cfg_get(dec_cfg, "hidden_dim", 128)),
+                clamps=dict(clamps),
+                distant_mode=str(self.stage6_phase_b_long_distant_mode),
             ).to(self.device)
 
         losses_cfg = self._cfg_get(config, "losses", {}) or {}
@@ -740,10 +910,50 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         self.stage6_phase_b_tbptt_forbid_cache_eviction = bool(
             self._cfg_get(tbptt_cfg, "forbid_cache_eviction", False)
         )
+        phase_b_long = self._cfg_get(losses_cfg, "phase_b_long", {}) or {}
+        final_history = self._cfg_get(phase_b_long, "final_history_render", {}) or {}
+        final_current = self._cfg_get(phase_b_long, "final_current_render", {}) or {}
+        final_history_recon = self._cfg_get(phase_b_long, "final_history_recon_render", final_history) or final_history
+        final_history_nvs = self._cfg_get(phase_b_long, "final_history_nvs_render", final_history) or final_history
+        final_current_recon = self._cfg_get(phase_b_long, "final_current_recon_render", final_current) or final_current
+        final_current_nvs = self._cfg_get(phase_b_long, "final_current_nvs_render", final_current) or final_current
+        offset_reg = self._cfg_get(phase_b_long, "offset_regularization", {}) or {}
+        self.stage6_phase_b_long_history_weight = float(self._cfg_get(final_history, "weight", 1.0))
+        self.stage6_phase_b_long_history_l1_weight = float(self._cfg_get(final_history, "l1_weight", 0.8))
+        self.stage6_phase_b_long_history_ssim_weight = float(self._cfg_get(final_history, "ssim_weight", 0.2))
+        self.stage6_phase_b_long_history_mask_policy = str(
+            self._cfg_get(final_history, "mask_policy", "non_sky_non_egocar")
+        )
+        self.stage6_phase_b_long_current_weight = float(self._cfg_get(final_current, "weight", 1.0))
+        self.stage6_phase_b_long_current_l1_weight = float(self._cfg_get(final_current, "l1_weight", 0.8))
+        self.stage6_phase_b_long_current_ssim_weight = float(self._cfg_get(final_current, "ssim_weight", 0.2))
+        self.stage6_phase_b_long_current_mask_policy = str(
+            self._cfg_get(final_current, "mask_policy", "non_sky_non_egocar")
+        )
+        self.stage6_phase_b_long_role_render_cfg = {
+            "history_recon": dict(final_history_recon),
+            "history_nvs": dict(final_history_nvs),
+            "current_recon": dict(final_current_recon),
+            "current_nvs": dict(final_current_nvs),
+        }
+        self.stage6_phase_b_long_offset_reg_cfg = dict(offset_reg)
+        self.stage6_phase_b_long_offset_reg_weight = float(self._cfg_get(offset_reg, "weight", 1.0e-4))
 
     def _configure_stage6_trainability_after_module_init(self, config: Any) -> None:
         model_cfg = self._require_key(config, "model", "config")
         phase = str(self._cfg_get(model_cfg, "phase", "phase_A_block_local_unroll"))
+        if phase == PHASE_B_LONG_NAME:
+            for param in self.parameters():
+                param.requires_grad_(False)
+            if self.stage6_long_vsm is None:
+                raise ValueError("6_0_phase_b internal error: stage6_long_vsm was not initialized.")
+            if self.stage6_long_offset_decoder is None:
+                raise ValueError("6_0_phase_b internal error: stage6_long_offset_decoder was not initialized.")
+            for param in self.stage6_long_vsm.parameters():
+                param.requires_grad_(True)
+            for param in self.stage6_long_offset_decoder.parameters():
+                param.requires_grad_(True)
+            return
         if phase != PHASE_B_NAME:
             return
         for param in self.parameters():
@@ -969,6 +1179,26 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                     for name, param in self.stage6_query_decoder.named_parameters()  # type: ignore[union-attr]
                 ],
                 lr=lr_for("query_decoder"),
+                wd=weight_decay,
+            )
+        if getattr(self, "stage6_long_vsm", None) is not None:
+            add_group(
+                logical_name="stage6_long_vsm",
+                named_params=[
+                    (f"stage6_long_vsm.{name}", param)
+                    for name, param in self.stage6_long_vsm.named_parameters()  # type: ignore[union-attr]
+                ],
+                lr=lr_for("long_vsm"),
+                wd=weight_decay,
+            )
+        if getattr(self, "stage6_long_offset_decoder", None) is not None:
+            add_group(
+                logical_name="stage6_long_offset_decoder",
+                named_params=[
+                    (f"stage6_long_offset_decoder.{name}", param)
+                    for name, param in self.stage6_long_offset_decoder.named_parameters()  # type: ignore[union-attr]
+                ],
+                lr=lr_for("offset_decoder"),
                 wd=weight_decay,
             )
 
@@ -1409,6 +1639,8 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
     def _event_with_default_view_code(event: Any) -> Any:
         if getattr(event, "view_code_bg", None) is None and getattr(event, "obs_code_bg", None) is not None:
             event.view_code_bg = event.obs_code_bg
+        if getattr(event, "view_code_distant", None) is None and getattr(event, "obs_code_distant", None) is not None:
+            event.view_code_distant = event.obs_code_distant
         if getattr(event, "view_code_rigid", None) is None and getattr(event, "obs_code_rigid", None) is not None:
             event.view_code_rigid = event.obs_code_rigid
         return event
@@ -2487,8 +2719,233 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "leak/query_written_overlap": float(len(set(roles.query_label_refs) & set(written_refs))),
         }
 
+    def _phase_b_long_state_dtype(self, ref: torch.Tensor, dtype_name: str) -> torch.dtype:
+        name = str(dtype_name).lower()
+        if name in {"bf16", "bfloat16"} and ref.is_cuda:
+            return torch.bfloat16
+        if name in {"fp16", "float16"}:
+            return torch.float16
+        return ref.dtype
+
+    @staticmethod
+    def _phase_b_long_autocast_torch_dtype(dtype_name: str) -> Optional[torch.dtype]:
+        name = str(dtype_name).strip().lower()
+        if name in {"", "none", "off", "false", "fp32", "float32"}:
+            return None
+        if name in {"bf16", "bfloat16"}:
+            return torch.bfloat16
+        if name in {"fp16", "float16"}:
+            return torch.float16
+        raise ValueError(f"unsupported phase_b_long amp_dtype={dtype_name!r}")
+
+    def _phase_b_long_vsm_compute_dtype(self, ref: torch.Tensor) -> Optional[torch.dtype]:
+        dtype = self._phase_b_long_autocast_torch_dtype(
+            str(getattr(self, "stage6_phase_b_long_amp_dtype", "bf16"))
+        )
+        if dtype is None or not ref.is_cuda:
+            return None
+        return dtype
+
+    def _phase_b_long_autocast_context(self, ref: torch.Tensor) -> Any:
+        dtype = self._phase_b_long_vsm_compute_dtype(ref)
+        if dtype is None:
+            return nullcontext()
+        return torch.autocast(device_type="cuda", dtype=dtype, enabled=True)
+
+    def _phase_b_long_clamp_sensor_state_to_aabb(self, state: LocalGSState) -> LocalGSState:
+        """Keep offset-materialized sensor rows compatible with the frozen xCPE grid."""
+
+        def clamp_branch(branch: Optional[Any]) -> Optional[Any]:
+            if branch is None:
+                return None
+            lo, hi = self._stage6_aabb(branch.means)
+            return replace(branch, means=branch.means.clamp(min=lo, max=hi))
+
+        return LocalGSState(
+            bg=clamp_branch(state.bg),
+            distant=state.distant,
+            rigid=clamp_branch(state.rigid),
+            rigid_template=state.rigid_template,
+        )
+
+    def _forward_6_0_phase_b_long(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+        roles = resolve_long_phase_b_batch(batch)
+        self._mem_debug("forward_phase_b_long/begin", inner_K=int(roles.inner_K))
+        if self.stage6_long_vsm is None:
+            raise RuntimeError("6_0_phase_b requires stage6_long_vsm.")
+        if self.stage6_long_offset_decoder is None:
+            raise RuntimeError("6_0_phase_b requires stage6_long_offset_decoder.")
+        if len(batch.get("source_views", [])) == 0:
+            raise ValueError("6_0_phase_b requires non-empty source_views.")
+        if len(batch.get("targets", [])) == 0:
+            raise ValueError("6_0_phase_b requires non-empty final targets.")
+
+        node_state_bg, node_state_rigid, node_state_distant = self._get_or_init_node_states_bg_rigid_distant(batch)
+        local_base = LocalGSState.from_node_states(
+            bg=node_state_bg,
+            distant=node_state_distant,
+            rigid=node_state_rigid,
+            hidden_dim=self.stage6_hidden_dim,
+        )
+        base_state = self._detach_local_state(local_base)
+        offset_dtype = self._phase_b_long_state_dtype(
+            base_state.bg.means,
+            str(getattr(self, "stage6_phase_b_long_offset_dtype", "bf16")),
+        )
+        vsm_dtype = self._phase_b_long_state_dtype(
+            base_state.bg.means,
+            str(getattr(self, "stage6_phase_b_long_vsm_dtype", "bf16")),
+        )
+        offset = PhaseBOffsetState.zeros_like(base_state=base_state, dtype=offset_dtype)
+        episode_id = int(roles.request_meta.get("episode_id", roles.request_meta.get("episode_idx_global", -1)) or -1)
+        vsm_state = self.stage6_long_vsm.init_state(
+            base_state=base_state,
+            dtype=vsm_dtype,
+            rigid_meta=roles.rigid_meta,
+            distant_mode=str(getattr(self, "stage6_phase_b_long_distant_mode", "frozen_render_only")),
+            episode_id=episode_id,
+        )
+        per_step: List[Dict[str, float]] = []
+        for k in range(int(roles.inner_K)):
+            visit = roles.visits[int(k)]
+            frame_idx = int(visit.frame_idx)
+            repeat_idx = int(visit.repeat_idx)
+            with torch.no_grad():
+                sensor_state = materialize_phase_b_state(
+                    base_state=base_state,
+                    offset=offset.detach_for_sensor(),
+                    target_frame_idx=int(frame_idx),
+                    rigid_meta=roles.rigid_meta,
+                )
+                sensor_state = self._phase_b_long_clamp_sensor_state_to_aabb(sensor_state)
+                measurement = self._observe_v4_measurement(
+                    local_state=sensor_state,
+                    batch=batch,
+                    source_indices=roles.evidence_source_indices_by_step[int(k)],
+                    source_frame_idx=int(frame_idx),
+                )
+                event = self._build_stage6_event_from_measurement(local_state=sensor_state, measurement=measurement)
+                event = self._detach_event_pack(self._event_with_default_view_code(event))
+            if not torch.isfinite(event.event_bg).all():
+                raise RuntimeError("6_0_phase_b event_bg contains NaN/Inf.")
+            self._phase_b_rigid_route_indices(event=event, local_state=base_state, label=f"long step {int(k)}")
+            vsm_compute_dtype = self._phase_b_long_vsm_compute_dtype(event.event_bg)
+            with self._phase_b_long_autocast_context(event.event_bg):
+                vsm_state, read_pack, vsm_aux = self.stage6_long_vsm.write_read(
+                    state=vsm_state,
+                    event=event,
+                    step_idx=int(k),
+                    frame_idx=int(frame_idx),
+                    repeat_idx=int(repeat_idx),
+                    rigid_meta=roles.rigid_meta,
+                    distant_mode=str(getattr(self, "stage6_phase_b_long_distant_mode", "frozen_render_only")),
+                    visit_time_code=torch.tensor(
+                        roles.visit_time_codes[int(k)],
+                        device=event.event_bg.device,
+                        dtype=vsm_compute_dtype or event.event_bg.dtype,
+                    ),
+                    compute_dtype=vsm_compute_dtype,
+                )
+                delta = self.stage6_long_offset_decoder(
+                    read=read_pack,
+                    distant_mode=str(getattr(self, "stage6_phase_b_long_distant_mode", "frozen_render_only")),
+                )
+            offset = offset.apply(delta, frame_idx=int(frame_idx), rigid_meta=roles.rigid_meta)
+            step_stats = {
+                "k": float(k),
+                "frame_idx": float(frame_idx),
+                "repeat_idx": float(repeat_idx),
+                "anchor_id": float(visit.anchor_id),
+                "rollout_order_rank": float(visit.rollout_order_rank),
+                "chronological_rank": float(visit.chronological_rank),
+                "visit_pos_code": float(visit.visit_pos_code),
+                "frame_time_code": float(visit.frame_time_code),
+                "evidence_ref_count": float(len(roles.evidence_refs_by_step[int(k)])),
+                **{key: float(value) for key, value in vsm_aux.items()},
+                **{key: float(value) for key, value in delta.stats(prefix=f"k{int(k)}").items()},
+            }
+            per_step.append(step_stats)
+            self._mem_debug("forward_phase_b_long/after_step", k=int(k))
+
+        role_specs = [
+            ("history_recon", roles.final_history_recon_target_indices),
+            ("history_nvs", roles.final_history_nvs_target_indices),
+            ("current_recon", roles.final_current_recon_target_indices),
+            ("current_nvs", roles.final_current_nvs_target_indices),
+        ]
+        role_losses: Dict[str, torch.Tensor] = {}
+        role_stats: Dict[str, float] = {}
+        role_total = base_state.bg.means.new_tensor(0.0)
+        for role_name, target_indices in role_specs:
+            cfg_role = dict(getattr(self, "stage6_phase_b_long_role_render_cfg", {}).get(role_name, {}) or {})
+            default_is_history = str(role_name).startswith("history")
+            default_weight = self.stage6_phase_b_long_history_weight if default_is_history else self.stage6_phase_b_long_current_weight
+            default_l1 = self.stage6_phase_b_long_history_l1_weight if default_is_history else self.stage6_phase_b_long_current_l1_weight
+            default_ssim = self.stage6_phase_b_long_history_ssim_weight if default_is_history else self.stage6_phase_b_long_current_ssim_weight
+            default_mask = self.stage6_phase_b_long_history_mask_policy if default_is_history else self.stage6_phase_b_long_current_mask_policy
+            loss_i, stats_i = phase_b_long_final_render_loss(
+                self,
+                base_state=base_state,
+                offset=offset,
+                batch=batch,
+                target_indices=target_indices,
+                role=role_name,
+                rigid_meta=roles.rigid_meta,
+                mask_policy=str(self._cfg_get(cfg_role, "mask_policy", default_mask)),
+                l1_weight=float(self._cfg_get(cfg_role, "l1_weight", default_l1)),
+                ssim_weight=float(self._cfg_get(cfg_role, "ssim_weight", default_ssim)),
+            )
+            weight_i = float(self._cfg_get(cfg_role, "weight", default_weight))
+            role_losses[str(role_name)] = loss_i
+            role_total = role_total + weight_i * loss_i
+            role_stats.update({key: float(value) for key, value in stats_i.items()})
+            role_stats[f"phase_b_long/final_{role_name}_weight"] = float(weight_i)
+        history_loss = 0.5 * (role_losses["history_recon"] + role_losses["history_nvs"])
+        current_loss = 0.5 * (role_losses["current_recon"] + role_losses["current_nvs"])
+        reg_loss, reg_stats = phase_b_long_offset_regularization(
+            offset,
+            weights=dict(getattr(self, "stage6_phase_b_long_offset_reg_cfg", {}) or {}),
+        )
+        total_loss = (
+            role_total
+            + float(self.stage6_phase_b_long_offset_reg_weight) * reg_loss
+        )
+        if not torch.isfinite(total_loss).all():
+            raise RuntimeError("6_0_phase_b loss became NaN/Inf.")
+        stats = {
+            **role_stats,
+            **reg_stats,
+            "phase_b_long/final_history_weight": float(self.stage6_phase_b_long_history_weight),
+            "phase_b_long/final_current_weight": float(self.stage6_phase_b_long_current_weight),
+            "phase_b_long/offset_reg_weight": float(self.stage6_phase_b_long_offset_reg_weight),
+            "phase_b_long/shape/" + str(roles.shape_name): 1.0,
+            "phase_b_long/nvs_fallback_to_evidence_cam_ratio": float(
+                roles.request_meta.get("nvs_fallback_to_evidence_cam_ratio", 0.0) or 0.0
+            ),
+        }
+        return {
+            "loss": total_loss,
+            "base_G": base_state,
+            "offset_state": offset,
+            "vsm_state": vsm_state.detach_to_cache_optional(),
+            "node_state_bg": node_state_bg,
+            "node_state_distant": node_state_distant,
+            "node_state_rigid": node_state_rigid,
+            "roles": roles,
+            "per_step": per_step,
+            "stats": stats,
+            "history_loss": history_loss.detach(),
+            "current_loss": current_loss.detach(),
+            "reg_loss": reg_loss.detach(),
+            "num_targets": len(batch.get("targets", [])),
+            "num_source_views": len(batch.get("source_views", [])),
+        }
+
     def forward(self, batch: Dict[str, Any]) -> Dict[str, Any]:
-        if str(getattr(self, "stage6_phase", "phase_A_block_local_unroll")) == PHASE_B_NAME:
+        phase = str(getattr(self, "stage6_phase", "phase_A_block_local_unroll"))
+        if phase == PHASE_B_LONG_NAME:
+            return self._forward_6_0_phase_b_long(batch)
+        if phase == PHASE_B_NAME:
             return self._forward_phase_b(batch)
         return self._forward_phase_a(batch)
 
@@ -2525,6 +2982,83 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             max_saved_cams=int(max_saved_cams),
         )
 
+    def validate_long_phase_b(
+        self,
+        batch: Dict[str, Any],
+        *,
+        mask_policy: str = "non_sky_non_egocar",
+        min_valid_pixels: int = 1,
+        ablations: Optional[List[str]] = None,
+    ) -> Dict[str, float]:
+        from models.streetforward.validation_long_phase_b_runner import validate_long_phase_b
+
+        self.eval()
+        with torch.no_grad():
+            return validate_long_phase_b(
+                self,
+                batch,
+                mask_policy=str(mask_policy),
+                min_valid_pixels=int(min_valid_pixels),
+                ablations=tuple(ablations or ["normal", "zero_vsm", "shuffle_vsm"]),
+            )
+
+    def _train_step_6_0_phase_b_long(
+        self,
+        *,
+        batch: Dict[str, Any],
+        scheduler_node_sync: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        self.train()
+        self.optimizer.zero_grad(set_to_none=True)
+        out = self._forward_6_0_phase_b_long(batch)
+        loss = out["loss"]
+        loss.backward()
+        grad_group_sums = self._stage6_assert_required_group_grads_phase_b_long(out)
+        skip_optimizer = bool(float(grad_group_sums.get("phase_b_long/skipped_no_support_rollout", 0.0)) > 0.0)
+        if skip_optimizer:
+            grad_norm = loss.detach().new_tensor(0.0)
+        else:
+            grad_norm = self._stage6_compute_and_check_grad_norm()
+            self.optimizer.step()
+        did_reset_node_state = False
+        if scheduler_node_sync is not None and bool(scheduler_node_sync.get("reset_after_block", False)):
+            self.reset_node_state()
+            did_reset_node_state = True
+        self.optimizer.zero_grad(set_to_none=True)
+        roles = out["roles"]
+        stats = dict(out.get("stats") or {})
+        logs: Dict[str, Any] = {
+            "loss": float(loss.detach().item()),
+            "phase_b_long/loss_total": float(loss.detach().item()),
+            "stage6/phase": "6_0_phase_b",
+            "stage6/inner_K": float(roles.inner_K),
+            "num_targets": int(out.get("num_targets", 0)),
+            "num_source_views": int(out.get("num_source_views", 0)),
+            "pred_rgbs": list(out.get("pred_rgbs") or []),
+            "gt_images": list(out.get("gt_images") or []),
+            "num_gaussians_bg": int(out["node_state_bg"].means.shape[0]),
+            "num_gaussians_distant": int(out["node_state_distant"].means.shape[0]) if out["node_state_distant"] is not None else 0,
+            "num_gaussians_rigid": int(out["node_state_rigid"].means.shape[0]) if out["node_state_rigid"] is not None else 0,
+            "phase_b_long/grad_norm_total": float(grad_norm.detach().item()),
+            "node_state_sync_reset": bool(did_reset_node_state),
+            "node_state_cache_segments_bg": int(len(getattr(self, "node_states_bg", {}))),
+            "node_state_cache_segments_distant": int(len(getattr(self, "node_states_distant", {}))),
+            "node_state_cache_segments_rigid": int(len(getattr(self, "node_states_rigid", {}))),
+            **{key: float(value) for key, value in stats.items() if isinstance(value, (int, float))},
+            **grad_group_sums,
+        }
+        for item in list(out.get("per_step") or []):
+            k = int(item.get("k", 0))
+            for key, value in item.items():
+                if key == "k" or not isinstance(value, (int, float)):
+                    continue
+                logs[f"phase_b_long/k{k}/{key}"] = float(value)
+        if torch.cuda.is_available():
+            logs["memory/allocated_gb"] = float(torch.cuda.memory_allocated() / (1024.0 ** 3))
+            logs["memory/reserved_gb"] = float(torch.cuda.memory_reserved() / (1024.0 ** 3))
+            logs["memory/peak_gb"] = float(torch.cuda.max_memory_allocated() / (1024.0 ** 3))
+        return logs
+
     def train_step(
         self,
         batch: Dict[str, Any],
@@ -2537,7 +3071,10 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         _ = (profile_phase_timing, sync_cuda_timing, runtime_policy)
         batch = dict(batch)
         batch["global_step"] = int(step or 0)
-        if str(getattr(self, "stage6_phase", "phase_A_block_local_unroll")) == PHASE_B_NAME:
+        phase = str(getattr(self, "stage6_phase", "phase_A_block_local_unroll"))
+        if phase == PHASE_B_LONG_NAME:
+            return self._train_step_6_0_phase_b_long(batch=batch, scheduler_node_sync=scheduler_node_sync)
+        if phase == PHASE_B_NAME:
             return self._train_step_phase_b(batch=batch, scheduler_node_sync=scheduler_node_sync)
         self.train()
         self.optimizer.zero_grad(set_to_none=True)
@@ -2786,6 +3323,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         group_name: str,
         params: List[torch.nn.Parameter],
         required: bool = True,
+        detail: Optional[str] = None,
     ) -> float:
         total = 0.0
         seen = 0
@@ -2796,7 +3334,10 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             if param.grad is not None:
                 total += float(param.grad.detach().abs().sum().item())
         if required and (seen == 0 or total == 0.0):
-            raise RuntimeError(f"{group_name} has zero gradient in Stage6_0.")
+            msg = f"{group_name} has zero gradient in Stage6_0."
+            if detail:
+                msg = f"{msg} {detail}"
+            raise RuntimeError(msg)
         return float(total)
 
     def _stage6_assert_required_group_grads(self, out: Dict[str, Any]) -> Dict[str, float]:
@@ -2900,6 +3441,141 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         }
         return sums
 
+    @staticmethod
+    def _stage6_phase_b_long_grad_detail(out: Dict[str, Any], grad_sums: Dict[str, float]) -> str:
+        roles = out.get("roles")
+        stats = dict(out.get("stats") or {})
+        per_step = list(out.get("per_step") or [])
+
+        def _f(value: Any, default: float = 0.0) -> float:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return float(default)
+
+        def _max_step(key: str) -> float:
+            vals = [_f(item.get(key, 0.0)) for item in per_step if isinstance(item, dict)]
+            return float(max(vals)) if vals else 0.0
+
+        def _last_step(key: str) -> float:
+            if not per_step or not isinstance(per_step[-1], dict):
+                return 0.0
+            return _f(per_step[-1].get(key, 0.0))
+
+        role_parts: List[str] = []
+        for role_name in ("history_recon", "history_nvs", "current_recon", "current_nvs"):
+            prefix = f"phase_b_long/final_{role_name}"
+            role_parts.append(
+                (
+                    f"{role_name}:refs={_f(stats.get(prefix + '_num_refs', 0.0)):.0f},"
+                    f"loss={_f(stats.get(prefix + '_loss', 0.0)):.6g},"
+                    f"valid={_f(stats.get(prefix + '_valid_ratio', 0.0)):.4f},"
+                    f"skipped={_f(stats.get(prefix + '_skipped_no_valid_pixels', 0.0)):.0f}"
+                )
+            )
+
+        request_meta = dict(getattr(roles, "request_meta", {}) or {}) if roles is not None else {}
+        target_roles = list(request_meta.get("target_image_roles") or [])
+        target_role_counts = {
+            str(role): int(target_roles.count(role))
+            for role in sorted(set(str(x) for x in target_roles))
+        }
+        source_refs = list(request_meta.get("source_image_refs") or [])[:8]
+        target_refs = list(request_meta.get("target_image_refs") or [])[:8]
+        scene_id = request_meta.get("scene_id", "unknown")
+        segment_id = request_meta.get("segment_id", "unknown")
+        shape_name = getattr(roles, "shape_name", request_meta.get("shape_name", "unknown")) if roles is not None else "unknown"
+        inner_k = getattr(roles, "inner_K", request_meta.get("inner_K", 0)) if roles is not None else request_meta.get("inner_K", 0)
+        return (
+            "6_0_phase_b debug: "
+            f"scene={scene_id} segment={segment_id} shape={shape_name} inner_K={inner_k}; "
+            f"grad_sums={{{', '.join(f'{k}={v:.6g}' for k, v in grad_sums.items())}}}; "
+            f"vsm_bg_seen_rows_max={_max_step('vsm_bg_seen_rows'):.0f}, "
+            f"vsm_bg_seen_ratio_max={_max_step('vsm_bg_seen_ratio'):.6f}, "
+            f"vsm_bg_write_gate_max={_max_step('vsm_bg_write_gate_mean'):.6f}, "
+            f"vsm_bg_hard_valid_ratio_max={_max_step('vsm_bg_hard_valid_ratio'):.6f}, "
+            f"vsm_bg_support_max={_max_step('vsm_bg_support_max'):.6g}, "
+            f"vsm_bg_support_positive_ratio_max={_max_step('vsm_bg_support_positive_ratio'):.6f}, "
+            f"vsm_bg_support_fallback_used_max={_max_step('vsm_bg_support_fallback_used'):.0f}, "
+            f"vsm_bg_h_norm_last={_last_step('vsm_bg_h_norm'):.6f}, "
+            f"vsm_distant_active_rows_max={_max_step('vsm_distant_active_rows'):.0f}, "
+            f"vsm_distant_seen_rows_max={_max_step('vsm_distant_seen_rows'):.0f}, "
+            f"vsm_distant_support_max={_max_step('vsm_distant_support_max'):.6g}, "
+            f"offset_bg_delta_means_norm_max={_max_step('offset_bg_delta_means_norm'):.6f}, "
+            f"offset_bg_delta_opacity_norm_max={_max_step('offset_bg_delta_opacity_norm'):.6f}; "
+            f"roles=[{'; '.join(role_parts)}]; "
+            f"target_role_counts={target_role_counts}; "
+            f"source_refs_preview={source_refs}; target_refs_preview={target_refs}"
+        )
+
+    def _stage6_phase_b_long_allow_no_support_skip(self) -> bool:
+        model_cfg = self._cfg_get(self.config, "model", {}) or {}
+        stage_cfg = self._cfg_get(model_cfg, "stage6_0", {}) or {}
+        long_cfg = self._cfg_get(stage_cfg, "phase_b_long", {}) or {}
+        return bool(self._cfg_get(long_cfg, "skip_no_support_rollout", True))
+
+    @staticmethod
+    def _stage6_phase_b_long_is_no_support_rollout(out: Dict[str, Any]) -> bool:
+        per_step = list(out.get("per_step") or [])
+        if not per_step:
+            return False
+
+        def _f(value: Any, default: float = 0.0) -> float:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return float(default)
+
+        bg_support_max = max((_f(item.get("vsm_bg_support_max", 0.0)) for item in per_step if isinstance(item, dict)), default=0.0)
+        bg_seen_rows = max((_f(item.get("vsm_bg_seen_rows", 0.0)) for item in per_step if isinstance(item, dict)), default=0.0)
+        rigid_support_max = max((_f(item.get("vsm_rigid_support_max", 0.0)) for item in per_step if isinstance(item, dict)), default=0.0)
+        rigid_seen_rows = max((_f(item.get("vsm_rigid_seen_rows", 0.0)) for item in per_step if isinstance(item, dict)), default=0.0)
+        distant_support_max = max((_f(item.get("vsm_distant_support_max", 0.0)) for item in per_step if isinstance(item, dict)), default=0.0)
+        distant_seen_rows = max((_f(item.get("vsm_distant_seen_rows", 0.0)) for item in per_step if isinstance(item, dict)), default=0.0)
+        return (
+            float(bg_support_max) <= 0.0
+            and float(bg_seen_rows) <= 0.0
+            and float(rigid_support_max) <= 0.0
+            and float(rigid_seen_rows) <= 0.0
+            and float(distant_support_max) <= 0.0
+            and float(distant_seen_rows) <= 0.0
+        )
+
+    def _stage6_assert_required_group_grads_phase_b_long(self, out: Dict[str, Any]) -> Dict[str, float]:
+        grad_sums = {
+            "grad/stage6_long_vsm_sum": self._assert_group_nonzero_grad(
+                group_name="stage6_long_vsm",
+                params=list(self.stage6_long_vsm.parameters()) if self.stage6_long_vsm is not None else [],
+                required=False,
+            ),
+            "grad/stage6_long_offset_decoder_sum": self._assert_group_nonzero_grad(
+                group_name="stage6_long_offset_decoder",
+                params=list(self.stage6_long_offset_decoder.parameters()) if self.stage6_long_offset_decoder is not None else [],
+                required=False,
+            ),
+        }
+        zero_groups = [key for key, value in grad_sums.items() if float(value) == 0.0]
+        if zero_groups:
+            detail = self._stage6_phase_b_long_grad_detail(out, grad_sums)
+            if self._stage6_phase_b_long_allow_no_support_skip() and self._stage6_phase_b_long_is_no_support_rollout(out):
+                skip_count = int(getattr(self, "_phase_b_long_no_support_skip_count", 0)) + 1
+                self._phase_b_long_no_support_skip_count = int(skip_count)
+                if skip_count <= 8 or skip_count in {16, 32, 64, 128}:
+                    logger.warning(
+                        "Skipping 6_0_phase_b optimizer update for no-support rollout (%d): %s",
+                        int(skip_count),
+                        detail,
+                    )
+                grad_sums["phase_b_long/skipped_no_support_rollout"] = 1.0
+                grad_sums["phase_b_long/no_support_skip_count"] = float(skip_count)
+                return grad_sums
+            raise RuntimeError(
+                "6_0_phase_b has zero gradient in required trainable groups: "
+                f"{zero_groups}. {detail}"
+            )
+        grad_sums["phase_b_long/skipped_no_support_rollout"] = 0.0
+        return grad_sums
+
     def _stage6_params_with_grads(self) -> List[torch.nn.Parameter]:
         return [
             p
@@ -3002,10 +3678,11 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             raise ValueError("Stage6_0 Phase B export payload missing posterior_updater_base.")
         missing, unexpected = self.stage6_posterior_updater.load_state_dict(updater_sd, strict=False)
         bad_missing = [k for k in missing if not str(k).startswith("vsm_ctx_adapter.")]
-        if bad_missing or unexpected:
+        bad_unexpected = [k for k in unexpected if not str(k).startswith("vsm_ctx_adapter.")]
+        if bad_missing or bad_unexpected:
             raise ValueError(
                 "Stage6_0 Phase B failed to load posterior updater base payload: "
-                f"missing={bad_missing} unexpected={list(unexpected)}"
+                f"missing={bad_missing} unexpected={bad_unexpected}"
             )
 
     def load_init_checkpoint_payload(
@@ -3017,7 +3694,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         path: Optional[str] = None,
     ) -> bool:
         _ = (weights_only, path)
-        if str(getattr(self, "stage6_phase", "phase_A_block_local_unroll")) != PHASE_B_NAME:
+        if str(getattr(self, "stage6_phase", "phase_A_block_local_unroll")) not in {PHASE_B_NAME, PHASE_B_LONG_NAME}:
             return False
         target_device = device if device is not None else self.device
         if str(ckpt.get("export_type", "")) == "stage6_0_phase_a_for_phase_b":
@@ -3031,13 +3708,21 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         allowed_missing_prefixes = (
             "stage6_vsm.",
             "stage6_query_decoder.",
+            "stage6_long_vsm.",
+            "stage6_long_offset_decoder.",
             "stage6_posterior_updater.vsm_ctx_adapter.",
         )
+        allowed_unexpected_prefixes = (
+            "stage6_posterior_updater.vsm_ctx_adapter.",
+        )
+        if bool(self._cfg_get(self._cfg_get(self.config, "model", {}) or {}, "allow_missing_legacy_sparse_conv", False)):
+            allowed_unexpected_prefixes = allowed_unexpected_prefixes + ("sparse_conv.",)
         bad_missing = [k for k in missing if not str(k).startswith(allowed_missing_prefixes)]
-        if bad_missing or unexpected:
+        bad_unexpected = [k for k in unexpected if not str(k).startswith(allowed_unexpected_prefixes)]
+        if bad_missing or bad_unexpected:
             raise ValueError(
                 "Stage6_0 Phase B ordinary checkpoint load was not compatible: "
-                f"missing={bad_missing} unexpected={list(unexpected)}"
+                f"missing={bad_missing} unexpected={bad_unexpected}"
             )
         return True
 

@@ -297,6 +297,7 @@ def convert_batch_to_minimal_format(
         "_scheduler_v8_aligned_info",
         "_scheduler_v9_aligned_info",
         "_scheduler_v9",
+        "_scheduler_long_phase_b",
     ):
         if batch.get(k) is not None:
             passthrough[k] = batch.get(k)

@@ -18,6 +18,10 @@ if "open3d" not in sys.modules:
 
 from datasets.pointcloud_generators.lidar import LiDARRGBPointCloudGenerator
 from datasets.pointcloud_generators.monocular import MonocularRGBPointCloudGenerator
+from datasets.pointcloud_generators.dynamic_balance import (
+    collect_instance_volumes_from_frames,
+    compute_volume_balanced_point_caps,
+)
 
 
 def _instance(intid: int, center_x: float = 0.0):
@@ -114,3 +118,26 @@ def test_lidar_static_instance_stays_background():
     assert dynamic == {}
     assert background.shape == (1, 6)
     assert np.allclose(background[0, :3], [0.0, 0.0, 0.0])
+
+
+def test_bbox_volume_balance_gives_larger_cap_to_larger_instance():
+    small = _instance(0)
+    large = _instance(1, center_x=2.0)
+    large["size_lwh"] = np.asarray([4.0, 2.0, 2.0], dtype=np.float32)
+
+    volumes = collect_instance_volumes_from_frames([[small, large]])
+    caps = compute_volume_balanced_point_caps(
+        100,
+        volumes,
+        {
+            "enable": True,
+            "mode": "bbox_volume",
+            "volume_exponent": 1.0,
+            "min_scale": 0.25,
+            "max_scale": 4.0,
+        },
+    )
+
+    assert caps[1] > caps[0]
+    assert caps[0] < 100
+    assert caps[1] > 100

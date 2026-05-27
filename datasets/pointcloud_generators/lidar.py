@@ -1,11 +1,19 @@
 import logging
 from collections import defaultdict
-from typing import Dict, List, Literal, Optional, Set, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple, TYPE_CHECKING
 
 import numpy as np
 import torch
 
 from .base import RGBPointCloudGenerator
+from .dynamic_balance import (
+    cap_dynamic_points_by_intid,
+    collect_instance_volumes_from_frames,
+    compute_volume_balanced_point_caps,
+    dynamic_point_balance_enabled,
+    normalize_dynamic_point_balance_cfg,
+    volume_map_to_jsonable,
+)
 from .motion_utils import compute_static_instance_intids
 
 if TYPE_CHECKING:
@@ -29,6 +37,8 @@ class LiDARRGBPointCloudGenerator(RGBPointCloudGenerator):
         static_instance_motion_enable: bool = False,
         static_instance_motion_traj_length_thresh_m: Optional[float] = None,
         dynamic_bbox_expand_xyz_m: Optional[List[float]] = None,
+        dynamic_max_points_per_instance: Optional[int] = None,
+        dynamic_point_balance: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(
             sparsity=sparsity,
@@ -39,6 +49,19 @@ class LiDARRGBPointCloudGenerator(RGBPointCloudGenerator):
         )
         self.static_instance_motion_enable = bool(static_instance_motion_enable)
         self.static_instance_motion_traj_length_thresh_m = static_instance_motion_traj_length_thresh_m
+        self.dynamic_max_points_per_instance = (
+            int(dynamic_max_points_per_instance)
+            if dynamic_max_points_per_instance is not None
+            else None
+        )
+        if self.dynamic_max_points_per_instance is not None and self.dynamic_max_points_per_instance <= 0:
+            raise ValueError("dynamic_max_points_per_instance must be > 0 when set.")
+        self.dynamic_point_balance = normalize_dynamic_point_balance_cfg(dynamic_point_balance)
+        if dynamic_point_balance_enabled(self.dynamic_point_balance) and self.dynamic_max_points_per_instance is None:
+            raise ValueError(
+                "LiDARRGBPointCloudGenerator: dynamic_point_balance.enable=true requires "
+                "dynamic_max_points_per_instance."
+            )
         if self.static_instance_motion_enable and self.static_instance_motion_traj_length_thresh_m is None:
             raise ValueError(
                 "LiDARRGBPointCloudGenerator: static_instance_motion_enable=true requires "
@@ -89,6 +112,15 @@ class LiDARRGBPointCloudGenerator(RGBPointCloudGenerator):
                 frame_indices,
                 float(self.static_instance_motion_traj_length_thresh_m),
             )
+        dynamic_instance_volumes_m3 = collect_instance_volumes_from_frames(
+            instances_by_frame,
+            skip_instance_intids=skip_instance_intids,
+        )
+        dynamic_point_caps = compute_volume_balanced_point_caps(
+            self.dynamic_max_points_per_instance,
+            dynamic_instance_volumes_m3,
+            self.dynamic_point_balance,
+        )
 
         all_backgrounds: List[np.ndarray] = []
         all_dynamic_objects: Dict[int, List[np.ndarray]] = defaultdict(list)
@@ -133,6 +165,12 @@ class LiDARRGBPointCloudGenerator(RGBPointCloudGenerator):
             for intid, points_list in all_dynamic_objects.items()
             if len(points_list) > 0
         }
+        if dynamic_point_balance_enabled(self.dynamic_point_balance):
+            dynamic_objects = cap_dynamic_points_by_intid(
+                dynamic_objects,
+                cap_by_intid=dynamic_point_caps,
+                default_cap=self.dynamic_max_points_per_instance,
+            )
 
         # Single-stage filtering; distant/near 划分交给上层根据 segment_aabb 完成
         if len(background) > 0:
@@ -159,6 +197,13 @@ class LiDARRGBPointCloudGenerator(RGBPointCloudGenerator):
             "static_instance_motion_enable": self.static_instance_motion_enable,
             "static_instance_intids": static_list,
             "dynamic_bbox_expand_xyz_m": self.dynamic_bbox_expand_xyz_m.tolist(),
+            "dynamic_max_points_per_instance": self.dynamic_max_points_per_instance,
+            "dynamic_point_balance": dict(self.dynamic_point_balance),
+            "dynamic_instance_volumes_m3": volume_map_to_jsonable(dynamic_instance_volumes_m3),
+            "dynamic_instance_point_caps": {
+                str(int(k)): int(v)
+                for k, v in sorted(dynamic_point_caps.items(), key=lambda kv: int(kv[0]))
+            },
         }
 
         return {
@@ -374,6 +419,7 @@ class LiDARRGBPointCloudGenerator(RGBPointCloudGenerator):
             depth_consistency=False,
             downscale=1,
             dynamic_filter=False,
+            dynamic_point_balance={"enable": False},
             device=self.device,
         )
         return helper._get_instances_for_segment(

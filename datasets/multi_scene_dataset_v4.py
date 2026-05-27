@@ -30,10 +30,17 @@ from datasets.asset_preload_manager_v2 import (
     parse_preload_cfg_v2,
 )
 from datasets.sky_mask_semantics import normalize_sky_mask_to_one_is_sky
+from datasets.pointcloud_generators.dynamic_balance import (
+    compute_volume_balanced_point_caps,
+    dynamic_point_balance_enabled,
+    normalize_dynamic_point_balance_cfg,
+    volume_map_from_metadata,
+)
 from datasets.streetforward_assets import StreetForwardAssetStore
 from datasets.train_scheduler_v6 import TrainSchedulerV6
 from datasets.train_scheduler_v7 import TrainSchedulerV7
 from datasets.train_scheduler_v8 import TrainSchedulerV8
+from datasets.train_scheduler_long_phase_b import TrainSchedulerLongPhaseB
 from datasets.train_scheduler_v9 import TrainSchedulerV9, ViewSetRolloutBatchV9
 
 ImageRef = Tuple[int, int]
@@ -139,6 +146,12 @@ def _pointcloud_cap_keys_differ(
         if _cap_int_or_none(asset_pc, key) != _cap_int_or_none(runtime_pc, key):
             return True
     return False
+
+
+def _pointcloud_dynamic_balance_differ(asset_pc: Dict[str, Any], runtime_pc: Dict[str, Any]) -> bool:
+    asset_balance = normalize_dynamic_point_balance_cfg(asset_pc.get("dynamic_point_balance"))
+    runtime_balance = normalize_dynamic_point_balance_cfg(runtime_pc.get("dynamic_point_balance"))
+    return asset_balance != runtime_balance
 
 
 def _parse_knn_validation_requirements(raw: Any) -> KNNValidationRequirementsV4:
@@ -315,6 +328,10 @@ class MultiSceneDatasetV4:
             keys.append("monocular_dynamic_recovery_max_points_per_instance")
         return tuple(k for k in _POINTCLOUD_CAP_KEYS if k in set(keys))
 
+    def _knn_strict_dynamic_balance(self) -> bool:
+        branches = set(str(x) for x in self._knn_requirements.required_branches)
+        return len(branches) == 0 or "rigid" in branches
+
     @staticmethod
     def _stride_keep_indices(num_points: int, max_count: Optional[int]) -> np.ndarray:
         n = int(num_points)
@@ -345,7 +362,17 @@ class MultiSceneDatasetV4:
         near_cap = self._runtime_cap_or_none("near_max_points")
         distant_cap = self._runtime_cap_or_none("distant_max_points")
         dynamic_cap = self._runtime_cap_or_none("monocular_dynamic_recovery_max_points_per_instance")
-        if near_cap is None and distant_cap is None and dynamic_cap is None:
+        runtime_pc = self._runtime_pointcloud_cfg if isinstance(self._runtime_pointcloud_cfg, dict) else {}
+        dynamic_balance_cfg = normalize_dynamic_point_balance_cfg(
+            runtime_pc.get("dynamic_point_balance")
+        )
+        dynamic_balance_on = dynamic_point_balance_enabled(dynamic_balance_cfg)
+        if dynamic_balance_on and dynamic_cap is None:
+            raise ValueError(
+                "dataset.pointcloud.dynamic_point_balance.enable=true requires "
+                "dataset.pointcloud.monocular_dynamic_recovery_max_points_per_instance for runtime caps."
+            )
+        if near_cap is None and distant_cap is None and dynamic_cap is None and not dynamic_balance_on:
             return pointcloud
 
         background = np.asarray(
@@ -373,6 +400,13 @@ class MultiSceneDatasetV4:
         dynamic_after: Any = dynamic_raw
         dynamic_before_total = 0
         dynamic_after_total = 0
+        dynamic_point_caps: Dict[int, int] = {}
+        if dynamic_balance_on:
+            dynamic_point_caps = compute_volume_balanced_point_caps(
+                dynamic_cap,
+                volume_map_from_metadata(pointcloud.get("metadata")),
+                dynamic_balance_cfg,
+            )
         if isinstance(dynamic_raw, dict):
             dyn_out: Dict[int, np.ndarray] = {}
             for intid_raw in sorted(dynamic_raw.keys(), key=lambda x: int(x)):
@@ -383,7 +417,8 @@ class MultiSceneDatasetV4:
                         f"pointcloud.dynamic[{intid}] must have shape [N,>=3] for runtime cap downsample, "
                         f"got {tuple(pts.shape)} (context={context} scene_id={int(scene_id)} segment_id={int(segment_id)})"
                     )
-                keep_dyn = self._stride_keep_indices(int(pts.shape[0]), dynamic_cap)
+                cap = dynamic_point_caps.get(intid, dynamic_cap) if dynamic_balance_on else dynamic_cap
+                keep_dyn = self._stride_keep_indices(int(pts.shape[0]), cap)
                 pts_after = np.ascontiguousarray(pts[keep_dyn], dtype=np.float32)
                 dyn_out[intid] = pts_after
                 dynamic_before_total += int(pts.shape[0])
@@ -414,7 +449,7 @@ class MultiSceneDatasetV4:
                 str(distant_cap),
                 int(dynamic_before_total),
                 int(dynamic_after_total),
-                str(dynamic_cap),
+                str(dynamic_point_caps if dynamic_balance_on else dynamic_cap),
             )
 
         out = dict(pointcloud)
@@ -443,8 +478,24 @@ class MultiSceneDatasetV4:
                 f"but it is missing/invalid (context={context} scene_id={int(scene_id)} segment_id={int(segment_id)})"
             )
         strict_cap_keys = self._knn_strict_pointcloud_cap_keys()
-        if not _pointcloud_cap_keys_differ(asset_pc, runtime_pc, strict_cap_keys):
+        cap_mismatch = _pointcloud_cap_keys_differ(asset_pc, runtime_pc, strict_cap_keys)
+        balance_mismatch = (
+            self._knn_strict_dynamic_balance()
+            and _pointcloud_dynamic_balance_differ(asset_pc, runtime_pc)
+        )
+        if not cap_mismatch and not balance_mismatch:
             return
+        if balance_mismatch:
+            raise ValueError(
+                "Runtime dynamic_point_balance for KNN-backed rigid branches must match exported "
+                "asset config; runtime dynamic downsample is disabled for KNN-backed branches in "
+                "strict mode. "
+                f"(context={context} branches={self._knn_required_branches_label()} "
+                f"scene_id={int(scene_id)} segment_id={int(segment_id)} "
+                f"asset_dynamic_point_balance={asset_pc.get('dynamic_point_balance')} "
+                f"runtime_dynamic_point_balance={runtime_pc.get('dynamic_point_balance')}). "
+                "Re-export assets (segment + segment_knn) with the current pointcloud config."
+            )
         raise ValueError(
             "Runtime pointcloud caps for KNN-backed branches must match exported asset caps; "
             "runtime cap downsample is disabled for KNN-backed branches in strict mode. "
@@ -2660,6 +2711,42 @@ class MultiSceneDatasetV4:
             aux_feature_splat_targets_cfg=aux_feature_splat_targets_cfg,
             block_source_frame_policy=str(block_source_frame_policy),
             episode_source_mode=str(episode_source_mode),
+        )
+
+    def create_train_scheduler_long_phase_b(
+        self,
+        *,
+        episode_window_cfg: Optional[Any] = None,
+        rollout_shapes: Optional[Sequence[Any]] = None,
+        rollout_shapes_schedule: Optional[Sequence[Any]] = None,
+        anchor_sampling_cfg: Optional[Any] = None,
+        traversal_cfg: Optional[Any] = None,
+        preload_cfg: Optional[Any] = None,
+        include_test: bool,
+        fixed_scene_id: Optional[int],
+        fixed_segment_id: Optional[int],
+        evidence_cfg: Optional[Any] = None,
+        final_supervision_cfg: Optional[Any] = None,
+        rigid_meta_cfg: Optional[Any] = None,
+        distant_meta_cfg: Optional[Any] = None,
+        fail_fast: bool = True,
+    ) -> TrainSchedulerLongPhaseB:
+        return TrainSchedulerLongPhaseB(
+            dataset=self,
+            episode_window_cfg=episode_window_cfg,
+            rollout_shapes=rollout_shapes,
+            rollout_shapes_schedule=rollout_shapes_schedule,
+            anchor_sampling_cfg=anchor_sampling_cfg,
+            traversal_cfg=traversal_cfg,
+            preload_cfg=preload_cfg,
+            include_test=include_test,
+            fixed_scene_id=fixed_scene_id,
+            fixed_segment_id=fixed_segment_id,
+            evidence_cfg=evidence_cfg,
+            final_supervision_cfg=final_supervision_cfg,
+            rigid_meta_cfg=rigid_meta_cfg,
+            distant_meta_cfg=distant_meta_cfg,
+            fail_fast=bool(fail_fast),
         )
 
     def create_train_scheduler_v9(

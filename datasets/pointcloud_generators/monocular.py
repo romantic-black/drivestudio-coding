@@ -1,11 +1,17 @@
 import logging
 from collections import defaultdict
-from typing import Dict, List, Literal, Optional, Set, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple, TYPE_CHECKING
 
 import numpy as np
 import torch
 
 from .base import RGBPointCloudGenerator
+from .dynamic_balance import (
+    collect_instance_volumes_from_frames,
+    compute_volume_balanced_point_caps,
+    normalize_dynamic_point_balance_cfg,
+    volume_map_to_jsonable,
+)
 from .motion_utils import compute_static_instance_intids
 
 if TYPE_CHECKING:
@@ -39,6 +45,7 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
         dynamic_recovery_assignment: Literal["first_hit", "nearest_center"] = "first_hit",
         static_instance_motion_enable: bool = False,
         static_instance_motion_traj_length_thresh_m: Optional[float] = None,
+        dynamic_point_balance: Optional[Dict[str, Any]] = None,
         device: torch.device = torch.device("cpu"),
     ):
         super().__init__(
@@ -56,6 +63,7 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
         self.dynamic_recovery_assignment = str(dynamic_recovery_assignment)
         self.static_instance_motion_enable = bool(static_instance_motion_enable)
         self.static_instance_motion_traj_length_thresh_m = static_instance_motion_traj_length_thresh_m
+        self.dynamic_point_balance = normalize_dynamic_point_balance_cfg(dynamic_point_balance)
         if self.static_instance_motion_enable and self.static_instance_motion_traj_length_thresh_m is None:
             raise ValueError(
                 "MonocularRGBPointCloudGenerator: static_instance_motion_enable=true requires "
@@ -172,9 +180,19 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
             frame_to_instances = {
                 frame_idx: instances_by_frame[i] for i, frame_idx in enumerate(frame_indices)
             }
+            dynamic_instance_volumes_m3 = collect_instance_volumes_from_frames(
+                instances_by_frame,
+                skip_instance_intids=static_instance_intids,
+            )
         else:
             instance_mapping = {}
             frame_to_instances = {}
+            dynamic_instance_volumes_m3 = {}
+        dynamic_point_caps = compute_volume_balanced_point_caps(
+            self.dynamic_recovery_max_points_per_instance,
+            dynamic_instance_volumes_m3,
+            self.dynamic_point_balance,
+        )
 
         for frame_idx in frame_indices:
             frame_points_seg0: List[np.ndarray] = []
@@ -260,6 +278,7 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
                     dynamic_points_seg0,
                     dynamic_colors,
                     moving_instances,
+                    point_cap_by_intid=dynamic_point_caps,
                 )
                 if len(dynamic_frame) > 0:
                     dynamic_recovery_frame_count += 1
@@ -272,7 +291,10 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
             if len(all_backgrounds) > 0
             else np.zeros((0, 6), dtype=np.float32)
         )
-        dynamic_objects = self._finalize_dynamic_objects_with_cap(all_dynamic_objects)
+        dynamic_objects = self._finalize_dynamic_objects_with_cap(
+            all_dynamic_objects,
+            point_cap_by_intid=dynamic_point_caps,
+        )
         # Single-stage filtering without inside/outside split; distant/near划分交给上层根据 segment_aabb 完成
         if len(background) > 0:
             background_pts, background_colors = background[:, :3], background[:, 3:]
@@ -304,6 +326,12 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
             ),
             "static_instance_motion_enable": self.static_instance_motion_enable,
             "static_instance_intids": sorted(int(x) for x in static_instance_intids),
+            "dynamic_point_balance": dict(self.dynamic_point_balance),
+            "dynamic_instance_volumes_m3": volume_map_to_jsonable(dynamic_instance_volumes_m3),
+            "dynamic_instance_point_caps": {
+                str(int(k)): int(v)
+                for k, v in sorted(dynamic_point_caps.items(), key=lambda kv: int(kv[0]))
+            },
         }
 
         return {
@@ -698,12 +726,15 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
         if max_count is None:
             return points6
         n = int(points6.shape[0])
-        if n <= int(max_count):
+        cap = int(max_count)
+        if cap <= 0:
+            return points6[:0]
+        if n <= cap:
             return points6
-        step = max(1, n // int(max_count))
+        step = max(1, n // cap)
         idx = np.arange(0, n, step, dtype=np.int64)
-        if idx.shape[0] > int(max_count):
-            idx = idx[: int(max_count)]
+        if idx.shape[0] > cap:
+            idx = idx[:cap]
         return points6[idx]
 
     def _recover_dynamic_points_by_3d_bbox(
@@ -711,6 +742,7 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
         points_world: np.ndarray,
         colors: np.ndarray,
         instances: List[Dict],
+        point_cap_by_intid: Optional[Dict[int, int]] = None,
     ) -> Tuple[Dict[int, np.ndarray], int]:
         if len(points_world) == 0 or len(instances) == 0:
             return {}, 0
@@ -769,7 +801,12 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
                 local_points = best_local[mask]
                 selected_colors = colors[mask].astype(np.float32, copy=False)
                 points6 = np.concatenate([local_points, selected_colors], axis=1)
-                points6 = self._stride_limit_points6(points6, self.dynamic_recovery_max_points_per_instance)
+                cap = (
+                    int(point_cap_by_intid[int(intid)])
+                    if point_cap_by_intid is not None and int(intid) in point_cap_by_intid
+                    else self.dynamic_recovery_max_points_per_instance
+                )
+                points6 = self._stride_limit_points6(points6, cap)
                 if points6.shape[0] > 0:
                     dynamic_dict[int(intid)] = points6.astype(np.float32, copy=False)
             return dynamic_dict, recovered_before_cap
@@ -809,7 +846,12 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
             selected_colors = colors[selected_idx].astype(np.float32, copy=False)
             points6 = np.concatenate([local_points, selected_colors], axis=1)
             recovered_before_cap += int(points6.shape[0])
-            points6 = self._stride_limit_points6(points6, self.dynamic_recovery_max_points_per_instance)
+            cap = (
+                int(point_cap_by_intid[intid])
+                if point_cap_by_intid is not None and intid in point_cap_by_intid
+                else self.dynamic_recovery_max_points_per_instance
+            )
+            points6 = self._stride_limit_points6(points6, cap)
             if points6.shape[0] > 0:
                 dynamic_dict[intid] = points6.astype(np.float32, copy=False)
                 if self.dynamic_recovery_assignment == "first_hit":
@@ -820,6 +862,7 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
     def _finalize_dynamic_objects_with_cap(
         self,
         all_dynamic_objects: Dict[int, List[np.ndarray]],
+        point_cap_by_intid: Optional[Dict[int, int]] = None,
     ) -> Dict[int, np.ndarray]:
         if len(all_dynamic_objects) == 0:
             return {}
@@ -829,9 +872,14 @@ class MonocularRGBPointCloudGenerator(RGBPointCloudGenerator):
             if len(points_list) == 0:
                 continue
             merged = np.concatenate(points_list, axis=0).astype(np.float32, copy=False)
+            cap = (
+                int(point_cap_by_intid[int(intid)])
+                if point_cap_by_intid is not None and int(intid) in point_cap_by_intid
+                else self.dynamic_recovery_max_points_per_instance
+            )
             merged = self._stride_limit_points6(
                 merged,
-                self.dynamic_recovery_max_points_per_instance,
+                cap,
             )
             finalized[intid] = merged
         return finalized

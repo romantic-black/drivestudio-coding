@@ -539,6 +539,35 @@ def _build_scheduler_node_sync_v9_fallback(
     }
 
 
+def _build_scheduler_node_sync_long_phase_b_fallback(
+    cfg: Any,
+    scheduler_info: Dict[str, Any],
+    step_events: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    slong = cfg.get("scheduler_long_phase_b") if hasattr(cfg, "get") else None
+    if slong is None or not bool(slong.get("enable", False)):
+        return None
+    if str(scheduler_info.get("scheduler_version", "")) != "long_v1":
+        return None
+    execution = slong.get("execution") if hasattr(slong, "get") else None
+    reset_policy = (
+        str(execution.get("reset_policy", "episode_end")).strip()
+        if execution is not None and hasattr(execution, "get")
+        else "episode_end"
+    )
+    if reset_policy not in ("episode_end", "never"):
+        raise ValueError("scheduler_long_phase_b.execution.reset_policy must be one of ['episode_end', 'never']")
+    should_reset = any(ev.get("type") == "episode_end" for ev in step_events) if reset_policy == "episode_end" else False
+    return {
+        "U": int(scheduler_info.get("U", 1)),
+        "segment_local_step": int(scheduler_info.get("segment_local_step", 0)),
+        "reset_after_block": bool(should_reset),
+        "reset_policy": str(reset_policy),
+        "scheduler_version": "long_v1",
+        "block_order": str(scheduler_info.get("block_order", "long_rollout")),
+    }
+
+
 def _node_state_cache_sizes(model: Any) -> Dict[str, int]:
     return {
         "bg": int(len(getattr(model, "node_states_bg", {}) or {})),
@@ -554,7 +583,7 @@ def _reset_model_node_state_and_release_cuda(
     reason: str,
     step: int,
     scheduler_info: Optional[Dict[str, Any]] = None,
-) -> Dict[str, int]:
+) -> Dict[str, Any]:
     before = _node_state_cache_sizes(model)
     model.reset_node_state()
     empty_cache = str(os.environ.get("STAGE6_EMPTY_CACHE_ON_RESET", "")).lower() in {"1", "true", "yes", "on"}
@@ -576,7 +605,11 @@ def _reset_model_node_state_and_release_cuda(
         after,
         bool(empty_cache and torch.cuda.is_available()),
     )
-    return after
+    return {
+        "before": before,
+        "after": after,
+        "cuda_empty_cache": bool(empty_cache and torch.cuda.is_available()),
+    }
 
 
 def _drop_result_tensor_payloads(result: Optional[Dict[str, Any]]) -> None:
@@ -1572,6 +1605,9 @@ def main() -> None:
     log_interval = cfg.training.get("log_interval", 50)
     save_every = cfg.training.get("save_checkpoint_freq", 500)
     enable_psnr = bool(cfg.eval.get("enable_psnr", True))
+    train_step_metrics_interval = int(cfg.logging.get("train_step_metrics_interval", 0))
+    if train_step_metrics_interval < 0:
+        raise ValueError("logging.train_step_metrics_interval must be >= 0")
     train_monitor_cfg = cfg.logging.get("train_monitor") or {}
     train_monitor_enable_heavy_metrics = bool(train_monitor_cfg.get("enable_heavy_metrics", True))
     train_monitor_include_per_view_metrics = bool(train_monitor_cfg.get("include_per_view_metrics", True))
@@ -1602,11 +1638,12 @@ def main() -> None:
         save_train_views_psnr_below = None
     logger.info(
         "Train monitor switches: heavy_metrics=%s include_per_view_metrics=%s "
-        "include_extra_result_metrics=%s low_psnr_image_dump=%s",
+        "include_extra_result_metrics=%s low_psnr_image_dump=%s train_step_metrics_interval=%s",
         bool(train_monitor_enable_heavy_metrics),
         bool(train_monitor_include_per_view_metrics),
         bool(train_monitor_include_extra_result_metrics),
         bool(train_monitor_enable_low_psnr_image_dump),
+        int(train_step_metrics_interval),
     )
     enable_jsonl_metrics = bool(cfg.logging.get("enable_jsonl_metrics", True))
     metrics_history_append = bool(cfg.logging.get("metrics_history_append", True))
@@ -1795,6 +1832,8 @@ def main() -> None:
                         if train_episode_counter % int(validation_v7_cfg.validate_every_n_episodes) == 0:
                             validation_due_episode_counters.append(int(train_episode_counter))
             scheduler_node_sync = _build_scheduler_node_sync(cfg, scheduler_info, step_events)
+            if scheduler_node_sync is None:
+                scheduler_node_sync = _build_scheduler_node_sync_long_phase_b_fallback(cfg, scheduler_info, step_events)
             if scheduler_node_sync is None:
                 scheduler_node_sync = _build_scheduler_node_sync_v9_fallback(cfg, scheduler_info, step_events)
             if scheduler_node_sync is None:
@@ -2072,6 +2111,74 @@ def main() -> None:
                 diag_window.append({"loss": loss_val, "step_time_ms": step_time_ms})
                 if step % max(diag_cfg["interval"], 1) == 0:
                     diag_row = _diagnose_step(list(diag_window))
+
+            if train_step_metrics_interval > 0 and step % train_step_metrics_interval == 0:
+                train_step_row: Dict[str, Any] = {
+                    "step": int(step),
+                    "split": "train_step",
+                    "scene_id": int(minimal_batch.get("scene_id", -1)),
+                    "scene_dir": _scene_dir_str(minimal_batch.get("scene_id", -1)),
+                    "segment_id": int(minimal_batch.get("segment_id", -1)),
+                    "epoch_idx": int(scheduler_info.get("epoch_idx", -1)),
+                    "global_step": int(scheduler_info.get("global_step", -1)),
+                    "segment_local_step": int(scheduler_info.get("segment_local_step", -1)),
+                    "segment_step_budget": int(scheduler_info.get("segment_step_budget", -1)),
+                    "block_idx_in_segment": int(scheduler_info.get("block_idx_in_segment", -1)),
+                    "block_idx_global": int(scheduler_info.get("block_idx_global", -1)),
+                    "episode_idx_global": int(scheduler_info.get("episode_idx_global", -1)),
+                    "source_frame_idx": int(scheduler_info.get("source_frame_idx", -1)),
+                    "source_keyframe_idx": int(scheduler_info.get("source_keyframe_idx", -1)),
+                    "source_image_ref": list(scheduler_info.get("source_image_ref", (-1, -1))),
+                    "target_image_refs": [list(x) for x in scheduler_info.get("target_image_refs", [])],
+                    "step_event_types": [str(ev.get("type", "")) for ev in step_events],
+                    "U": int(scheduler_info.get("U", -1)),
+                    "K_u_nominal": int(scheduler_info.get("K_u_nominal", -1)),
+                    "K_u_effective": int(scheduler_info.get("K_u_effective", -1)),
+                    "K_steps_effective": int(scheduler_info.get("K_steps_effective", -1)),
+                    "K_steps": int(scheduler_info.get("K_steps", -1)),
+                    "R_steps": int(scheduler_info.get("R_steps", -1)),
+                    "T_steps": int(scheduler_info.get("T_steps", -1)),
+                    "loss": float(loss_val),
+                    "num_views": int(num_views),
+                    "num_source_views": int(result.get("num_source_views", 0)),
+                    "num_targets": int(result.get("num_targets", 0)),
+                    "num_query_targets": int(result.get("num_query_targets", 0)),
+                    "num_gaussians_bg": int(result.get("num_gaussians_bg", 0)),
+                    "num_gaussians_distant": int(result.get("num_gaussians_distant", 0)),
+                    "num_gaussians_rigid": int(result.get("num_gaussians_rigid", 0)),
+                    "num_gaussians_sky": int(result.get("num_gaussians_sky", 0)),
+                    "step_time_ms": float(step_time_ms),
+                    "forward_ms": float(result.get("forward_ms", 0.0)),
+                    "backward_ms": float(result.get("backward_ms", 0.0)),
+                    "optimizer_ms": float(result.get("optimizer_ms", 0.0)),
+                    "node_state_sync_update": bool(result.get("node_state_sync_update", False)),
+                    "node_state_sync_reset": bool(result.get("node_state_sync_reset", False)),
+                }
+                for k, v in result.items():
+                    if k.startswith("_") or k in train_step_row or k in {"pred_rgbs", "gt_images"}:
+                        continue
+                    if isinstance(v, bool):
+                        train_step_row[k] = bool(v)
+                    elif isinstance(v, int):
+                        train_step_row[k] = int(v)
+                    elif isinstance(v, float):
+                        train_step_row[k] = float(v)
+                    elif isinstance(v, str) and k in {"stage6/phase"}:
+                        train_step_row[k] = str(v)
+                if diag_row:
+                    train_step_row.update(diag_row)
+                if perf_cfg["enable"] and perf_cfg["cuda_memory"] and torch.cuda.is_available():
+                    train_step_row["peak_mem_bytes"] = int(torch.cuda.max_memory_allocated())
+                    train_step_row["peak_mem_reserved_bytes"] = int(torch.cuda.max_memory_reserved())
+                _write_metrics_history(metrics_fh, train_step_row)
+                if writer is not None:
+                    writer.add_scalar("train/loss", float(loss_val), step)
+                    writer.add_scalar("train/perf/step_time_ms", float(step_time_ms), step)
+                    for k, v in train_step_row.items():
+                        if k in {"step", "split", "scene_dir", "source_image_ref", "target_image_refs", "step_event_types"}:
+                            continue
+                        if isinstance(v, (int, float)) and not isinstance(v, bool):
+                            writer.add_scalar(f"train_step/{k}", float(v), step)
 
             if diag_cfg["enable"] and diag_cfg["save_branch_renders"] and step % max(diag_cfg["interval"], 1) == 0:
                 _save_diagnostic_renders(model, minimal_batch, step, cfg.log_dir)
@@ -2493,6 +2600,7 @@ def main() -> None:
                     "phaseA/",
                     "phase_b/",
                     "stage6/",
+                    "memory/",
                     "mask/",
                     "node_state_",
                     "grad/",
@@ -2583,12 +2691,40 @@ def main() -> None:
                     )
                 validation_ms += float((time.perf_counter() - val_t0) * 1000.0)
             if defer_node_state_reset_for_episode_hook:
-                _reset_model_node_state_and_release_cuda(
+                reset_info = _reset_model_node_state_and_release_cuda(
                     model,
                     reason="deferred_episode_hook",
                     step=int(step),
                     scheduler_info=scheduler_info,
                 )
+                reset_before = dict(reset_info.get("before") or {})
+                reset_after = dict(reset_info.get("after") or {})
+                reset_row: Dict[str, Any] = {
+                    "step": int(step),
+                    "split": "node_state_reset",
+                    "reason": "deferred_episode_hook",
+                    "scene_id": int(scheduler_info.get("scene_id", -1)),
+                    "scene_dir": _scene_dir_str(scheduler_info.get("scene_id", -1)),
+                    "segment_id": int(scheduler_info.get("segment_id", -1)),
+                    "epoch_idx": int(scheduler_info.get("epoch_idx", -1)),
+                    "global_step": int(scheduler_info.get("global_step", -1)),
+                    "segment_local_step": int(scheduler_info.get("segment_local_step", -1)),
+                    "step_event_types": [str(ev.get("type", "")) for ev in step_events],
+                    "node_state_cache_segments_bg_before": int(reset_before.get("bg", 0)),
+                    "node_state_cache_segments_distant_before": int(reset_before.get("distant", 0)),
+                    "node_state_cache_segments_rigid_before": int(reset_before.get("rigid", 0)),
+                    "node_state_cache_segments_sky_before": int(reset_before.get("sky", 0)),
+                    "node_state_cache_segments_bg_after": int(reset_after.get("bg", 0)),
+                    "node_state_cache_segments_distant_after": int(reset_after.get("distant", 0)),
+                    "node_state_cache_segments_rigid_after": int(reset_after.get("rigid", 0)),
+                    "node_state_cache_segments_sky_after": int(reset_after.get("sky", 0)),
+                    "cuda_empty_cache": bool(reset_info.get("cuda_empty_cache", False)),
+                }
+                if torch.cuda.is_available():
+                    reset_row["memory/allocated_gb"] = float(torch.cuda.memory_allocated() / (1024.0 ** 3))
+                    reset_row["memory/reserved_gb"] = float(torch.cuda.memory_reserved() / (1024.0 ** 3))
+                    reset_row["memory/peak_gb"] = float(torch.cuda.max_memory_allocated() / (1024.0 ** 3))
+                _write_metrics_history(metrics_fh, reset_row)
 
             _drop_result_tensor_payloads(result)
             pred_rgbs = []

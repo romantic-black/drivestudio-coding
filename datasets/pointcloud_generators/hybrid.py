@@ -1,12 +1,21 @@
 import logging
 from collections import defaultdict
-from typing import Dict, List, Literal, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Literal, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
 import torch
 import open3d as o3d
 
 from .base import RGBPointCloudGenerator
+from .dynamic_balance import (
+    cap_dynamic_points_by_intid,
+    compute_volume_balanced_point_caps,
+    dynamic_point_balance_enabled,
+    merge_instance_volume_maps,
+    normalize_dynamic_point_balance_cfg,
+    volume_map_from_metadata,
+    volume_map_to_jsonable,
+)
 from .lidar import LiDARRGBPointCloudGenerator
 from .monocular import MonocularRGBPointCloudGenerator
 
@@ -43,6 +52,7 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
         distant_max_points: Optional[int] = None,
         static_instance_motion_enable: bool = False,
         static_instance_motion_traj_length_thresh_m: Optional[float] = None,
+        dynamic_point_balance: Optional[Dict[str, Any]] = None,
         device: torch.device = torch.device("cpu"),
     ):
         # 使用通用参数初始化基类（不再持有 crop_aabb/input_aabb，AABB 由上层控制）
@@ -54,6 +64,21 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
             device=device,
         )
 
+        self.dynamic_point_balance = normalize_dynamic_point_balance_cfg(dynamic_point_balance)
+        self.dynamic_max_points_per_instance = (
+            int(monocular_dynamic_recovery_max_points_per_instance)
+            if monocular_dynamic_recovery_max_points_per_instance is not None
+            else None
+        )
+        if (
+            dynamic_point_balance_enabled(self.dynamic_point_balance)
+            and self.dynamic_max_points_per_instance is None
+        ):
+            raise ValueError(
+                "HybridRGBPointCloudGenerator: dynamic_point_balance.enable=true requires "
+                "monocular_dynamic_recovery_max_points_per_instance."
+            )
+
         # 创建LiDAR生成器（不再传递 crop_aabb/input_aabb；由上层使用 segment_aabb 划分近/远景）
         self.lidar_generator = LiDARRGBPointCloudGenerator(
             sparsity=lidar_sparsity,
@@ -61,6 +86,8 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
             static_instance_motion_enable=static_instance_motion_enable,
             static_instance_motion_traj_length_thresh_m=static_instance_motion_traj_length_thresh_m,
             dynamic_bbox_expand_xyz_m=monocular_dynamic_recovery_bbox_expand_xyz_m,
+            dynamic_max_points_per_instance=self.dynamic_max_points_per_instance,
+            dynamic_point_balance=self.dynamic_point_balance,
         )
 
         # 创建单目生成器
@@ -77,6 +104,7 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
             dynamic_recovery_assignment="first_hit",
             static_instance_motion_enable=static_instance_motion_enable,
             static_instance_motion_traj_length_thresh_m=static_instance_motion_traj_length_thresh_m,
+            dynamic_point_balance=self.dynamic_point_balance,
             device=device,
         )
 
@@ -244,6 +272,15 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
                 for k, v in monocular_dynamic.items()
                 if int(k) not in static_instance_intids
             }
+        dynamic_instance_volumes_m3 = merge_instance_volume_maps(
+            volume_map_from_metadata(lidar_meta),
+            volume_map_from_metadata(monocular_meta),
+        )
+        dynamic_point_caps = compute_volume_balanced_point_caps(
+            self.dynamic_max_points_per_instance,
+            dynamic_instance_volumes_m3,
+            self.dynamic_point_balance,
+        )
 
         # 统一实例映射（使用LiDAR的映射，因为它是更稳定的来源）
         instance_mapping = lidar_instance_mapping
@@ -259,6 +296,13 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
 
         # 融合动态对象点云
         fused_dynamic = self._fuse_dynamic_objects(lidar_dynamic, monocular_dynamic)
+        dynamic_count_before_balance = sum(int(points.shape[0]) for points in fused_dynamic.values())
+        if dynamic_point_balance_enabled(self.dynamic_point_balance):
+            fused_dynamic = cap_dynamic_points_by_intid(
+                fused_dynamic,
+                cap_by_intid=dynamic_point_caps,
+                default_cap=self.dynamic_max_points_per_instance,
+            )
 
         # 构建元数据
         dynamic_count = sum(len(points) for points in fused_dynamic.values())
@@ -277,6 +321,13 @@ class HybridRGBPointCloudGenerator(RGBPointCloudGenerator):
                 monocular_meta.get("static_instance_motion_enable", False),
             ),
             "static_instance_intids": sorted(static_instance_intids),
+            "dynamic_count_before_balance": int(dynamic_count_before_balance),
+            "dynamic_point_balance": dict(self.dynamic_point_balance),
+            "dynamic_instance_volumes_m3": volume_map_to_jsonable(dynamic_instance_volumes_m3),
+            "dynamic_instance_point_caps": {
+                str(int(k)): int(v)
+                for k, v in sorted(dynamic_point_caps.items(), key=lambda kv: int(kv[0]))
+            },
         }
 
         return {

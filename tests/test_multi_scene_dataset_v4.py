@@ -578,6 +578,44 @@ def test_v4_runtime_cap_helper_downsamples_without_knn():
     assert int(out["dynamic"][10].shape[0]) == 1
 
 
+def test_v4_runtime_dynamic_cap_uses_bbox_volume_metadata():
+    ds = MultiSceneDatasetV4.__new__(MultiSceneDatasetV4)
+    ds._runtime_pointcloud_cfg = {
+        "monocular_dynamic_recovery_max_points_per_instance": 10,
+        "dynamic_point_balance": {
+            "enable": True,
+            "mode": "bbox_volume",
+            "volume_exponent": 1.0,
+            "min_scale": 0.5,
+            "max_scale": 4.0,
+        },
+    }
+    ds.segment_aabb = torch.tensor([[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]], dtype=torch.float32)
+    pointcloud = {
+        "background": np.zeros((0, 6), dtype=np.float32),
+        "dynamic": {
+            1: np.ones((50, 6), dtype=np.float32),
+            2: np.ones((50, 6), dtype=np.float32),
+        },
+        "metadata": {
+            "dynamic_instance_volumes_m3": {
+                "1": 1.0,
+                "2": 8.0,
+            }
+        },
+    }
+
+    out = ds._apply_runtime_pointcloud_caps(
+        pointcloud=pointcloud,
+        scene_id=1,
+        segment_id=0,
+        context="test",
+    )
+
+    assert int(out["dynamic"][1].shape[0]) == 5
+    assert int(out["dynamic"][2].shape[0]) == 18
+
+
 def test_v4_runtime_cap_mismatch_random_downsamples(tmp_path):
     inside_pts = np.zeros((60, 6), dtype=np.float32)
     outside_pts = np.zeros((80, 6), dtype=np.float32)
@@ -703,6 +741,49 @@ def test_v4_knn_strict_caps_reject_knn_backed_runtime_cap_mismatch(tmp_path):
         },
     )
     with pytest.raises(ValueError, match="checked_cap_keys=.*near_max_points"):
+        ds.initialize()
+
+
+def test_v4_knn_strict_rejects_dynamic_point_balance_mismatch(tmp_path):
+    store = _prepare_demo_assets(
+        tmp_path,
+        pointcloud_config_normalized={
+            "type": "hybrid",
+            "near_max_points": 1000,
+            "distant_max_points": 400,
+            "monocular_dynamic_recovery_max_points_per_instance": 1000,
+        },
+        knn_payload={
+            "background_avg_dist_by_k": {4: np.ones((2,), dtype=np.float32)},
+            "dynamic_avg_dist_by_k": {4: {9: np.ones((1,), dtype=np.float32)}},
+        },
+    )
+    data_cfg, dataset_cfg = _build_cfg(
+        tmp_path,
+        pointcloud={
+            "type": "hybrid",
+            "near_max_points": 1000,
+            "distant_max_points": 400,
+            "monocular_dynamic_recovery_max_points_per_instance": 1000,
+            "dynamic_point_balance": {
+                "enable": True,
+                "mode": "bbox_volume",
+            },
+        },
+    )
+    ds = MultiSceneDatasetV4(
+        dataset_cfg=dataset_cfg,
+        data_cfg=data_cfg,
+        device=torch.device("cpu"),
+        asset_store=store,
+        knn_requirements={
+            "enabled": True,
+            "background_ks": [4],
+            "dynamic_ks": [4],
+            "required_branches": ["rigid"],
+        },
+    )
+    with pytest.raises(ValueError, match="dynamic_point_balance"):
         ds.initialize()
 
 

@@ -53,22 +53,22 @@ data:
     lidar_downsample_factor: 1
     lidar_percentile: 0.02
   assets:
-    root: "/root/autodl-tmp/streetforward_assets_pt40w_40w"
+    root: "/root/autodl-tmp/streetforward_assets_pt12w_8w"
 
 dataset:
   num_source_keyframes: 1
   num_target_keyframes: 3
-  segment_overlap_ratio: 0.5
+  segment_overlap_ratio: 0.25
   min_keyframes_per_scene: 2
-  min_keyframes_per_segment: 2
+  min_keyframes_per_segment: 4
   preload_scene_count: 2
   keyframe_split_config:
     num_splits: 0
     min_count: 1
-    min_length: 3.0
+    min_length: 2.0
   segment_aabb:
-    - [-20.0, -10.0, 0.0]
-    - [20.0, 4.8, 60.0]
+    - [-15.0, -10.0, 0.0]
+    - [15.0, 4.8, 40.0]
   pointcloud:
     type: "hybrid"
     lidar_sparsity: full
@@ -76,11 +76,19 @@ dataset:
     monocular_sparsity: full
     monocular_filter_sky: true
     monocular_depth_consistency: false
-    monocular_downscale: 1
+    monocular_downscale: 2
     monocular_dynamic_recovery_bbox_expand_xyz_m: [0.5, 0.2, 0.5]
-    monocular_dynamic_recovery_max_points_per_instance: 5000
-    near_max_points: 400000
-    distant_max_points: 400000
+    monocular_dynamic_recovery_max_points_per_instance: 3000
+    dynamic_point_balance:
+      enable: true
+      mode: bbox_volume
+      reference_volume_m3: 13.0
+      volume_exponent: 0.5
+      min_scale: 0.25
+      max_scale: 3.0
+      min_points_per_instance: 512
+    near_max_points: 120000
+    distant_max_points: 80000
     static_instance_motion:
       enable: true
       traj_length_thresh_m: 0.5
