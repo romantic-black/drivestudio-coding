@@ -2518,6 +2518,16 @@ def main() -> None:
                     int(result.get("src_backproject_pass_count", 0)),
                 )
 
+                def _optional_int_result(key: str) -> Optional[int]:
+                    if key not in result or result.get(key) is None:
+                        return None
+                    return int(result[key])
+
+                def _optional_float_result(key: str) -> Optional[float]:
+                    if key not in result or result.get(key) is None:
+                        return None
+                    return float(result[key])
+
                 row = {
                     "step": int(step),
                     "split": "train_monitor",
@@ -2547,17 +2557,17 @@ def main() -> None:
                     "loss_ssim": float(result.get("loss_ssim", 0.0)),
                     "loss_mask": float(result.get("loss_mask", 0.0)),
                     "loss_opacity_entropy": float(result.get("loss_opacity_entropy", 0.0)),
-                    "num_rigid_src_feat_valid": int(result.get("num_rigid_src_feat_valid", 0)),
-                    "num_rigid_update": int(result.get("num_rigid_update", 0)),
+                    "num_rigid_src_feat_valid": _optional_int_result("num_rigid_src_feat_valid"),
+                    "num_rigid_update": _optional_int_result("num_rigid_update"),
                     "num_target_frames": int(result.get("num_target_frames", 0)),
                     "loss_effective_frames": int(result.get("loss_effective_frames", 0)),
                     "num_source_views": int(result.get("num_source_views", 0)),
                     "num_targets": int(result.get("num_targets", 0)),
-                    "num_rigid_valid_src": int(result.get("num_rigid_valid_src", 0)),
-                    "rigid_valid_ratio": float(result.get("rigid_valid_ratio", 0.0)),
-                    "rigid_update_ratio": float(result.get("rigid_update_ratio", 0.0)),
-                    "rigid_update_among_feat_valid": float(result.get("rigid_update_among_feat_valid", 0.0)),
-                    "writeback_rigid_ratio": float(result.get("writeback_rigid_ratio", 0.0)),
+                    "num_rigid_valid_src": _optional_int_result("num_rigid_valid_src"),
+                    "rigid_valid_ratio": _optional_float_result("rigid_valid_ratio"),
+                    "rigid_update_ratio": _optional_float_result("rigid_update_ratio"),
+                    "rigid_update_among_feat_valid": _optional_float_result("rigid_update_among_feat_valid"),
+                    "writeback_rigid_ratio": _optional_float_result("writeback_rigid_ratio"),
                     "num_bg_src_feat_valid": int(result.get("num_bg_src_feat_valid", 0)),
                     "num_bg_update": int(result.get("num_bg_update", 0)),
                     "bg_update_ratio": float(result.get("bg_update_ratio", 0.0)),
@@ -2566,6 +2576,9 @@ def main() -> None:
                     "distant_update_ratio": float(result.get("distant_update_ratio", 0.0)),
                     "writeback_bg_ratio": float(result.get("writeback_bg_ratio", 0.0)),
                     "writeback_distant_ratio": float(result.get("writeback_distant_ratio", 0.0)),
+                    "num_gaussians_bg": _optional_int_result("num_gaussians_bg"),
+                    "num_gaussians_distant": _optional_int_result("num_gaussians_distant"),
+                    "num_gaussians_rigid": _optional_int_result("num_gaussians_rigid"),
                     "num_gaussians_sky": int(result.get("num_gaussians_sky", 0)),
                     "num_sky_src_feat_valid": int(result.get("num_sky_src_feat_valid", 0)),
                     "num_sky_update": int(result.get("num_sky_update", 0)),
@@ -2573,11 +2586,11 @@ def main() -> None:
                     "src_backproject_pass_count": int(result.get("src_backproject_pass_count", 0)),
                     "hidden_norm_bg_mean": float(result.get("hidden_norm_bg_mean", 0.0)),
                     "hidden_norm_distant_mean": float(result.get("hidden_norm_distant_mean", 0.0)),
-                    "hidden_norm_rigid_mean": float(result.get("hidden_norm_rigid_mean", 0.0)),
+                    "hidden_norm_rigid_mean": _optional_float_result("hidden_norm_rigid_mean"),
                     "hidden_norm_sky_mean": float(result.get("hidden_norm_sky_mean", 0.0)),
                     "grad_norm_bg": float(result.get("grad_norm_bg", 0.0)),
                     "grad_norm_distant": float(result.get("grad_norm_distant", 0.0)),
-                    "grad_norm_rigid": float(result.get("grad_norm_rigid", 0.0)),
+                    "grad_norm_rigid": _optional_float_result("grad_norm_rigid"),
                     "grad_norm_sky": float(result.get("grad_norm_sky", 0.0)),
                     "step_time_ms": float(step_time_ms),
                     "forward_ms": float(result.get("forward_ms", 0.0)),
@@ -2609,8 +2622,10 @@ def main() -> None:
                     "feedback/",
                     "branch/",
                     "phaseA/",
+                    "phase_a/",
                     "phase_b/",
                     "stage6/",
+                    "state/",
                     "memory/",
                     "mask/",
                     "node_state_",
@@ -2618,10 +2633,15 @@ def main() -> None:
                     "monitor/aux_",
                     "perf/aux_",
                 )
+                always_scalar_keys = {
+                    "num_gaussians_bg",
+                    "num_gaussians_distant",
+                    "num_gaussians_rigid",
+                }
                 for k, v in result.items():
                     if k.startswith("_") or k in row:
                         continue
-                    if not any(k.startswith(pf) for pf in always_scalar_prefixes):
+                    if k not in always_scalar_keys and not any(k.startswith(pf) for pf in always_scalar_prefixes):
                         continue
                     if isinstance(v, bool):
                         row[k] = bool(v)
@@ -2641,10 +2661,17 @@ def main() -> None:
                     if mean_loss is not None:
                         writer.add_scalar("train/mean_loss_in_block", float(mean_loss), step)
                     writer.add_scalar("train/mse", float(mse_val), step)
-                    writer.add_scalar("train/num_bg_update", int(result.get("num_bg_update", 0)), step)
-                    writer.add_scalar("train/num_distant_update", int(result.get("num_distant_update", 0)), step)
-                    writer.add_scalar("train/num_gaussians_sky", int(result.get("num_gaussians_sky", 0)), step)
-                    writer.add_scalar("train/src_backproject_pass_count", int(result.get("src_backproject_pass_count", 0)), step)
+                    for scalar_key in (
+                        "num_bg_update",
+                        "num_distant_update",
+                        "num_gaussians_bg",
+                        "num_gaussians_distant",
+                        "num_gaussians_rigid",
+                        "num_gaussians_sky",
+                        "src_backproject_pass_count",
+                    ):
+                        if scalar_key in result and isinstance(result[scalar_key], (int, float)):
+                            writer.add_scalar(f"train/{scalar_key}", float(result[scalar_key]), step)
                     for k, v in metric_vals.items():
                         writer.add_scalar(f"train/{k}", float(v), step)
                     if train_monitor_include_extra_result_metrics:
@@ -2654,7 +2681,9 @@ def main() -> None:
                             if isinstance(v, (int, float)):
                                 writer.add_scalar(f"train/{k}", float(v), step)
                     for k, v in result.items():
-                        if k.startswith("_") or not any(k.startswith(pf) for pf in always_scalar_prefixes):
+                        if k.startswith("_") or (
+                            k not in always_scalar_keys and not any(k.startswith(pf) for pf in always_scalar_prefixes)
+                        ):
                             continue
                         if isinstance(v, (int, float)):
                             writer.add_scalar(f"train/{k}", float(v), step)

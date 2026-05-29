@@ -41,6 +41,7 @@ from datasets.train_scheduler_v6 import TrainSchedulerV6
 from datasets.train_scheduler_v7 import TrainSchedulerV7
 from datasets.train_scheduler_v8 import TrainSchedulerV8
 from datasets.train_scheduler_v9 import TrainSchedulerV9, ViewSetRolloutBatchV9
+from streetforward_core.data.schedulers.legacy_v9_phase_a_adapter import convert_v9_phase_a_plan
 
 ImageRef = Tuple[int, int]
 
@@ -2517,6 +2518,8 @@ class MultiSceneDatasetV4:
             )
         batch["request_meta"] = request_meta
         batch["_scheduler_v9"] = plan_dict
+        if str(v9_plan.phase) == "phase_A_block_local_unroll":
+            batch["rollout_plan"] = convert_v9_phase_a_plan(v9_plan)
         return batch
 
     def get_segment_eval_batch_from_image_refs(self, request: EvalRequestV4) -> Dict[str, Any]:

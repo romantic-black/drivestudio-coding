@@ -38,6 +38,9 @@ from datasets.validation_long_phase_b import (
 )
 from models.streetforward.minimal_trainer_stage6_0 import MinimalStreetForwardStage6_0
 from models.streetforward.validation_v9_runner import aggregate_validation_v9_phase_a_rows
+from streetforward_core.data.schedulers.legacy_v9_phase_a_adapter import LegacyV9PhaseASchedulerAdapter
+from streetforward_core.protocols.rollout import PHASE_A_NAME
+from streetforward_core.train.stage6_phase_a_trainer import Stage6PhaseAFacadeTrainer
 from tools.streetforward_validation_v9_config import ValidationV9Config, parse_validation_v9_config
 from tools.train_minimal_streetforward_stage4_3_v7_common import parse_include_test, validate_train_scene_for_fixed
 from tools.train_minimal_streetforward_stage4_3_v9_common import (
@@ -83,7 +86,20 @@ def resolve_fixed_scene_segment_stage6(cfg: Any) -> tuple[Optional[int], Optiona
 
 
 def build_train_scheduler_stage6_from_cfg(cfg: Any, dataset: Any) -> Any:
-    return build_train_scheduler_v9_from_cfg(cfg, dataset)
+    scheduler = build_train_scheduler_v9_from_cfg(cfg, dataset)
+    sv9 = cfg.get("scheduler_v9") if hasattr(cfg, "get") else None
+    phase = str(_cfg_get(sv9, "phase", PHASE_A_NAME))
+    if phase == PHASE_A_NAME:
+        return LegacyV9PhaseASchedulerAdapter(scheduler)
+    return scheduler
+
+
+def build_stage6_trainer_from_cfg(config: Any, device: torch.device) -> Any:
+    model_cfg = _cfg_get(config, "model", {}) or {}
+    phase = str(_cfg_get(model_cfg, "phase", PHASE_A_NAME))
+    if phase == PHASE_A_NAME:
+        return Stage6PhaseAFacadeTrainer(config=config, device=device)
+    return MinimalStreetForwardStage6_0(config=config, device=device)
 
 
 def _scheduler_v9_blocks_per_episode(cfg: Any) -> int:
@@ -488,8 +504,8 @@ def main() -> None:
     base.resolve_fixed_scene_segment = resolve_fixed_scene_segment_stage6
     base.EPISODE_END_HOOK = _validation_v9_episode_end_hook
     base.TRAIN_START_HOOK = _validation_v9_train_start_hook
-    base.TRAINER_CLASS = MinimalStreetForwardStage6_0
-    base.MinimalStreetForwardStage4_3 = MinimalStreetForwardStage6_0
+    base.TRAINER_CLASS = build_stage6_trainer_from_cfg
+    base.MinimalStreetForwardStage4_3 = build_stage6_trainer_from_cfg
     base.CKPT_PREFIX = "minimal_sf_stage6_0_phase_a_v9"
     base.DEFAULT_CONFIG_FILE = default_config
     base.main()

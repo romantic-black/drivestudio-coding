@@ -4,7 +4,7 @@ import dataclasses
 from dataclasses import dataclass, field
 import math
 import random
-from typing import Any, Dict, List, Literal, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Set, Tuple
 
 from datasets.train_scheduler_v7 import SegmentIndexLike, TrainSchedulerV7
 from datasets.train_scheduler_v8 import TrainSchedulerDatasetV7, TrainSchedulerV8
@@ -2407,16 +2407,22 @@ class TrainSchedulerV9(TrainSchedulerV8):
         batch["_scheduler_v9_aligned_info"] = dict(aligned)
         return batch
 
-    def next_batch(self) -> Dict[str, Any]:
+    def _next_batch(
+        self,
+        *,
+        materialize_plan: Callable[[ViewSetRolloutBatchV9], Dict[str, Any]],
+        merge_plan_request_meta: bool,
+    ) -> Dict[str, Any]:
         self._ensure_episode_state()
         st = self.current_episode_state
         if st is None:
             raise ValueError("TrainSchedulerV9 internal state is not initialized")
         plan = self._take_plan_for_state(st)
         self._validate_v9_plan(plan)
-        batch = self._batch_from_v9_plan(plan)
+        batch = materialize_plan(plan)
         request_meta = dict(batch.get("request_meta") or {})
-        request_meta.update(plan.request_meta)
+        if bool(merge_plan_request_meta):
+            request_meta.update(plan.request_meta)
         batch["request_meta"] = request_meta
         batch["_scheduler_v9"] = dataclasses.asdict(plan)
         phase_b_stream_tbptt = bool(
@@ -2527,6 +2533,20 @@ class TrainSchedulerV9(TrainSchedulerV8):
         if hasattr(self.dataset, "maybe_log_overlap_stats"):
             self.dataset.maybe_log_overlap_stats(int(self.global_step))
         return batch
+
+    def next_batch_with_v9_plan_materializer(
+        self,
+        materialize_plan: Callable[[ViewSetRolloutBatchV9], Dict[str, Any]],
+        *,
+        merge_plan_request_meta: bool = True,
+    ) -> Dict[str, Any]:
+        return self._next_batch(
+            materialize_plan=materialize_plan,
+            merge_plan_request_meta=bool(merge_plan_request_meta),
+        )
+
+    def next_batch(self) -> Dict[str, Any]:
+        return self._next_batch(materialize_plan=self._batch_from_v9_plan, merge_plan_request_meta=True)
 
     def get_current_info(self) -> Dict[str, Any]:
         out = dict(super().get_current_info())
