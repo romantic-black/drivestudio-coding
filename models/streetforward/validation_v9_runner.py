@@ -183,9 +183,8 @@ def _render_metrics_for_indices(
     if len(target_indices) == 0:
         return {
             "num_refs": 0.0,
-            "psnr": 0.0,
-            "l1": 0.0,
-            "ssim": 0.0,
+            "num_metric_refs": 0.0,
+            "metric_valid": 0.0,
             "valid_ratio": 0.0,
             "skipped_no_valid_pixels": 0.0,
         }
@@ -208,9 +207,10 @@ def _render_metrics_for_indices(
             ssim_weight=float(getattr(model, "loss_w_ssim", 0.0)),
             min_valid_pixels=int(min_valid_pixels),
         )
-        psnr_vals.append(_safe_float(stats.get("psnr", 0.0)))
-        l1_vals.append(_safe_float(stats.get("l1", 0.0)))
-        ssim_vals.append(_safe_float(stats.get("ssim", 0.0)))
+        if _safe_float(stats.get("skipped_no_valid_pixels", 0.0)) < 0.5:
+            psnr_vals.append(_safe_float(stats.get("psnr", 0.0)))
+            l1_vals.append(_safe_float(stats.get("l1", 0.0)))
+            ssim_vals.append(_safe_float(stats.get("ssim", 0.0)))
         valid_ratios.append(_safe_float(stats.get("valid_ratio", 0.0)))
         skipped += _safe_float(stats.get("skipped_no_valid_pixels", 0.0))
         if save_dir and save_k is not None and saved < int(max_saved_cams):
@@ -223,14 +223,18 @@ def _render_metrics_for_indices(
                 gt=gt,
             )
             saved += 1
-    return {
+    out = {
         "num_refs": float(len(target_indices)),
-        "psnr": _mean(psnr_vals),
-        "l1": _mean(l1_vals),
-        "ssim": _mean(ssim_vals),
+        "num_metric_refs": float(len(psnr_vals)),
+        "metric_valid": float(1.0 if psnr_vals else 0.0),
         "valid_ratio": _mean(valid_ratios),
         "skipped_no_valid_pixels": float(skipped),
     }
+    if psnr_vals:
+        out["psnr"] = _mean(psnr_vals)
+        out["l1"] = _mean(l1_vals)
+        out["ssim"] = _mean(ssim_vals)
+    return out
 
 
 def _indices_for_k_or_first_nonempty(groups: Sequence[Sequence[int]], k: int) -> Sequence[int]:
@@ -400,23 +404,37 @@ def validate_v9_phase_a(
                 if bool(compute_runtime_stats):
                     timings["render_metric_ms"] += float((time.perf_counter() - render_t0) * 1000.0)
                 for prefix, stats in (("block", block_stats), ("nearby", nearby_stats)):
-                    row[f"{prefix}_psnr@{int(k)}"] = float(stats.get("psnr", 0.0))
-                    row[f"{prefix}_l1@{int(k)}"] = float(stats.get("l1", 0.0))
-                    row[f"{prefix}_ssim@{int(k)}"] = float(stats.get("ssim", 0.0))
                     row[f"{prefix}_valid_ratio@{int(k)}"] = float(stats.get("valid_ratio", 0.0))
                     row[f"{prefix}_skipped_no_valid_pixels@{int(k)}"] = float(
                         stats.get("skipped_no_valid_pixels", 0.0)
                     )
-                    row[f"val_v9/phaseA/{prefix}_psnr@{int(k)}"] = row[f"{prefix}_psnr@{int(k)}"]
-                    row[f"val_v9/phaseA/{prefix}_l1@{int(k)}"] = row[f"{prefix}_l1@{int(k)}"]
-                    row[f"val_v9/phaseA/{prefix}_ssim@{int(k)}"] = row[f"{prefix}_ssim@{int(k)}"]
+                    row[f"{prefix}_metric_valid@{int(k)}"] = float(stats.get("metric_valid", 0.0))
+                    row[f"{prefix}_num_metric_refs@{int(k)}"] = float(stats.get("num_metric_refs", 0.0))
                     row[f"val_v9/phaseA/{prefix}_valid_ratio@{int(k)}"] = row[f"{prefix}_valid_ratio@{int(k)}"]
                     row[f"val_v9/phaseA/{prefix}_skipped_no_valid_pixels@{int(k)}"] = row[
                         f"{prefix}_skipped_no_valid_pixels@{int(k)}"
                     ]
-                gap = float(row[f"block_psnr@{int(k)}"]) - float(row[f"nearby_psnr@{int(k)}"])
-                row[f"generalization_gap@{int(k)}"] = gap
-                row[f"val_v9/phaseA/generalization_gap@{int(k)}"] = gap
+                    row[f"val_v9/phaseA/{prefix}_metric_valid@{int(k)}"] = row[
+                        f"{prefix}_metric_valid@{int(k)}"
+                    ]
+                    row[f"val_v9/phaseA/{prefix}_num_metric_refs@{int(k)}"] = row[
+                        f"{prefix}_num_metric_refs@{int(k)}"
+                    ]
+                    for metric_name in ("psnr", "l1", "ssim"):
+                        value = stats.get(metric_name)
+                        if value is None:
+                            continue
+                        value_f = float(value)
+                        if not math.isfinite(value_f):
+                            continue
+                        row[f"{prefix}_{metric_name}@{int(k)}"] = value_f
+                        row[f"val_v9/phaseA/{prefix}_{metric_name}@{int(k)}"] = value_f
+                block_psnr = row.get(f"block_psnr@{int(k)}")
+                nearby_psnr = row.get(f"nearby_psnr@{int(k)}")
+                if block_psnr is not None and nearby_psnr is not None:
+                    gap = float(block_psnr) - float(nearby_psnr)
+                    row[f"generalization_gap@{int(k)}"] = gap
+                    row[f"val_v9/phaseA/generalization_gap@{int(k)}"] = gap
                 if bool(compute_delta_stats):
                     for name, value in _collect_state_stats(local_state, k=int(k)).items():
                         if name == "k":
@@ -459,20 +477,32 @@ def validate_v9_phase_a(
                 if int(k) == 0:
                     continue
                 for prefix in ("block", "nearby"):
-                    gain = float(row.get(f"{prefix}_psnr@{int(k)}", 0.0)) - float(row.get(f"{prefix}_psnr@0", 0.0))
+                    current = row.get(f"{prefix}_psnr@{int(k)}")
+                    baseline = row.get(f"{prefix}_psnr@0")
+                    if current is None or baseline is None:
+                        continue
+                    gain = float(current) - float(baseline)
                     row[f"{prefix}_psnr_gain@{int(k)}"] = float(gain)
                     row[f"val_v9/phaseA/{prefix}_psnr_gain@{int(k)}"] = float(gain)
 
             for prefix in ("block", "nearby"):
-                vals = [(int(k), float(row.get(f"{prefix}_psnr@{int(k)}", 0.0))) for k in k_values_i]
+                vals = [
+                    (int(k), float(row[f"{prefix}_psnr@{int(k)}"]))
+                    for k in k_values_i
+                    if f"{prefix}_psnr@{int(k)}" in row
+                ]
+                if not vals:
+                    continue
                 best_k, best_val = max(vals, key=lambda item: item[1])
-                final_val = float(row.get(f"{prefix}_psnr@{int(max_K)}", 0.0))
+                final_raw = row.get(f"{prefix}_psnr@{int(max_K)}")
                 row[f"best_{prefix}_psnr"] = float(best_val)
                 row[f"best_{prefix}_k"] = float(best_k)
-                row[f"final_{prefix}_psnr_drop"] = float(best_val - final_val)
                 row[f"val_v9/phaseA/best_{prefix}_psnr"] = float(best_val)
                 row[f"val_v9/phaseA/best_{prefix}_k"] = float(best_k)
-                row[f"val_v9/phaseA/final_{prefix}_psnr_drop"] = float(best_val - final_val)
+                if final_raw is not None:
+                    final_val = float(final_raw)
+                    row[f"final_{prefix}_psnr_drop"] = float(best_val - final_val)
+                    row[f"val_v9/phaseA/final_{prefix}_psnr_drop"] = float(best_val - final_val)
     finally:
         if snap is not None and hasattr(model, "_restore_runtime_state"):
             model._restore_runtime_state(key, snap)

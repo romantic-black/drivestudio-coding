@@ -1,4 +1,4 @@
-output_name: experiment001
+output_name: experiment003
 
 data:
   data_root: "/root/autodl-tmp/nuScenes/"
@@ -53,7 +53,7 @@ data:
     lidar_downsample_factor: 1
     lidar_percentile: 0.02
   assets:
-    root: "/root/autodl-tmp/streetforward_assets_pt40w_40w"
+    root: "/root/autodl-tmp/streetforward_assets_pt20w_15w"
   scene_asset_cache_max_items: 16
   segment_static_cache_max_items: 32
   image_meta_cache_max_items: 4096
@@ -62,17 +62,17 @@ data:
 dataset:
   num_source_keyframes: 1
   num_target_keyframes: 3
-  segment_overlap_ratio: 0.5
+  segment_overlap_ratio: 0.25
   min_keyframes_per_scene: 2
-  min_keyframes_per_segment: 2
+  min_keyframes_per_segment: 4
   preload_scene_count: 2
   keyframe_split_config:
     num_splits: 0
     min_count: 1
-    min_length: 3.0
+    min_length: 2.0
   segment_aabb:
-    - [-20.0, -10.0, 0.0]
-    - [20.0, 4.8, 60.0]
+    - [-15.0, -10.0, 0.0]
+    - [15.0, 4.8, 40.0]
   pointcloud:
     type: "hybrid"
     lidar_sparsity: full
@@ -80,12 +80,20 @@ dataset:
     monocular_sparsity: full
     monocular_filter_sky: true
     monocular_depth_consistency: false
-    monocular_downscale: 1
+    monocular_downscale: 2
     monocular_dynamic_recovery_bbox_expand_xyz_m: [0.5, 0.2, 0.5]
     monocular_dynamic_recovery_max_points_per_instance: 5000
-    near_max_points: 400000
-    distant_max_points: 200000
-    max_dynamic_points_per_segment: 150000
+    dynamic_point_balance:
+      enable: true
+      mode: bbox_volume
+      reference_volume_m3: 13.0
+      volume_exponent: 0.5
+      min_scale: 0.25
+      max_scale: 3.0
+      min_points_per_instance: 512
+    near_max_points: 200000
+    distant_max_points: 150000
+    max_dynamic_points_per_segment: 120000
     static_instance_motion:
       enable: true
       traj_length_thresh_m: 0.5
@@ -126,7 +134,7 @@ scheduler_v9:
     block:
       repeat_block_iteration: true
       inner_K_choices: [2, 4, 6, 8]
-      inner_K_probs: [0.25, 0.25, 0.25, 0.25]
+      inner_K_probs: [0.2, 0.25, 0.25, 0.3] 
       source_frame_policy: fixed_for_scheduler_step
       block_loss_policy: source_frame_all_cams
     nearby_supervision:
@@ -135,7 +143,7 @@ scheduler_v9:
       policy: adjacent_then_random_same_keyframe
       same_keyframe_only: true
       frames_per_block: 2
-      adjacent_radius: 1
+      adjacent_radius: 2
       random_fill: true
       exclude_source_frame: true
       exclude_existing_block_loss_frames: true
@@ -146,9 +154,9 @@ scheduler_v9:
       add_to_history_record_views: false
       apply_every_step: false
       apply_final_step_only: true
-      loss_weight: 0.25
-      loss_warmup_steps: 2000
-      max_refs_per_step: 12
+      loss_weight: 0.7
+      loss_warmup_steps: 30000
+      max_refs_per_step: 24
     masks:
       block_loss_mask: non_sky_non_egocar
       nearby_loss_mask: non_sky_non_egocar
@@ -173,10 +181,10 @@ scheduler_v9:
       cameras_per_frame: all_cams
       exclude_event_frames: true
     masks:
-      vsm_scope: bg_static
-      evidence_mask: valid_non_sky_non_egocar_non_dynamic
-      prefix_loss_mask: valid_non_sky_non_egocar_non_dynamic
-      query_label_mask: valid_non_sky_non_egocar_non_dynamic
+      vsm_scope: bg_rigid
+      evidence_mask: non_sky_non_egocar
+      prefix_loss_mask: non_sky_non_egocar
+      query_label_mask: non_sky_non_egocar
   leakage_check:
     enable: true
     nearby_not_in_evidence: true
@@ -201,7 +209,7 @@ validation_v8:
     reset_policy: episode_end
   trigger:
     by: train_episode_interval
-    validate_every_n_episodes: 100
+    validate_every_n_episodes: 10000
     run_at_train_start: false
   episode_selection:
     policy: middle
@@ -223,7 +231,7 @@ validation_v9:
   fail_fast: true
   trigger:
     by: train_episode_interval
-    validate_every_n_episodes: 100
+    validate_every_n_episodes: 10000
     run_at_train_start: false
   selection:
     seed: 20260524
@@ -238,8 +246,8 @@ validation_v9:
     resample_blocks_every_validation: false
     source_frame_policy: middle_in_keyframe
   phase_A:
-    k_values: [0, 4, 8, 16, 32]
-    max_K: 32
+    k_values: [0, 4, 8, 16, 32, 64]
+    max_K: 64
     nearby:
       enable: true
       frames_per_block: 1

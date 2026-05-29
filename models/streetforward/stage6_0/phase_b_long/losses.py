@@ -59,6 +59,8 @@ def phase_b_long_final_render_loss(
     mask_policy: str = "valid",
     l1_weight: float = 0.8,
     ssim_weight: float = 0.2,
+    pred_rgbs_out: Optional[List[torch.Tensor]] = None,
+    gt_images_out: Optional[List[torch.Tensor]] = None,
 ) -> tuple[torch.Tensor, Dict[str, float]]:
     if len(target_indices) == 0:
         return base_state.bg.means.new_tensor(0.0), {
@@ -98,6 +100,8 @@ def phase_b_long_final_render_loss(
             mask_policy=str(mask_policy),
             l1_weight=float(l1_weight),
             ssim_weight=float(ssim_weight),
+            pred_rgbs_out=pred_rgbs_out,
+            gt_images_out=gt_images_out,
         )
         losses.append(loss_f * float(len(indices)))
         weighted_refs += int(len(indices))

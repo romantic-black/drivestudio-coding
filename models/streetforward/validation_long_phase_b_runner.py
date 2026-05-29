@@ -13,9 +13,18 @@ from models.streetforward.stage6_0.phase_a_losses import masked_rgb_loss, target
 from models.streetforward.stage6_0.phase_b_long import (
     PhaseBOffsetState,
     materialize_phase_b_state,
-    resolve_long_phase_b_batch,
 )
+from models.streetforward.stage6_0.phase_b_long.resolver import resolve_long_phase_b_batch
 from models.streetforward.stage6_0.phase_b_long.types import LongVSMReadPack
+
+DEFAULT_LONG_VSM_ABLATIONS = (
+    "normal",
+    "zero_read_keep_seen",
+    "zero_read_zero_seen",
+    "zero_delta",
+    "shuffle_read",
+    "seen_only",
+)
 
 
 def _safe_mean(values: Sequence[float]) -> float:
@@ -23,18 +32,23 @@ def _safe_mean(values: Sequence[float]) -> float:
     return float(sum(vals) / max(len(vals), 1)) if vals else 0.0
 
 
-def _zero_read(read: LongVSMReadPack) -> LongVSMReadPack:
+def _zero_like_optional(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    return None if x is None else x.detach() * 0.0
+
+
+def _zero_read(read: LongVSMReadPack, *, zero_seen: bool = True) -> LongVSMReadPack:
+    seen_bg = read.seen_bg.detach() * 0.0 if bool(zero_seen) else read.seen_bg
     return LongVSMReadPack(
         bg=read.bg.detach() * 0.0,
-        seen_bg=read.seen_bg,
+        seen_bg=seen_bg,
         bg_indices=read.bg_indices,
-        rigid=None if read.rigid is None else read.rigid.detach() * 0.0,
+        rigid=_zero_like_optional(read.rigid),
         rigid_indices=read.rigid_indices,
-        rigid_seen=read.rigid_seen,
+        rigid_seen=_zero_like_optional(read.rigid_seen) if bool(zero_seen) else read.rigid_seen,
         rigid_stable_mask=read.rigid_stable_mask,
-        distant=None if read.distant is None else read.distant.detach() * 0.0,
+        distant=_zero_like_optional(read.distant),
         distant_indices=read.distant_indices,
-        distant_seen=read.distant_seen,
+        distant_seen=_zero_like_optional(read.distant_seen) if bool(zero_seen) else read.distant_seen,
     )
 
 
@@ -140,13 +154,16 @@ def run_long_phase_b_inference(
     offset_dtype = model._phase_b_long_state_dtype(base_state.bg.means, str(getattr(model, "stage6_phase_b_long_offset_dtype", "bf16")))
     vsm_dtype = model._phase_b_long_state_dtype(base_state.bg.means, str(getattr(model, "stage6_phase_b_long_vsm_dtype", "bf16")))
     offset = PhaseBOffsetState.zeros_like(base_state=base_state, dtype=offset_dtype)
-    vsm_state = model.stage6_long_vsm.init_state(
-        base_state=base_state,
-        dtype=vsm_dtype,
-        rigid_meta=roles.rigid_meta,
-        distant_mode=str(getattr(model, "stage6_phase_b_long_distant_mode", "frozen_render_only")),
-        episode_id=int(roles.request_meta.get("episode_id", -1) or -1),
-    )
+    init_kwargs: Dict[str, Any] = {
+        "base_state": base_state,
+        "dtype": vsm_dtype,
+        "rigid_meta": roles.rigid_meta,
+        "distant_mode": str(getattr(model, "stage6_phase_b_long_distant_mode", "frozen_render_only")),
+        "episode_id": int(roles.request_meta.get("episode_id", -1) or -1),
+    }
+    if str(getattr(model, "stage6_phase_b_long_vsm_type", "streaming_selective_ssm")) == "cell_streaming_selective_ssm":
+        init_kwargs["batch"] = batch
+    vsm_state = model.stage6_long_vsm.init_state(**init_kwargs)
     with torch.no_grad():
         for k, visit in enumerate(roles.visits):
             frame_idx = int(visit.frame_idx)
@@ -192,10 +209,14 @@ def run_long_phase_b_inference(
                     ),
                     compute_dtype=vsm_compute_dtype,
                 )
-                if str(ablation) == "zero_vsm":
-                    read_pack = _zero_read(read_pack)
-                elif str(ablation) == "shuffle_vsm":
+                if str(ablation) in {"zero_vsm", "zero_read_zero_seen"}:
+                    read_pack = _zero_read(read_pack, zero_seen=True)
+                elif str(ablation) in {"zero_read_keep_seen", "seen_only"}:
+                    read_pack = _zero_read(read_pack, zero_seen=False)
+                elif str(ablation) in {"shuffle_vsm", "shuffle_read"}:
                     read_pack = _shuffle_read(read_pack)
+                elif str(ablation) == "zero_delta":
+                    continue
                 elif str(ablation) != "normal":
                     raise ValueError(f"unsupported Long validation ablation={ablation!r}")
                 delta = model.stage6_long_offset_decoder(
@@ -212,7 +233,7 @@ def validate_long_phase_b(
     *,
     mask_policy: str = "non_sky_non_egocar",
     min_valid_pixels: int = 1,
-    ablations: Sequence[str] = ("normal", "zero_vsm", "shuffle_vsm"),
+    ablations: Sequence[str] = DEFAULT_LONG_VSM_ABLATIONS,
 ) -> Dict[str, float]:
     meta = dict(batch.get("request_meta") or {})
     buckets = dict(meta.get("validation_buckets") or {})

@@ -25,6 +25,13 @@ RefRoleV9 = Literal[
     "aux_loss",
 ]
 
+PHASE_B_FINAL_TARGET_ROLES = (
+    "final_history_recon",
+    "final_current_recon",
+    "final_history_nvs",
+    "final_current_nvs",
+)
+
 
 @dataclass(frozen=True)
 class RefGroupV9:
@@ -36,6 +43,18 @@ class RefGroupV9:
     allow_render_loss: bool
     allow_query_label: bool
     mask_policy: str
+
+
+@dataclass(frozen=True)
+class RolloutShapeV9:
+    name: str
+    blocks_per_rollout: int
+    repeats_per_block: int
+    prob: float = 1.0
+
+    @property
+    def inner_K(self) -> int:
+        return int(self.blocks_per_rollout) * int(self.repeats_per_block)
 
 
 @dataclass(frozen=True)
@@ -193,10 +212,12 @@ class TrainSchedulerV9(TrainSchedulerV8):
         phase_b_episode = self._cfg_get(self.phase_b_cfg, "episode", {}) or {}
         phase_b_prefix = self._cfg_get(self.phase_b_cfg, "prefix_render", {}) or {}
         phase_b_query = self._cfg_get(self.phase_b_cfg, "query_observation", {}) or {}
+        phase_b_final = self._cfg_get(self.phase_b_cfg, "final_supervision", {}) or {}
         phase_b_masks = self._cfg_get(self.phase_b_cfg, "masks", {}) or {}
         self.phase_b_reset_vsm_on_episode_end = bool(
             self._cfg_get(phase_b_episode, "reset_vsm_on_episode_end", True)
         )
+        self.phase_b_rollouts_per_episode = int(self._cfg_get(phase_b_episode, "rollouts_per_episode", 1))
         self.phase_b_K_choices = [
             int(x) for x in list(self._cfg_get(phase_b_rollout, "K_choices", [2, 4]) or [2, 4])
         ]
@@ -217,6 +238,32 @@ class TrainSchedulerV9(TrainSchedulerV8):
         )
         self.phase_b_allow_short_final_chunk = bool(
             self._cfg_get(phase_b_rollout, "allow_short_final_chunk", True)
+        )
+        phase_b_short_rollout = self._cfg_get(phase_b_rollout, "short_rollout", {}) or {}
+        self.phase_b_short_rollout_enable = bool(
+            self._cfg_get(phase_b_short_rollout, "enable", self.phase_b_allow_short_final_chunk)
+        )
+        self.phase_b_short_rollout_policy = str(
+            self._cfg_get(phase_b_short_rollout, "policy", "early_stop_episode")
+        )
+        self.phase_b_short_rollout_min_blocks = int(
+            self._cfg_get(phase_b_short_rollout, "min_blocks", 1)
+        )
+        self.phase_b_rollout_shapes = self._parse_phase_b_rollout_shapes(
+            self._cfg_get(phase_b_rollout, "shapes", []) or []
+        )
+        self.phase_b_rollout_max_inner_K = int(self._cfg_get(phase_b_rollout, "max_inner_K", self.phase_b_repeat_max_inner_K))
+        block_selection = self._cfg_get(phase_b_rollout, "block_selection", {}) or {}
+        self.phase_b_rollout_block_selection_policy = str(
+            self._cfg_get(block_selection, "policy", "next_after_history_or_random_future")
+        )
+        self.phase_b_rollout_next_prob = float(self._cfg_get(block_selection, "next_prob", 0.7))
+        self.phase_b_rollout_random_future_prob = float(self._cfg_get(block_selection, "random_future_prob", 0.3))
+        self.phase_b_rollout_require_chronological_execution = bool(
+            self._cfg_get(block_selection, "require_chronological_execution", True)
+        )
+        self.phase_b_rollout_distinct_event_blocks = bool(
+            self._cfg_get(block_selection, "distinct_event_blocks", True)
         )
         self.phase_b_sample_event_frames = str(
             self._cfg_get(phase_b_rollout, "sample_event_frames", "random_blocks_in_episode")
@@ -246,6 +293,36 @@ class TrainSchedulerV9(TrainSchedulerV8):
         self.phase_b_query_allow_empty_on_last_chunk = bool(
             self._cfg_get(phase_b_query, "allow_empty_on_last_chunk", False)
         )
+        final_history = self._cfg_get(phase_b_final, "history", {}) or {}
+        final_current = self._cfg_get(phase_b_final, "current", {}) or {}
+        final_nvs = self._cfg_get(phase_b_final, "nvs", {}) or {}
+        self.phase_b_final_apply = str(self._cfg_get(phase_b_final, "apply", "rollout_final_only"))
+        self.phase_b_final_history_max_frames = int(self._cfg_get(final_history, "max_frames", 3))
+        self.phase_b_final_history_sample_policy = str(
+            self._cfg_get(final_history, "sample_policy", "recent_then_random")
+        )
+        raw_current_max = self._cfg_get(final_current, "max_frames", None)
+        self.phase_b_final_current_max_frames = None if raw_current_max is None else int(raw_current_max)
+        self.phase_b_final_current_sample_policy = str(
+            self._cfg_get(final_current, "sample_policy", "all_or_recent")
+        )
+        self.phase_b_final_current_frame_policy = str(
+            self._cfg_get(final_current, "frame_policy", "all_trained_current_frames")
+        )
+        self.phase_b_final_current_allow_subsample = bool(
+            self._cfg_get(final_current, "allow_subsample", False)
+        )
+        self.phase_b_final_nvs_enable = bool(self._cfg_get(final_nvs, "enable", True))
+        self.phase_b_final_nvs_frames_per_rollout = int(self._cfg_get(final_nvs, "frames_per_rollout", 1))
+        self.phase_b_final_nvs_forbid_evidence_overlap = bool(
+            self._cfg_get(final_nvs, "forbid_evidence_overlap", True)
+        )
+        self.phase_b_final_nvs_required_policy = str(
+            self._cfg_get(final_nvs, "required_policy", "required_if_future_available")
+        )
+        self.phase_b_final_required_roles = [
+            str(x) for x in list(self._cfg_get(phase_b_final, "required_roles", ["final_current_recon"]) or [])
+        ]
         self.phase_b_vsm_scope = str(self._cfg_get(phase_b_masks, "vsm_scope", "bg_rigid"))
         self.phase_b_evidence_mask = str(
             self._cfg_get(phase_b_masks, "evidence_mask", "non_sky_non_egocar")
@@ -313,10 +390,12 @@ class TrainSchedulerV9(TrainSchedulerV8):
             "episode_stream_tbptt",
             "episode_block_repeat_tbptt",
             "episode_grouped_repeat_tbptt",
+            "episode_rollout_grouped_repeat_tbptt",
         ):
             raise ValueError(
                 "scheduler_v9.phase_B.rollout.mode must be random_viewset_local, "
-                "episode_stream_tbptt, episode_block_repeat_tbptt, or episode_grouped_repeat_tbptt"
+                "episode_stream_tbptt, episode_block_repeat_tbptt, episode_grouped_repeat_tbptt, "
+                "or episode_rollout_grouped_repeat_tbptt"
             )
         if self.phase == "phase_B_viewset_rollout" and self.phase_b_rollout_mode == "episode_stream_tbptt":
             if self.phase_b_sample_event_frames != "sequential_blocks_in_episode":
@@ -368,6 +447,51 @@ class TrainSchedulerV9(TrainSchedulerV8):
                         blocks_per_episode=int(blocks_per_episode),
                         label="phase_B.rollout.curriculum.repeat_patterns",
                     )
+        if self.phase == "phase_B_viewset_rollout" and self.phase_b_rollout_mode == "episode_rollout_grouped_repeat_tbptt":
+            if int(steps_per_block) != 1:
+                raise ValueError("Phase B episode_rollout_grouped_repeat_tbptt requires scheduler_v9.block.steps_per_block=1")
+            if int(self.phase_b_rollouts_per_episode) < 1:
+                raise ValueError("Phase B requires phase_B.episode.rollouts_per_episode >= 1")
+            if self.phase_b_final_apply != "rollout_final_only":
+                raise ValueError("Phase B final rollout mode requires phase_B.final_supervision.apply=rollout_final_only")
+            if self.phase_b_rollout_block_selection_policy != "next_after_history_or_random_future":
+                raise ValueError(
+                    "Phase B final rollout mode supports block_selection.policy=next_after_history_or_random_future only"
+                )
+            if not self.phase_b_rollout_require_chronological_execution:
+                raise ValueError("Phase B final rollout mode requires chronological execution")
+            if not self.phase_b_rollout_distinct_event_blocks:
+                raise ValueError("Phase B final rollout mode requires distinct_event_blocks=true")
+            if self.phase_b_final_history_sample_policy != "recent_then_random":
+                raise ValueError("Phase B final rollout mode supports history.sample_policy=recent_then_random only")
+            if self.phase_b_final_current_sample_policy != "all_or_recent":
+                raise ValueError("Phase B final rollout mode supports current.sample_policy=all_or_recent only")
+            if self.phase_b_final_current_frame_policy != "all_trained_current_frames":
+                raise ValueError(
+                    "Phase B final rollout mode requires "
+                    "phase_B.final_supervision.current.frame_policy=all_trained_current_frames"
+                )
+            if self.phase_b_final_current_max_frames is not None:
+                raise ValueError(
+                    "Phase B final current supervision must cover every trained current frame; "
+                    "set phase_B.final_supervision.current.max_frames=null"
+                )
+            if self.phase_b_short_rollout_policy != "early_stop_episode":
+                raise ValueError("Phase B final rollout supports short_rollout.policy=early_stop_episode only")
+            if int(self.phase_b_short_rollout_min_blocks) < 1:
+                raise ValueError("Phase B short_rollout.min_blocks must be >= 1")
+            if self.phase_b_final_nvs_required_policy != "required_if_future_available":
+                raise ValueError("Phase B final rollout supports nvs.required_policy=required_if_future_available only")
+            if not self.phase_b_rollout_shapes:
+                self.phase_b_rollout_shapes = [
+                    RolloutShapeV9(name="b4_r4", blocks_per_rollout=4, repeats_per_block=4, prob=0.5),
+                    RolloutShapeV9(name="b6_r3", blocks_per_rollout=6, repeats_per_block=3, prob=0.5),
+                ]
+            self._validate_phase_b_rollout_shapes(
+                self.phase_b_rollout_shapes,
+                blocks_per_episode=int(blocks_per_episode),
+                label="phase_B.rollout.shapes",
+            )
         if self.phase == "phase_B_viewset_rollout" and self.phase_b_rollout_mode == "random_viewset_local":
             if self.phase_b_sample_event_frames != "random_blocks_in_episode":
                 raise ValueError(
@@ -378,7 +502,7 @@ class TrainSchedulerV9(TrainSchedulerV8):
             raise ValueError("scheduler_v9 P0 supports prefix_render.policy=current_plus_random_previous only")
         if self.phase_b_query_cameras_per_frame != "all_cams":
             raise ValueError("scheduler_v9 P0 supports query_observation.cameras_per_frame=all_cams only")
-        if self.phase_b_query_allow_empty_on_last_chunk:
+        if self.phase_b_query_allow_empty_on_last_chunk and self.phase_b_rollout_mode != "episode_rollout_grouped_repeat_tbptt":
             raise ValueError("scheduler_v9 Phase B P0 requires query_observation.allow_empty_on_last_chunk=false")
         if self.phase_b_vsm_scope != "bg_rigid":
             raise ValueError("scheduler_v9 Phase B-R requires phase_B.masks.vsm_scope=bg_rigid")
@@ -394,7 +518,7 @@ class TrainSchedulerV9(TrainSchedulerV8):
         if (
             self.phase == "phase_B_viewset_rollout"
             and self.phase_b_distinct_event_frames
-            and self.phase_b_rollout_mode != "episode_grouped_repeat_tbptt"
+            and self.phase_b_rollout_mode not in ("episode_grouped_repeat_tbptt", "episode_rollout_grouped_repeat_tbptt")
         ):
             max_k = max([int(x) for x in self.phase_b_K_choices] + [
                 int(k)
@@ -522,6 +646,88 @@ class TrainSchedulerV9(TrainSchedulerV8):
             total_prob += float(prob)
         if total_prob <= 0.0:
             raise ValueError(f"{label} probabilities must sum to > 0")
+
+    def _parse_phase_b_rollout_shapes(self, raw_shapes: Sequence[Any]) -> List[RolloutShapeV9]:
+        out: List[RolloutShapeV9] = []
+        for idx, raw in enumerate(list(raw_shapes or [])):
+            item = dict(raw)
+            blocks = int(self._cfg_get(item, "blocks_per_rollout", 0) or 0)
+            repeats = int(self._cfg_get(item, "repeats_per_block", 0) or 0)
+            name = str(self._cfg_get(item, "name", f"b{blocks}_r{repeats}"))
+            prob = float(self._cfg_get(item, "prob", 1.0))
+            if blocks < 1 or repeats < 1:
+                raise ValueError(
+                    f"phase_B.rollout.shapes[{idx}] blocks_per_rollout and repeats_per_block must be >= 1"
+                )
+            out.append(
+                RolloutShapeV9(
+                    name=str(name),
+                    blocks_per_rollout=int(blocks),
+                    repeats_per_block=int(repeats),
+                    prob=float(prob),
+                )
+            )
+        return out
+
+    def _validate_phase_b_rollout_shapes(
+        self,
+        shapes: Sequence[RolloutShapeV9],
+        *,
+        blocks_per_episode: int,
+        label: str,
+    ) -> None:
+        vals = list(shapes or [])
+        if not vals:
+            raise ValueError(f"{label} must not be empty")
+        total_prob = 0.0
+        for idx, shape in enumerate(vals):
+            if int(shape.blocks_per_rollout) < 1 or int(shape.repeats_per_block) < 1:
+                raise ValueError(f"{label}[{idx}] blocks_per_rollout/repeats_per_block must be >= 1")
+            allow_shape_larger_than_episode = bool(
+                self.phase == "phase_B_viewset_rollout"
+                and self.phase_b_rollout_mode == "episode_rollout_grouped_repeat_tbptt"
+                and self.phase_b_short_rollout_enable
+            )
+            if int(shape.blocks_per_rollout) > int(blocks_per_episode) and not allow_shape_larger_than_episode:
+                raise ValueError(
+                    "Phase B rollout blocks_per_rollout cannot exceed blocks_per_episode: "
+                    f"blocks_per_rollout={int(shape.blocks_per_rollout)} blocks_per_episode={int(blocks_per_episode)}"
+                )
+            if int(shape.inner_K) > int(self.phase_b_rollout_max_inner_K):
+                raise ValueError(
+                    "Phase B rollout inner_K exceeds max_inner_K: "
+                    f"inner_K={int(shape.inner_K)} max_inner_K={int(self.phase_b_rollout_max_inner_K)}"
+                )
+            if not math.isfinite(float(shape.prob)) or float(shape.prob) < 0.0:
+                raise ValueError(f"{label}[{idx}].prob must be finite and >= 0")
+            total_prob += float(shape.prob)
+        if total_prob <= 0.0:
+            raise ValueError(f"{label} probabilities must sum to > 0")
+
+    def _phase_b_active_rollout_shapes(self) -> List[RolloutShapeV9]:
+        shapes = list(self.phase_b_rollout_shapes)
+        active_start = None
+        for stage in self.phase_b_curriculum:
+            start = int(self._cfg_get(stage, "start_step", 0) or 0)
+            if int(self.global_step) < int(start):
+                continue
+            raw_shapes = self._cfg_get(stage, "shapes", None)
+            if raw_shapes is None:
+                continue
+            if active_start is None or int(start) >= int(active_start):
+                active_start = int(start)
+                shapes = self._parse_phase_b_rollout_shapes(list(raw_shapes or []))
+        return shapes
+
+    def _sample_phase_b_rollout_shape(self) -> RolloutShapeV9:
+        shapes = self._phase_b_active_rollout_shapes()
+        self._validate_phase_b_rollout_shapes(
+            shapes,
+            blocks_per_episode=int(self.blocks_per_episode),
+            label="active phase_B.rollout.shapes",
+        )
+        weights = [float(shape.prob) for shape in shapes]
+        return random.choices(shapes, weights=weights, k=1)[0]
 
     def _phase_b_active_k_choices(self) -> tuple[List[int], Optional[List[float]]]:
         choices = list(self.phase_b_K_choices)
@@ -769,6 +975,135 @@ class TrainSchedulerV9(TrainSchedulerV8):
         }
         return selected, meta
 
+    def _phase_b_rollout_state(self, st: Dict[str, Any]) -> Dict[str, Any]:
+        state = dict(st.get("phase_b_rollout") or {})
+        return {
+            "rollout_idx_in_episode": int(state.get("rollout_idx_in_episode", 0) or 0),
+            "rollout_id_global": int(state.get("rollout_id_global", self.global_step) or self.global_step),
+            "written_block_indices": [int(x) for x in list(state.get("written_block_indices", []) or [])],
+            "written_frame_indices": [int(x) for x in list(state.get("written_frame_indices", []) or [])],
+        }
+
+    def _select_phase_b_rollout_blocks(
+        self,
+        st: Dict[str, Any],
+        *,
+        blocks_per_rollout: int,
+    ) -> tuple[List[int], Dict[str, Any]]:
+        blocks = list(range(int(self._episode_num_blocks_from_state(st))))
+        if not blocks:
+            raise ValueError("Phase B rollout final mode requires non-empty episode blocks")
+        state = self._phase_b_rollout_state(st)
+        rollout_idx = int(state["rollout_idx_in_episode"])
+        written_blocks = sorted({int(x) for x in state["written_block_indices"]})
+        cursor = int(max(written_blocks) + 1) if written_blocks else 0
+        future_blocks = [int(b) for b in blocks if int(b) not in set(written_blocks) and int(b) >= int(cursor)]
+        if not future_blocks:
+            raise ValueError("Phase B rollout final mode has no future blocks; episode should have ended")
+
+        max_blocks_per_rollout = max(int(s.blocks_per_rollout) for s in self._phase_b_active_rollout_shapes())
+        remaining_rollouts_after = max(int(self.phase_b_rollouts_per_episode) - int(rollout_idx) - 1, 0)
+        max_last_allowed = int(len(blocks)) - int(remaining_rollouts_after) * int(max_blocks_per_rollout) - 1
+        bounded_candidates = [int(b) for b in future_blocks if int(b) <= int(max_last_allowed)]
+        requested = int(blocks_per_rollout)
+        actual_count = min(int(requested), int(len(future_blocks)))
+        if actual_count < requested:
+            if not bool(self.phase_b_short_rollout_enable):
+                raise ValueError(
+                    "Phase B short rollout is required but disabled: "
+                    f"requested={int(requested)}, available={int(len(future_blocks))}."
+                )
+            if int(actual_count) < int(self.phase_b_short_rollout_min_blocks):
+                raise ValueError(
+                    "Phase B short rollout has too few available blocks: "
+                    f"available={int(actual_count)} min_blocks={int(self.phase_b_short_rollout_min_blocks)}."
+                )
+            selected = [int(x) for x in future_blocks[:actual_count]]
+            mode = "short_final"
+            is_last = True
+            short_reason = "segment_blocks_exhausted"
+        else:
+            next_weight = max(float(self.phase_b_rollout_next_prob), 0.0)
+            random_weight = max(float(self.phase_b_rollout_random_future_prob), 0.0)
+            if next_weight + random_weight <= 0.0:
+                next_weight = 1.0
+            mode = random.choices(["next", "random_future"], weights=[next_weight, random_weight], k=1)[0]
+            if mode == "random_future" and len(bounded_candidates) >= requested:
+                selected = sorted(int(x) for x in random.sample(bounded_candidates, requested))
+            else:
+                mode = "next"
+                selected = [int(x) for x in future_blocks[:requested]]
+            if mode == "next" and selected != list(range(int(selected[0]), int(selected[0]) + len(selected))):
+                raise ValueError("Phase B next block selection must be contiguous")
+            is_last = bool(
+                int(rollout_idx) + 1 >= int(self.phase_b_rollouts_per_episode)
+                or int(max(selected)) >= int(max(blocks))
+            )
+            short_reason = ""
+        meta = {
+            "enable": True,
+            "strict": True,
+            "stream_id": "rollout_final",
+            "chunk_idx": int(rollout_idx),
+            "rollout_idx_in_episode": int(rollout_idx),
+            "rollout_id_global": int(state["rollout_id_global"]),
+            "is_first_chunk": bool(rollout_idx == 0),
+            "is_last_chunk": bool(is_last),
+            "start_block_idx": int(selected[0]),
+            "end_block_idx": int(max(selected) + 1),
+            "event_block_indices": [int(x) for x in selected],
+            "prior_written_frames": [int(x) for x in state["written_frame_indices"]],
+            "prior_written_blocks": [int(x) for x in written_blocks],
+            "block_selection_mode": str(mode),
+            "rollouts_per_episode": int(self.phase_b_rollouts_per_episode),
+            "requested_blocks_per_rollout": int(requested),
+            "actual_blocks_per_rollout": int(len(selected)),
+            "short_rollout": bool(len(selected) < requested),
+            "short_rollout_reason": str(short_reason),
+            "episode_total_blocks": int(len(blocks)),
+            "remaining_blocks_before_rollout": int(len(future_blocks)),
+        }
+        return [int(x) for x in selected], meta
+
+    def _sample_phase_b_history_frames(self, written_frames: List[int], max_frames: int) -> List[int]:
+        frames = [int(x) for x in written_frames]
+        max_frames = max(int(max_frames), 0)
+        if max_frames <= 0 or not frames:
+            return []
+        if len(frames) <= max_frames:
+            return [int(x) for x in frames]
+        recent = [int(frames[-1])]
+        older = [int(x) for x in frames[:-1]]
+        random.shuffle(older)
+        out = recent + older[: max(int(max_frames) - len(recent), 0)]
+        return sorted({int(x) for x in out})
+
+    @staticmethod
+    def _add_role_refs(
+        refs: List[ImageRef],
+        roles: List[str],
+        *,
+        role: str,
+        new_refs: Sequence[ImageRef],
+    ) -> None:
+        if str(role) not in PHASE_B_FINAL_TARGET_ROLES:
+            raise ValueError(f"unknown Phase B final target role {role!r}")
+        role_by_ref = {tuple(ref): str(existing_role) for ref, existing_role in zip(refs, roles)}
+        seen = set(role_by_ref)
+        for ref in new_refs:
+            r = (int(ref[0]), int(ref[1]))
+            if r in seen:
+                if role_by_ref.get(r) != str(role):
+                    raise ValueError(
+                        f"Phase B final supervision ref {r} has conflicting roles: "
+                        f"{role_by_ref.get(r)} vs {str(role)}"
+                    )
+                continue
+            refs.append(r)
+            roles.append(str(role))
+            seen.add(r)
+            role_by_ref[r] = str(role)
+
     def _select_event_block_repeat(self, st: Dict[str, Any], K: int) -> tuple[List[int], Dict[str, Any]]:
         if int(K) != 1:
             raise ValueError("Phase B episode_block_repeat_tbptt requires inner K=1")
@@ -802,6 +1137,7 @@ class TrainSchedulerV9(TrainSchedulerV8):
             "episode_stream_tbptt",
             "episode_block_repeat_tbptt",
             "episode_grouped_repeat_tbptt",
+            "episode_rollout_grouped_repeat_tbptt",
         ):
             return
         tbptt = dict((plan.request_meta or {}).get("tbptt") or {})
@@ -811,7 +1147,11 @@ class TrainSchedulerV9(TrainSchedulerV8):
         current = {int(x) for x in list(tbptt.get("event_frame_indices", []) or [])}
         cursor = (
             int(tbptt["end_block_idx"])
-            if self.phase_b_rollout_mode in ("episode_stream_tbptt", "episode_grouped_repeat_tbptt")
+            if self.phase_b_rollout_mode in (
+                "episode_stream_tbptt",
+                "episode_grouped_repeat_tbptt",
+                "episode_rollout_grouped_repeat_tbptt",
+            )
             else int(st.get("block_cursor", 0))
         )
         st["phase_b_tbptt"] = {
@@ -819,6 +1159,15 @@ class TrainSchedulerV9(TrainSchedulerV8):
             "chunk_idx": int(tbptt["chunk_idx"]) + 1,
             "written_frames": sorted(prior | current),
         }
+        if self.phase_b_rollout_mode == "episode_rollout_grouped_repeat_tbptt":
+            prior_blocks = {int(x) for x in list(tbptt.get("prior_written_blocks", []) or [])}
+            current_blocks = {int(x) for x in list(tbptt.get("event_block_indices", []) or [])}
+            st["phase_b_rollout"] = {
+                "rollout_idx_in_episode": int(tbptt.get("rollout_idx_in_episode", tbptt.get("chunk_idx", 0))) + 1,
+                "rollout_id_global": int(tbptt.get("rollout_id_global", self.global_step)) + 1,
+                "written_block_indices": sorted(prior_blocks | current_blocks),
+                "written_frame_indices": sorted(prior | current),
+            }
 
     def _sample_prefix_frames(self, *, written_frames: List[int], current_frame: int, step_idx: int, inner_K: int) -> List[int]:
         if str(self.phase_b_prefix_policy) != "current_plus_random_previous":
@@ -1006,7 +1355,326 @@ class TrainSchedulerV9(TrainSchedulerV8):
             repeat_meta=repeat_meta,
         )
 
+    def _build_phase_b_rollout_final_plan(self, st: Dict[str, Any]) -> ViewSetRolloutBatchV9:
+        sidx = self.dataset.get_segment_index(int(st["scene_id"]), int(st["segment_id"]))
+        shape = self._sample_phase_b_rollout_shape()
+        unique_blocks, tbptt_meta = self._select_phase_b_rollout_blocks(
+            st,
+            blocks_per_rollout=int(shape.blocks_per_rollout),
+        )
+        repeats_per_block = int(shape.repeats_per_block)
+        inner_K = int(repeats_per_block * len(unique_blocks))
+        if inner_K < 1:
+            raise ValueError("Phase B final rollout generated empty inner rollout")
+        if inner_K > int(self.phase_b_rollout_max_inner_K):
+            raise ValueError(
+                "Phase B final rollout actual inner_K exceeds max_inner_K: "
+                f"inner_K={int(inner_K)} max_inner_K={int(self.phase_b_rollout_max_inner_K)}"
+            )
+
+        num_cams = int(st["num_cams"])
+        self._last_num_cams = int(num_cams)
+        prior_written_frames = [int(x) for x in list(tbptt_meta.get("prior_written_frames", []) or [])]
+        prior_written_blocks = [int(x) for x in list(tbptt_meta.get("prior_written_blocks", []) or [])]
+        current_event_frames: List[int] = []
+        current_event_keyframes: List[int] = []
+        steps: List[StepPlanV9] = []
+        step_block_indices: List[int] = []
+        step_repeat_indices: List[int] = []
+        step_memory_write_flags: List[bool] = []
+        step_source_frame_indices: List[int] = []
+        visit_time_codes: List[Tuple[float, float, float, float]] = []
+        frame_chain = [int(x) for x in list(st.get("frame_chain", []) or [])]
+        frame_span = max((max(frame_chain) - min(frame_chain)) if frame_chain else 1, 1)
+        frame_start = min(frame_chain) if frame_chain else 0
+
+        for rollout_rank, block_idx in enumerate(unique_blocks):
+            source_keyframe_idx, source_frame = self._sample_source_frame_for_block(
+                st=st,
+                sidx=sidx,
+                block_idx=int(block_idx),
+            )
+            if current_event_frames and int(source_frame) <= int(current_event_frames[-1]):
+                raise ValueError("Phase B final rollout requires source frames strictly chronological across blocks")
+            current_event_frames.append(int(source_frame))
+            current_event_keyframes.append(int(source_keyframe_idx))
+            evidence_refs = self._frame_targets_to_image_refs(num_cams, [int(source_frame)])
+            for repeat_idx in range(int(repeats_per_block)):
+                step_idx = int(len(steps))
+                visit_pos = float(step_idx) / float(max(int(inner_K) - 1, 1))
+                frame_time = float(int(source_frame) - int(frame_start)) / float(frame_span)
+                chrono = float(rollout_rank) / float(max(len(unique_blocks) - 1, 1))
+                repeat_code = float(repeat_idx) / float(max(int(repeats_per_block) - 1, 1))
+                steps.append(
+                    StepPlanV9(
+                        step_idx=int(step_idx),
+                        source_keyframe_idx=int(source_keyframe_idx),
+                        source_frame_idx=int(source_frame),
+                        block_idx=int(block_idx),
+                        evidence_refs=[tuple(x) for x in evidence_refs],
+                        block_loss_refs=[],
+                        nearby_loss_refs=[],
+                        prefix_loss_refs=[],
+                        query_label_refs=[],
+                        aux_loss_refs=[],
+                        evidence_frame_indices=[int(source_frame)],
+                        loss_frame_indices=[],
+                        nearby_frame_indices=[],
+                        query_frame_indices=[],
+                    )
+                )
+                step_block_indices.append(int(block_idx))
+                step_repeat_indices.append(int(repeat_idx))
+                step_memory_write_flags.append(bool(int(repeat_idx) == 0))
+                step_source_frame_indices.append(int(source_frame))
+                visit_time_codes.append((float(visit_pos), float(frame_time), float(chrono), float(repeat_code)))
+
+        trained_current_frames = [int(x) for x in current_event_frames]
+        actual_blocks = int(len(unique_blocks))
+        requested_blocks = int(shape.blocks_per_rollout)
+        requested_inner_K = int(requested_blocks * repeats_per_block)
+        actual_inner_K = int(actual_blocks * repeats_per_block)
+        short_rollout = bool(actual_blocks < requested_blocks)
+        effective_shape_name = (
+            str(shape.name)
+            if not short_rollout
+            else f"{shape.name}_short_b{actual_blocks}_r{int(repeats_per_block)}"
+        )
+        if int(actual_inner_K) != int(inner_K):
+            raise ValueError("Phase B final rollout actual_inner_K invariant is broken")
+        if len(trained_current_frames) != int(actual_blocks):
+            raise ValueError(
+                "Phase B final rollout invariant broken: "
+                f"trained_current_frames={len(trained_current_frames)} actual_blocks={int(actual_blocks)}."
+            )
+        if len(set(trained_current_frames)) != len(trained_current_frames):
+            raise ValueError("Phase B final rollout trained current frames must be distinct")
+        if trained_current_frames != sorted(trained_current_frames):
+            raise ValueError("Phase B final rollout trained current frames must be chronological")
+        if str(tbptt_meta.get("block_selection_mode", "")) == "next":
+            expected_next = list(range(int(unique_blocks[0]), int(unique_blocks[0]) + len(unique_blocks)))
+            if [int(x) for x in unique_blocks] != expected_next:
+                raise ValueError("Phase B final rollout next block selection must be contiguous")
+        expected_cams = set(range(int(num_cams)))
+        for frame_idx in trained_current_frames:
+            positions = [
+                int(idx)
+                for idx, frame_val in enumerate(step_source_frame_indices)
+                if int(frame_val) == int(frame_idx)
+            ]
+            if len(positions) != int(repeats_per_block):
+                raise ValueError(
+                    f"Frame {int(frame_idx)} has {len(positions)} repeat steps, "
+                    f"expected {int(repeats_per_block)}."
+                )
+            for pos in positions:
+                refs = [tuple(x) for x in steps[int(pos)].evidence_refs]
+                frames = {int(ref[0]) for ref in refs}
+                cams = {int(ref[1]) for ref in refs}
+                if frames != {int(frame_idx)}:
+                    raise ValueError("Phase B final rollout evidence refs do not match step source frame")
+                if cams != expected_cams:
+                    raise ValueError("Phase B final rollout evidence refs do not cover all cams")
+
+        history_frames = self._sample_phase_b_history_frames(
+            prior_written_frames,
+            max_frames=int(self.phase_b_final_history_max_frames),
+        )
+        current_frames = [int(x) for x in trained_current_frames]
+        if str(self.phase_b_final_current_frame_policy) != "all_trained_current_frames":
+            raise ValueError("Phase B final current frame_policy must be all_trained_current_frames")
+        if self.phase_b_final_current_max_frames is not None and len(current_frames) > int(self.phase_b_final_current_max_frames):
+            raise ValueError(
+                "Phase B final current supervision must cover every trained current frame. "
+                "Set final_supervision.current.max_frames=null."
+            )
+
+        final_refs: List[ImageRef] = []
+        final_roles: List[str] = []
+        self._add_role_refs(
+            final_refs,
+            final_roles,
+            role="final_history_recon",
+            new_refs=self._frame_targets_to_image_refs(num_cams, history_frames),
+        )
+        self._add_role_refs(
+            final_refs,
+            final_roles,
+            role="final_current_recon",
+            new_refs=self._frame_targets_to_image_refs(num_cams, current_frames),
+        )
+        expected_current_refs = set(self._frame_targets_to_image_refs(num_cams, trained_current_frames))
+        actual_current_refs = {
+            tuple(ref)
+            for ref, role in zip(final_refs, final_roles)
+            if str(role) == "final_current_recon"
+        }
+        if actual_current_refs != expected_current_refs:
+            missing = sorted(expected_current_refs - actual_current_refs)
+            extra = sorted(actual_current_refs - expected_current_refs)
+            raise ValueError(
+                "Phase B final_current_recon must exactly match trained current frames. "
+                f"missing={missing[:8]} extra={extra[:8]} "
+                f"trained_current_frames={trained_current_frames}"
+            )
+
+        nvs_frames: List[int] = []
+        if bool(self.phase_b_final_nvs_enable) and int(self.phase_b_final_nvs_frames_per_rollout) > 0:
+            used_blocks = set(int(x) for x in prior_written_blocks + list(unique_blocks))
+            future_blocks = [
+                int(b)
+                for b in range(int(self._episode_num_blocks_from_state(st)))
+                if int(b) not in used_blocks and int(b) > int(max(unique_blocks))
+            ]
+            random.shuffle(future_blocks)
+            for block_idx in sorted(future_blocks[: int(self.phase_b_final_nvs_frames_per_rollout)]):
+                _kf, frame_idx = self._sample_source_frame_for_block(st=st, sidx=sidx, block_idx=int(block_idx))
+                if int(frame_idx) not in set(current_event_frames) and int(frame_idx) not in set(prior_written_frames):
+                    nvs_frames.append(int(frame_idx))
+        self._add_role_refs(
+            final_refs,
+            final_roles,
+            role="final_current_nvs",
+            new_refs=self._frame_targets_to_image_refs(num_cams, nvs_frames),
+        )
+        if not final_refs:
+            raise ValueError("Phase B final rollout sampled zero final supervision refs")
+        role_set = set(final_roles)
+        missing = [role for role in self.phase_b_final_required_roles if str(role) not in role_set]
+        if missing:
+            raise ValueError(f"Phase B final rollout missing required final roles: {missing}")
+
+        evidence_set = set(self._flatten([step.evidence_refs for step in steps]))
+        nvs_set = {
+            tuple(ref)
+            for ref, role in zip(final_refs, final_roles)
+            if str(role).endswith("_nvs")
+        }
+        nvs_overlap_count = int(len(nvs_set & evidence_set))
+        if nvs_overlap_count > 0 and bool(self.phase_b_final_nvs_forbid_evidence_overlap):
+            raise ValueError("Phase B final rollout NVS refs overlap evidence refs")
+
+        last = int(len(steps) - 1)
+        steps[last] = dataclasses.replace(
+            steps[last],
+            prefix_loss_refs=[tuple(x) for x in final_refs],
+            loss_frame_indices=sorted({int(ref[0]) for ref in final_refs}),
+        )
+
+        prior_written_refs = self._frame_targets_to_image_refs(num_cams, prior_written_frames)
+        tbptt_meta = dict(tbptt_meta)
+        tbptt_meta["event_frame_indices"] = [int(x) for x in current_event_frames]
+        tbptt_meta["step_event_frame_indices"] = [int(x) for x in step_source_frame_indices]
+        tbptt_meta["prior_written_refs"] = [tuple(x) for x in prior_written_refs]
+        tbptt_meta["written_block_indices_after_rollout"] = sorted({int(x) for x in prior_written_blocks + list(unique_blocks)})
+        tbptt_meta["written_frame_indices_after_rollout"] = sorted({int(x) for x in prior_written_frames + list(current_event_frames)})
+        tbptt_meta["short_rollout"] = bool(short_rollout)
+        tbptt_meta["requested_blocks_per_rollout"] = int(requested_blocks)
+        tbptt_meta["actual_blocks_per_rollout"] = int(actual_blocks)
+        tbptt_meta["requested_inner_K"] = int(requested_inner_K)
+        tbptt_meta["actual_inner_K"] = int(actual_inner_K)
+        tbptt_meta["effective_shape_name"] = str(effective_shape_name)
+
+        repeat_meta = {
+            "mode": "episode_rollout_grouped_repeat_tbptt",
+            "pattern_name": str(shape.name),
+            "shape_name": str(shape.name),
+            "effective_shape_name": str(effective_shape_name),
+            "repeats_per_block": int(repeats_per_block),
+            "blocks_per_rollout": int(requested_blocks),
+            "requested_blocks_per_rollout": int(requested_blocks),
+            "actual_blocks_per_rollout": int(actual_blocks),
+            "requested_inner_K": int(requested_inner_K),
+            "actual_inner_K": int(actual_inner_K),
+            "inner_K": int(inner_K),
+            "short_rollout": bool(short_rollout),
+            "repeat_source_frame_policy": "fixed_within_block",
+            "repeat_memory_write_policy": "first_repeat_only",
+            "evidence_recompute_policy": "every_repeat",
+            "step_block_indices": [int(x) for x in step_block_indices],
+            "step_repeat_indices": [int(x) for x in step_repeat_indices],
+            "step_memory_write_flags": [bool(x) for x in step_memory_write_flags],
+            "step_source_frame_indices": [int(x) for x in step_source_frame_indices],
+            "unique_event_block_indices": [int(x) for x in unique_blocks],
+            "unique_event_frame_indices": [int(x) for x in trained_current_frames],
+        }
+        rollout_meta = {
+            "mode": "episode_rollout_grouped_repeat_tbptt",
+            "rollout_id_global": int(tbptt_meta.get("rollout_id_global", self.global_step)),
+            "rollout_idx_in_episode": int(tbptt_meta.get("rollout_idx_in_episode", 0)),
+            "rollouts_per_episode": int(self.phase_b_rollouts_per_episode),
+            "shape_name": str(shape.name),
+            "effective_shape_name": str(effective_shape_name),
+            "blocks_per_rollout": int(requested_blocks),
+            "requested_blocks_per_rollout": int(requested_blocks),
+            "actual_blocks_per_rollout": int(actual_blocks),
+            "repeats_per_block": int(repeats_per_block),
+            "requested_inner_K": int(requested_inner_K),
+            "actual_inner_K": int(actual_inner_K),
+            "short_rollout": bool(short_rollout),
+            "short_rollout_reason": str(tbptt_meta.get("short_rollout_reason", "")),
+            "event_block_indices": [int(x) for x in unique_blocks],
+            "event_keyframe_indices": [int(x) for x in current_event_keyframes],
+            "event_frame_indices": [int(x) for x in trained_current_frames],
+            "history_block_indices_before_rollout": [int(x) for x in prior_written_blocks],
+            "history_frame_indices_before_rollout": [int(x) for x in prior_written_frames],
+            "current_event_frame_indices": [int(x) for x in trained_current_frames],
+            "trained_current_frame_indices": [int(x) for x in trained_current_frames],
+            "block_selection_mode": str(tbptt_meta.get("block_selection_mode", "next")),
+            "episode_total_blocks": int(tbptt_meta.get("episode_total_blocks", self._episode_num_blocks_from_state(st))),
+            "remaining_blocks_before_rollout": int(tbptt_meta.get("remaining_blocks_before_rollout", len(unique_blocks))),
+        }
+        final_supervision_meta = {
+            "step_idx": int(last),
+            "refs": [tuple(x) for x in final_refs],
+            "roles": [str(x) for x in final_roles],
+            "trained_current_frames": [int(x) for x in trained_current_frames],
+            "history_frames": [int(x) for x in history_frames],
+            "current_frames": [int(x) for x in current_frames],
+            "nvs_frames": [int(x) for x in nvs_frames],
+            "history_recon_frames": [int(x) for x in history_frames],
+            "current_recon_frames": [int(x) for x in current_frames],
+            "history_nvs_frames": [],
+            "current_nvs_frames": [int(x) for x in nvs_frames],
+            "nvs_evidence_overlap_count": int(nvs_overlap_count),
+            "requested_current_frame_count": int(requested_blocks),
+            "actual_current_frame_count": int(actual_blocks),
+            "supervised_current_frame_count": int(len(current_frames)),
+            "current_recon_ref_count": int(len(actual_current_refs)),
+            "expected_current_recon_ref_count": int(actual_blocks * num_cams),
+            "current_recon_matches_trained_frames": bool(actual_current_refs == expected_current_refs),
+            "short_rollout": bool(short_rollout),
+            "effective_shape_name": str(effective_shape_name),
+        }
+        return self._make_batch_plan(
+            st=st,
+            inner_K=int(inner_K),
+            steps=steps,
+            query_label_refs=[],
+            aux_loss_refs=[],
+            query_frame_indices=[],
+            tbptt_meta=tbptt_meta,
+            repeat_meta=repeat_meta,
+            rollout_meta=rollout_meta,
+            final_supervision_meta=final_supervision_meta,
+            final_target_roles=[str(x) for x in final_roles],
+            visit_time_codes=[tuple(x) for x in visit_time_codes],
+            shape_meta={
+                "shape_name": str(shape.name),
+                "effective_shape_name": str(effective_shape_name),
+                "blocks_per_rollout": int(requested_blocks),
+                "requested_blocks_per_rollout": int(requested_blocks),
+                "actual_blocks_per_rollout": int(actual_blocks),
+                "repeats_per_block": int(repeats_per_block),
+                "requested_inner_K": int(requested_inner_K),
+                "actual_inner_K": int(actual_inner_K),
+                "short_rollout": bool(short_rollout),
+            },
+        )
+
     def _build_phase_b_rollout_plan(self, st: Dict[str, Any]) -> ViewSetRolloutBatchV9:
+        if self.phase_b_rollout_mode == "episode_rollout_grouped_repeat_tbptt":
+            return self._build_phase_b_rollout_final_plan(st)
         if self.phase_b_rollout_mode == "episode_grouped_repeat_tbptt":
             return self._build_phase_b_grouped_repeat_plan(st)
         sidx = self.dataset.get_segment_index(int(st["scene_id"]), int(st["segment_id"]))
@@ -1099,6 +1767,11 @@ class TrainSchedulerV9(TrainSchedulerV8):
         query_frame_indices: Optional[List[int]] = None,
         tbptt_meta: Optional[Dict[str, Any]] = None,
         repeat_meta: Optional[Dict[str, Any]] = None,
+        rollout_meta: Optional[Dict[str, Any]] = None,
+        final_supervision_meta: Optional[Dict[str, Any]] = None,
+        final_target_roles: Optional[List[str]] = None,
+        visit_time_codes: Optional[List[Tuple[float, float, float, float]]] = None,
+        shape_meta: Optional[Dict[str, Any]] = None,
     ) -> ViewSetRolloutBatchV9:
         query_frames = [int(x) for x in (query_frame_indices or [])]
         if query_frames:
@@ -1136,6 +1809,59 @@ class TrainSchedulerV9(TrainSchedulerV8):
             request_meta["tbptt"] = dict(tbptt_meta)
         if repeat_meta is not None:
             request_meta["phase_b_repeat"] = dict(repeat_meta)
+        if rollout_meta is not None:
+            request_meta["phase_b_rollout"] = dict(rollout_meta)
+        if final_supervision_meta is not None:
+            final_meta = dict(final_supervision_meta)
+            final_refs = [tuple(x) for x in list(final_meta.get("refs", []) or [])]
+            final_roles = [str(x) for x in list(final_target_roles or final_meta.get("roles", []) or [])]
+            if len(final_refs) != len(final_roles):
+                raise ValueError("phase_b_final_supervision refs/roles length mismatch")
+            request_meta["phase_b_final_supervision"] = {
+                **final_meta,
+                "refs": [tuple(x) for x in final_refs],
+                "roles": [str(x) for x in final_roles],
+            }
+            request_meta["phase_b_loss_timing"] = "rollout_final_only"
+            request_meta["target_image_refs"] = [tuple(x) for x in final_refs]
+            request_meta["target_image_roles"] = [str(x) for x in final_roles]
+            request_meta["flat_render_loss_refs"] = [tuple(x) for x in final_refs]
+            request_meta["flat_loss_refs"] = [tuple(x) for x in request_meta.get("flat_non_evidence_refs", [])]
+            role_policy = dict(request_meta.get("role_policy") or {})
+            for role in PHASE_B_FINAL_TARGET_ROLES:
+                role_policy[str(role)] = "loss_only"
+            request_meta["role_policy"] = role_policy
+            role_groups = [dict(x) for x in list(request_meta.get("role_groups") or [])]
+            role_groups = [g for g in role_groups if str(g.get("role", "")) not in {"render_loss", "prefix_loss"}]
+            role_groups.append(
+                {
+                    "role": "render_loss",
+                    "refs": [tuple(x) for x in final_refs],
+                    "image_roles": [str(x) for x in final_roles],
+                    "allow_update_evidence": False,
+                    "allow_render_loss": True,
+                    "allow_query_label": False,
+                    "mask_policy": str(self.phase_b_prefix_loss_mask),
+                }
+            )
+            for role in PHASE_B_FINAL_TARGET_ROLES:
+                role_refs = [tuple(ref) for ref, r in zip(final_refs, final_roles) if str(r) == str(role)]
+                role_groups.append(
+                    {
+                        "role": str(role),
+                        "refs": role_refs,
+                        "image_roles": [str(role) for _ in role_refs],
+                        "allow_update_evidence": False,
+                        "allow_render_loss": True,
+                        "allow_query_label": False,
+                        "mask_policy": str(self.phase_b_prefix_loss_mask),
+                    }
+                )
+            request_meta["role_groups"] = role_groups
+        if visit_time_codes is not None:
+            request_meta["visit_time_codes"] = [tuple(float(v) for v in item) for item in visit_time_codes]
+        if shape_meta is not None:
+            request_meta.update(dict(shape_meta))
         leakage_check = dict(request_meta.get("leakage_check") or {})
         return dataclasses.replace(plan, request_meta=request_meta, leakage_check=leakage_check)
 
@@ -1269,8 +1995,13 @@ class TrainSchedulerV9(TrainSchedulerV8):
             raise ValueError("episode_grouped_repeat_tbptt requires request_meta.phase_b_repeat")
         if not tbptt:
             raise ValueError("episode_grouped_repeat_tbptt requires request_meta.tbptt")
-        if str(repeat_meta.get("mode", "")) != "episode_grouped_repeat_tbptt":
-            raise ValueError("phase_b_repeat.mode must be episode_grouped_repeat_tbptt")
+        expected_mode = (
+            "episode_rollout_grouped_repeat_tbptt"
+            if self.phase_b_rollout_mode == "episode_rollout_grouped_repeat_tbptt"
+            else "episode_grouped_repeat_tbptt"
+        )
+        if str(repeat_meta.get("mode", "")) != str(expected_mode):
+            raise ValueError(f"phase_b_repeat.mode must be {expected_mode}")
         inner_k = int(plan.inner_K)
         repeats_per_block = int(repeat_meta.get("repeats_per_block", 0) or 0)
         step_blocks = [int(x) for x in list(repeat_meta.get("step_block_indices", []) or [])]
@@ -1295,6 +2026,13 @@ class TrainSchedulerV9(TrainSchedulerV8):
             raise ValueError("phase_b_repeat unique block/frame metadata is invalid")
         if unique_frames != sorted(unique_frames) or len(set(unique_frames)) != len(unique_frames):
             raise ValueError("phase_b_repeat unique_event_frame_indices must be strictly chronological")
+        actual_blocks = int(repeat_meta.get("actual_blocks_per_rollout", len(unique_blocks)) or 0)
+        if int(actual_blocks) != len(unique_blocks):
+            raise ValueError("phase_b_repeat.actual_blocks_per_rollout must equal unique event block count")
+        if int(inner_k) != int(actual_blocks) * int(repeats_per_block):
+            raise ValueError("Phase B actual inner_K must equal actual_blocks_per_rollout * repeats_per_block")
+        if int(repeat_meta.get("actual_inner_K", inner_k) or 0) != int(inner_k):
+            raise ValueError("phase_b_repeat.actual_inner_K must equal inner_K")
         if [int(x) for x in list(tbptt.get("event_frame_indices", []) or [])] != unique_frames:
             raise ValueError("tbptt.event_frame_indices must equal phase_b_repeat unique_event_frame_indices")
         if [int(x) for x in list(tbptt.get("event_block_indices", []) or [])] != unique_blocks:
@@ -1319,11 +2057,77 @@ class TrainSchedulerV9(TrainSchedulerV8):
             if flag_vals != expected_flags:
                 raise ValueError("grouped repeat requires exactly one first-repeat memory write per block")
 
-        query_frames = {int(ref[0]) for ref in plan.query_label_refs}
-        forbidden_query_frames = set(unique_frames)
-        forbidden_query_frames.update(int(x) for x in list(tbptt.get("prior_written_frames", []) or []))
-        if query_frames & forbidden_query_frames:
-            raise ValueError("query_label_refs overlap grouped repeat written/evidence frames")
+        if self.phase_b_rollout_mode != "episode_rollout_grouped_repeat_tbptt":
+            query_frames = {int(ref[0]) for ref in plan.query_label_refs}
+            forbidden_query_frames = set(unique_frames)
+            forbidden_query_frames.update(int(x) for x in list(tbptt.get("prior_written_frames", []) or []))
+            if query_frames & forbidden_query_frames:
+                raise ValueError("query_label_refs overlap grouped repeat written/evidence frames")
+        else:
+            loss_steps = [idx for idx, refs in enumerate(plan.prefix_loss_refs_by_step) if len(refs) > 0]
+            if loss_steps != [int(plan.inner_K) - 1]:
+                raise ValueError("Phase B final rollout requires prefix_loss refs only on the final step")
+            num_cams = int(plan.num_cams)
+            for step_refs in plan.evidence_refs_by_step:
+                frames = {int(ref[0]) for ref in step_refs}
+                cams = {int(ref[1]) for ref in step_refs}
+                if len(frames) != 1 or cams != set(range(int(num_cams))):
+                    raise ValueError("Phase B final rollout requires all-cams evidence for exactly one frame per step")
+            final_meta = dict(meta.get("phase_b_final_supervision") or {})
+            final_refs = [tuple(x) for x in list(final_meta.get("refs", []) or [])]
+            final_roles = [str(x) for x in list(final_meta.get("roles", []) or [])]
+            if len(final_refs) != len(final_roles) or len(final_refs) == 0:
+                raise ValueError("Phase B final rollout requires final supervision refs/roles")
+            nvs_refs = {tuple(ref) for ref, role in zip(final_refs, final_roles) if str(role).endswith("_nvs")}
+            if nvs_refs & set(self._flatten(plan.evidence_refs_by_step)):
+                raise ValueError("Phase B final rollout NVS refs overlap evidence refs")
+            rollout_meta = dict(meta.get("phase_b_rollout") or {})
+            event_frames = [
+                int(x)
+                for x in list(
+                    rollout_meta.get(
+                        "trained_current_frame_indices",
+                        rollout_meta.get("current_event_frame_indices", []),
+                    )
+                    or []
+                )
+            ]
+            current_recon_frames = [
+                int(x) for x in list(final_meta.get("current_recon_frames", []) or [])
+            ]
+            if event_frames != unique_frames:
+                raise ValueError("phase_b_rollout trained current frames must equal repeat unique event frames")
+            if current_recon_frames != event_frames:
+                raise ValueError(
+                    "Phase B final_current_recon frames must equal current rollout event frames: "
+                    f"current_recon_frames={current_recon_frames}, event_frames={event_frames}"
+                )
+            expected_current_refs = {
+                (int(frame_idx), int(cam_idx))
+                for frame_idx in event_frames
+                for cam_idx in range(int(num_cams))
+            }
+            actual_current_refs = {
+                tuple(ref)
+                for ref, role in zip(final_refs, final_roles)
+                if str(role) == "final_current_recon"
+            }
+            if actual_current_refs != expected_current_refs:
+                missing = sorted(expected_current_refs - actual_current_refs)
+                extra = sorted(actual_current_refs - expected_current_refs)
+                raise ValueError(
+                    "Phase B final_current_recon refs must exactly cover all cams of trained current frames. "
+                    f"missing={missing[:8]} extra={extra[:8]}"
+                )
+            rollout_actual_blocks = int(rollout_meta.get("actual_blocks_per_rollout", len(event_frames)) or 0)
+            if int(rollout_actual_blocks) != len(event_frames):
+                raise ValueError(
+                    "Phase B actual_blocks_per_rollout must equal number of trained current frames"
+                )
+            if str(rollout_meta.get("block_selection_mode", "")) == "next":
+                expected_next = list(range(int(unique_blocks[0]), int(unique_blocks[0]) + len(unique_blocks)))
+                if unique_blocks != expected_next:
+                    raise ValueError("Phase B next rollout event blocks must be contiguous")
 
     def _validate_v9_plan(self, plan: ViewSetRolloutBatchV9) -> None:
         if str(plan.scheduler_version) != "v9":
@@ -1364,9 +2168,13 @@ class TrainSchedulerV9(TrainSchedulerV8):
         if plan.phase == "phase_B_viewset_rollout":
             if nearby:
                 raise ValueError("Phase B must not emit nearby_loss_refs")
-            if self.phase_b_query_enable and not query:
+            if (
+                self.phase_b_query_enable
+                and not query
+                and self.phase_b_rollout_mode != "episode_rollout_grouped_repeat_tbptt"
+            ):
                 raise ValueError("Phase B query_observation enabled but no query_label_refs emitted")
-            if self.phase_b_rollout_mode == "episode_grouped_repeat_tbptt":
+            if self.phase_b_rollout_mode in ("episode_grouped_repeat_tbptt", "episode_rollout_grouped_repeat_tbptt"):
                 self._validate_phase_b_grouped_repeat_plan(plan)
         for step in plan.steps:
             if not step.evidence_refs:
@@ -1568,6 +2376,10 @@ class TrainSchedulerV9(TrainSchedulerV8):
         episode_total_steps = int(self._episode_total_steps_from_state(st))
         tbptt_end = int(tbptt_meta.get("end_block_idx", int(st.get("episode_step_cursor", 0))))
         st["episode_step_cursor"] = int(episode_total_steps) if bool(tbptt_is_last_chunk) else int(tbptt_end)
+        if bool(tbptt_is_last_chunk) and self.phase_b_rollout_mode == "episode_rollout_grouped_repeat_tbptt":
+            st["block_update_counts"] = [
+                max(int(x), int(self.steps_per_block)) for x in list(st.get("block_update_counts", []))
+            ]
         if int(st.get("episode_step_cursor", 0)) >= int(episode_total_steps):
             self._finalize_episode_if_needed()
             return
@@ -1613,6 +2425,7 @@ class TrainSchedulerV9(TrainSchedulerV8):
                 "episode_stream_tbptt",
                 "episode_block_repeat_tbptt",
                 "episode_grouped_repeat_tbptt",
+                "episode_rollout_grouped_repeat_tbptt",
             )
         )
         tbptt_meta = dict(request_meta.get("tbptt") or {})
@@ -1631,6 +2444,7 @@ class TrainSchedulerV9(TrainSchedulerV8):
             if phase_b_stream_tbptt and self.phase_b_rollout_mode in (
                 "episode_stream_tbptt",
                 "episode_grouped_repeat_tbptt",
+                "episode_rollout_grouped_repeat_tbptt",
             ):
                 tbptt_blocks = [int(x) for x in list(tbptt_meta.get("event_block_indices", []) or [])]
                 for tb in tbptt_blocks:
@@ -1655,7 +2469,7 @@ class TrainSchedulerV9(TrainSchedulerV8):
         if (
             self._block_order_uses_episode_visit_order()
             and phase_b_stream_tbptt
-            and self.phase_b_rollout_mode == "episode_grouped_repeat_tbptt"
+            and self.phase_b_rollout_mode in ("episode_grouped_repeat_tbptt", "episode_rollout_grouped_repeat_tbptt")
         ):
             self._finish_grouped_repeat_tbptt_chunk(
                 st=st,

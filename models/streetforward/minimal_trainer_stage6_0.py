@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import gc
 import logging
+import math
 import os
 from collections import defaultdict
 from contextlib import nullcontext
@@ -22,6 +23,7 @@ from models.streetforward.stage6_0 import (
     LocalGSState,
     PHASE_B_NAME,
     PHASE_B_LONG_NAME,
+    LongCellStreamingVSM,
     LongStreamingVSM,
     PhaseBOffsetState,
     Stage6QueryDecoder,
@@ -37,7 +39,6 @@ from models.streetforward.stage6_0 import (
     phase_b_long_final_render_loss,
     resolve_v9_phase_a_batch,
     resolve_v9_phase_b_batch,
-    resolve_long_phase_b_batch,
     stage6_to_struct_decoder_input,
 )
 from models.streetforward.stage6_0.phase_a_losses import (
@@ -140,6 +141,15 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 block = {"steps_per_block": 1}
             else:
                 ep = self._require_key(sched_src, "episode", sched_label)
+                if self._cfg_get(ep, "blocks_per_episode", None) is None and str(
+                    self._cfg_get(sched_src, "phase", "")
+                ) == PHASE_B_NAME:
+                    phase_b = self._cfg_get(sched_src, "phase_B", {}) or {}
+                    rollout = self._cfg_get(phase_b, "rollout", {}) or {}
+                    shapes = [dict(x) for x in list(self._cfg_get(rollout, "shapes", []) or [])]
+                    if shapes:
+                        max_blocks = max(int(self._cfg_get(shape, "blocks_per_rollout", 0) or 0) for shape in shapes)
+                        ep["blocks_per_episode"] = int(self._cfg_get(ep, "rollouts_per_episode", 1)) * int(max_blocks)
                 execution = self._cfg_get(sched_src, "execution", {}) or {}
                 block = self._cfg_get(sched_src, "block", {}) or {}
             traversal = self._cfg_get(sched_src, "traversal", {}) or {}
@@ -384,6 +394,55 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         if bool(self._cfg_get(ctx_cfg, "enable", False)):
             raise ValueError("Stage6_0 Phase B forbids current_context_adapter.")
 
+        sv9_probe = self._require_key(config, "scheduler_v9", "config")
+        phase_b_probe = self._require_key(sv9_probe, "phase_B", "scheduler_v9")
+        rollout_probe = self._cfg_get(phase_b_probe, "rollout", {}) or {}
+        rollout_mode_probe = str(self._cfg_get(rollout_probe, "mode", "random_viewset_local"))
+        if rollout_mode_probe == "episode_rollout_grouped_repeat_tbptt":
+            if bool(self._cfg_get(sv9_probe, "enable", False)) is not True:
+                raise ValueError("Stage6_0 Phase B final rollout requires scheduler_v9.enable=true.")
+            if str(self._cfg_get(sv9_probe, "phase", "")) != PHASE_B_NAME:
+                raise ValueError("Stage6_0 Phase B final rollout requires scheduler_v9.phase=phase_B_viewset_rollout.")
+            block_cfg = self._cfg_get(sv9_probe, "block", {}) or {}
+            if int(self._cfg_get(block_cfg, "steps_per_block", 1)) != 1:
+                raise ValueError("Stage6_0 Phase B final rollout requires scheduler_v9.block.steps_per_block=1.")
+            episode_cfg = self._require_key(sv9_probe, "episode", "scheduler_v9")
+            if int(self._cfg_get(episode_cfg, "rollouts_per_episode", 0) or 0) < 1:
+                raise ValueError("Stage6_0 Phase B final rollout requires episode.rollouts_per_episode >= 1.")
+            if not list(self._cfg_get(rollout_probe, "shapes", []) or []):
+                raise ValueError("Stage6_0 Phase B final rollout requires phase_B.rollout.shapes.")
+            final_cfg = self._require_key(phase_b_probe, "final_supervision", "scheduler_v9.phase_B")
+            if str(self._cfg_get(final_cfg, "apply", "")) != "rollout_final_only":
+                raise ValueError("Stage6_0 Phase B final rollout requires final_supervision.apply=rollout_final_only.")
+            masks = self._require_key(phase_b_probe, "masks", "scheduler_v9.phase_B")
+            for key in ("vsm_scope", "evidence_mask", "prefix_loss_mask", "query_label_mask"):
+                actual = str(self._cfg_get(masks, key, ""))
+                if "dynamic" in actual:
+                    raise ValueError("Stage6_0 Phase B final rollout must not use dynamic mask policies.")
+            local_rollout = self._cfg_get(stage6, "local_rollout", {}) or {}
+            if str(self._cfg_get(local_rollout, "source", "")) != "scheduler_v9":
+                raise ValueError("Stage6_0 Phase B final rollout requires local_rollout.source=scheduler_v9.")
+            long_cfg = self._require_key(stage6, "phase_b_long", "model.stage6_0")
+            if bool(self._cfg_get(long_cfg, "enable", False)) is not True:
+                raise ValueError("Stage6_0 Phase B final rollout requires phase_b_long.enable=true.")
+            q_cfg = self._cfg_get(long_cfg, "query_decoder", {}) or {}
+            if bool(self._cfg_get(q_cfg, "enable", False)):
+                raise ValueError("Stage6_0 Phase B final rollout requires phase_b_long.query_decoder.enable=false.")
+            vsm_long_cfg = self._require_key(long_cfg, "vsm", "model.stage6_0.phase_b_long")
+            vsm_type = str(self._cfg_get(vsm_long_cfg, "type", "streaming_selective_ssm"))
+            if vsm_type not in {"streaming_selective_ssm", "cell_streaming_selective_ssm"}:
+                raise ValueError("Stage6_0 Phase B final rollout requires a Long VSM implementation.")
+            dec_cfg = self._require_key(long_cfg, "offset_decoder", "model.stage6_0.phase_b_long")
+            if str(self._cfg_get(dec_cfg, "input_source", "vsm_readout_only")) != "vsm_readout_only":
+                raise ValueError("Stage6_0 Phase B final rollout requires offset_decoder.input_source=vsm_readout_only.")
+            losses_cfg = self._cfg_get(config, "losses", {}) or {}
+            phase_b_long = self._require_key(losses_cfg, "phase_b_long", "losses")
+            for key in ("query_observation", "nearby_render", "per_step_prefix_render"):
+                node = self._cfg_get(phase_b_long, key, {}) or {}
+                if bool(self._cfg_get(node, "enable", False)):
+                    raise ValueError(f"Stage6_0 Phase B final rollout requires losses.phase_b_long.{key}.enable=false.")
+            return
+
         vsm_cfg = self._cfg_get(stage6, "vsm", {}) or {}
         if bool(self._cfg_get(vsm_cfg, "enable", False)) is not True:
             raise ValueError("Stage6_0 Phase B requires stage6_0.vsm.enable=true.")
@@ -564,11 +623,26 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         if bool(self._cfg_get(q_cfg, "enable", False)):
             raise ValueError("6_0_phase_b V1 requires query_decoder.enable=false.")
         vsm_cfg = self._require_key(long_cfg, "vsm", "model.stage6_0.phase_b_long")
-        if str(self._cfg_get(vsm_cfg, "type", "streaming_selective_ssm")) != "streaming_selective_ssm":
-            raise ValueError("6_0_phase_b V1 requires streaming_selective_ssm VSM.")
-        for forbidden in ("use_spatial_mamba", "use_cell_memory", "use_global_memory"):
-            if bool(self._cfg_get(vsm_cfg, forbidden, False)):
-                raise ValueError(f"6_0_phase_b V1 forbids vsm.{forbidden}=true.")
+        vsm_type = str(self._cfg_get(vsm_cfg, "type", "streaming_selective_ssm"))
+        if vsm_type not in {"streaming_selective_ssm", "cell_streaming_selective_ssm"}:
+            raise ValueError("6_0_phase_b requires streaming_selective_ssm or cell_streaming_selective_ssm VSM.")
+        if vsm_type == "streaming_selective_ssm":
+            for forbidden in ("use_spatial_mamba", "use_cell_memory", "use_global_memory"):
+                if bool(self._cfg_get(vsm_cfg, forbidden, False)):
+                    raise ValueError(f"6_0_phase_b V1 forbids vsm.{forbidden}=true.")
+        else:
+            if bool(self._cfg_get(vsm_cfg, "use_cell_memory", False)) is not True:
+                raise ValueError("6_0_phase_b cell_streaming_selective_ssm requires vsm.use_cell_memory=true.")
+            if bool(self._cfg_get(vsm_cfg, "use_spatial_mamba", False)):
+                raise ValueError("6_0_phase_b cell_streaming_selective_ssm does not support vsm.use_spatial_mamba=true yet.")
+            bg_cfg = self._cfg_get(vsm_cfg, "bg", {}) or {}
+            for key in ("point_context_source", "final_read_context_source"):
+                value = str(self._cfg_get(bg_cfg, key, "previous_cell_global" if key == "point_context_source" else "updated_cell_global"))
+                if value not in {"previous_cell_global", "updated_cell_global"}:
+                    raise ValueError(
+                        f"6_0_phase_b cell_streaming_selective_ssm requires vsm.bg.{key} "
+                        "to be previous_cell_global or updated_cell_global."
+                    )
         distant_cfg = self._cfg_get(vsm_cfg, "distant", {}) or {}
         distant_mode = str(self._cfg_get(distant_cfg, "mode", DISTANT_MODE_FROZEN))
         if distant_mode not in {DISTANT_MODE_FROZEN, DISTANT_MODE_APPEARANCE_SCALE}:
@@ -801,6 +875,9 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             long_rigid_cfg = self._cfg_get(long_vsm_cfg, "rigid", {}) or {}
             long_distant_cfg = self._cfg_get(long_vsm_cfg, "distant", {}) or {}
             mem_long_cfg = self._cfg_get(self._cfg_get(config, "memory", {}) or {}, "phase_b_long", {}) or {}
+            self.stage6_phase_b_long_vsm_type = str(
+                self._cfg_get(long_vsm_cfg, "type", "streaming_selective_ssm")
+            )
             self.stage6_phase_b_long_distant_mode = str(
                 self._cfg_get(long_distant_cfg, "mode", "frozen_render_only")
             )
@@ -809,22 +886,67 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 self._cfg_get(mem_long_cfg, "amp_dtype", self.stage6_phase_b_long_vsm_dtype)
             )
             self._phase_b_long_autocast_torch_dtype(self.stage6_phase_b_long_amp_dtype)
-            self.stage6_long_vsm = LongStreamingVSM(
-                event_dim=int(self.stage6_event_dim),
-                view_dim=2,
-                bg_mem_dim=int(self._cfg_get(long_bg_cfg, "mem_dim", 64)),
-                rigid_mem_dim=int(self._cfg_get(long_rigid_cfg, "mem_dim", 64)),
-                distant_mem_dim=int(self._cfg_get(long_distant_cfg, "mem_dim", 32)),
-                input_dim=int(self._cfg_get(long_vsm_cfg, "input_dim", max(96, self.stage6_event_dim))),
-                dtype=str(self.stage6_phase_b_long_vsm_dtype),
-                distant_mode=str(self.stage6_phase_b_long_distant_mode),
-                support_fallback_when_no_valid=bool(
-                    self._cfg_get(long_vsm_cfg, "support_fallback_when_no_valid", False)
-                ),
-                support_fallback_min=float(self._cfg_get(long_vsm_cfg, "support_fallback_min", 0.0)),
-                support_fallback_scale=float(self._cfg_get(long_vsm_cfg, "support_fallback_scale", 1.0)),
-                bg_active_sparse=bool(self._cfg_get(long_bg_cfg, "active_sparse", True)),
-            ).to(self.device)
+            if self.stage6_phase_b_long_vsm_type == "cell_streaming_selective_ssm":
+                bg_cell_mem_dim = int(self._cfg_get(long_bg_cfg, "cell_mem_dim", self._cfg_get(long_bg_cfg, "mem_dim", 64)))
+                bg_read_dim = int(self._cfg_get(long_bg_cfg, "read_dim", bg_cell_mem_dim))
+                rigid_object_mem_dim = int(self._cfg_get(long_rigid_cfg, "object_mem_dim", self._cfg_get(long_rigid_cfg, "mem_dim", 64)))
+                rigid_read_dim = int(self._cfg_get(long_rigid_cfg, "read_dim", self._cfg_get(long_rigid_cfg, "mem_dim", rigid_object_mem_dim)))
+                local_grid_raw = list(self._cfg_get(long_rigid_cfg, "local_grid", [8, 8, 4]) or [8, 8, 4])
+                if len(local_grid_raw) != 3:
+                    raise ValueError("phase_b_long.vsm.rigid.local_grid must have length 3.")
+                self.stage6_phase_b_long_bg_mem_dim = int(bg_read_dim)
+                self.stage6_phase_b_long_rigid_mem_dim = int(rigid_read_dim)
+                self.stage6_long_vsm = LongCellStreamingVSM(
+                    event_dim=int(self.stage6_event_dim),
+                    view_dim=2,
+                    bg_point_mem_dim=int(self._cfg_get(long_bg_cfg, "point_mem_dim", 32)),
+                    bg_cell_mem_dim=int(bg_cell_mem_dim),
+                    bg_global_mem_dim=int(self._cfg_get(long_bg_cfg, "global_mem_dim", 64)),
+                    bg_read_dim=int(bg_read_dim),
+                    bg_cell_voxel_size=float(self._cfg_get(long_bg_cfg, "voxel_size", self._cfg_get(long_bg_cfg, "cell_voxel_size", 0.5))),
+                    use_global_memory=bool(self._cfg_get(long_vsm_cfg, "use_global_memory", self._cfg_get(long_bg_cfg, "use_global_memory", True))),
+                    rigid_point_mem_dim=int(self._cfg_get(long_rigid_cfg, "point_mem_dim", 32)),
+                    rigid_object_mem_dim=int(rigid_object_mem_dim),
+                    rigid_cell_mem_dim=int(self._cfg_get(long_rigid_cfg, "cell_mem_dim", 64)),
+                    rigid_read_dim=int(rigid_read_dim),
+                    rigid_local_grid=(int(local_grid_raw[0]), int(local_grid_raw[1]), int(local_grid_raw[2])),
+                    distant_mem_dim=int(self._cfg_get(long_distant_cfg, "mem_dim", 32)),
+                    input_dim=int(self._cfg_get(long_vsm_cfg, "input_dim", max(96, self.stage6_event_dim))),
+                    dtype=str(self.stage6_phase_b_long_vsm_dtype),
+                    distant_mode=str(self.stage6_phase_b_long_distant_mode),
+                    support_fallback_when_no_valid=bool(
+                        self._cfg_get(long_vsm_cfg, "support_fallback_when_no_valid", False)
+                    ),
+                    support_fallback_min=float(self._cfg_get(long_vsm_cfg, "support_fallback_min", 0.0)),
+                    support_fallback_scale=float(self._cfg_get(long_vsm_cfg, "support_fallback_scale", 1.0)),
+                    bg_active_sparse=bool(self._cfg_get(long_bg_cfg, "active_sparse", True)),
+                    bg_outside_policy=str(self._cfg_get(long_bg_cfg, "outside_policy", "mark_invalid")),
+                    bg_point_context_source=str(
+                        self._cfg_get(long_bg_cfg, "point_context_source", "previous_cell_global")
+                    ),
+                    bg_final_read_context_source=str(
+                        self._cfg_get(long_bg_cfg, "final_read_context_source", "updated_cell_global")
+                    ),
+                ).to(self.device)
+            else:
+                self.stage6_phase_b_long_bg_mem_dim = int(self._cfg_get(long_bg_cfg, "mem_dim", 64))
+                self.stage6_phase_b_long_rigid_mem_dim = int(self._cfg_get(long_rigid_cfg, "mem_dim", 64))
+                self.stage6_long_vsm = LongStreamingVSM(
+                    event_dim=int(self.stage6_event_dim),
+                    view_dim=2,
+                    bg_mem_dim=int(self.stage6_phase_b_long_bg_mem_dim),
+                    rigid_mem_dim=int(self.stage6_phase_b_long_rigid_mem_dim),
+                    distant_mem_dim=int(self._cfg_get(long_distant_cfg, "mem_dim", 32)),
+                    input_dim=int(self._cfg_get(long_vsm_cfg, "input_dim", max(96, self.stage6_event_dim))),
+                    dtype=str(self.stage6_phase_b_long_vsm_dtype),
+                    distant_mode=str(self.stage6_phase_b_long_distant_mode),
+                    support_fallback_when_no_valid=bool(
+                        self._cfg_get(long_vsm_cfg, "support_fallback_when_no_valid", False)
+                    ),
+                    support_fallback_min=float(self._cfg_get(long_vsm_cfg, "support_fallback_min", 0.0)),
+                    support_fallback_scale=float(self._cfg_get(long_vsm_cfg, "support_fallback_scale", 1.0)),
+                    bg_active_sparse=bool(self._cfg_get(long_bg_cfg, "active_sparse", True)),
+                ).to(self.device)
             dec_cfg = self._cfg_get(long_cfg, "offset_decoder", {}) or {}
             clamps = self._cfg_get(dec_cfg, "clamps", {}) or {}
             self.stage6_phase_b_long_offset_dtype = str(
@@ -834,8 +956,8 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             dec_distant_scope = self._cfg_get(dec_update_scope, "distant", {}) or {}
             distant_sh_rest_bases = max(int(self.sh_degree + 1) ** 2 - 1, 0)
             self.stage6_long_offset_decoder = VSMOffsetDecoder(
-                bg_mem_dim=int(self._cfg_get(long_bg_cfg, "mem_dim", 64)),
-                rigid_mem_dim=int(self._cfg_get(long_rigid_cfg, "mem_dim", 64)),
+                bg_mem_dim=int(getattr(self, "stage6_phase_b_long_bg_mem_dim", self._cfg_get(long_bg_cfg, "mem_dim", 64))),
+                rigid_mem_dim=int(getattr(self, "stage6_phase_b_long_rigid_mem_dim", self._cfg_get(long_rigid_cfg, "mem_dim", 64))),
                 distant_mem_dim=int(self._cfg_get(long_distant_cfg, "mem_dim", 32)),
                 distant_sh_rest_bases=int(distant_sh_rest_bases),
                 distant_sh_rest_update_bases=int(
@@ -955,6 +1077,23 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 param.requires_grad_(True)
             return
         if phase != PHASE_B_NAME:
+            return
+        sv9 = self._cfg_get(config, "scheduler_v9", {}) or {}
+        phase_b = self._cfg_get(sv9, "phase_B", {}) or {}
+        rollout = self._cfg_get(phase_b, "rollout", {}) or {}
+        if str(self._cfg_get(rollout, "mode", "")) == "episode_rollout_grouped_repeat_tbptt":
+            for param in self.parameters():
+                param.requires_grad_(False)
+            if self.stage6_long_vsm is None:
+                raise ValueError("Stage6_0 Phase B final rollout internal error: stage6_long_vsm was not initialized.")
+            if self.stage6_long_offset_decoder is None:
+                raise ValueError(
+                    "Stage6_0 Phase B final rollout internal error: stage6_long_offset_decoder was not initialized."
+                )
+            for param in self.stage6_long_vsm.parameters():
+                param.requires_grad_(True)
+            for param in self.stage6_long_offset_decoder.parameters():
+                param.requires_grad_(True)
             return
         for param in self.parameters():
             param.requires_grad_(False)
@@ -1877,9 +2016,8 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         if len(target_indices) == 0:
             return local_state.bg.means.new_tensor(0.0), {
                 "num_refs": 0.0,
-                "psnr": 0.0,
-                "l1": 0.0,
-                "ssim": 0.0,
+                "num_metric_refs": 0.0,
+                "metric_valid": 0.0,
                 "valid_ratio": 0.0,
                 "skipped_no_valid_pixels": 0.0,
             }
@@ -1912,14 +2050,18 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             if gt_images_out is not None:
                 gt_images_out.append(gt.detach())
             losses.append(loss_i)
-            psnr_vals.append(float(stat_i["psnr"]))
-            l1_vals.append(float(stat_i["l1"]))
-            ssim_vals.append(float(stat_i.get("ssim", 0.0)))
+            if float(stat_i.get("skipped_no_valid_pixels", 0.0)) < 0.5:
+                psnr_vals.append(float(stat_i["psnr"]))
+                l1_vals.append(float(stat_i["l1"]))
+                ssim_vals.append(float(stat_i.get("ssim", 0.0)))
             valid_ratios.append(float(stat_i.get("valid_ratio", 0.0)))
             skip_count += float(stat_i.get("skipped_no_valid_pixels", 0.0))
-        stats["psnr"] = float(sum(psnr_vals) / max(len(psnr_vals), 1))
-        stats["l1"] = float(sum(l1_vals) / max(len(l1_vals), 1))
-        stats["ssim"] = float(sum(ssim_vals) / max(len(ssim_vals), 1))
+        if psnr_vals:
+            stats["psnr"] = float(sum(psnr_vals) / len(psnr_vals))
+            stats["l1"] = float(sum(l1_vals) / len(l1_vals))
+            stats["ssim"] = float(sum(ssim_vals) / len(ssim_vals))
+        stats["num_metric_refs"] = float(len(psnr_vals))
+        stats["metric_valid"] = float(1.0 if psnr_vals else 0.0)
         stats["valid_ratio"] = float(sum(valid_ratios) / max(len(valid_ratios), 1))
         stats["skipped_no_valid_pixels"] = float(skip_count)
         return torch.stack(losses).mean(), stats
@@ -2086,6 +2228,46 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
 
     def _phase_b_clear_tbptt_cache_key(self, key: Tuple[int, int, int, str]) -> None:
         self.stage6_phase_b_tbptt_cache.pop(tuple(key), None)
+
+    def _phase_b_long_store_v9_state(
+        self,
+        *,
+        key: Tuple[int, int, int, str],
+        base_state: LocalGSState,
+        vsm_state: Any,
+        offset_state: PhaseBOffsetState,
+        written_refs: set[Tuple[int, int]],
+        tbptt_meta: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if not bool(getattr(self, "stage6_phase_b_tbptt_enable", True)):
+            return
+        max_items = int(getattr(self, "stage6_phase_b_tbptt_max_items", 8))
+        if (
+            bool(getattr(self, "stage6_phase_b_tbptt_strict", False))
+            and bool(getattr(self, "stage6_phase_b_tbptt_forbid_cache_eviction", False))
+            and tuple(key) not in self.stage6_phase_b_tbptt_cache
+            and len(self.stage6_phase_b_tbptt_cache) >= max(max_items, 1)
+        ):
+            raise RuntimeError(
+                "Phase B final rollout cache full; eviction would break episode continuity: "
+                f"max_items={max_items}, active={len(self.stage6_phase_b_tbptt_cache)}"
+            )
+        meta = dict(tbptt_meta or {})
+        event_frames = [int(x) for x in list(meta.get("event_frame_indices", []) or [])]
+        chunk_idx = int(meta.get("chunk_idx", -1)) if meta else -1
+        detach_vsm = getattr(vsm_state, "detach_to_cache_optional", None)
+        self.stage6_phase_b_tbptt_cache[tuple(key)] = {
+            "base_G": self._detach_local_state(base_state),
+            "long_vsm_state": detach_vsm() if callable(detach_vsm) else vsm_state.detach(),
+            "offset_state": offset_state.detach_for_sensor(),
+            "written_refs": set(written_refs),
+            "last_event_frame_idx": max(event_frames) if event_frames else -1,
+            "next_chunk_idx": int(chunk_idx) + 1 if chunk_idx >= 0 else 0,
+            "phase_b_v9_final_rollout_long": True,
+        }
+        while len(self.stage6_phase_b_tbptt_cache) > max(max_items, 1):
+            oldest = next(iter(self.stage6_phase_b_tbptt_cache.keys()))
+            self.stage6_phase_b_tbptt_cache.pop(oldest, None)
 
     @staticmethod
     def _phase_b_ref_set(raw_refs: Any) -> set[Tuple[int, int]]:
@@ -2407,24 +2589,31 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 raise RuntimeError("Stage6_0 Phase A loss became NaN/Inf.")
             total_loss = total_loss + loss_k
             self._mem_debug("forward/k_end", k=int(k))
-            per_step.append(
-                {
-                    "k": float(k),
-                    "loss_block": float(block_loss.detach().item()),
-                    "loss_nearby": float(nearby_loss.detach().item()),
-                    "nearby_weight": float(near_weight),
-                    "block_psnr": float(block_stats.get("psnr", 0.0)),
-                    "nearby_psnr": float(nearby_stats.get("psnr", 0.0)),
-                    "block_valid_ratio": float(block_stats.get("valid_ratio", 0.0)),
-                    "nearby_valid_ratio": float(nearby_stats.get("valid_ratio", 0.0)),
-                    "block_skipped": float(block_stats.get("skipped_no_valid_pixels", 0.0)),
-                    "nearby_skipped": float(nearby_stats.get("skipped_no_valid_pixels", 0.0)),
-                    "block_ssim": float(block_stats.get("ssim", 0.0)),
-                    "nearby_ssim": float(nearby_stats.get("ssim", 0.0)),
-                    **{k2: float(v) for k2, v in reg_stats.items()},
-                    **{k2: float(v) for k2, v in update_aux.items() if isinstance(v, (int, float))},
-                }
-            )
+            item = {
+                "k": float(k),
+                "loss_block": float(block_loss.detach().item()),
+                "loss_nearby": float(nearby_loss.detach().item()),
+                "nearby_weight": float(near_weight),
+                "block_valid_ratio": float(block_stats.get("valid_ratio", 0.0)),
+                "nearby_valid_ratio": float(nearby_stats.get("valid_ratio", 0.0)),
+                "block_skipped": float(block_stats.get("skipped_no_valid_pixels", 0.0)),
+                "nearby_skipped": float(nearby_stats.get("skipped_no_valid_pixels", 0.0)),
+                "block_metric_valid": float(block_stats.get("metric_valid", 0.0)),
+                "nearby_metric_valid": float(nearby_stats.get("metric_valid", 0.0)),
+                "block_num_metric_refs": float(block_stats.get("num_metric_refs", 0.0)),
+                "nearby_num_metric_refs": float(nearby_stats.get("num_metric_refs", 0.0)),
+                **{k2: float(v) for k2, v in reg_stats.items()},
+                **{k2: float(v) for k2, v in update_aux.items() if isinstance(v, (int, float))},
+            }
+            for prefix, stats in (("block", block_stats), ("nearby", nearby_stats)):
+                for metric_name in ("psnr", "ssim", "l1"):
+                    value = stats.get(metric_name)
+                    if value is None:
+                        continue
+                    value_f = float(value)
+                    if math.isfinite(value_f):
+                        item[f"{prefix}_{metric_name}"] = value_f
+            per_step.append(item)
         return {
             "loss": total_loss,
             "local_G": local_state,
@@ -2439,7 +2628,261 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "gt_images": gt_images,
         }
 
+    def _forward_phase_b_v9_final_rollout_long(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+        key = self._phase_b_cache_key_from_batch(batch)
+        request_meta = dict(batch.get("request_meta") or {})
+        tbptt_meta = dict(request_meta.get("tbptt") or {})
+        prior_written_refs = self._phase_b_prior_written_refs(key) | self._phase_b_ref_set(
+            tbptt_meta.get("prior_written_refs", [])
+        )
+        roles = resolve_v9_phase_b_batch(batch, written_refs=prior_written_refs)
+        if int(roles.final_supervision_step_idx) != int(roles.inner_K) - 1:
+            raise ValueError("V9 Phase B final rollout requires final supervision at inner_K - 1.")
+        self._mem_debug("forward_phase_b_v9_final_long/begin", inner_K=int(roles.inner_K))
+        if self.stage6_long_vsm is None:
+            raise RuntimeError("V9 Phase B final rollout requires stage6_long_vsm.")
+        if self.stage6_long_offset_decoder is None:
+            raise RuntimeError("V9 Phase B final rollout requires stage6_long_offset_decoder.")
+        if len(batch.get("source_views", [])) == 0:
+            raise ValueError("V9 Phase B final rollout requires non-empty source_views.")
+        if len(batch.get("targets", [])) == 0:
+            raise ValueError("V9 Phase B final rollout requires non-empty final targets.")
+
+        node_state_bg, node_state_rigid, node_state_distant = self._get_or_init_node_states_bg_rigid_distant(batch)
+        local_base = LocalGSState.from_node_states(
+            bg=node_state_bg,
+            distant=node_state_distant,
+            rigid=node_state_rigid,
+            hidden_dim=self.stage6_hidden_dim,
+        )
+        base_state = self._detach_local_state(local_base)
+        cached = self.stage6_phase_b_tbptt_cache.get(tuple(key)) if self.stage6_phase_b_tbptt_enable else None
+        written_refs = set(prior_written_refs)
+        offset_dtype = self._phase_b_long_state_dtype(
+            base_state.bg.means,
+            str(getattr(self, "stage6_phase_b_long_offset_dtype", "bf16")),
+        )
+        vsm_dtype = self._phase_b_long_state_dtype(
+            base_state.bg.means,
+            str(getattr(self, "stage6_phase_b_long_vsm_dtype", "bf16")),
+        )
+        if cached is not None and bool(cached.get("phase_b_v9_final_rollout_long", False)):
+            cached_base = self._detach_local_state(cached["base_G"])
+            cached_rigid_n = int(cached_base.rigid.means.shape[0]) if cached_base.rigid is not None else 0
+            node_rigid_n = int(node_state_rigid.means.shape[0]) if node_state_rigid is not None else 0
+            if int(cached_base.bg.means.shape[0]) == int(base_state.bg.means.shape[0]) and cached_rigid_n == node_rigid_n:
+                if cached_base.rigid is not None and node_state_rigid is not None:
+                    cached_base.rigid_template = node_state_rigid.detach_clone()
+                base_state = cached_base
+                detach_vsm = getattr(cached["long_vsm_state"], "detach_to_cache_optional", None)
+                vsm_state = detach_vsm() if callable(detach_vsm) else cached["long_vsm_state"].detach()
+                offset = cached["offset_state"].detach_for_sensor()
+                written_refs = set(cached.get("written_refs") or set())
+            elif bool(getattr(self, "stage6_phase_b_tbptt_strict", False)):
+                raise ValueError("V9 Phase B final rollout cache shape mismatch.")
+            else:
+                cached = None
+        if cached is None or not bool(cached.get("phase_b_v9_final_rollout_long", False)):
+            offset = PhaseBOffsetState.zeros_like(base_state=base_state, dtype=offset_dtype)
+            episode_id = int(request_meta.get("episode_id", request_meta.get("episode_idx_global", -1)) or -1)
+            init_kwargs: Dict[str, Any] = {
+                "base_state": base_state,
+                "dtype": vsm_dtype,
+                "rigid_meta": dict(request_meta.get("rigid_meta") or {}),
+                "distant_mode": str(getattr(self, "stage6_phase_b_long_distant_mode", "frozen_render_only")),
+                "episode_id": episode_id,
+            }
+            if str(getattr(self, "stage6_phase_b_long_vsm_type", "streaming_selective_ssm")) == "cell_streaming_selective_ssm":
+                init_kwargs["batch"] = batch
+            vsm_state = self.stage6_long_vsm.init_state(**init_kwargs)
+
+        rigid_meta = dict(request_meta.get("rigid_meta") or {})
+        per_step: List[Dict[str, float]] = []
+        for k in range(int(roles.inner_K)):
+            evidence_refs = roles.evidence_refs_by_step[int(k)]
+            frame_idx = int(roles.step_source_frame_indices[int(k)])
+            repeat_idx = int(roles.step_repeat_indices[int(k)])
+            memory_write = bool(roles.memory_write_flags_by_step[int(k)])
+            with torch.no_grad():
+                sensor_state = materialize_phase_b_state(
+                    base_state=base_state,
+                    offset=offset.detach_for_sensor(),
+                    target_frame_idx=int(frame_idx),
+                    rigid_meta=rigid_meta,
+                )
+                sensor_state = self._phase_b_long_clamp_sensor_state_to_aabb(sensor_state)
+                measurement = self._observe_v4_measurement(
+                    local_state=sensor_state,
+                    batch=batch,
+                    source_indices=roles.evidence_source_indices_by_step[int(k)],
+                    source_frame_idx=int(frame_idx),
+                )
+                event = self._build_stage6_event_from_measurement(local_state=sensor_state, measurement=measurement)
+                event = self._detach_event_pack(self._event_with_default_view_code(event))
+            if not torch.isfinite(event.event_bg).all():
+                raise RuntimeError("V9 Phase B final rollout event_bg contains NaN/Inf.")
+            self._phase_b_rigid_route_indices(event=event, local_state=base_state, label=f"v9 final step {int(k)}")
+            vsm_compute_dtype = self._phase_b_long_vsm_compute_dtype(event.event_bg)
+            time_code = (roles.visit_time_codes or [(0.0, 0.0, 0.0, 0.0) for _ in range(int(roles.inner_K))])[int(k)]
+            with self._phase_b_long_autocast_context(event.event_bg):
+                vsm_state, read_pack, vsm_aux = self.stage6_long_vsm.write_read(
+                    state=vsm_state,
+                    event=event,
+                    step_idx=int(k),
+                    frame_idx=int(frame_idx),
+                    repeat_idx=int(repeat_idx),
+                    rigid_meta=rigid_meta,
+                    distant_mode=str(getattr(self, "stage6_phase_b_long_distant_mode", "frozen_render_only")),
+                    visit_time_code=torch.tensor(
+                        time_code,
+                        device=event.event_bg.device,
+                        dtype=vsm_compute_dtype or event.event_bg.dtype,
+                    ),
+                    compute_dtype=vsm_compute_dtype,
+                    commit_memory=bool(memory_write),
+                )
+                delta = self.stage6_long_offset_decoder(
+                    read=read_pack,
+                    distant_mode=str(getattr(self, "stage6_phase_b_long_distant_mode", "frozen_render_only")),
+                )
+            offset = offset.apply(delta, frame_idx=int(frame_idx), rigid_meta=rigid_meta)
+            if memory_write:
+                written_refs.update(set(evidence_refs))
+            per_step.append(
+                {
+                    "k": float(k),
+                    "frame_idx": float(frame_idx),
+                    "repeat_idx": float(repeat_idx),
+                    "block_idx": float(roles.step_block_indices[int(k)]),
+                    "memory_write": float(1.0 if memory_write else 0.0),
+                    "evidence_ref_count": float(len(evidence_refs)),
+                    "final_ref_count": float(len(roles.prefix_loss_refs_by_step[int(k)])),
+                    **{key2: float(value) for key2, value in vsm_aux.items()},
+                    **{key2: float(value) for key2, value in delta.stats(prefix=f"k{int(k)}").items()},
+                }
+            )
+            self._mem_debug("forward_phase_b_v9_final_long/after_step", k=int(k), memory_write=bool(memory_write))
+
+        by_role = roles.final_target_indices_by_role or {}
+        role_specs = [
+            ("history_recon", by_role.get("final_history_recon", [])),
+            ("history_nvs", by_role.get("final_history_nvs", [])),
+            ("current_recon", by_role.get("final_current_recon", [])),
+            ("current_nvs", by_role.get("final_current_nvs", [])),
+        ]
+        role_losses: Dict[str, torch.Tensor] = {}
+        role_stats: Dict[str, float] = {}
+        role_total = base_state.bg.means.new_tensor(0.0)
+        pred_rgbs: List[torch.Tensor] = []
+        gt_images: List[torch.Tensor] = []
+        for role_name, target_indices in role_specs:
+            cfg_role = dict(getattr(self, "stage6_phase_b_long_role_render_cfg", {}).get(role_name, {}) or {})
+            default_is_history = str(role_name).startswith("history")
+            default_weight = self.stage6_phase_b_long_history_weight if default_is_history else self.stage6_phase_b_long_current_weight
+            default_l1 = self.stage6_phase_b_long_history_l1_weight if default_is_history else self.stage6_phase_b_long_current_l1_weight
+            default_ssim = self.stage6_phase_b_long_history_ssim_weight if default_is_history else self.stage6_phase_b_long_current_ssim_weight
+            default_mask = self.stage6_phase_b_long_history_mask_policy if default_is_history else self.stage6_phase_b_long_current_mask_policy
+            loss_i, stats_i = phase_b_long_final_render_loss(
+                self,
+                base_state=base_state,
+                offset=offset,
+                batch=batch,
+                target_indices=target_indices,
+                role=role_name,
+                rigid_meta=rigid_meta,
+                mask_policy=str(self._cfg_get(cfg_role, "mask_policy", default_mask)),
+                l1_weight=float(self._cfg_get(cfg_role, "l1_weight", default_l1)),
+                ssim_weight=float(self._cfg_get(cfg_role, "ssim_weight", default_ssim)),
+                pred_rgbs_out=pred_rgbs,
+                gt_images_out=gt_images,
+            )
+            weight_i = float(self._cfg_get(cfg_role, "weight", default_weight))
+            role_losses[str(role_name)] = loss_i
+            role_total = role_total + weight_i * loss_i
+            role_stats.update({key2: float(value) for key2, value in stats_i.items()})
+            role_stats[f"phase_b_long/final_{role_name}_weight"] = float(weight_i)
+        zero = base_state.bg.means.new_tensor(0.0)
+        history_loss = 0.5 * (role_losses.get("history_recon", zero) + role_losses.get("history_nvs", zero))
+        current_loss = 0.5 * (role_losses.get("current_recon", zero) + role_losses.get("current_nvs", zero))
+        reg_loss, reg_stats = phase_b_long_offset_regularization(
+            offset,
+            weights=dict(getattr(self, "stage6_phase_b_long_offset_reg_cfg", {}) or {}),
+        )
+        total_loss = role_total + float(self.stage6_phase_b_long_offset_reg_weight) * reg_loss
+        if not torch.isfinite(total_loss).all():
+            raise RuntimeError("V9 Phase B final rollout loss became NaN/Inf.")
+        rollout_meta = dict(roles.phase_b_rollout or {})
+        final_meta = dict(roles.final_supervision or {})
+        final_roles = [str(x) for x in list(final_meta.get("roles", []) or [])]
+        current_recon_matches = bool(final_meta.get("current_recon_matches_trained_frames", False))
+        if not current_recon_matches:
+            raise RuntimeError("Phase B current supervision does not match trained frames.")
+        stats = {
+            **role_stats,
+            **reg_stats,
+            "phase_b_v9/final_supervision_step_idx": float(roles.final_supervision_step_idx),
+            "phase_b_v9/final_supervision_ref_count": float(len(roles.final_target_indices or [])),
+            "phase_b_v9/intermediate_loss_ref_count": float(
+                sum(len(x) for x in roles.prefix_loss_refs_by_step[:-1])
+            ),
+            "phase_b_v9/nvs_evidence_overlap_count": float(
+                (roles.final_supervision or {}).get("nvs_evidence_overlap_count", 0.0)
+            ),
+            "phase_b_long/final_history_weight": float(self.stage6_phase_b_long_history_weight),
+            "phase_b_long/final_current_weight": float(self.stage6_phase_b_long_current_weight),
+            "phase_b_long/offset_reg_weight": float(self.stage6_phase_b_long_offset_reg_weight),
+            "phase_b_long/shape/" + str(request_meta.get("shape_name", "unknown")): 1.0,
+            "phase_b_long/effective_shape/" + str(rollout_meta.get("effective_shape_name", request_meta.get("shape_name", "unknown"))): 1.0,
+            "phase_b_v9/requested_blocks_per_rollout": float(rollout_meta.get("requested_blocks_per_rollout", request_meta.get("blocks_per_rollout", 0))),
+            "phase_b_v9/actual_blocks_per_rollout": float(rollout_meta.get("actual_blocks_per_rollout", 0)),
+            "phase_b_v9/repeats_per_block": float(rollout_meta.get("repeats_per_block", 0)),
+            "phase_b_v9/requested_inner_K": float(rollout_meta.get("requested_inner_K", 0)),
+            "phase_b_v9/actual_inner_K": float(rollout_meta.get("actual_inner_K", roles.inner_K)),
+            "phase_b_v9/short_rollout": float(bool(rollout_meta.get("short_rollout", False))),
+            "phase_b_v9/trained_current_frame_count": float(len(final_meta.get("trained_current_frames", []) or [])),
+            "phase_b_v9/supervised_current_frame_count": float(len(final_meta.get("current_recon_frames", []) or [])),
+            "phase_b_v9/current_recon_matches_trained_frames": float(current_recon_matches),
+            "phase_b_v9/final_current_recon_frame_count": float(len(final_meta.get("current_recon_frames", []) or [])),
+            "phase_b_v9/final_current_recon_ref_count": float(
+                sum(1 for role in final_roles if str(role) == "final_current_recon")
+            ),
+            "phase_b_v9/expected_final_current_recon_ref_count": float(
+                final_meta.get("expected_current_recon_ref_count", 0)
+            ),
+            "phase_b_v9/final_history_recon_frame_count": float(len(final_meta.get("history_recon_frames", []) or [])),
+            "phase_b_v9/final_current_nvs_frame_count": float(len(final_meta.get("current_nvs_frames", []) or [])),
+        }
+        return {
+            "loss": total_loss,
+            "base_G": base_state,
+            "local_G": base_state,
+            "offset_state": offset,
+            "vsm_state": vsm_state.detach_to_cache_optional(),
+            "node_state_bg": node_state_bg,
+            "node_state_distant": node_state_distant,
+            "node_state_rigid": node_state_rigid,
+            "roles": roles,
+            "per_step": per_step,
+            "stats": stats,
+            "history_loss": history_loss.detach(),
+            "current_loss": current_loss.detach(),
+            "reg_loss": reg_loss.detach(),
+            "num_targets": len(batch.get("targets", [])),
+            "num_source_views": len(batch.get("source_views", [])),
+            "num_query_targets": len(batch.get("query_targets", [])),
+            "pred_rgbs": pred_rgbs,
+            "gt_images": gt_images,
+            "written_refs": set(written_refs),
+            "tbptt_key": key,
+            "tbptt_meta": tbptt_meta,
+            "tbptt_cache_hit": bool(cached is not None),
+            "phase_b_v9_final_rollout_long": True,
+        }
+
     def _forward_phase_b(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+        request_meta = dict(batch.get("request_meta") or {})
+        if str(request_meta.get("phase_b_loss_timing", "")) == "rollout_final_only":
+            return self._forward_phase_b_v9_final_rollout_long(batch)
         key = self._phase_b_cache_key_from_batch(batch)
         request_meta = dict(batch.get("request_meta") or {})
         tbptt_meta = dict(request_meta.get("tbptt") or {})
@@ -2769,6 +3212,8 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         )
 
     def _forward_6_0_phase_b_long(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+        from models.streetforward.stage6_0.phase_b_long.resolver import resolve_long_phase_b_batch
+
         roles = resolve_long_phase_b_batch(batch)
         self._mem_debug("forward_phase_b_long/begin", inner_K=int(roles.inner_K))
         if self.stage6_long_vsm is None:
@@ -2798,13 +3243,16 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         )
         offset = PhaseBOffsetState.zeros_like(base_state=base_state, dtype=offset_dtype)
         episode_id = int(roles.request_meta.get("episode_id", roles.request_meta.get("episode_idx_global", -1)) or -1)
-        vsm_state = self.stage6_long_vsm.init_state(
-            base_state=base_state,
-            dtype=vsm_dtype,
-            rigid_meta=roles.rigid_meta,
-            distant_mode=str(getattr(self, "stage6_phase_b_long_distant_mode", "frozen_render_only")),
-            episode_id=episode_id,
-        )
+        init_kwargs: Dict[str, Any] = {
+            "base_state": base_state,
+            "dtype": vsm_dtype,
+            "rigid_meta": roles.rigid_meta,
+            "distant_mode": str(getattr(self, "stage6_phase_b_long_distant_mode", "frozen_render_only")),
+            "episode_id": episode_id,
+        }
+        if str(getattr(self, "stage6_phase_b_long_vsm_type", "streaming_selective_ssm")) == "cell_streaming_selective_ssm":
+            init_kwargs["batch"] = batch
+        vsm_state = self.stage6_long_vsm.init_state(**init_kwargs)
         per_step: List[Dict[str, float]] = []
         for k in range(int(roles.inner_K)):
             visit = roles.visits[int(k)]
@@ -2990,7 +3438,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         min_valid_pixels: int = 1,
         ablations: Optional[List[str]] = None,
     ) -> Dict[str, float]:
-        from models.streetforward.validation_long_phase_b_runner import validate_long_phase_b
+        from models.streetforward.validation_long_phase_b_runner import DEFAULT_LONG_VSM_ABLATIONS, validate_long_phase_b
 
         self.eval()
         with torch.no_grad():
@@ -2999,7 +3447,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 batch,
                 mask_policy=str(mask_policy),
                 min_valid_pixels=int(min_valid_pixels),
-                ablations=tuple(ablations or ["normal", "zero_vsm", "shuffle_vsm"]),
+                ablations=tuple(ablations or DEFAULT_LONG_VSM_ABLATIONS),
             )
 
     def _train_step_6_0_phase_b_long(
@@ -3111,12 +3559,14 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "num_gaussians_rigid": int(out["node_state_rigid"].means.shape[0]) if out["node_state_rigid"] is not None else 0,
             "phaseA/loss_block_final": float(final.get("loss_block", 0.0)),
             "phaseA/loss_nearby_final": float(final.get("loss_nearby", 0.0)),
-            "phaseA/block_psnr_final": float(final.get("block_psnr", 0.0)),
-            "phaseA/nearby_psnr_final": float(final.get("nearby_psnr", 0.0)),
             "mask/block_valid_ratio_final": float(final.get("block_valid_ratio", 0.0)),
             "mask/nearby_valid_ratio_final": float(final.get("nearby_valid_ratio", 0.0)),
             "mask/block_skipped_no_valid_pixels_final": float(final.get("block_skipped", 0.0)),
             "mask/nearby_skipped_no_valid_pixels_final": float(final.get("nearby_skipped", 0.0)),
+            "mask/block_metric_valid_final": float(final.get("block_metric_valid", 0.0)),
+            "mask/nearby_metric_valid_final": float(final.get("nearby_metric_valid", 0.0)),
+            "mask/block_num_metric_refs_final": float(final.get("block_num_metric_refs", 0.0)),
+            "mask/nearby_num_metric_refs_final": float(final.get("nearby_num_metric_refs", 0.0)),
             "phaseA/grad_norm_total": float(grad_norm.detach().item()),
             "node_state_sync_reset": bool(did_reset_node_state),
             "node_state_cache_segments_bg": int(len(getattr(self, "node_states_bg", {}))),
@@ -3124,15 +3574,34 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "node_state_cache_segments_rigid": int(len(getattr(self, "node_states_rigid", {}))),
             **grad_group_sums,
         }
+        for prefix in ("block", "nearby"):
+            for metric_name in ("psnr", "ssim", "l1"):
+                value = final.get(f"{prefix}_{metric_name}")
+                if value is None:
+                    continue
+                value_f = float(value)
+                if math.isfinite(value_f):
+                    logs[f"phaseA/{prefix}_{metric_name}_final"] = value_f
         for item in per_step:
             k = int(item["k"])
             logs[f"phaseA/loss_block_k{k}"] = float(item.get("loss_block", 0.0))
             logs[f"phaseA/loss_nearby_k{k}"] = float(item.get("loss_nearby", 0.0))
-            logs[f"phaseA/block_psnr_k{k}"] = float(item.get("block_psnr", 0.0))
             logs[f"mask/block_valid_ratio_k{k}"] = float(item.get("block_valid_ratio", 0.0))
             logs[f"mask/nearby_valid_ratio_k{k}"] = float(item.get("nearby_valid_ratio", 0.0))
             logs[f"mask/block_skipped_no_valid_pixels_k{k}"] = float(item.get("block_skipped", 0.0))
             logs[f"mask/nearby_skipped_no_valid_pixels_k{k}"] = float(item.get("nearby_skipped", 0.0))
+            logs[f"mask/block_metric_valid_k{k}"] = float(item.get("block_metric_valid", 0.0))
+            logs[f"mask/nearby_metric_valid_k{k}"] = float(item.get("nearby_metric_valid", 0.0))
+            logs[f"mask/block_num_metric_refs_k{k}"] = float(item.get("block_num_metric_refs", 0.0))
+            logs[f"mask/nearby_num_metric_refs_k{k}"] = float(item.get("nearby_num_metric_refs", 0.0))
+            for prefix in ("block", "nearby"):
+                for metric_name in ("psnr", "ssim", "l1"):
+                    value = item.get(f"{prefix}_{metric_name}")
+                    if value is None:
+                        continue
+                    value_f = float(value)
+                    if math.isfinite(value_f):
+                        logs[f"phaseA/{prefix}_{metric_name}_k{k}"] = value_f
         if did_reset_node_state:
             del out, loss
             empty_cache = str(os.environ.get("STAGE6_EMPTY_CACHE_ON_RESET", "")).lower() in {
@@ -3158,6 +3627,86 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         out = self._forward_phase_b(batch)
         loss = out["loss"]
         loss.backward()
+        if bool(out.get("phase_b_v9_final_rollout_long", False)):
+            grad_group_sums = self._stage6_assert_required_group_grads_phase_b_long(out)
+            skip_optimizer = bool(float(grad_group_sums.get("phase_b_long/skipped_no_support_rollout", 0.0)) > 0.0)
+            if skip_optimizer:
+                grad_norm = loss.detach().new_tensor(0.0)
+            else:
+                grad_norm = self._stage6_compute_and_check_grad_norm()
+                self.optimizer.step()
+            tbptt_meta = dict(out.get("tbptt_meta") or {})
+            tbptt_is_last_chunk = bool(tbptt_meta.get("is_last_chunk", False)) if tbptt_meta else False
+            reset_after_block = bool(scheduler_node_sync.get("reset_after_block", False)) if scheduler_node_sync is not None else False
+            did_reset_node_state = False
+            if tbptt_is_last_chunk:
+                self._phase_b_clear_tbptt_cache_key(out["tbptt_key"])
+                if reset_after_block:
+                    self.reset_node_state()
+                    did_reset_node_state = True
+            elif reset_after_block:
+                self.reset_node_state()
+                self._phase_b_clear_tbptt_cache_key(out["tbptt_key"])
+                did_reset_node_state = True
+            else:
+                self._phase_b_long_store_v9_state(
+                    key=out["tbptt_key"],
+                    base_state=out["base_G"],
+                    vsm_state=out["vsm_state"],
+                    offset_state=out["offset_state"],
+                    written_refs=set(out.get("written_refs") or set()),
+                    tbptt_meta=tbptt_meta,
+                )
+            self.optimizer.zero_grad(set_to_none=True)
+            roles = out["roles"]
+            stats = dict(out.get("stats") or {})
+            logs: Dict[str, Any] = {
+                "loss": float(loss.detach().item()),
+                "phase_b/loss_total": float(loss.detach().item()),
+                "phase_b_long/loss_total": float(loss.detach().item()),
+                "stage6/phase": PHASE_B_NAME,
+                "stage6/inner_K": float(roles.inner_K),
+                "num_targets": int(out.get("num_targets", 0)),
+                "num_source_views": int(out.get("num_source_views", 0)),
+                "num_query_targets": int(out.get("num_query_targets", 0)),
+                "pred_rgbs": list(out.get("pred_rgbs") or []),
+                "gt_images": list(out.get("gt_images") or []),
+                "num_gaussians_bg": int(out["node_state_bg"].means.shape[0]),
+                "num_gaussians_distant": int(out["node_state_distant"].means.shape[0]) if out["node_state_distant"] is not None else 0,
+                "num_gaussians_rigid": int(out["node_state_rigid"].means.shape[0]) if out["node_state_rigid"] is not None else 0,
+                "phase_b_v9/final_supervision_step_idx": float(getattr(roles, "final_supervision_step_idx", -1)),
+                "phase_b_v9/final_supervision_ref_count": float(len(getattr(roles, "final_target_indices", []) or [])),
+                "phase_b_v9/intermediate_loss_ref_count": float(
+                    sum(len(x) for x in roles.prefix_loss_refs_by_step[:-1])
+                ),
+                "phase_b_v9/evidence_ref_count": float(sum(len(x) for x in roles.evidence_refs_by_step)),
+                "phase_b_v9/memory_write_steps": float(sum(1 for x in roles.memory_write_flags_by_step if bool(x))),
+                "phase_b_v9/memory_write_ratio": float(
+                    sum(1 for x in roles.memory_write_flags_by_step if bool(x)) / max(int(roles.inner_K), 1)
+                ),
+                "phase_b/tbptt_cache_hit": bool(out.get("tbptt_cache_hit", False)),
+                "phase_b/tbptt_cache_size": int(len(getattr(self, "stage6_phase_b_tbptt_cache", {}))),
+                "phase_b/tbptt_chunk_idx": int(tbptt_meta.get("chunk_idx", -1)) if tbptt_meta else -1,
+                "phase_b/tbptt_is_last_chunk": bool(tbptt_is_last_chunk),
+                "phase_b/grad_norm_total": float(grad_norm.detach().item()),
+                "node_state_sync_reset": bool(did_reset_node_state),
+                "node_state_cache_segments_bg": int(len(getattr(self, "node_states_bg", {}))),
+                "node_state_cache_segments_distant": int(len(getattr(self, "node_states_distant", {}))),
+                "node_state_cache_segments_rigid": int(len(getattr(self, "node_states_rigid", {}))),
+                **{key: float(value) for key, value in stats.items() if isinstance(value, (int, float))},
+                **grad_group_sums,
+            }
+            for item in list(out.get("per_step") or []):
+                k = int(item.get("k", 0))
+                for key2, value in item.items():
+                    if key2 == "k" or not isinstance(value, (int, float)):
+                        continue
+                    logs[f"phase_b_v9/k{k}/{key2}"] = float(value)
+            if torch.cuda.is_available():
+                logs["memory/allocated_gb"] = float(torch.cuda.memory_allocated() / (1024.0 ** 3))
+                logs["memory/reserved_gb"] = float(torch.cuda.memory_reserved() / (1024.0 ** 3))
+                logs["memory/peak_gb"] = float(torch.cuda.max_memory_allocated() / (1024.0 ** 3))
+            return logs
         grad_group_sums = self._stage6_assert_required_group_grads_phase_b(out)
         grad_norm = self._stage6_compute_and_check_grad_norm()
         self.optimizer.step()

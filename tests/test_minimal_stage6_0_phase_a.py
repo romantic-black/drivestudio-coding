@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -21,6 +22,7 @@ from models.streetforward.stage6_0.phase_a_losses import delta_regularization
 from models.streetforward.stage6_0.phase_a_losses import masked_rgb_loss
 from models.streetforward.stage6_0.phase_a_losses import target_valid_mask
 from models.streetforward.stage6_0.posterior_updater import BranchDelta, DeltaPack
+from models.streetforward.validation_v9_runner import aggregate_validation_v9_phase_a_rows
 
 
 def _phase_a_batch_meta():
@@ -732,6 +734,21 @@ def test_validation_v9_mask_skip_is_logged():
     )
     assert row["val_v9/phaseA/block_skipped_no_valid_pixels@0"] == 1.0
     assert row["val_v9/phaseA/nearby_skipped_no_valid_pixels@0"] == 1.0
+    assert row["val_v9/phaseA/block_metric_valid@0"] == 0.0
+    assert row["val_v9/phaseA/nearby_metric_valid@0"] == 0.0
+    assert "val_v9/phaseA/block_psnr@0" not in row
+    assert "val_v9/phaseA/nearby_psnr@0" not in row
+
+
+def test_validation_v9_aggregate_skips_missing_nearby_psnr():
+    summary = aggregate_validation_v9_phase_a_rows(
+        [
+            {"scene_id": 1, "nearby_psnr@2": 20.0, "nearby_valid_ratio@2": 1.0},
+            {"scene_id": 39, "nearby_valid_ratio@2": 0.0, "nearby_metric_valid@2": 0.0},
+        ],
+        k_values=[2],
+    )
+    assert summary["val_v9/phaseA/mean_nearby_psnr@2"] == 20.0
 
 
 def _valid_stage6_config():
@@ -1006,6 +1023,41 @@ def test_phase_a_zero_valid_mask_skips_rgb_loss():
     )
     assert loss.item() == 0.0
     assert stats["skipped_no_valid_pixels"] == 1.0
+
+
+def test_phase_a_render_loss_zero_valid_mask_omits_psnr_metric():
+    model = MinimalStreetForwardStage6_0.__new__(MinimalStreetForwardStage6_0)
+    model.loss_w_ssim = 0.0
+
+    def _render_targets_grouped_by_frame(*, local_state, targets_with_indices):
+        _ = local_state
+        return {int(idx): (torch.ones(2, 2, 3), torch.ones(2, 2)) for idx, _target in targets_with_indices}
+
+    model._render_targets_grouped_by_frame = _render_targets_grouped_by_frame
+    local_state = SimpleNamespace(bg=SimpleNamespace(means=torch.zeros(1, 3)))
+    batch = {
+        "targets": [
+            {
+                "gt_image": torch.zeros(2, 2, 3),
+                "valid_mask": torch.zeros(2, 2),
+                "sky_mask": torch.zeros(2, 2),
+                "egocar_mask": torch.zeros(2, 2),
+            }
+        ]
+    }
+
+    loss, stats = MinimalStreetForwardStage6_0._render_loss_for_indices(
+        model,
+        local_state=local_state,
+        batch=batch,
+        target_indices=[0],
+        mask_policy="non_sky_non_egocar",
+    )
+
+    assert loss.item() == 0.0
+    assert stats["metric_valid"] == 0.0
+    assert stats["num_metric_refs"] == 0.0
+    assert "psnr" not in stats
 
 
 def test_stage6_delta_regularization_uses_extra_weights_and_scale_barrier():

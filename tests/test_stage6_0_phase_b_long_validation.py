@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import inspect
 from types import SimpleNamespace
+
+import torch
 
 from datasets.validation_long_phase_b import (
     build_validation_plan_long_phase_b,
     materialize_validation_long_phase_b_batch,
 )
 from models.streetforward import validation_long_phase_b_runner as vlr
+from models.streetforward.stage6_0.phase_b_long.types import LongVSMReadPack
 
 
 def _cfg():
@@ -160,3 +164,37 @@ def test_validation_long_runner_reports_lpips_and_vsm_ablation(monkeypatch):
     assert out["val_long/shuffle_vsm/segment_all_lpips"] == 0.2
     assert "val_long/zero_vsm_gain/segment_all_psnr" in out
     assert out["val_long/materialized_segment_all_refs"] == 3.0
+
+
+def test_validation_zero_read_can_zero_seen_or_keep_seen():
+    read = LongVSMReadPack(
+        bg=torch.ones(2, 4),
+        seen_bg=torch.full((2, 1), 3.0),
+        rigid=torch.ones(1, 5),
+        rigid_indices=torch.tensor([1]),
+        rigid_seen=torch.full((1, 1), 2.0),
+        rigid_stable_mask=torch.tensor([True]),
+        distant=torch.ones(1, 3),
+        distant_indices=torch.tensor([0]),
+        distant_seen=torch.full((1, 1), 4.0),
+    )
+
+    zero_seen = vlr._zero_read(read, zero_seen=True)
+    assert torch.count_nonzero(zero_seen.bg) == 0
+    assert torch.count_nonzero(zero_seen.seen_bg) == 0
+    assert zero_seen.rigid is not None and torch.count_nonzero(zero_seen.rigid) == 0
+    assert zero_seen.rigid_seen is not None and torch.count_nonzero(zero_seen.rigid_seen) == 0
+    assert zero_seen.distant is not None and torch.count_nonzero(zero_seen.distant) == 0
+    assert zero_seen.distant_seen is not None and torch.count_nonzero(zero_seen.distant_seen) == 0
+
+    keep_seen = vlr._zero_read(read, zero_seen=False)
+    assert torch.count_nonzero(keep_seen.bg) == 0
+    assert torch.equal(keep_seen.seen_bg, read.seen_bg)
+    assert keep_seen.rigid_seen is not None and torch.equal(keep_seen.rigid_seen, read.rigid_seen)
+    assert keep_seen.distant_seen is not None and torch.equal(keep_seen.distant_seen, read.distant_seen)
+
+
+def test_validation_cell_vsm_init_passes_batch_for_persistent_aabb():
+    source = inspect.getsource(vlr.run_long_phase_b_inference)
+    assert 'stage6_phase_b_long_vsm_type", "streaming_selective_ssm"' in source
+    assert 'init_kwargs["batch"] = batch' in source

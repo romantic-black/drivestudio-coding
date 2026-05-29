@@ -380,6 +380,7 @@ class LongStreamingVSM(nn.Module):
         distant_mode: Optional[str] = None,
         visit_time_code: Optional[torch.Tensor] = None,
         compute_dtype: Optional[torch.dtype] = None,
+        commit_memory: bool = True,
     ) -> tuple[LongVSMState, LongVSMReadPack, Dict[str, float]]:
         mode = _check_distant_mode(str(distant_mode or self.distant_mode))
         event_bg = event.event_bg
@@ -732,4 +733,4 @@ class LongStreamingVSM(nn.Module):
             distant_indices=distant_indices,
             distant_seen=distant_seen_active,
         )
-        return out_state, read, aux
+        return (out_state if bool(commit_memory) else state), read, aux

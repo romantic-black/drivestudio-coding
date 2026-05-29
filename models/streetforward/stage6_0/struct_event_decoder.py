@@ -12,9 +12,9 @@ from models.streetforward.struct_decoders.common import (
     StructDecoderInput,
     VoxelLayout,
     normalize_params_for_embed,
-    offsets_to_batch_ids,
     scatter_mean,
 )
+from models.streetforward.struct_decoders.voxel_layout_utils import build_voxel_layout
 from models.streetforward.struct_decoders.xcpe_decoder import _SPCONV_AVAILABLE, _XCPEResidualLayer
 from models.streetforward.stage6_0.event_encoder import EventPack
 
@@ -355,38 +355,22 @@ class Stage6NearXcpeEventDecoder(nn.Module):
         aabb_max: torch.Tensor,
         batch_offsets: Optional[torch.Tensor],
     ) -> VoxelLayout:
-        if not torch.isfinite(coords).all():
-            raise RuntimeError("Stage6 near xCPE coords contain NaN/Inf")
-        bbx_min = aabb_min.to(device=coords.device, dtype=coords.dtype)
-        bbx_max = aabb_max.to(device=coords.device, dtype=coords.dtype)
-        outside = ((coords < bbx_min) | (coords > bbx_max)).any(dim=-1)
-        if bool(outside.any().item()):
-            raise RuntimeError("Stage6 near xCPE received points outside segment_aabb")
-        n = int(coords.shape[0])
-        if batch_offsets is None:
-            batch_offsets = torch.tensor([n], device=coords.device, dtype=torch.long)
-        batch_ids = offsets_to_batch_ids(batch_offsets, num_points=n, device=coords.device)
-        spatial_shape_xyz = torch.floor((bbx_max - bbx_min) / self.voxel_size).long() + 1
-        if bool((spatial_shape_xyz <= 0).any().item()):
-            raise RuntimeError("Invalid Stage6 near xCPE spatial shape")
-        grid_coord_xyz = torch.floor((coords - bbx_min) / self.voxel_size).long()
-        grid_key = torch.cat([batch_ids[:, None], grid_coord_xyz], dim=1)
-        unique_key, inverse = torch.unique(grid_key, dim=0, sorted=True, return_inverse=True)
-        b = unique_key[:, 0]
-        x = unique_key[:, 1]
-        y = unique_key[:, 2]
-        z = unique_key[:, 3]
-        indices_bzyx = torch.stack([b, z, y, x], dim=1).int()
-        spatial_shape_zyx = torch.stack([spatial_shape_xyz[2], spatial_shape_xyz[1], spatial_shape_xyz[0]], dim=0)
-        return VoxelLayout(
-            grid_coord_xyz=grid_coord_xyz,
-            batch_ids=batch_ids,
-            unique_key=unique_key,
-            inverse=inverse,
-            indices_bzyx=indices_bzyx,
-            spatial_shape_zyx=spatial_shape_zyx,
-            spatial_shape_xyz=spatial_shape_xyz,
-        )
+        try:
+            return build_voxel_layout(
+                coords,
+                aabb_min=aabb_min,
+                aabb_max=aabb_max,
+                voxel_size=float(self.voxel_size),
+                batch_offsets=batch_offsets,
+                strict_inside=True,
+            )
+        except RuntimeError as exc:
+            msg = str(exc)
+            if "outside segment_aabb" in msg:
+                raise RuntimeError("Stage6 near xCPE received points outside segment_aabb") from exc
+            if "spatial shape" in msg:
+                raise RuntimeError("Invalid Stage6 near xCPE spatial shape") from exc
+            raise
 
     def forward(
         self,

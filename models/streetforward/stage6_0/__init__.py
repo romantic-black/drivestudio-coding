@@ -21,20 +21,15 @@ from .v9_role_resolver import (
 )
 from .phase_b_long import (
     PHASE_B_LONG_NAME,
-    LONG_TARGET_ROLES,
-    LongAnchor,
-    LongEpisodeWindow,
-    LongRolloutShape,
-    LongVisit,
+    LongCellStreamingVSM,
+    LongCellVSMState,
     LongStreamingVSM,
     LongVSMState,
     PhaseBOffsetState,
-    ResolvedLongPhaseBBatch,
     VSMOffsetDecoder,
     materialize_phase_b_state,
     offset_regularization,
     phase_b_long_final_render_loss,
-    resolve_long_phase_b_batch,
 )
 from .vsm import Stage6BranchQueryPred, Stage6QueryDecoder, Stage6QueryPred, Stage6VSMState, Stage6ViewSetMemory
 
@@ -47,17 +42,13 @@ __all__ = [
     "PHASE_A_NAME",
     "PHASE_B_NAME",
     "PHASE_B_LONG_NAME",
-    "LONG_TARGET_ROLES",
-    "LongAnchor",
-    "LongEpisodeWindow",
-    "LongRolloutShape",
-    "LongVisit",
+    "LongCellStreamingVSM",
+    "LongCellVSMState",
     "LongStreamingVSM",
     "LongVSMState",
     "PhaseBOffsetState",
     "ResolvedV9PhaseABatch",
     "ResolvedV9PhaseBBatch",
-    "ResolvedLongPhaseBBatch",
     "Stage6QueryDecoder",
     "Stage6BranchQueryPred",
     "Stage6QueryPred",
@@ -80,5 +71,4 @@ __all__ = [
     "materialize_phase_b_state",
     "offset_regularization",
     "phase_b_long_final_render_loss",
-    "resolve_long_phase_b_batch",
 ]

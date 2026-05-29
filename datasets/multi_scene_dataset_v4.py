@@ -40,7 +40,6 @@ from datasets.streetforward_assets import StreetForwardAssetStore
 from datasets.train_scheduler_v6 import TrainSchedulerV6
 from datasets.train_scheduler_v7 import TrainSchedulerV7
 from datasets.train_scheduler_v8 import TrainSchedulerV8
-from datasets.train_scheduler_long_phase_b import TrainSchedulerLongPhaseB
 from datasets.train_scheduler_v9 import TrainSchedulerV9, ViewSetRolloutBatchV9
 
 ImageRef = Tuple[int, int]
@@ -2428,6 +2427,19 @@ class MultiSceneDatasetV4:
             out_roles.append(str(role))
         return out_refs, out_roles
 
+    @staticmethod
+    def _assert_no_v9_ref_role_conflicts(refs: Sequence[ImageRef], roles: Sequence[str]) -> None:
+        if len(refs) != len(roles):
+            raise ValueError(f"V9 refs/roles length mismatch: {len(refs)} vs {len(roles)}")
+        role_by_ref: Dict[ImageRef, str] = {}
+        for ref, role in zip(refs, roles):
+            r = (int(ref[0]), int(ref[1]))
+            role_s = str(role)
+            prev = role_by_ref.get(r)
+            if prev is not None and prev != role_s:
+                raise ValueError(f"V9 final supervision ref {r} has conflicting roles: {prev} vs {role_s}")
+            role_by_ref[r] = role_s
+
     def _assemble_segment_batch_from_v9_request(
         self,
         *,
@@ -2457,6 +2469,15 @@ class MultiSceneDatasetV4:
             + ["nearby_loss" for _ in nearby_refs]
             + ["prefix_loss" for _ in prefix_refs]
         )
+        final_meta = dict((v9_plan.request_meta or {}).get("phase_b_final_supervision") or {})
+        if str((v9_plan.request_meta or {}).get("phase_b_loss_timing", "")) == "rollout_final_only":
+            final_refs = [(int(ref[0]), int(ref[1])) for ref in list(final_meta.get("refs", []) or [])]
+            final_roles = [str(x) for x in list(final_meta.get("roles", []) or [])]
+            if len(final_refs) != len(final_roles) or not final_refs:
+                raise ValueError("V9 final rollout request requires phase_b_final_supervision refs/roles")
+            self._assert_no_v9_ref_role_conflicts(final_refs, final_roles)
+            raw_loss_refs = [tuple(x) for x in final_refs]
+            raw_loss_roles = [str(x) for x in final_roles]
         loss_refs, loss_roles = self._dedupe_v9_refs_roles_keep_order(raw_loss_refs, raw_loss_roles)
         query_refs = self._dedupe_v9_refs_keep_order(v9_plan.query_label_refs)
         aux_refs = self._dedupe_v9_refs_keep_order(v9_plan.aux_loss_refs)
@@ -2731,6 +2752,8 @@ class MultiSceneDatasetV4:
         distant_meta_cfg: Optional[Any] = None,
         fail_fast: bool = True,
     ) -> TrainSchedulerLongPhaseB:
+        from datasets.train_scheduler_long_phase_b import TrainSchedulerLongPhaseB
+
         return TrainSchedulerLongPhaseB(
             dataset=self,
             episode_window_cfg=episode_window_cfg,

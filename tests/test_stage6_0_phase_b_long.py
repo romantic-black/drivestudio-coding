@@ -7,18 +7,20 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from datasets.multi_scene_dataset_v4 import MultiSceneDatasetV4, SegmentIndexV4
 from datasets.train_scheduler_long_phase_b import TrainSchedulerLongPhaseB
 from models.streetforward.minimal_trainer_stage6_0 import MinimalStreetForwardStage6_0
 from models.streetforward.stage6_0 import EventPack, LocalGSState
 from models.streetforward.stage6_0.local_gs_state import LocalBranchState
 from models.streetforward.stage6_0.phase_b_long import (
+    LongCellStreamingVSM,
     LongStreamingVSM,
     PhaseBOffsetState,
     VSMOffsetDecoder,
     materialize_phase_b_state,
-    resolve_long_phase_b_batch,
 )
+from models.streetforward.stage6_0.phase_b_long.resolver import resolve_long_phase_b_batch
+from models.streetforward.node_states import NodeStateRigid
+from models.streetforward.struct_decoders.voxel_layout_utils import build_segment_cell_index, build_voxel_layout
 
 
 def _branch(n: int, hidden: int = 4, sh_rest_bases: int = 0) -> LocalBranchState:
@@ -30,6 +32,29 @@ def _branch(n: int, hidden: int = 4, sh_rest_bases: int = 0) -> LocalBranchState
         sh_dc=torch.zeros(n, 3),
         sh_rest=torch.zeros(n, int(sh_rest_bases), 3),
         hidden=torch.zeros(n, hidden),
+    )
+
+
+def _rigid_template(point_ids: torch.Tensor) -> NodeStateRigid:
+    n = int(point_ids.numel())
+    num_objects = int(point_ids.max().item()) + 1 if n > 0 else 0
+    quats = torch.zeros(1, num_objects, 4)
+    if num_objects > 0:
+        quats[..., 0] = 1.0
+    return NodeStateRigid(
+        means=torch.zeros(n, 3),
+        scales_log=torch.zeros(n, 3),
+        quats=torch.nn.functional.normalize(torch.ones(n, 4), dim=-1),
+        opacity_logit=torch.zeros(n, 1),
+        sh_dc=torch.zeros(n, 3),
+        sh_rest=torch.zeros(n, 0, 3),
+        point_ids=point_ids.reshape(-1, 1).long(),
+        instances_quats=quats,
+        instances_trans=torch.zeros(1, num_objects, 3),
+        instances_fv=torch.ones(1, num_objects, dtype=torch.bool),
+        instance_ids=list(range(num_objects)),
+        frame_ids=[0],
+        cur_frame=0,
     )
 
 
@@ -445,9 +470,304 @@ def test_distant_vsm_sparse_appearance_scale_offsets_preserve_geometry():
     assert torch.allclose(mat.distant.quats, base.distant.quats)
 
 
-def _make_sidx() -> SegmentIndexV4:
+def test_segment_cell_index_matches_stage6_voxel_layout_and_marks_outside():
+    coords_inside = torch.tensor(
+        [
+            [0.1, 0.1, 0.1],
+            [0.6, 0.1, 0.1],
+            [0.1, 0.6, 0.1],
+            [0.1, 0.1, 0.6],
+        ],
+        dtype=torch.float32,
+    )
+    aabb_min = torch.tensor([0.0, 0.0, 0.0])
+    aabb_max = torch.tensor([1.0, 1.0, 1.0])
+    layout = build_voxel_layout(
+        coords_inside,
+        aabb_min=aabb_min,
+        aabb_max=aabb_max,
+        voxel_size=0.5,
+        strict_inside=True,
+    )
+    cell = build_segment_cell_index(
+        torch.cat([coords_inside, torch.tensor([[2.0, 0.0, 0.0]])], dim=0),
+        aabb_min=aabb_min,
+        aabb_max=aabb_max,
+        voxel_size=0.5,
+        strict_inside=False,
+        outside_policy="mark_invalid",
+    )
+    assert torch.equal(cell.unique_key, layout.unique_key)
+    assert torch.equal(cell.point_cell_id[:4], layout.inverse)
+    assert int(cell.point_cell_id[4].item()) == -1
+    assert torch.equal(cell.indices_bzyx, layout.indices_bzyx)
+
+
+def test_long_cell_bg_memory_sparse_read_and_cross_step_gradients():
+    torch.manual_seed(13)
+    base = LocalGSState(bg=_branch(6))
+    base.bg.means = torch.tensor(
+        [
+            [0.0, 0.0, 0.0],
+            [0.1, 0.0, 0.0],
+            [0.7, 0.0, 0.0],
+            [0.7, 0.7, 0.0],
+            [1.4, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    batch = {"aabb": torch.tensor([[-0.5, -0.5, -0.5], [2.0, 2.0, 2.0]], dtype=torch.float32)}
+    vsm = LongCellStreamingVSM(
+        event_dim=48,
+        bg_point_mem_dim=8,
+        bg_cell_mem_dim=16,
+        bg_global_mem_dim=16,
+        bg_read_dim=16,
+        rigid_point_mem_dim=8,
+        rigid_object_mem_dim=16,
+        rigid_cell_mem_dim=16,
+        rigid_read_dim=16,
+        dtype="fp32",
+        support_fallback_when_no_valid=True,
+    )
+    decoder = VSMOffsetDecoder(bg_mem_dim=16, rigid_mem_dim=16)
+    state = vsm.init_state(base_state=base, batch=batch)
+    assert state.index.bg.point_cell_id[-1].item() == -1
+
+    def make_event(valid_rows):
+        valid = torch.zeros(6, dtype=torch.bool)
+        valid[torch.tensor(valid_rows, dtype=torch.long)] = True
+        event = EventPack(
+            event_bg=torch.randn(6, 48),
+            support_bg=valid.to(dtype=torch.float32),
+            valid_bg=valid,
+            obs_code_bg=torch.zeros(6, 2),
+        )
+        event = SimpleNamespace(**event.__dict__)
+        event.view_code_bg = event.obs_code_bg
+        return event
+
+    state_a, read_a, aux_a = vsm.write_read(
+        state=state,
+        event=make_event([0, 2]),
+        step_idx=0,
+        frame_idx=10,
+        repeat_idx=0,
+        rigid_meta={},
+        distant_mode="frozen_render_only",
+    )
+    assert read_a.bg_indices is not None and read_a.bg_indices.tolist() == [0, 2]
+    assert aux_a["vsm_bg_cell_seen_ratio"] > 0.0
+    assert aux_a["vsm_bg_point_context_previous_cell_global"] == 1.0
+    assert aux_a["vsm_bg_final_read_context_updated_cell_global"] == 1.0
+    state_a.bg_point_h.retain_grad()
+    state_a.bg_cell_h.retain_grad()
+
+    _state_b, read_b, aux_b = vsm.write_read(
+        state=state_a,
+        event=make_event([2, 3]),
+        step_idx=1,
+        frame_idx=11,
+        repeat_idx=0,
+        rigid_meta={},
+        distant_mode="frozen_render_only",
+    )
+    assert read_b.bg_indices is not None and read_b.bg_indices.tolist() == [2, 3]
+    assert aux_b["vsm_bg_seen_rows"] == 3.0
+    delta = decoder(read=read_b)
+    offset = PhaseBOffsetState.zeros_like(base_state=base)
+    offset = offset.apply(delta, frame_idx=11, rigid_meta={})
+    loss = offset.bg_means[2].sum()
+    loss.backward()
+    assert state_a.bg_point_h.grad is not None
+    assert float(state_a.bg_point_h.grad[2].abs().sum()) > 0.0
+    assert state_a.bg_cell_h.grad is not None
+    assert float(state_a.bg_cell_h.grad.abs().sum()) > 0.0
+
+
+def test_long_cell_rigid_sparse_memory_unstable_snapshot_and_distant_vsm():
+    base = LocalGSState(
+        bg=_branch(3),
+        distant=_branch(4, sh_rest_bases=2),
+        rigid=_branch(4),
+        rigid_template=_rigid_template(torch.tensor([0, 0, 1, 1])),
+    )
+    base.rigid.means = torch.tensor(
+        [
+            [0.0, 0.0, 0.0],
+            [0.2, 0.0, 0.0],
+            [0.0, 0.2, 0.0],
+            [0.2, 0.2, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    rigid_meta = {"stable_mask": torch.tensor([True, False, True, False])}
+    vsm = LongCellStreamingVSM(
+        event_dim=48,
+        bg_point_mem_dim=8,
+        bg_cell_mem_dim=16,
+        bg_global_mem_dim=16,
+        bg_read_dim=16,
+        rigid_point_mem_dim=8,
+        rigid_object_mem_dim=16,
+        rigid_cell_mem_dim=16,
+        rigid_read_dim=16,
+        distant_mem_dim=12,
+        dtype="fp32",
+        distant_mode="appearance_scale_only",
+    )
+    state = vsm.init_state(
+        base_state=base,
+        batch={"aabb": torch.tensor([[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]])},
+        rigid_meta=rigid_meta,
+        distant_mode="appearance_scale_only",
+    )
+    assert state.rigid_point_h is not None and state.rigid_point_h.shape[0] == 2
+    assert state.rigid_object_h is not None and state.rigid_object_h.shape[0] == 2
+    event = EventPack(
+        event_bg=torch.randn(3, 48),
+        event_distant=torch.randn(4, 48),
+        event_rigid=torch.randn(3, 48),
+        support_bg=torch.ones(3),
+        support_distant=torch.tensor([1.0, 0.0, 1.0, 0.0]),
+        support_rigid=torch.ones(3),
+        valid_bg=torch.ones(3, dtype=torch.bool),
+        valid_distant=torch.tensor([True, False, True, False]),
+        valid_rigid=torch.ones(3, dtype=torch.bool),
+        obs_code_bg=torch.zeros(3, 2),
+        obs_code_distant=torch.zeros(4, 2),
+        obs_code_rigid=torch.zeros(3, 2),
+        route=SimpleNamespace(S=torch.tensor([0, 2, 3])),
+    )
+    event = SimpleNamespace(**event.__dict__)
+    event.view_code_bg = event.obs_code_bg
+    event.view_code_distant = event.obs_code_distant
+    event.view_code_rigid = event.obs_code_rigid
+    state, read, aux = vsm.write_read(
+        state=state,
+        event=event,
+        step_idx=0,
+        frame_idx=10,
+        repeat_idx=0,
+        rigid_meta=rigid_meta,
+        distant_mode="appearance_scale_only",
+    )
+    assert read.rigid is not None and read.rigid.shape == (3, 16)
+    assert read.distant is not None and read.distant.shape == (2, 12)
+    assert aux["vsm_rigid_stable_rows"] == 2.0
+    assert aux["vsm_rigid_unstable_rows"] == 1.0
+    decoder = VSMOffsetDecoder(
+        bg_mem_dim=16,
+        rigid_mem_dim=16,
+        distant_mem_dim=12,
+        distant_mode="appearance_scale_only",
+        distant_sh_rest_bases=2,
+        distant_sh_rest_update_bases=1,
+    )
+    offset = PhaseBOffsetState.zeros_like(base_state=base)
+    delta = decoder(read=read, distant_mode="appearance_scale_only")
+    offset = offset.apply(delta, frame_idx=10, rigid_meta=rigid_meta)
+    assert offset.rigid_frame_snapshots[10].mask[3].item() == pytest.approx(1.0)
+    mat = materialize_phase_b_state(base_state=base, offset=offset, target_frame_idx=10, rigid_meta=rigid_meta)
+    assert mat.distant is not None
+    assert torch.allclose(mat.distant.means, base.distant.means)
+    assert torch.allclose(mat.distant.quats, base.distant.quats)
+
+
+def _minimal_phase_b_long_config(vsm_type: str = "streaming_selective_ssm"):
+    use_cell = str(vsm_type) == "cell_streaming_selective_ssm"
+    return {
+        "model": {
+            "stage": "6_0",
+            "phase": "6_0_phase_b",
+            "stage6_0": {
+                "base_measurement": {
+                    "type": "stage5_4_v4",
+                    "require_fused_v4": True,
+                    "source_evidence_grad_mode": "no_grad_v4",
+                    "detach_v4_outputs": True,
+                    "train_2d_frontend": False,
+                },
+                "struct_event_decoder": {"enable": True},
+                "query_decoder": {"enable": False},
+                "phase_b_long": {
+                    "enable": True,
+                    "vsm": {
+                        "type": str(vsm_type),
+                        "use_spatial_mamba": False,
+                        "use_cell_memory": bool(use_cell),
+                        "use_global_memory": bool(use_cell),
+                        "distant": {
+                            "mode": "appearance_scale_only",
+                            "update_means": False,
+                            "update_quat": False,
+                            "update_scales": True,
+                            "update_opacity": True,
+                            "update_sh_dc": True,
+                        },
+                    },
+                    "offset_decoder": {
+                        "input_source": "vsm_readout_only",
+                        "allow_event_bypass": False,
+                    },
+                },
+            },
+        },
+        "scheduler_long_phase_b": {
+            "enable": True,
+            "version": "long_v1",
+            "phase": "6_0_phase_b",
+            "episode_window": {},
+            "anchor_sampling": {},
+            "final_supervision": {},
+            "rollout_shapes": [{"name": "r1_a1"}],
+        },
+        "validation_v9": {"enable": False},
+        "losses": {
+            "phase_b_long": {
+                "query_observation": {"enable": False},
+                "nearby_render": {"enable": False},
+                "per_step_prefix_render": {"enable": False},
+            }
+        },
+    }
+
+
+def test_long_phase_b_config_validation_allows_cell_vsm_and_keeps_old_forbids():
+    model = MinimalStreetForwardStage6_0.__new__(MinimalStreetForwardStage6_0)
+    torch.nn.Module.__init__(model)
+    MinimalStreetForwardStage6_0._validate_stage6_0_phase_b_long_config(
+        model,
+        _minimal_phase_b_long_config("cell_streaming_selective_ssm"),
+    )
+
+    bad_old = _minimal_phase_b_long_config("streaming_selective_ssm")
+    bad_old["model"]["stage6_0"]["phase_b_long"]["vsm"]["use_cell_memory"] = True
+    with pytest.raises(ValueError, match="forbids vsm.use_cell_memory"):
+        MinimalStreetForwardStage6_0._validate_stage6_0_phase_b_long_config(model, bad_old)
+
+    bad_cell = _minimal_phase_b_long_config("cell_streaming_selective_ssm")
+    bad_cell["model"]["stage6_0"]["phase_b_long"]["vsm"]["use_cell_memory"] = False
+    with pytest.raises(ValueError, match="requires vsm.use_cell_memory=true"):
+        MinimalStreetForwardStage6_0._validate_stage6_0_phase_b_long_config(model, bad_cell)
+
+    bad_mamba = _minimal_phase_b_long_config("cell_streaming_selective_ssm")
+    bad_mamba["model"]["stage6_0"]["phase_b_long"]["vsm"]["use_spatial_mamba"] = True
+    with pytest.raises(ValueError, match="does not support vsm.use_spatial_mamba=true"):
+        MinimalStreetForwardStage6_0._validate_stage6_0_phase_b_long_config(model, bad_mamba)
+
+    bad_context = _minimal_phase_b_long_config("cell_streaming_selective_ssm")
+    bad_context["model"]["stage6_0"]["phase_b_long"]["vsm"]["bg"] = {
+        "point_context_source": "current_event_shortcut"
+    }
+    with pytest.raises(ValueError, match="vsm.bg.point_context_source"):
+        MinimalStreetForwardStage6_0._validate_stage6_0_phase_b_long_config(model, bad_context)
+
+
+def _make_sidx() -> SimpleNamespace:
     frames = [10, 20, 30, 40]
-    return SegmentIndexV4(
+    return SimpleNamespace(
         scene_id=1,
         segment_id=0,
         num_cams=3,

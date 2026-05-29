@@ -61,62 +61,29 @@ def _cfg_get(node: Any, key: str, default: Any = None) -> Any:
     return default
 
 
+def _metric_or_nan(row: Dict[str, Any], key: str) -> float:
+    try:
+        return float(row[key])
+    except (KeyError, TypeError, ValueError):
+        return float("nan")
+
+
 def _scheduler_long_phase_b_enabled(cfg: Any) -> bool:
-    sl = cfg.get("scheduler_long_phase_b") if hasattr(cfg, "get") else None
-    return bool(_cfg_get(sl, "enable", False))
+    _ = cfg
+    return False
 
 
 def _validation_long_phase_b_enabled(cfg: Any) -> bool:
-    raw = cfg.get("validation_long_phase_b") if hasattr(cfg, "get") else None
-    return bool(_cfg_get(raw, "enable", False))
+    _ = cfg
+    return False
 
 
 def resolve_fixed_scene_segment_stage6(cfg: Any) -> tuple[Optional[int], Optional[int]]:
-    if not _scheduler_long_phase_b_enabled(cfg):
-        return resolve_fixed_scene_segment_v9(cfg)
-    sl = cfg.get("scheduler_long_phase_b") if hasattr(cfg, "get") else None
-    trav = _cfg_get(sl, "traversal", {}) or {}
-    scene = _cfg_get(trav, "fixed_scene_id", None)
-    segment = _cfg_get(trav, "fixed_segment_id", None)
-    return (None if scene is None else int(scene), None if segment is None else int(segment))
+    return resolve_fixed_scene_segment_v9(cfg)
 
 
 def build_train_scheduler_stage6_from_cfg(cfg: Any, dataset: Any) -> Any:
-    if not _scheduler_long_phase_b_enabled(cfg):
-        return build_train_scheduler_v9_from_cfg(cfg, dataset)
-    sl = cfg.get("scheduler_long_phase_b") if hasattr(cfg, "get") else None
-    if sl is None:
-        raise ValueError("config must define scheduler_long_phase_b")
-    trav = _cfg_get(sl, "traversal", None)
-    preload = _cfg_get(sl, "preload", None)
-    episode_window = _cfg_get(sl, "episode_window", None)
-    anchor_sampling = _cfg_get(sl, "anchor_sampling", None)
-    if episode_window is None or trav is None or preload is None or anchor_sampling is None:
-        raise ValueError("scheduler_long_phase_b must define episode_window/anchor_sampling/traversal/preload")
-    if str(_cfg_get(sl, "version", "long_v1")) != "long_v1":
-        raise ValueError("scheduler_long_phase_b.version must be long_v1")
-    if str(_cfg_get(sl, "phase", "6_0_phase_b")) != "6_0_phase_b":
-        raise ValueError("scheduler_long_phase_b.phase must be 6_0_phase_b")
-
-    fixed_scene_id, fixed_segment_id = resolve_fixed_scene_segment_stage6(cfg)
-    validate_train_scene_for_fixed(cfg, fixed_scene_id)
-    include_test = parse_include_test(cfg)
-    return dataset.create_train_scheduler_long_phase_b(
-        episode_window_cfg=episode_window,
-        rollout_shapes=list(_cfg_get(sl, "rollout_shapes", []) or []),
-        rollout_shapes_schedule=list(_cfg_get(sl, "rollout_shapes_schedule", []) or []),
-        anchor_sampling_cfg=anchor_sampling,
-        traversal_cfg=trav,
-        preload_cfg=preload,
-        include_test=include_test,
-        fixed_scene_id=fixed_scene_id,
-        fixed_segment_id=fixed_segment_id,
-        evidence_cfg=_cfg_get(sl, "evidence", {}) or {},
-        final_supervision_cfg=_cfg_get(sl, "final_supervision", {}) or {},
-        rigid_meta_cfg=_cfg_get(sl, "rigid_meta", {}) or {},
-        distant_meta_cfg=_cfg_get(sl, "distant_meta", {}) or {},
-        fail_fast=bool(_cfg_get(sl, "fail_fast", True)),
-    )
+    return build_train_scheduler_v9_from_cfg(cfg, dataset)
 
 
 def _scheduler_v9_blocks_per_episode(cfg: Any) -> int:
@@ -126,7 +93,16 @@ def _scheduler_v9_blocks_per_episode(cfg: Any) -> int:
     ep = sv9.get("episode") if hasattr(sv9, "get") else None
     if ep is None:
         raise ValueError("validation_v9 requires scheduler_v9.episode")
-    return int(ep["blocks_per_episode"])
+    blocks = _cfg_get(ep, "blocks_per_episode", None)
+    if blocks is not None:
+        return int(blocks)
+    phase_b = _cfg_get(sv9, "phase_B", {}) or {}
+    rollout = _cfg_get(phase_b, "rollout", {}) or {}
+    shapes = [dict(x) for x in list(_cfg_get(rollout, "shapes", []) or [])]
+    if not shapes:
+        raise ValueError("validation_v9 requires scheduler_v9.episode.blocks_per_episode or phase_B.rollout.shapes")
+    max_blocks = max(int(_cfg_get(shape, "blocks_per_rollout", 0) or 0) for shape in shapes)
+    return int(_cfg_get(ep, "rollouts_per_episode", 1)) * int(max_blocks)
 
 
 def _run_validation_v9_round(
@@ -230,9 +206,9 @@ def _run_validation_v9_round(
             int(spec.block_idx),
             int(spec.source_frame_idx),
             int(plan.max_K),
-            float(row.get(f"block_psnr@{int(plan.max_K)}", 0.0)),
+            _metric_or_nan(row, f"block_psnr@{int(plan.max_K)}"),
             int(plan.max_K),
-            float(row.get(f"nearby_psnr@{int(plan.max_K)}", 0.0)),
+            _metric_or_nan(row, f"nearby_psnr@{int(plan.max_K)}"),
         )
         del minimal_batch, raw_batch
     summary: Dict[str, Any] = aggregate_validation_v9_phase_a_rows(rows, k_values=[int(x) for x in plan.k_values])
@@ -255,9 +231,9 @@ def _run_validation_v9_round(
         int(trigger_step),
         int(len(rows)),
         int(plan.max_K),
-        float(summary.get(f"val_v9/phaseA/mean_block_psnr@{int(plan.max_K)}", 0.0)),
+        _metric_or_nan(summary, f"val_v9/phaseA/mean_block_psnr@{int(plan.max_K)}"),
         int(plan.max_K),
-        float(summary.get(f"val_v9/phaseA/mean_nearby_psnr@{int(plan.max_K)}", 0.0)),
+        _metric_or_nan(summary, f"val_v9/phaseA/mean_nearby_psnr@{int(plan.max_K)}"),
     )
 
 

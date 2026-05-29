@@ -70,11 +70,25 @@ def build_train_scheduler_v9_from_cfg(cfg: Any, dataset: MultiSceneDatasetV4) ->
     steps_per_block = int(_cfg_get(block, "steps_per_block", _cfg_get(execution, "steps_per_block", 1)))
     if steps_per_block < 1:
         raise ValueError("scheduler_v9.block.steps_per_block must be >= 1")
+    blocks_per_episode_raw = _cfg_get(ep, "blocks_per_episode", None)
+    if blocks_per_episode_raw is None and phase == "phase_B_viewset_rollout":
+        phase_b = _cfg_get(sv9, "phase_B", {}) or {}
+        phase_b_rollout = _cfg_get(phase_b, "rollout", {}) or {}
+        shapes = [dict(x) for x in list(_cfg_get(phase_b_rollout, "shapes", []) or [])]
+        if not shapes:
+            raise ValueError(
+                "scheduler_v9.episode.blocks_per_episode is required unless phase_B.rollout.shapes is defined"
+            )
+        max_blocks = max(int(_cfg_get(shape, "blocks_per_rollout", 0) or 0) for shape in shapes)
+        rollouts_per_episode = int(_cfg_get(ep, "rollouts_per_episode", 1))
+        blocks_per_episode = int(rollouts_per_episode) * int(max_blocks)
+    else:
+        blocks_per_episode = int(blocks_per_episode_raw)
 
     return dataset.create_train_scheduler_v9(
         phase=phase,
         steps_per_block=steps_per_block,
-        blocks_per_episode=int(_cfg_get(ep, "blocks_per_episode")),
+        blocks_per_episode=int(blocks_per_episode),
         include_source_frame=bool(_cfg_get(ep, "include_source_frame", True)),
         frame_within_keyframe_policy=str(_cfg_get(ep, "frame_within_keyframe_policy", "random_once_per_episode")),
         min_keyframes_required_policy=str(
