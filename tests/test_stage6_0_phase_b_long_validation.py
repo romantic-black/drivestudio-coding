@@ -11,6 +11,7 @@ from datasets.validation_long_phase_b import (
 )
 from models.streetforward import validation_long_phase_b_runner as vlr
 from models.streetforward.stage6_0.phase_b_long.types import LongVSMReadPack
+import tools.train_minimal_streetforward_stage6_0_multi_scene_v9 as stage6_entry
 
 
 def _cfg():
@@ -164,6 +165,59 @@ def test_validation_long_runner_reports_lpips_and_vsm_ablation(monkeypatch):
     assert out["val_long/shuffle_vsm/segment_all_lpips"] == 0.2
     assert "val_long/zero_vsm_gain/segment_all_psnr" in out
     assert out["val_long/materialized_segment_all_refs"] == 3.0
+
+
+def test_validation_long_phase_b_round_honors_runtime_max_specs(monkeypatch):
+    specs = [
+        SimpleNamespace(scene_id=1, segment_id=0, interval_T=4, order="chronological"),
+        SimpleNamespace(scene_id=1, segment_id=1, interval_T=4, order="chronological"),
+        SimpleNamespace(scene_id=1, segment_id=2, interval_T=4, order="chronological"),
+    ]
+    plan = SimpleNamespace(specs=specs, interval_T_values=[4], orders=["chronological"])
+    seen_specs = []
+    rows = []
+
+    monkeypatch.setattr(stage6_entry, "build_validation_plan_long_phase_b", lambda **kwargs: plan)
+
+    def fake_materialize(dataset, spec, include_test=False):
+        seen_specs.append(int(spec.segment_id))
+        return {"target": {"image": torch.zeros(1, 2, 2, 3)}}
+
+    monkeypatch.setattr(stage6_entry, "materialize_validation_long_phase_b_batch", fake_materialize)
+    monkeypatch.setattr(
+        stage6_entry.base,
+        "convert_batch_to_minimal_format",
+        lambda raw_batch, device, num_targets, include_source_for_2d, view_selection: raw_batch,
+    )
+    monkeypatch.setattr(stage6_entry.base, "_write_metrics_history", lambda fh, row: rows.append(dict(row)))
+
+    class Model:
+        def validate_long_phase_b(self, batch, **kwargs):
+            return {"val_long/segment_all_psnr": 12.0}
+
+    cfg = {
+        "data": {"eval_scene_ids": [1]},
+        "validation_long_phase_b": {
+            "enable": True,
+            "runtime": {"max_specs_per_round": 2, "empty_cache_after_round": True},
+            "masks": {"mask_policy": "none", "min_valid_pixels": 1},
+            "ablations": {"zero_vsm": False, "zero_read_keep_seen": False, "shuffle_vsm": False, "zero_delta": False},
+        },
+    }
+    stage6_entry._run_validation_long_phase_b_round(
+        cfg=cfg,
+        dataset=object(),
+        model=Model(),
+        device=torch.device("cpu"),
+        trigger_train_episode_counter=1,
+        trigger_step=5,
+        metrics_fh=object(),
+        writer=None,
+    )
+    assert seen_specs == [0, 1]
+    summary = rows[-1]
+    assert summary["split"] == "validation_long_phase_b_global"
+    assert summary["num_specs"] == 2
 
 
 def test_direct_validate_long_phase_b_default_ablations_match_config_names(monkeypatch):

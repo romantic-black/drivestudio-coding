@@ -594,7 +594,8 @@ def test_stage6_render_loss_batches_targets_per_frame():
         out = []
         for target in targets:
             gt = target["gt_image"]
-            out.append((torch.full_like(gt, float(target["pred_value"])), torch.ones(gt.shape[:2])))
+            pred = torch.full_like(gt, float(target["pred_value"])).requires_grad_(True)
+            out.append((pred, torch.ones(gt.shape[:2])))
         return out
 
     def fail_single_view(*args, **kwargs):
@@ -625,6 +626,8 @@ def test_stage6_render_loss_batches_targets_per_frame():
     assert torch.isclose(loss, torch.tensor(0.2), atol=1.0e-6)
     assert [float(x[0, 0, 0]) for x in pred_rgbs] == pytest.approx([0.1, 0.2, 0.3])
     assert len(gt_images) == 3
+    assert all(x.device.type == "cpu" and not x.requires_grad for x in pred_rgbs)
+    assert all(x.device.type == "cpu" and not x.requires_grad for x in gt_images)
 
 
 def test_stage6_render_loss_can_disable_grouped_multiview():

@@ -82,9 +82,17 @@ class Stage6PhaseBLongFacadeTrainer:
         scheduler_node_sync: Optional[Dict[str, Any]] = None,
         runtime_policy: Optional[Any] = None,
     ) -> Dict[str, Any]:
-        _ = (step, profile_phase_timing, sync_cuda_timing, runtime_policy)
-        return self.runner.train_step(batch=batch, scheduler_node_sync=scheduler_node_sync)
+        _ = runtime_policy
+        batch = dict(batch)
+        if step is not None:
+            batch["global_step"] = int(step)
+        return self.runner.train_step(
+            batch=batch,
+            step=step,
+            profile_phase_timing=bool(profile_phase_timing),
+            sync_cuda_timing=bool(sync_cuda_timing),
+            scheduler_node_sync=scheduler_node_sync,
+        )
 
 
 __all__ = ["Stage6PhaseBLongFacadeTrainer"]
-

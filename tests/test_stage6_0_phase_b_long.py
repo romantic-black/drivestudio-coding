@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -9,6 +10,7 @@ import torch
 from omegaconf import OmegaConf
 
 from datasets.train_scheduler_long_phase_b import TrainSchedulerLongPhaseB
+import models.streetforward.minimal_trainer_stage6_0 as stage6_mod
 from models.streetforward.minimal_trainer_stage6_0 import MinimalStreetForwardStage6_0
 from models.streetforward.stage6_0 import EventPack, LocalGSState
 from models.streetforward.stage6_0.local_gs_state import LocalBranchState
@@ -20,6 +22,7 @@ from models.streetforward.stage6_0.phase_b_long import (
     materialize_phase_b_state,
 )
 from models.streetforward.stage6_0.phase_b_long.resolver import resolve_long_phase_b_batch
+from models.streetforward.stage6_0.phase_b_long import resolver as phase_b_long_resolver_mod
 from models.streetforward.node_states import NodeStateRigid
 from models.streetforward.struct_decoders.voxel_layout_utils import build_segment_cell_index, build_voxel_layout
 
@@ -775,9 +778,151 @@ def test_phase_b_config_requires_export_payload_by_default():
     assert "load_modules" not in phase_b_init
     assert "freeze_after_load" not in phase_b_init
     assert "train_new_modules" not in phase_b_init
+    assert "phase_B" not in cfg.scheduler_v9
+    assert "validation_v8" not in cfg
+    assert "phase_a" not in cfg.losses
+    assert "current_observation" not in cfg
+    assert "history_memory" not in cfg.model
+    assert "view_transient" not in cfg.model
+    assert "update_gate" not in cfg.model
+    assert set(cfg.optimizer.groups.keys()) == {"long_vsm", "offset_decoder", "default"}
+    assert float(cfg.optimizer.groups.default.lr) == 0.0
+    assert cfg.logging.image_trigger.mode == "raw_step_interval"
+    assert int(cfg.logging.image_trigger.interval_blocks_equiv) == 100
     model = MinimalStreetForwardStage6_0.__new__(MinimalStreetForwardStage6_0)
     torch.nn.Module.__init__(model)
     MinimalStreetForwardStage6_0._validate_stage6_0_phase_b_long_config(model, cfg)
+
+
+def test_phase_b_debug_config_is_lightweight_and_validates():
+    cfg = OmegaConf.load("configs/stage6_0_phase_b_debug.yaml")
+    first_shape = cfg.scheduler_long_phase_b.rollout_shapes_schedule[0].shapes[0]
+    assert first_shape.name == "r2_a2"
+    assert int(first_shape.repeats_per_anchor) == 2
+    assert int(first_shape.anchors_per_rollout) == 2
+    assert cfg.validation_long_phase_b.evidence.interval_T_values == [4]
+    assert list(cfg.validation_long_phase_b.order.extra_orders) == []
+    assert int(cfg.validation_long_phase_b.runtime.max_specs_per_round) == 2
+    assert bool(cfg.validation_long_phase_b.runtime.empty_cache_after_round) is True
+    assert bool(cfg.validation_long_phase_b.ablations.zero_vsm) is True
+    assert bool(cfg.validation_long_phase_b.ablations.shuffle_vsm) is False
+    model = MinimalStreetForwardStage6_0.__new__(MinimalStreetForwardStage6_0)
+    torch.nn.Module.__init__(model)
+    MinimalStreetForwardStage6_0._validate_stage6_0_phase_b_long_config(model, cfg)
+
+
+def test_phase_b_long_forward_collects_debug_images_only_when_requested(monkeypatch):
+    roles = SimpleNamespace(
+        inner_K=1,
+        visits=[
+            SimpleNamespace(
+                frame_idx=10,
+                repeat_idx=0,
+                anchor_id=0,
+                rollout_order_rank=0,
+                chronological_rank=0,
+                visit_pos_code=0.0,
+                frame_time_code=0.0,
+            )
+        ],
+        evidence_source_indices_by_step=[[0]],
+        evidence_refs_by_step=[[(10, 0)]],
+        visit_time_codes=[(0.0, 0.0, 0.0, 0.0)],
+        final_history_recon_target_indices=[0],
+        final_history_nvs_target_indices=[1],
+        final_current_recon_target_indices=[2],
+        final_current_nvs_target_indices=[3],
+        rigid_meta={},
+        request_meta={},
+        shape_name="r1_a1",
+    )
+    monkeypatch.setattr(phase_b_long_resolver_mod, "resolve_long_phase_b_batch", lambda batch: roles)
+
+    class FakeLocalGSState:
+        @staticmethod
+        def from_node_states(*, bg, distant, rigid, hidden_dim):
+            return SimpleNamespace(bg=SimpleNamespace(means=torch.ones(1, 3)), distant=None, rigid=None)
+
+    class FakeOffset:
+        @classmethod
+        def zeros_like(cls, *, base_state, dtype):
+            return cls()
+
+        def detach_for_sensor(self):
+            return self
+
+        def apply(self, delta, *, frame_idx, rigid_meta):
+            return self
+
+    class FakeVSM:
+        def init_state(self, **kwargs):
+            return SimpleNamespace(detach_to_cache_optional=lambda: "cache")
+
+        def write_read(self, **kwargs):
+            return kwargs["state"], object(), {"vsm_aux": 1.0}
+
+    class FakeDecoder:
+        def __call__(self, **kwargs):
+            return SimpleNamespace(stats=lambda prefix: {f"{prefix}/delta_norm": 1.0})
+
+    def fake_final_render_loss(*args, pred_rgbs_out=None, gt_images_out=None, **kwargs):
+        if pred_rgbs_out is not None:
+            pred_rgbs_out.append(torch.full((1, 1, 3), 0.25))
+        if gt_images_out is not None:
+            gt_images_out.append(torch.full((1, 1, 3), 0.75))
+        return torch.tensor(1.0), {"phase_b_long/final_fake": 1.0}
+
+    model = MinimalStreetForwardStage6_0.__new__(MinimalStreetForwardStage6_0)
+    torch.nn.Module.__init__(model)
+    model.stage6_long_vsm = FakeVSM()
+    model.stage6_long_offset_decoder = FakeDecoder()
+    model.stage6_hidden_dim = 4
+    model.stage6_phase_b_long_history_weight = 1.0
+    model.stage6_phase_b_long_current_weight = 1.0
+    model.stage6_phase_b_long_history_l1_weight = 1.0
+    model.stage6_phase_b_long_current_l1_weight = 1.0
+    model.stage6_phase_b_long_history_ssim_weight = 0.0
+    model.stage6_phase_b_long_current_ssim_weight = 0.0
+    model.stage6_phase_b_long_history_mask_policy = "none"
+    model.stage6_phase_b_long_current_mask_policy = "none"
+    model.stage6_phase_b_long_role_render_cfg = {}
+    model.stage6_phase_b_long_offset_reg_cfg = {}
+    model.stage6_phase_b_long_offset_reg_weight = 0.0
+    model._get_or_init_node_states_bg_rigid_distant = lambda batch: (
+        SimpleNamespace(means=torch.ones(1, 3)),
+        None,
+        None,
+    )
+    model._detach_local_state = lambda state: state
+    model._phase_b_long_state_dtype = lambda ref, dtype_name: torch.float32
+    model._phase_b_long_clamp_sensor_state_to_aabb = lambda state: state
+    model._observe_v4_measurement = lambda **kwargs: object()
+    model._build_stage6_event_from_measurement = lambda **kwargs: SimpleNamespace(event_bg=torch.ones(1, 48))
+    model._event_with_default_view_code = lambda event: event
+    model._detach_event_pack = lambda event: event
+    model._phase_b_rigid_route_indices = lambda **kwargs: None
+    model._phase_b_long_vsm_compute_dtype = lambda ref: torch.float32
+    model._phase_b_long_autocast_context = lambda ref: nullcontext()
+    model._mem_debug = lambda *args, **kwargs: None
+    model._cfg_get = MinimalStreetForwardStage6_0._cfg_get
+
+    monkeypatch.setattr(stage6_mod, "LocalGSState", FakeLocalGSState)
+    monkeypatch.setattr(stage6_mod, "PhaseBOffsetState", FakeOffset)
+    monkeypatch.setattr(stage6_mod, "materialize_phase_b_state", lambda **kwargs: kwargs["base_state"])
+    monkeypatch.setattr(stage6_mod, "phase_b_long_final_render_loss", fake_final_render_loss)
+    monkeypatch.setattr(stage6_mod, "phase_b_long_offset_regularization", lambda offset, weights: (torch.tensor(0.0), {}))
+
+    batch = {"source_views": [object()], "targets": [object(), object(), object(), object()]}
+    no_images = MinimalStreetForwardStage6_0._forward_6_0_phase_b_long(model, dict(batch))
+    assert no_images["pred_rgbs"] == []
+    assert no_images["gt_images"] == []
+
+    with_images = MinimalStreetForwardStage6_0._forward_6_0_phase_b_long(
+        model,
+        dict(batch, _stage5_6_collect_debug_images=True, _max_collect_train_images=2),
+    )
+    assert len(with_images["pred_rgbs"]) == 2
+    assert len(with_images["gt_images"]) == 2
 
 
 def test_phase_b_rejects_removed_init_schema_fields():

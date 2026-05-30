@@ -8,6 +8,8 @@ import os
 import sys
 from typing import Any, Dict, Optional
 
+import torch
+
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
 
@@ -371,6 +373,11 @@ def _run_validation_long_phase_b_round(
     plan = build_validation_plan_long_phase_b(dataset=dataset, cfg=cfg, eval_scene_ids=eval_scene_ids)
     if not plan.specs:
         raise ValueError("validation_long_phase_b enabled but no validation specs were built.")
+    runtime_cfg = _cfg_get(raw, "runtime", {}) or {}
+    specs = list(plan.specs)
+    max_specs = int(_cfg_get(runtime_cfg, "max_specs_per_round", 0) or 0)
+    if max_specs > 0:
+        specs = specs[:max_specs]
     mask_cfg = _cfg_get(raw, "masks", {}) or {}
     mask_policy = str(_cfg_get(mask_cfg, "mask_policy", "non_sky_non_egocar"))
     min_valid_pixels = int(_cfg_get(mask_cfg, "min_valid_pixels", 1))
@@ -394,12 +401,12 @@ def _run_validation_long_phase_b_round(
         "VALIDATION_LONG_PHASE_B_BEGIN trigger_episode_counter=%s trigger_step=%s specs=%s T=%s orders=%s",
         int(trigger_train_episode_counter),
         int(trigger_step),
-        int(len(plan.specs)),
+        int(len(specs)),
         [int(x) for x in plan.interval_T_values],
         [str(x) for x in plan.orders],
     )
     rows = []
-    for spec in plan.specs:
+    for spec in specs:
         raw_batch = materialize_validation_long_phase_b_batch(dataset, spec, include_test=False)
         minimal_batch = base.convert_batch_to_minimal_format(
             raw_batch,
@@ -455,6 +462,8 @@ def _run_validation_long_phase_b_round(
         int(len(rows)),
         float(summary.get("val_long/mean_segment_all_psnr", 0.0)),
     )
+    if torch.cuda.is_available() and bool(_cfg_get(runtime_cfg, "empty_cache_after_round", False)):
+        torch.cuda.empty_cache()
 
 
 def _validation_long_phase_b_episode_end_hook(

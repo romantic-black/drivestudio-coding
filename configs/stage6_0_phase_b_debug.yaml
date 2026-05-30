@@ -1,4 +1,4 @@
-output_name: experiment003_cell_memory
+output_name: experiment003_cell_memory_debug
 
 initialization:
   phase_b_from_phase_a:
@@ -140,22 +140,16 @@ scheduler_long_phase_b:
   rollout_shapes_schedule:
     - start_step: 0
       shapes:
-        - {name: r8_a2, repeats_per_anchor: 8, anchors_per_rollout: 2, prob: 1.0}
-    - start_step: 5000
+        - {name: r2_a2, repeats_per_anchor: 2, anchors_per_rollout: 2, prob: 1.0}
+    - start_step: 2000
       shapes:
-        - {name: r6_a4, repeats_per_anchor: 6, anchors_per_rollout: 4, prob: 0.33}
-        - {name: r12_a2, repeats_per_anchor: 12, anchors_per_rollout: 2, prob: 0.33}
-        - {name: r8_a3, repeats_per_anchor: 8, anchors_per_rollout: 3, prob: 0.34}
-    - start_step: 10000
+        - {name: r4_a2, repeats_per_anchor: 4, anchors_per_rollout: 2, prob: 1.0}
+    - start_step: 8000
       shapes:
-        - {name: r6_a6, repeats_per_anchor: 6, anchors_per_rollout: 6, prob: 0.33}
-        - {name: r12_a3, repeats_per_anchor: 12, anchors_per_rollout: 3, prob: 0.33}
-        - {name: r8_a4, repeats_per_anchor: 8, anchors_per_rollout: 4, prob: 0.34}
+        - {name: r4_a4, repeats_per_anchor: 4, anchors_per_rollout: 4, prob: 1.0}
     - start_step: 20000
       shapes:
-        - {name: r6_a8, repeats_per_anchor: 6, anchors_per_rollout: 8, prob: 0.33}
-        - {name: r12_a4, repeats_per_anchor: 12, anchors_per_rollout: 4, prob: 0.33}
-        - {name: r8_a6, repeats_per_anchor: 8, anchors_per_rollout: 6, prob: 0.34}
+        - {name: r8_a4, repeats_per_anchor: 8, anchors_per_rollout: 4, prob: 1.0}
   anchor_sampling:
     min_temporal_span: 1
     max_temporal_span: 80
@@ -169,11 +163,11 @@ scheduler_long_phase_b:
     allow_same_cam_repeat: true
   final_supervision:
     required_final_roles: [final_current_recon, final_current_nvs]
-    history_anchor_count: 3
+    history_anchor_count: 1
     final_history_recon:
       cams_per_anchor: 1
     final_history_nvs:
-      cams_per_anchor: 1
+      cams_per_anchor: 0
     final_current_recon:
       cams: 1
     final_current_nvs:
@@ -200,16 +194,16 @@ validation_long_phase_b:
     policy: first
     fixed_segment_ids: []
     max_segments_per_scene: 1
-    max_frames_per_segment: 24
+    max_frames_per_segment: 12
     target_frame_stride: 1
   evidence:
-    interval_T_values: [1, 2, 4, 8]
-    repeats_per_evidence_frame: 2
+    interval_T_values: [4]
+    repeats_per_evidence_frame: 1
     evidence_cams_per_frame: 1
     cam_policy: fixed_round_robin
   order:
     primary: chronological
-    extra_orders: [reverse, random_seeded]
+    extra_orders: []
   render_eval:
     reconstruction:
       enable: true
@@ -221,21 +215,21 @@ validation_long_phase_b:
       eval_non_evidence_frames: true
       cams_per_non_evidence_frame: 1
     segment_all:
-      max_render_refs: 64
+      max_render_refs: 16
   masks:
     mask_policy: non_sky_non_egocar
     min_valid_pixels: 1
   ablations:
     zero_vsm: true
-    zero_read_keep_seen: true
-    shuffle_vsm: true
+    zero_read_keep_seen: false
+    shuffle_vsm: false
     zero_delta: true
   trigger:
-    validate_every_n_episodes: 100
+    validate_every_n_episodes: 100000
     run_at_train_start: false
   runtime:
-    max_specs_per_round: 0
-    empty_cache_after_round: false
+    max_specs_per_round: 2
+    empty_cache_after_round: true
 
 model:
   stage: "6_0"

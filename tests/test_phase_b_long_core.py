@@ -19,6 +19,10 @@ from streetforward_core.protocols.phase_b_long import (
 from streetforward_core.protocols.refs import ImageRef
 from streetforward_core.protocols.roles import LongRole
 from streetforward_core.protocols.validators import validate_phase_b_long_plan
+from streetforward_core.recipes.phase_b_long_recipe import PhaseBLongForwardOutput
+from streetforward_core.train.phase_b_long_runner import PhaseBLongTrainRunner
+from streetforward_core.train.stage6_phase_b_long_trainer import Stage6PhaseBLongFacadeTrainer
+import tools.train_minimal_streetforward_stage4_3_multi_scene_v4 as train_base
 from tools.train_minimal_streetforward_stage6_0_multi_scene_v9 import (
     _scheduler_long_phase_b_enabled,
     _validation_long_phase_b_enabled,
@@ -242,3 +246,152 @@ def test_phase_b_checkpoint_prefix_is_phase_b_long():
         checkpoint_prefix_stage6_from_cfg(OmegaConf.create({"model": {"phase": "phase_A_block_local_unroll"}}))
         == "minimal_sf_stage6_0_phase_a_v9"
     )
+
+
+def test_phase_b_long_runner_logs_timing_metadata_and_only_endpoint_k_metrics():
+    weight = torch.nn.Parameter(torch.tensor(1.0))
+
+    class Optimizer:
+        def zero_grad(self, set_to_none=True):
+            if weight.grad is not None:
+                weight.grad = None
+
+        def step(self):
+            with torch.no_grad():
+                weight.sub_(0.01 * weight.grad)
+
+    class Runtime:
+        optimizer = Optimizer()
+        node_states_bg = {}
+        node_states_distant = {}
+        node_states_rigid = {}
+
+        def train(self):
+            pass
+
+        def _stage6_assert_required_group_grads_phase_b_long(self, legacy):
+            return {
+                "grad/stage6_long_vsm_sum": 1.0,
+                "grad/stage6_long_offset_decoder_sum": 1.0,
+            }
+
+        def _stage6_compute_and_check_grad_norm(self):
+            return weight.grad.detach().abs()
+
+    class Recipe(torch.nn.Module):
+        def forward(self, batch):
+            roles = SimpleNamespace(
+                inner_K=4,
+                request_meta={
+                    "global_step": 11,
+                    "rollout_id": 22,
+                    "rollout_id_in_episode": 2,
+                    "episode_window_id": 7,
+                    "rollout_budget_per_episode": 4,
+                    "shape_name": "r2_a2",
+                },
+            )
+            legacy = {
+                "loss": weight * 2.0,
+                "roles": roles,
+                "stats": {"phase_b_long/custom_stat": 3.0},
+                "per_step": [
+                    {"k": 0, "metric": 1.0},
+                    {"k": 1, "metric": 2.0},
+                    {"k": 2, "metric": 3.0},
+                    {"k": 3, "metric": 4.0},
+                ],
+                "num_targets": 3,
+                "num_source_views": 4,
+                "pred_rgbs": [],
+                "gt_images": [],
+                "node_state_bg": SimpleNamespace(means=torch.zeros(2, 3)),
+                "node_state_distant": None,
+                "node_state_rigid": None,
+            }
+            return PhaseBLongForwardOutput(loss=legacy["loss"], legacy=legacy)
+
+    logs = PhaseBLongTrainRunner(runtime=Runtime(), recipe=Recipe()).train_step(
+        {"global_step": 9},
+        step=10,
+        profile_phase_timing=True,
+        sync_cuda_timing=False,
+    )
+    assert logs["train_iter"] == 10
+    assert logs["rollout_step"] == 11
+    assert logs["rollout_id"] == 22
+    assert logs["rollout_id_in_episode"] == 2
+    assert logs["episode_window_id"] == 7
+    assert logs["shape_name"] == "r2_a2"
+    assert logs["visit_count"] == 4
+    assert logs["forward_ms"] > 0.0
+    assert logs["backward_ms"] > 0.0
+    assert logs["grad_check_ms"] >= 0.0
+    assert logs["optimizer_ms"] >= 0.0
+    assert logs["phase_b_long/k0/metric"] == 1.0
+    assert logs["phase_b_long/k3/metric"] == 4.0
+    assert "phase_b_long/k1/metric" not in logs
+    assert "phase_b_long/k2/metric" not in logs
+
+
+def test_phase_b_long_facade_train_step_passes_timing_arguments():
+    class Runner:
+        def train_step(self, **kwargs):
+            self.kwargs = kwargs
+            return {"ok": True}
+
+    trainer = Stage6PhaseBLongFacadeTrainer.__new__(Stage6PhaseBLongFacadeTrainer)
+    trainer.runner = Runner()
+    batch = {"x": 1}
+    out = trainer.train_step(
+        batch,
+        step=5,
+        profile_phase_timing=True,
+        sync_cuda_timing=True,
+        scheduler_node_sync={"reset_after_block": False},
+        runtime_policy=object(),
+    )
+    assert out == {"ok": True}
+    assert "global_step" not in batch
+    assert trainer.runner.kwargs["batch"]["global_step"] == 5
+    assert trainer.runner.kwargs["step"] == 5
+    assert trainer.runner.kwargs["profile_phase_timing"] is True
+    assert trainer.runner.kwargs["sync_cuda_timing"] is True
+    assert trainer.runner.kwargs["scheduler_node_sync"] == {"reset_after_block": False}
+
+
+def test_save_train_monitor_triplets_allows_phase_b_long_non_block_indices(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_save(step, pred, gt, out_dir, *, view_suffix, save_error):
+        calls.append(
+            {
+                "step": int(step),
+                "out_dir": str(out_dir),
+                "view_suffix": str(view_suffix),
+                "save_error": bool(save_error),
+                "pred_requires_grad": bool(pred.requires_grad),
+                "gt_requires_grad": bool(gt.requires_grad),
+            }
+        )
+
+    monkeypatch.setattr(train_base, "_save_image_triplet", fake_save)
+    raw_batch = {
+        "scene_folder_name": "014",
+        "target": {
+            "frame_indices": torch.tensor([123]),
+            "cam_indices": torch.tensor([1]),
+        },
+    }
+    train_base._save_train_monitor_triplets(
+        step=17,
+        pred_rgbs=[torch.zeros(2, 2, 3)],
+        gt_images=[torch.ones(2, 2, 3)],
+        raw_batch=raw_batch,
+        log_dir=str(tmp_path),
+        block_idx_global=-1,
+        scene_id_fallback=14,
+        pixel_camera_ids=[0, 1, 2],
+    )
+    assert len(calls) == 1
+    assert calls[0]["view_suffix"].startswith("b000017_sc014_v0_f00123_c1")

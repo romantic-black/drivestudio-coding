@@ -136,6 +136,87 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         cfg = copy.deepcopy(config)
         model_cfg = self._require_key(cfg, "model", "config")
         model_cfg["stage"] = "5_4"
+        if self._cfg_get(cfg, "current_observation", None) is None:
+            cfg["current_observation"] = {
+                "enable": True,
+                "dim": 2,
+                "rho_source": "feature",
+                "eps": 1.0e-6,
+                "input_to_struct_decoder": False,
+                "input_to_far_mlp": False,
+                "input_to_gru": False,
+                "input_to_history_gate": False,
+                "record_to_history_memory": False,
+            }
+        if self._cfg_get(model_cfg, "history_memory", None) is None:
+            model_cfg["history_memory"] = {
+                "enable": True,
+                "record_on": "block_exit",
+                "record_views": "source_image_refs",
+                "support": {
+                    "fast_ema_beta_visible": 0.35,
+                    "fast_ema_beta_invisible": 0.60,
+                    "slow_ema_beta_visible": 0.90,
+                    "slow_ema_beta_invisible": 0.95,
+                },
+                "residual": {
+                    "fast_error_beta": 0.35,
+                    "slow_error_beta": 0.9,
+                    "error_eps": 1.0e-6,
+                },
+                "update": {
+                    "fast_ema_beta": 0.45,
+                    "slow_ema_beta": 0.92,
+                    "apply_in_eval": True,
+                },
+            }
+        if self._cfg_get(model_cfg, "view_transient", None) is None:
+            model_cfg["view_transient"] = {
+                "enable": True,
+                "source": "ego_to_point",
+                "input_to_gate": True,
+                "input_to_struct_decoder": False,
+                "use_delta_xyz": True,
+                "use_delta_norm": True,
+                "use_angle_delta": False,
+                "use_initialized_flag": False,
+                "detach": True,
+                "update_in_train": True,
+                "update_in_eval": True,
+            }
+        if self._cfg_get(model_cfg, "update_gate", None) is None:
+            model_cfg["update_gate"] = {
+                "enable": True,
+                "type": "attribute_5",
+                "hidden_dim": 48,
+                "require_initialized_in_input": True,
+                "include_visible_now": True,
+                "bind_with_mask_update": True,
+                "min_gate": {
+                    "means": 0.03,
+                    "scales": 0.03,
+                    "quat": 0.01,
+                    "opacity": 0.05,
+                    "sh": 0.05,
+                },
+                "init_bias": {
+                    "means": -1.40,
+                    "scales": -1.70,
+                    "quat": -2.00,
+                    "opacity": -0.40,
+                    "sh": 0.40,
+                },
+                "branch_bias": {
+                    "bg": {"means": 0.0, "scales": 0.0, "quat": -0.2, "opacity": 0.0, "sh": 0.1},
+                    "distant": {"means": -1.0, "scales": -0.3, "quat": -1.0, "opacity": 0.0, "sh": 0.0},
+                    "rigid_in": {"means": -0.2, "scales": -0.2, "quat": -0.3, "opacity": 0.1, "sh": 0.2},
+                    "rigid_out": {"means": -0.8, "scales": -0.3, "quat": -0.8, "opacity": 0.0, "sh": 0.0},
+                },
+                "hidden_gate": {
+                    "mode": "weighted_sum",
+                    "weights": {"means": 0.2, "scales": 0.0, "quat": 0.0, "opacity": 0.3, "sh": 0.5},
+                },
+            }
         hist = self._cfg_get(model_cfg, "history_memory", None)
         if hist is not None:
             hist["enable"] = True
@@ -2219,9 +2300,9 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 ssim_weight=float(getattr(self, "loss_w_ssim", 0.0)) if ssim_weight is None else float(ssim_weight),
             )
             if pred_rgbs_out is not None:
-                pred_rgbs_out.append(pred.detach())
+                pred_rgbs_out.append(pred.detach().float().clamp(0.0, 1.0).cpu())
             if gt_images_out is not None:
-                gt_images_out.append(gt.detach())
+                gt_images_out.append(gt.detach().float().clamp(0.0, 1.0).cpu())
             losses.append(loss_i)
             if float(stat_i.get("skipped_no_valid_pixels", 0.0)) < 0.5:
                 psnr_vals.append(float(stat_i["psnr"]))
@@ -3397,6 +3478,13 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             raise ValueError("6_0_phase_b requires non-empty source_views.")
         if len(batch.get("targets", [])) == 0:
             raise ValueError("6_0_phase_b requires non-empty final targets.")
+        collect_images = bool(
+            batch.get("_stage5_6_collect_debug_images", False)
+            or batch.get("_collect_train_images", False)
+        )
+        max_collect_images = int(batch.get("_max_collect_train_images", 8) or 8)
+        pred_rgbs: List[torch.Tensor] = []
+        gt_images: List[torch.Tensor] = []
 
         node_state_bg, node_state_rigid, node_state_distant = self._get_or_init_node_states_bg_rigid_distant(batch)
         local_base = LocalGSState.from_node_states(
@@ -3515,6 +3603,8 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 mask_policy=str(self._cfg_get(cfg_role, "mask_policy", default_mask)),
                 l1_weight=float(self._cfg_get(cfg_role, "l1_weight", default_l1)),
                 ssim_weight=float(self._cfg_get(cfg_role, "ssim_weight", default_ssim)),
+                pred_rgbs_out=pred_rgbs if collect_images else None,
+                gt_images_out=gt_images if collect_images else None,
             )
             weight_i = float(self._cfg_get(cfg_role, "weight", default_weight))
             role_losses[str(role_name)] = loss_i
@@ -3560,6 +3650,8 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "reg_loss": reg_loss.detach(),
             "num_targets": len(batch.get("targets", [])),
             "num_source_views": len(batch.get("source_views", [])),
+            "pred_rgbs": pred_rgbs[:max_collect_images] if collect_images else [],
+            "gt_images": gt_images[:max_collect_images] if collect_images else [],
         }
 
     def forward(self, batch: Dict[str, Any]) -> Dict[str, Any]:

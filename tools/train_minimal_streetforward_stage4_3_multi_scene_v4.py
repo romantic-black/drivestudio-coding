@@ -291,21 +291,24 @@ def _save_train_monitor_triplets(
     scene_id_fallback: Any,
     pixel_camera_ids: List[int],
 ) -> None:
-    if int(block_idx_global) < 1:
+    if len(pred_rgbs) == 0 or len(gt_images) == 0:
         return
     out_dir = os.path.join(log_dir, "images", "train")
     tgt_meta = raw_batch.get("target") or {}
     fi_t = tgt_meta.get("frame_indices")
     ci_t = tgt_meta.get("cam_indices")
     sc_lab = _scene_folder_label_from_batch(raw_batch, scene_id_fallback)
-    for v in range(len(pred_rgbs)):
+    safe_block_idx = int(block_idx_global)
+    if safe_block_idx < 0:
+        safe_block_idx = int(step)
+    for v in range(min(len(pred_rgbs), len(gt_images))):
         if fi_t is not None and ci_t is not None and int(fi_t.shape[0]) > v and int(ci_t.shape[0]) > v:
             f_lab = int(fi_t[v].item())
             c_lab = int(ci_t[v].item())
             nusc_suf = _nuscenes_cam_id_suffix(pixel_camera_ids, c_lab)
-            vsuf = f"b{int(block_idx_global):06d}_sc{sc_lab}_v{v}_f{f_lab:05d}_c{c_lab}{nusc_suf}"
+            vsuf = f"b{safe_block_idx:06d}_sc{sc_lab}_v{v}_f{f_lab:05d}_c{c_lab}{nusc_suf}"
         else:
-            vsuf = f"b{int(block_idx_global):06d}_sc{sc_lab}_view{v}"
+            vsuf = f"b{safe_block_idx:06d}_sc{sc_lab}_view{v}"
         _save_image_triplet(
             step,
             pred_rgbs[v],
@@ -2395,7 +2398,7 @@ def main() -> None:
                         train_step_row[k] = int(v)
                     elif isinstance(v, float):
                         train_step_row[k] = float(v)
-                    elif isinstance(v, str) and k in {"stage6/phase"}:
+                    elif isinstance(v, str) and k in {"stage6/phase", "shape_name"}:
                         train_step_row[k] = str(v)
                 if diag_row:
                     train_step_row.update(diag_row)
