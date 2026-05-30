@@ -19,11 +19,10 @@ from models.streetforward.stage6_0.phase_b_long.types import LongVSMReadPack
 
 DEFAULT_LONG_VSM_ABLATIONS = (
     "normal",
+    "zero_vsm",
     "zero_read_keep_seen",
-    "zero_read_zero_seen",
+    "shuffle_vsm",
     "zero_delta",
-    "shuffle_read",
-    "seen_only",
 )
 
 

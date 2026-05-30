@@ -1091,3 +1091,50 @@ A: 当前 `validate_v9_phase_a` 仍显式代理到 legacy validation path；reci
 ## 17. 一句话总结
 
 Phase A 应该被重构为 StreetForward 的第一个“协议驱动 recipe”：scheduler 只声明局部观测-监督计划，dataset 只物化图像 refs，adapter 只提供 V4 measurement/rendering，PhaseARecipe 只学习 `measurement → struct event → posterior delta → local GS update → render loss` 这个科研闭环。
+
+---
+
+## 18. Phase B Long 当前主线
+
+Phase B Long 不再和旧 `phase_B_viewset_rollout / scheduler_v9` 共用主配置。当前主线固定为：
+
+```text
+model.phase = 6_0_phase_b
+scheduler_long_phase_b.enable = true
+scheduler_long_phase_b.version = long_v1
+validation_long_phase_b.enable = true
+scheduler_v9.enable = false
+validation_v9.enable = false
+```
+
+新的 Phase B Long batch 路径是：
+
+```text
+TrainSchedulerLongPhaseB
+  emits PhaseBLongRolloutPlan
+        ↓
+validate_phase_b_long_plan
+        ↓
+PhaseBLongBatchAssembler
+  materializes source/target ImageRef batch
+        ↓
+PhaseBLongBatchResolver
+  returns ResolvedLongPhaseBBatch
+        ↓
+PhaseBLongRecipe / PhaseBLongTrainRunner
+```
+
+`PhaseBLongRolloutPlan` 的协议版本是 `sf.phase_b_long.v1`，scheduler 版本是 `long_v1`。允许的监督 role 只包括：
+
+```text
+final_history_recon
+final_history_nvs
+final_current_recon
+final_current_nvs
+```
+
+`prefix_loss`、`query_label`、`block_loss`、`nearby_loss` 属于旧 Phase B/V9 语义，Long V1 resolver 和 validator 必须拒绝它们。Long V1 的科研边界是 `long VSM / offset decoder → final render loss`，不是 query decoder，也不是 Phase A 的大 K 版本。
+
+Phase B Long 初始化只接受 `MinimalStreetForwardStage6_0.build_phase_b_export_checkpoint()` 生成的 `export_type=stage6_0_phase_a_for_phase_b` payload。普通 Phase A resume checkpoint 默认拒绝；`load_modules`、`freeze_after_load`、`train_new_modules` 不再作为配置 schema 暴露，因为当前加载、冻结和 trainability 策略是固定 contract。
+
+当前 `Stage6PhaseBLongFacadeTrainer` 和 `PhaseBLongRecipe` 仍是 legacy-backed parity 层：外壳提供新 recipe/runner 入口，但内部仍通过 `MinimalStreetForwardStage6_0` 复用已有 state、renderer、optimizer/checkpoint 和 `_forward_6_0_phase_b_long`。真正把 FrozenPhaseAObserver、LongVSM、offset decoder 和 final render loss 完全迁出 legacy runtime，是下一阶段工作。

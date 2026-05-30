@@ -26,6 +26,7 @@ import io
 import json
 import logging
 import os
+import random
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -83,6 +84,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 current_time = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
 CKPT_PREFIX = "minimal_sf_stage4_3_multi_scene_v4"
+CHECKPOINT_PREFIX_RESOLVER = None
 TRAINER_CLASS = MinimalStreetForwardStage4_3
 DEFAULT_CONFIG_FILE = "configs/minimal_streetforward_stage4_3_multi_scene_v4.yaml"
 ALLOW_ONE_SEGMENT = False
@@ -99,6 +101,163 @@ def _scene_dir_str(scene_id: Any) -> str:
     if s < 0:
         return "unknown"
     return f"{s:03d}"
+
+
+def _checkpoint_prefix_for_cfg(cfg: Any) -> str:
+    resolver = globals().get("CHECKPOINT_PREFIX_RESOLVER", None)
+    if callable(resolver):
+        return str(resolver(cfg))
+    return str(CKPT_PREFIX)
+
+
+def _checkpoint_step(payload: Dict[str, Any], default: int = 0) -> int:
+    for key in ("global_step", "step", "iteration", "iter"):
+        value = payload.get(key)
+        if value is not None:
+            return int(value)
+    lr_info = payload.get("lr_scheduler")
+    if isinstance(lr_info, dict) and lr_info.get("global_step") is not None:
+        return int(lr_info["global_step"])
+    opt_state = payload.get("optimizer_state_dict")
+    if isinstance(opt_state, dict) and opt_state.get("_sf_global_step") is not None:
+        return int(opt_state["_sf_global_step"])
+    return int(default)
+
+
+def _capture_rng_state() -> Dict[str, Any]:
+    state: Dict[str, Any] = {
+        "python_random": random.getstate(),
+        "numpy_random": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["torch_cuda_all"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_rng_state(state: Any) -> None:
+    if not isinstance(state, dict):
+        logger.warning("Resume checkpoint has no rng_state; sampling will not be bitwise-continuous.")
+        return
+    try:
+        if "python_random" in state:
+            random.setstate(state["python_random"])
+        if "numpy_random" in state:
+            np.random.set_state(state["numpy_random"])
+        if "torch_cpu" in state:
+            torch.set_rng_state(state["torch_cpu"].detach().cpu())
+        cuda_states = state.get("torch_cuda_all")
+        if cuda_states is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all([x.detach().cpu() for x in list(cuda_states)])
+        logger.info("Restored RNG state from resume checkpoint.")
+    except Exception:
+        logger.exception("Failed to restore RNG state from resume checkpoint; continuing with current RNG state.")
+
+
+def _restore_scheduler_state_from_checkpoint(scheduler: Any, payload: Dict[str, Any]) -> bool:
+    state = payload.get("scheduler_state")
+    if not isinstance(state, dict):
+        logger.warning("Resume checkpoint has no scheduler_state; scheduler traversal will restart from a fresh plan.")
+        return False
+    loader = getattr(scheduler, "load_state_dict", None)
+    if not callable(loader):
+        logger.warning("Scheduler %s does not implement load_state_dict; cannot restore scheduler_state.", type(scheduler).__name__)
+        return False
+    loader(state)
+    logger.info(
+        "Restored scheduler_state version=%s global_step=%s epoch_idx=%s.",
+        state.get("scheduler_version"),
+        state.get("global_step"),
+        state.get("epoch_idx"),
+    )
+    return True
+
+
+def _apply_scheduler_start_step(scheduler: Any, start_step: int) -> None:
+    if int(start_step) <= 0:
+        return
+    if hasattr(scheduler, "global_step"):
+        setattr(scheduler, "global_step", int(start_step))
+    prefetch = getattr(scheduler, "_prefetch_v9_plan_for_current_state", None)
+    if callable(prefetch):
+        prefetch()
+    logger.info("Applied training.start_step=%s to scheduler global_step.", int(start_step))
+
+
+def _resolve_resume_checkpoint_cfg(cfg: Any, args: argparse.Namespace) -> str:
+    cli_path = str(getattr(args, "resume_checkpoint", "") or "")
+    training_cfg = cfg.get("training") or {}
+    cfg_path = str(training_cfg.get("resume_checkpoint", "") or "")
+    return cli_path or cfg_path
+
+
+def _resolve_start_step(cfg: Any, args: argparse.Namespace, resume_payload: Optional[Dict[str, Any]]) -> int:
+    cli_start = getattr(args, "start_step", None)
+    if cli_start is not None:
+        return int(cli_start)
+    training_cfg = cfg.get("training") or {}
+    cfg_start = int(training_cfg.get("start_step", 0) or 0)
+    if cfg_start > 0:
+        return int(cfg_start)
+    if resume_payload is not None:
+        return int(_checkpoint_step(resume_payload)) + 1
+    return 0
+
+
+def _load_resume_checkpoint(path: str, model: Any) -> Dict[str, Any]:
+    if not path:
+        return {}
+    ckpt = torch.load(path, map_location="cpu")
+    if not isinstance(ckpt, dict):
+        raise ValueError(f"Resume checkpoint must be a dict payload, got {type(ckpt)}: {path}")
+    sd = ckpt.get("model_state_dict")
+    if sd is None:
+        raise ValueError(f"Resume checkpoint missing model_state_dict: {path}")
+    model.load_state_dict(sd, strict=True)
+    od = ckpt.get("optimizer_state_dict")
+    if od is None:
+        raise ValueError(f"Resume checkpoint missing optimizer_state_dict: {path}")
+    if hasattr(model, "load_optimizer_state_from_checkpoint"):
+        loaded = bool(model.load_optimizer_state_from_checkpoint(ckpt))
+        if not loaded:
+            raise ValueError(f"Resume checkpoint optimizer state is incompatible with current model/config: {path}")
+    else:
+        model.optimizer.load_state_dict(od)
+    runtime_loader = getattr(model, "load_runtime_state_from_checkpoint", None)
+    if callable(runtime_loader):
+        runtime_loader(ckpt)
+    logger.info(
+        "Loaded resume_checkpoint from %s (saved_step=%s, global_step=%s)",
+        path,
+        ckpt.get("step"),
+        ckpt.get("global_step"),
+    )
+    return ckpt
+
+
+def _checkpoint_runtime_extra(
+    *,
+    model: Any,
+    scheduler: Any,
+    train_episode_counter: int,
+    step: int,
+    start_step: int,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "train_loop": {
+            "start_step": int(start_step),
+            "saved_at_step": int(step),
+            "train_episode_counter": int(train_episode_counter),
+        },
+        "rng_state": _capture_rng_state(),
+    }
+    state_fn = getattr(scheduler, "state_dict", None)
+    if callable(state_fn):
+        payload["scheduler_state"] = state_fn()
+    model_runtime_fn = getattr(model, "build_runtime_checkpoint_extra", None)
+    if callable(model_runtime_fn):
+        payload.update(model_runtime_fn())
+    return payload
 
 
 def _scene_folder_label_from_batch(raw_batch: Dict[str, Any], scene_id_fallback: Any) -> str:
@@ -1364,6 +1523,18 @@ def main() -> None:
         action="store_true",
         help="With --init_checkpoint, only restore model weights (fresh Adam state).",
     )
+    parser.add_argument(
+        "--resume_checkpoint",
+        type=str,
+        default="",
+        help="Resume training from a checkpoint, restoring model and optimizer state.",
+    )
+    parser.add_argument(
+        "--start_step",
+        type=int,
+        default=None,
+        help="Override training.start_step; interpreted as the first loop step to run.",
+    )
     parser.add_argument("opts", nargs="*", help="Override config")
     args = parser.parse_args()
 
@@ -1608,7 +1779,8 @@ def main() -> None:
             str(sv9_execution.get("reset_policy", "episode_end")),
         )
 
-    max_iterations = args.max_steps or cfg.training.get("max_iterations", 1000)
+    max_iterations = int(args.max_steps or cfg.training.get("max_iterations", 1000))
+    resume_checkpoint = _resolve_resume_checkpoint_cfg(cfg, args)
     log_interval = cfg.training.get("log_interval", 50)
     save_every = cfg.training.get("save_checkpoint_freq", 500)
     enable_psnr = bool(cfg.eval.get("enable_psnr", True))
@@ -1657,6 +1829,10 @@ def main() -> None:
     )
     enable_jsonl_metrics = bool(cfg.logging.get("enable_jsonl_metrics", True))
     metrics_history_append = bool(cfg.logging.get("metrics_history_append", True))
+    if resume_checkpoint and not metrics_history_append:
+        logger.warning(
+            "Resume is active but logging.metrics_history_append=false; using the same log_dir would overwrite metrics_history.jsonl."
+        )
     image_trigger_cfg = cfg.logging.get("image_trigger") or {}
     if image_trigger_cfg:
         image_trigger_mode = str(image_trigger_cfg.get("mode", "raw_step_interval")).strip()
@@ -1743,12 +1919,57 @@ def main() -> None:
                 )
     model.train()
     init_checkpoint, init_weights_only, require_export_type = _resolve_init_checkpoint_cfg(cfg, args)
-    _load_init_checkpoint(
-        init_checkpoint,
-        model,
-        device,
-        weights_only=init_weights_only,
-        require_export_type=require_export_type,
+    if resume_checkpoint and init_checkpoint:
+        raise ValueError(
+            "--resume_checkpoint / training.resume_checkpoint cannot be combined with init_checkpoint. "
+            "Use resume for continuation or init_checkpoint for warm-start initialization."
+        )
+    resume_payload: Optional[Dict[str, Any]] = None
+    if resume_checkpoint:
+        resume_payload = _load_resume_checkpoint(resume_checkpoint, model)
+    else:
+        _load_init_checkpoint(
+            init_checkpoint,
+            model,
+            device,
+            weights_only=init_weights_only,
+            require_export_type=require_export_type,
+        )
+    start_step = _resolve_start_step(cfg, args, resume_payload)
+    if start_step < 0:
+        raise ValueError(f"training.start_step must be >= 0, got {int(start_step)}")
+    if resume_payload is not None:
+        expected_resume_step = int(_checkpoint_step(resume_payload)) + 1
+        if int(start_step) != int(expected_resume_step):
+            logger.warning(
+                "Resume start_step=%s differs from checkpoint step + 1 (%s); "
+                "this is a manual override and may not be a strict continuation.",
+                int(start_step),
+                int(expected_resume_step),
+            )
+        restored_scheduler = _restore_scheduler_state_from_checkpoint(scheduler, resume_payload)
+        if not restored_scheduler:
+            _apply_scheduler_start_step(scheduler, start_step)
+        _restore_rng_state(resume_payload.get("rng_state"))
+        train_loop_state = resume_payload.get("train_loop")
+        if isinstance(train_loop_state, dict) and train_loop_state.get("train_episode_counter") is not None:
+            train_episode_counter = int(train_loop_state["train_episode_counter"])
+        else:
+            logger.warning(
+                "Resume checkpoint has no train_loop.train_episode_counter; validation episode counters restart at 0."
+            )
+    else:
+        _apply_scheduler_start_step(scheduler, start_step)
+    if max_iterations > 0 and int(start_step) >= int(max_iterations):
+        raise ValueError(
+            f"start_step={int(start_step)} is >= training.max_iterations/--max_steps={int(max_iterations)}. "
+            "max_iterations is interpreted as an absolute exclusive end step."
+        )
+    logger.info(
+        "Training loop step range: start_step=%s max_iterations=%s resume_checkpoint=%s",
+        int(start_step),
+        int(max_iterations),
+        bool(resume_checkpoint),
     )
 
     psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
@@ -1798,7 +2019,7 @@ def main() -> None:
                 validation_cfg=validation_v7_cfg,
                 device=device,
                 trigger_train_episode_counter=0,
-                trigger_step=-1,
+                trigger_step=int(start_step) - 1,
                 psnr_metric=psnr_metric,
                 ssim_metric=ssim_metric,
                 lpips_metric=lpips_metric,
@@ -1812,7 +2033,7 @@ def main() -> None:
                 model=model,
                 device=device,
                 trigger_train_episode_counter=0,
-                trigger_step=-1,
+                trigger_step=int(start_step) - 1,
                 psnr_metric=psnr_metric,
                 ssim_metric=ssim_metric,
                 lpips_metric=lpips_metric,
@@ -1820,7 +2041,7 @@ def main() -> None:
                 writer=writer,
             )
 
-        for step in range(max_iterations):
+        for step in range(int(start_step), int(max_iterations)):
             iter_t0 = time.perf_counter()
             fetch_t0 = time.perf_counter()
             raw_batch = scheduler.next_batch()
@@ -2775,7 +2996,8 @@ def main() -> None:
             checkpoint_ms = 0.0
             if save_every and step > 0 and step % save_every == 0:
                 ckpt_t0 = time.perf_counter()
-                ckpt_path = os.path.join(cfg.log_dir, "checkpoints", f"{CKPT_PREFIX}_step{step}.pt")
+                ckpt_prefix = _checkpoint_prefix_for_cfg(cfg)
+                ckpt_path = os.path.join(cfg.log_dir, "checkpoints", f"{ckpt_prefix}_step{step}.pt")
                 ckpt_payload = {
                     "step": step,
                     "model_state_dict": model.state_dict(),
@@ -2783,6 +3005,15 @@ def main() -> None:
                 }
                 if hasattr(model, "build_light_checkpoint_extra"):
                     ckpt_payload.update(model.build_light_checkpoint_extra(step=int(step)))
+                ckpt_payload.update(
+                    _checkpoint_runtime_extra(
+                        model=model,
+                        scheduler=scheduler,
+                        train_episode_counter=int(train_episode_counter),
+                        step=int(step),
+                        start_step=int(start_step),
+                    )
+                )
                 torch.save(
                     ckpt_payload,
                     ckpt_path,
@@ -2815,6 +3046,7 @@ def main() -> None:
                 )
 
         summary = {
+            "start_step": int(start_step),
             "final_step": int(max_iterations - 1),
             "train": {"loss": float(result["loss"]) if result is not None else float("nan")},
             "gs_stats": {
@@ -2851,7 +3083,7 @@ def main() -> None:
         if hasattr(dataset, "shutdown_preload"):
             dataset.shutdown_preload()
 
-    final_ckpt = os.path.join(cfg.log_dir, "checkpoints", f"{CKPT_PREFIX}_final.pt")
+    final_ckpt = os.path.join(cfg.log_dir, "checkpoints", f"{_checkpoint_prefix_for_cfg(cfg)}_final.pt")
     final_payload = {
         "step": max_iterations - 1,
         "model_state_dict": model.state_dict(),
@@ -2859,6 +3091,15 @@ def main() -> None:
     }
     if hasattr(model, "build_light_checkpoint_extra"):
         final_payload.update(model.build_light_checkpoint_extra(step=int(max_iterations - 1)))
+    final_payload.update(
+        _checkpoint_runtime_extra(
+            model=model,
+            scheduler=scheduler,
+            train_episode_counter=int(train_episode_counter),
+            step=int(max_iterations - 1),
+            start_step=int(start_step),
+        )
+    )
     torch.save(
         final_payload,
         final_ckpt,

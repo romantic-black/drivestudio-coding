@@ -39,7 +39,9 @@ from datasets.validation_long_phase_b import (
 from models.streetforward.minimal_trainer_stage6_0 import MinimalStreetForwardStage6_0
 from models.streetforward.validation_v9_runner import aggregate_validation_v9_phase_a_rows
 from streetforward_core.data.schedulers.legacy_v9_phase_a_adapter import LegacyV9PhaseASchedulerAdapter
+from streetforward_core.protocols.phase_b_long import PHASE_B_LONG_NAME
 from streetforward_core.protocols.rollout import PHASE_A_NAME
+from streetforward_core.train.stage6_phase_b_long_trainer import Stage6PhaseBLongFacadeTrainer
 from streetforward_core.train.stage6_phase_a_trainer import Stage6PhaseAFacadeTrainer
 from tools.streetforward_validation_v9_config import ValidationV9Config, parse_validation_v9_config
 from tools.train_minimal_streetforward_stage4_3_v7_common import parse_include_test, validate_train_scene_for_fixed
@@ -72,20 +74,60 @@ def _metric_or_nan(row: Dict[str, Any], key: str) -> float:
 
 
 def _scheduler_long_phase_b_enabled(cfg: Any) -> bool:
-    _ = cfg
-    return False
+    raw = cfg.get("scheduler_long_phase_b") if hasattr(cfg, "get") else None
+    return raw is not None and bool(_cfg_get(raw, "enable", False))
 
 
 def _validation_long_phase_b_enabled(cfg: Any) -> bool:
-    _ = cfg
-    return False
+    raw = cfg.get("validation_long_phase_b") if hasattr(cfg, "get") else None
+    return raw is not None and bool(_cfg_get(raw, "enable", False))
 
 
 def resolve_fixed_scene_segment_stage6(cfg: Any) -> tuple[Optional[int], Optional[int]]:
+    if _scheduler_long_phase_b_enabled(cfg):
+        slong = cfg.get("scheduler_long_phase_b") if hasattr(cfg, "get") else None
+        traversal = _cfg_get(slong, "traversal", {}) or {}
+        fixed_scene_id = _cfg_get(traversal, "fixed_scene_id", None)
+        fixed_segment_id = _cfg_get(traversal, "fixed_segment_id", None)
+        return (
+            None if fixed_scene_id is None else int(fixed_scene_id),
+            None if fixed_segment_id is None else int(fixed_segment_id),
+        )
     return resolve_fixed_scene_segment_v9(cfg)
 
 
+def build_train_scheduler_long_phase_b_from_cfg(cfg: Any, dataset: Any) -> Any:
+    slong = cfg.get("scheduler_long_phase_b") if hasattr(cfg, "get") else None
+    if slong is None or not bool(_cfg_get(slong, "enable", False)):
+        raise ValueError("scheduler_long_phase_b.enable must be true")
+    if str(_cfg_get(slong, "version", "long_v1")) != "long_v1":
+        raise ValueError("scheduler_long_phase_b.version must be long_v1")
+    if str(_cfg_get(slong, "phase", PHASE_B_LONG_NAME)) != PHASE_B_LONG_NAME:
+        raise ValueError("scheduler_long_phase_b.phase must be 6_0_phase_b")
+    traversal = _cfg_get(slong, "traversal", {}) or {}
+    fixed_scene_id, fixed_segment_id = resolve_fixed_scene_segment_stage6(cfg)
+    validate_train_scene_for_fixed(cfg, fixed_scene_id)
+    return dataset.create_train_scheduler_long_phase_b(
+        episode_window_cfg=_cfg_get(slong, "episode_window", {}) or {},
+        rollout_shapes=_cfg_get(slong, "rollout_shapes", []) or [],
+        rollout_shapes_schedule=_cfg_get(slong, "rollout_shapes_schedule", []) or [],
+        anchor_sampling_cfg=_cfg_get(slong, "anchor_sampling", {}) or {},
+        traversal_cfg=traversal,
+        preload_cfg=_cfg_get(slong, "preload", {}) or {},
+        include_test=parse_include_test(cfg),
+        fixed_scene_id=fixed_scene_id,
+        fixed_segment_id=fixed_segment_id,
+        evidence_cfg=_cfg_get(slong, "evidence", {}) or {},
+        final_supervision_cfg=_cfg_get(slong, "final_supervision", {}) or {},
+        rigid_meta_cfg=_cfg_get(slong, "rigid_meta", {}) or {},
+        distant_meta_cfg=_cfg_get(slong, "distant_meta", {}) or {},
+        fail_fast=bool(_cfg_get(slong, "fail_fast", True)),
+    )
+
+
 def build_train_scheduler_stage6_from_cfg(cfg: Any, dataset: Any) -> Any:
+    if _scheduler_long_phase_b_enabled(cfg):
+        return build_train_scheduler_long_phase_b_from_cfg(cfg, dataset)
     scheduler = build_train_scheduler_v9_from_cfg(cfg, dataset)
     sv9 = cfg.get("scheduler_v9") if hasattr(cfg, "get") else None
     phase = str(_cfg_get(sv9, "phase", PHASE_A_NAME))
@@ -99,7 +141,17 @@ def build_stage6_trainer_from_cfg(config: Any, device: torch.device) -> Any:
     phase = str(_cfg_get(model_cfg, "phase", PHASE_A_NAME))
     if phase == PHASE_A_NAME:
         return Stage6PhaseAFacadeTrainer(config=config, device=device)
+    if phase == PHASE_B_LONG_NAME:
+        return Stage6PhaseBLongFacadeTrainer(config=config, device=device)
     return MinimalStreetForwardStage6_0(config=config, device=device)
+
+
+def checkpoint_prefix_stage6_from_cfg(cfg: Any) -> str:
+    model_cfg = _cfg_get(cfg, "model", {}) or {}
+    phase = str(_cfg_get(model_cfg, "phase", PHASE_A_NAME))
+    if phase == PHASE_B_LONG_NAME:
+        return "minimal_sf_stage6_0_phase_b_long_v1"
+    return "minimal_sf_stage6_0_phase_a_v9"
 
 
 def _scheduler_v9_blocks_per_episode(cfg: Any) -> int:
@@ -326,8 +378,18 @@ def _run_validation_long_phase_b_round(
     ablations = ["normal"]
     if bool(_cfg_get(ablations_cfg, "zero_vsm", True)):
         ablations.append("zero_vsm")
+    if bool(_cfg_get(ablations_cfg, "zero_read_keep_seen", True)):
+        ablations.append("zero_read_keep_seen")
+    if bool(_cfg_get(ablations_cfg, "zero_read_zero_seen", False)):
+        ablations.append("zero_read_zero_seen")
     if bool(_cfg_get(ablations_cfg, "shuffle_vsm", True)):
         ablations.append("shuffle_vsm")
+    if bool(_cfg_get(ablations_cfg, "shuffle_read", False)):
+        ablations.append("shuffle_read")
+    if bool(_cfg_get(ablations_cfg, "zero_delta", True)):
+        ablations.append("zero_delta")
+    if bool(_cfg_get(ablations_cfg, "seen_only", False)):
+        ablations.append("seen_only")
     base.logger.info(
         "VALIDATION_LONG_PHASE_B_BEGIN trigger_episode_counter=%s trigger_step=%s specs=%s T=%s orders=%s",
         int(trigger_train_episode_counter),
@@ -507,6 +569,7 @@ def main() -> None:
     base.TRAINER_CLASS = build_stage6_trainer_from_cfg
     base.MinimalStreetForwardStage4_3 = build_stage6_trainer_from_cfg
     base.CKPT_PREFIX = "minimal_sf_stage6_0_phase_a_v9"
+    base.CHECKPOINT_PREFIX_RESOLVER = checkpoint_prefix_stage6_from_cfg
     base.DEFAULT_CONFIG_FILE = default_config
     base.main()
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import dataclasses
 from dataclasses import dataclass, field
 import math
@@ -561,6 +562,22 @@ class TrainSchedulerV9(TrainSchedulerV8):
             block_source_frame_policy=str(block_source_frame_policy),
             episode_source_mode=str(episode_source_mode),
         )
+
+    def state_dict(self) -> Dict[str, Any]:
+        state = super().state_dict()
+        state["scheduler_class"] = type(self).__name__
+        state["scheduler_version"] = "v9"
+        state["v9_prefetched_plan"] = copy.deepcopy(self._v9_prefetched_plan)
+        state["v9_prefetched_plan_key"] = copy.deepcopy(self._v9_prefetched_plan_key)
+        state["last_num_cams"] = int(getattr(self, "_last_num_cams", 0))
+        return state
+
+    def load_state_dict(self, state: Dict[str, Any]) -> None:
+        super().load_state_dict(state)
+        self._v9_prefetched_plan = copy.deepcopy(state.get("v9_prefetched_plan", None))
+        self._v9_prefetched_plan_key = copy.deepcopy(state.get("v9_prefetched_plan_key", None))
+        if "last_num_cams" in state:
+            self._last_num_cams = int(state.get("last_num_cams", 0))
 
     @staticmethod
     def _optional_float_list(raw: Any) -> Optional[List[float]]:

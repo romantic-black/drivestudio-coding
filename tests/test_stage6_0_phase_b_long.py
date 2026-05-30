@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+from omegaconf import OmegaConf
 
 from datasets.train_scheduler_long_phase_b import TrainSchedulerLongPhaseB
 from models.streetforward.minimal_trainer_stage6_0 import MinimalStreetForwardStage6_0
@@ -723,7 +724,9 @@ def _minimal_phase_b_long_config(vsm_type: str = "streaming_selective_ssm"):
             "final_supervision": {},
             "rollout_shapes": [{"name": "r1_a1"}],
         },
+        "scheduler_v9": {"enable": False},
         "validation_v9": {"enable": False},
+        "validation_long_phase_b": {"enable": True},
         "losses": {
             "phase_b_long": {
                 "query_observation": {"enable": False},
@@ -763,6 +766,67 @@ def test_long_phase_b_config_validation_allows_cell_vsm_and_keeps_old_forbids():
     }
     with pytest.raises(ValueError, match="vsm.bg.point_context_source"):
         MinimalStreetForwardStage6_0._validate_stage6_0_phase_b_long_config(model, bad_context)
+
+
+def test_phase_b_config_requires_export_payload_by_default():
+    cfg = OmegaConf.load("configs/stage6_0_phase_b.yaml")
+    phase_b_init = cfg.initialization.phase_b_from_phase_a
+    assert bool(phase_b_init.reject_plain_model_state_dict) is True
+    assert "load_modules" not in phase_b_init
+    assert "freeze_after_load" not in phase_b_init
+    assert "train_new_modules" not in phase_b_init
+    model = MinimalStreetForwardStage6_0.__new__(MinimalStreetForwardStage6_0)
+    torch.nn.Module.__init__(model)
+    MinimalStreetForwardStage6_0._validate_stage6_0_phase_b_long_config(model, cfg)
+
+
+def test_phase_b_rejects_removed_init_schema_fields():
+    model = MinimalStreetForwardStage6_0.__new__(MinimalStreetForwardStage6_0)
+    torch.nn.Module.__init__(model)
+    cfg = _minimal_phase_b_long_config("cell_streaming_selective_ssm")
+    cfg["initialization"] = {
+        "phase_b_from_phase_a": {
+            "enable": True,
+            "export_type": "stage6_0_phase_a_for_phase_b",
+            "reject_plain_model_state_dict": True,
+            "load_modules": {"measurement_frontend": True},
+        }
+    }
+    with pytest.raises(ValueError, match="no longer accepts load_modules"):
+        MinimalStreetForwardStage6_0._validate_stage6_0_phase_b_long_config(model, cfg)
+
+    cfg = _minimal_phase_b_long_config("cell_streaming_selective_ssm")
+    cfg["initialization"] = {
+        "phase_b_from_phase_a": {
+            "enable": True,
+            "export_type": "stage6_0_phase_a_for_phase_b",
+            "reject_plain_model_state_dict": False,
+        }
+    }
+    with pytest.raises(ValueError, match="reject_plain_model_state_dict=true"):
+        MinimalStreetForwardStage6_0._validate_stage6_0_phase_b_long_config(model, cfg)
+
+
+def test_phase_b_plain_model_state_dict_rejected_when_export_required():
+    model = MinimalStreetForwardStage6_0.__new__(MinimalStreetForwardStage6_0)
+    torch.nn.Module.__init__(model)
+    model.stage6_phase = "6_0_phase_b"
+    model.device = torch.device("cpu")
+    model.config = {
+        "initialization": {
+            "phase_b_from_phase_a": {
+                "enable": True,
+                "reject_plain_model_state_dict": True,
+            }
+        }
+    }
+    with pytest.raises(ValueError, match="Plain model_state_dict checkpoints are rejected"):
+        MinimalStreetForwardStage6_0.load_init_checkpoint_payload(
+            model,
+            {"model_state_dict": {}},
+            device=torch.device("cpu"),
+            weights_only=True,
+        )
 
 
 def _make_sidx() -> SimpleNamespace:

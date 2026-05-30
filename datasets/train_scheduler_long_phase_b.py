@@ -12,6 +12,11 @@ from models.streetforward.stage6_0.phase_b_long.types import (
     LongRolloutShape,
     LongVisit,
 )
+from streetforward_core.data.assemblers.phase_b_long_batch_assembler import PhaseBLongBatchAssembler
+from streetforward_core.protocols.phase_b_long import (
+    PHASE_B_LONG_PROTOCOL_VERSION,
+    phase_b_long_plan_from_mapping,
+)
 
 
 class LongPhaseBDatasetLike(Protocol):
@@ -114,6 +119,7 @@ class TrainSchedulerLongPhaseB:
         self._pending_events: List[Dict[str, Any]] = []
         self._current_window: Optional[LongEpisodeWindow] = None
         self._last_info: Dict[str, Any] = {"scheduler_version": "long_v1", "U": 1, "global_step": 0}
+        self._assembler = PhaseBLongBatchAssembler(dataset)
         self._segments = self._build_segment_plan()
         if not self._segments:
             raise ValueError("scheduler_long_phase_b found no training segments.")
@@ -449,6 +455,7 @@ class TrainSchedulerLongPhaseB:
         ]
 
         request_meta = {
+            "protocol_version": PHASE_B_LONG_PROTOCOL_VERSION,
             "scheduler_version": "long_v1",
             "scheduler_phase": PHASE_B_LONG_NAME,
             "assembly_mode": "image_ref_long_v1",
@@ -502,27 +509,8 @@ class TrainSchedulerLongPhaseB:
         return request_meta
 
     def _batch_from_meta(self, meta: Dict[str, Any]) -> Dict[str, Any]:
-        if not hasattr(self.dataset, "_assemble_segment_batch_from_image_refs"):
-            raise ValueError("TrainSchedulerLongPhaseB requires image-ref batch assembly.")
-        source_refs = [tuple(x) for x in meta["source_image_refs"]]
-        target_refs = [tuple(x) for x in meta["target_image_refs"]]
-        batch = self.dataset._assemble_segment_batch_from_image_refs(
-            int(meta["scene_id"]),
-            int(meta["segment_id"]),
-            source_refs,
-            target_refs,
-            aux_image_refs=None,
-            query_label_image_refs=[],
-            include_test=bool(self.include_test),
-            test_image_refs=None,
-            enforce_target0_equals_source=False,
-            target_ref_purpose="train",
-        )
-        req = dict(batch.get("request_meta") or {})
-        req.update(meta)
-        batch["request_meta"] = req
-        batch["_scheduler_long_phase_b"] = dict(req)
-        return batch
+        plan = phase_b_long_plan_from_mapping(meta)
+        return self._assembler.materialize(plan, include_test=bool(self.include_test))
 
     def materialize_current_batch_without_advance(self) -> Dict[str, Any]:
         if self._current_window is None:

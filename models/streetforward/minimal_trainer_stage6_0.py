@@ -54,6 +54,32 @@ from models.streetforward.stage6_0.vsm import Stage6QueryPred, masked_smooth_l1
 logger = logging.getLogger(__name__)
 
 
+def _to_plain_dict(node: Any) -> Dict[str, Any]:
+    if node is None:
+        return {}
+    if isinstance(node, dict):
+        return {
+            str(k): _to_plain_dict(v)
+            if isinstance(v, dict) or hasattr(v, "keys")
+            else [x for x in v]
+            if isinstance(v, (list, tuple))
+            else v
+            for k, v in node.items()
+        }
+    if hasattr(node, "keys"):
+        out: Dict[str, Any] = {}
+        for k in node.keys():
+            v = node[k]
+            if isinstance(v, dict) or hasattr(v, "keys"):
+                out[str(k)] = _to_plain_dict(v)
+            elif isinstance(v, (list, tuple)):
+                out[str(k)] = [x for x in v]
+            else:
+                out[str(k)] = v
+        return out
+    return {}
+
+
 class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
     """
     Stage6_0 Phase A trainer.
@@ -672,9 +698,35 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             self._require_key(sched, key, "scheduler_long_phase_b")
         if not (list(self._cfg_get(sched, "rollout_shapes", []) or []) or list(self._cfg_get(sched, "rollout_shapes_schedule", []) or [])):
             raise ValueError("6_0_phase_b requires scheduler_long_phase_b.rollout_shapes or rollout_shapes_schedule.")
+        sv9 = self._cfg_get(config, "scheduler_v9", {}) or {}
+        if bool(self._cfg_get(sv9, "enable", False)):
+            raise ValueError("6_0_phase_b uses scheduler_long_phase_b; scheduler_v9 must stay disabled for this phase.")
         validation_v9 = self._cfg_get(config, "validation_v9", {}) or {}
         if bool(self._cfg_get(validation_v9, "enable", False)):
             raise ValueError("6_0_phase_b uses validation_long_phase_b; validation_v9 must stay disabled for this phase.")
+        validation_long = self._require_key(config, "validation_long_phase_b", "config")
+        if bool(self._cfg_get(validation_long, "enable", False)) is not True:
+            raise ValueError("6_0_phase_b requires validation_long_phase_b.enable=true.")
+        init_cfg = self._cfg_get(config, "initialization", {}) or {}
+        phase_b_init = self._cfg_get(init_cfg, "phase_b_from_phase_a", {}) or {}
+        if bool(self._cfg_get(phase_b_init, "enable", False)):
+            if str(self._cfg_get(phase_b_init, "export_type", "stage6_0_phase_a_for_phase_b")) != "stage6_0_phase_a_for_phase_b":
+                raise ValueError(
+                    "6_0_phase_b initialization.phase_b_from_phase_a.export_type must be "
+                    "stage6_0_phase_a_for_phase_b."
+                )
+            if bool(self._cfg_get(phase_b_init, "reject_plain_model_state_dict", True)) is not True:
+                raise ValueError(
+                    "6_0_phase_b requires initialization.phase_b_from_phase_a.reject_plain_model_state_dict=true; "
+                    "plain Phase A resume checkpoints are not a supported Phase B Long bootstrap path."
+                )
+            for key in ("load_modules", "freeze_after_load", "train_new_modules"):
+                if self._cfg_get(phase_b_init, key, None) is not None:
+                    raise ValueError(
+                        "6_0_phase_b initialization.phase_b_from_phase_a no longer accepts "
+                        f"{key}; module loading, freezing, and trainability are fixed by the "
+                        "Phase B export contract."
+                    )
         losses_cfg = self._cfg_get(config, "losses", {}) or {}
         phase_b_long = self._require_key(losses_cfg, "phase_b_long", "losses")
         for key in ("query_observation", "nearby_render", "per_step_prefix_render"):
@@ -1232,21 +1284,28 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 return
             decay, no_decay = split_decay(unique_named)
             if decay:
+                decay_ids = {id(param) for param in decay}
                 groups.append(
                     {
                         "params": decay,
                         "lr": float(lr),
                         "weight_decay": float(wd),
                         "logical_name": logical_name,
+                        "name": logical_name,
+                        "param_names": [name for name, param in unique_named if id(param) in decay_ids],
                     }
                 )
             if no_decay:
+                no_decay_ids = {id(param) for param in no_decay}
+                no_decay_name = f"{logical_name}_no_weight_decay"
                 groups.append(
                     {
                         "params": no_decay,
                         "lr": float(lr),
                         "weight_decay": 0.0,
-                        "logical_name": f"{logical_name}_no_weight_decay",
+                        "logical_name": no_decay_name,
+                        "name": no_decay_name,
+                        "param_names": [name for name, param in unique_named if id(param) in no_decay_ids],
                     }
                 )
 
@@ -1396,6 +1455,120 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             self.optimizer = torch.optim.Adam(groups, betas=betas, eps=eps)
         else:
             raise ValueError(f"Stage6_0 unsupported optimizer.type={opt_type!r}")
+
+    def _stage6_optimizer_signature(self) -> Dict[str, Any]:
+        name_by_id = {id(param): str(name) for name, param in self.named_parameters()}
+        groups: List[Dict[str, Any]] = []
+        for group in self.optimizer.param_groups:
+            param_names = [
+                name_by_id.get(id(param), "")
+                for param in list(group.get("params", []))
+            ]
+            groups.append(
+                {
+                    "name": str(group.get("name", group.get("logical_name", ""))),
+                    "num_params": int(len(param_names)),
+                    "param_names": [str(x) for x in param_names],
+                }
+            )
+        return {"num_groups": int(len(groups)), "groups": groups}
+
+    @staticmethod
+    def _stage6_ckpt_cache_key(key: Any) -> Tuple[int, int]:
+        if isinstance(key, (tuple, list)) and len(key) >= 2:
+            return (int(key[0]), int(key[1]))
+        raise ValueError(f"Invalid Stage6 runtime cache key: {key!r}")
+
+    @staticmethod
+    def _stage6_ckpt_clone_state(state: Any) -> Any:
+        if state is None:
+            return None
+        if hasattr(state, "detach_clone"):
+            out = state.detach_clone()
+        else:
+            out = copy.deepcopy(state)
+        for name, value in vars(out).items():
+            if torch.is_tensor(value):
+                setattr(out, name, value.detach().cpu().clone())
+        return out
+
+    def _stage6_ckpt_state_to_device(self, state: Any) -> Any:
+        if state is None:
+            return None
+        out = copy.deepcopy(state)
+        for name, value in vars(out).items():
+            if torch.is_tensor(value):
+                setattr(out, name, value.to(self.device))
+        return out
+
+    @staticmethod
+    def _stage6_ckpt_clone_hidden_cache(cache: Dict[Any, torch.Tensor]) -> Dict[Tuple[int, int], torch.Tensor]:
+        return {
+            MinimalStreetForwardStage6_0._stage6_ckpt_cache_key(key): value.detach().cpu().clone()
+            for key, value in dict(cache).items()
+            if torch.is_tensor(value)
+        }
+
+    def build_runtime_checkpoint_extra(self) -> Dict[str, Any]:
+        def clone_state_cache(cache: Dict[Any, Any]) -> Dict[Tuple[int, int], Any]:
+            return {
+                self._stage6_ckpt_cache_key(key): self._stage6_ckpt_clone_state(value)
+                for key, value in dict(cache).items()
+            }
+
+        return {
+            "model_runtime_state": {
+                "runtime_format": "stage6_0_node_state_runtime_v1",
+                "node_states_bg": clone_state_cache(getattr(self, "node_states_bg", {})),
+                "node_states_distant": clone_state_cache(getattr(self, "node_states_distant", {})),
+                "node_states_rigid": clone_state_cache(getattr(self, "node_states_rigid", {})),
+                "node_states_sky": clone_state_cache(getattr(self, "node_states_sky", {})),
+                "h_cache_bg": self._stage6_ckpt_clone_hidden_cache(getattr(self, "h_cache_bg", {})),
+                "h_cache_distant": self._stage6_ckpt_clone_hidden_cache(getattr(self, "h_cache_distant", {})),
+                "h_cache_rigid": self._stage6_ckpt_clone_hidden_cache(getattr(self, "h_cache_rigid", {})),
+                "h_cache_sky": self._stage6_ckpt_clone_hidden_cache(getattr(self, "h_cache_sky", {})),
+            }
+        }
+
+    def load_runtime_state_from_checkpoint(self, payload: Dict[str, Any]) -> bool:
+        runtime = payload.get("model_runtime_state")
+        if not isinstance(runtime, dict):
+            logger.warning("Resume checkpoint has no model_runtime_state; Stage6 node-state runtime is fresh.")
+            return False
+
+        def restore_state_cache(cache_name: str) -> None:
+            raw = runtime.get(cache_name, {})
+            if not isinstance(raw, dict):
+                raise ValueError(f"model_runtime_state.{cache_name} must be a dict")
+            restored = {
+                self._stage6_ckpt_cache_key(key): self._stage6_ckpt_state_to_device(value)
+                for key, value in raw.items()
+            }
+            setattr(self, cache_name, restored)
+
+        def restore_hidden_cache(cache_name: str) -> None:
+            raw = runtime.get(cache_name, {})
+            if not isinstance(raw, dict):
+                raise ValueError(f"model_runtime_state.{cache_name} must be a dict")
+            restored = {
+                self._stage6_ckpt_cache_key(key): value.to(self.device)
+                for key, value in raw.items()
+                if torch.is_tensor(value)
+            }
+            setattr(self, cache_name, restored)
+
+        for cache_name in ("node_states_bg", "node_states_distant", "node_states_rigid", "node_states_sky"):
+            restore_state_cache(cache_name)
+        for cache_name in ("h_cache_bg", "h_cache_distant", "h_cache_rigid", "h_cache_sky"):
+            restore_hidden_cache(cache_name)
+        logger.info(
+            "Restored Stage6 runtime node-state caches: bg=%s distant=%s rigid=%s sky=%s.",
+            len(getattr(self, "node_states_bg", {})),
+            len(getattr(self, "node_states_distant", {})),
+            len(getattr(self, "node_states_rigid", {})),
+            len(getattr(self, "node_states_sky", {})),
+        )
+        return True
 
     def _nearby_weight(self, *, global_step: int, k: int, K: int) -> float:
         if not self.stage6_nearby_enable:
@@ -4250,6 +4423,19 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             self._load_phase_b_export_payload(ckpt, device=target_device)
             return True
 
+        init_cfg = self._cfg_get(self.config, "initialization", {}) or {}
+        phase_b_init = self._cfg_get(init_cfg, "phase_b_from_phase_a", {}) or {}
+        if (
+            str(getattr(self, "stage6_phase", "phase_A_block_local_unroll")) == PHASE_B_LONG_NAME
+            and bool(self._cfg_get(phase_b_init, "enable", False))
+            and bool(self._cfg_get(phase_b_init, "reject_plain_model_state_dict", True))
+        ):
+            raise ValueError(
+                "6_0_phase_b requires an init checkpoint with export_type="
+                "stage6_0_phase_a_for_phase_b. Plain model_state_dict checkpoints are rejected "
+                "for Phase B Long initialization."
+            )
+
         sd = ckpt.get("model_state_dict")
         if sd is None:
             return False
@@ -4276,11 +4462,45 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         return True
 
     def build_light_checkpoint_extra(self, *, step: int) -> Dict[str, Any]:
+        optimizer_cfg = self._cfg_get(self.config, "optimizer", {}) or {}
+        lr_scheduler_cfg = self._cfg_get(self.config, "lr_scheduler", {}) or {}
         return {
+            "format": "streetforward_stage6_0_ckpt_v2",
+            "resume_semantics": "resume_model_optimizer_runtime_when_available",
+            "restore_train_scheduler_runtime": True,
+            "restore_rng_state": True,
+            "restore_node_state_runtime": True,
             "model_stage": "6_0",
             "phase": str(getattr(self, "stage6_phase", "phase_A_block_local_unroll")),
             "global_step": int(step),
+            "optimizer_signature": self._stage6_optimizer_signature(),
+            "optimizer_cfg": _to_plain_dict(optimizer_cfg),
+            "lr_scheduler_cfg": _to_plain_dict(lr_scheduler_cfg),
+            "lr_scheduler": {
+                "type": str(self._cfg_get(lr_scheduler_cfg, "type", "")),
+                "global_step": int(step),
+                "active": False,
+            },
         }
+
+    def load_optimizer_state_from_checkpoint(self, payload: Dict[str, Any]) -> bool:
+        old_sig = payload.get("optimizer_signature")
+        if old_sig is not None:
+            cur_sig = self._stage6_optimizer_signature()
+            if old_sig != cur_sig:
+                logger.warning("Skip Stage6_0 optimizer load: signature mismatch.")
+                return False
+        opt_state = payload.get("optimizer_state_dict")
+        if opt_state is None:
+            logger.warning("Skip Stage6_0 optimizer load: checkpoint has no optimizer_state_dict.")
+            return False
+        self.optimizer.load_state_dict(opt_state)
+        if old_sig is None:
+            logger.warning(
+                "Loaded Stage6_0 optimizer from checkpoint without optimizer_signature; "
+                "group compatibility was validated only by torch.optim."
+            )
+        return True
 
 
 __all__ = ["MinimalStreetForwardStage6_0"]

@@ -754,6 +754,8 @@ lr_scheduler:
 
 training:
   max_iterations: 3000010
+  start_step: 0
+  resume_checkpoint: ""
   log_interval: 1000
   save_checkpoint_freq: 10000
   seed: 41

@@ -7,25 +7,12 @@ initialization:
     # MinimalStreetForwardStage6_0.build_phase_b_export_checkpoint().
     # A normal Phase A resume checkpoint is intentionally rejected by default,
     # because Phase B needs only frozen measurement/lifting/updater-base weights
-    # plus fresh VSM/QueryDecoder/ctx-adapter state.
+    # plus fresh Long VSM / offset decoder state.
     checkpoint: "/root/autodl-tmp/outputs/minimal_sf_stage6_0_phase_a_v9/experiment001/checkpoints/minimal_sf_stage6_0_phase_a_v9_step60000.pt"
     required: true
     weights_only: true
     export_type: stage6_0_phase_a_for_phase_b
-    reject_plain_model_state_dict: false
-    load_modules:
-      measurement_frontend: true
-      struct_event_decoder: true
-      param_obs_codec: true
-      posterior_updater_base: true
-      optimizer: false
-    freeze_after_load:
-      measurement_frontend: true
-      struct_event_decoder: true
-      posterior_updater_base: true
-    train_new_modules:
-      long_vsm: true
-      offset_decoder: true
+    reject_plain_model_state_dict: true
 
 data:
   data_root: "/root/autodl-tmp/nuScenes/"
@@ -132,7 +119,7 @@ dataset:
       traj_length_thresh_m: 0.5
 
 scheduler_v9:
-  enable: true
+  enable: false
   phase: phase_B_viewset_rollout
   fail_fast: true
 
@@ -259,9 +246,113 @@ validation_v8:
   near_random_supervision:
     enable: false
 
+validation_v9:
+  enable: false
+  eval_enable: false
+
+scheduler_long_phase_b:
+  enable: true
+  version: long_v1
+  phase: 6_0_phase_b
+  fail_fast: true
+  episode_window:
+    frames_per_window: 24
+    min_frames_required: 8
+    frame_pool_policy: contiguous_window
+    rollout_budget_per_episode: 4
+  rollout_shapes_schedule:
+    - start_step: 0
+      shapes:
+        - {name: r2_a2, repeats_per_anchor: 2, anchors_per_rollout: 2, prob: 1.0}
+    - start_step: 1000
+      shapes:
+        - {name: r4_a4, repeats_per_anchor: 4, anchors_per_rollout: 4, prob: 1.0}
+    - start_step: 5000
+      shapes:
+        - {name: r4_a8, repeats_per_anchor: 4, anchors_per_rollout: 8, prob: 0.4}
+        - {name: r8_a4, repeats_per_anchor: 8, anchors_per_rollout: 4, prob: 0.4}
+        - {name: r6_a5, repeats_per_anchor: 6, anchors_per_rollout: 5, prob: 0.2}
+  anchor_sampling:
+    min_temporal_span: 1
+    max_temporal_span: 80
+    allow_chronological_order_prob: 0.1
+    allow_reverse_order_prob: 0.1
+    allow_random_order_prob: 0.8
+  evidence:
+    cams_per_visit: 1
+    distinct_cams_per_anchor: 1
+    reserve_nvs_cams_per_anchor: 1
+    allow_same_cam_repeat: true
+  final_supervision:
+    required_final_roles: [final_current_recon, final_current_nvs]
+    history_anchor_count: 3
+    final_history_recon:
+      cams_per_anchor: 1
+    final_history_nvs:
+      cams_per_anchor: 1
+    final_current_recon:
+      cams: 1
+    final_current_nvs:
+      cams: 1
+    max_nvs_fallback_ratio: 0.25
+  traversal:
+    fixed_scene_id: null
+    fixed_segment_id: null
+    segment_order: ascending
+    scene_order: shuffle_per_epoch
+  execution:
+    reset_policy: episode_end
+  preload:
+    emit_hints: true
+  rigid_meta: {}
+  distant_meta:
+    mode: appearance_scale_only
+
+validation_long_phase_b:
+  enable: true
+  version: long_v1
+  phase: 6_0_phase_b
+  segment:
+    policy: first
+    fixed_segment_ids: []
+    max_segments_per_scene: 1
+    max_frames_per_segment: 24
+    target_frame_stride: 1
+  evidence:
+    interval_T_values: [1, 2, 4, 8]
+    repeats_per_evidence_frame: 2
+    evidence_cams_per_frame: 1
+    cam_policy: fixed_round_robin
+  order:
+    primary: chronological
+    extra_orders: [reverse, random_seeded]
+  render_eval:
+    reconstruction:
+      enable: true
+    nvs_same_frame:
+      enable: true
+      heldout_cams_per_evidence_frame: 1
+    temporal_nvs:
+      enable: true
+      eval_non_evidence_frames: true
+      cams_per_non_evidence_frame: 1
+    segment_all:
+      max_render_refs: 64
+  masks:
+    mask_policy: non_sky_non_egocar
+    min_valid_pixels: 1
+  ablations:
+    zero_vsm: true
+    zero_read_keep_seen: true
+    shuffle_vsm: true
+    zero_delta: true
+  trigger:
+    validate_every_n_episodes: 100
+    run_at_train_start: false
+
 model:
   stage: "6_0"
-  phase: "phase_B_viewset_rollout"
+  phase: "6_0_phase_b"
   production_training: false
   backprojector_version: "v4"
   scale_init_value: 0.1
@@ -312,7 +403,7 @@ model:
       train_dinov2: false
       detach_v4_outputs: true
     local_rollout:
-      source: "scheduler_v9"
+      source: "scheduler_long_phase_b"
       use_scheduler_inner_K: true
       local_G_no_detach_between_steps: true
       detach_persistent_state_at_block_start: true
@@ -691,7 +782,7 @@ current_observation:
     log_interval_steps: 50
 
 training_recipe:
-  name: stage6_0_phase_b_v9_final_rollout_cell_memory
+  name: stage6_0_phase_b_long_v1_cell_memory
 
 losses:
   phase_a:
@@ -874,6 +965,8 @@ lr_scheduler:
 
 training:
   max_iterations: 3000010
+  start_step: 0
+  resume_checkpoint: ""
   log_interval: 50
   save_checkpoint_freq: 10000
   seed: 41
@@ -898,7 +991,7 @@ eval:
 
 logging:
   output_root: /root/autodl-tmp/outputs
-  project: minimal_sf_stage6_0_phase_b_v9_cell_memory
+  project: minimal_sf_stage6_0_phase_b_long_v1_cell_memory
   log_dir: null
   image_interval_blocks: 1000
   train_step_metrics_interval: 50

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 import random
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
@@ -145,6 +146,15 @@ class TrainSchedulerV8(TrainSchedulerV7):
         )
         self.episode_window_keyframes = int(self.blocks_per_episode)
         self.start_new_epoch()
+
+    def state_dict(self) -> Dict[str, Any]:
+        state = super().state_dict()
+        state["scheduler_class"] = type(self).__name__
+        state["scheduler_version"] = "v8"
+        return copy.deepcopy(state)
+
+    def load_state_dict(self, state: Dict[str, Any]) -> None:
+        super().load_state_dict(state)
 
     @staticmethod
     def _cfg_get(node: Any, key: str, default: Any) -> Any:

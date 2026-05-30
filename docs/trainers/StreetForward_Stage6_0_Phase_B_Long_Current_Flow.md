@@ -88,13 +88,10 @@ flowchart TD
 | 配置 | 作用 |
 | --- | --- |
 | `initialization.phase_b_from_phase_a.enable` | 从 Phase A checkpoint 初始化 |
-| `export_type: stage6_0_phase_a_for_phase_b` | 推荐的 Phase A export 类型 |
-| `load_modules.measurement_frontend` | 加载 frozen V4 measurement frontend |
-| `load_modules.struct_event_decoder` | 加载 frozen event decoder |
-| `load_modules.param_obs_codec` | 加载 param/obs 编码权重 |
-| `load_modules.posterior_updater_base` | 加载 frozen posterior updater base；Long V1 forward 不使用 updater 更新 local state |
-| `train_new_modules.long_vsm` | 训练新 Long VSM |
-| `train_new_modules.offset_decoder` | 训练新 offset decoder |
+| `export_type: stage6_0_phase_a_for_phase_b` | 必须匹配 Phase A export payload |
+| `reject_plain_model_state_dict: true` | 拒绝普通 Phase A resume checkpoint |
+
+`load_modules`、`freeze_after_load`、`train_new_modules` 不再是 Phase B Long 主配置字段。当前加载、冻结和 trainability 是固定 contract：Phase A export 只提供 frozen observation/event/updater-base 权重，Long VSM 与 offset decoder 使用 Phase B 新模块状态。
 
 trainability 在 `_configure_stage6_trainability_after_module_init()` 里强制收敛：
 
@@ -442,4 +439,3 @@ PHASE_B_LONG_NAME  = "6_0_phase_b"              # current Long Phase B
 | `models/streetforward/stage6_0/phase_b_long/offset_decoder.py` | `VSMOffsetDecoder` |
 | `models/streetforward/stage6_0/phase_b_long/offset_state.py` | `PhaseBOffsetState` 与 materialization |
 | `models/streetforward/stage6_0/phase_b_long/losses.py` | final render loss 与 offset regularization |
-

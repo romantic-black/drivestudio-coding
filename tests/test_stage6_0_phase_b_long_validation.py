@@ -166,6 +166,54 @@ def test_validation_long_runner_reports_lpips_and_vsm_ablation(monkeypatch):
     assert out["val_long/materialized_segment_all_refs"] == 3.0
 
 
+def test_direct_validate_long_phase_b_default_ablations_match_config_names(monkeypatch):
+    batch = {
+        "request_meta": {
+            "validation_interval_T": 2,
+            "target_image_refs": [(0, 0)],
+            "validation_buckets": {
+                "reconstruction": [(0, 0)],
+                "nvs_same_frame": [],
+                "temporal_nvs": [],
+                "segment_all": [(0, 0)],
+            },
+        },
+        "targets": [{}],
+    }
+    seen_ablations = []
+
+    def fake_inference(model, batch_arg, *, ablation):
+        seen_ablations.append(ablation)
+        return {
+            "roles": SimpleNamespace(rigid_meta={}, step_chronological_ranks=[]),
+            "base_state": object(),
+            "offset": SimpleNamespace(rigid_frame_snapshots={}),
+        }
+
+    def fake_render(model, *, target_indices, lpips_model, **kwargs):
+        return {
+            "num_refs": float(len(list(target_indices))),
+            "psnr": 10.0,
+            "l1": 0.1,
+            "ssim": 0.9,
+            "lpips": 0.2,
+            "rigid_fallback_rows": 0.0,
+        }, lpips_model
+
+    monkeypatch.setattr(vlr, "run_long_phase_b_inference", fake_inference)
+    monkeypatch.setattr(vlr, "_render_metrics_for_indices", fake_render)
+
+    vlr.validate_long_phase_b(object(), batch)
+    assert tuple(seen_ablations) == (
+        "normal",
+        "zero_vsm",
+        "zero_read_keep_seen",
+        "shuffle_vsm",
+        "zero_delta",
+    )
+    assert vlr.DEFAULT_LONG_VSM_ABLATIONS == tuple(seen_ablations)
+
+
 def test_validation_zero_read_can_zero_seen_or_keep_seen():
     read = LongVSMReadPack(
         bg=torch.ones(2, 4),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import random
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Protocol, Tuple
@@ -205,6 +206,36 @@ class TrainSchedulerV7:
 
     def _emit(self, event: Dict[str, Any]) -> None:
         self._pending_events.append(event)
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "scheduler_class": type(self).__name__,
+            "scheduler_version": "v7",
+            "epoch_idx": int(self.epoch_idx),
+            "global_step": int(self.global_step),
+            "pending_events": copy.deepcopy(self._pending_events),
+            "block_idx_global": int(self._block_idx_global),
+            "episode_idx_global": int(self._episode_idx_global),
+            "epoch_plan": copy.deepcopy(self.epoch_plan),
+            "episode_cursor_plan": copy.deepcopy(self.episode_cursor_plan),
+            "plan_cursor": int(self.plan_cursor),
+            "current_episode_state": copy.deepcopy(self.current_episode_state),
+            "segment_runtime": copy.deepcopy(self._segment_runtime),
+        }
+
+    def load_state_dict(self, state: Dict[str, Any]) -> None:
+        if not isinstance(state, dict):
+            raise TypeError(f"scheduler state must be a dict, got {type(state)}")
+        self.epoch_idx = int(state.get("epoch_idx", self.epoch_idx))
+        self.global_step = int(state.get("global_step", self.global_step))
+        self._pending_events = copy.deepcopy(list(state.get("pending_events", [])))
+        self._block_idx_global = int(state.get("block_idx_global", self._block_idx_global))
+        self._episode_idx_global = int(state.get("episode_idx_global", self._episode_idx_global))
+        self.epoch_plan = copy.deepcopy(list(state.get("epoch_plan", self.epoch_plan)))
+        self.episode_cursor_plan = copy.deepcopy(list(state.get("episode_cursor_plan", self.episode_cursor_plan)))
+        self.plan_cursor = int(state.get("plan_cursor", self.plan_cursor))
+        self.current_episode_state = copy.deepcopy(state.get("current_episode_state", self.current_episode_state))
+        self._segment_runtime = copy.deepcopy(dict(state.get("segment_runtime", self._segment_runtime)))
 
     def _set_current_scheduler_scope(self, scene_id: int, segment_id: int) -> None:
         if hasattr(self.dataset, "set_preload_active_scope"):
