@@ -2441,6 +2441,213 @@ class MultiSceneDatasetV4:
                 raise ValueError(f"V9 final supervision ref {r} has conflicting roles: {prev} vs {role_s}")
             role_by_ref[r] = role_s
 
+    @staticmethod
+    def _assert_no_iforward_ref_role_conflicts(refs: Sequence[ImageRef], roles: Sequence[str]) -> None:
+        if len(refs) != len(roles):
+            raise ValueError(f"IForward refs/roles length mismatch: {len(refs)} vs {len(roles)}")
+        role_by_ref: Dict[ImageRef, str] = {}
+        for ref, role in zip(refs, roles):
+            r = (int(ref[0]), int(ref[1]))
+            role_s = str(role)
+            prev = role_by_ref.get(r)
+            if prev is not None and prev != role_s:
+                raise ValueError(f"IForward final supervision ref {r} has conflicting roles: {prev} vs {role_s}")
+            role_by_ref[r] = role_s
+
+    @staticmethod
+    def _iforward_ref_key(ref: ImageRef) -> str:
+        return f"{int(ref[0])}:{int(ref[1])}"
+
+    def _assemble_segment_batch_from_iforward_request(
+        self,
+        *,
+        scene_id: int,
+        segment_id: int,
+        plan: Any,
+        include_test: bool = False,
+    ) -> Dict[str, Any]:
+        if str(getattr(plan, "scheduler_version", "")) != "iforward_v1":
+            raise ValueError("expected IForwardRolloutPlan.scheduler_version == 'iforward_v1'")
+        if int(scene_id) != int(getattr(plan, "scene_id")) or int(segment_id) != int(getattr(plan, "segment_id")):
+            raise ValueError(
+                "IForward request scene/segment mismatch: "
+                f"request=({int(scene_id)},{int(segment_id)}) "
+                f"plan=({int(getattr(plan, 'scene_id'))},{int(getattr(plan, 'segment_id'))})"
+            )
+
+        evidence_refs = self._dedupe_v9_refs_keep_order(
+            [(int(ref[0]), int(ref[1])) for ref in list(getattr(plan, "evidence_refs_flat", []) or [])]
+        )
+        target_refs_raw = [(int(ref[0]), int(ref[1])) for ref in list(getattr(plan, "target_refs_flat", []) or [])]
+        target_roles_raw = [str(x) for x in list(getattr(plan, "target_roles_flat", []) or [])]
+        self._assert_no_iforward_ref_role_conflicts(target_refs_raw, target_roles_raw)
+        target_refs, target_roles = self._dedupe_v9_refs_roles_keep_order(target_refs_raw, target_roles_raw)
+        if len(evidence_refs) == 0:
+            raise ValueError("IForward request requires non-empty evidence refs")
+        if len(target_refs) == 0:
+            raise ValueError("IForward request requires non-empty target refs")
+        if len(target_refs) != len(target_roles):
+            raise ValueError("IForward target refs/roles length mismatch after dedupe")
+        for ref in evidence_refs + target_refs:
+            self.validate_image_ref(int(scene_id), int(segment_id), tuple(ref), purpose="train")
+
+        bundle = self._resolve_segment_bundle(int(scene_id), int(segment_id))
+        dynamic_points = bundle.pointcloud.get("dynamic") if isinstance(bundle.pointcloud, dict) else None
+        if isinstance(dynamic_points, dict) and len(dynamic_points) > 0:
+            if not bool(self._knn_requirements.fixed_neighbor_enabled):
+                raise ValueError(
+                    "IForward state carry requires stable full-segment rigid row-space. "
+                    "Enable fixed cached KNN / fixed_neighbor_enabled, or add an "
+                    "IForward full-dynamic-row-space assembly path."
+                )
+
+        batch = self._assemble_segment_batch_from_image_refs(
+            int(scene_id),
+            int(segment_id),
+            evidence_refs,
+            target_refs,
+            aux_image_refs=None,
+            query_label_image_refs=None,
+            include_test=bool(include_test),
+            test_image_refs=None,
+            enforce_target0_equals_source=False,
+            target_ref_purpose="train",
+        )
+
+        source_ref_to_index: Dict[ImageRef, int] = {tuple(ref): int(idx) for idx, ref in enumerate(evidence_refs)}
+        target_ref_to_index: Dict[ImageRef, int] = {tuple(ref): int(idx) for idx, ref in enumerate(target_refs)}
+        target_indices_by_role: Dict[str, List[int]] = {}
+        target_refs_by_role: Dict[str, List[ImageRef]] = {}
+        for idx, (ref, role) in enumerate(zip(target_refs, target_roles)):
+            role_s = str(role)
+            target_indices_by_role.setdefault(role_s, []).append(int(idx))
+            target_refs_by_role.setdefault(role_s, []).append(tuple(ref))
+
+        plan_dict = dataclasses.asdict(plan)
+        steps_meta: List[Dict[str, Any]] = []
+        for step in list(getattr(plan, "steps", []) or []):
+            step_dict = dataclasses.asdict(step)
+            step_refs = [(int(ref[0]), int(ref[1])) for ref in list(getattr(step, "evidence_refs", []) or [])]
+            step_dict["evidence_refs"] = [tuple(x) for x in step_refs]
+            step_dict["source_indices"] = [int(source_ref_to_index[tuple(ref)]) for ref in step_refs]
+            steps_meta.append(step_dict)
+
+        final_plan = getattr(plan, "final_supervision", None)
+        final_meta = dataclasses.asdict(final_plan) if final_plan is not None else {}
+        final_meta.update(
+            {
+                "refs": [tuple(x) for x in target_refs],
+                "roles": [str(x) for x in target_roles],
+                "target_indices_by_role": {
+                    str(role): [int(x) for x in indices]
+                    for role, indices in target_indices_by_role.items()
+                },
+                "target_refs_by_role": {
+                    str(role): [tuple(x) for x in refs]
+                    for role, refs in target_refs_by_role.items()
+                },
+            }
+        )
+
+        role_groups: List[Dict[str, Any]] = [
+            {
+                "role": "evidence_input",
+                "refs": [tuple(x) for x in evidence_refs],
+                "image_roles": ["evidence_input" for _ in evidence_refs],
+                "allow_update_evidence": True,
+                "allow_render_loss": False,
+                "allow_memory_write": True,
+                "mask_policy": str(
+                    ((getattr(plan, "request_meta", None) or {}).get("evidence_mask_policy", "non_sky_non_egocar"))
+                ),
+            }
+        ]
+        for role, refs in target_refs_by_role.items():
+            role_groups.append(
+                {
+                    "role": str(role),
+                    "refs": [tuple(x) for x in refs],
+                    "image_roles": [str(role) for _ in refs],
+                    "allow_update_evidence": False,
+                    "allow_render_loss": True,
+                    "allow_memory_write": False,
+                    "mask_policy": "non_sky_non_egocar",
+                }
+            )
+
+        iforward_meta = {
+            "scheduler_version": "iforward_v1",
+            "model_family": "IForward",
+            "scene_id": int(getattr(plan, "scene_id")),
+            "segment_id": int(getattr(plan, "segment_id")),
+            "episode_id": int(getattr(plan, "episode_id")),
+            "rollout_id_global": int(getattr(plan, "rollout_id_global")),
+            "rollout_idx_in_episode": int(getattr(plan, "rollout_idx_in_episode")),
+            "inner_K": int(getattr(plan, "inner_K")),
+            "shape_name": str(getattr(plan, "shape_name")),
+            "requested_blocks_per_rollout": int(getattr(plan, "requested_blocks_per_rollout")),
+            "actual_blocks_per_rollout": int(getattr(plan, "actual_blocks_per_rollout")),
+            "repeats_per_block": int(getattr(plan, "repeats_per_block")),
+            "requested_inner_K": int(getattr(plan, "requested_inner_K")),
+            "actual_inner_K": int(getattr(plan, "actual_inner_K")),
+            "short_rollout": bool(getattr(plan, "short_rollout")),
+            "short_rollout_reason": str(getattr(plan, "short_rollout_reason")),
+            "input_frame_indices": [int(x) for x in list(getattr(plan, "input_frame_indices", []) or [])],
+            "input_keyframe_indices": [int(x) for x in list(getattr(plan, "input_keyframe_indices", []) or [])],
+            "delivery_frame_indices": [int(x) for x in list(getattr(plan, "delivery_frame_indices", []) or [])],
+            "evidence_refs_flat": [tuple(x) for x in evidence_refs],
+            "target_refs_flat": [tuple(x) for x in target_refs],
+            "target_roles_flat": [str(x) for x in target_roles],
+            "steps": steps_meta,
+            "source_ref_to_index_keyed": {
+                self._iforward_ref_key(ref): int(idx)
+                for ref, idx in source_ref_to_index.items()
+            },
+            "target_ref_to_index_keyed": {
+                self._iforward_ref_key(ref): int(idx)
+                for ref, idx in target_ref_to_index.items()
+            },
+            "final_supervision": final_meta,
+            "reset_scene_state_before_rollout": bool(getattr(plan, "reset_scene_state_before_rollout")),
+            "carry_scene_state_after_rollout": bool(getattr(plan, "carry_scene_state_after_rollout")),
+            "episode_end_after_rollout": bool(getattr(plan, "episode_end_after_rollout")),
+            "discard_scene_state_after_rollout": bool(getattr(plan, "episode_end_after_rollout")),
+            "detach_graph_after_rollout": bool(getattr(plan, "detach_graph_after_rollout")),
+            "leakage_check": dict(getattr(plan, "leakage_check", {}) or {}),
+        }
+
+        request_meta = dict(batch.get("request_meta") or {})
+        request_meta.update(dict(getattr(plan, "request_meta", {}) or {}))
+        request_meta["scheduler_version"] = "iforward_v1"
+        request_meta["model_family"] = "IForward"
+        request_meta["scene_id"] = int(getattr(plan, "scene_id"))
+        request_meta["segment_id"] = int(getattr(plan, "segment_id"))
+        request_meta["episode_id"] = int(getattr(plan, "episode_id"))
+        request_meta["episode_idx_global"] = int(getattr(plan, "episode_id"))
+        request_meta["rollout_id_global"] = int(getattr(plan, "rollout_id_global"))
+        request_meta["rollout_idx_in_episode"] = int(getattr(plan, "rollout_idx_in_episode"))
+        request_meta["inner_K"] = int(getattr(plan, "inner_K"))
+        request_meta["source_image_refs"] = [tuple(x) for x in evidence_refs]
+        request_meta["source_image_ref"] = tuple(evidence_refs[0])
+        request_meta["target_image_refs"] = [tuple(x) for x in target_refs]
+        request_meta["target_image_roles"] = [str(x) for x in target_roles]
+        request_meta["role_groups"] = role_groups
+        request_meta["iforward"] = iforward_meta
+        request_meta["assembly_mode"] = "image_ref_iforward_v1"
+        if len(request_meta["target_image_refs"]) != len(request_meta["target_image_roles"]):
+            raise ValueError(
+                "IForward target_image_refs/target_image_roles mismatch after assembly: "
+                f"{len(request_meta['target_image_refs'])} vs {len(request_meta['target_image_roles'])}"
+            )
+        batch["request_meta"] = request_meta
+        batch["_iforward"] = iforward_meta
+        batch["_iforward_plan"] = plan_dict
+        batch["_iforward_runtime_maps"] = {
+            "source_ref_to_index": dict(source_ref_to_index),
+            "target_ref_to_index": dict(target_ref_to_index),
+        }
+        return batch
+
     def _assemble_segment_batch_from_v9_request(
         self,
         *,
@@ -2772,6 +2979,46 @@ class MultiSceneDatasetV4:
             final_supervision_cfg=final_supervision_cfg,
             rigid_meta_cfg=rigid_meta_cfg,
             distant_meta_cfg=distant_meta_cfg,
+            fail_fast=bool(fail_fast),
+        )
+
+    def create_train_scheduler_iforward(
+        self,
+        *,
+        episode_cfg: Optional[Any] = None,
+        rollout_cfg: Optional[Any] = None,
+        traversal_cfg: Optional[Any] = None,
+        evidence_cfg: Optional[Any] = None,
+        supervision_cfg: Optional[Any] = None,
+        memory_cfg: Optional[Any] = None,
+        loss_timing_cfg: Optional[Any] = None,
+        leakage_check_cfg: Optional[Any] = None,
+        preload_cfg: Optional[Any] = None,
+        include_test: bool = False,
+        fixed_scene_id: Optional[int] = None,
+        fixed_segment_id: Optional[int] = None,
+        seed: Optional[int] = None,
+        version: str = "iforward_v1",
+        fail_fast: bool = True,
+    ) -> Any:
+        from datasets.train_scheduler_iforward import TrainSchedulerIForward
+
+        return TrainSchedulerIForward(
+            dataset=self,
+            episode_cfg=episode_cfg,
+            rollout_cfg=rollout_cfg,
+            traversal_cfg=traversal_cfg,
+            evidence_cfg=evidence_cfg,
+            supervision_cfg=supervision_cfg,
+            memory_cfg=memory_cfg,
+            loss_timing_cfg=loss_timing_cfg,
+            leakage_check_cfg=leakage_check_cfg,
+            preload_cfg=preload_cfg,
+            include_test=bool(include_test),
+            fixed_scene_id=fixed_scene_id,
+            fixed_segment_id=fixed_segment_id,
+            seed=seed,
+            version=str(version),
             fail_fast=bool(fail_fast),
         )
 

@@ -1,13 +1,37 @@
 from __future__ import annotations
 
+import sys
+import types
+
 import numpy as np
 import pytest
 import torch
 from omegaconf import OmegaConf
 from PIL import Image
 
+if "open3d" not in sys.modules:
+    fake_open3d = types.ModuleType("open3d")
+
+    class _FakePointCloud:
+        def __init__(self):
+            self.points = []
+            self.colors = []
+
+        def uniform_down_sample(self, every_k_points):
+            _ = every_k_points
+            return self
+
+    fake_open3d.geometry = types.SimpleNamespace(PointCloud=_FakePointCloud, KDTreeFlann=object)
+    fake_open3d.utility = types.SimpleNamespace(Vector3dVector=lambda x: x)
+    sys.modules["open3d"] = fake_open3d
+
 from datasets.multi_scene_dataset_v4 import BatchRequestV4, MultiSceneDatasetV4
 from datasets.streetforward_assets import StreetForwardAssetStore
+from datasets.train_scheduler_iforward import (
+    IForwardFinalSupervisionPlan,
+    IForwardRolloutPlan,
+    IForwardStepPlan,
+)
 from datasets.train_scheduler_v9 import StepPlanV9, ViewSetRolloutBatchV9
 
 
@@ -223,6 +247,234 @@ def test_v4_batch_from_assets_strict_success(tmp_path):
     assert torch.allclose(batch["aabb"], torch.tensor([[-1, -1, -1], [1, 1, 1]], dtype=torch.float32))
     assert "pointcloud" in batch
     assert "dynamic_info" in batch
+
+
+def test_v4_iforward_request_materializer_writes_mapping_meta(tmp_path):
+    store = _prepare_demo_assets(
+        tmp_path,
+        pointcloud_payload={
+            "background": np.zeros((2, 6), dtype=np.float32),
+            "dynamic": {},
+            "instance_mapping": {},
+            "metadata": {"static_instance_intids": []},
+        },
+    )
+    data_cfg, dataset_cfg = _build_cfg(tmp_path)
+    ds = MultiSceneDatasetV4(
+        dataset_cfg=dataset_cfg,
+        data_cfg=data_cfg,
+        device=torch.device("cpu"),
+        asset_store=store,
+    )
+    ds.initialize()
+
+    steps = [
+        IForwardStepPlan(
+            step_idx=0,
+            episode_block_idx=0,
+            rollout_block_rank=0,
+            repeat_idx=0,
+            source_keyframe_idx=0,
+            source_frame_idx=0,
+            evidence_refs=[(0, 0)],
+            evidence_frame_indices=[0],
+            evidence_cam_indices=[0],
+            commit_observation_memory=True,
+            update_optimizer_memory=True,
+            detach_before_step=False,
+            detach_after_step=False,
+            allow_step_render_loss=False,
+            step_loss_refs=[],
+            rollout_pos_code=0.0,
+            frame_pos_code=0.0,
+            repeat_pos_code=0.0,
+        ),
+        IForwardStepPlan(
+            step_idx=1,
+            episode_block_idx=1,
+            rollout_block_rank=1,
+            repeat_idx=0,
+            source_keyframe_idx=1,
+            source_frame_idx=1,
+            evidence_refs=[(1, 0)],
+            evidence_frame_indices=[1],
+            evidence_cam_indices=[0],
+            commit_observation_memory=True,
+            update_optimizer_memory=True,
+            detach_before_step=False,
+            detach_after_step=False,
+            allow_step_render_loss=False,
+            step_loss_refs=[],
+            rollout_pos_code=1.0,
+            frame_pos_code=1.0,
+            repeat_pos_code=0.0,
+        ),
+    ]
+    final = IForwardFinalSupervisionPlan(
+        refs=[(0, 0), (1, 0)],
+        roles=["final_current_recon", "final_current_recon"],
+        current_input_frames=[0, 1],
+        nearby_frames=[],
+        skipped_nearby=True,
+        nearby_skip_reason="no_non_input_frame_in_rollout",
+        current_ref_count=2,
+        nearby_ref_count=0,
+    )
+    plan = IForwardRolloutPlan(
+        scheduler_version="iforward_v1",
+        scene_id=1,
+        segment_id=0,
+        episode_id=7,
+        rollout_id_global=11,
+        rollout_idx_in_episode=0,
+        episode_start_keyframe_pos=0,
+        keyframe_window=[0, 1],
+        frame_chain=[0, 1],
+        num_cams=1,
+        shape_name="b2_r1",
+        blocks_per_rollout=2,
+        repeats_per_block=1,
+        requested_blocks_per_rollout=2,
+        actual_blocks_per_rollout=2,
+        requested_inner_K=2,
+        actual_inner_K=2,
+        short_rollout=False,
+        short_rollout_reason="",
+        episode_block_indices=[0, 1],
+        input_keyframe_indices=[0, 1],
+        input_frame_indices=[0, 1],
+        delivery_frame_indices=[0, 1],
+        delivery_order_policy="chronological",
+        inner_K=2,
+        steps=steps,
+        final_supervision=final,
+        reset_scene_state_before_rollout=True,
+        carry_scene_state_after_rollout=False,
+        episode_end_after_rollout=True,
+        detach_graph_after_rollout=True,
+        evidence_refs_flat=[(0, 0), (1, 0)],
+        target_refs_flat=[(0, 0), (1, 0)],
+        target_roles_flat=["final_current_recon", "final_current_recon"],
+        request_meta={"scheduler_version": "iforward_v1"},
+        leakage_check={},
+    )
+
+    batch = ds._assemble_segment_batch_from_iforward_request(
+        scene_id=1,
+        segment_id=0,
+        plan=plan,
+        include_test=False,
+    )
+    assert batch["source"]["image"].shape == (2, 4, 5, 3)
+    assert batch["target"]["image"].shape == (2, 4, 5, 3)
+    assert batch["_iforward"]["scheduler_version"] == "iforward_v1"
+    assert batch["_iforward_plan"]["scheduler_version"] == "iforward_v1"
+
+    meta = batch["request_meta"]
+    assert meta["scheduler_version"] == "iforward_v1"
+    assert meta["model_family"] == "IForward"
+    assert meta["assembly_mode"] == "image_ref_iforward_v1"
+    assert meta["source_image_refs"] == [(0, 0), (1, 0)]
+    assert meta["target_image_refs"] == [(0, 0), (1, 0)]
+    assert meta["target_image_roles"] == ["final_current_recon", "final_current_recon"]
+
+    ifwd = meta["iforward"]
+    assert batch["_iforward"] == ifwd
+    assert ifwd["source_ref_to_index_keyed"]["0:0"] == 0
+    assert ifwd["source_ref_to_index_keyed"]["1:0"] == 1
+    assert ifwd["target_ref_to_index_keyed"]["0:0"] == 0
+    assert batch["_iforward_runtime_maps"]["source_ref_to_index"][(0, 0)] == 0
+    assert ifwd["steps"][0]["source_indices"] == [0]
+    assert ifwd["steps"][1]["source_indices"] == [1]
+    assert ifwd["final_supervision"]["target_indices_by_role"]["final_current_recon"] == [0, 1]
+
+
+def test_v4_iforward_requires_stable_dynamic_row_space(tmp_path):
+    store = _prepare_demo_assets(tmp_path)
+    data_cfg, dataset_cfg = _build_cfg(tmp_path)
+    ds = MultiSceneDatasetV4(
+        dataset_cfg=dataset_cfg,
+        data_cfg=data_cfg,
+        device=torch.device("cpu"),
+        asset_store=store,
+    )
+    ds.initialize()
+    step = IForwardStepPlan(
+        step_idx=0,
+        episode_block_idx=0,
+        rollout_block_rank=0,
+        repeat_idx=0,
+        source_keyframe_idx=0,
+        source_frame_idx=0,
+        evidence_refs=[(0, 0)],
+        evidence_frame_indices=[0],
+        evidence_cam_indices=[0],
+        commit_observation_memory=True,
+        update_optimizer_memory=True,
+        detach_before_step=False,
+        detach_after_step=False,
+        allow_step_render_loss=False,
+        step_loss_refs=[],
+        rollout_pos_code=0.0,
+        frame_pos_code=0.0,
+        repeat_pos_code=0.0,
+    )
+    final = IForwardFinalSupervisionPlan(
+        refs=[(0, 0)],
+        roles=["final_current_recon"],
+        current_input_frames=[0],
+        nearby_frames=[],
+        skipped_nearby=True,
+        nearby_skip_reason="no_non_input_frame_in_rollout",
+        current_ref_count=1,
+        nearby_ref_count=0,
+    )
+    plan = IForwardRolloutPlan(
+        scheduler_version="iforward_v1",
+        scene_id=1,
+        segment_id=0,
+        episode_id=0,
+        rollout_id_global=0,
+        rollout_idx_in_episode=0,
+        episode_start_keyframe_pos=0,
+        keyframe_window=[0],
+        frame_chain=[0],
+        num_cams=1,
+        shape_name="b1_r1",
+        blocks_per_rollout=1,
+        repeats_per_block=1,
+        requested_blocks_per_rollout=1,
+        actual_blocks_per_rollout=1,
+        requested_inner_K=1,
+        actual_inner_K=1,
+        short_rollout=False,
+        short_rollout_reason="",
+        episode_block_indices=[0],
+        input_keyframe_indices=[0],
+        input_frame_indices=[0],
+        delivery_frame_indices=[0],
+        delivery_order_policy="chronological",
+        inner_K=1,
+        steps=[step],
+        final_supervision=final,
+        reset_scene_state_before_rollout=True,
+        carry_scene_state_after_rollout=False,
+        episode_end_after_rollout=True,
+        detach_graph_after_rollout=True,
+        evidence_refs_flat=[(0, 0)],
+        target_refs_flat=[(0, 0)],
+        target_roles_flat=["final_current_recon"],
+        request_meta={"scheduler_version": "iforward_v1"},
+        leakage_check={},
+    )
+
+    with pytest.raises(ValueError, match="stable full-segment rigid row-space"):
+        ds._assemble_segment_batch_from_iforward_request(
+            scene_id=1,
+            segment_id=0,
+            plan=plan,
+            include_test=False,
+        )
 
 
 def test_v4_filters_segments_with_too_many_dynamic_points(tmp_path):

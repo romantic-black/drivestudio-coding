@@ -1,0 +1,90 @@
+scheduler_iforward:
+  enable: true
+  version: iforward_v1
+  fail_fast: true
+
+  traversal:
+    fixed_scene_id: null
+    fixed_segment_id: null
+    seed: null
+    scene_order: shuffle_per_epoch
+    segment_order: shuffle_per_epoch
+    traversal_mode: episode_serial
+
+  episode:
+    source_mode: keyframes
+    blocks_per_episode: 8
+    episode_stride: 8
+    allow_short_last_episode: true
+    min_blocks_per_episode: 2
+    block_source_frame_policy: random_within_keyframe_once_per_episode
+    reset_scene_state_policy: episode_begin
+
+  rollout:
+    block_selection_policy: next_contiguous
+    delivery_order_policy: chronological
+    allow_short_final_rollout: true
+    min_blocks_per_rollout: 2
+    avoid_single_block_tail: true
+    detach_graph_after_rollout: true
+    shapes:
+      - {name: b2_r8, blocks_per_rollout: 2, repeats_per_block: 8, prob: 0.50}
+      - {name: b3_r6, blocks_per_rollout: 3, repeats_per_block: 6, prob: 0.30}
+      - {name: b4_r4, blocks_per_rollout: 4, repeats_per_block: 4, prob: 0.20}
+    shapes_schedule: []
+
+  evidence:
+    camera_policy: all_cams
+    cams_per_input: null
+    fixed_cam_ids: null
+    allow_camera_dropout: false
+    mask_policy: non_sky_non_egocar
+
+  memory:
+    observation_commit_policy: first_repeat_only
+    optimizer_memory_update_policy: every_repeat
+    reset_policy: episode_begin
+    carry_policy: across_rollouts_until_episode_end
+
+  loss_timing:
+    policy: rollout_final_only
+    intermediate_step_loss: false
+
+  supervision:
+    current:
+      enable: true
+      role_name: final_current_recon
+      frame_policy: all_input_frames
+      camera_policy: all_cams
+      required: true
+
+    nearby:
+      enable: true
+      role_name: final_nearby_rollout
+      scope: rollout_keyframe_span
+      policy: random_non_input_frames
+      frames_per_rollout: 1
+      insufficient_policy: use_available_or_skip_if_none
+      camera_policy: all_cams
+      max_refs_per_rollout: 24
+      add_to_evidence: false
+      mask_policy: non_sky_non_egocar
+
+    history_replay:
+      enable: false
+
+  leakage_check:
+    enable: true
+    same_scene_segment_required: true
+    forbid_test_refs_in_train: true
+    target_role_count_match_required: true
+    nearby_not_in_evidence: true
+    nearby_not_input_frame: true
+    current_supervision_must_cover_all_inputs: true
+
+  preload:
+    emit_hints: true
+    warm_current_rollout_refs: true
+    warm_next_rollout_refs: false
+    warm_episode_chain: false
+    hint_scope_for_exact_refs: v9_role_refs
