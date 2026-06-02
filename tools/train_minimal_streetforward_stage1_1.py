@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import time
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, TextIO, Tuple
 
 import numpy as np
@@ -210,10 +211,10 @@ def _role_dict_to_minimal_targets(
     viewdirs_list: List[Optional[torch.Tensor]] = [None] * num_target
     target_viewdirs = role_data.get("viewdirs")
     for i in range(num_target):
-        view = type("View", (), {
-            "camtoworlds": role_data["extrinsics"][i].to(device),
-            "Ks": role_data["intrinsics"][i][:3, :3].unsqueeze(0).to(device),
-        })()
+        view = SimpleNamespace(
+            camtoworlds=role_data["extrinsics"][i].to(device),
+            Ks=role_data["intrinsics"][i][:3, :3].unsqueeze(0).to(device),
+        )
         target_views.append(view)
         gt_images.append(role_data["image"][i].to(device))
         if target_viewdirs is not None:
@@ -298,6 +299,9 @@ def convert_batch_to_minimal_format(
         "_scheduler_v9_aligned_info",
         "_scheduler_v9",
         "_scheduler_long_phase_b",
+        "_iforward",
+        "_iforward_plan",
+        "_iforward_runtime_maps",
         "rollout_plan",
     ):
         if batch.get(k) is not None:

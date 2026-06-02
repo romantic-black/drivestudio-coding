@@ -162,9 +162,9 @@ def _dedupe_refs_roles_keep_order(
 class TrainSchedulerIForward:
     """Standalone IForward short-sequence rollout scheduler.
 
-    P0 intentionally supports only the documented low-variance policy set:
-    episode-serial traversal, contiguous chronological rollouts, all-camera
-    evidence, and rollout-final supervision.
+    IForward v1 intentionally supports the documented full short-sequence
+    contract: episode-serial traversal, contiguous chronological rollouts,
+    all-camera evidence, and rollout-final supervision.
     """
 
     def __init__(
@@ -236,21 +236,21 @@ class TrainSchedulerIForward:
             or _cfg_get(self.rollout_cfg, "version", _cfg_get(self.traversal_cfg, "version", IFORWARD_SCHEDULER_VERSION))
         )
         if version not in (IFORWARD_SCHEDULER_VERSION, "iforward_v1"):
-            raise ValueError(f"IForward P0 requires version={IFORWARD_SCHEDULER_VERSION}, got {version!r}")
+            raise ValueError(f"IForward v1 requires version={IFORWARD_SCHEDULER_VERSION}, got {version!r}")
 
         traversal_mode = str(_cfg_get(self.traversal_cfg, "traversal_mode", _cfg_get(self.traversal_cfg, "mode", "episode_serial")))
         if traversal_mode != "episode_serial":
-            raise ValueError("scheduler_iforward P0 requires traversal.traversal_mode=episode_serial")
+            raise ValueError("scheduler_iforward IForward v1 requires traversal.traversal_mode=episode_serial")
         for name in ("scene_order", "segment_order"):
             val = str(_cfg_get(self.traversal_cfg, name, "shuffle_per_epoch" if name == "scene_order" else "ascending"))
             if val not in ("ascending", "shuffle_per_epoch"):
                 raise ValueError(f"scheduler_iforward.traversal.{name} must be ascending or shuffle_per_epoch")
 
         if str(_cfg_get(self.episode_cfg, "source_mode", "keyframes")) != "keyframes":
-            raise ValueError("scheduler_iforward P0 requires episode.source_mode=keyframes")
+            raise ValueError("scheduler_iforward IForward v1 requires episode.source_mode=keyframes")
         if str(_cfg_get(self.episode_cfg, "block_source_frame_policy", "random_within_keyframe_once_per_episode")) != "random_within_keyframe_once_per_episode":
             raise ValueError(
-                "scheduler_iforward P0 requires "
+                "scheduler_iforward IForward v1 requires "
                 "episode.block_source_frame_policy=random_within_keyframe_once_per_episode"
             )
         if int(_cfg_get(self.episode_cfg, "blocks_per_episode", 8)) < 1:
@@ -261,69 +261,69 @@ class TrainSchedulerIForward:
             raise ValueError("scheduler_iforward.episode.min_blocks_per_episode must be >= 1")
 
         if str(_cfg_get(self.rollout_cfg, "block_selection_policy", "next_contiguous")) != "next_contiguous":
-            raise ValueError("scheduler_iforward P0 requires rollout.block_selection_policy=next_contiguous")
+            raise ValueError("scheduler_iforward IForward v1 requires rollout.block_selection_policy=next_contiguous")
         if str(_cfg_get(self.rollout_cfg, "delivery_order_policy", "chronological")) != "chronological":
-            raise ValueError("scheduler_iforward P0 requires rollout.delivery_order_policy=chronological")
+            raise ValueError("scheduler_iforward IForward v1 requires rollout.delivery_order_policy=chronological")
         if int(_cfg_get(self.rollout_cfg, "min_blocks_per_rollout", 1)) < 1:
             raise ValueError("scheduler_iforward.rollout.min_blocks_per_rollout must be >= 1")
         if not bool(_cfg_get(self.rollout_cfg, "detach_graph_after_rollout", True)):
-            raise ValueError("scheduler_iforward P0 requires rollout.detach_graph_after_rollout=true")
+            raise ValueError("scheduler_iforward IForward v1 requires rollout.detach_graph_after_rollout=true")
         self._validate_shapes(self._raw_rollout_shapes(), label="rollout.shapes")
         for stage in list(_cfg_get(self.rollout_cfg, "shapes_schedule", []) or []):
             self._validate_shapes(list(_cfg_get(stage, "shapes", []) or []), label="rollout.shapes_schedule.shapes")
 
         if str(_cfg_get(self.evidence_cfg, "camera_policy", "all_cams")) != "all_cams":
-            raise ValueError("scheduler_iforward P0 requires evidence.camera_policy=all_cams")
+            raise ValueError("scheduler_iforward IForward v1 requires evidence.camera_policy=all_cams")
         if bool(_cfg_get(self.evidence_cfg, "allow_camera_dropout", False)):
-            raise ValueError("scheduler_iforward P0 requires evidence.allow_camera_dropout=false")
+            raise ValueError("scheduler_iforward IForward v1 requires evidence.allow_camera_dropout=false")
 
         if str(_cfg_get(self.loss_timing_cfg, "policy", "rollout_final_only")) != "rollout_final_only":
-            raise ValueError("scheduler_iforward P0 requires loss_timing.policy=rollout_final_only")
+            raise ValueError("scheduler_iforward IForward v1 requires loss_timing.policy=rollout_final_only")
         if bool(_cfg_get(self.loss_timing_cfg, "intermediate_step_loss", False)):
-            raise ValueError("scheduler_iforward P0 requires loss_timing.intermediate_step_loss=false")
+            raise ValueError("scheduler_iforward IForward v1 requires loss_timing.intermediate_step_loss=false")
 
         memory_commit = str(_cfg_get(self.memory_cfg, "observation_commit_policy", "first_repeat_only"))
         memory_update = str(_cfg_get(self.memory_cfg, "optimizer_memory_update_policy", "every_repeat"))
         reset_policy = str(_cfg_get(self.memory_cfg, "reset_policy", "episode_begin"))
         carry_policy = str(_cfg_get(self.memory_cfg, "carry_policy", "across_rollouts_until_episode_end"))
         if memory_commit != "first_repeat_only":
-            raise ValueError("scheduler_iforward P0 requires memory.observation_commit_policy=first_repeat_only")
+            raise ValueError("scheduler_iforward IForward v1 requires memory.observation_commit_policy=first_repeat_only")
         if memory_update != "every_repeat":
-            raise ValueError("scheduler_iforward P0 requires memory.optimizer_memory_update_policy=every_repeat")
+            raise ValueError("scheduler_iforward IForward v1 requires memory.optimizer_memory_update_policy=every_repeat")
         if reset_policy != "episode_begin":
-            raise ValueError("scheduler_iforward P0 requires memory.reset_policy=episode_begin")
+            raise ValueError("scheduler_iforward IForward v1 requires memory.reset_policy=episode_begin")
         if carry_policy != "across_rollouts_until_episode_end":
-            raise ValueError("scheduler_iforward P0 requires memory.carry_policy=across_rollouts_until_episode_end")
+            raise ValueError("scheduler_iforward IForward v1 requires memory.carry_policy=across_rollouts_until_episode_end")
 
         current = dict(_cfg_get(self.supervision_cfg, "current", {}) or {})
         nearby = dict(_cfg_get(self.supervision_cfg, "nearby", {}) or {})
         history = dict(_cfg_get(self.supervision_cfg, "history_replay", {}) or {})
         if not bool(_cfg_get(current, "enable", True)):
-            raise ValueError("scheduler_iforward P0 requires supervision.current.enable=true")
+            raise ValueError("scheduler_iforward IForward v1 requires supervision.current.enable=true")
         if str(_cfg_get(current, "frame_policy", "all_input_frames")) != "all_input_frames":
-            raise ValueError("scheduler_iforward P0 requires supervision.current.frame_policy=all_input_frames")
+            raise ValueError("scheduler_iforward IForward v1 requires supervision.current.frame_policy=all_input_frames")
         if str(_cfg_get(current, "camera_policy", "all_cams")) != "all_cams":
-            raise ValueError("scheduler_iforward P0 requires supervision.current.camera_policy=all_cams")
+            raise ValueError("scheduler_iforward IForward v1 requires supervision.current.camera_policy=all_cams")
         if bool(_cfg_get(history, "enable", False)):
-            raise ValueError("scheduler_iforward P0 requires supervision.history_replay.enable=false")
+            raise ValueError("scheduler_iforward IForward v1 requires supervision.history_replay.enable=false")
         if bool(_cfg_get(nearby, "enable", True)):
             if str(_cfg_get(nearby, "scope", "rollout_keyframe_span")) != "rollout_keyframe_span":
-                raise ValueError("scheduler_iforward P0 requires supervision.nearby.scope=rollout_keyframe_span")
+                raise ValueError("scheduler_iforward IForward v1 requires supervision.nearby.scope=rollout_keyframe_span")
             if str(_cfg_get(nearby, "policy", "random_non_input_frames")) != "random_non_input_frames":
-                raise ValueError("scheduler_iforward P0 requires supervision.nearby.policy=random_non_input_frames")
+                raise ValueError("scheduler_iforward IForward v1 requires supervision.nearby.policy=random_non_input_frames")
             if str(_cfg_get(nearby, "insufficient_policy", "use_available_or_skip_if_none")) != "use_available_or_skip_if_none":
                 raise ValueError(
-                    "scheduler_iforward P0 requires "
+                    "scheduler_iforward IForward v1 requires "
                     "supervision.nearby.insufficient_policy=use_available_or_skip_if_none"
                 )
             if str(_cfg_get(nearby, "camera_policy", "all_cams")) != "all_cams":
-                raise ValueError("scheduler_iforward P0 requires supervision.nearby.camera_policy=all_cams")
+                raise ValueError("scheduler_iforward IForward v1 requires supervision.nearby.camera_policy=all_cams")
             if bool(_cfg_get(nearby, "add_to_evidence", False)):
-                raise ValueError("scheduler_iforward P0 requires supervision.nearby.add_to_evidence=false")
+                raise ValueError("scheduler_iforward IForward v1 requires supervision.nearby.add_to_evidence=false")
 
         leakage_enable = bool(_cfg_get(self.leakage_check_cfg, "enable", True))
         if not leakage_enable:
-            raise ValueError("scheduler_iforward P0 requires leakage_check.enable=true")
+            raise ValueError("scheduler_iforward IForward v1 requires leakage_check.enable=true")
 
     def _raw_rollout_shapes(self) -> List[Dict[str, Any]]:
         raw = [dict(x) for x in list(_cfg_get(self.rollout_cfg, "shapes", []) or [])]
@@ -415,7 +415,15 @@ class TrainSchedulerIForward:
                 valid.append(shape)
         if valid:
             return self._sample_shape_from(valid)
-        return self._sample_shape_from(shapes)
+        sampled = self._sample_shape_from(shapes)
+        sampled_blocks = int(sampled.blocks_per_rollout)
+        if sampled_blocks < remaining:
+            return dataclasses.replace(
+                sampled,
+                name=f"{sampled.name}_tailmerge_b{remaining}",
+                blocks_per_rollout=int(remaining),
+            )
+        return sampled
 
     def _emit(self, event: Dict[str, Any]) -> None:
         self._pending_events.append(dict(event))
@@ -779,11 +787,11 @@ class TrainSchedulerIForward:
             if frames != {int(step.source_frame_idx)}:
                 raise ValueError("IForward step evidence refs must match step.source_frame_idx")
             if cams != expected_cams:
-                raise ValueError("IForward P0 step evidence must cover all cams")
+                raise ValueError("IForward v1 step evidence must cover all cams")
             if bool(step.detach_before_step) or bool(step.detach_after_step):
                 raise ValueError("IForward rollout steps must not detach inside rollout")
             if bool(step.allow_step_render_loss) or step.step_loss_refs:
-                raise ValueError("IForward P0 forbids intermediate step render loss")
+                raise ValueError("IForward v1 forbids intermediate step render loss")
             if bool(step.commit_observation_memory) != (int(step.repeat_idx) == 0):
                 raise ValueError("IForward commit_observation_memory must be true only on repeat_idx=0")
             if not bool(step.update_optimizer_memory):
@@ -857,10 +865,17 @@ class TrainSchedulerIForward:
     def _preload_refs_from_plan(self, plan: IForwardRolloutPlan) -> List[ImageRef]:
         return _dedupe_refs_keep_order(list(plan.evidence_refs_flat) + list(plan.target_refs_flat))
 
-    def _emit_preload_hint_for_plan(self, plan: IForwardRolloutPlan) -> None:
+    def _emit_preload_hint_for_plan(
+        self,
+        plan: IForwardRolloutPlan,
+        *,
+        warm_flag_key: str = "warm_current_rollout_refs",
+        emit_event: bool = True,
+        event_type: str = "preload_hint",
+    ) -> None:
         if not bool(_cfg_get(self.preload_cfg, "emit_hints", True)):
             return
-        if not bool(_cfg_get(self.preload_cfg, "warm_current_rollout_refs", True)):
+        if not bool(_cfg_get(self.preload_cfg, warm_flag_key, True)):
             return
         if not hasattr(self.dataset, "build_preload_hint") or not hasattr(self.dataset, "submit_preload_hint"):
             return
@@ -882,9 +897,11 @@ class TrainSchedulerIForward:
             block_idx_global=int(plan.rollout_id_global),
             include_test=bool(self.include_test),
         )
+        if not bool(emit_event):
+            return
         self._emit(
             {
-                "type": "preload_hint",
+                "type": str(event_type),
                 "scheduler_version": IFORWARD_SCHEDULER_VERSION,
                 "global_step": int(self.global_step),
                 "scene_id": int(plan.scene_id),
@@ -895,6 +912,22 @@ class TrainSchedulerIForward:
                 "num_future_image_refs": int(len(refs)),
             }
         )
+
+    def _emit_preload_hint_for_next_rollout(self) -> None:
+        if not bool(_cfg_get(self.preload_cfg, "warm_next_rollout_refs", False)):
+            return
+        state = self.state_dict()
+        try:
+            episode = self._ensure_episode()
+            plan = self._build_rollout_plan(episode)
+            self._emit_preload_hint_for_plan(
+                plan,
+                warm_flag_key="warm_next_rollout_refs",
+                emit_event=False,
+                event_type="preload_hint_next_rollout",
+            )
+        finally:
+            self.load_state_dict(state)
 
     def materialize_current_batch_without_advance(self) -> Dict[str, Any]:
         state = self.state_dict()
@@ -912,6 +945,8 @@ class TrainSchedulerIForward:
         plan = self._build_rollout_plan(episode)
         batch = self._batch_from_plan(plan)
         self._emit_preload_hint_for_plan(plan)
+        first_step = plan.steps[0] if plan.steps else None
+        first_source_ref = plan.evidence_refs_flat[0] if plan.evidence_refs_flat else (-1, -1)
 
         self._last_info = {
             "scheduler_version": IFORWARD_SCHEDULER_VERSION,
@@ -920,8 +955,24 @@ class TrainSchedulerIForward:
             "scene_id": int(plan.scene_id),
             "segment_id": int(plan.segment_id),
             "episode_id": int(plan.episode_id),
+            "episode_idx_global": int(plan.episode_id),
+            "epoch_idx": int(self.epoch_idx),
+            "block_idx_global": int(plan.rollout_id_global),
+            "block_idx_in_episode": int(plan.episode_block_indices[0]) if plan.episode_block_indices else -1,
+            "block_idx_in_segment": int(plan.episode_block_indices[0]) if plan.episode_block_indices else -1,
             "rollout_id_global": int(plan.rollout_id_global),
             "rollout_idx_in_episode": int(plan.rollout_idx_in_episode),
+            "source_frame_idx": int(first_step.source_frame_idx) if first_step is not None else -1,
+            "source_keyframe_idx": int(first_step.source_keyframe_idx) if first_step is not None else -1,
+            "source_image_ref": (int(first_source_ref[0]), int(first_source_ref[1])),
+            "target_image_refs": [(int(ref[0]), int(ref[1])) for ref in plan.target_refs_flat],
+            "U": int(plan.actual_blocks_per_rollout),
+            "K_u_nominal": int(plan.repeats_per_block),
+            "K_u_effective": int(plan.repeats_per_block),
+            "K_steps": int(plan.inner_K),
+            "K_steps_effective": int(plan.inner_K),
+            "R_steps": int(plan.repeats_per_block),
+            "T_steps": int(plan.actual_blocks_per_rollout),
             "inner_K": int(plan.inner_K),
             "shape_name": str(plan.shape_name),
             "actual_blocks_per_rollout": int(plan.actual_blocks_per_rollout),
@@ -960,6 +1011,8 @@ class TrainSchedulerIForward:
                 }
             )
             self._current_episode = None
+
+        self._emit_preload_hint_for_next_rollout()
 
         if hasattr(self.dataset, "maybe_log_preload_stats"):
             self.dataset.maybe_log_preload_stats(int(self.global_step))

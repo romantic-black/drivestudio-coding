@@ -319,6 +319,128 @@ def _save_train_monitor_triplets(
         )
 
 
+def _safe_image_role(role: Any) -> str:
+    text = str(role or "view").strip().lower()
+    out = []
+    for ch in text:
+        if ch.isalnum() or ch in {"_", "-"}:
+            out.append(ch)
+        else:
+            out.append("_")
+    return "".join(out).strip("_") or "view"
+
+
+def _hwc01_for_tb(img: torch.Tensor) -> torch.Tensor:
+    x = torch.clamp(torch.nan_to_num(img.detach().float().cpu(), nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
+    if x.dim() != 3:
+        raise ValueError(f"expected image tensor [H,W,C], got {tuple(x.shape)}")
+    if int(x.shape[-1]) == 1:
+        x = x.expand(*x.shape[:-1], 3)
+    if int(x.shape[-1]) != 3:
+        raise ValueError(f"expected image tensor channel dim=3, got {tuple(x.shape)}")
+    return x
+
+
+def _save_iforward_train_images(
+    *,
+    step: int,
+    pred_rgbs: List[torch.Tensor],
+    gt_images: List[torch.Tensor],
+    image_refs: List[Any],
+    image_roles: List[Any],
+    raw_batch: Dict[str, Any],
+    log_dir: str,
+    block_idx_global: int,
+    scene_id_fallback: Any,
+    pixel_camera_ids: List[int],
+    writer: Optional[Any] = None,
+    max_tb_images: int = 6,
+) -> None:
+    if len(pred_rgbs) == 0 or len(gt_images) == 0:
+        return
+    out_dir = os.path.join(log_dir, "images", "iforward_train")
+    sc_lab = _scene_folder_label_from_batch(raw_batch, scene_id_fallback)
+    safe_block_idx = int(block_idx_global)
+    if safe_block_idx < 0:
+        safe_block_idx = int(step)
+    n = min(len(pred_rgbs), len(gt_images))
+    for v in range(n):
+        role = _safe_image_role(image_roles[v] if v < len(image_roles) else "view")
+        ref = image_refs[v] if v < len(image_refs) else None
+        try:
+            f_lab = int(ref[0])  # type: ignore[index]
+            c_lab = int(ref[1])  # type: ignore[index]
+            nusc_suf = _nuscenes_cam_id_suffix(pixel_camera_ids, c_lab)
+            vsuf = f"b{safe_block_idx:06d}_sc{sc_lab}_v{v}_{role}_f{f_lab:05d}_c{c_lab}{nusc_suf}"
+        except Exception:
+            vsuf = f"b{safe_block_idx:06d}_sc{sc_lab}_v{v}_{role}"
+        _save_image_triplet(
+            step,
+            pred_rgbs[v],
+            gt_images[v],
+            out_dir,
+            view_suffix=vsuf,
+            save_error=True,
+        )
+        if writer is None or int(v) >= int(max_tb_images):
+            continue
+        try:
+            pred = _hwc01_for_tb(pred_rgbs[v])
+            gt = _hwc01_for_tb(gt_images[v])
+            err = (pred - gt).abs()
+            max_err = float(err.max().item()) if err.numel() else 0.0
+            if max_err > 0.0:
+                err = err / max_err
+            tag_base = f"iforward_train/{role}/view{int(v)}"
+            writer.add_image(f"{tag_base}/pred", pred.permute(2, 0, 1), int(step))
+            writer.add_image(f"{tag_base}/gt", gt.permute(2, 0, 1), int(step))
+            writer.add_image(f"{tag_base}/error", err.permute(2, 0, 1), int(step))
+        except Exception as exc:
+            logger.warning("Failed to write IForward TensorBoard image view=%s role=%s: %s", int(v), role, exc)
+
+
+def _save_train_images_for_result(
+    *,
+    step: int,
+    result: Dict[str, Any],
+    pred_rgbs: List[torch.Tensor],
+    gt_images: List[torch.Tensor],
+    raw_batch: Dict[str, Any],
+    log_dir: str,
+    block_idx_global: int,
+    scene_id_fallback: Any,
+    pixel_camera_ids: List[int],
+    writer: Optional[Any] = None,
+) -> None:
+    image_refs = result.get("image_refs")
+    image_roles = result.get("image_roles")
+    if isinstance(image_refs, list) and isinstance(image_roles, list):
+        _save_iforward_train_images(
+            step=step,
+            pred_rgbs=pred_rgbs,
+            gt_images=gt_images,
+            image_refs=image_refs,
+            image_roles=image_roles,
+            raw_batch=raw_batch,
+            log_dir=log_dir,
+            block_idx_global=block_idx_global,
+            scene_id_fallback=scene_id_fallback,
+            pixel_camera_ids=pixel_camera_ids,
+            writer=writer,
+        )
+        return
+    _save_train_monitor_triplets(
+        step=step,
+        pred_rgbs=pred_rgbs,
+        gt_images=gt_images,
+        raw_batch=raw_batch,
+        log_dir=log_dir,
+        block_idx_global=block_idx_global,
+        scene_id_fallback=scene_id_fallback,
+        pixel_camera_ids=pixel_camera_ids,
+    )
+
+
 def _map_to_01(map_tensor: torch.Tensor) -> torch.Tensor:
     x = map_tensor.detach().float().cpu()
     x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
@@ -790,6 +912,200 @@ def _drop_result_tensor_payloads(result: Optional[Dict[str, Any]]) -> None:
             result[key] = ()
         elif isinstance(value, dict) and any(torch.is_tensor(x) for x in value.values()):
             result[key] = {}
+
+
+def _record_cuda_storage(
+    tensor: Any,
+    storages: Dict[int, int],
+    *,
+    meta: Optional[Dict[int, str]] = None,
+) -> int:
+    if not torch.is_tensor(tensor) or not tensor.is_cuda:
+        return 0
+    try:
+        storage = tensor.untyped_storage()
+        ptr = int(storage.data_ptr())
+        nbytes = int(storage.nbytes())
+    except Exception:
+        ptr = int(tensor.data_ptr())
+        nbytes = int(tensor.numel() * tensor.element_size())
+    if ptr in storages:
+        return 0
+    storages[ptr] = int(nbytes)
+    if meta is not None:
+        try:
+            shape = tuple(int(x) for x in tensor.shape)
+        except Exception:
+            shape = ()
+        meta[ptr] = (
+            f"{float(nbytes) / (1024.0 ** 2):.1f}MiB "
+            f"shape={shape} dtype={str(tensor.dtype)} grad={bool(getattr(tensor, 'requires_grad', False))}"
+        )
+    return int(nbytes)
+
+
+def _collect_cuda_storages_from_object(
+    obj: Any,
+    storages: Dict[int, int],
+    *,
+    max_depth: int = 6,
+    max_items: int = 200000,
+) -> int:
+    seen: set[int] = set()
+    visited = 0
+
+    def walk(value: Any, depth: int) -> None:
+        nonlocal visited
+        if depth < 0 or visited >= max_items:
+            return
+        if torch.is_tensor(value):
+            _record_cuda_storage(value, storages)
+            return
+        if value is None or isinstance(value, (str, bytes, int, float, bool)):
+            return
+        oid = id(value)
+        if oid in seen:
+            return
+        seen.add(oid)
+        visited += 1
+        if isinstance(value, dict):
+            for child in value.values():
+                walk(child, depth - 1)
+            return
+        if isinstance(value, (list, tuple, set, deque)):
+            for child in value:
+                walk(child, depth - 1)
+            return
+        slots = getattr(value, "__slots__", None)
+        if slots:
+            for name in slots:
+                if hasattr(value, name):
+                    walk(getattr(value, name), depth - 1)
+        attrs = getattr(value, "__dict__", None)
+        if isinstance(attrs, dict):
+            for child in attrs.values():
+                walk(child, depth - 1)
+
+    walk(obj, int(max_depth))
+    return int(visited)
+
+
+def _cuda_storage_bytes_from_tensors(tensors: Any) -> int:
+    storages: Dict[int, int] = {}
+    for tensor in list(tensors):
+        _record_cuda_storage(tensor, storages)
+    return int(sum(storages.values()))
+
+
+def _optimizer_cuda_state_bytes(optimizer: Any) -> int:
+    storages: Dict[int, int] = {}
+    state = getattr(optimizer, "state", None)
+    if isinstance(state, dict):
+        for value in state.values():
+            _collect_cuda_storages_from_object(value, storages, max_depth=4)
+    return int(sum(storages.values()))
+
+
+def _dataset_cuda_cache_bytes(dataset: Any) -> int:
+    storages: Dict[int, int] = {}
+    for name in (
+        "_view_pack_cache",
+        "_scene_asset_cache",
+        "_segment_static_cache",
+        "_image_meta_cache",
+        "_egocar_mask_cache",
+        "_preload_manager",
+    ):
+        if hasattr(dataset, name):
+            _collect_cuda_storages_from_object(getattr(dataset, name), storages, max_depth=5)
+    return int(sum(storages.values()))
+
+
+def _stage6_runtime_cuda_cache_summary(model: Any) -> Dict[str, int]:
+    runtime = getattr(getattr(getattr(model, "model", None), "bridge", None), "runtime", None)
+    if runtime is None:
+        return {
+            "cuda_component/stage6_runtime_node_cache_bytes": 0,
+            "cuda_component/stage6_runtime_node_cache_bg": 0,
+            "cuda_component/stage6_runtime_node_cache_distant": 0,
+            "cuda_component/stage6_runtime_node_cache_rigid": 0,
+            "cuda_component/stage6_runtime_node_cache_sky": 0,
+        }
+    storages: Dict[int, int] = {}
+    counts: Dict[str, int] = {}
+    for branch, name in (
+        ("bg", "node_states_bg"),
+        ("distant", "node_states_distant"),
+        ("rigid", "node_states_rigid"),
+        ("sky", "node_states_sky"),
+        ("h_bg", "h_cache_bg"),
+        ("h_distant", "h_cache_distant"),
+        ("h_rigid", "h_cache_rigid"),
+        ("h_sky", "h_cache_sky"),
+    ):
+        cache = getattr(runtime, name, None)
+        counts[branch] = int(len(cache) if hasattr(cache, "__len__") else 0)
+        _collect_cuda_storages_from_object(cache, storages, max_depth=6)
+    return {
+        "cuda_component/stage6_runtime_node_cache_bytes": int(sum(storages.values())),
+        "cuda_component/stage6_runtime_node_cache_bg": int(counts.get("bg", 0)),
+        "cuda_component/stage6_runtime_node_cache_distant": int(counts.get("distant", 0)),
+        "cuda_component/stage6_runtime_node_cache_rigid": int(counts.get("rigid", 0)),
+        "cuda_component/stage6_runtime_node_cache_sky": int(counts.get("sky", 0)),
+        "cuda_component/stage6_runtime_h_cache_bg": int(counts.get("h_bg", 0)),
+        "cuda_component/stage6_runtime_h_cache_distant": int(counts.get("h_distant", 0)),
+        "cuda_component/stage6_runtime_h_cache_rigid": int(counts.get("h_rigid", 0)),
+        "cuda_component/stage6_runtime_h_cache_sky": int(counts.get("h_sky", 0)),
+    }
+
+
+def _cuda_live_tensor_summary(*, topk: int = 12) -> Dict[str, Any]:
+    gc.collect()
+    storages: Dict[int, int] = {}
+    meta: Dict[int, str] = {}
+    tensor_objects = 0
+    for obj in gc.get_objects():
+        try:
+            if torch.is_tensor(obj):
+                tensor_objects += 1
+                _record_cuda_storage(obj, storages, meta=meta)
+        except Exception:
+            continue
+    top_items = sorted(storages.items(), key=lambda kv: kv[1], reverse=True)[: max(0, int(topk))]
+    return {
+        "cuda_live/tensor_objects": int(tensor_objects),
+        "cuda_live/unique_storages": int(len(storages)),
+        "cuda_live/storage_bytes": int(sum(storages.values())),
+        "cuda_live/top_storages": " | ".join(meta.get(ptr, f"{nbytes}B") for ptr, nbytes in top_items),
+    }
+
+
+def _cuda_component_memory_summary(
+    *,
+    model: Any,
+    dataset: Any,
+    include_live: bool,
+    topk: int,
+) -> Dict[str, Any]:
+    if not torch.cuda.is_available():
+        return {}
+    params = list(model.parameters()) if hasattr(model, "parameters") else []
+    buffers = list(model.buffers()) if hasattr(model, "buffers") else []
+    state_cache = getattr(model, "_state_cache", None)
+    state_cache_storages: Dict[int, int] = {}
+    if state_cache is not None:
+        _collect_cuda_storages_from_object(state_cache, state_cache_storages, max_depth=8)
+    summary: Dict[str, Any] = {
+        "cuda_component/model_param_bytes": int(_cuda_storage_bytes_from_tensors(params)),
+        "cuda_component/model_buffer_bytes": int(_cuda_storage_bytes_from_tensors(buffers)),
+        "cuda_component/optimizer_state_bytes": int(_optimizer_cuda_state_bytes(getattr(model, "optimizer", None))),
+        "cuda_component/iforward_state_cache_bytes": int(sum(state_cache_storages.values())),
+        "cuda_component/dataset_cache_bytes": int(_dataset_cuda_cache_bytes(dataset)),
+    }
+    summary.update(_stage6_runtime_cuda_cache_summary(model))
+    if include_live:
+        summary.update(_cuda_live_tensor_summary(topk=int(topk)))
+    return summary
 
 
 @dataclass(frozen=True)
@@ -1890,6 +2206,21 @@ def main() -> None:
     use_tensorboard = bool(cfg.logging.get("use_tensorboard", False))
     diag_cfg = _parse_diagnostics_cfg(cfg)
     perf_cfg = _parse_perf_cfg(cfg)
+    perf_raw_cfg = cfg.logging.get("performance") or {}
+    perf_empty_cache_interval_steps = int(perf_raw_cfg.get("empty_cache_interval_steps", 0))
+    if perf_empty_cache_interval_steps < 0:
+        raise ValueError("logging.performance.empty_cache_interval_steps must be >= 0")
+    perf_cleanup_metrics_interval_steps = int(
+        perf_raw_cfg.get("cleanup_metrics_interval_steps", train_step_metrics_interval)
+    )
+    if perf_cleanup_metrics_interval_steps < 0:
+        raise ValueError("logging.performance.cleanup_metrics_interval_steps must be >= 0")
+    perf_live_tensor_summary_interval_steps = int(perf_raw_cfg.get("live_tensor_summary_interval_steps", 0))
+    if perf_live_tensor_summary_interval_steps < 0:
+        raise ValueError("logging.performance.live_tensor_summary_interval_steps must be >= 0")
+    perf_live_tensor_summary_topk = int(perf_raw_cfg.get("live_tensor_summary_topk", 12))
+    if perf_live_tensor_summary_topk < 0:
+        raise ValueError("logging.performance.live_tensor_summary_topk must be >= 0")
 
     pixel_camera_ids: List[int] = []
     if cfg.data is not None and cfg.data.get("pixel_source") is not None:
@@ -1982,6 +2313,7 @@ def main() -> None:
     metrics_fh: Optional[TextIO] = None
     writer: Optional[Any] = None
     result: Optional[Dict[str, Any]] = None
+    last_train_loss = float("nan")
     total_steps = 0
     sum_num_gaussians_bg = 0.0
     sum_num_gaussians_distant = 0.0
@@ -2013,6 +2345,8 @@ def main() -> None:
             tb_dir = os.path.join(cfg.log_dir, "tb")
             os.makedirs(tb_dir, exist_ok=True)
             writer = SummaryWriter(log_dir=tb_dir)
+        elif use_tensorboard and SummaryWriter is None:
+            logger.warning("logging.use_tensorboard=true but torch.utils.tensorboard is unavailable; TensorBoard disabled.")
         if bool(validation_v7_cfg.eval_enable and validation_v7_cfg.run_at_train_start):
             _run_validation_v7_round(
                 cfg=cfg,
@@ -2294,6 +2628,7 @@ def main() -> None:
                         log_reset=bool(log_node_state_reset),
                     )
             loss_val = float(result["loss"])
+            last_train_loss = float(loss_val)
             pred_rgbs = result["pred_rgbs"]
             gt_images = result["gt_images"]
             num_views = len(pred_rgbs)
@@ -2383,6 +2718,8 @@ def main() -> None:
                     "num_gaussians_rigid": int(result.get("num_gaussians_rigid", 0)),
                     "num_gaussians_sky": int(result.get("num_gaussians_sky", 0)),
                     "step_time_ms": float(step_time_ms),
+                    "batch_fetch_ms": float(batch_fetch_ms),
+                    "batch_convert_ms": float(batch_convert_ms),
                     "forward_ms": float(result.get("forward_ms", 0.0)),
                     "backward_ms": float(result.get("backward_ms", 0.0)),
                     "optimizer_ms": float(result.get("optimizer_ms", 0.0)),
@@ -2390,7 +2727,7 @@ def main() -> None:
                     "node_state_sync_reset": bool(result.get("node_state_sync_reset", False)),
                 }
                 for k, v in result.items():
-                    if k.startswith("_") or k in train_step_row or k in {"pred_rgbs", "gt_images"}:
+                    if k.startswith("_") or k in train_step_row or k in {"pred_rgbs", "gt_images", "image_refs", "image_roles"}:
                         continue
                     if isinstance(v, bool):
                         train_step_row[k] = bool(v)
@@ -2403,6 +2740,8 @@ def main() -> None:
                 if diag_row:
                     train_step_row.update(diag_row)
                 if perf_cfg["enable"] and perf_cfg["cuda_memory"] and torch.cuda.is_available():
+                    train_step_row["mem_allocated_bytes"] = int(torch.cuda.memory_allocated())
+                    train_step_row["mem_reserved_bytes"] = int(torch.cuda.memory_reserved())
                     train_step_row["peak_mem_bytes"] = int(torch.cuda.max_memory_allocated())
                     train_step_row["peak_mem_reserved_bytes"] = int(torch.cuda.max_memory_reserved())
                 _write_metrics_history(metrics_fh, train_step_row)
@@ -2420,9 +2759,10 @@ def main() -> None:
 
             if image_trigger_mode == "raw_step_interval":
                 scheduler_global_step = int(scheduler_info.get("global_step", step + 1))
-                if scheduler_global_step > 0 and scheduler_global_step % int(image_trigger_interval_steps) == 0:
-                    _save_train_monitor_triplets(
+                if scheduler_global_step == 0 or scheduler_global_step % int(image_trigger_interval_steps) == 0:
+                    _save_train_images_for_result(
                         step=int(step),
+                        result=result,
                         pred_rgbs=pred_rgbs,
                         gt_images=gt_images,
                         raw_batch=raw_batch,
@@ -2430,6 +2770,7 @@ def main() -> None:
                         block_idx_global=int(scheduler_info.get("block_idx_global", 0)),
                         scene_id_fallback=scheduler_info.get("scene_id", -1),
                         pixel_camera_ids=pixel_camera_ids,
+                        writer=writer,
                     )
                     _save_stage5_5_aux_debug_maps(
                         step=int(step),
@@ -2453,8 +2794,9 @@ def main() -> None:
                 if any(ev.get("type") == "episode_end" for ev in step_events):
                     completed_blocks = int(scheduler_info.get("block_idx_global", -1)) + 1
                     if completed_blocks > 0 and completed_blocks % int(image_interval_blocks_equiv) == 0:
-                        _save_train_monitor_triplets(
+                        _save_train_images_for_result(
                             step=int(step),
+                            result=result,
                             pred_rgbs=pred_rgbs,
                             gt_images=gt_images,
                             raw_batch=raw_batch,
@@ -2462,6 +2804,7 @@ def main() -> None:
                             block_idx_global=int(scheduler_info.get("block_idx_global", 0)),
                             scene_id_fallback=scheduler_info.get("scene_id", -1),
                             pixel_camera_ids=pixel_camera_ids,
+                            writer=writer,
                         )
                         _save_stage5_5_aux_debug_maps(
                             step=int(step),
@@ -2491,8 +2834,9 @@ def main() -> None:
                 block_idx_global = int(ev.get("block_idx_global", 0))
                 if image_trigger_mode == "block_end":
                     if block_idx_global >= 1 and (block_idx_global - 1) % int(image_interval_blocks_equiv) == 0:
-                        _save_train_monitor_triplets(
+                        _save_train_images_for_result(
                             step=int(step),
+                            result=result,
                             pred_rgbs=pred_rgbs,
                             gt_images=gt_images,
                             raw_batch=raw_batch,
@@ -2500,6 +2844,7 @@ def main() -> None:
                             block_idx_global=int(block_idx_global),
                             scene_id_fallback=ev.get("scene_id", -1),
                             pixel_camera_ids=pixel_camera_ids,
+                            writer=writer,
                         )
                         _save_stage5_5_aux_debug_maps(
                             step=int(step),
@@ -2995,6 +3340,79 @@ def main() -> None:
             _drop_result_tensor_payloads(result)
             pred_rgbs = []
             gt_images = []
+            if "pred_rgbs_eval" in locals():
+                pred_rgbs_eval = []
+            if "gt_images_eval" in locals():
+                gt_images_eval = []
+            if "train_step_row" in locals():
+                train_step_row = {}
+            if "row" in locals():
+                row = {}
+            if "metric_vals" in locals():
+                metric_vals = {}
+            if "diag_row" in locals():
+                diag_row = {}
+            raw_batch = {}
+            minimal_batch = {}
+            result = None
+            did_empty_cache = False
+            if (
+                perf_empty_cache_interval_steps > 0
+                and step % int(perf_empty_cache_interval_steps) == 0
+                and torch.cuda.is_available()
+            ):
+                torch.cuda.empty_cache()
+                did_empty_cache = True
+            if (
+                perf_cleanup_metrics_interval_steps > 0
+                and step % perf_cleanup_metrics_interval_steps == 0
+                and perf_cfg["enable"]
+                and perf_cfg["cuda_memory"]
+                and torch.cuda.is_available()
+            ):
+                iter_wall_pre_checkpoint_ms = float((time.perf_counter() - iter_t0) * 1000.0)
+                residual_pre_checkpoint_ms = max(
+                    0.0,
+                    float(iter_wall_pre_checkpoint_ms)
+                    - float(step_time_ms)
+                    - float(batch_fetch_ms)
+                    - float(batch_convert_ms)
+                    - float(block_end_monitor_ms)
+                    - float(validation_ms),
+                )
+                cleanup_row = {
+                    "step": int(step),
+                    "split": "step_cleanup",
+                    "scene_id": int(scheduler_info.get("scene_id", -1)),
+                    "scene_dir": _scene_dir_str(scheduler_info.get("scene_id", -1)),
+                    "segment_id": int(scheduler_info.get("segment_id", -1)),
+                    "global_step": int(scheduler_info.get("global_step", -1)),
+                    "iter_wall_pre_checkpoint_ms": float(iter_wall_pre_checkpoint_ms),
+                    "train_step_ms": float(step_time_ms),
+                    "batch_fetch_ms": float(batch_fetch_ms),
+                    "batch_convert_ms": float(batch_convert_ms),
+                    "block_end_monitor_ms": float(block_end_monitor_ms),
+                    "validation_ms": float(validation_ms),
+                    "residual_non_train_pre_checkpoint_ms": float(residual_pre_checkpoint_ms),
+                    "mem_allocated_bytes": int(torch.cuda.memory_allocated()),
+                    "mem_reserved_bytes": int(torch.cuda.memory_reserved()),
+                    "peak_mem_bytes": int(torch.cuda.max_memory_allocated()),
+                    "peak_mem_reserved_bytes": int(torch.cuda.max_memory_reserved()),
+                    "cuda_empty_cache": bool(did_empty_cache),
+                }
+                if (
+                    perf_live_tensor_summary_interval_steps > 0
+                    and step % perf_live_tensor_summary_interval_steps == 0
+                ):
+                    cleanup_row.update(
+                        _cuda_component_memory_summary(
+                            model=model,
+                            dataset=dataset,
+                            include_live=True,
+                            topk=int(perf_live_tensor_summary_topk),
+                        )
+                    )
+                _write_metrics_history(metrics_fh, cleanup_row)
 
             checkpoint_ms = 0.0
             if save_every and step > 0 and step % save_every == 0:
@@ -3051,7 +3469,7 @@ def main() -> None:
         summary = {
             "start_step": int(start_step),
             "final_step": int(max_iterations - 1),
-            "train": {"loss": float(result["loss"]) if result is not None else float("nan")},
+            "train": {"loss": float(last_train_loss)},
             "gs_stats": {
                 "avg_num_gaussians_bg": sum_num_gaussians_bg / max(total_steps, 1),
                 "avg_num_gaussians_rigid": sum_num_gaussians_rigid / max(total_steps, 1),
