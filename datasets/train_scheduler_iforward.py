@@ -100,6 +100,8 @@ class IForwardRolloutPlan:
     reset_scene_state_before_rollout: bool
     carry_scene_state_after_rollout: bool
     episode_end_after_rollout: bool
+    tail_skipped_after_rollout: bool
+    tail_skipped_remaining_blocks: int
     detach_graph_after_rollout: bool
     evidence_refs_flat: List[ImageRef]
     target_refs_flat: List[ImageRef]
@@ -248,10 +250,17 @@ class TrainSchedulerIForward:
 
         if str(_cfg_get(self.episode_cfg, "source_mode", "keyframes")) != "keyframes":
             raise ValueError("scheduler_iforward IForward v1 requires episode.source_mode=keyframes")
-        if str(_cfg_get(self.episode_cfg, "block_source_frame_policy", "random_within_keyframe_once_per_episode")) != "random_within_keyframe_once_per_episode":
+        block_source_frame_policy = str(
+            _cfg_get(self.episode_cfg, "block_source_frame_policy", "random_within_keyframe_once_per_episode")
+        )
+        if block_source_frame_policy not in (
+            "random_within_keyframe_once_per_episode",
+            "random_within_keyframe_per_rollout",
+        ):
             raise ValueError(
                 "scheduler_iforward IForward v1 requires "
-                "episode.block_source_frame_policy=random_within_keyframe_once_per_episode"
+                "episode.block_source_frame_policy=random_within_keyframe_once_per_episode "
+                "or random_within_keyframe_per_rollout"
             )
         if int(_cfg_get(self.episode_cfg, "blocks_per_episode", 8)) < 1:
             raise ValueError("scheduler_iforward.episode.blocks_per_episode must be >= 1")
@@ -260,8 +269,12 @@ class TrainSchedulerIForward:
         if int(_cfg_get(self.episode_cfg, "min_blocks_per_episode", 2)) < 1:
             raise ValueError("scheduler_iforward.episode.min_blocks_per_episode must be >= 1")
 
-        if str(_cfg_get(self.rollout_cfg, "block_selection_policy", "next_contiguous")) != "next_contiguous":
-            raise ValueError("scheduler_iforward IForward v1 requires rollout.block_selection_policy=next_contiguous")
+        block_selection_policy = str(_cfg_get(self.rollout_cfg, "block_selection_policy", "next_contiguous"))
+        if block_selection_policy not in ("next_contiguous", "random_start_contiguous"):
+            raise ValueError(
+                "scheduler_iforward IForward v1 requires rollout.block_selection_policy="
+                "next_contiguous or random_start_contiguous"
+            )
         if str(_cfg_get(self.rollout_cfg, "delivery_order_policy", "chronological")) != "chronological":
             raise ValueError("scheduler_iforward IForward v1 requires rollout.delivery_order_policy=chronological")
         if int(_cfg_get(self.rollout_cfg, "min_blocks_per_rollout", 1)) < 1:
@@ -396,11 +409,24 @@ class TrainSchedulerIForward:
     def _sample_shape(self) -> IForwardRolloutShape:
         return self._sample_shape_from(self._active_shapes())
 
+    def _block_selection_policy(self) -> str:
+        return str(_cfg_get(self.rollout_cfg, "block_selection_policy", "next_contiguous"))
+
+    def _block_source_frame_policy(self) -> str:
+        return str(_cfg_get(self.episode_cfg, "block_source_frame_policy", "random_within_keyframe_once_per_episode"))
+
     def _sample_shape_for_remaining(self, remaining_blocks: int) -> IForwardRolloutShape:
         shapes = self._active_shapes()
         remaining = int(remaining_blocks)
         if remaining < 1:
             raise ValueError("remaining_blocks must be >= 1")
+        allow_short = bool(_cfg_get(self.rollout_cfg, "allow_short_final_rollout", True))
+        if not allow_short:
+            valid_full = [shape for shape in shapes if int(shape.blocks_per_rollout) <= remaining]
+            if valid_full:
+                return self._sample_shape_from(valid_full)
+            return self._sample_shape_from(shapes)
+
         if not bool(_cfg_get(self.rollout_cfg, "avoid_single_block_tail", False)):
             return self._sample_shape_from(shapes)
 
@@ -424,6 +450,77 @@ class TrainSchedulerIForward:
                 blocks_per_rollout=int(remaining),
             )
         return sampled
+
+    def _sample_shape_for_episode_length(self, episode_blocks: int) -> IForwardRolloutShape:
+        shapes = self._active_shapes()
+        valid = [shape for shape in shapes if int(shape.blocks_per_rollout) <= int(episode_blocks)]
+        if not valid:
+            return self._sample_shape_from(shapes)
+        return self._sample_shape_from(valid)
+
+    def _min_active_shape_blocks(self) -> int:
+        shapes = self._active_shapes()
+        if not shapes:
+            raise ValueError("scheduler_iforward rollout.shapes is empty")
+        return min(int(shape.blocks_per_rollout) for shape in shapes)
+
+    def _remaining_blocks_in_episode(self, episode: Dict[str, Any]) -> int:
+        frame_chain = [int(x) for x in list(episode.get("frame_chain", []) or [])]
+        return max(0, int(len(frame_chain)) - int(episode.get("block_cursor", 0)))
+
+    def _should_skip_episode_tail(self, episode: Dict[str, Any]) -> bool:
+        remaining = int(self._remaining_blocks_in_episode(episode))
+        if remaining <= 0:
+            return True
+        if bool(_cfg_get(self.rollout_cfg, "allow_short_final_rollout", True)):
+            return False
+        min_rollout = int(_cfg_get(self.rollout_cfg, "min_blocks_per_rollout", 1))
+        min_shape = int(self._min_active_shape_blocks())
+        return remaining < max(int(min_rollout), int(min_shape))
+
+    def _skip_current_episode_tail(self, episode: Dict[str, Any], *, reason: str) -> None:
+        remaining = int(self._remaining_blocks_in_episode(episode))
+        self._emit(
+            {
+                "type": "episode_tail_skipped",
+                "scheduler_version": IFORWARD_SCHEDULER_VERSION,
+                "global_step": int(self.global_step),
+                "scene_id": int(episode["scene_id"]),
+                "segment_id": int(episode["segment_id"]),
+                "episode_id": int(episode["episode_id"]),
+                "rollout_idx_in_episode": int(episode["rollout_idx_in_episode"]),
+                "remaining_blocks": int(remaining),
+                "reason": str(reason),
+            }
+        )
+        self._emit(
+            {
+                "type": "episode_end",
+                "scheduler_version": IFORWARD_SCHEDULER_VERSION,
+                "global_step": int(self.global_step),
+                "scene_id": int(episode["scene_id"]),
+                "segment_id": int(episode["segment_id"]),
+                "episode_id": int(episode["episode_id"]),
+                "rollout_id_global": int(self._rollout_id_global),
+                "tail_skipped": True,
+                "remaining_blocks": int(remaining),
+            }
+        )
+        self._current_episode = None
+
+    def _ensure_episode_with_rollout_available(self) -> Dict[str, Any]:
+        attempts = 0
+        while True:
+            episode = self._ensure_episode()
+            if not self._should_skip_episode_tail(episode):
+                return episode
+            self._skip_current_episode_tail(episode, reason="remaining_blocks_lt_required_rollout")
+            attempts += 1
+            if attempts > max(8, len(self._episode_plan) + 2):
+                raise ValueError(
+                    "scheduler_iforward could not find an episode with enough blocks for a rollout. "
+                    "Check rollout.min_blocks_per_rollout, rollout.shapes, and episode window settings."
+                )
 
     def _emit(self, event: Dict[str, Any]) -> None:
         self._pending_events.append(dict(event))
@@ -490,6 +587,16 @@ class TrainSchedulerIForward:
             return [int(keyframe_idx)]
         return []
 
+    def _sample_train_frame_for_keyframe(self, sidx: Any, keyframe_idx: int) -> int:
+        candidates = self._keyframe_train_frames(sidx, int(keyframe_idx))
+        if not candidates:
+            raise ValueError(
+                "scheduler_iforward keyframe has no train frames: "
+                f"scene={getattr(sidx, 'scene_id', '?')} segment={getattr(sidx, 'segment_id', '?')} "
+                f"keyframe={int(keyframe_idx)}"
+            )
+        return int(self.rng.choice(candidates))
+
     def _start_next_episode(self) -> None:
         if self._episode_plan_cursor >= len(self._episode_plan):
             self._rebuild_epoch_plan()
@@ -497,6 +604,7 @@ class TrainSchedulerIForward:
         self._episode_plan_cursor += 1
 
         sidx = self.dataset.get_segment_index(int(spec["scene_id"]), int(spec["segment_id"]))
+        frame_policy = self._block_source_frame_policy()
         frame_chain: List[int] = []
         for keyframe_idx in list(spec["keyframe_window"]):
             candidates = self._keyframe_train_frames(sidx, int(keyframe_idx))
@@ -505,7 +613,10 @@ class TrainSchedulerIForward:
                     "scheduler_iforward keyframe has no train frames: "
                     f"scene={spec['scene_id']} segment={spec['segment_id']} keyframe={int(keyframe_idx)}"
                 )
-            frame_chain.append(int(self.rng.choice(candidates)))
+            if frame_policy == "random_within_keyframe_per_rollout":
+                frame_chain.append(int(candidates[0]))
+            else:
+                frame_chain.append(int(self.rng.choice(candidates)))
 
         episode_id = int(self._episode_id_next)
         self._episode_id_next += 1
@@ -519,6 +630,7 @@ class TrainSchedulerIForward:
             "num_cams": int(getattr(sidx, "num_cams", 1)),
             "block_cursor": 0,
             "rollout_idx_in_episode": 0,
+            "used_rollout_starts": [],
         }
         self._emit(
             {
@@ -579,6 +691,47 @@ class TrainSchedulerIForward:
         count = min(int(frames_per_rollout), len(sorted_candidates))
         return sorted(self.rng.sample(sorted_candidates, count)), False, ""
 
+    def _select_episode_blocks(
+        self,
+        *,
+        episode: Dict[str, Any],
+        shape: IForwardRolloutShape,
+    ) -> Tuple[List[int], int, int]:
+        keyframe_window = [int(x) for x in list(episode["keyframe_window"])]
+        requested_blocks = int(shape.blocks_per_rollout)
+        if requested_blocks < 1:
+            raise ValueError("IForward requested_blocks_per_rollout must be >= 1")
+        if len(keyframe_window) < requested_blocks:
+            raise ValueError(
+                "scheduler_iforward episode is shorter than requested rollout: "
+                f"episode_blocks={len(keyframe_window)} requested={requested_blocks}"
+            )
+
+        policy = self._block_selection_policy()
+        if policy == "next_contiguous":
+            block_cursor = int(episode["block_cursor"])
+            end = min(block_cursor + requested_blocks, len(keyframe_window))
+            return list(range(block_cursor, end)), int(block_cursor), int(end)
+
+        if policy != "random_start_contiguous":
+            raise ValueError(f"Unsupported IForward block_selection_policy={policy!r}")
+
+        max_start = int(len(keyframe_window) - requested_blocks)
+        valid_starts = list(range(max_start + 1))
+        used_starts = set(int(x) for x in list(episode.get("used_rollout_starts", []) or []))
+        available = [int(x) for x in valid_starts if int(x) not in used_starts]
+        if not available:
+            available = valid_starts
+        last_start_raw = episode.get("last_rollout_start_block_idx", None)
+        if last_start_raw is not None and len(available) > 1:
+            sequential_next = int(last_start_raw) + int(requested_blocks)
+            non_sequential = [int(x) for x in available if int(x) != int(sequential_next)]
+            if non_sequential:
+                available = non_sequential
+        start = int(self.rng.choice(available))
+        end = int(start + requested_blocks)
+        return list(range(start, end)), int(start), int(end)
+
     def _build_rollout_plan(self, episode: Dict[str, Any]) -> IForwardRolloutPlan:
         sidx = self.dataset.get_segment_index(int(episode["scene_id"]), int(episode["segment_id"]))
         block_cursor = int(episode["block_cursor"])
@@ -588,11 +741,13 @@ class TrainSchedulerIForward:
             raise ValueError("IForward episode block cursor is already at end")
 
         remaining_blocks = int(len(frame_chain) - block_cursor)
-        shape = self._sample_shape_for_remaining(remaining_blocks)
+        if self._block_selection_policy() == "random_start_contiguous":
+            shape = self._sample_shape_for_episode_length(len(frame_chain))
+        else:
+            shape = self._sample_shape_for_remaining(remaining_blocks)
         requested_blocks = int(shape.blocks_per_rollout)
         repeats = int(shape.repeats_per_block)
-        end = min(block_cursor + requested_blocks, len(frame_chain))
-        episode_blocks = list(range(block_cursor, end))
+        episode_blocks, rollout_start_block_idx, selected_end = self._select_episode_blocks(episode=episode, shape=shape)
         if len(episode_blocks) < requested_blocks:
             allow_short = bool(_cfg_get(self.rollout_cfg, "allow_short_final_rollout", True))
             min_blocks = int(_cfg_get(self.rollout_cfg, "min_blocks_per_rollout", 1))
@@ -602,9 +757,19 @@ class TrainSchedulerIForward:
                 )
 
         input_keyframes = [int(keyframe_window[int(idx)]) for idx in episode_blocks]
-        input_frames = [int(frame_chain[int(idx)]) for idx in episode_blocks]
+        if self._block_source_frame_policy() == "random_within_keyframe_per_rollout":
+            input_frames = [self._sample_train_frame_for_keyframe(sidx, int(kf)) for kf in input_keyframes]
+            rollout_frame_by_block = {int(block_idx): int(frame_idx) for block_idx, frame_idx in zip(episode_blocks, input_frames)}
+            plan_frame_chain = [
+                int(rollout_frame_by_block.get(int(idx), int(frame_chain[int(idx)])))
+                for idx in range(len(frame_chain))
+            ]
+        else:
+            input_frames = [int(frame_chain[int(idx)]) for idx in episode_blocks]
+            rollout_frame_by_block = {int(block_idx): int(frame_chain[int(block_idx)]) for block_idx in episode_blocks}
+            plan_frame_chain = [int(x) for x in frame_chain]
         delivery_blocks = list(episode_blocks)
-        delivery_frames = [int(frame_chain[int(idx)]) for idx in delivery_blocks]
+        delivery_frames = [int(rollout_frame_by_block[int(idx)]) for idx in delivery_blocks]
         actual_blocks = int(len(delivery_blocks))
         requested_inner_k = int(requested_blocks * repeats)
         actual_inner_k = int(actual_blocks * repeats)
@@ -617,7 +782,7 @@ class TrainSchedulerIForward:
         num_cams = int(episode["num_cams"])
         steps: List[IForwardStepPlan] = []
         for rollout_rank, block_idx in enumerate(delivery_blocks):
-            frame_idx = int(frame_chain[int(block_idx)])
+            frame_idx = int(rollout_frame_by_block[int(block_idx)])
             keyframe_idx = int(keyframe_window[int(block_idx)])
             evidence_refs = self._refs_for_frames(num_cams, [frame_idx])
             for repeat_idx in range(repeats):
@@ -671,7 +836,19 @@ class TrainSchedulerIForward:
             current_ref_count=int(len(current_refs)),
             nearby_ref_count=int(len(nearby_refs)),
         )
-        episode_end = bool(end >= len(frame_chain))
+        logical_end = int(block_cursor + actual_blocks)
+        remaining_after_rollout = int(len(frame_chain) - logical_end)
+        tail_skipped_after_rollout = False
+        episode_end = bool(logical_end >= len(frame_chain))
+        if not episode_end and remaining_after_rollout > 0:
+            allow_short_final = bool(_cfg_get(self.rollout_cfg, "allow_short_final_rollout", True))
+            if not allow_short_final:
+                min_rollout = int(_cfg_get(self.rollout_cfg, "min_blocks_per_rollout", 1))
+                min_shape = int(self._min_active_shape_blocks())
+                min_required = max(int(min_rollout), int(min_shape))
+                if int(remaining_after_rollout) < int(min_required):
+                    tail_skipped_after_rollout = True
+                    episode_end = True
         reset_before = bool(int(episode["rollout_idx_in_episode"]) == 0)
 
         leakage_check = {
@@ -697,6 +874,10 @@ class TrainSchedulerIForward:
             "inner_K": int(actual_inner_k),
             "shape_name": str(shape_name),
             "requested_shape_name": str(shape.name),
+            "block_selection_policy": str(self._block_selection_policy()),
+            "source_frame_sampling_policy": str(self._block_source_frame_policy()),
+            "rollout_start_block_idx": int(rollout_start_block_idx),
+            "selected_block_end_exclusive": int(selected_end),
             "blocks_per_rollout": int(requested_blocks),
             "requested_blocks_per_rollout": int(requested_blocks),
             "actual_blocks_per_rollout": int(actual_blocks),
@@ -705,6 +886,8 @@ class TrainSchedulerIForward:
             "actual_inner_K": int(actual_inner_k),
             "short_rollout": bool(short_rollout),
             "short_rollout_reason": str(short_reason),
+            "tail_skipped_after_rollout": bool(tail_skipped_after_rollout),
+            "tail_skipped_remaining_blocks": int(remaining_after_rollout) if bool(tail_skipped_after_rollout) else 0,
             "carry_scene_state_after_rollout": bool(not episode_end),
             "discard_scene_state_after_rollout": bool(episode_end),
             "source_image_refs": [tuple(x) for x in evidence_refs_flat],
@@ -729,7 +912,7 @@ class TrainSchedulerIForward:
             rollout_idx_in_episode=int(episode["rollout_idx_in_episode"]),
             episode_start_keyframe_pos=int(episode["episode_start_keyframe_pos"]),
             keyframe_window=[int(x) for x in keyframe_window],
-            frame_chain=[int(x) for x in frame_chain],
+            frame_chain=[int(x) for x in plan_frame_chain],
             num_cams=int(num_cams),
             shape_name=str(shape_name),
             blocks_per_rollout=int(requested_blocks),
@@ -751,6 +934,8 @@ class TrainSchedulerIForward:
             reset_scene_state_before_rollout=bool(reset_before),
             carry_scene_state_after_rollout=bool(not episode_end),
             episode_end_after_rollout=bool(episode_end),
+            tail_skipped_after_rollout=bool(tail_skipped_after_rollout),
+            tail_skipped_remaining_blocks=int(remaining_after_rollout) if bool(tail_skipped_after_rollout) else 0,
             detach_graph_after_rollout=True,
             evidence_refs_flat=[tuple(x) for x in evidence_refs_flat],
             target_refs_flat=[tuple(x) for x in target_refs],
@@ -918,7 +1103,7 @@ class TrainSchedulerIForward:
             return
         state = self.state_dict()
         try:
-            episode = self._ensure_episode()
+            episode = self._ensure_episode_with_rollout_available()
             plan = self._build_rollout_plan(episode)
             self._emit_preload_hint_for_plan(
                 plan,
@@ -932,7 +1117,7 @@ class TrainSchedulerIForward:
     def materialize_current_batch_without_advance(self) -> Dict[str, Any]:
         state = self.state_dict()
         try:
-            episode = self._ensure_episode()
+            episode = self._ensure_episode_with_rollout_available()
             plan = self._build_rollout_plan(episode)
             batch = self._batch_from_plan(plan)
             batch["_iforward_peek"] = True
@@ -941,7 +1126,7 @@ class TrainSchedulerIForward:
             self.load_state_dict(state)
 
     def next_batch(self) -> Dict[str, Any]:
-        episode = self._ensure_episode()
+        episode = self._ensure_episode_with_rollout_available()
         plan = self._build_rollout_plan(episode)
         batch = self._batch_from_plan(plan)
         self._emit_preload_hint_for_plan(plan)
@@ -975,6 +1160,9 @@ class TrainSchedulerIForward:
             "T_steps": int(plan.actual_blocks_per_rollout),
             "inner_K": int(plan.inner_K),
             "shape_name": str(plan.shape_name),
+            "block_selection_policy": str(plan.request_meta.get("block_selection_policy", self._block_selection_policy())),
+            "source_frame_sampling_policy": str(plan.request_meta.get("source_frame_sampling_policy", self._block_source_frame_policy())),
+            "rollout_start_block_idx": int(plan.request_meta.get("rollout_start_block_idx", plan.episode_block_indices[0] if plan.episode_block_indices else -1)),
             "actual_blocks_per_rollout": int(plan.actual_blocks_per_rollout),
             "repeats_per_block": int(plan.repeats_per_block),
             "block_order": "iforward_rollout",
@@ -993,12 +1181,33 @@ class TrainSchedulerIForward:
             }
         )
 
+        if self._block_selection_policy() == "random_start_contiguous":
+            used_starts = list(episode.get("used_rollout_starts", []) or [])
+            used_starts.append(int(plan.request_meta.get("rollout_start_block_idx", plan.episode_block_indices[0])))
+            episode["used_rollout_starts"] = [int(x) for x in used_starts]
+            episode["last_rollout_start_block_idx"] = int(
+                plan.request_meta.get("rollout_start_block_idx", plan.episode_block_indices[0])
+            )
         episode["block_cursor"] = int(episode["block_cursor"]) + int(plan.actual_blocks_per_rollout)
         episode["rollout_idx_in_episode"] = int(episode["rollout_idx_in_episode"]) + 1
         self.global_step += 1
         self._rollout_id_global += 1
 
         if bool(plan.episode_end_after_rollout):
+            if bool(plan.request_meta.get("tail_skipped_after_rollout", False)):
+                self._emit(
+                    {
+                        "type": "episode_tail_skipped",
+                        "scheduler_version": IFORWARD_SCHEDULER_VERSION,
+                        "global_step": int(self.global_step),
+                        "scene_id": int(plan.scene_id),
+                        "segment_id": int(plan.segment_id),
+                        "episode_id": int(plan.episode_id),
+                        "rollout_idx_in_episode": int(plan.rollout_idx_in_episode) + 1,
+                        "remaining_blocks": int(plan.request_meta.get("tail_skipped_remaining_blocks", 0)),
+                        "reason": "remaining_blocks_lt_required_rollout_after_emit",
+                    }
+                )
             self._emit(
                 {
                     "type": "episode_end",

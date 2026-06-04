@@ -91,14 +91,16 @@ def _scheduler(ds: _FakeDataset, **kwargs) -> TrainSchedulerIForward:
             "source_mode": "keyframes",
             "blocks_per_episode": int(kwargs.get("blocks_per_episode", 4)),
             "episode_stride": int(kwargs.get("episode_stride", kwargs.get("blocks_per_episode", 4))),
-            "allow_short_last_episode": True,
+            "allow_short_last_episode": bool(kwargs.get("allow_short_last_episode", True)),
             "min_blocks_per_episode": int(kwargs.get("min_blocks_per_episode", 1)),
-            "block_source_frame_policy": "random_within_keyframe_once_per_episode",
+            "block_source_frame_policy": str(
+                kwargs.get("block_source_frame_policy", "random_within_keyframe_once_per_episode")
+            ),
         },
         rollout_cfg={
-            "block_selection_policy": "next_contiguous",
+            "block_selection_policy": str(kwargs.get("block_selection_policy", "next_contiguous")),
             "delivery_order_policy": "chronological",
-            "allow_short_final_rollout": True,
+            "allow_short_final_rollout": bool(kwargs.get("allow_short_final_rollout", True)),
             "min_blocks_per_rollout": int(kwargs.get("min_blocks_per_rollout", 1)),
             "avoid_single_block_tail": bool(kwargs.get("avoid_single_block_tail", False)),
             "detach_graph_after_rollout": True,
@@ -363,6 +365,94 @@ def test_iforward_tail_aware_sampler_avoids_single_block_tail_when_possible():
     second = scheduler.next_batch()["_iforward"]
     assert first["actual_blocks_per_rollout"] == 3
     assert second["actual_blocks_per_rollout"] == 2
+
+
+def test_iforward_short_final_rollout_disabled_skips_tail():
+    ds = _FakeDataset(multi_frame_per_keyframe=False, num_keyframes=6, num_cams=2)
+    scheduler = TrainSchedulerIForward(
+        dataset=ds,
+        episode_cfg={
+            "source_mode": "keyframes",
+            "blocks_per_episode": 6,
+            "episode_stride": 6,
+            "allow_short_last_episode": True,
+            "min_blocks_per_episode": 1,
+            "block_source_frame_policy": "random_within_keyframe_once_per_episode",
+        },
+        rollout_cfg={
+            "block_selection_policy": "next_contiguous",
+            "delivery_order_policy": "chronological",
+            "allow_short_final_rollout": False,
+            "min_blocks_per_rollout": 4,
+            "avoid_single_block_tail": True,
+            "detach_graph_after_rollout": True,
+            "shapes": [
+                {"name": "b4_r2", "blocks_per_rollout": 4, "repeats_per_block": 2, "prob": 1.0},
+            ],
+        },
+        traversal_cfg={"traversal_mode": "episode_serial", "scene_order": "ascending", "segment_order": "ascending", "seed": 1},
+        evidence_cfg={"camera_policy": "all_cams", "allow_camera_dropout": False},
+        supervision_cfg={
+            "current": {"enable": True, "role_name": "final_current_recon", "frame_policy": "all_input_frames", "camera_policy": "all_cams"},
+            "nearby": {"enable": False},
+            "history_replay": {"enable": False},
+        },
+        memory_cfg={
+            "observation_commit_policy": "first_repeat_only",
+            "optimizer_memory_update_policy": "every_repeat",
+            "reset_policy": "episode_begin",
+            "carry_policy": "across_rollouts_until_episode_end",
+        },
+        loss_timing_cfg={"policy": "rollout_final_only", "intermediate_step_loss": False},
+        leakage_check_cfg={"enable": True, "forbid_test_refs_in_train": True},
+        preload_cfg={"emit_hints": False},
+        fixed_scene_id=1,
+        fixed_segment_id=0,
+    )
+    first = scheduler.next_batch()["_iforward"]
+    assert first["actual_blocks_per_rollout"] == 4
+    assert first["inner_K"] == 8
+    events = scheduler.pop_events()
+    assert first["episode_end_after_rollout"] is True
+    assert first["carry_scene_state_after_rollout"] is False
+    assert first["tail_skipped_after_rollout"] is True
+    assert any(event.get("type") == "episode_tail_skipped" and int(event.get("remaining_blocks", 0)) == 2 for event in events)
+    assert not any(str(event.get("type", "")).startswith("rollout") and int(event.get("inner_K", 8)) != 8 for event in events)
+
+
+def test_iforward_random_start_rollout_resamples_start_and_frames_per_rollout():
+    ds = _FakeDataset(multi_frame_per_keyframe=True, num_keyframes=8, num_cams=2)
+    scheduler = _scheduler(
+        ds,
+        blocks_per_rollout=4,
+        repeats_per_block=2,
+        blocks_per_episode=8,
+        block_selection_policy="random_start_contiguous",
+        block_source_frame_policy="random_within_keyframe_per_rollout",
+        allow_short_final_rollout=False,
+        min_blocks_per_rollout=4,
+        seed=7,
+    )
+
+    first = scheduler.next_batch()["_iforward"]
+    second = scheduler.next_batch()["_iforward"]
+
+    for plan in (first, second):
+        assert plan["request_meta"]["block_selection_policy"] == "random_start_contiguous"
+        assert plan["request_meta"]["source_frame_sampling_policy"] == "random_within_keyframe_per_rollout"
+        assert plan["actual_blocks_per_rollout"] == 4
+        assert plan["inner_K"] == 8
+        assert plan["short_rollout"] is False
+        blocks = [int(x) for x in plan["episode_block_indices"]]
+        assert blocks == list(range(blocks[0], blocks[0] + 4))
+        assert 0 <= blocks[0] <= 4
+        assert [int(x) for x in plan["input_keyframe_indices"]] == blocks
+
+    first_start = int(first["request_meta"]["rollout_start_block_idx"])
+    second_start = int(second["request_meta"]["rollout_start_block_idx"])
+    assert second_start != first_start
+    if first_start + 4 <= 4:
+        assert second_start != first_start + 4
 
 
 def test_iforward_events_use_batch_emitted_name():

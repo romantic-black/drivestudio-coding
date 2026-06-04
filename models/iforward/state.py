@@ -130,6 +130,7 @@ class IForwardShortMemoryEntry:
     ctx: torch.Tensor
     support: Optional[torch.Tensor] = None
     valid: Optional[torch.Tensor] = None
+    row_aligned: bool = False
 
     def detach(self) -> "IForwardShortMemoryEntry":
         return IForwardShortMemoryEntry(
@@ -143,6 +144,7 @@ class IForwardShortMemoryEntry:
             ctx=self.ctx.detach().clone().cpu(),
             support=None if self.support is None else self.support.detach().clone().cpu(),
             valid=None if self.valid is None else self.valid.detach().clone().cpu(),
+            row_aligned=bool(self.row_aligned),
         )
 
 
@@ -257,13 +259,19 @@ class IForwardShortWindowHistory:
         for entry in reversed(entries):
             if str(entry.branch) != str(branch):
                 continue
+            if not bool(getattr(entry, "row_aligned", False)):
+                continue
             if entry.ctx.dim() != 2:
                 continue
             if int(entry.ctx.shape[0]) != n or int(entry.ctx.shape[1]) != int(ref.shape[1]):
                 continue
             if int(entry.point_keys.numel()) != n:
                 continue
-            return entry.ctx.to(device=ref.device, dtype=ref.dtype), 1.0
+            hit_ratio = 1.0
+            if entry.valid is not None:
+                valid = entry.valid.to(device=ref.device).reshape(n, -1).any(dim=-1)
+                hit_ratio = float(valid.float().mean().item()) if valid.numel() else 0.0
+            return entry.ctx.to(device=ref.device, dtype=ref.dtype), float(hit_ratio)
         return None
 
     def read_context(
@@ -330,7 +338,7 @@ def detach_local_gs_state(local_state: LocalGSState) -> LocalGSState:
 @dataclass
 class IForwardState:
     local_gs: LocalGSState
-    memory: IForwardMemoryState
+    memory: Any
     history: IForwardShortWindowHistory
     scene_id: int
     segment_id: int

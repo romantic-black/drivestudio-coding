@@ -16,6 +16,16 @@ DEFAULT_IFORWARD_ABLATIONS = (
     "shuffle_memory",
 )
 
+DEFAULT_IFORWARD_V6_ABLATIONS = (
+    "full",
+    "point_only",
+    "xcpe_only",
+    "no_memory",
+    "disable_rigid_xcpe",
+    "freeze_write",
+    "shuffle_context",
+)
+
 
 def _finite_float(value: Any, default: float = float("nan")) -> float:
     try:
@@ -45,7 +55,7 @@ def validate_iforward_memory_ablation(
     model: Any,
     rollout_batches: Sequence[Dict[str, Any]],
     initial_state: Optional[Any] = None,
-    ablations: Iterable[str] = DEFAULT_IFORWARD_ABLATIONS,
+    ablations: Optional[Iterable[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Run memory ablations from the same initial carried state.
 
@@ -57,6 +67,9 @@ def validate_iforward_memory_ablation(
     batches = list(rollout_batches)
     if not batches:
         raise ValueError("validate_iforward_memory_ablation requires non-empty rollout_batches.")
+
+    if ablations is None:
+        ablations = DEFAULT_IFORWARD_V6_ABLATIONS if bool(getattr(model, "is_v6_point_mamba_xcpe", False)) else DEFAULT_IFORWARD_ABLATIONS
 
     rows: List[Dict[str, Any]] = []
     for mode in [str(x) for x in list(ablations)]:
@@ -106,4 +119,4 @@ def validate_iforward_memory_ablation(
     return rows
 
 
-__all__ = ["DEFAULT_IFORWARD_ABLATIONS", "validate_iforward_memory_ablation"]
+__all__ = ["DEFAULT_IFORWARD_ABLATIONS", "DEFAULT_IFORWARD_V6_ABLATIONS", "validate_iforward_memory_ablation"]

@@ -116,11 +116,15 @@ class FakeIForwardBridge(nn.Module):
             "ssim": 0.0,
         }
 
-    def render_loss_for_targets(self, *, local_state, ref_batch, targets, mask_policy):
+    def render_loss_for_targets(self, *, local_state, ref_batch, targets, mask_policy, pred_rgbs_out=None, gt_images_out=None):
         _ = ref_batch, mask_policy
         self.render_calls.append(tuple(range(len(targets))))
         if not targets:
             return local_state.bg.means.new_tensor(0.0), {"num_refs": 0.0, "valid_ratio": 0.0}
+        if pred_rgbs_out is not None:
+            pred_rgbs_out.append(local_state.bg.means.new_zeros(1, 1, 3))
+        if gt_images_out is not None:
+            gt_images_out.append(local_state.bg.means.new_zeros(1, 1, 3))
         return local_state.bg.means.pow(2).mean(), {"num_refs": float(len(targets)), "valid_ratio": 1.0}
 
     def delta_regularization(self, delta, *, local_state):
@@ -128,7 +132,7 @@ class FakeIForwardBridge(nn.Module):
         return delta.bg.means.pow(2).mean() * 0.0, {"delta_l2": 0.0}
 
 
-def _batch(*, rollout_idx=0, episode_end=False, repeat_only=False):
+def _batch(*, rollout_idx=0, episode_end=False, repeat_only=False, episode_id=3):
     source_refs = [(10, 0), (10, 1), (10, 2), (11, 0), (11, 1), (11, 2)]
     target_refs = [(10, 0), (10, 1), (10, 2), (11, 0), (11, 1), (11, 2), (12, 0), (12, 1), (12, 2)]
     target_roles = ["final_current_recon"] * 6 + ["final_nearby_rollout"] * 3
@@ -177,7 +181,7 @@ def _batch(*, rollout_idx=0, episode_end=False, repeat_only=False):
         "model_family": "IForward",
         "scene_id": 1,
         "segment_id": 2,
-        "episode_id": 3,
+        "episode_id": int(episode_id),
         "rollout_id_global": int(rollout_idx),
         "rollout_idx_in_episode": int(rollout_idx),
         "inner_K": len(steps),
@@ -216,11 +220,12 @@ def test_iforward_forward_rollout_carries_memory_and_renders_only_final():
     assert bridge.observe_calls == [(10, (0, 1, 2)), (11, (3, 4, 5))]
     assert len(bridge.render_calls) == 3
     assert bridge.render_calls[0] == (3, 4, 5)
-    assert bridge.render_calls[2] == (0, 1, 2)
+    assert bridge.render_calls[1] == (0, 1, 2)
+    assert bridge.render_calls[2] == (6, 7, 8)
     assert out.next_state.memory.count_tokens()["bg_point"] == 2
     assert len(out.next_state.history.entries) == 6
-    assert out.image_refs == [(11, 0), (12, 0)]
-    assert out.image_roles == ["current_latest", "nearby"]
+    assert out.image_refs == [(11, 0), (10, 0), (12, 0)]
+    assert out.image_roles == ["current_latest", "history_rollout", "nearby"]
 
 
 def test_iforward_trainer_detaches_carry_and_discards_on_episode_end():
@@ -239,6 +244,19 @@ def test_iforward_trainer_detaches_carry_and_discards_on_episode_end():
     logs1 = trainer.train_step(_batch(rollout_idx=1, episode_end=True), step=1)
     assert logs1["iforward/state_cache_size"] == 0
     assert bridge.delta_scale.grad is None
+
+
+def test_iforward_trainer_clears_stale_cache_on_new_episode_reset():
+    bridge = FakeIForwardBridge()
+    model = IForwardModel(config=None, device=torch.device("cpu"), bridge=bridge, resolver=IForwardBatchResolver())
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    trainer = IForwardTrainer(config={}, device=torch.device("cpu"), model=model, optimizer=optimizer)
+    logs0 = trainer.train_step(_batch(rollout_idx=0, episode_end=False, episode_id=3), step=0)
+    assert logs0["iforward/state_cache_size"] == 1
+
+    logs1 = trainer.train_step(_batch(rollout_idx=0, episode_end=True, episode_id=4), step=1)
+    assert logs1["iforward/stale_state_cache_entries_cleared"] == 1
+    assert logs1["iforward/state_cache_size"] == 0
 
 
 def test_iforward_trainer_restores_state_cache_from_state_dict():
@@ -316,7 +334,8 @@ def test_drop_short_window_drops_read_but_keeps_short_history_loss():
     )
     assert torch.isfinite(out1.loss)
     assert "short_window_history" in out1.losses
-    assert bridge.render_calls[-1] == tuple(range(len(out0.next_state.history.entries)))
+    assert tuple(range(len(out0.next_state.history.entries))) in bridge.render_calls
+    assert "short_window_history" in out1.image_roles
 
 
 def test_iforward_ablation_modes_are_accepted():
@@ -336,6 +355,44 @@ def test_iforward_ablation_modes_are_accepted():
         out = model.forward_rollout(_batch(), ablation=mode)
         assert torch.isfinite(out.loss)
         assert out.stats["ablation"] == mode
+
+
+def test_iforward_v6_rollout_path_ablations_and_no_short_memory_entries():
+    cfg = {
+        "model": {
+            "iforward": {
+                "version": "v6_point_mamba_xcpe",
+                "memory": {"point_mamba": {"model_dim": 4, "output_dim": 3, "state_dim": 2, "conv_kernel": 2}},
+                "local_conflict": {
+                    "sparse_backend": "fallback_neighbor_mean",
+                    "hidden_dim": 4,
+                    "output_dim": 4,
+                    "num_blocks": 1,
+                    "voxel_size": 0.5,
+                },
+                "context_adapter": {"output_dim": 4},
+                "short_window_history": {"max_entries": 24, "max_memory_entries": 8},
+            }
+        }
+    }
+    for mode in (
+        "full",
+        "point_only",
+        "xcpe_only",
+        "no_memory",
+        "disable_rigid_xcpe",
+        "freeze_write",
+        "shuffle_context",
+    ):
+        bridge = FakeIForwardBridge()
+        model = IForwardModel(config=cfg, device=torch.device("cpu"), bridge=bridge, resolver=IForwardBatchResolver())
+        out = model.forward_rollout(_batch(), ablation=mode)
+        assert torch.isfinite(out.loss)
+        assert out.stats["ablation"] == mode
+        assert out.stats["memory_entries_after"] == 0
+        assert out.next_state.history.max_memory_entries == 0
+        if mode == "full":
+            assert out.next_state.memory.count_tokens()["bg_point_seen"] == 2
 
 
 def test_iforward_memory_ablation_validation_reports_retention_table():

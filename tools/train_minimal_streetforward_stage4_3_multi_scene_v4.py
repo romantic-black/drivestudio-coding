@@ -90,6 +90,7 @@ DEFAULT_CONFIG_FILE = "configs/minimal_streetforward_stage4_3_multi_scene_v4.yam
 ALLOW_ONE_SEGMENT = False
 EPISODE_END_HOOK = None
 TRAIN_START_HOOK = None
+STEP_END_HOOK = None
 
 
 def _scene_dir_str(scene_id: Any) -> str:
@@ -354,7 +355,7 @@ def _save_iforward_train_images(
     scene_id_fallback: Any,
     pixel_camera_ids: List[int],
     writer: Optional[Any] = None,
-    max_tb_images: int = 6,
+    max_tb_images: int = 12,
 ) -> None:
     if len(pred_rgbs) == 0 or len(gt_images) == 0:
         return
@@ -2334,6 +2335,7 @@ def main() -> None:
     )
     episode_end_hook = globals().get("EPISODE_END_HOOK")
     train_start_hook = globals().get("TRAIN_START_HOOK")
+    step_end_hook = globals().get("STEP_END_HOOK")
 
     try:
         metrics_fh = _open_metrics_history(
@@ -3298,6 +3300,25 @@ def main() -> None:
                         metrics_fh=metrics_fh,
                         writer=writer,
                     )
+                validation_ms += float((time.perf_counter() - val_t0) * 1000.0)
+            if callable(step_end_hook):
+                val_t0 = time.perf_counter()
+                step_end_hook(
+                    cfg=cfg,
+                    dataset=dataset,
+                    model=model,
+                    device=device,
+                    trigger_train_episode_counter=int(train_episode_counter),
+                    trigger_step=int(step),
+                    minimal_batch=minimal_batch,
+                    scheduler_info=scheduler_info,
+                    step_events=step_events,
+                    psnr_metric=psnr_metric,
+                    ssim_metric=ssim_metric,
+                    lpips_metric=lpips_metric,
+                    metrics_fh=metrics_fh,
+                    writer=writer,
+                )
                 validation_ms += float((time.perf_counter() - val_t0) * 1000.0)
             if defer_node_state_reset_for_episode_hook:
                 reset_info = _reset_model_node_state_and_release_cuda(

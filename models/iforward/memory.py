@@ -50,6 +50,18 @@ def _empty_dense_from_cell(cell: StreamingMambaCell, *, num_rows: int, device: t
     return DenseMambaState(conv_state=init.conv_state, ssm_state=init.ssm_state, seen=init.seen)
 
 
+def _sort_keyed_state(state: KeyedMambaState) -> KeyedMambaState:
+    if int(state.keys.numel()) <= 1:
+        return state
+    keys, order = torch.sort(state.keys.to(dtype=torch.long))
+    return KeyedMambaState(
+        keys=keys,
+        conv_state=state.conv_state[order],
+        ssm_state=state.ssm_state[order],
+        seen=state.seen[order],
+    )
+
+
 def _ensure_dense_capacity(
     cell: StreamingMambaCell,
     state: Optional[DenseMambaState],
@@ -93,21 +105,18 @@ def _gather_state_for_keys(
     if state is None or int(keys.numel()) == 0 or int(state.keys.numel()) == 0:
         return gathered
     state = state.to(device=device, dtype=dtype)
-    index = {int(k): int(i) for i, k in enumerate(state.keys.detach().cpu().tolist())}
-    src_rows = []
-    dst_rows = []
-    for dst, key in enumerate(keys.detach().cpu().tolist()):
-        src = index.get(int(key))
-        if src is not None:
-            src_rows.append(int(src))
-            dst_rows.append(int(dst))
-    if not src_rows:
+    query = keys.to(device=device, dtype=torch.long)
+    pos = torch.searchsorted(state.keys, query)
+    n_state = int(state.keys.numel())
+    safe_pos = pos.clamp(max=max(n_state - 1, 0))
+    hit = (pos < n_state) & (state.keys[safe_pos] == query)
+    dst_rows = torch.nonzero(hit, as_tuple=False).squeeze(1)
+    if int(dst_rows.numel()) == 0:
         return gathered
-    src_t = torch.tensor(src_rows, device=device, dtype=torch.long)
-    dst_t = torch.tensor(dst_rows, device=device, dtype=torch.long)
-    gathered.conv_state[dst_t] = state.conv_state[src_t]
-    gathered.ssm_state[dst_t] = state.ssm_state[src_t]
-    gathered.seen[dst_t] = state.seen[src_t]
+    src_rows = safe_pos[dst_rows]
+    gathered.conv_state[dst_rows] = state.conv_state[src_rows]
+    gathered.ssm_state[dst_rows] = state.ssm_state[src_rows]
+    gathered.seen[dst_rows] = state.seen[src_rows]
     return gathered
 
 
@@ -123,25 +132,28 @@ def _scatter_state_for_keys(
 ) -> Optional[KeyedMambaState]:
     if int(keys.numel()) == 0 or int(write_mask.numel()) == 0:
         return state
+    mask_rows = torch.nonzero(write_mask.to(device=device, dtype=torch.bool), as_tuple=False).squeeze(1)
+    if int(mask_rows.numel()) == 0:
+        return state
     base = state.to(device=device, dtype=dtype) if state is not None else _empty_keyed_from_cell(cell, device=device, dtype=dtype)
-    existing = {int(k): int(i) for i, k in enumerate(base.keys.detach().cpu().tolist())}
-    key_list = [int(k) for k in keys.detach().cpu().tolist()]
-    mask_list = [bool(x) for x in write_mask.to(device=device, dtype=torch.bool).detach().cpu().tolist()]
-    missing_keys = [int(k) for k, should_write in zip(key_list, mask_list) if should_write and int(k) not in existing]
-    if missing_keys:
-        new_keys = torch.tensor(missing_keys, device=device, dtype=torch.long)
-        init = cell.init_state(len(missing_keys), device=device, dtype=dtype)
-        all_keys = torch.cat([base.keys, new_keys], dim=0)
+    write_keys = keys.to(device=device, dtype=torch.long)[mask_rows]
+    if int(base.keys.numel()) == 0:
+        missing_keys = write_keys
+    else:
+        pos0 = torch.searchsorted(base.keys, write_keys)
+        n0 = int(base.keys.numel())
+        safe_pos0 = pos0.clamp(max=max(n0 - 1, 0))
+        hit0 = (pos0 < n0) & (base.keys[safe_pos0] == write_keys)
+        missing_keys = write_keys[~hit0]
+    if int(missing_keys.numel()) > 0:
+        init = cell.init_state(int(missing_keys.numel()), device=device, dtype=dtype)
+        all_keys = torch.cat([base.keys, missing_keys], dim=0)
         all_conv = torch.cat([base.conv_state, init.conv_state], dim=0)
         all_ssm = torch.cat([base.ssm_state, init.ssm_state], dim=0)
         all_seen = torch.cat([base.seen, init.seen], dim=0)
-        base = KeyedMambaState(keys=all_keys, conv_state=all_conv, ssm_state=all_ssm, seen=all_seen)
-        existing = {int(k): int(i) for i, k in enumerate(base.keys.detach().cpu().tolist())}
+        base = _sort_keyed_state(KeyedMambaState(keys=all_keys, conv_state=all_conv, ssm_state=all_ssm, seen=all_seen))
 
-    mask_rows = torch.nonzero(write_mask.to(device=device, dtype=torch.bool), as_tuple=False).squeeze(1)
-    if int(mask_rows.numel()) == 0:
-        return base
-    rows = torch.tensor([existing[int(key_list[int(i)])] for i in mask_rows.detach().cpu().tolist()], device=device, dtype=torch.long)
+    rows = torch.searchsorted(base.keys, write_keys)
     conv = base.conv_state.clone()
     ssm = base.ssm_state.clone()
     seen = base.seen.clone()
@@ -188,6 +200,42 @@ def _update_keyed(
     return new_state, out_u[inverse]
 
 
+def _masked_mean_token(x: torch.Tensor, write_mask: torch.Tensor) -> torch.Tensor:
+    if int(x.shape[0]) == 0:
+        return x.new_zeros((1, int(x.shape[-1])))
+    mask_f = write_mask.to(device=x.device, dtype=x.dtype).reshape(-1)
+    count = mask_f.sum().clamp_min(1.0)
+    masked_mean = (x * mask_f[:, None]).sum(dim=0, keepdim=True) / count
+    all_mean = x.mean(dim=0, keepdim=True)
+    return torch.where((mask_f.sum() > 0).reshape(1, 1), masked_mean, all_mean)
+
+
+def _update_single_key(
+    cell: StreamingMambaCell,
+    state: Optional[KeyedMambaState],
+    *,
+    key: torch.Tensor,
+    x: torch.Tensor,
+    write_mask: torch.Tensor,
+) -> Tuple[Optional[KeyedMambaState], torch.Tensor]:
+    if int(x.shape[0]) != 1:
+        raise ValueError(f"IForward single-key memory expected x [1,D], got {tuple(x.shape)}")
+    key = key.to(device=x.device, dtype=torch.long).reshape(1)
+    mask = write_mask.to(device=x.device, dtype=torch.bool).reshape(1)
+    cell_state = _gather_state_for_keys(cell, state, key, device=x.device, dtype=x.dtype)
+    out, updated = cell(x, cell_state, write_mask=mask)
+    new_state = _scatter_state_for_keys(
+        cell,
+        state,
+        key,
+        updated,
+        write_mask=mask,
+        device=x.device,
+        dtype=x.dtype,
+    )
+    return new_state, out
+
+
 def _update_dense_point(
     cell: StreamingMambaCell,
     state: Optional[DenseMambaState],
@@ -208,6 +256,8 @@ def _update_dense_point(
     if int(mask.numel()) != n:
         raise ValueError("IForward dense point write_mask row count mismatch.")
     out, updated = cell(x, cell_state, write_mask=mask)
+    if int(base.seen.numel()) == n:
+        return DenseMambaState(conv_state=updated.conv_state, ssm_state=updated.ssm_state, seen=updated.seen), out
     conv = base.conv_state.clone()
     ssm = base.ssm_state.clone()
     seen = base.seen.clone()
@@ -349,13 +399,25 @@ class IForwardBranchMemory(nn.Module):
             x=x,
             write_mask=hard_write,
         )
-        global_state, global_ctx = _update_keyed(
-            self.global_token,
-            state.global_token,
-            keys=global_keys,
-            x=x,
-            write_mask=hard_write,
-        )
+        if str(branch_name) in {"bg", "distant"}:
+            global_token_x = _masked_mean_token(x, hard_write)
+            global_key = global_keys[:1] if int(global_keys.numel()) > 0 else torch.zeros(1, device=event.device, dtype=torch.long)
+            global_state, global_ctx_token = _update_single_key(
+                self.global_token,
+                state.global_token,
+                key=global_key,
+                x=global_token_x,
+                write_mask=hard_write.any().reshape(1),
+            )
+            global_ctx = global_ctx_token.expand(int(event.shape[0]), -1)
+        else:
+            global_state, global_ctx = _update_keyed(
+                self.global_token,
+                state.global_token,
+                keys=global_keys,
+                x=x,
+                write_mask=hard_write,
+            )
         if str(ablation) == "zero_point":
             point_ctx = torch.zeros_like(point_ctx)
         if str(ablation) == "zero_cell":
@@ -371,7 +433,23 @@ class IForwardBranchMemory(nn.Module):
             raise RuntimeError("IForward memory context contains NaN/Inf")
         entry = None
         entry_rows = torch.nonzero(hard_write, as_tuple=False).squeeze(1)
-        if bool(write_short_entry) and int(entry_rows.numel()) > 0:
+        if bool(write_short_entry) and str(branch_name) in {"bg", "distant"}:
+            entry_ctx = ctx.detach().clone()
+            entry_ctx[~hard_write] = 0
+            entry = IForwardShortMemoryEntry(
+                frame_idx=int(frame_idx),
+                step_idx=int(step_idx),
+                branch=str(branch_name),
+                point_keys=point_keys.detach().clone(),
+                cell_keys=cell_keys.detach().clone(),
+                global_keys=global_keys.detach().clone(),
+                event=event.detach().new_zeros((0, int(event.shape[-1]))),
+                ctx=entry_ctx,
+                support=None,
+                valid=hard_write.detach().clone()[:, None],
+                row_aligned=True,
+            )
+        elif bool(write_short_entry) and int(entry_rows.numel()) > 0:
             entry = IForwardShortMemoryEntry(
                 frame_idx=int(frame_idx),
                 step_idx=int(step_idx),
@@ -383,6 +461,7 @@ class IForwardBranchMemory(nn.Module):
                 ctx=ctx[entry_rows].detach().clone(),
                 support=None if support is None else support.reshape(int(event.shape[0]), -1)[entry_rows].detach().clone(),
                 valid=None if valid is None else valid.reshape(int(event.shape[0]), -1)[entry_rows].detach().clone(),
+                row_aligned=False,
             )
         aux = {"rows": float(event.shape[0])}
         if aux_stats:
@@ -393,7 +472,8 @@ class IForwardBranchMemory(nn.Module):
             aux["support_positive_ratio"] = (
                 float((support_f.detach() > 0).float().mean().item()) if support_f.numel() else 0.0
             )
-            aux["short_entry_rows"] = float(entry_rows.numel()) if entry is not None else 0.0
+            aux["short_entry_rows"] = float(entry.ctx.shape[0]) if entry is not None else 0.0
+            aux["short_entry_valid_rows"] = float(entry_rows.numel()) if entry is not None else 0.0
             aux["ctx_norm"] = float(ctx.detach().norm(dim=-1).mean().item()) if ctx.numel() else 0.0
             aux["short_ctx_norm"] = (
                 float(short_ctx.detach().norm(dim=-1).mean().item()) if short_ctx.numel() else 0.0

@@ -1,4 +1,4 @@
-output_name: iforward_v6_point_mamba_xcpe
+output_name: iforward_v5
 
 initialization:
   phase_b_from_phase_a:
@@ -205,56 +205,30 @@ model:
       enable: true
       k: 8
   iforward:
-    version: v6_point_mamba_xcpe
+    version: v1
     debug:
       enable_memory_aux_stats: false
       log_per_k_metrics: false
       log_per_k_aux_interval: 1000
       nvtx_ranges: false
     memory:
-      point_mamba:
-        enable: true
-        model_dim: 16
-        output_dim: 16
-        state_dim: 4
-        conv_kernel: 2
-        dense_point_memory: true
-        branches:
-          bg: true
-          distant: true
-          rigid: true
-        write_policy:
-          update_optimizer_memory: every_repeat
-          hard_valid_required: true
-          hard_support_min_commit: 0.0
-          hard_support_min_optimizer: 0.0
-          learnable_soft_gate: false
-      cell_mamba:
-        enable: false
-      global_mamba:
-        enable: false
-    local_conflict:
-      enable: true
-      type: post_event_xcpe
-      sparse_backend: spconv
-      hidden_dim: 48
-      output_dim: 48
-      num_blocks: 1
-      kernel_size: 3
-      voxel_size: 0.25
-      route:
-        bg_near: xcpe
-        rigid_near: xcpe_shared_with_bg
-        distant: point_mlp
-    context_adapter:
-      enable: true
-      output_dim: 48
-      output_scale_init: 1.0
-      output_scale_learnable: false
-      zero_last: false
+      model_dim: 16
+      state_dim: 4
+      conv_kernel: 2
+      bg_cell_size: 0.5
+      distant_cell_size: 2.0
+      rigid_cell_size: 0.5
+      dense_point_memory: true
+      long_write_policy: every_repeat
+      short_entry_policy: frame_exit_only
+      short_entry_detach: true
+      write_gate:
+        hard_valid_required: true
+        hard_support_min_commit: 0.0
+        hard_support_min_optimizer: 0.0
     short_window_history:
       max_entries: 24
-      max_memory_entries: 0
+      max_memory_entries: 24
     loss:
       current: {weight: 1.0}
       nearby: {weight: 0.20}
@@ -263,9 +237,7 @@ model:
       delta_regularization: {weight: 1.0}
     trainability:
       train_memory: true
-      train_point_mamba: true
-      train_local_conflict_xcpe: true
-      train_context_adapter: true
+      train_memory_fuse: true
       train_vsm_ctx_adapter: true
       train_measurement_frontend: true
       unfreeze_updater_base_after_step: 0
@@ -427,9 +399,8 @@ optimizer:
   type: adamw
   lr:
     default: 1.0e-4
-    point_mamba: 1.0e-4
-    local_conflict_xcpe: 1.0e-4
-    context_adapter: 1.0e-4
+    memory: 1.0e-4
+    memory_fuse: 1.0e-4
     vsm_ctx_adapter: 2.0e-4
     stage6_posterior_updater_base: 1.0e-5
     stage6_struct_decoder: 1.0e-5

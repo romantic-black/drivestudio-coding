@@ -12,7 +12,11 @@ import torch.nn as nn
 from models.streetforward.stage6_0 import DeltaPack, LocalGSState
 
 from .bridge import IForwardStage6Bridge
+from .context_adapter import IForwardContextAdapter
+from .iforward_v6_state import IForwardV6MemoryState
+from .local_conflict_xcpe import IForwardLocalConflictXcpe
 from .memory import IForwardMemoryStepContext, IForwardSceneMemory
+from .point_mamba_memory import IForwardPointMambaMemory
 from .resolver import IForwardBatchResolver, IForwardResolvedBatch
 from .state import IForwardMemoryState, IForwardShortWindowHistory, IForwardState
 from .utils import cfg_ensure_child, cfg_get, cfg_set, clone_config
@@ -381,36 +385,85 @@ class IForwardModel(nn.Module):
 
         event_dim = int(getattr(self.bridge, "event_dim", 48))
         iforward_cfg = cfg_get(cfg_get(config, "model", {}) or {}, "iforward", {}) or {}
+        self.iforward_version = str(cfg_get(iforward_cfg, "version", "v1"))
+        self.is_v6_point_mamba_xcpe = self.iforward_version == "v6_point_mamba_xcpe"
         debug_cfg = cfg_get(iforward_cfg, "debug", {}) or {}
         self.enable_nvtx_ranges = bool(cfg_get(debug_cfg, "nvtx_ranges", False))
         memory_cfg = cfg_get(iforward_cfg, "memory", {}) or {}
-        self.memory = IForwardSceneMemory(
-            event_dim=event_dim,
-            model_dim=int(cfg_get(memory_cfg, "model_dim", event_dim)),
-            state_dim=int(cfg_get(memory_cfg, "state_dim", 16)),
-            conv_kernel=int(cfg_get(memory_cfg, "conv_kernel", 4)),
-            bg_cell_size=float(cfg_get(memory_cfg, "bg_cell_size", 0.5)),
-            distant_cell_size=float(cfg_get(memory_cfg, "distant_cell_size", 2.0)),
-            rigid_cell_size=float(cfg_get(memory_cfg, "rigid_cell_size", 0.5)),
-            enable_aux_stats=bool(cfg_get(debug_cfg, "enable_memory_aux_stats", False)),
-            log_per_k_aux_interval=int(cfg_get(debug_cfg, "log_per_k_aux_interval", 50)),
-            dense_point_memory=bool(cfg_get(memory_cfg, "dense_point_memory", True)),
-            long_write_policy=str(cfg_get(memory_cfg, "long_write_policy", "every_repeat")),
-            short_entry_policy=str(cfg_get(memory_cfg, "short_entry_policy", "frame_exit_only")),
-            short_entry_detach=bool(cfg_get(memory_cfg, "short_entry_detach", True)),
-            hard_valid_required=bool(
-                cfg_get(cfg_get(memory_cfg, "write_gate", {}) or {}, "hard_valid_required", True)
-            ),
-            hard_support_min_commit=float(
-                cfg_get(cfg_get(memory_cfg, "write_gate", {}) or {}, "hard_support_min_commit", 0.0)
-            ),
-            hard_support_min_optimizer=float(
-                cfg_get(cfg_get(memory_cfg, "write_gate", {}) or {}, "hard_support_min_optimizer", 0.0)
-            ),
-        )
+        if self.is_v6_point_mamba_xcpe:
+            point_cfg = cfg_get(memory_cfg, "point_mamba", {}) or {}
+            write_policy_cfg = cfg_get(point_cfg, "write_policy", {}) or {}
+            point_ctx_dim = int(cfg_get(point_cfg, "output_dim", cfg_get(point_cfg, "model_dim", 16)))
+            long_write_policy = str(
+                cfg_get(
+                    write_policy_cfg,
+                    "update_optimizer_memory",
+                    cfg_get(point_cfg, "long_write_policy", "every_repeat"),
+                )
+            )
+            self.point_mamba = IForwardPointMambaMemory(
+                event_dim=event_dim,
+                point_ctx_dim=point_ctx_dim,
+                model_dim=int(cfg_get(point_cfg, "model_dim", 16)),
+                state_dim=int(cfg_get(point_cfg, "state_dim", 4)),
+                conv_kernel=int(cfg_get(point_cfg, "conv_kernel", 2)),
+                dense_bg=bool(cfg_get(point_cfg, "dense_point_memory", cfg_get(memory_cfg, "dense_point_memory", True))),
+                dense_distant=bool(cfg_get(point_cfg, "dense_point_memory", cfg_get(memory_cfg, "dense_point_memory", True))),
+                hard_valid_required=bool(cfg_get(write_policy_cfg, "hard_valid_required", True)),
+                hard_support_min_commit=float(cfg_get(write_policy_cfg, "hard_support_min_commit", 0.0)),
+                hard_support_min_optimizer=float(cfg_get(write_policy_cfg, "hard_support_min_optimizer", 0.0)),
+                long_write_policy=long_write_policy,
+                learnable_soft_gate=bool(cfg_get(write_policy_cfg, "learnable_soft_gate", False)),
+            )
+            local_cfg = cfg_get(iforward_cfg, "local_conflict", {}) or {}
+            self.local_conflict = IForwardLocalConflictXcpe(
+                event_dim=event_dim,
+                point_ctx_dim=point_ctx_dim,
+                hidden_dim=int(cfg_get(local_cfg, "hidden_dim", event_dim)),
+                output_dim=int(cfg_get(local_cfg, "output_dim", event_dim)),
+                num_blocks=int(cfg_get(local_cfg, "num_blocks", 1)),
+                kernel_size=int(cfg_get(local_cfg, "kernel_size", 3)),
+                voxel_size=float(cfg_get(local_cfg, "voxel_size", 0.25)),
+                sparse_backend=str(cfg_get(local_cfg, "sparse_backend", "spconv")),
+            )
+            adapter_cfg = cfg_get(iforward_cfg, "context_adapter", {}) or {}
+            self.context_adapter = IForwardContextAdapter(
+                event_dim=event_dim,
+                point_ctx_dim=point_ctx_dim,
+                local_ctx_dim=int(cfg_get(local_cfg, "output_dim", event_dim)),
+                output_dim=int(cfg_get(adapter_cfg, "output_dim", event_dim)),
+                output_scale_init=float(cfg_get(adapter_cfg, "output_scale_init", 1.0)),
+                output_scale_learnable=bool(cfg_get(adapter_cfg, "output_scale_learnable", False)),
+            )
+            self.memory = None
+        else:
+            self.memory = IForwardSceneMemory(
+                event_dim=event_dim,
+                model_dim=int(cfg_get(memory_cfg, "model_dim", event_dim)),
+                state_dim=int(cfg_get(memory_cfg, "state_dim", 16)),
+                conv_kernel=int(cfg_get(memory_cfg, "conv_kernel", 4)),
+                bg_cell_size=float(cfg_get(memory_cfg, "bg_cell_size", 0.5)),
+                distant_cell_size=float(cfg_get(memory_cfg, "distant_cell_size", 2.0)),
+                rigid_cell_size=float(cfg_get(memory_cfg, "rigid_cell_size", 0.5)),
+                enable_aux_stats=bool(cfg_get(debug_cfg, "enable_memory_aux_stats", False)),
+                log_per_k_aux_interval=int(cfg_get(debug_cfg, "log_per_k_aux_interval", 50)),
+                dense_point_memory=bool(cfg_get(memory_cfg, "dense_point_memory", True)),
+                long_write_policy=str(cfg_get(memory_cfg, "long_write_policy", "every_repeat")),
+                short_entry_policy=str(cfg_get(memory_cfg, "short_entry_policy", "frame_exit_only")),
+                short_entry_detach=bool(cfg_get(memory_cfg, "short_entry_detach", True)),
+                hard_valid_required=bool(
+                    cfg_get(cfg_get(memory_cfg, "write_gate", {}) or {}, "hard_valid_required", True)
+                ),
+                hard_support_min_commit=float(
+                    cfg_get(cfg_get(memory_cfg, "write_gate", {}) or {}, "hard_support_min_commit", 0.0)
+                ),
+                hard_support_min_optimizer=float(
+                    cfg_get(cfg_get(memory_cfg, "write_gate", {}) or {}, "hard_support_min_optimizer", 0.0)
+                ),
+            )
         history_cfg = cfg_get(iforward_cfg, "short_window_history", {}) or {}
         self.history_max_entries = int(cfg_get(history_cfg, "max_entries", 24))
-        self.history_max_memory_entries = int(cfg_get(history_cfg, "max_memory_entries", 8))
+        self.history_max_memory_entries = 0 if self.is_v6_point_mamba_xcpe else int(cfg_get(history_cfg, "max_memory_entries", 8))
         loss_cfg = cfg_get(iforward_cfg, "loss", {}) or {}
         self.loss_current_weight = float(cfg_get(cfg_get(loss_cfg, "current", {}) or {}, "weight", 1.0))
         self.loss_nearby_weight = float(
@@ -431,17 +484,28 @@ class IForwardModel(nn.Module):
         self.allow_missing_carried_state_reset = bool(
             cfg_get(train_ifwd_cfg, "allow_missing_carried_state_reset", False)
         )
-        self.allowed_ablations = {
-            "full",
-            "zero_all",
-            "zero_point",
-            "zero_cell",
-            "zero_global",
-            "drop_short_window",
-            "freeze_write",
-            "shuffle_memory",
-            "bypass_memory",
-        }
+        if self.is_v6_point_mamba_xcpe:
+            self.allowed_ablations = {
+                "full",
+                "point_only",
+                "xcpe_only",
+                "no_memory",
+                "disable_rigid_xcpe",
+                "freeze_write",
+                "shuffle_context",
+            }
+        else:
+            self.allowed_ablations = {
+                "full",
+                "zero_all",
+                "zero_point",
+                "zero_cell",
+                "zero_global",
+                "drop_short_window",
+                "freeze_write",
+                "shuffle_memory",
+                "bypass_memory",
+            }
         self.to(self.device)
 
     def _nvtx_range(self, name: str) -> Any:
@@ -470,9 +534,10 @@ class IForwardModel(nn.Module):
 
     def init_iforward_state_from_batch_assets(self, batch: Dict[str, Any], resolved: IForwardResolvedBatch) -> IForwardState:
         local_state, node_bg, node_distant, node_rigid = self.bridge.make_local_state(batch=batch)
+        memory_state = IForwardV6MemoryState.empty() if self.is_v6_point_mamba_xcpe else IForwardMemoryState.empty()
         return IForwardState(
             local_gs=local_state,
-            memory=IForwardMemoryState.empty(),
+            memory=memory_state,
             history=IForwardShortWindowHistory.empty(
                 max_entries=int(self.history_max_entries),
                 max_memory_entries=int(self.history_max_memory_entries),
@@ -528,6 +593,43 @@ class IForwardModel(nn.Module):
         appended = len(pred_rgbs) - before
         image_refs.extend([tuple(int(x) for x in resolved.target_refs[int(i)]) for i in current_indices[:appended]])
         image_roles.extend(["current_latest"] * int(appended))
+        if self.loss_in_rollout_history_weight > 0.0 and len(resolved.history_rollout_target_indices) > 0:
+            history_indices = list(resolved.history_rollout_target_indices)
+            before = len(pred_rgbs)
+            in_rollout_history_loss, in_rollout_stats = self.bridge.render_loss(
+                local_state=local_state,
+                batch=batch,
+                target_indices=history_indices,
+                mask_policy=str(getattr(self.bridge, "current_mask_policy", "non_sky_non_egocar")),
+                pred_rgbs_out=pred_rgbs,
+                gt_images_out=gt_images,
+            )
+            appended = len(pred_rgbs) - before
+            image_refs.extend([tuple(int(x) for x in resolved.target_refs[int(i)]) for i in history_indices[:appended]])
+            image_roles.extend(["history_rollout"] * int(appended))
+        else:
+            in_rollout_history_loss, in_rollout_stats = self._zero_loss(local_state.bg.means)
+
+        short_history_loss, short_history_stats = self._zero_loss(local_state.bg.means)
+        if (
+            carried_state is not None
+            and self.loss_short_window_history_weight > 0.0
+            and carried_state.history.entries
+        ):
+            short_targets = [dict(x) for x in carried_state.history.entries]
+            before = len(pred_rgbs)
+            short_history_loss, short_history_stats = self.bridge.render_loss_for_targets(
+                local_state=local_state,
+                ref_batch=batch,
+                targets=short_targets,
+                mask_policy=str(getattr(self.bridge, "current_mask_policy", "non_sky_non_egocar")),
+                pred_rgbs_out=pred_rgbs,
+                gt_images_out=gt_images,
+            )
+            appended = len(pred_rgbs) - before
+            for target in short_targets[:appended]:
+                image_refs.append((int(target.get("frame_idx", -1)), int(target.get("cam_idx", -1))))
+                image_roles.append("short_window_history")
         nearby_indices = list(resolved.nearby_target_indices)
         before = len(pred_rgbs)
         nearby_loss, nearby_stats = self.bridge.render_loss(
@@ -541,28 +643,6 @@ class IForwardModel(nn.Module):
         appended = len(pred_rgbs) - before
         image_refs.extend([tuple(int(x) for x in resolved.target_refs[int(i)]) for i in nearby_indices[:appended]])
         image_roles.extend(["nearby"] * int(appended))
-        if self.loss_in_rollout_history_weight > 0.0 and len(resolved.history_rollout_target_indices) > 0:
-            in_rollout_history_loss, in_rollout_stats = self.bridge.render_loss(
-                local_state=local_state,
-                batch=batch,
-                target_indices=list(resolved.history_rollout_target_indices),
-                mask_policy=str(getattr(self.bridge, "current_mask_policy", "non_sky_non_egocar")),
-            )
-        else:
-            in_rollout_history_loss, in_rollout_stats = self._zero_loss(local_state.bg.means)
-
-        short_history_loss, short_history_stats = self._zero_loss(local_state.bg.means)
-        if (
-            carried_state is not None
-            and self.loss_short_window_history_weight > 0.0
-            and carried_state.history.entries
-        ):
-            short_history_loss, short_history_stats = self.bridge.render_loss_for_targets(
-                local_state=local_state,
-                ref_batch=batch,
-                targets=[dict(x) for x in carried_state.history.entries],
-                mask_policy=str(getattr(self.bridge, "current_mask_policy", "non_sky_non_egocar")),
-            )
         losses = {
             "current": current_loss,
             "nearby": nearby_loss,
@@ -592,6 +672,56 @@ class IForwardModel(nn.Module):
                 if value is not None and math.isfinite(float(value)):
                     stats[f"{prefix}_{metric}"] = float(value)
         return losses, stats, pred_rgbs, gt_images, image_refs, image_roles
+
+    def _build_v6_context(
+        self,
+        *,
+        event: Any,
+        local_state: LocalGSState,
+        memory_state: Any,
+        step_context: IForwardMemoryStepContext,
+        ablation: str,
+    ) -> tuple[IForwardV6MemoryState, Any, Dict[str, float]]:
+        point_mamba = getattr(self, "point_mamba", None)
+        local_conflict = getattr(self, "local_conflict", None)
+        context_adapter = getattr(self, "context_adapter", None)
+        if point_mamba is None or local_conflict is None or context_adapter is None:
+            raise RuntimeError("IForward-v6 modules are not initialized.")
+        v6_state = memory_state if isinstance(memory_state, IForwardV6MemoryState) else IForwardV6MemoryState.empty()
+        next_memory, point_pack, point_aux = point_mamba(
+            event=event,
+            local_state=local_state,
+            state=v6_state,
+            step_context=step_context,
+            ablation=str(ablation),
+        )
+        if hasattr(self.bridge, "stage6_aabb"):
+            aabb_min, aabb_max = self.bridge.stage6_aabb(local_state.bg.means)
+        else:
+            ref = local_state.bg.means
+            aabb_min = ref.detach().amin(dim=0) - 1.0 if ref.numel() else ref.new_full((3,), -1.0)
+            aabb_max = ref.detach().amax(dim=0) + 1.0 if ref.numel() else ref.new_full((3,), 1.0)
+        local_pack = local_conflict(
+            event=event,
+            point_ctx=point_pack,
+            local_state=local_state,
+            step_context=step_context,
+            aabb_min=aabb_min,
+            aabb_max=aabb_max,
+            ablation=str(ablation),
+        )
+        ctx_pack = context_adapter(
+            event=event,
+            point_ctx=point_pack,
+            local_ctx=local_pack,
+            step_context=step_context,
+            ablation=str(ablation),
+        )
+        aux: Dict[str, float] = {}
+        for source in (point_aux, getattr(local_pack, "aux", None), getattr(ctx_pack, "aux", None)):
+            if isinstance(source, dict):
+                aux.update({str(k): float(v) for k, v in source.items() if isinstance(v, (int, float))})
+        return next_memory, ctx_pack, aux
 
     def forward_rollout(
         self,
@@ -676,20 +806,30 @@ class IForwardModel(nn.Module):
             )
             t0 = time.perf_counter()
             with self._nvtx_range("iforward/memory"):
-                memory_state, ctx_memory, memory_aux, short_entries = self.memory(
-                    event=event,
-                    local_state=local_state,
-                    state=memory_state,
-                    short_history=working_history,
-                    step_context=step_context,
-                    commit_observation_memory=bool(step.commit_observation_memory),
-                    update_optimizer_memory=bool(step.update_optimizer_memory),
-                    ablation=ablation_name,
-                )
+                if self.is_v6_point_mamba_xcpe:
+                    memory_state, ctx_memory, memory_aux = self._build_v6_context(
+                        event=event,
+                        local_state=local_state,
+                        memory_state=memory_state,
+                        step_context=step_context,
+                        ablation=ablation_name,
+                    )
+                    short_entries = []
+                else:
+                    memory_state, ctx_memory, memory_aux, short_entries = self.memory(
+                        event=event,
+                        local_state=local_state,
+                        state=memory_state,
+                        short_history=working_history,
+                        step_context=step_context,
+                        commit_observation_memory=bool(step.commit_observation_memory),
+                        update_optimizer_memory=bool(step.update_optimizer_memory),
+                        ablation=ablation_name,
+                    )
             timings["memory_ms"] += (time.perf_counter() - t0) * 1000.0
             working_history = working_history.commit_memory_entries(
                 short_entries,
-                detach=bool(getattr(self.memory, "short_entry_detach", True)),
+                detach=bool(getattr(self.memory, "short_entry_detach", True)) if self.memory is not None else True,
             )
             t0 = time.perf_counter()
             with self._nvtx_range("iforward/update"):

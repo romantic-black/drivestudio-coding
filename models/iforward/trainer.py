@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -26,8 +26,251 @@ class IForwardTrainer(nn.Module):
         self.config = config
         self.device = device
         self.model = model if model is not None else IForwardModel(config=config, device=device)
+        self._optimizer_group_names: List[str] = []
+        self._optimizer_group_param_ids: Dict[str, List[int]] = {}
         self.optimizer = optimizer if optimizer is not None else self._build_optimizer(config)
+        self._apply_trainability_schedule(0)
         self._state_cache: Dict[Tuple[int, int, int], IForwardState] = {}
+
+    @staticmethod
+    def _named_params(module: Optional[nn.Module], prefix: str = "") -> List[Tuple[str, nn.Parameter]]:
+        if module is None:
+            return []
+        out: List[Tuple[str, nn.Parameter]] = []
+        for name, param in module.named_parameters(recurse=True):
+            out.append((f"{prefix}.{name}" if prefix else str(name), param))
+        return out
+
+    @staticmethod
+    def _dedupe_params(named_params: Sequence[Tuple[str, nn.Parameter]]) -> List[nn.Parameter]:
+        params: List[nn.Parameter] = []
+        seen = set()
+        for _, param in named_params:
+            pid = id(param)
+            if pid in seen:
+                continue
+            seen.add(pid)
+            params.append(param)
+        return params
+
+    def _phase_a_runtime(self) -> Optional[nn.Module]:
+        runtime = getattr(self.model, "phase_a_runtime", None)
+        if isinstance(runtime, nn.Module):
+            return runtime
+        bridge = getattr(self.model, "bridge", None)
+        runtime = getattr(bridge, "runtime", None)
+        return runtime if isinstance(runtime, nn.Module) else None
+
+    def _stage6_posterior_updater(self) -> Optional[nn.Module]:
+        runtime = self._phase_a_runtime()
+        updater = getattr(runtime, "stage6_posterior_updater", None) if runtime is not None else None
+        return updater if isinstance(updater, nn.Module) else None
+
+    def _stage6_struct_decoder(self) -> Optional[nn.Module]:
+        runtime = self._phase_a_runtime()
+        decoder = getattr(runtime, "stage6_struct_event_decoder", None) if runtime is not None else None
+        return decoder if isinstance(decoder, nn.Module) else None
+
+    def _is_v6_point_mamba_xcpe(self) -> bool:
+        if bool(getattr(self.model, "is_v6_point_mamba_xcpe", False)):
+            return True
+        iforward_cfg = cfg_get(cfg_get(self.config, "model", {}) or {}, "iforward", {}) or {}
+        return str(cfg_get(iforward_cfg, "version", "")) == "v6_point_mamba_xcpe"
+
+    def _measurement_frontend_params(self) -> Dict[str, List[Tuple[str, nn.Parameter]]]:
+        runtime = self._phase_a_runtime()
+        if runtime is None:
+            return {
+                "stage6_measurement_frontend_residual_unet": [],
+                "stage6_measurement_frontend_fusion_neck": [],
+                "stage6_measurement_frontend": [],
+            }
+        trainable_names = set(str(x) for x in getattr(runtime, "stage6_measurement_trainable_param_names", set()))
+        if not trainable_names:
+            return {
+                "stage6_measurement_frontend_residual_unet": [],
+                "stage6_measurement_frontend_fusion_neck": [],
+                "stage6_measurement_frontend": [],
+            }
+
+        named = [(str(name), param) for name, param in runtime.named_parameters(recurse=True) if str(name) in trainable_names]
+        residual_prefixes = (
+            "image_feature_extractor.residual",
+            "image_feature_extractor.residual_unet",
+        )
+        fusion_prefixes = (
+            "image_feature_extractor.fusion",
+            "image_feature_extractor.fusion_neck",
+        )
+        residual = [(name, param) for name, param in named if any(name.startswith(prefix) for prefix in residual_prefixes)]
+        residual_ids = {id(param) for _, param in residual}
+        fusion = [
+            (name, param)
+            for name, param in named
+            if any(name.startswith(prefix) for prefix in fusion_prefixes) and id(param) not in residual_ids
+        ]
+        assigned_ids = {id(param) for _, param in residual + fusion}
+        other = [(name, param) for name, param in named if id(param) not in assigned_ids]
+        return {
+            "stage6_measurement_frontend_residual_unet": residual,
+            "stage6_measurement_frontend_fusion_neck": fusion,
+            "stage6_measurement_frontend": other,
+        }
+
+    def _group_param_lists(self) -> Dict[str, List[Tuple[str, nn.Parameter]]]:
+        updater = self._stage6_posterior_updater()
+        adapter = getattr(updater, "vsm_ctx_adapter", None) if updater is not None else None
+        adapter_named = self._named_params(
+            adapter if isinstance(adapter, nn.Module) else None,
+            "stage6_posterior_updater.vsm_ctx_adapter",
+        )
+        adapter_ids = {id(param) for _, param in adapter_named}
+        updater_base = [
+            (f"stage6_posterior_updater.{name}", param)
+            for name, param in self._named_params(updater, "")
+            if id(param) not in adapter_ids
+        ]
+        struct_decoder = self._stage6_struct_decoder()
+        if self._is_v6_point_mamba_xcpe():
+            groups: Dict[str, List[Tuple[str, nn.Parameter]]] = {
+                "point_mamba": self._named_params(getattr(self.model, "point_mamba", None), "point_mamba"),
+                "local_conflict_xcpe": self._named_params(getattr(self.model, "local_conflict", None), "local_conflict"),
+                "context_adapter": self._named_params(getattr(self.model, "context_adapter", None), "context_adapter"),
+                "vsm_ctx_adapter": adapter_named,
+                "stage6_posterior_updater_base": updater_base,
+                "stage6_struct_decoder": self._named_params(struct_decoder, "stage6_struct_event_decoder"),
+            }
+        else:
+            memory = getattr(self.model, "memory", None)
+            memory_named = self._named_params(memory if isinstance(memory, nn.Module) else None, "memory")
+            memory_main: List[Tuple[str, nn.Parameter]] = []
+            memory_fuse: List[Tuple[str, nn.Parameter]] = []
+            for name, param in memory_named:
+                if ".fuse." in name:
+                    memory_fuse.append((name, param))
+                else:
+                    memory_main.append((name, param))
+            groups = {
+                "memory": memory_main,
+                "memory_fuse": memory_fuse,
+                "vsm_ctx_adapter": adapter_named,
+                "stage6_posterior_updater_base": updater_base,
+                "stage6_struct_decoder": self._named_params(struct_decoder, "stage6_struct_event_decoder"),
+            }
+        measurement_groups = self._measurement_frontend_params()
+        iforward_cfg = cfg_get(cfg_get(self.config, "model", {}) or {}, "iforward", {}) or {}
+        trainability = cfg_get(iforward_cfg, "trainability", {}) or {}
+        train_measurement = bool(cfg_get(trainability, "train_measurement_frontend", False))
+        if train_measurement and not any(len(params) > 0 for params in measurement_groups.values()):
+            raise ValueError(
+                "IForward trainability.train_measurement_frontend=true but Stage6 runtime has no "
+                "measurement frontend trainable params. Check phase_a_mode/from_scratch and base_measurement flags."
+            )
+        for group_name, named_params in measurement_groups.items():
+            if named_params:
+                groups[str(group_name)] = list(named_params)
+        seen: Dict[int, str] = {}
+        for group_name, named_params in groups.items():
+            for name, param in named_params:
+                pid = id(param)
+                if pid in seen:
+                    raise ValueError(
+                        "IForward optimizer parameter appears in multiple groups: "
+                        f"{name} in {group_name} already assigned to {seen[pid]}"
+                    )
+                seen[pid] = str(group_name)
+        missing = [str(name) for name, named_params in groups.items() if len(named_params) == 0]
+        if missing:
+            raise ValueError(f"IForward optimizer group(s) have no parameters: {missing}")
+        return groups
+
+    def _lr_for_group(self, config: Any, group_name: str, default_lr: float) -> float:
+        opt_cfg = cfg_get(config, "optimizer", {}) or {}
+        lr_cfg = cfg_get(opt_cfg, "lr", 1.0e-4)
+        if isinstance(lr_cfg, (float, int)):
+            return float(lr_cfg)
+        fallback = float(cfg_get(lr_cfg, "default", default_lr))
+        defaults = {
+            "memory": fallback,
+            "point_mamba": float(cfg_get(lr_cfg, "point_mamba", cfg_get(lr_cfg, "memory", fallback))),
+            "local_conflict_xcpe": float(cfg_get(lr_cfg, "local_conflict_xcpe", fallback)),
+            "context_adapter": float(cfg_get(lr_cfg, "context_adapter", fallback)),
+            "memory_fuse": float(cfg_get(lr_cfg, "memory_fuse", fallback)),
+            "vsm_ctx_adapter": float(cfg_get(lr_cfg, "vsm_ctx_adapter", 2.0e-4)),
+            "stage6_posterior_updater_base": float(cfg_get(lr_cfg, "stage6_posterior_updater_base", 1.0e-5)),
+            "stage6_struct_decoder": float(cfg_get(lr_cfg, "stage6_struct_decoder", 0.0)),
+            "stage6_measurement_frontend_residual_unet": float(
+                cfg_get(lr_cfg, "stage6_measurement_frontend_residual_unet", cfg_get(lr_cfg, "measurement_frontend", fallback))
+            ),
+            "stage6_measurement_frontend_fusion_neck": float(
+                cfg_get(lr_cfg, "stage6_measurement_frontend_fusion_neck", cfg_get(lr_cfg, "measurement_frontend", fallback))
+            ),
+            "stage6_measurement_frontend": float(cfg_get(lr_cfg, "measurement_frontend", fallback)),
+        }
+        return float(cfg_get(lr_cfg, group_name, defaults.get(str(group_name), fallback)))
+
+    def _set_all_model_requires_grad(self, value: bool) -> None:
+        for param in self.model.parameters():
+            param.requires_grad_(bool(value))
+
+    def _set_group_requires_grad(self, group_name: str, value: bool) -> None:
+        ids = set(int(x) for x in self._optimizer_group_param_ids.get(str(group_name), []))
+        if not ids:
+            return
+        for param in self.model.parameters():
+            if id(param) in ids:
+                param.requires_grad_(bool(value))
+
+    def _apply_trainability_schedule(self, global_step: int) -> None:
+        if not self._optimizer_group_param_ids:
+            return
+        iforward_cfg = cfg_get(cfg_get(self.config, "model", {}) or {}, "iforward", {}) or {}
+        trainability = cfg_get(iforward_cfg, "trainability", {}) or {}
+        unfreeze_updater_step = int(cfg_get(trainability, "unfreeze_updater_base_after_step", 1000))
+        train_struct = bool(cfg_get(trainability, "train_stage6_struct_decoder", False))
+        unfreeze_struct_step = int(cfg_get(trainability, "unfreeze_struct_decoder_after_step", 10**12))
+        train_measurement = bool(cfg_get(trainability, "train_measurement_frontend", False))
+
+        self._set_all_model_requires_grad(False)
+        if self._is_v6_point_mamba_xcpe():
+            self._set_group_requires_grad(
+                "point_mamba",
+                bool(cfg_get(trainability, "train_point_mamba", cfg_get(trainability, "train_memory", True))),
+            )
+            self._set_group_requires_grad(
+                "local_conflict_xcpe",
+                bool(cfg_get(trainability, "train_local_conflict_xcpe", True)),
+            )
+            self._set_group_requires_grad(
+                "context_adapter",
+                bool(cfg_get(trainability, "train_context_adapter", True)),
+            )
+        else:
+            self._set_group_requires_grad("memory", bool(cfg_get(trainability, "train_memory", True)))
+            self._set_group_requires_grad("memory_fuse", bool(cfg_get(trainability, "train_memory_fuse", True)))
+        self._set_group_requires_grad("vsm_ctx_adapter", bool(cfg_get(trainability, "train_vsm_ctx_adapter", True)))
+        updater_train = bool(int(global_step) >= int(unfreeze_updater_step))
+        self._set_group_requires_grad("stage6_posterior_updater_base", updater_train)
+        struct_train = bool(train_struct and int(global_step) >= int(unfreeze_struct_step))
+        self._set_group_requires_grad("stage6_struct_decoder", struct_train)
+        for group_name in (
+            "stage6_measurement_frontend_residual_unet",
+            "stage6_measurement_frontend_fusion_neck",
+            "stage6_measurement_frontend",
+        ):
+            self._set_group_requires_grad(group_name, train_measurement)
+
+        base_lrs = {name: self._lr_for_group(self.config, name, 1.0e-4) for name in self._optimizer_group_names}
+        for group in getattr(self, "optimizer", None).param_groups if getattr(self, "optimizer", None) is not None else []:
+            name = str(group.get("name", group.get("logical_name", "")))
+            lr = float(base_lrs.get(name, group.get("lr", 0.0)))
+            if name == "stage6_posterior_updater_base" and not updater_train:
+                lr = 0.0
+            if name == "stage6_struct_decoder" and not struct_train:
+                lr = 0.0
+            if name.startswith("stage6_measurement_frontend") and not train_measurement:
+                lr = 0.0
+            group["lr"] = float(lr)
 
     def _build_optimizer(self, config: Any) -> torch.optim.Optimizer:
         opt_cfg = cfg_get(config, "optimizer", {}) or {}
@@ -36,14 +279,29 @@ class IForwardTrainer(nn.Module):
         weight_decay = float(cfg_get(opt_cfg, "weight_decay", 0.0))
         betas = tuple(float(x) for x in list(cfg_get(opt_cfg, "betas", [0.9, 0.95]) or [0.9, 0.95]))
         eps = float(cfg_get(opt_cfg, "eps", 1.0e-8))
-        params = [p for p in self.model.parameters() if p.requires_grad]
-        if not params:
-            raise ValueError("IForwardTrainer has no trainable parameters.")
+        named_groups = self._group_param_lists()
+        self._set_all_model_requires_grad(False)
+        self._optimizer_group_names = list(named_groups.keys())
+        param_groups: List[Dict[str, Any]] = []
+        for group_name, named_params in named_groups.items():
+            params = self._dedupe_params(named_params)
+            self._optimizer_group_param_ids[str(group_name)] = [id(param) for param in params]
+            group_lr = self._lr_for_group(config, str(group_name), lr)
+            param_groups.append(
+                {
+                    "params": params,
+                    "lr": float(group_lr),
+                    "weight_decay": weight_decay,
+                    "name": str(group_name),
+                    "logical_name": str(group_name),
+                    "param_names": [str(name) for name, _ in named_params],
+                }
+            )
         opt_type = str(cfg_get(opt_cfg, "type", "adamw")).lower()
         if opt_type == "adamw":
-            return torch.optim.AdamW(params, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+            return torch.optim.AdamW(param_groups, lr=lr, betas=betas, eps=eps)
         if opt_type == "adam":
-            return torch.optim.Adam(params, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+            return torch.optim.Adam(param_groups, lr=lr, betas=betas, eps=eps)
         raise ValueError(f"IForward unsupported optimizer.type={opt_type!r}")
 
     def forward_rollout(self, *args: Any, **kwargs: Any) -> IForwardRolloutOutput:
@@ -69,8 +327,54 @@ class IForwardTrainer(nn.Module):
             return torch.tensor(0.0)
         return torch.sqrt(total.clamp_min(0.0))
 
+    @staticmethod
+    def _param_count(parameters: Sequence[nn.Parameter]) -> int:
+        return int(sum(int(param.numel()) for param in parameters))
+
+    @staticmethod
+    def _trainable_param_count(parameters: Sequence[nn.Parameter]) -> int:
+        return int(sum(int(param.numel()) for param in parameters if bool(param.requires_grad)))
+
+    def _optimizer_group_metrics(self) -> Dict[str, float]:
+        metrics: Dict[str, float] = {}
+        for group in getattr(self.optimizer, "param_groups", []):
+            name = str(group.get("name", group.get("logical_name", "group")))
+            params = [param for param in list(group.get("params", []) or []) if isinstance(param, nn.Parameter)]
+            grad_norm = self._grad_norm(params)
+            metrics[f"iforward/optimizer/{name}/lr"] = float(group.get("lr", 0.0))
+            metrics[f"iforward/optimizer/{name}/param_count"] = float(self._param_count(params))
+            metrics[f"iforward/optimizer/{name}/trainable_param_count"] = float(self._trainable_param_count(params))
+            metrics[f"iforward/grad/{name}"] = float(grad_norm.detach().item())
+        return metrics
+
+    def _adapter_metrics(self) -> Dict[str, float]:
+        updater = self._stage6_posterior_updater()
+        adapter = getattr(updater, "vsm_ctx_adapter", None) if updater is not None else None
+        if not isinstance(adapter, nn.Module):
+            return {}
+        out: Dict[str, float] = {}
+        weight = getattr(adapter, "weight", None)
+        bias = getattr(adapter, "bias", None)
+        if torch.is_tensor(weight):
+            out["iforward/adapter/vsm_ctx_adapter_weight_norm"] = float(weight.detach().norm().item())
+            if weight.grad is not None:
+                out["iforward/adapter/vsm_ctx_adapter_weight_grad_norm"] = float(weight.grad.detach().norm().item())
+        if torch.is_tensor(bias):
+            out["iforward/adapter/vsm_ctx_adapter_bias_norm"] = float(bias.detach().norm().item())
+            if bias.grad is not None:
+                out["iforward/adapter/vsm_ctx_adapter_bias_grad_norm"] = float(bias.grad.detach().norm().item())
+        params = list(adapter.parameters())
+        if params:
+            out["iforward/adapter/vsm_ctx_adapter_grad_norm"] = float(self._grad_norm(params).detach().item())
+        return out
+
     def _cache_key_from_output(self, out: IForwardRolloutOutput) -> Tuple[int, int, int]:
         return tuple(out.resolved.cache_key)
+
+    def _clear_state_cache_for_new_episode(self) -> int:
+        removed = int(len(self._state_cache))
+        self._state_cache.clear()
+        return removed
 
     @staticmethod
     def _sync_cuda(enabled: bool) -> None:
@@ -99,14 +403,16 @@ class IForwardTrainer(nn.Module):
         timings: Dict[str, float] = {}
         batch = dict(batch)
         batch["global_step"] = int(step or 0)
+        self._apply_trainability_schedule(int(step or 0))
         t0 = time.perf_counter()
         resolved = self.model.resolver.resolve(batch)
         timings["resolve_ms"] = (time.perf_counter() - t0) * 1000.0
         t0 = time.perf_counter()
         key = tuple(resolved.cache_key)
         runtime_reset_before: Dict[str, int] = {}
+        stale_cache_entries_cleared = 0
         if bool(resolved.reset_scene_state_before_rollout):
-            self._state_cache.pop(key, None)
+            stale_cache_entries_cleared = self._clear_state_cache_for_new_episode()
             runtime_reset_before = self._reset_bridge_runtime_node_state()
         carried = self._state_cache.get(key)
         timings["state_cache_ms"] = (time.perf_counter() - t0) * 1000.0
@@ -141,6 +447,8 @@ class IForwardTrainer(nn.Module):
         grad_norm_after_clip = self._grad_norm(params_with_grad).to(device=loss.device)
         if not torch.isfinite(grad_norm_after_clip).all():
             raise RuntimeError("IForward clipped gradient norm became NaN/Inf.")
+        group_metrics = self._optimizer_group_metrics()
+        adapter_metrics = self._adapter_metrics()
         timings["grad_norm_ms"] = (time.perf_counter() - t0) * 1000.0
         self._sync_cuda(profile_cuda)
         t0 = time.perf_counter()
@@ -169,6 +477,7 @@ class IForwardTrainer(nn.Module):
             "iforward/episode_end_after_rollout": bool(out.resolved.episode_end_after_rollout),
             "iforward/carry_scene_state_after_rollout": bool(out.resolved.carry_scene_state_after_rollout),
             "iforward/state_cache_size": int(len(self._state_cache)),
+            "iforward/stale_state_cache_entries_cleared": int(stale_cache_entries_cleared),
             "iforward/grad_norm_total": float(grad_norm_after_clip.detach().item()),
             "iforward/grad_norm_unclipped": float(grad_norm_unclipped.detach().item()),
             "iforward/grad_norm_after_clip": float(grad_norm_after_clip.detach().item()),
@@ -197,6 +506,8 @@ class IForwardTrainer(nn.Module):
                 final[f"{prefix}/{name}"] = int(value)
         for name, value in losses.items():
             final[f"iforward/loss_{name}"] = float(value)
+        final.update(group_metrics)
+        final.update(adapter_metrics)
         for name, value in out.stats.items():
             if isinstance(value, bool):
                 final[f"iforward/{name}"] = bool(value)
@@ -215,14 +526,19 @@ class IForwardTrainer(nn.Module):
                     final[f"iforward/memory_tokens/{name}"] = int(value)
                 elif isinstance(value, float) and math.isfinite(float(value)):
                     final[f"iforward/memory_tokens/{name}"] = float(value)
-        for item in out.per_step:
-            k = int(item.get("k", 0))
-            for name, value in item.items():
-                if name == "k" or not isinstance(value, (int, float)):
-                    continue
-                value_f = float(value)
-                if math.isfinite(value_f):
-                    final[f"iforward/k{k}/{name}"] = value_f
+        model_cfg = cfg_get(self.config, "model", {}) or {}
+        iforward_cfg = cfg_get(model_cfg, "iforward", {}) or {}
+        debug_cfg = cfg_get(iforward_cfg, "debug", {}) or {}
+        log_per_k_metrics = bool(cfg_get(debug_cfg, "log_per_k_metrics", True))
+        if log_per_k_metrics:
+            for item in out.per_step:
+                k = int(item.get("k", 0))
+                for name, value in item.items():
+                    if name == "k" or not isinstance(value, (int, float)):
+                        continue
+                    value_f = float(value)
+                    if math.isfinite(value_f):
+                        final[f"iforward/k{k}/{name}"] = value_f
         final["logging_pack_ms"] = float((time.perf_counter() - t0) * 1000.0)
         return final
 

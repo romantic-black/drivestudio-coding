@@ -362,8 +362,6 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         train_fusion_neck = bool(self._cfg_get(base_measurement, "train_fusion_neck", train_2d_frontend))
         train_v4_lift = bool(self._cfg_get(base_measurement, "train_v4_lift", False))
         train_dinov2 = bool(self._cfg_get(base_measurement, "train_dinov2", False))
-        if train_v4_lift:
-            raise ValueError("Stage6_0 Phase A P0 requires base_measurement.train_v4_lift=false.")
         if train_dinov2:
             raise ValueError("Stage6_0 Phase A P0 requires base_measurement.train_dinov2=false.")
         if phase_a_mode == "updater_only":
@@ -373,8 +371,8 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 )
             if not detach_v4_outputs:
                 raise ValueError("Stage6_0 Phase A updater_only requires base_measurement.detach_v4_outputs=true.")
-            if train_2d_frontend or train_residual_unet or train_fusion_neck:
-                raise ValueError("Stage6_0 Phase A updater_only must keep the 2D frontend frozen.")
+            if train_2d_frontend or train_residual_unet or train_fusion_neck or train_v4_lift:
+                raise ValueError("Stage6_0 Phase A updater_only must keep the 2D/V4 frontend frozen.")
         else:
             if source_grad_mode != "train_2d_detach_alpha":
                 raise ValueError(
@@ -827,6 +825,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             self._cfg_get(base_measurement, "source_evidence_grad_mode", "no_grad_v4")
         ).strip()
         self.stage6_detach_v4_outputs = bool(self._cfg_get(base_measurement, "detach_v4_outputs", True))
+        self.stage6_train_v4_lift = bool(self._cfg_get(base_measurement, "train_v4_lift", False))
         self.stage6_measurement_trainable_param_names: set[str] = set()
 
         for param in self.parameters():
@@ -864,6 +863,12 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 mark_trainable(image_feature_extractor.fusion_neck, "image_feature_extractor.fusion_neck")
         elif train_fusion_neck and not hasattr(image_feature_extractor, "residual_unet"):
             mark_trainable(image_feature_extractor, "image_feature_extractor")
+
+        if self.stage6_train_v4_lift:
+            for attr_name in ("feature_backprojector", "alpha_t_extractor_v4"):
+                module = getattr(self, attr_name, None)
+                if isinstance(module, nn.Module):
+                    mark_trainable(module, attr_name)
 
         if len(self.stage6_measurement_trainable_param_names) == 0:
             raise ValueError("Stage6_0 Phase A from_scratch did not enable any 2D frontend parameters.")

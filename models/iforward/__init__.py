@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .mamba import StreamingMambaCell, StreamingMambaCellState
+from .iforward_v6_state import IForwardV6BranchPointState, IForwardV6MemoryState
 from .resolver import (
     IFORWARD_CURRENT_ROLE,
     IFORWARD_NEARBY_ROLE,
@@ -25,6 +26,18 @@ def __getattr__(name: str):
         from .memory import IForwardSceneMemory
 
         return IForwardSceneMemory
+    if name == "IForwardPointMambaMemory":
+        from .point_mamba_memory import IForwardPointMambaMemory
+
+        return IForwardPointMambaMemory
+    if name == "IForwardLocalConflictXcpe":
+        from .local_conflict_xcpe import IForwardLocalConflictXcpe
+
+        return IForwardLocalConflictXcpe
+    if name == "IForwardContextAdapter":
+        from .context_adapter import IForwardContextAdapter
+
+        return IForwardContextAdapter
     if name == "IForwardStage6Bridge":
         from .bridge import IForwardStage6Bridge
 
@@ -47,6 +60,11 @@ __all__ = [
     "IFORWARD_SCHEDULER_VERSION",
     "IForwardBatchResolver",
     "IForwardMemoryState",
+    "IForwardV6BranchPointState",
+    "IForwardV6MemoryState",
+    "IForwardPointMambaMemory",
+    "IForwardLocalConflictXcpe",
+    "IForwardContextAdapter",
     "IForwardModel",
     "IForwardResolvedBatch",
     "IForwardResolvedStep",

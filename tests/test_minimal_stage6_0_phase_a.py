@@ -834,6 +834,8 @@ def _validate_with_parent_noop(cfg, monkeypatch):
         (("model", "stage6_0", "base_measurement", "type"), "other"),
         (("model", "stage6_0", "base_measurement", "require_fused_v4"), False),
         (("model", "stage6_0", "base_measurement", "source_evidence_grad_mode"), "full_debug"),
+        (("model", "stage6_0", "base_measurement", "train_v4_lift"), True),
+        (("model", "stage6_0", "base_measurement", "train_dinov2"), True),
         (("model", "stage6_0", "event_encoder", "enable"), True),
         (("model", "stage6_0", "event_encoder", "mode"), "direct_concat_mlp"),
         (("model", "stage6_0", "current_context_adapter", "enable"), True),
@@ -861,7 +863,7 @@ def test_stage6_config_validation_rejects_scheduler_v8_runtime(monkeypatch):
         _validate_with_parent_noop(cfg, monkeypatch)
 
 
-def test_stage6_config_validation_accepts_from_scratch_2d_frontend(monkeypatch):
+def test_stage6_config_validation_accepts_from_scratch_2d_frontend_and_v4_lift(monkeypatch):
     cfg = _valid_stage6_config()
     cfg["model"]["stage6_0"]["phase_a_mode"] = "from_scratch"
     cfg["model"]["stage6_0"]["base_measurement"].update(
@@ -870,7 +872,7 @@ def test_stage6_config_validation_accepts_from_scratch_2d_frontend(monkeypatch):
             "train_2d_frontend": True,
             "train_residual_unet": True,
             "train_fusion_neck": True,
-            "train_v4_lift": False,
+            "train_v4_lift": True,
             "train_dinov2": False,
             "detach_v4_outputs": False,
         }

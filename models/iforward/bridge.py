@@ -105,6 +105,31 @@ class IForwardStage6Bridge:
     ) -> EventPack:
         return self.runtime._build_stage6_event_from_measurement(local_state=local_state, measurement=measurement)
 
+    def stage6_aabb(self, ref: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        getter = getattr(self.runtime, "_stage6_aabb", None)
+        if callable(getter):
+            return getter(ref)
+        lo = ref.detach().amin(dim=0) - 1.0 if int(ref.numel()) > 0 else ref.new_full((3,), -1.0)
+        hi = ref.detach().amax(dim=0) + 1.0 if int(ref.numel()) > 0 else ref.new_full((3,), 1.0)
+        return lo.to(device=ref.device, dtype=ref.dtype), hi.to(device=ref.device, dtype=ref.dtype)
+
+    @staticmethod
+    def _branch_delta_norms(delta: Any, *, branch: str) -> Dict[str, float]:
+        if delta is None:
+            return {}
+        out: Dict[str, float] = {}
+        for name, value in (
+            ("means", getattr(delta, "means", None)),
+            ("scale", getattr(delta, "scales_log", None)),
+            ("opacity", getattr(delta, "opacity_logit", None)),
+            ("sh", getattr(delta, "sh", None)),
+        ):
+            if torch.is_tensor(value) and int(value.numel()) > 0:
+                out[f"delta/{name}_norm_{branch}"] = float(value.detach().reshape(int(value.shape[0]), -1).norm(dim=-1).mean().item())
+            else:
+                out[f"delta/{name}_norm_{branch}"] = 0.0
+        return out
+
     def apply_update(
         self,
         *,
@@ -112,7 +137,33 @@ class IForwardStage6Bridge:
         event: EventPack,
         ctx_memory: Optional[ContextPack],
     ) -> Tuple[LocalGSState, DeltaPack, Dict[str, Any]]:
-        return self.runtime._apply_event_update(local_state=local_state, event=event, ctx_vsm=ctx_memory)
+        local_state_out, delta, aux = self.runtime._apply_event_update(local_state=local_state, event=event, ctx_vsm=ctx_memory)
+        adapter = getattr(getattr(self.runtime, "stage6_posterior_updater", None), "vsm_ctx_adapter", None)
+        if adapter is not None and ctx_memory is not None:
+            with torch.no_grad():
+                for branch, ctx, event_x in (
+                    ("bg", getattr(ctx_memory, "ctx_bg", None), getattr(event, "event_bg", None)),
+                    ("distant", getattr(ctx_memory, "ctx_distant", None), getattr(event, "event_distant", None)),
+                    ("rigid", getattr(ctx_memory, "ctx_rigid", None), getattr(event, "event_rigid", None)),
+                ):
+                    if ctx is None or not torch.is_tensor(ctx) or int(ctx.numel()) == 0:
+                        continue
+                    y = adapter(ctx.detach())
+                    input_norm = ctx.detach().norm(dim=-1).mean()
+                    output_norm = y.detach().norm(dim=-1).mean()
+                    event_norm = (
+                        event_x.detach().norm(dim=-1).mean()
+                        if torch.is_tensor(event_x) and int(event_x.numel()) > 0
+                        else output_norm.new_tensor(0.0)
+                    )
+                    aux[f"vsm_ctx_adapter/input_norm_{branch}"] = float(input_norm.item())
+                    aux[f"vsm_ctx_adapter/output_norm_{branch}"] = float(output_norm.item())
+                    aux[f"vsm_ctx_adapter/output_event_ratio_{branch}"] = float((output_norm / event_norm.clamp_min(1.0e-6)).item())
+                    aux[f"adapter_output_norm_{branch}"] = float(y.detach().norm(dim=-1).mean().item())
+        aux.update(self._branch_delta_norms(delta.bg, branch="bg"))
+        aux.update(self._branch_delta_norms(delta.distant, branch="distant"))
+        aux.update(self._branch_delta_norms(delta.rigid, branch="rigid"))
+        return local_state_out, delta, aux
 
     def render_loss(
         self,
@@ -140,6 +191,8 @@ class IForwardStage6Bridge:
         ref_batch: Dict[str, Any],
         targets: List[Dict[str, Any]],
         mask_policy: str,
+        pred_rgbs_out: Optional[List[torch.Tensor]] = None,
+        gt_images_out: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         if not targets:
             ref = local_state.bg.means
@@ -157,6 +210,8 @@ class IForwardStage6Bridge:
             batch=batch,
             target_indices=list(range(len(targets))),
             mask_policy=mask_policy,
+            pred_rgbs_out=pred_rgbs_out,
+            gt_images_out=gt_images_out,
         )
 
     def delta_regularization(
