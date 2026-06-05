@@ -289,17 +289,12 @@ class IForwardLocalConflictXcpe(nn.Module):
             rigid_coords_all = self._rigid_coords(event, local_state, n_rigid, event_rigid)
             inside = self._rigid_inside_mask(event, n_rigid, event_rigid.device)
             ctx_rigid_out = event_rigid.new_zeros((n_rigid, self.output_dim))
-            if str(ablation) == "disable_rigid_xcpe":
-                ctx_rigid_out = self.point_mlp(rigid_raw_all)
-            else:
+            if str(ablation) != "disable_rigid_xcpe":
                 inside_rows = torch.nonzero(inside, as_tuple=False).squeeze(1)
-                outside_rows = torch.nonzero(~inside, as_tuple=False).squeeze(1)
                 if int(inside_rows.numel()) > 0:
                     near_raw = torch.cat([near_raw, rigid_raw_all.index_select(0, inside_rows)], dim=0)
                     near_coords = torch.cat([near_coords, rigid_coords_all.index_select(0, inside_rows)], dim=0)
                     near_event_for_ratio = torch.cat([near_event_for_ratio, event_rigid.index_select(0, inside_rows)], dim=0)
-                if int(outside_rows.numel()) > 0:
-                    ctx_rigid_out[outside_rows] = self.point_mlp(rigid_raw_all.index_select(0, outside_rows))
 
         near_out, xcpe_aux = self._run_xcpe(
             raw=near_raw,
@@ -347,4 +342,3 @@ class IForwardLocalConflictXcpe(nn.Module):
             }
         )
         return ContextPack(ctx_bg=ctx_bg, ctx_distant=ctx_distant, ctx_rigid=ctx_rigid_out, aux=aux)
-

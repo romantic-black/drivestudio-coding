@@ -13,6 +13,7 @@ import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+from omegaconf import OmegaConf
 
 import tools.train_minimal_streetforward_stage4_3_multi_scene_v4 as base
 from datasets.train_scheduler_iforward import TrainSchedulerIForward
@@ -47,6 +48,34 @@ def checkpoint_prefix_iforward_from_cfg(cfg: Any) -> str:
     iforward_cfg = _cfg_get(model_cfg, "iforward", {}) or {}
     version = str(_cfg_get(iforward_cfg, "version", "v1"))
     return f"iforward_{version}"
+
+
+def _config_file_from_argv(argv: List[str], default_config: str) -> str:
+    for idx, arg in enumerate(argv):
+        if arg == "--config_file" and idx + 1 < len(argv):
+            return str(argv[idx + 1])
+        if arg.startswith("--config_file="):
+            return str(arg.split("=", 1)[1])
+    return str(default_config)
+
+
+def _route_random_window_entrypoint_if_needed(default_config: str) -> bool:
+    config_file = _config_file_from_argv(list(sys.argv), default_config)
+    cfg = OmegaConf.load(config_file)
+    random_cfg = _cfg_get(cfg, "scheduler_iforward_random_window", None)
+    legacy_cfg = _cfg_get(cfg, "scheduler_iforward", None)
+    random_enabled = random_cfg is not None and bool(_cfg_get(random_cfg, "enable", True))
+    if random_enabled and legacy_cfg is None:
+        from tools import train_iforward_random_window
+
+        train_iforward_random_window.main()
+        return True
+    if legacy_cfg is None:
+        raise ValueError(
+            "tools/train_iforward.py requires legacy scheduler_iforward. "
+            "For scheduler_iforward_random_window configs, use tools/train_iforward_random_window.py."
+        )
+    return False
 
 
 def _iforward_validation_cfg(cfg: Any) -> Dict[str, Any]:
@@ -393,8 +422,10 @@ def _iforward_step_end_hook(**kwargs: Any) -> None:
 
 def main() -> None:
     default_config = "configs/iforward/iforward_base.yaml"
-    if "--config_file" not in sys.argv:
+    if not any(arg == "--config_file" or arg.startswith("--config_file=") for arg in sys.argv):
         sys.argv.extend(["--config_file", default_config])
+    if _route_random_window_entrypoint_if_needed(default_config):
+        return
     base.build_multi_scene_dataset_v3 = build_multi_scene_dataset_v4
     base.build_train_scheduler_from_cfg = build_train_scheduler_iforward_from_cfg
     base.resolve_fixed_scene_segment = resolve_fixed_scene_segment_iforward

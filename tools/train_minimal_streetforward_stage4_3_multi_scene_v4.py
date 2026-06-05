@@ -88,6 +88,7 @@ CHECKPOINT_PREFIX_RESOLVER = None
 TRAINER_CLASS = MinimalStreetForwardStage4_3
 DEFAULT_CONFIG_FILE = "configs/minimal_streetforward_stage4_3_multi_scene_v4.yaml"
 ALLOW_ONE_SEGMENT = False
+ALLOW_OPTIONAL_ONE_SEGMENT = False
 EPISODE_END_HOOK = None
 TRAIN_START_HOOK = None
 STEP_END_HOOK = None
@@ -102,6 +103,230 @@ def _scene_dir_str(scene_id: Any) -> str:
     if s < 0:
         return "unknown"
     return f"{s:03d}"
+
+
+def _metric_float(value: Any, default: Optional[float] = None) -> Optional[float]:
+    if value is None:
+        return default
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not np.isfinite(out):
+        return default
+    return out
+
+
+def _metric_int(value: Any, default: int = -1) -> int:
+    if value is None:
+        return int(default)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _metric_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return bool(default)
+    return bool(value)
+
+
+def _metric_list_int(value: Any) -> List[int]:
+    if value is None:
+        return []
+    try:
+        return [int(x) for x in list(value)]
+    except (TypeError, ValueError):
+        return []
+
+
+def _is_iforward_random_window_result(result: Dict[str, Any]) -> bool:
+    return str(result.get("iforward/scheduler_version", "")) == "random_window_v1"
+
+
+def _copy_metric(
+    row: Dict[str, Any],
+    dst_key: str,
+    result: Dict[str, Any],
+    src_key: str,
+    *,
+    default: Optional[float] = None,
+) -> None:
+    row[dst_key] = _metric_float(result.get(src_key), default)
+
+
+def _build_iforward_random_window_train_step_row(
+    *,
+    step: int,
+    minimal_batch: Dict[str, Any],
+    scheduler_info: Dict[str, Any],
+    step_events: List[Dict[str, Any]],
+    result: Dict[str, Any],
+    loss_val: float,
+    num_views: int,
+    step_time_ms: float,
+    batch_fetch_ms: float,
+    batch_convert_ms: float,
+) -> Dict[str, Any]:
+    row: Dict[str, Any] = {
+        "step": int(step),
+        "split": "train_step",
+        "scheduler_version": str(result.get("iforward/scheduler_version", "random_window_v1")),
+        "scene_id": _metric_int(result.get("iforward/scene_id", minimal_batch.get("scene_id", -1))),
+        "segment_id": _metric_int(result.get("iforward/segment_id", minimal_batch.get("segment_id", -1))),
+        "epoch_idx": _metric_int(scheduler_info.get("epoch_idx", -1)),
+        "global_step": _metric_int(scheduler_info.get("global_step", step)),
+        "episode_id": _metric_int(result.get("iforward/episode_id", scheduler_info.get("episode_id", -1))),
+        "rollout_id_global": _metric_int(result.get("iforward/rollout_id_global", -1)),
+        "rollout_idx": _metric_int(result.get("iforward/rollout_idx_in_episode", -1)),
+        "rollouts_per_episode": _metric_int(result.get("iforward/rollouts_per_episode", -1)),
+        "window_start": _metric_int(result.get("iforward/window_start", -1)),
+        "window_end": _metric_int(result.get("iforward/window_end", -1)),
+        "window_hash": _metric_int(result.get("iforward/window_hash", -1)),
+        "window_block_ids": _metric_list_int(result.get("iforward/window_block_ids")),
+        "window_revisit_count": _metric_int(result.get("iforward/window_revisit_count", 0), 0),
+        "unique_windows_seen": _metric_int(result.get("iforward/unique_windows_seen", 0), 0),
+        "is_repeated_window": _metric_bool(result.get("iforward/is_repeated_window", False)),
+        "reset_before_rollout": _metric_bool(result.get("iforward/reset_scene_state_before_rollout", False)),
+        "carry_after_rollout": _metric_bool(result.get("iforward/carry_scene_state_after_rollout", False)),
+        "episode_end_after_rollout": _metric_bool(result.get("iforward/episode_end_after_rollout", False)),
+        "blocks_per_rollout": _metric_int(result.get("iforward/blocks_per_rollout", 4), 4),
+        "repeats_per_block": _metric_int(result.get("iforward/repeats_per_block", 2), 2),
+        "inner_K": _metric_int(result.get("iforward/inner_K", 8), 8),
+        "num_views": int(num_views),
+        "num_source_views": _metric_int(result.get("num_source_views", result.get("iforward/num_source_views", 0)), 0),
+        "num_targets": _metric_int(result.get("num_targets", result.get("iforward/num_targets", 0)), 0),
+        "num_gaussians_bg": _metric_int(result.get("num_gaussians_bg", result.get("iforward/num_gaussians_bg", 0)), 0),
+        "num_gaussians_distant": _metric_int(
+            result.get("num_gaussians_distant", result.get("iforward/num_gaussians_distant", 0)),
+            0,
+        ),
+        "num_gaussians_rigid": _metric_int(
+            result.get("num_gaussians_rigid", result.get("iforward/num_gaussians_rigid", 0)),
+            0,
+        ),
+        "num_gaussians_sky": _metric_int(result.get("num_gaussians_sky", result.get("iforward/num_gaussians_sky", 0)), 0),
+        "state_cache_size": _metric_int(result.get("iforward/state_cache_size", 0), 0),
+        "stale_state_cache_entries_cleared": _metric_int(
+            result.get("iforward/stale_state_cache_entries_cleared", 0),
+            0,
+        ),
+        "history_entries_before": _metric_int(result.get("iforward/history_entries_before", 0), 0),
+        "history_entries_after": _metric_int(result.get("iforward/history_entries_after", 0), 0),
+        "history_entries": _metric_int(result.get("iforward/history_entries", 0), 0),
+        "memory_entries_before": _metric_int(result.get("iforward/memory_entries_before", 0), 0),
+        "memory_entries_after": _metric_int(result.get("iforward/memory_entries_after", 0), 0),
+        "grad_norm_unclipped": _metric_float(result.get("iforward/grad_norm_unclipped")),
+        "grad_norm_after_clip": _metric_float(result.get("iforward/grad_norm_after_clip")),
+        "grad_clip_applied": _metric_bool(result.get("iforward/grad_clip_applied", False)),
+        "step_time_ms": float(step_time_ms),
+        "batch_fetch_ms": float(batch_fetch_ms),
+        "batch_convert_ms": float(batch_convert_ms),
+        "resolve_ms": _metric_float(result.get("resolve_ms"), 0.0),
+        "forward_ms": _metric_float(result.get("forward_ms"), 0.0),
+        "backward_ms": _metric_float(result.get("backward_ms"), 0.0),
+        "optimizer_ms": _metric_float(result.get("optimizer_ms"), 0.0),
+        "state_cache_ms": _metric_float(result.get("state_cache_ms"), 0.0),
+        "logging_pack_ms": _metric_float(result.get("logging_pack_ms"), 0.0),
+        "step_event_types": [str(ev.get("type", "")) for ev in step_events],
+    }
+    _copy_metric(row, "loss_total", result, "iforward/loss_total", default=float(loss_val))
+    for name in (
+        "current_latest",
+        "in_rollout_history",
+        "short_window_history",
+        "nearby",
+        "delta_regularization",
+    ):
+        _copy_metric(row, f"loss_{name}", result, f"iforward/loss_{name}")
+    for role in ("current_latest", "in_rollout_history", "short_window_history", "nearby"):
+        _copy_metric(row, f"{role}_psnr", result, f"iforward/{role}_psnr")
+        _copy_metric(row, f"{role}_ssim", result, f"iforward/{role}_ssim")
+        _copy_metric(row, f"{role}_l1", result, f"iforward/{role}_l1")
+        _copy_metric(row, f"{role}_valid_ratio", result, f"iforward/{role}_valid_ratio")
+        _copy_metric(row, f"{role}_num_refs", result, f"iforward/{role}_num_refs")
+    for role in ("current", "history", "nearby"):
+        _copy_metric(row, f"revisit_{role}_psnr_delta", result, f"iforward/revisit/{role}_psnr_delta")
+    for branch in ("bg_point", "distant_point", "rigid_point"):
+        _copy_metric(row, f"memory_{branch}_seen_ratio", result, f"iforward/memory_tokens/{branch}_seen_ratio")
+        _copy_metric(row, f"memory_{branch}_seen", result, f"iforward/memory_tokens/{branch}_seen")
+    return row
+
+
+def _build_iforward_random_window_diagnostics_row(
+    *,
+    step: int,
+    result: Dict[str, Any],
+    scheduler_info: Dict[str, Any],
+    diag_row: Dict[str, Any],
+) -> Dict[str, Any]:
+    row: Dict[str, Any] = {
+        "step": int(step),
+        "split": "train_step_diagnostics",
+        "scheduler_version": str(result.get("iforward/scheduler_version", "random_window_v1")),
+        "scene_id": _metric_int(result.get("iforward/scene_id", -1)),
+        "segment_id": _metric_int(result.get("iforward/segment_id", -1)),
+        "episode_id": _metric_int(result.get("iforward/episode_id", -1)),
+        "rollout_idx": _metric_int(result.get("iforward/rollout_idx_in_episode", -1)),
+        "window_hash": _metric_int(result.get("iforward/window_hash", -1)),
+        "global_step": _metric_int(scheduler_info.get("global_step", step)),
+    }
+    prefixes = (
+        "iforward/optimizer/",
+        "iforward/grad/",
+        "iforward/adapter/",
+        "iforward/delta_reg/",
+        "iforward/loss_weight/",
+        "iforward/memory_tokens/",
+        "iforward/runtime_node_state_reset_before/",
+        "iforward/runtime_node_state_reset_after/",
+    )
+    exact_keys = {
+        "iforward/runtime_node_state_reset_before",
+        "iforward/runtime_node_state_reset_after",
+        "iforward/runtime_node_state_reset_before/before_bg",
+        "iforward/runtime_node_state_reset_after/after_bg",
+        "iforward/observe_ms",
+        "iforward/event_ms",
+        "iforward/memory_ms",
+        "iforward/update_ms",
+        "iforward/delta_reg_ms",
+        "iforward/final_render_ms",
+        "grad_norm_ms",
+    }
+    for key, value in result.items():
+        if key.startswith("_"):
+            continue
+        if key not in exact_keys and not any(str(key).startswith(prefix) for prefix in prefixes):
+            continue
+        if isinstance(value, bool):
+            row[key] = bool(value)
+        elif isinstance(value, int):
+            row[key] = int(value)
+        elif isinstance(value, float):
+            value_f = float(value)
+            if np.isfinite(value_f):
+                row[key] = value_f
+    for key, value in diag_row.items():
+        if isinstance(value, bool):
+            row[key] = bool(value)
+        elif isinstance(value, (int, float)):
+            value_f = float(value)
+            if np.isfinite(value_f):
+                row[key] = value_f
+    return row
+
+
+def _write_scalar_row_to_tensorboard(writer: Any, prefix: str, row: Dict[str, Any], step: int) -> None:
+    if writer is None:
+        return
+    skip = {"step", "split", "scheduler_version", "window_block_ids", "step_event_types"}
+    for key, value in row.items():
+        if key in skip or isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)) and np.isfinite(float(value)):
+            writer.add_scalar(f"{prefix}/{key}", float(value), int(step))
 
 
 def _checkpoint_prefix_for_cfg(cfg: Any) -> str:
@@ -1909,21 +2134,23 @@ def main() -> None:
         )
 
     allow_one_segment = bool(globals().get("ALLOW_ONE_SEGMENT", False))
-    if cfg.get("one_segment") is not None and not allow_one_segment:
+    allow_optional_one_segment = bool(globals().get("ALLOW_OPTIONAL_ONE_SEGMENT", False))
+    allow_single_segment_mode = bool(allow_one_segment or allow_optional_one_segment)
+    if cfg.get("one_segment") is not None and not allow_single_segment_mode:
         raise ValueError(
             "multi_scene training: remove `one_segment` from config; "
             f"use {DEFAULT_CONFIG_FILE}."
         )
     train_ids = list(cfg.data.train_scene_ids)
-    if len(train_ids) < 2 and not allow_one_segment:
+    if len(train_ids) < 2 and not allow_single_segment_mode:
         raise ValueError("multi_scene training requires len(data.train_scene_ids) >= 2")
     fixed_scene_id, fixed_segment_id = resolve_fixed_scene_segment(cfg)
-    if (fixed_scene_id is not None or fixed_segment_id is not None) and not allow_one_segment:
+    if (fixed_scene_id is not None or fixed_segment_id is not None) and not allow_single_segment_mode:
         raise ValueError(
             "multi_scene training requires scheduler traversal fixed_scene_id and fixed_segment_id to be null "
             "(unset one_segment and traversal overrides)."
         )
-    if allow_one_segment and (fixed_scene_id is None or fixed_segment_id is None):
+    if allow_one_segment and not allow_optional_one_segment and (fixed_scene_id is None or fixed_segment_id is None):
         raise ValueError(
             "one-segment training requires one_segment.scene_id/segment_id or "
             "scheduler traversal fixed_scene_id/fixed_segment_id."
@@ -2107,6 +2334,11 @@ def main() -> None:
     train_step_metrics_interval = int(cfg.logging.get("train_step_metrics_interval", 0))
     if train_step_metrics_interval < 0:
         raise ValueError("logging.train_step_metrics_interval must be >= 0")
+    random_window_diagnostics_interval = int(
+        cfg.logging.get("random_window_diagnostics_interval", max(int(train_step_metrics_interval), 100))
+    )
+    if random_window_diagnostics_interval < 0:
+        raise ValueError("logging.random_window_diagnostics_interval must be >= 0")
     log_node_state_reset = bool(cfg.logging.get("log_node_state_reset", True))
     write_node_state_reset_metrics = bool(cfg.logging.get("write_node_state_reset_metrics", True))
     node_state_reset_cuda_memory = bool(cfg.logging.get("node_state_reset_cuda_memory", False))
@@ -2146,6 +2378,10 @@ def main() -> None:
         bool(train_monitor_include_extra_result_metrics),
         bool(train_monitor_enable_low_psnr_image_dump),
         int(train_step_metrics_interval),
+    )
+    logger.info(
+        "Random-window metrics: diagnostics_interval=%s",
+        int(random_window_diagnostics_interval),
     )
     enable_jsonl_metrics = bool(cfg.logging.get("enable_jsonl_metrics", True))
     metrics_history_append = bool(cfg.logging.get("metrics_history_append", True))
@@ -2685,76 +2921,119 @@ def main() -> None:
                     diag_row = _diagnose_step(list(diag_window))
 
             if train_step_metrics_interval > 0 and step % train_step_metrics_interval == 0:
-                train_step_row: Dict[str, Any] = {
-                    "step": int(step),
-                    "split": "train_step",
-                    "scene_id": int(minimal_batch.get("scene_id", -1)),
-                    "scene_dir": _scene_dir_str(minimal_batch.get("scene_id", -1)),
-                    "segment_id": int(minimal_batch.get("segment_id", -1)),
-                    "epoch_idx": int(scheduler_info.get("epoch_idx", -1)),
-                    "global_step": int(scheduler_info.get("global_step", -1)),
-                    "segment_local_step": int(scheduler_info.get("segment_local_step", -1)),
-                    "segment_step_budget": int(scheduler_info.get("segment_step_budget", -1)),
-                    "block_idx_in_segment": int(scheduler_info.get("block_idx_in_segment", -1)),
-                    "block_idx_global": int(scheduler_info.get("block_idx_global", -1)),
-                    "episode_idx_global": int(scheduler_info.get("episode_idx_global", -1)),
-                    "source_frame_idx": int(scheduler_info.get("source_frame_idx", -1)),
-                    "source_keyframe_idx": int(scheduler_info.get("source_keyframe_idx", -1)),
-                    "source_image_ref": list(scheduler_info.get("source_image_ref", (-1, -1))),
-                    "target_image_refs": [list(x) for x in scheduler_info.get("target_image_refs", [])],
-                    "step_event_types": [str(ev.get("type", "")) for ev in step_events],
-                    "U": int(scheduler_info.get("U", -1)),
-                    "K_u_nominal": int(scheduler_info.get("K_u_nominal", -1)),
-                    "K_u_effective": int(scheduler_info.get("K_u_effective", -1)),
-                    "K_steps_effective": int(scheduler_info.get("K_steps_effective", -1)),
-                    "K_steps": int(scheduler_info.get("K_steps", -1)),
-                    "R_steps": int(scheduler_info.get("R_steps", -1)),
-                    "T_steps": int(scheduler_info.get("T_steps", -1)),
-                    "loss": float(loss_val),
-                    "num_views": int(num_views),
-                    "num_source_views": int(result.get("num_source_views", 0)),
-                    "num_targets": int(result.get("num_targets", 0)),
-                    "num_query_targets": int(result.get("num_query_targets", 0)),
-                    "num_gaussians_bg": int(result.get("num_gaussians_bg", 0)),
-                    "num_gaussians_distant": int(result.get("num_gaussians_distant", 0)),
-                    "num_gaussians_rigid": int(result.get("num_gaussians_rigid", 0)),
-                    "num_gaussians_sky": int(result.get("num_gaussians_sky", 0)),
-                    "step_time_ms": float(step_time_ms),
-                    "batch_fetch_ms": float(batch_fetch_ms),
-                    "batch_convert_ms": float(batch_convert_ms),
-                    "forward_ms": float(result.get("forward_ms", 0.0)),
-                    "backward_ms": float(result.get("backward_ms", 0.0)),
-                    "optimizer_ms": float(result.get("optimizer_ms", 0.0)),
-                    "node_state_sync_update": bool(result.get("node_state_sync_update", False)),
-                    "node_state_sync_reset": bool(result.get("node_state_sync_reset", False)),
-                }
-                for k, v in result.items():
-                    if k.startswith("_") or k in train_step_row or k in {"pred_rgbs", "gt_images", "image_refs", "image_roles"}:
-                        continue
-                    if isinstance(v, bool):
-                        train_step_row[k] = bool(v)
-                    elif isinstance(v, int):
-                        train_step_row[k] = int(v)
-                    elif isinstance(v, float):
-                        train_step_row[k] = float(v)
-                    elif isinstance(v, str) and k in {"stage6/phase", "shape_name"}:
-                        train_step_row[k] = str(v)
-                if diag_row:
-                    train_step_row.update(diag_row)
-                if perf_cfg["enable"] and perf_cfg["cuda_memory"] and torch.cuda.is_available():
-                    train_step_row["mem_allocated_bytes"] = int(torch.cuda.memory_allocated())
-                    train_step_row["mem_reserved_bytes"] = int(torch.cuda.memory_reserved())
-                    train_step_row["peak_mem_bytes"] = int(torch.cuda.max_memory_allocated())
-                    train_step_row["peak_mem_reserved_bytes"] = int(torch.cuda.max_memory_reserved())
-                _write_metrics_history(metrics_fh, train_step_row)
-                if writer is not None:
-                    writer.add_scalar("train/loss", float(loss_val), step)
-                    writer.add_scalar("train/perf/step_time_ms", float(step_time_ms), step)
-                    for k, v in train_step_row.items():
-                        if k in {"step", "split", "scene_dir", "source_image_ref", "target_image_refs", "step_event_types"}:
+                if _is_iforward_random_window_result(result):
+                    train_step_row = _build_iforward_random_window_train_step_row(
+                        step=int(step),
+                        minimal_batch=minimal_batch,
+                        scheduler_info=scheduler_info,
+                        step_events=step_events,
+                        result=result,
+                        loss_val=float(loss_val),
+                        num_views=int(num_views),
+                        step_time_ms=float(step_time_ms),
+                        batch_fetch_ms=float(batch_fetch_ms),
+                        batch_convert_ms=float(batch_convert_ms),
+                    )
+                    if perf_cfg["enable"] and perf_cfg["cuda_memory"] and torch.cuda.is_available():
+                        train_step_row["mem_allocated_bytes"] = int(torch.cuda.memory_allocated())
+                        train_step_row["mem_reserved_bytes"] = int(torch.cuda.memory_reserved())
+                        train_step_row["peak_mem_bytes"] = int(torch.cuda.max_memory_allocated())
+                        train_step_row["peak_mem_reserved_bytes"] = int(torch.cuda.max_memory_reserved())
+                    _write_metrics_history(metrics_fh, train_step_row)
+                    if writer is not None:
+                        writer.add_scalar("train/loss", float(loss_val), step)
+                        writer.add_scalar("train/perf/step_time_ms", float(step_time_ms), step)
+                        _write_scalar_row_to_tensorboard(writer, "train_step", train_step_row, step)
+                    if (
+                        random_window_diagnostics_interval > 0
+                        and step % int(random_window_diagnostics_interval) == 0
+                    ):
+                        random_window_diag_row = _build_iforward_random_window_diagnostics_row(
+                            step=int(step),
+                            result=result,
+                            scheduler_info=scheduler_info,
+                            diag_row=diag_row,
+                        )
+                        _write_metrics_history(metrics_fh, random_window_diag_row)
+                        _write_scalar_row_to_tensorboard(
+                            writer,
+                            "train_step_diagnostics",
+                            random_window_diag_row,
+                            step,
+                        )
+                else:
+                    train_step_row = {
+                        "step": int(step),
+                        "split": "train_step",
+                        "scene_id": int(minimal_batch.get("scene_id", -1)),
+                        "scene_dir": _scene_dir_str(minimal_batch.get("scene_id", -1)),
+                        "segment_id": int(minimal_batch.get("segment_id", -1)),
+                        "epoch_idx": int(scheduler_info.get("epoch_idx", -1)),
+                        "global_step": int(scheduler_info.get("global_step", -1)),
+                        "segment_local_step": int(scheduler_info.get("segment_local_step", -1)),
+                        "segment_step_budget": int(scheduler_info.get("segment_step_budget", -1)),
+                        "block_idx_in_segment": int(scheduler_info.get("block_idx_in_segment", -1)),
+                        "block_idx_global": int(scheduler_info.get("block_idx_global", -1)),
+                        "episode_idx_global": int(scheduler_info.get("episode_idx_global", -1)),
+                        "source_frame_idx": int(scheduler_info.get("source_frame_idx", -1)),
+                        "source_keyframe_idx": int(scheduler_info.get("source_keyframe_idx", -1)),
+                        "source_image_ref": list(scheduler_info.get("source_image_ref", (-1, -1))),
+                        "target_image_refs": [list(x) for x in scheduler_info.get("target_image_refs", [])],
+                        "step_event_types": [str(ev.get("type", "")) for ev in step_events],
+                        "U": int(scheduler_info.get("U", -1)),
+                        "K_u_nominal": int(scheduler_info.get("K_u_nominal", -1)),
+                        "K_u_effective": int(scheduler_info.get("K_u_effective", -1)),
+                        "K_steps_effective": int(scheduler_info.get("K_steps_effective", -1)),
+                        "K_steps": int(scheduler_info.get("K_steps", -1)),
+                        "R_steps": int(scheduler_info.get("R_steps", -1)),
+                        "T_steps": int(scheduler_info.get("T_steps", -1)),
+                        "loss": float(loss_val),
+                        "num_views": int(num_views),
+                        "num_source_views": int(result.get("num_source_views", 0)),
+                        "num_targets": int(result.get("num_targets", 0)),
+                        "num_query_targets": int(result.get("num_query_targets", 0)),
+                        "num_gaussians_bg": int(result.get("num_gaussians_bg", 0)),
+                        "num_gaussians_distant": int(result.get("num_gaussians_distant", 0)),
+                        "num_gaussians_rigid": int(result.get("num_gaussians_rigid", 0)),
+                        "num_gaussians_sky": int(result.get("num_gaussians_sky", 0)),
+                        "step_time_ms": float(step_time_ms),
+                        "batch_fetch_ms": float(batch_fetch_ms),
+                        "batch_convert_ms": float(batch_convert_ms),
+                        "forward_ms": float(result.get("forward_ms", 0.0)),
+                        "backward_ms": float(result.get("backward_ms", 0.0)),
+                        "optimizer_ms": float(result.get("optimizer_ms", 0.0)),
+                        "node_state_sync_update": bool(result.get("node_state_sync_update", False)),
+                        "node_state_sync_reset": bool(result.get("node_state_sync_reset", False)),
+                    }
+                    for k, v in result.items():
+                        if k.startswith("_") or k in train_step_row or k in {"pred_rgbs", "gt_images", "image_refs", "image_roles"}:
                             continue
-                        if isinstance(v, (int, float)) and not isinstance(v, bool):
-                            writer.add_scalar(f"train_step/{k}", float(v), step)
+                        if isinstance(v, bool):
+                            train_step_row[k] = bool(v)
+                        elif isinstance(v, int):
+                            train_step_row[k] = int(v)
+                        elif isinstance(v, float):
+                            train_step_row[k] = float(v)
+                        elif isinstance(v, str) and k in {"stage6/phase", "shape_name", "iforward/scheduler_version"}:
+                            train_step_row[k] = str(v)
+                        elif k == "iforward/window_block_ids" and isinstance(v, (list, tuple)):
+                            train_step_row[k] = [int(x) for x in v]
+                    if diag_row:
+                        train_step_row.update(diag_row)
+                    if perf_cfg["enable"] and perf_cfg["cuda_memory"] and torch.cuda.is_available():
+                        train_step_row["mem_allocated_bytes"] = int(torch.cuda.memory_allocated())
+                        train_step_row["mem_reserved_bytes"] = int(torch.cuda.memory_reserved())
+                        train_step_row["peak_mem_bytes"] = int(torch.cuda.max_memory_allocated())
+                        train_step_row["peak_mem_reserved_bytes"] = int(torch.cuda.max_memory_reserved())
+                    _write_metrics_history(metrics_fh, train_step_row)
+                    if writer is not None:
+                        writer.add_scalar("train/loss", float(loss_val), step)
+                        writer.add_scalar("train/perf/step_time_ms", float(step_time_ms), step)
+                        for k, v in train_step_row.items():
+                            if k in {"step", "split", "scene_dir", "source_image_ref", "target_image_refs", "step_event_types"}:
+                                continue
+                            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                                writer.add_scalar(f"train_step/{k}", float(v), step)
 
             if diag_cfg["enable"] and diag_cfg["save_branch_renders"] and step % max(diag_cfg["interval"], 1) == 0:
                 _save_diagnostic_renders(model, minimal_batch, step, cfg.log_dir)

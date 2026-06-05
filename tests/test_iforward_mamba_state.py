@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from models.iforward import IForwardMemoryState, IForwardShortMemoryEntry, IForwardShortWindowHistory, StreamingMambaCell
@@ -405,7 +406,43 @@ def test_iforward_v6_local_conflict_fallback_routes_bg_rigid_and_distant():
     assert pack.ctx_distant.shape == (1, 4)
     assert pack.ctx_rigid.shape == (2, 4)
     assert torch.isfinite(pack.ctx_bg).all()
+    assert torch.isfinite(pack.ctx_rigid[0]).all()
+    assert torch.allclose(pack.ctx_rigid[1], torch.zeros_like(pack.ctx_rigid[1]))
     assert pack.aux["local_xcpe/num_points"] == 3.0
+
+
+def test_iforward_v6_local_conflict_near_rigid_outside_aabb_fails_strict_layout():
+    torch.manual_seed(2)
+    event = _v6_event()
+    event.route.inside_mask_S = torch.tensor([True, True])
+    local_state = _v6_local_state()
+    point_pack = type(
+        "PointPack",
+        (),
+        {
+            "ctx_bg": torch.randn(2, 3),
+            "ctx_distant": torch.randn(1, 3),
+            "ctx_rigid": torch.randn(2, 3),
+        },
+    )()
+    module = IForwardLocalConflictXcpe(
+        event_dim=4,
+        point_ctx_dim=3,
+        hidden_dim=4,
+        output_dim=4,
+        num_blocks=1,
+        sparse_backend="fallback_neighbor_mean",
+        voxel_size=0.5,
+    )
+    with pytest.raises(RuntimeError, match="outside segment_aabb"):
+        module(
+            event=event,
+            point_ctx=point_pack,
+            local_state=local_state,
+            step_context=_v6_step(),
+            aabb_min=torch.tensor([-1.0, -1.0, -1.0]),
+            aabb_max=torch.tensor([1.0, 1.0, 1.0]),
+        )
 
 
 def test_iforward_v6_context_adapter_outputs_finite_nonzero_initialized_context():

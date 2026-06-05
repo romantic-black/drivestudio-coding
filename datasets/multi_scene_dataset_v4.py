@@ -2648,6 +2648,195 @@ class MultiSceneDatasetV4:
         }
         return batch
 
+    def _assemble_segment_batch_from_iforward_random_window_request(
+        self,
+        *,
+        scene_id: int,
+        segment_id: int,
+        plan: Any,
+        include_test: bool = False,
+    ) -> Dict[str, Any]:
+        from models.iforward.random_window_batch import (
+            RANDOM_WINDOW_ASSEMBLY_MODE,
+            RANDOM_WINDOW_MODEL_FAMILY,
+            RANDOM_WINDOW_SCHEDULER_VERSION,
+        )
+
+        if str(getattr(plan, "scheduler_version", "")) != RANDOM_WINDOW_SCHEDULER_VERSION:
+            raise ValueError("expected IForwardRandomWindowPlan.scheduler_version == 'random_window_v1'")
+        if int(scene_id) != int(getattr(plan, "scene_id")) or int(segment_id) != int(getattr(plan, "segment_id")):
+            raise ValueError(
+                "IForward random-window request scene/segment mismatch: "
+                f"request=({int(scene_id)},{int(segment_id)}) "
+                f"plan=({int(getattr(plan, 'scene_id'))},{int(getattr(plan, 'segment_id'))})"
+            )
+
+        evidence_refs = self._dedupe_v9_refs_keep_order(
+            [(int(ref[0]), int(ref[1])) for ref in list(getattr(plan, "evidence_refs_flat", []) or [])]
+        )
+        target_refs_raw = [(int(ref[0]), int(ref[1])) for ref in list(getattr(plan, "target_refs_flat", []) or [])]
+        target_roles_raw = [str(x) for x in list(getattr(plan, "target_roles_flat", []) or [])]
+        self._assert_no_iforward_ref_role_conflicts(target_refs_raw, target_roles_raw)
+        target_refs, target_roles = self._dedupe_v9_refs_roles_keep_order(target_refs_raw, target_roles_raw)
+        if not evidence_refs:
+            raise ValueError("IForward random-window request requires non-empty evidence refs")
+        if not target_refs:
+            raise ValueError("IForward random-window request requires non-empty target refs")
+        if len(target_refs) != len(target_roles):
+            raise ValueError("IForward random-window target refs/roles length mismatch after dedupe")
+        for ref in evidence_refs + target_refs:
+            self.validate_image_ref(int(scene_id), int(segment_id), tuple(ref), purpose="train")
+
+        bundle = self._resolve_segment_bundle(int(scene_id), int(segment_id))
+        dynamic_points = bundle.pointcloud.get("dynamic") if isinstance(bundle.pointcloud, dict) else None
+        if isinstance(dynamic_points, dict) and len(dynamic_points) > 0:
+            if not bool(self._knn_requirements.fixed_neighbor_enabled):
+                raise ValueError(
+                    "IForward random-window state carry requires stable full-segment rigid row-space. "
+                    "Enable fixed cached KNN / fixed_neighbor_enabled."
+                )
+
+        batch = self._assemble_segment_batch_from_image_refs(
+            int(scene_id),
+            int(segment_id),
+            evidence_refs,
+            target_refs,
+            aux_image_refs=None,
+            query_label_image_refs=None,
+            include_test=bool(include_test),
+            test_image_refs=None,
+            enforce_target0_equals_source=False,
+            target_ref_purpose="train",
+        )
+
+        source_ref_to_index: Dict[ImageRef, int] = {tuple(ref): int(idx) for idx, ref in enumerate(evidence_refs)}
+        target_ref_to_index: Dict[ImageRef, int] = {tuple(ref): int(idx) for idx, ref in enumerate(target_refs)}
+        target_indices_by_role: Dict[str, List[int]] = {}
+        target_refs_by_role: Dict[str, List[ImageRef]] = {}
+        for idx, (ref, role) in enumerate(zip(target_refs, target_roles)):
+            role_s = str(role)
+            target_indices_by_role.setdefault(role_s, []).append(int(idx))
+            target_refs_by_role.setdefault(role_s, []).append(tuple(ref))
+
+        plan_dict = dataclasses.asdict(plan)
+        steps_meta: List[Dict[str, Any]] = []
+        for step in list(getattr(plan, "steps", []) or []):
+            step_dict = dataclasses.asdict(step)
+            step_refs = [(int(ref[0]), int(ref[1])) for ref in list(getattr(step, "evidence_refs", []) or [])]
+            step_dict["evidence_refs"] = [tuple(x) for x in step_refs]
+            step_dict["source_indices"] = [int(source_ref_to_index[tuple(ref)]) for ref in step_refs]
+            steps_meta.append(step_dict)
+
+        role_groups: List[Dict[str, Any]] = [
+            {
+                "role": "evidence_input",
+                "refs": [tuple(x) for x in evidence_refs],
+                "image_roles": ["evidence_input" for _ in evidence_refs],
+                "allow_update_evidence": True,
+                "allow_render_loss": False,
+                "allow_memory_write": True,
+                "mask_policy": str((getattr(plan, "request_meta", None) or {}).get("evidence_mask_policy", "non_sky_non_egocar")),
+            }
+        ]
+        for role, refs in target_refs_by_role.items():
+            role_groups.append(
+                {
+                    "role": str(role),
+                    "refs": [tuple(x) for x in refs],
+                    "image_roles": [str(role) for _ in refs],
+                    "allow_update_evidence": False,
+                    "allow_render_loss": True,
+                    "allow_memory_write": False,
+                    "mask_policy": "non_sky_non_egocar",
+                }
+            )
+
+        iforward_meta = {
+            "scheduler_version": RANDOM_WINDOW_SCHEDULER_VERSION,
+            "model_family": RANDOM_WINDOW_MODEL_FAMILY,
+            "scene_id": int(getattr(plan, "scene_id")),
+            "segment_id": int(getattr(plan, "segment_id")),
+            "episode_id": int(getattr(plan, "episode_id")),
+            "rollout_id_global": int(getattr(plan, "rollout_id_global")),
+            "rollout_idx_in_episode": int(getattr(plan, "rollout_idx_in_episode")),
+            "rollouts_per_episode": int(getattr(plan, "rollouts_per_episode")),
+            "window_start": int(getattr(plan, "window_start")),
+            "window_end": int(getattr(plan, "window_end")),
+            "window_block_ids": [int(x) for x in list(getattr(plan, "window_block_ids", []) or [])],
+            "window_keyframe_indices": [int(x) for x in list(getattr(plan, "window_keyframe_indices", []) or [])],
+            "window_frame_indices": [int(x) for x in list(getattr(plan, "window_frame_indices", []) or [])],
+            "window_hash": int(getattr(plan, "window_hash")),
+            "window_revisit_count": int(getattr(plan, "window_revisit_count")),
+            "unique_windows_seen": int(getattr(plan, "unique_windows_seen")),
+            "is_repeated_window": bool(getattr(plan, "is_repeated_window")),
+            "blocks_per_rollout": int(getattr(plan, "blocks_per_rollout")),
+            "repeats_per_block": int(getattr(plan, "repeats_per_block")),
+            "inner_K": int(getattr(plan, "inner_K")),
+            "input_frame_indices": [int(x) for x in list(getattr(plan, "input_frame_indices", []) or [])],
+            "input_keyframe_indices": [int(x) for x in list(getattr(plan, "input_keyframe_indices", []) or [])],
+            "nearby_frame_indices": [int(x) for x in list(getattr(plan, "nearby_frame_indices", []) or [])],
+            "evidence_refs_flat": [tuple(x) for x in evidence_refs],
+            "target_refs_flat": [tuple(x) for x in target_refs],
+            "target_roles_flat": [str(x) for x in target_roles],
+            "current_latest_refs": [tuple(x) for x in list(getattr(plan, "current_latest_refs", []) or [])],
+            "in_rollout_history_refs": [tuple(x) for x in list(getattr(plan, "in_rollout_history_refs", []) or [])],
+            "short_window_history_refs": [tuple(x) for x in list(getattr(plan, "short_window_history_refs", []) or [])],
+            "nearby_refs": [tuple(x) for x in list(getattr(plan, "nearby_refs", []) or [])],
+            "steps": steps_meta,
+            "source_ref_to_index_keyed": {
+                self._iforward_ref_key(ref): int(idx)
+                for ref, idx in source_ref_to_index.items()
+            },
+            "target_ref_to_index_keyed": {
+                self._iforward_ref_key(ref): int(idx)
+                for ref, idx in target_ref_to_index.items()
+            },
+            "final_supervision": {
+                "target_indices_by_role": {
+                    str(role): [int(x) for x in indices]
+                    for role, indices in target_indices_by_role.items()
+                },
+                "target_refs_by_role": {
+                    str(role): [tuple(x) for x in refs]
+                    for role, refs in target_refs_by_role.items()
+                },
+            },
+            "reset_scene_state_before_rollout": bool(getattr(plan, "reset_scene_state_before_rollout")),
+            "carry_scene_state_after_rollout": bool(getattr(plan, "carry_scene_state_after_rollout")),
+            "episode_end_after_rollout": bool(getattr(plan, "episode_end_after_rollout")),
+            "discard_scene_state_after_rollout": bool(getattr(plan, "episode_end_after_rollout")),
+            "detach_graph_after_rollout": bool(getattr(plan, "detach_graph_after_rollout")),
+            "leakage_check": dict(getattr(plan, "leakage_check", {}) or {}),
+        }
+
+        request_meta = dict(batch.get("request_meta") or {})
+        request_meta.update(dict(getattr(plan, "request_meta", {}) or {}))
+        request_meta["scheduler_version"] = RANDOM_WINDOW_SCHEDULER_VERSION
+        request_meta["model_family"] = RANDOM_WINDOW_MODEL_FAMILY
+        request_meta["scene_id"] = int(getattr(plan, "scene_id"))
+        request_meta["segment_id"] = int(getattr(plan, "segment_id"))
+        request_meta["episode_id"] = int(getattr(plan, "episode_id"))
+        request_meta["episode_idx_global"] = int(getattr(plan, "episode_id"))
+        request_meta["rollout_id_global"] = int(getattr(plan, "rollout_id_global"))
+        request_meta["rollout_idx_in_episode"] = int(getattr(plan, "rollout_idx_in_episode"))
+        request_meta["rollouts_per_episode"] = int(getattr(plan, "rollouts_per_episode"))
+        request_meta["inner_K"] = int(getattr(plan, "inner_K"))
+        request_meta["source_image_refs"] = [tuple(x) for x in evidence_refs]
+        request_meta["source_image_ref"] = tuple(evidence_refs[0])
+        request_meta["target_image_refs"] = [tuple(x) for x in target_refs]
+        request_meta["target_image_roles"] = [str(x) for x in target_roles]
+        request_meta["role_groups"] = role_groups
+        request_meta["iforward"] = iforward_meta
+        request_meta["assembly_mode"] = RANDOM_WINDOW_ASSEMBLY_MODE
+        batch["request_meta"] = request_meta
+        batch["_iforward"] = iforward_meta
+        batch["_iforward_plan"] = plan_dict
+        batch["_iforward_runtime_maps"] = {
+            "source_ref_to_index": dict(source_ref_to_index),
+            "target_ref_to_index": dict(target_ref_to_index),
+        }
+        return batch
+
     def _assemble_segment_batch_from_v9_request(
         self,
         *,
@@ -3020,6 +3209,46 @@ class MultiSceneDatasetV4:
             seed=seed,
             version=str(version),
             fail_fast=bool(fail_fast),
+        )
+
+    def create_train_scheduler_iforward_random_window(
+        self,
+        *,
+        traversal_cfg: Optional[Any] = None,
+        segment_cfg: Optional[Any] = None,
+        episode_cfg: Optional[Any] = None,
+        rollout_cfg: Optional[Any] = None,
+        evidence_cfg: Optional[Any] = None,
+        supervision_cfg: Optional[Any] = None,
+        memory_cfg: Optional[Any] = None,
+        loss_timing_cfg: Optional[Any] = None,
+        preload_cfg: Optional[Any] = None,
+        include_test: bool = False,
+        fixed_scene_id: Optional[int] = None,
+        fixed_segment_id: Optional[int] = None,
+        seed: Optional[int] = None,
+        fail_fast: bool = True,
+        fixed_window_starts: Optional[Sequence[int]] = None,
+    ) -> Any:
+        from datasets.iforward_random_window_scheduler import IForwardRandomWindowScheduler
+
+        return IForwardRandomWindowScheduler(
+            dataset=self,
+            traversal_cfg=traversal_cfg,
+            segment_cfg=segment_cfg,
+            episode_cfg=episode_cfg,
+            rollout_cfg=rollout_cfg,
+            evidence_cfg=evidence_cfg,
+            supervision_cfg=supervision_cfg,
+            memory_cfg=memory_cfg,
+            loss_timing_cfg=loss_timing_cfg,
+            preload_cfg=preload_cfg,
+            include_test=bool(include_test),
+            fixed_scene_id=fixed_scene_id,
+            fixed_segment_id=fixed_segment_id,
+            seed=seed,
+            fail_fast=bool(fail_fast),
+            fixed_window_starts=fixed_window_starts,
         )
 
     def create_train_scheduler_v9(

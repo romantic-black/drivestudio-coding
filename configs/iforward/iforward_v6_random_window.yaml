@@ -1,4 +1,4 @@
-output_name: iforward_v6_point_mamba_xcpe
+output_name: iforward_v6_random_window
 
 initialization:
   phase_b_from_phase_a:
@@ -78,84 +78,58 @@ dataset:
       enable: true
       traj_length_thresh_m: 0.5
 
-scheduler_iforward:
+scheduler_iforward_random_window:
   enable: true
-  version: iforward_v1
   fail_fast: true
   traversal:
     fixed_scene_id: null
     fixed_segment_id: null
-    seed: null
+    seed: 41
     scene_order: shuffle_per_epoch
     segment_order: shuffle_per_epoch
-    traversal_mode: episode_serial
-  episode:
+  segment:
     source_mode: keyframes
-    blocks_per_episode: 8
-    episode_stride: 8
-    allow_short_last_episode: false
-    min_blocks_per_episode: 4
-    block_source_frame_policy: random_within_keyframe_per_rollout
-    reset_scene_state_policy: episode_begin
+    min_blocks: 4
+  episode:
+    rollouts_per_episode: 8
+    reset_state_at_begin: true
+    carry_state_until_end: true
   rollout:
-    block_selection_policy: random_start_contiguous
-    delivery_order_policy: chronological
-    allow_short_final_rollout: false
-    min_blocks_per_rollout: 4
-    avoid_single_block_tail: true
+    blocks_per_rollout: 4
+    repeats_per_block: 2
+    window_policy: random_with_replacement
+    delivery_order: chronological
     detach_graph_after_rollout: true
-    shapes:
-      - {name: b4_r2, blocks_per_rollout: 4, repeats_per_block: 2, prob: 0.50}
-      - {name: b6_r1, blocks_per_rollout: 6, repeats_per_block: 1, prob: 0.50}
-
-    shapes_schedule: []
   evidence:
     camera_policy: all_cams
-    cams_per_input: null
-    fixed_cam_ids: null
-    allow_camera_dropout: false
     mask_policy: non_sky_non_egocar
+  supervision:
+    current_latest:
+      enable: true
+      camera_policy: all_cams
+    in_rollout_history:
+      enable: true
+      camera_policy: all_cams
+    short_window_history:
+      enable: true
+      source: carried_history_buffer
+      max_entries: 24
+    nearby:
+      enable: true
+      frames_per_rollout: 1
+      policy: random_non_input_frame_in_segment
+      camera_policy: all_cams
+      max_refs_per_rollout: 3
   memory:
     observation_commit_policy: first_repeat_only
     optimizer_memory_update_policy: every_repeat
     reset_policy: episode_begin
-    carry_policy: across_rollouts_until_episode_end
+    carry_policy: episode
   loss_timing:
     policy: rollout_final_only
-    intermediate_step_loss: false
-  supervision:
-    current:
-      enable: true
-      role_name: final_current_recon
-      frame_policy: all_input_frames
-      camera_policy: all_cams
-      required: true
-    nearby:
-      enable: true
-      role_name: final_nearby_rollout
-      scope: rollout_keyframe_span
-      policy: random_non_input_frames
-      frames_per_rollout: 1
-      insufficient_policy: use_available_or_skip_if_none
-      camera_policy: all_cams
-      max_refs_per_rollout: 24
-      add_to_evidence: false
-      mask_policy: non_sky_non_egocar
-    history_replay:
-      enable: false
-  leakage_check:
-    enable: true
-    same_scene_segment_required: true
-    forbid_test_refs_in_train: true
-    target_role_count_match_required: true
-    nearby_not_in_evidence: true
-    nearby_not_input_frame: true
-    current_supervision_must_cover_all_inputs: true
   preload:
     emit_hints: true
     warm_current_rollout_refs: true
-    warm_next_rollout_refs: true
-    warm_episode_chain: false
     hint_scope_for_exact_refs: v9_role_refs
 
 # Present only for the private Stage6 low-level bridge initialization.
@@ -289,7 +263,7 @@ model:
       train_dinov2: false
       detach_v4_outputs: false
     local_rollout:
-      source: scheduler_iforward
+      source: scheduler_iforward_random_window
       use_scheduler_inner_K: true
       local_G_no_detach_between_steps: true
       detach_persistent_state_at_block_start: true
@@ -465,14 +439,19 @@ validation_v8:
 validation_v9:
   enable: false
 
-iforward_validation:
+iforward_random_window_validation:
   enable: true
   run_at_train_start: true
-  interval_steps: 1000
+  interval_steps: 5000
   segments_per_scene: 1
-  rollouts_per_segment: 1
+  rollouts_per_segment: 8
+  window_policy: fixed_random_with_replacement
+  seed: 20260604
+  carry_state_across_rollouts: true
+  reset_state_at_segment_begin: true
   tensorboard_images:
     enable: true
+    rollout_indices: [0, 1, 3, 7]
     max_images_per_role: 2
 
 eval:
@@ -481,7 +460,7 @@ eval:
 
 logging:
   output_root: /root/autodl-tmp/outputs
-  project: iforward_stage1_0
+  project: iforward_v6_random_window
   log_dir: null
   image_interval_blocks: 500
   image_interval: 500
@@ -491,6 +470,7 @@ logging:
   enable_jsonl_metrics: true
   metrics_history_append: false
   train_step_metrics_interval: 1
+  random_window_diagnostics_interval: 100
   train_monitor:
     enable_heavy_metrics: false
     include_per_view_metrics: false
@@ -498,9 +478,9 @@ logging:
     enable_low_psnr_image_dump: false
   use_tensorboard: true
   performance:
-    enable: true
+    enable: false
     phase_timing: false
-    cuda_memory: true
+    cuda_memory: false
     cleanup_metrics_interval_steps: 0
     live_tensor_summary_interval_steps: 0
     live_tensor_summary_topk: 0

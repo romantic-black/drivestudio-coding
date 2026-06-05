@@ -6,6 +6,12 @@ import torch
 import torch.nn as nn
 
 from models.iforward import IForwardBatchResolver, IForwardModel, IForwardTrainer
+from models.iforward.random_window_batch import (
+    RANDOM_WINDOW_ASSEMBLY_MODE,
+    RANDOM_WINDOW_MODEL_FAMILY,
+    RANDOM_WINDOW_SCHEDULER_VERSION,
+)
+from models.iforward.random_window_resolver import IForwardRandomWindowBatchResolver
 from models.iforward.validation import validate_iforward_memory_ablation
 from models.iforward.bridge import IForwardStage6Bridge
 from models.streetforward.node_states import NodeStateBackground, NodeStateRigid
@@ -212,6 +218,102 @@ def _batch(*, rollout_idx=0, episode_end=False, repeat_only=False, episode_id=3)
     }
 
 
+def _rw_refs(frame_idx: int) -> List[Tuple[int, int]]:
+    return [(int(frame_idx), int(cam_idx)) for cam_idx in range(3)]
+
+
+def _random_window_batch(
+    *,
+    rollout_idx: int = 0,
+    episode_end: bool = False,
+    episode_id: int = 31,
+    frames: Tuple[int, int, int, int] = (10, 20, 30, 40),
+    short_refs: Optional[List[Tuple[int, int]]] = None,
+    window_hash: Optional[int] = None,
+    window_revisit_count: int = 0,
+):
+    input_frames = [int(x) for x in frames]
+    source_refs = [ref for frame in input_frames for ref in _rw_refs(frame)]
+    current_latest_refs = _rw_refs(input_frames[-1])
+    in_rollout_history_refs = [ref for frame in input_frames[:-1] for ref in _rw_refs(frame)]
+    short_refs = list(short_refs or [])
+    nearby_refs = _rw_refs(max(input_frames) + 100)
+    target_refs = current_latest_refs + in_rollout_history_refs + short_refs + nearby_refs
+    target_roles = (
+        ["current_latest"] * len(current_latest_refs)
+        + ["in_rollout_history"] * len(in_rollout_history_refs)
+        + ["short_window_history"] * len(short_refs)
+        + ["nearby"] * len(nearby_refs)
+    )
+    steps = []
+    for block_pos, frame_idx in enumerate(input_frames):
+        for repeat_idx in range(2):
+            k = len(steps)
+            steps.append(
+                {
+                    "step_idx": int(k),
+                    "block_id": int(block_pos),
+                    "block_pos_in_window": int(block_pos),
+                    "repeat_idx": int(repeat_idx),
+                    "global_k": int(k),
+                    "source_frame_idx": int(frame_idx),
+                    "source_keyframe_idx": int(block_pos),
+                    "evidence_refs": _rw_refs(frame_idx),
+                    "commit_observation_memory": bool(repeat_idx == 0),
+                    "update_optimizer_memory": True,
+                    "is_frame_exit": bool(repeat_idx == 1),
+                }
+            )
+    ifwd = {
+        "scheduler_version": RANDOM_WINDOW_SCHEDULER_VERSION,
+        "model_family": RANDOM_WINDOW_MODEL_FAMILY,
+        "scene_id": 1,
+        "segment_id": 2,
+        "episode_id": int(episode_id),
+        "rollout_id_global": int(rollout_idx),
+        "rollout_idx_in_episode": int(rollout_idx),
+        "rollouts_per_episode": 8,
+        "window_start": int(rollout_idx),
+        "window_end": int(rollout_idx + 4),
+        "window_block_ids": [int(rollout_idx + x) for x in range(4)],
+        "window_hash": int(1000 + rollout_idx if window_hash is None else window_hash),
+        "window_revisit_count": int(window_revisit_count),
+        "unique_windows_seen": int(rollout_idx + 1),
+        "is_repeated_window": bool(window_revisit_count > 0),
+        "blocks_per_rollout": 4,
+        "repeats_per_block": 2,
+        "inner_K": 8,
+        "steps": steps,
+        "input_frame_indices": list(input_frames),
+        "evidence_refs_flat": list(source_refs),
+        "target_refs_flat": list(target_refs),
+        "target_roles_flat": list(target_roles),
+        "current_latest_refs": list(current_latest_refs),
+        "in_rollout_history_refs": list(in_rollout_history_refs),
+        "short_window_history_refs": list(short_refs),
+        "nearby_refs": list(nearby_refs),
+        "reset_scene_state_before_rollout": int(rollout_idx) == 0,
+        "carry_scene_state_after_rollout": not bool(episode_end),
+        "episode_end_after_rollout": bool(episode_end),
+        "detach_graph_after_rollout": True,
+    }
+    return {
+        "scene_id": 1,
+        "segment_id": 2,
+        "request_meta": {
+            "scheduler_version": RANDOM_WINDOW_SCHEDULER_VERSION,
+            "model_family": RANDOM_WINDOW_MODEL_FAMILY,
+            "assembly_mode": RANDOM_WINDOW_ASSEMBLY_MODE,
+            "source_image_refs": list(source_refs),
+            "target_image_refs": list(target_refs),
+            "target_image_roles": list(target_roles),
+            "iforward": ifwd,
+        },
+        "_iforward": ifwd,
+        "targets": [{"gt_image": torch.zeros(1, 1, 3), "frame_idx": f, "cam_idx": c} for f, c in target_refs],
+    }
+
+
 def test_iforward_forward_rollout_carries_memory_and_renders_only_final():
     bridge = FakeIForwardBridge()
     model = IForwardModel(config=None, device=torch.device("cpu"), bridge=bridge, resolver=IForwardBatchResolver())
@@ -304,6 +406,75 @@ def test_iforward_long_memory_writes_on_non_commit_optimizer_repeat():
     assert counts["bg_point"] == 2
     assert counts["bg_cell"] == 1
     assert counts["bg_global_token"] == 1
+
+
+def test_iforward_random_window_commits_full_window_and_caps_short_history():
+    bridge = FakeIForwardBridge()
+    model = IForwardModel(
+        config=None,
+        device=torch.device("cpu"),
+        bridge=bridge,
+        resolver=IForwardRandomWindowBatchResolver(expected_cams_per_step=3),
+    )
+    out0 = model.forward_rollout(_random_window_batch(rollout_idx=0, frames=(10, 20, 30, 40)))
+    assert out0.stats["scheduler_version"] == RANDOM_WINDOW_SCHEDULER_VERSION
+    assert out0.stats["current_latest_num_refs"] == 3.0
+    assert out0.stats["in_rollout_history_num_refs"] == 9.0
+    assert len(out0.next_state.history.entries) == 12
+
+    short0 = [(int(item["frame_idx"]), int(item["cam_idx"])) for item in out0.next_state.history.entries]
+    out1 = model.forward_rollout(
+        _random_window_batch(rollout_idx=1, frames=(50, 60, 70, 80), short_refs=short0),
+        carried_state=out0.next_state.detach_for_next_rollout(),
+    )
+    assert out1.stats["short_window_history_num_refs"] == 12.0
+    assert len(out1.next_state.history.entries) == 24
+
+    short1 = [(int(item["frame_idx"]), int(item["cam_idx"])) for item in out1.next_state.history.entries]
+    out2 = model.forward_rollout(
+        _random_window_batch(rollout_idx=2, frames=(90, 100, 110, 120), short_refs=short1),
+        carried_state=out1.next_state.detach_for_next_rollout(),
+    )
+    assert out2.stats["history_entries_before"] == 24
+    assert out2.stats["history_entries_after"] == 24
+    assert len(out2.next_state.history.entries) == 24
+
+
+def test_iforward_trainer_logs_random_window_revisit_psnr_deltas():
+    bridge = FakeIForwardBridge()
+    model = IForwardModel(
+        config=None,
+        device=torch.device("cpu"),
+        bridge=bridge,
+        resolver=IForwardRandomWindowBatchResolver(expected_cams_per_step=3),
+    )
+    trainer = IForwardTrainer(
+        config={},
+        device=torch.device("cpu"),
+        model=model,
+        optimizer=torch.optim.SGD(model.parameters(), lr=0.1),
+    )
+    logs0 = trainer.train_step(
+        _random_window_batch(rollout_idx=0, frames=(10, 20, 30, 40), window_hash=77),
+        step=0,
+    )
+    logs1 = trainer.train_step(
+        _random_window_batch(
+            rollout_idx=1,
+            frames=(10, 20, 30, 40),
+            window_hash=77,
+            window_revisit_count=1,
+        ),
+        step=1,
+    )
+    assert "iforward/revisit/current_psnr_delta" not in logs0
+    assert logs0["iforward/scheduler_version"] == RANDOM_WINDOW_SCHEDULER_VERSION
+    assert logs0["iforward/window_block_ids"] == [0, 1, 2, 3]
+    assert logs0["iforward/reset_scene_state_before_rollout"] is True
+    assert logs1["iforward/reset_scene_state_before_rollout"] is False
+    assert logs1["iforward/revisit/current_psnr_delta"] == 0.0
+    assert logs1["iforward/revisit/history_psnr_delta"] == 0.0
+    assert logs1["iforward/revisit/nearby_psnr_delta"] == 0.0
 
 
 def test_iforward_trainer_applies_grad_clip():

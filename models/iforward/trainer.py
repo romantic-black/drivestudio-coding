@@ -31,6 +31,7 @@ class IForwardTrainer(nn.Module):
         self.optimizer = optimizer if optimizer is not None else self._build_optimizer(config)
         self._apply_trainability_schedule(0)
         self._state_cache: Dict[Tuple[int, int, int], IForwardState] = {}
+        self._random_window_metric_cache: Dict[Tuple[int, int, int, int], Dict[str, float]] = {}
 
     @staticmethod
     def _named_params(module: Optional[nn.Module], prefix: str = "") -> List[Tuple[str, nn.Parameter]]:
@@ -374,7 +375,45 @@ class IForwardTrainer(nn.Module):
     def _clear_state_cache_for_new_episode(self) -> int:
         removed = int(len(self._state_cache))
         self._state_cache.clear()
+        self._random_window_metric_cache.clear()
         return removed
+
+    @staticmethod
+    def _finite_metric(value: Any) -> Optional[float]:
+        if not isinstance(value, (int, float)):
+            return None
+        value_f = float(value)
+        return value_f if math.isfinite(value_f) else None
+
+    def _random_window_revisit_metrics(self, out: IForwardRolloutOutput) -> Dict[str, float]:
+        resolved = out.resolved
+        if str(resolved.scheduler_version) != "random_window_v1" or int(resolved.window_hash) < 0:
+            return {}
+        key = (
+            int(resolved.scene_id),
+            int(resolved.segment_id),
+            int(resolved.episode_id),
+            int(resolved.window_hash),
+        )
+        current = {
+            "current": self._finite_metric(out.stats.get("current_latest_psnr")),
+            "history": self._finite_metric(out.stats.get("in_rollout_history_psnr")),
+            "nearby": self._finite_metric(out.stats.get("nearby_psnr")),
+        }
+        previous = self._random_window_metric_cache.get(key)
+        self._random_window_metric_cache[key] = {
+            name: float(value)
+            for name, value in current.items()
+            if value is not None
+        }
+        if not previous:
+            return {}
+        metrics: Dict[str, float] = {}
+        for name, value in current.items():
+            if value is None or name not in previous:
+                continue
+            metrics[f"iforward/revisit/{name}_psnr_delta"] = float(value) - float(previous[name])
+        return metrics
 
     @staticmethod
     def _sync_cuda(enabled: bool) -> None:
@@ -471,9 +510,14 @@ class IForwardTrainer(nn.Module):
         final = {
             "loss": float(loss.detach().item()),
             "iforward/loss_total": float(loss.detach().item()),
+            "iforward/scene_id": int(out.resolved.scene_id),
+            "iforward/segment_id": int(out.resolved.segment_id),
+            "iforward/episode_id": int(out.resolved.episode_id),
             "iforward/inner_K": float(out.resolved.inner_K),
             "iforward/rollout_id_global": float(out.resolved.rollout_id_global),
             "iforward/rollout_idx_in_episode": float(out.resolved.rollout_idx_in_episode),
+            "iforward/rollouts_per_episode": int(out.resolved.rollouts_per_episode),
+            "iforward/reset_scene_state_before_rollout": bool(out.resolved.reset_scene_state_before_rollout),
             "iforward/episode_end_after_rollout": bool(out.resolved.episode_end_after_rollout),
             "iforward/carry_scene_state_after_rollout": bool(out.resolved.carry_scene_state_after_rollout),
             "iforward/state_cache_size": int(len(self._state_cache)),
@@ -496,6 +540,9 @@ class IForwardTrainer(nn.Module):
             "image_refs": [tuple(int(v) for v in ref) for ref in out.image_refs],
             "image_roles": [str(role) for role in out.image_roles],
         }
+        if str(out.resolved.scheduler_version) == "random_window_v1":
+            final["iforward/scheduler_version"] = str(out.resolved.scheduler_version)
+            final["iforward/window_block_ids"] = [int(x) for x in tuple(out.resolved.window_block_ids)]
         for name, value in timings.items():
             final[name] = float(value)
         for prefix, values in (
@@ -508,6 +555,7 @@ class IForwardTrainer(nn.Module):
             final[f"iforward/loss_{name}"] = float(value)
         final.update(group_metrics)
         final.update(adapter_metrics)
+        final.update(self._random_window_revisit_metrics(out))
         for name, value in out.stats.items():
             if isinstance(value, bool):
                 final[f"iforward/{name}"] = bool(value)

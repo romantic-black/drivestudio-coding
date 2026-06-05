@@ -17,6 +17,7 @@ _LAZY_EXPORTS: Dict[str, Tuple[str, str]] = {
     "TrainSchedulerV8": ("datasets.train_scheduler_v8", "TrainSchedulerV8"),
     "TrainSchedulerV9": ("datasets.train_scheduler_v9", "TrainSchedulerV9"),
     "TrainSchedulerIForward": ("datasets.train_scheduler_iforward", "TrainSchedulerIForward"),
+    "IForwardRandomWindowScheduler": ("datasets.iforward_random_window_scheduler", "IForwardRandomWindowScheduler"),
     "IForwardRolloutShape": ("datasets.train_scheduler_iforward", "IForwardRolloutShape"),
     "IForwardStepPlan": ("datasets.train_scheduler_iforward", "IForwardStepPlan"),
     "IForwardFinalSupervisionPlan": ("datasets.train_scheduler_iforward", "IForwardFinalSupervisionPlan"),

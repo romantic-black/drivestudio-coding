@@ -368,7 +368,16 @@ class IForwardModel(nn.Module):
         super().__init__()
         self.config = config
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.resolver = resolver if resolver is not None else IForwardBatchResolver()
+        if resolver is not None:
+            self.resolver = resolver
+        else:
+            random_window_cfg = cfg_get(config, "scheduler_iforward_random_window", {}) or {}
+            if bool(cfg_get(random_window_cfg, "enable", False)):
+                from .random_window_resolver import IForwardRandomWindowBatchResolver
+
+                self.resolver = IForwardRandomWindowBatchResolver()
+            else:
+                self.resolver = IForwardBatchResolver()
 
         if bridge is None:
             runtime = phase_a_runtime
@@ -645,17 +654,23 @@ class IForwardModel(nn.Module):
         image_roles.extend(["nearby"] * int(appended))
         losses = {
             "current": current_loss,
+            "current_latest": current_loss,
             "nearby": nearby_loss,
             "in_rollout_history": in_rollout_history_loss,
             "short_window_history": short_history_loss,
         }
         stats = {
             "current_valid_ratio": float(current_stats.get("valid_ratio", 0.0)),
+            "current_latest_valid_ratio": float(current_stats.get("valid_ratio", 0.0)),
             "nearby_valid_ratio": float(nearby_stats.get("valid_ratio", 0.0)),
             "in_rollout_history_valid_ratio": float(in_rollout_stats.get("valid_ratio", 0.0)),
             "short_window_history_valid_ratio": float(short_history_stats.get("valid_ratio", 0.0)),
             "current_num_refs": float(current_stats.get("num_refs", len(resolved.current_latest_target_indices))),
+            "current_latest_num_refs": float(current_stats.get("num_refs", len(resolved.current_latest_target_indices))),
             "history_rollout_num_refs": float(
+                in_rollout_stats.get("num_refs", len(resolved.history_rollout_target_indices))
+            ),
+            "in_rollout_history_num_refs": float(
                 in_rollout_stats.get("num_refs", len(resolved.history_rollout_target_indices))
             ),
             "nearby_num_refs": float(nearby_stats.get("num_refs", len(resolved.nearby_target_indices))),
@@ -671,6 +686,10 @@ class IForwardModel(nn.Module):
                 value = item.get(metric)
                 if value is not None and math.isfinite(float(value)):
                     stats[f"{prefix}_{metric}"] = float(value)
+                    if prefix == "current":
+                        stats[f"current_latest_{metric}"] = float(value)
+                    if prefix == "history_rollout":
+                        stats[f"in_rollout_history_{metric}"] = float(value)
         return losses, stats, pred_rgbs, gt_images, image_refs, image_roles
 
     def _build_v6_context(
@@ -887,7 +906,8 @@ class IForwardModel(nn.Module):
         if not torch.isfinite(total).all():
             raise RuntimeError("IForward rollout loss became NaN/Inf.")
 
-        history = working_history.commit_targets(batch, tuple(resolved.current_target_indices))
+        history_indices = tuple(resolved.history_commit_target_indices or resolved.current_target_indices)
+        history = working_history.commit_targets(batch, history_indices)
         history_entries_after = int(len(history.entries))
         memory_entries_after = int(len(history.memory_entries))
         next_state = IForwardState(
@@ -905,6 +925,16 @@ class IForwardModel(nn.Module):
             **final_stats,
             "inner_K": int(resolved.inner_K),
             "ablation": ablation_name,
+            "scheduler_version": str(resolved.scheduler_version),
+            "rollouts_per_episode": int(resolved.rollouts_per_episode),
+            "window_start": int(resolved.window_start),
+            "window_end": int(resolved.window_end),
+            "window_hash": int(resolved.window_hash),
+            "window_revisit_count": int(resolved.window_revisit_count),
+            "unique_windows_seen": int(resolved.unique_windows_seen),
+            "is_repeated_window": bool(resolved.is_repeated_window),
+            "blocks_per_rollout": int(len(resolved.window_block_ids)) if resolved.window_block_ids else 0,
+            "repeats_per_block": 2 if str(resolved.scheduler_version) == "random_window_v1" else 0,
             "num_source_views": int(len(resolved.source_refs)),
             "num_targets": int(len(resolved.target_refs)),
             "num_gaussians_bg": int(local_state.bg.means.shape[0]),

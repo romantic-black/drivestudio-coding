@@ -54,6 +54,16 @@ class IForwardResolvedBatch:
     carry_scene_state_after_rollout: bool
     episode_end_after_rollout: bool
     detach_graph_after_rollout: bool
+    rollouts_per_episode: int = 1
+    window_start: int = -1
+    window_end: int = -1
+    window_block_ids: Tuple[int, ...] = ()
+    window_hash: int = -1
+    window_revisit_count: int = 0
+    unique_windows_seen: int = 0
+    is_repeated_window: bool = False
+    history_commit_target_indices: Tuple[int, ...] = ()
+    short_window_history_target_indices: Tuple[int, ...] = ()
 
     @property
     def cache_key(self) -> Tuple[int, int, int]:

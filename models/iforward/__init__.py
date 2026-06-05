@@ -10,6 +10,14 @@ from .resolver import (
     IForwardResolvedStep,
     IForwardBatchResolver,
 )
+from .random_window_batch import (
+    RANDOM_WINDOW_ASSEMBLY_MODE,
+    RANDOM_WINDOW_MODEL_FAMILY,
+    RANDOM_WINDOW_SCHEDULER_VERSION,
+    IForwardRandomWindowPlan,
+    IForwardRandomWindowStep,
+)
+from .random_window_resolver import IForwardRandomWindowBatchResolver
 from .state import (
     BranchMemoryState,
     DenseMambaState,
@@ -58,7 +66,13 @@ __all__ = [
     "IFORWARD_CURRENT_ROLE",
     "IFORWARD_NEARBY_ROLE",
     "IFORWARD_SCHEDULER_VERSION",
+    "RANDOM_WINDOW_ASSEMBLY_MODE",
+    "RANDOM_WINDOW_MODEL_FAMILY",
+    "RANDOM_WINDOW_SCHEDULER_VERSION",
     "IForwardBatchResolver",
+    "IForwardRandomWindowBatchResolver",
+    "IForwardRandomWindowPlan",
+    "IForwardRandomWindowStep",
     "IForwardMemoryState",
     "IForwardV6BranchPointState",
     "IForwardV6MemoryState",
