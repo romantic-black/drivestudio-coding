@@ -185,6 +185,9 @@ def _first_valid_iforward_eval_segments(cfg: Any, dataset: Any) -> List[Tuple[in
     val_cfg = _iforward_validation_cfg(cfg)
     if not bool(val_cfg["enable"]):
         return []
+    sched = _cfg_get(cfg, "scheduler_iforward", {}) or {}
+    scheduler_version = str(_cfg_get(sched, "version", "iforward_v1"))
+    min_keyframes = 8 if scheduler_version == "iforward_v3_random_window" else 4
     eval_scene_ids = [int(x) for x in list(_cfg_get(_cfg_get(cfg, "data", {}) or {}, "eval_scene_ids", []) or [])]
     out: List[Tuple[int, int]] = []
     for scene_id in eval_scene_ids:
@@ -192,7 +195,7 @@ def _first_valid_iforward_eval_segments(cfg: Any, dataset: Any) -> List[Tuple[in
         for segment_id in sorted(int(x) for x in list(dataset.list_segment_ids(int(scene_id)) or [])):
             sidx = dataset.get_segment_index(int(scene_id), int(segment_id))
             keyframes = [int(x) for x in list(getattr(sidx, "keyframe_indices", []) or [])]
-            if len(keyframes) < 4:
+            if len(keyframes) < int(min_keyframes):
                 continue
             out.append((int(scene_id), int(segment_id)))
             found += 1
@@ -203,32 +206,60 @@ def _first_valid_iforward_eval_segments(cfg: Any, dataset: Any) -> List[Tuple[in
 
 def _make_validation_scheduler(cfg: Any, dataset: Any, scene_id: int, segment_id: int) -> TrainSchedulerIForward:
     sched = _cfg_get(cfg, "scheduler_iforward", {}) or {}
+    scheduler_version = str(_cfg_get(sched, "version", "iforward_v1"))
     episode_cfg = copy.deepcopy(dict(_cfg_get(sched, "episode", {}) or {}))
-    episode_cfg.update(
-        {
-            "blocks_per_episode": 4,
-            "episode_stride": 4,
-            "allow_short_last_episode": False,
-            "min_blocks_per_episode": 4,
-        }
-    )
     rollout_cfg = copy.deepcopy(dict(_cfg_get(sched, "rollout", {}) or {}))
-    rollout_cfg.update(
-        {
-            "allow_short_final_rollout": False,
-            "min_blocks_per_rollout": 4,
-            "avoid_single_block_tail": True,
-            "shapes": [
-                {
-                    "name": "b4_r2",
-                    "blocks_per_rollout": 4,
-                    "repeats_per_block": 2,
-                    "prob": 1.0,
-                }
-            ],
-            "shapes_schedule": [],
-        }
-    )
+    if scheduler_version == "iforward_v3_random_window":
+        episode_cfg.update(
+            {
+                "blocks_per_episode": 8,
+                "episode_stride": 8,
+                "allow_short_last_episode": False,
+                "min_blocks_per_episode": 8,
+                "rollouts_per_episode": max(3, int(_cfg_get(episode_cfg, "rollouts_per_episode", 3))),
+            }
+        )
+        rollout_cfg.update(
+            {
+                "allow_short_final_rollout": False,
+                "min_blocks_per_rollout": 1,
+                "avoid_single_block_tail": False,
+                "fixed_shape_names": ["r8b1", "r4b2", "r2b4"],
+                "fixed_window_starts": [0, 2, 4],
+                "shapes": [
+                    {"name": "r8b1", "blocks_per_rollout": 1, "repeats_per_block": 8, "prob": 1.0},
+                    {"name": "r4b2", "blocks_per_rollout": 2, "repeats_per_block": 4, "prob": 1.0},
+                    {"name": "r2b4", "blocks_per_rollout": 4, "repeats_per_block": 2, "prob": 1.0},
+                ],
+                "shapes_schedule": [],
+            }
+        )
+    else:
+        episode_cfg.update(
+            {
+                "blocks_per_episode": 4,
+                "episode_stride": 4,
+                "allow_short_last_episode": False,
+                "min_blocks_per_episode": 4,
+                "rollouts_per_episode": int(_cfg_get(episode_cfg, "rollouts_per_episode", 1)),
+            }
+        )
+        rollout_cfg.update(
+            {
+                "allow_short_final_rollout": False,
+                "min_blocks_per_rollout": 4,
+                "avoid_single_block_tail": True,
+                "shapes": [
+                    {
+                        "name": "b4_r2",
+                        "blocks_per_rollout": 4,
+                        "repeats_per_block": 2,
+                        "prob": 1.0,
+                    }
+                ],
+                "shapes_schedule": [],
+            }
+        )
     traversal_cfg = copy.deepcopy(dict(_cfg_get(sched, "traversal", {}) or {}))
     traversal_cfg.update(
         {
@@ -257,7 +288,7 @@ def _make_validation_scheduler(cfg: Any, dataset: Any, scene_id: int, segment_id
         fixed_scene_id=int(scene_id),
         fixed_segment_id=int(segment_id),
         seed=0,
-        version="iforward_v1",
+        version=str(scheduler_version),
         fail_fast=True,
     )
 
@@ -304,8 +335,10 @@ def _write_iforward_validation_rows(
         with torch.no_grad():
             for scene_id, segment_id in segments:
                 scheduler = _make_validation_scheduler(cfg, dataset, int(scene_id), int(segment_id))
+                carried_state = None
                 for rollout_idx in range(int(val_cfg["rollouts_per_segment"])):
                     raw_batch = scheduler.next_batch()
+                    ifwd_meta = dict(raw_batch.get("_iforward", {}) or {})
                     target = raw_batch.get("target") or {}
                     num_targets = int(target["image"].shape[0])
                     minimal_batch = base.convert_batch_to_minimal_format(
@@ -316,9 +349,12 @@ def _write_iforward_validation_rows(
                         view_selection=None,
                     )
                     minimal_batch["global_step"] = int(trigger_step)
-                    out = model.forward_rollout(minimal_batch, carried_state=None, ablation="full")
+                    out = model.forward_rollout(minimal_batch, carried_state=carried_state, ablation="full")
                     stats = dict(out.stats or {})
                     losses = {name: _safe_float(value.detach().item()) for name, value in out.losses.items()}
+                    resolved = getattr(out, "resolved", None)
+                    carry_after = bool(getattr(resolved, "carry_scene_state_after_rollout", False))
+                    episode_end = bool(getattr(resolved, "episode_end_after_rollout", False))
                     row = {
                         "step": int(trigger_step),
                         "split": "iforward_validation",
@@ -327,21 +363,27 @@ def _write_iforward_validation_rows(
                         "scene_id": int(scene_id),
                         "segment_id": int(segment_id),
                         "rollout_idx": int(rollout_idx),
-                        "rollout_shape": "b4_r2",
+                        "rollout_shape": str(
+                            ifwd_meta.get("shape_name", ifwd_meta.get("requested_shape_name", "unknown"))
+                        ),
                         "inference_only": True,
                         "loss": _safe_float(out.loss.detach().item()),
-                        "current_loss": losses.get("current", float("nan")),
+                        "current_loss": losses.get("current", losses.get("current_latest", float("nan"))),
                         "history_rollout_loss": losses.get("in_rollout_history", float("nan")),
                         "nearby_loss": losses.get("nearby", float("nan")),
-                        "current_psnr": _safe_float(stats.get("current_psnr")),
+                        "current_psnr": _safe_float(stats.get("current_psnr", stats.get("current_latest_psnr"))),
                         "history_rollout_psnr": _safe_float(stats.get("history_rollout_psnr")),
                         "nearby_psnr": _safe_float(stats.get("nearby_psnr")),
-                        "current_valid_ratio": _safe_float(stats.get("current_valid_ratio")),
+                        "current_valid_ratio": _safe_float(
+                            stats.get("current_valid_ratio", stats.get("current_latest_valid_ratio"))
+                        ),
                         "history_rollout_valid_ratio": _safe_float(stats.get("in_rollout_history_valid_ratio")),
                         "nearby_valid_ratio": _safe_float(stats.get("nearby_valid_ratio")),
-                        "current_num_refs": _safe_float(stats.get("current_num_refs")),
+                        "current_num_refs": _safe_float(stats.get("current_num_refs", stats.get("current_latest_num_refs"))),
                         "history_rollout_num_refs": _safe_float(stats.get("history_rollout_num_refs")),
                         "nearby_num_refs": _safe_float(stats.get("nearby_num_refs")),
+                        "carry_scene_state_after_rollout": bool(carry_after),
+                        "episode_end_after_rollout": bool(episode_end),
                     }
                     rows.append(row)
                     if metrics_fh is not None:
@@ -361,10 +403,16 @@ def _write_iforward_validation_rows(
                                 rollout_idx=int(rollout_idx),
                                 max_images_per_role=int(val_cfg["tensorboard_images_max_per_role"]),
                             )
-                    if callable(reset_bridge):
-                        reset_bridge()
-                    if hasattr(model, "reset_iforward_state_cache"):
-                        model.reset_iforward_state_cache()
+                    if bool(carry_after) and not bool(episode_end):
+                        next_state = getattr(out, "next_state", None)
+                        detach = getattr(next_state, "detach_for_next_rollout", None)
+                        carried_state = detach() if callable(detach) else next_state
+                    else:
+                        carried_state = None
+                        if callable(reset_bridge):
+                            reset_bridge()
+                        if hasattr(model, "reset_iforward_state_cache"):
+                            model.reset_iforward_state_cache()
     finally:
         if hasattr(model, "_state_cache"):
             model._state_cache = saved_cache

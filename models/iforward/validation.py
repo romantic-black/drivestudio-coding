@@ -26,6 +26,13 @@ DEFAULT_IFORWARD_V6_ABLATIONS = (
     "shuffle_context",
 )
 
+DEFAULT_IFORWARD_V3_ABLATIONS = (
+    "full",
+    "no_gru",
+    "no_history_gate",
+    "freeze_write",
+)
+
 
 def _finite_float(value: Any, default: float = float("nan")) -> float:
     try:
@@ -69,7 +76,12 @@ def validate_iforward_memory_ablation(
         raise ValueError("validate_iforward_memory_ablation requires non-empty rollout_batches.")
 
     if ablations is None:
-        ablations = DEFAULT_IFORWARD_V6_ABLATIONS if bool(getattr(model, "is_v6_point_mamba_xcpe", False)) else DEFAULT_IFORWARD_ABLATIONS
+        if bool(getattr(model, "is_v3_gru_history_gate", False)):
+            ablations = DEFAULT_IFORWARD_V3_ABLATIONS
+        elif bool(getattr(model, "is_v6_point_mamba_xcpe", False)):
+            ablations = DEFAULT_IFORWARD_V6_ABLATIONS
+        else:
+            ablations = DEFAULT_IFORWARD_ABLATIONS
 
     rows: List[Dict[str, Any]] = []
     for mode in [str(x) for x in list(ablations)]:
@@ -119,4 +131,9 @@ def validate_iforward_memory_ablation(
     return rows
 
 
-__all__ = ["DEFAULT_IFORWARD_ABLATIONS", "DEFAULT_IFORWARD_V6_ABLATIONS", "validate_iforward_memory_ablation"]
+__all__ = [
+    "DEFAULT_IFORWARD_ABLATIONS",
+    "DEFAULT_IFORWARD_V3_ABLATIONS",
+    "DEFAULT_IFORWARD_V6_ABLATIONS",
+    "validate_iforward_memory_ablation",
+]

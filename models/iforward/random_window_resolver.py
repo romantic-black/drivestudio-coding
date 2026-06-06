@@ -15,6 +15,7 @@ from .resolver import (
     _ref_key,
     _ref_list,
     _require_order_matches,
+    _resolve_step_block_clock,
     _tensor_ref_list,
 )
 
@@ -106,6 +107,17 @@ class IForwardRandomWindowBatchResolver(IForwardBatchResolver):
                 raise ValueError("IForward random-window commit_observation_memory must be true only on repeat_idx=0.")
             if not bool(step.get("update_optimizer_memory", True)):
                 raise ValueError("IForward random-window update_optimizer_memory must be true for every repeat.")
+            rollout_block_rank = int(step.get("block_pos_in_window", step.get("rollout_block_rank", 0)))
+            next_step = dict(steps_raw[k + 1]) if k + 1 < len(steps_raw) and isinstance(steps_raw[k + 1], Mapping) else None
+            block_clock = _resolve_step_block_clock(
+                step=step,
+                next_step=next_step,
+                ifwd=ifwd,
+                request_meta=request_meta,
+                repeat_idx=int(repeat_idx),
+                rollout_block_rank=int(rollout_block_rank),
+                source_frame_idx=int(source_frame_idx),
+            )
             source_indices = []
             for ref in refs:
                 if tuple(ref) not in source_ref_to_index:
@@ -116,7 +128,7 @@ class IForwardRandomWindowBatchResolver(IForwardBatchResolver):
                     step_idx=int(step_idx),
                     source_frame_idx=int(source_frame_idx),
                     repeat_idx=int(repeat_idx),
-                    rollout_block_rank=int(step.get("block_pos_in_window", step.get("rollout_block_rank", 0))),
+                    rollout_block_rank=int(rollout_block_rank),
                     source_indices=tuple(source_indices),
                     evidence_refs=refs,
                     commit_observation_memory=bool(commit),
@@ -124,6 +136,15 @@ class IForwardRandomWindowBatchResolver(IForwardBatchResolver):
                     rollout_pos_code=float(step.get("rollout_pos_code", 0.0)),
                     frame_pos_code=float(step.get("frame_pos_code", 0.0)),
                     repeat_pos_code=float(step.get("repeat_pos_code", 0.0)),
+                    block_id=int(block_clock["block_id"]),
+                    episode_block_idx=int(block_clock["episode_block_idx"]),
+                    repeats_per_block=int(block_clock["repeats_per_block"]),
+                    is_block_enter=bool(block_clock["is_block_enter"]),
+                    is_block_exit=bool(block_clock["is_block_exit"]),
+                    is_frame_exit=bool(block_clock["is_block_exit"]),
+                    record_update_norm=bool(step.get("record_update_norm", True)),
+                    commit_support_on_exit=bool(step.get("commit_support_on_exit", block_clock["is_block_exit"])),
+                    commit_residual_on_exit=bool(step.get("commit_residual_on_exit", block_clock["is_block_exit"])),
                 )
             )
 

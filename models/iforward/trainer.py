@@ -78,6 +78,12 @@ class IForwardTrainer(nn.Module):
         iforward_cfg = cfg_get(cfg_get(self.config, "model", {}) or {}, "iforward", {}) or {}
         return str(cfg_get(iforward_cfg, "version", "")) == "v6_point_mamba_xcpe"
 
+    def _is_v3_gru_history_gate(self) -> bool:
+        if bool(getattr(self.model, "is_v3_gru_history_gate", False)):
+            return True
+        iforward_cfg = cfg_get(cfg_get(self.config, "model", {}) or {}, "iforward", {}) or {}
+        return str(cfg_get(iforward_cfg, "version", "")) == "v3_gru_history_gate"
+
     def _measurement_frontend_params(self) -> Dict[str, List[Tuple[str, nn.Parameter]]]:
         runtime = self._phase_a_runtime()
         if runtime is None:
@@ -132,7 +138,15 @@ class IForwardTrainer(nn.Module):
             if id(param) not in adapter_ids
         ]
         struct_decoder = self._stage6_struct_decoder()
-        if self._is_v6_point_mamba_xcpe():
+        if self._is_v3_gru_history_gate():
+            groups = {
+                "point_gru": self._named_params(getattr(self.model, "point_gru", None), "point_gru"),
+                "history_gate": self._named_params(getattr(self.model, "history_gate", None), "history_gate"),
+                "vsm_ctx_adapter": adapter_named,
+                "stage6_posterior_updater_base": updater_base,
+                "stage6_struct_decoder": self._named_params(struct_decoder, "stage6_struct_event_decoder"),
+            }
+        elif self._is_v6_point_mamba_xcpe():
             groups: Dict[str, List[Tuple[str, nn.Parameter]]] = {
                 "point_mamba": self._named_params(getattr(self.model, "point_mamba", None), "point_mamba"),
                 "local_conflict_xcpe": self._named_params(getattr(self.model, "local_conflict", None), "local_conflict"),
@@ -193,6 +207,8 @@ class IForwardTrainer(nn.Module):
         fallback = float(cfg_get(lr_cfg, "default", default_lr))
         defaults = {
             "memory": fallback,
+            "point_gru": float(cfg_get(lr_cfg, "point_gru", cfg_get(lr_cfg, "memory", fallback))),
+            "history_gate": float(cfg_get(lr_cfg, "history_gate", fallback)),
             "point_mamba": float(cfg_get(lr_cfg, "point_mamba", cfg_get(lr_cfg, "memory", fallback))),
             "local_conflict_xcpe": float(cfg_get(lr_cfg, "local_conflict_xcpe", fallback)),
             "context_adapter": float(cfg_get(lr_cfg, "context_adapter", fallback)),
@@ -233,7 +249,16 @@ class IForwardTrainer(nn.Module):
         train_measurement = bool(cfg_get(trainability, "train_measurement_frontend", False))
 
         self._set_all_model_requires_grad(False)
-        if self._is_v6_point_mamba_xcpe():
+        if self._is_v3_gru_history_gate():
+            self._set_group_requires_grad(
+                "point_gru",
+                bool(cfg_get(trainability, "train_point_gru", cfg_get(trainability, "train_memory", True))),
+            )
+            self._set_group_requires_grad(
+                "history_gate",
+                bool(cfg_get(trainability, "train_history_gate", True)),
+            )
+        elif self._is_v6_point_mamba_xcpe():
             self._set_group_requires_grad(
                 "point_mamba",
                 bool(cfg_get(trainability, "train_point_mamba", cfg_get(trainability, "train_memory", True))),
@@ -387,7 +412,7 @@ class IForwardTrainer(nn.Module):
 
     def _random_window_revisit_metrics(self, out: IForwardRolloutOutput) -> Dict[str, float]:
         resolved = out.resolved
-        if str(resolved.scheduler_version) != "random_window_v1" or int(resolved.window_hash) < 0:
+        if str(resolved.scheduler_version) not in {"random_window_v1", "iforward_v3_random_window"} or int(resolved.window_hash) < 0:
             return {}
         key = (
             int(resolved.scene_id),
@@ -396,8 +421,8 @@ class IForwardTrainer(nn.Module):
             int(resolved.window_hash),
         )
         current = {
-            "current": self._finite_metric(out.stats.get("current_latest_psnr")),
-            "history": self._finite_metric(out.stats.get("in_rollout_history_psnr")),
+            "current": self._finite_metric(out.stats.get("current_psnr", out.stats.get("current_latest_psnr"))),
+            "history": self._finite_metric(out.stats.get("history_psnr", out.stats.get("in_rollout_history_psnr"))),
             "nearby": self._finite_metric(out.stats.get("nearby_psnr")),
         }
         previous = self._random_window_metric_cache.get(key)

@@ -2,7 +2,7 @@
 
 版本：v3_gru_history_gate  
 目标：在当前 IForward / Stage6 事件骨架上，恢复类似 StreetForward 5_4 的 block-level history gate 稳定性，并用 TimeAwarePointGRU 替换当前 tiny point-Mamba 作为轻量 optimizer memory。  
-范围：只实现 **TimeAwarePointGRU + EMA history gate**。不引入新 ledger，不引入 memory-xCPE，不引入 Mamba，不重做长序列 scheduler。
+范围：只实现 **TimeAwarePointGRU + EMA history gate**。不引入新 ledger，不引入 memory-xCPE，不引入 Mamba，不把 random-window / revisit 放进 v3 主线。
 
 ---
 
@@ -37,7 +37,8 @@ block_exit: support EMA + residual EMA detach 更新
 3. **只有 update_norm 是 repeat 内更新。** 因为它描述真实写回幅度，会直接影响当前 block 后续 repeat 的保护强度。
 4. **history gate 必须放在最终写回前。** 它不是 posterior 内部 noop gate，也不是 GRU 的隐式能力。
 5. **GRU 是 optimizer memory，不是 history memory。** EMA history 仍然是 gate 的主要稳定来源。
-6. **v3 不考虑 Mamba / memory-xCPE / new ledger / long scheduler。** 先恢复可解释、可验证的稳定机制。
+6. **v3 不考虑 Mamba / memory-xCPE / new ledger / random-window 主线。** 先恢复可解释、可验证的稳定机制。
+7. **只要 LocalGS / GRU / EMA state 跨 rollout carry，scheduler 必须是 chronological next_contiguous。** `random_start_contiguous + carried state` 会破坏 block-clocked history 语义。
 
 ---
 
@@ -113,10 +114,10 @@ for step in resolved.steps:
         measurement=measurement,
     )
 
-    is_block_exit = step.is_block_exit or inferred_next_frame_changes
+    is_block_enter = bool(step.is_block_enter)
+    is_block_exit = bool(step.is_block_exit)
 
-    if step.commit_observation_memory:
-        # repeat_idx == 0 only
+    if is_block_enter:
         history_ema.record_block_support_snapshot(event=event)
 
     ctx_gru, gru_prepared, gru_aux = point_gru.read(
@@ -247,7 +248,29 @@ segment
         repeat    # 当前 block 内的 inner iteration
 ```
 
-### 3.2 StepPlan 必要字段
+### 3.2 Scheduler hard rule
+
+v3 mainline 是 block-clocked、chronological、stateful scheduler：
+
+```text
+episode:
+  block0 -> block1 -> block2 -> ...
+```
+
+当 `memory.carry_policy=across_rollouts_until_episode_end` 时必须满足：
+
+```text
+rollout.block_selection_policy = next_contiguous
+rollout.delivery_order_policy  = chronological
+```
+
+`random_start_contiguous` 只允许在 state reset per window 或单 rollout episode 下作为未来 ablation 使用。v3 主线禁止：
+
+```text
+random_start_contiguous + carried LocalGS / GRU / EMA state
+```
+
+### 3.3 StepPlan 必要字段
 
 当前 `IForwardResolvedStep` 已经有：
 
@@ -265,26 +288,36 @@ frame_pos_code
 repeat_pos_code
 ```
 
-v3 建议增加或在 resolver 内显式推导：
+v3 必须由 scheduler 输出并由 resolver 保留：
 
 ```python
+block_id: int
+episode_block_idx: int
+rollout_block_rank: int
+repeat_idx: int
+repeats_per_block: int
 is_block_enter: bool       # repeat_idx == 0
-is_block_exit: bool        # 当前 step 后 source_frame 变化，或 repeat_idx == repeats_per_block - 1
-block_id: int              # 等价 rollout_block_rank / episode_block_idx
-record_history_on_exit: bool
+is_block_exit: bool        # repeat_idx == repeats_per_block - 1
 ```
 
-P0 可以不改 dataclass，直接在 `forward_rollout()` 中推导：
+构建规则：
 
 ```python
-next_step = resolved.steps[step_pos + 1] if step_pos + 1 < len(resolved.steps) else None
-is_block_exit = next_step is None or int(next_step.source_frame_idx) != int(step.source_frame_idx)
 is_block_enter = int(step.repeat_idx) == 0
+is_block_exit = int(step.repeat_idx) == int(step.repeats_per_block) - 1
 ```
 
-但最终建议把 `is_block_exit` 写入 scheduler / resolver，避免 random-window、variable-repeat、revisit 之后语义变暗。
+`source_frame_idx` 变化只能作为 legacy batch compatibility fallback，不能作为 v3 block boundary 主判据。fallback 优先级：
 
-### 3.3 v3 调度规则
+```text
+explicit is_block_exit
+  -> block_id / episode_block_idx changes
+  -> source_frame_idx changes
+```
+
+这样同一个 `source_frame_idx` 的不同 block visit 不会被误合并。
+
+### 3.4 v3 调度规则
 
 ```text
 commit_observation_memory = True  only repeat_idx == 0
@@ -296,7 +329,7 @@ commit_support_ema        = True  only block_exit
 commit_residual_ema       = True  only block_exit
 ```
 
-### 3.4 与 5_4 的关系
+### 3.5 与 5_4 的关系
 
 v3 的 history clock 更接近 5_4：
 
@@ -429,8 +462,9 @@ class IForwardHistoryBranchEMA:
     initialized: torch.Tensor        # [N,1]
 
     # pending block support, not committed until block_exit
-    block_support_sum: torch.Tensor  # [N,1]
-    block_support_count: torch.Tensor# [N,1]
+    block_support_sum: torch.Tensor    # [N,1]
+    block_present_count: torch.Tensor  # [N,1]
+    block_visible_count: torch.Tensor  # [N,1]
 
 @dataclass
 class IForwardHistoryEMAState:
@@ -648,38 +682,47 @@ P0 不在 repeat1..K 中更新 support。
 ```python
 def record_block_support_snapshot(event):
     support = log1p(event.support.detach()).reshape(N, 1)
-    pending_sum = support
-    pending_count = valid_count
+    present = active_rows
+    visible = valid & (support > support_min)
+    block_support_sum += support
+    block_present_count += present
+    block_visible_count += visible
 ```
 
 commit：
 
 ```python
-support_cur = block_support_sum / block_support_count.clamp_min(1)
-visible = support_cur > support_min
+has_present = block_present_count > 0
+support_cur = block_support_sum / block_present_count.clamp_min(1)
+visible = has_present & (block_visible_count > 0) & (support_cur > support_min)
+invisible = has_present & ~visible
 
 support_fast = where(
     visible,
     beta_fast_visible * support_fast + (1 - beta_fast_visible) * support_cur,
-    beta_fast_invisible * support_fast + (1 - beta_fast_invisible) * support_cur,
+    where(invisible, beta_fast_invisible * support_fast, support_fast),
 )
 
 support_slow = where(
     visible,
     beta_slow_visible * support_slow + (1 - beta_slow_visible) * support_cur,
-    beta_slow_invisible * support_slow + (1 - beta_slow_invisible) * support_cur,
+    where(invisible, beta_slow_invisible * support_slow, support_slow),
 )
 
 initialized = max(initialized, visible)
 ```
 
+也就是说：present + visible rows 写入当前 support；present 但 invisible rows 按 invisible beta 衰减旧 support；not-present rows 不变。否则 invisible beta 永远不会真正生效。
+
 Rigid support snapshot 必须 scatter 到 full rigid rows：
 
 ```python
 support_full = zeros([num_rigid, 1])
-count_full = zeros([num_rigid, 1])
-support_full[event.route.S] = log1p(event.support_rigid)
-count_full[event.route.S] = valid_count
+present_full = zeros([num_rigid, 1])
+visible_full = zeros([num_rigid, 1])
+support_full.index_add_(0, event.route.S, log1p(event.support_rigid))
+present_full.index_add_(0, event.route.S, ones_like(event.support_rigid))
+visible_full.index_add_(0, event.route.S, valid_rigid.float())
 ```
 
 ### 6.3 residual EMA
@@ -1155,6 +1198,26 @@ configs/iforward/iforward_v3_gru_history_gate.yaml
 ```yaml
 output_name: iforward_v3_gru_history_gate
 
+scheduler_iforward:
+  enable: true
+  episode:
+    blocks_per_episode: 1
+    episode_stride: 1
+    min_blocks_per_episode: 1
+    block_source_frame_policy: random_within_keyframe_once_per_episode
+    reset_scene_state_policy: episode_begin
+  rollout:
+    block_selection_policy: next_contiguous
+    delivery_order_policy: chronological
+    min_blocks_per_rollout: 1
+    allow_short_final_rollout: false
+    detach_graph_after_rollout: true
+    shapes:
+      - {name: b1_r4, blocks_per_rollout: 1, repeats_per_block: 4, prob: 1.0}
+  memory:
+    reset_policy: episode_begin
+    carry_policy: across_rollouts_until_episode_end
+
 model:
   stage: "6_0"
   phase: "phase_A_block_local_unroll"
@@ -1267,8 +1330,18 @@ v3 使用同一 forward graph，不再区分单帧 A 结构和短序列 B 结构
 ### 12.1 Phase 1：单帧能力
 
 ```yaml
-blocks_per_rollout: 1
-repeats_per_block: 4-8
+scheduler_iforward:
+  episode:
+    blocks_per_episode: 1
+    episode_stride: 1
+  rollout:
+    block_selection_policy: next_contiguous
+    delivery_order_policy: chronological
+    min_blocks_per_rollout: 1
+    shapes:
+      - {name: b1_r4, blocks_per_rollout: 1, repeats_per_block: 4, prob: 1.0}
+  memory:
+    carry_policy: across_rollouts_until_episode_end
 ```
 
 loss：
@@ -1324,17 +1397,25 @@ update_norm_fast 是否在同一 block 内抑制连续大写回
 当前帧是否因为 gate 过强而无法优化
 ```
 
-### 12.3 Phase 3：revisit / random window
+### 12.3 Phase 3：稍长 chronological episode
 
-v3 先沿用现有 random-window scheduler。
+v3 mainline 继续保持 chronological block serial，只增加 episode / rollout 长度：
 
-不要先上更复杂 scheduler。只需要确保：
-
-```text
-block_exit residual/support 记录正确
-state carry across rollout 正确
-history_ema detach_for_next_rollout 正确
+```yaml
+scheduler_iforward:
+  episode:
+    blocks_per_episode: 8
+    episode_stride: 8
+  rollout:
+    block_selection_policy: next_contiguous
+    delivery_order_policy: chronological
+    min_blocks_per_rollout: 4
+    shapes:
+      - {name: b4_r2, blocks_per_rollout: 4, repeats_per_block: 2, prob: 0.7}
+      - {name: b4_r1, blocks_per_rollout: 4, repeats_per_block: 1, prob: 0.3}
 ```
+
+`random-window / revisit` 是 future ablation，不进入 v3 carried-state training path。未来如果启用，必须先引入显式 revisit semantics，并明确 LocalGS / GRU / EMA state 是否 reset、probe-only，或以特殊 revisit mode 更新。
 
 ---
 

@@ -53,7 +53,7 @@ data:
     lidar_downsample_factor: 1
     lidar_percentile: 0.02
   assets:
-    root: "/root/autodl-tmp/streetforward_assets_pt20w_15w"
+    root: "/root/autodl-tmp/streetforward_assets_pt30w_20w"
 
 dataset:
   num_source_keyframes: 1
@@ -87,8 +87,8 @@ dataset:
       min_scale: 0.25
       max_scale: 3.0
       min_points_per_instance: 512
-    near_max_points: 200000
-    distant_max_points: 150000
+    near_max_points: 300000
+    distant_max_points: 200000
     static_instance_motion:
       enable: true
       traj_length_thresh_m: 0.5

@@ -61,6 +61,16 @@ class _V6Model(nn.Module):
         self.phase_a_runtime = _Runtime()
 
 
+class _V3Model(nn.Module):
+    is_v3_gru_history_gate = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.point_gru = nn.Linear(2, 2)
+        self.history_gate = nn.Linear(2, 2)
+        self.phase_a_runtime = _Runtime()
+
+
 def _cfg() -> dict:
     return {
         "model": {
@@ -109,6 +119,24 @@ def _v6_cfg() -> dict:
             "point_mamba": 1.1e-4,
             "local_conflict_xcpe": 1.2e-4,
             "context_adapter": 1.3e-4,
+        }
+    )
+    return cfg
+
+
+def _v3_cfg() -> dict:
+    cfg = _cfg()
+    cfg["model"]["iforward"]["version"] = "v3_gru_history_gate"
+    cfg["model"]["iforward"]["trainability"].update(
+        {
+            "train_point_gru": True,
+            "train_history_gate": True,
+        }
+    )
+    cfg["optimizer"]["lr"].update(
+        {
+            "point_gru": 1.4e-4,
+            "history_gate": 1.5e-4,
         }
     )
     return cfg
@@ -170,3 +198,24 @@ def test_iforward_v6_optimizer_groups_use_point_xcpe_context_groups() -> None:
     assert any(p.requires_grad for p in _group(trainer, "point_mamba")["params"])
     assert any(p.requires_grad for p in _group(trainer, "local_conflict_xcpe")["params"])
     assert any(p.requires_grad for p in _group(trainer, "context_adapter")["params"])
+
+
+def test_iforward_v3_optimizer_groups_use_gru_history_gate_groups() -> None:
+    trainer = IForwardTrainer(config=_v3_cfg(), device=torch.device("cpu"), model=_V3Model())
+
+    names = {str(group.get("name")) for group in trainer.optimizer.param_groups}
+    assert names == {
+        "point_gru",
+        "history_gate",
+        "vsm_ctx_adapter",
+        "stage6_posterior_updater_base",
+        "stage6_struct_decoder",
+        "stage6_measurement_frontend_residual_unet",
+        "stage6_measurement_frontend_fusion_neck",
+    }
+
+    trainer._apply_trainability_schedule(0)
+    assert _group(trainer, "point_gru")["lr"] == 1.4e-4
+    assert _group(trainer, "history_gate")["lr"] == 1.5e-4
+    assert any(p.requires_grad for p in _group(trainer, "point_gru")["params"])
+    assert any(p.requires_grad for p in _group(trainer, "history_gate")["params"])

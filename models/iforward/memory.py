@@ -33,6 +33,9 @@ class IForwardMemoryStepContext:
     rollout_pos_code: float
     global_step: int = 0
     is_frame_exit: bool = False
+    episode_visit_idx: int = -1
+    rollout_visit_idx: int = -1
+    optimizer_step_idx_in_episode: int = -1
 
 
 def _empty_keyed_from_cell(cell: StreamingMambaCell, *, device: torch.device, dtype: torch.dtype) -> KeyedMambaState:

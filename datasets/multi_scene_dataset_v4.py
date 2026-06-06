@@ -2466,8 +2466,12 @@ class MultiSceneDatasetV4:
         plan: Any,
         include_test: bool = False,
     ) -> Dict[str, Any]:
-        if str(getattr(plan, "scheduler_version", "")) != "iforward_v1":
-            raise ValueError("expected IForwardRolloutPlan.scheduler_version == 'iforward_v1'")
+        plan_scheduler_version = str(getattr(plan, "scheduler_version", ""))
+        if plan_scheduler_version not in {"iforward_v1", "iforward_v3_random_window"}:
+            raise ValueError(
+                "expected IForwardRolloutPlan.scheduler_version == 'iforward_v1' "
+                "or 'iforward_v3_random_window'"
+            )
         if int(scene_id) != int(getattr(plan, "scene_id")) or int(segment_id) != int(getattr(plan, "segment_id")):
             raise ValueError(
                 "IForward request scene/segment mismatch: "
@@ -2576,13 +2580,14 @@ class MultiSceneDatasetV4:
             )
 
         iforward_meta = {
-            "scheduler_version": "iforward_v1",
+            "scheduler_version": plan_scheduler_version,
             "model_family": "IForward",
             "scene_id": int(getattr(plan, "scene_id")),
             "segment_id": int(getattr(plan, "segment_id")),
             "episode_id": int(getattr(plan, "episode_id")),
             "rollout_id_global": int(getattr(plan, "rollout_id_global")),
             "rollout_idx_in_episode": int(getattr(plan, "rollout_idx_in_episode")),
+            "rollouts_per_episode": int(getattr(plan, "rollouts_per_episode", 1)),
             "inner_K": int(getattr(plan, "inner_K")),
             "shape_name": str(getattr(plan, "shape_name")),
             "requested_blocks_per_rollout": int(getattr(plan, "requested_blocks_per_rollout")),
@@ -2595,6 +2600,17 @@ class MultiSceneDatasetV4:
             "input_frame_indices": [int(x) for x in list(getattr(plan, "input_frame_indices", []) or [])],
             "input_keyframe_indices": [int(x) for x in list(getattr(plan, "input_keyframe_indices", []) or [])],
             "delivery_frame_indices": [int(x) for x in list(getattr(plan, "delivery_frame_indices", []) or [])],
+            "episode_num_blocks": int(getattr(plan, "episode_num_blocks", len(getattr(plan, "keyframe_window", []) or []))),
+            "window_policy": str(getattr(plan, "window_policy", "")),
+            "window_start": int(getattr(plan, "window_start", -1)),
+            "window_end": int(getattr(plan, "window_end", -1)),
+            "window_block_ids": [int(x) for x in list(getattr(plan, "window_block_ids", []) or [])],
+            "window_keyframe_indices": [int(x) for x in list(getattr(plan, "window_keyframe_indices", []) or [])],
+            "window_frame_indices": [int(x) for x in list(getattr(plan, "window_frame_indices", []) or [])],
+            "window_hash": int(getattr(plan, "window_hash", -1)),
+            "window_revisit_count": int(getattr(plan, "window_revisit_count", 0)),
+            "unique_windows_seen": int(getattr(plan, "unique_windows_seen", 0)),
+            "is_repeated_window": bool(getattr(plan, "is_repeated_window", False)),
             "evidence_refs_flat": [tuple(x) for x in evidence_refs],
             "target_refs_flat": [tuple(x) for x in target_refs],
             "target_roles_flat": [str(x) for x in target_roles],
@@ -2618,7 +2634,7 @@ class MultiSceneDatasetV4:
 
         request_meta = dict(batch.get("request_meta") or {})
         request_meta.update(dict(getattr(plan, "request_meta", {}) or {}))
-        request_meta["scheduler_version"] = "iforward_v1"
+        request_meta["scheduler_version"] = plan_scheduler_version
         request_meta["model_family"] = "IForward"
         request_meta["scene_id"] = int(getattr(plan, "scene_id"))
         request_meta["segment_id"] = int(getattr(plan, "segment_id"))

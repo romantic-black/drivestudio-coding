@@ -343,6 +343,7 @@ class IForwardState:
     scene_id: int
     segment_id: int
     episode_id: int
+    history_ema: Optional[Any] = None
     node_state_bg: Optional[NodeStateBackground] = None
     node_state_distant: Optional[NodeStateDistant] = None
     node_state_rigid: Optional[NodeStateRigid] = None
@@ -359,6 +360,7 @@ class IForwardState:
             scene_id=int(self.scene_id),
             segment_id=int(self.segment_id),
             episode_id=int(self.episode_id),
+            history_ema=None if self.history_ema is None else self.history_ema.detach(),
             node_state_bg=None,
             node_state_distant=None,
             node_state_rigid=None,

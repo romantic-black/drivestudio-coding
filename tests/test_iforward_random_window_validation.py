@@ -11,6 +11,7 @@ from datasets.iforward_random_window_validation import (
     fixed_random_window_starts,
     write_random_window_validation_rows,
 )
+from tools import train_iforward as train_ifwd
 
 
 class _FakeValidationDataset:
@@ -65,6 +66,18 @@ class _FakeValidationDataset:
             "targets": [{"frame_idx": int(f), "cam_idx": int(c), "gt_image": torch.zeros(1, 1, 3)} for f, c in target_refs],
         }
 
+    def _assemble_segment_batch_from_iforward_request(self, *, scene_id, segment_id, plan, include_test=False):
+        _ = include_test
+        target_refs = list(plan.target_refs_flat)
+        return {
+            "scene_id": int(scene_id),
+            "segment_id": int(segment_id),
+            "request_meta": dict(plan.request_meta),
+            "_iforward": dataclasses.asdict(plan),
+            "target": {"image": torch.zeros(len(target_refs), 1, 1, 3)},
+            "targets": [{"frame_idx": int(f), "cam_idx": int(c), "gt_image": torch.zeros(1, 1, 3)} for f, c in target_refs],
+        }
+
 
 class _FakeCarriedState:
     def __init__(self, rollout_idx: int):
@@ -77,8 +90,13 @@ class _FakeCarriedState:
 class _FakeValidationOutput:
     def __init__(self, *, rollout_idx: int, ifwd):
         value = float(10 + int(rollout_idx))
+        final_supervision = dict(ifwd.get("final_supervision", {}) or {})
+        history_count = int(final_supervision.get("history_ref_count", len(ifwd.get("in_rollout_history_refs", []) or [])))
+        history_psnr = value + 1.0 if history_count > 0 else float("nan")
+        history_valid = 1.0 if history_count > 0 else 0.0
         self.loss = torch.tensor(1.0)
         self.losses = {
+            "current": torch.tensor(1.0),
             "current_latest": torch.tensor(1.0),
             "in_rollout_history": torch.tensor(2.0),
             "short_window_history": torch.tensor(3.0),
@@ -88,13 +106,24 @@ class _FakeValidationOutput:
             "window_start": int(ifwd["window_start"]),
             "window_hash": int(ifwd["window_hash"]),
             "is_repeated_window": bool(ifwd["is_repeated_window"]),
+            "current_psnr": value,
             "current_latest_psnr": value,
-            "in_rollout_history_psnr": value + 1.0,
+            "history_rollout_psnr": history_psnr,
+            "in_rollout_history_psnr": history_psnr,
             "short_window_history_psnr": value + 2.0,
             "nearby_psnr": value + 3.0,
+            "current_valid_ratio": 1.0,
+            "current_num_refs": float(final_supervision.get("current_ref_count", 0)) if final_supervision else 0.0,
+            "in_rollout_history_valid_ratio": history_valid,
+            "history_rollout_num_refs": float(history_count),
+            "nearby_valid_ratio": 1.0,
+            "nearby_num_refs": float(final_supervision.get("nearby_ref_count", 0)) if final_supervision else 0.0,
         }
         self.next_state = _FakeCarriedState(int(rollout_idx))
-        self.resolved = SimpleNamespace(carry_scene_state_after_rollout=bool(ifwd["carry_scene_state_after_rollout"]))
+        self.resolved = SimpleNamespace(
+            carry_scene_state_after_rollout=bool(ifwd["carry_scene_state_after_rollout"]),
+            episode_end_after_rollout=bool(ifwd.get("episode_end_after_rollout", False)),
+        )
         self.pred_rgbs = []
         self.gt_images = []
         self.image_refs = []
@@ -152,6 +181,56 @@ def _cfg():
     }
 
 
+def _cfg_v3():
+    return {
+        "data": {"eval_scene_ids": [1]},
+        "scheduler_iforward": {
+            "version": "iforward_v3_random_window",
+            "traversal": {"seed": 41},
+            "episode": {"rollouts_per_episode": 8},
+            "rollout": {
+                "window_policy": "random_with_replacement",
+                "delivery_order": "chronological_inside_window",
+                "detach_graph_after_rollout": True,
+            },
+            "evidence": {"camera_policy": "all_cams", "mask_policy": "non_sky_non_egocar"},
+            "supervision": {
+                "current": {
+                    "enable": True,
+                    "role_name": "final_current_recon",
+                    "frame_policy": "all_rollout_input_frames",
+                    "camera_policy": "all_cams",
+                },
+                "history_replay": {
+                    "enable": True,
+                    "role_name": "final_history_replay",
+                    "camera_policy": "all_cams",
+                    "max_frames_per_rollout": 8,
+                },
+                "nearby": {
+                    "enable": True,
+                    "role_name": "final_nearby_rollout",
+                    "frames_per_rollout": 1,
+                    "camera_policy": "all_cams",
+                    "max_refs_per_rollout": 3,
+                },
+            },
+            "memory": {
+                "observation_commit_policy": "first_repeat_only",
+                "optimizer_memory_update_policy": "every_repeat",
+            },
+            "loss_timing": {"policy": "rollout_final_only", "intermediate_step_loss": False},
+            "leakage_check": {"enable": True, "forbid_test_refs_in_train": True},
+        },
+        "iforward_validation": {
+            "enable": True,
+            "segments_per_scene": 1,
+            "rollouts_per_segment": 3,
+            "tensorboard_images": {"enable": False, "max_images_per_role": 2},
+        },
+    }
+
+
 def test_fixed_random_window_starts_are_deterministic_and_allow_repeats():
     a = fixed_random_window_starts(num_blocks=4, rollouts=8, seed=20260604, scene_id=1, segment_id=0)
     b = fixed_random_window_starts(num_blocks=4, rollouts=8, seed=20260604, scene_id=1, segment_id=0)
@@ -187,3 +266,49 @@ def test_random_window_validation_carries_state_and_writes_revisit_aggregates():
     assert rollout_rows[1]["revisit_current_psnr_delta"] == pytest.approx(1.0)
     assert global_rows[0]["revisit_current_psnr_delta_mean"] == pytest.approx(1.0)
     assert global_rows[0]["final_rollout_current_latest_psnr"] == pytest.approx(17.0)
+
+
+def test_iforward_v3_validation_scheduler_uses_fixed_v3_history_shapes():
+    ds = _FakeValidationDataset(num_keyframes=8, num_cams=3)
+    scheduler = train_ifwd._make_validation_scheduler(_cfg_v3(), ds, 1, 0)
+
+    batches = [scheduler.next_batch()["_iforward"] for _ in range(3)]
+
+    assert [batch["shape_name"] for batch in batches] == ["r8b1", "r4b2", "r2b4"]
+    assert [batch["window_start"] for batch in batches] == [0, 2, 4]
+    assert [batch["final_supervision"]["history_ref_count"] for batch in batches] == [0, 3, 9]
+    for batch in batches[1:]:
+        history_refs = {tuple(ref) for ref in batch["final_supervision"]["history_refs"]}
+        history_frames = {int(ref[0]) for ref in history_refs}
+        assert len(history_refs) == len(history_frames) * ds.num_cams
+        for frame_idx in history_frames:
+            assert {(frame_idx, cam_idx) for cam_idx in range(ds.num_cams)} <= history_refs
+        assert history_refs.isdisjoint({tuple(ref) for ref in batch["final_supervision"]["current_refs"]})
+
+
+def test_iforward_v3_validation_carries_state_and_reports_history(monkeypatch):
+    rows = []
+    model = _FakeValidationModel()
+    monkeypatch.setattr(train_ifwd.base, "convert_batch_to_minimal_format", lambda raw, *args, **kwargs: raw)
+    monkeypatch.setattr(train_ifwd.base, "_write_metrics_history", lambda fh, row: fh.append(dict(row)))
+
+    train_ifwd._write_iforward_validation_rows(
+        cfg=_cfg_v3(),
+        dataset=_FakeValidationDataset(num_keyframes=8, num_cams=3),
+        model=model,
+        device=torch.device("cpu"),
+        trigger_step=100,
+        trigger_train_episode_counter=5,
+        metrics_fh=rows,
+        writer=None,
+    )
+
+    rollout_rows = [row for row in rows if row["split"] == "iforward_validation"]
+    global_rows = [row for row in rows if row["split"] == "iforward_validation_global"]
+    assert len(rollout_rows) == 3
+    assert len(global_rows) == 1
+    assert [row["rollout_shape"] for row in rollout_rows] == ["r8b1", "r4b2", "r2b4"]
+    assert model.carried_flags == [False, True, True]
+    assert [row["history_rollout_num_refs"] for row in rollout_rows] == [0.0, 3.0, 9.0]
+    assert rollout_rows[1]["history_rollout_psnr"] == pytest.approx(12.0)
+    assert global_rows[0]["history_rollout_psnr"] == pytest.approx(12.5)

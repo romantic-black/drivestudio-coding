@@ -43,8 +43,8 @@ def build_train_scheduler_iforward_from_cfg(
     if _cfg_get(sched, "enable", False) is not True:
         raise ValueError("scheduler_iforward.enable must be true")
     version = str(_cfg_get(sched, "version", "iforward_v1"))
-    if version != "iforward_v1":
-        raise ValueError("scheduler_iforward.version must be iforward_v1")
+    if version not in {"iforward_v1", "iforward_v3_random_window"}:
+        raise ValueError("scheduler_iforward.version must be iforward_v1 or iforward_v3_random_window")
 
     fixed_scene_id, fixed_segment_id = resolve_fixed_scene_segment_iforward(cfg)
     from tools.train_minimal_streetforward_stage4_3_v7_common import (

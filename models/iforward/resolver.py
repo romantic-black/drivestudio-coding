@@ -8,8 +8,10 @@ import torch
 ImageRef = Tuple[int, int]
 
 IFORWARD_SCHEDULER_VERSION = "iforward_v1"
+IFORWARD_V3_SCHEDULER_VERSION = "iforward_v3_random_window"
 IFORWARD_MODEL_FAMILY = "IForward"
 IFORWARD_CURRENT_ROLE = "final_current_recon"
+IFORWARD_HISTORY_ROLE = "final_history_replay"
 IFORWARD_NEARBY_ROLE = "final_nearby_rollout"
 
 
@@ -26,6 +28,22 @@ class IForwardResolvedStep:
     rollout_pos_code: float = 0.0
     frame_pos_code: float = 0.0
     repeat_pos_code: float = 0.0
+    block_id: int = -1
+    episode_block_idx: int = -1
+    repeats_per_block: int = 0
+    is_block_enter: bool = False
+    is_block_exit: bool = False
+    is_frame_exit: bool = False
+    episode_visit_idx: int = -1
+    rollout_visit_idx: int = -1
+    optimizer_step_idx_in_episode: int = -1
+    record_update_norm: bool = True
+    commit_support_on_exit: bool = False
+    commit_residual_on_exit: bool = False
+    window_hash: int = -1
+    window_revisit_count: int = 0
+    block_visit_count_before: int = 0
+    block_visit_count_after: int = 0
 
 
 @dataclass(frozen=True)
@@ -125,6 +143,76 @@ def _flat_refs(groups: Iterable[Iterable[ImageRef]]) -> List[ImageRef]:
     return [tuple(ref) for group in groups for ref in group]
 
 
+def _step_get_int(step: Mapping[str, Any], keys: Sequence[str], default: Optional[int] = None) -> Optional[int]:
+    for key in keys:
+        if key in step and step.get(key) is not None:
+            return int(step.get(key))
+    return None if default is None else int(default)
+
+
+def _step_get_bool(step: Mapping[str, Any], keys: Sequence[str]) -> Optional[bool]:
+    for key in keys:
+        if key in step and step.get(key) is not None:
+            return bool(step.get(key))
+    return None
+
+
+def _resolve_step_block_clock(
+    *,
+    step: Mapping[str, Any],
+    next_step: Optional[Mapping[str, Any]],
+    ifwd: Mapping[str, Any],
+    request_meta: Mapping[str, Any],
+    repeat_idx: int,
+    rollout_block_rank: int,
+    source_frame_idx: int,
+) -> Dict[str, Any]:
+    block_id = int(
+        _step_get_int(
+            step,
+            ("block_id", "episode_block_idx", "block_pos_in_window", "rollout_block_rank"),
+            default=int(rollout_block_rank),
+        )
+    )
+    episode_block_idx = int(_step_get_int(step, ("episode_block_idx", "block_id", "block_pos_in_window"), default=block_id))
+    repeats_raw = _step_get_int(step, ("repeats_per_block",), default=None)
+    if repeats_raw is None:
+        repeats_raw = _step_get_int(ifwd, ("repeats_per_block",), default=None)
+    if repeats_raw is None:
+        repeats_raw = _step_get_int(request_meta, ("repeats_per_block",), default=0)
+    repeats_per_block = int(max(int(repeats_raw or 0), 0))
+
+    enter = _step_get_bool(step, ("is_block_enter",))
+    is_block_enter = bool(int(repeat_idx) == 0) if enter is None else bool(enter)
+
+    exit_flag = _step_get_bool(step, ("is_block_exit", "is_frame_exit"))
+    if exit_flag is not None:
+        is_block_exit = bool(exit_flag)
+    elif repeats_per_block > 0:
+        is_block_exit = bool(int(repeat_idx) == int(repeats_per_block) - 1)
+    elif next_step is None:
+        is_block_exit = True
+    else:
+        next_block_id = _step_get_int(
+            next_step,
+            ("block_id", "episode_block_idx", "block_pos_in_window", "rollout_block_rank"),
+            default=None,
+        )
+        if next_block_id is not None:
+            is_block_exit = bool(int(next_block_id) != int(block_id))
+        else:
+            next_source_frame_idx = int(next_step.get("source_frame_idx", source_frame_idx))
+            is_block_exit = bool(int(next_source_frame_idx) != int(source_frame_idx))
+
+    return {
+        "block_id": int(block_id),
+        "episode_block_idx": int(episode_block_idx),
+        "repeats_per_block": int(repeats_per_block),
+        "is_block_enter": bool(is_block_enter),
+        "is_block_exit": bool(is_block_exit),
+    }
+
+
 class IForwardBatchResolver:
     """Resolve and validate the scheduler_iforward batch contract.
 
@@ -140,12 +228,14 @@ class IForwardBatchResolver:
         expected_model_family: str = IFORWARD_MODEL_FAMILY,
         expected_cams_per_step: Optional[int] = 3,
         current_role: str = IFORWARD_CURRENT_ROLE,
+        history_role: str = IFORWARD_HISTORY_ROLE,
         nearby_role: str = IFORWARD_NEARBY_ROLE,
     ) -> None:
         self.expected_scheduler_version = str(expected_scheduler_version)
         self.expected_model_family = str(expected_model_family)
         self.expected_cams_per_step = None if expected_cams_per_step is None else int(expected_cams_per_step)
         self.current_role = str(current_role)
+        self.history_role = str(history_role)
         self.nearby_role = str(nearby_role)
 
     @staticmethod
@@ -228,6 +318,7 @@ class IForwardBatchResolver:
             raise ValueError(
                 f"IForward requires scheduler_version={self.expected_scheduler_version!r}, got {scheduler_version!r}."
             )
+        is_v3 = scheduler_version == IFORWARD_V3_SCHEDULER_VERSION
         model_family = str(ifwd.get("model_family", request_meta.get("model_family", self.expected_model_family)))
         if model_family != self.expected_model_family:
             raise ValueError(f"IForward requires model_family={self.expected_model_family!r}, got {model_family!r}.")
@@ -284,6 +375,39 @@ class IForwardBatchResolver:
                 raise ValueError("IForward commit_observation_memory must be true only on repeat_idx=0.")
             if not bool(step.get("update_optimizer_memory", True)):
                 raise ValueError("IForward update_optimizer_memory must be true for every repeat.")
+            rollout_block_rank = int(step.get("rollout_block_rank", 0))
+            next_step = dict(steps_raw[k + 1]) if k + 1 < len(steps_raw) and isinstance(steps_raw[k + 1], Mapping) else None
+            block_clock = _resolve_step_block_clock(
+                step=step,
+                next_step=next_step,
+                ifwd=ifwd,
+                request_meta=request_meta,
+                repeat_idx=int(repeat_idx),
+                rollout_block_rank=int(rollout_block_rank),
+                source_frame_idx=int(source_frame_idx),
+            )
+            is_frame_exit = bool(step.get("is_frame_exit", block_clock["is_block_exit"]))
+            episode_visit_idx = int(step.get("episode_visit_idx", -1))
+            rollout_visit_idx = int(step.get("rollout_visit_idx", step.get("rollout_block_rank", rollout_block_rank)))
+            optimizer_step_idx = int(step.get("optimizer_step_idx_in_episode", -1))
+            if is_v3:
+                missing = [
+                    name
+                    for name in (
+                        "block_id",
+                        "episode_block_idx",
+                        "is_block_enter",
+                        "is_block_exit",
+                        "is_frame_exit",
+                        "episode_visit_idx",
+                        "optimizer_step_idx_in_episode",
+                    )
+                    if name not in step
+                ]
+                if missing:
+                    raise ValueError(f"IForward v3 step requires explicit fields: {missing}")
+                if episode_visit_idx < 0 or optimizer_step_idx < 0:
+                    raise ValueError("IForward v3 requires non-negative visit and optimizer clocks.")
             source_indices = self._resolve_source_indices(
                 step_idx=k,
                 step=step,
@@ -294,7 +418,7 @@ class IForwardBatchResolver:
                     step_idx=step_idx,
                     source_frame_idx=source_frame_idx,
                     repeat_idx=repeat_idx,
-                    rollout_block_rank=int(step.get("rollout_block_rank", 0)),
+                    rollout_block_rank=int(rollout_block_rank),
                     source_indices=tuple(source_indices),
                     evidence_refs=refs,
                     commit_observation_memory=commit,
@@ -302,6 +426,24 @@ class IForwardBatchResolver:
                     rollout_pos_code=float(step.get("rollout_pos_code", 0.0)),
                     frame_pos_code=float(step.get("frame_pos_code", 0.0)),
                     repeat_pos_code=float(step.get("repeat_pos_code", 0.0)),
+                    block_id=int(block_clock["block_id"]),
+                    episode_block_idx=int(block_clock["episode_block_idx"]),
+                    repeats_per_block=int(block_clock["repeats_per_block"]),
+                    is_block_enter=bool(block_clock["is_block_enter"]),
+                    is_block_exit=bool(block_clock["is_block_exit"]),
+                    is_frame_exit=bool(is_frame_exit),
+                    episode_visit_idx=int(episode_visit_idx),
+                    rollout_visit_idx=int(rollout_visit_idx),
+                    optimizer_step_idx_in_episode=int(optimizer_step_idx),
+                    record_update_norm=bool(step.get("record_update_norm", True)),
+                    commit_support_on_exit=bool(step.get("commit_support_on_exit", block_clock["is_block_exit"])),
+                    commit_residual_on_exit=bool(step.get("commit_residual_on_exit", block_clock["is_block_exit"])),
+                    window_hash=int(step.get("window_hash", ifwd.get("window_hash", request_meta.get("window_hash", -1)))),
+                    window_revisit_count=int(
+                        step.get("window_revisit_count", ifwd.get("window_revisit_count", request_meta.get("window_revisit_count", 0)))
+                    ),
+                    block_visit_count_before=int(step.get("block_visit_count_before", 0)),
+                    block_visit_count_after=int(step.get("block_visit_count_after", 0)),
                 )
             )
 
@@ -317,7 +459,13 @@ class IForwardBatchResolver:
 
         final_supervision = dict(ifwd.get("final_supervision") or {})
         input_frame_indices = tuple(
-            int(x) for x in list(ifwd.get("input_frame_indices") or final_supervision.get("current_input_frames") or [])
+            int(x)
+            for x in list(
+                ifwd.get("input_frame_indices")
+                or final_supervision.get("current_frames")
+                or final_supervision.get("current_input_frames")
+                or []
+            )
         )
         expected_input_frames = set(input_frame_indices)
         if expected_input_frames:
@@ -337,17 +485,25 @@ class IForwardBatchResolver:
         if not input_frame_indices:
             raise ValueError("IForward requires non-empty input_frame_indices.")
         latest_input_frame_idx = int(input_frame_indices[-1])
-        history_frames = set(int(x) for x in input_frame_indices[:-1])
-        current_latest_indices = tuple(
-            int(idx) for idx in current_indices if int(target_refs[int(idx)][0]) == latest_input_frame_idx
-        )
-        history_rollout_indices = tuple(
-            int(idx) for idx in current_indices if int(target_refs[int(idx)][0]) in history_frames
-        )
-        if not current_latest_indices:
-            raise ValueError(
-                f"IForward current supervision missing latest input frame {int(latest_input_frame_idx)}."
+        if is_v3:
+            history_rollout_indices = tuple(int(x) for x in target_indices_by_role.get(self.history_role, []))
+            current_latest_indices = tuple(int(x) for x in current_indices)
+            current_refs = {target_refs[int(idx)] for idx in current_indices}
+            history_refs = {target_refs[int(idx)] for idx in history_rollout_indices}
+            if current_refs & history_refs:
+                raise ValueError("IForward v3 history refs must be disjoint from current refs.")
+        else:
+            history_frames = set(int(x) for x in input_frame_indices[:-1])
+            current_latest_indices = tuple(
+                int(idx) for idx in current_indices if int(target_refs[int(idx)][0]) == latest_input_frame_idx
             )
+            history_rollout_indices = tuple(
+                int(idx) for idx in current_indices if int(target_refs[int(idx)][0]) in history_frames
+            )
+            if not current_latest_indices:
+                raise ValueError(
+                    f"IForward current supervision missing latest input frame {int(latest_input_frame_idx)}."
+                )
 
         keyed = dict(ifwd.get("source_ref_to_index_keyed") or {})
         for ref in source_refs:
@@ -381,4 +537,13 @@ class IForwardBatchResolver:
             carry_scene_state_after_rollout=bool(ifwd.get("carry_scene_state_after_rollout", True)),
             episode_end_after_rollout=bool(ifwd.get("episode_end_after_rollout", ifwd.get("discard_scene_state_after_rollout", False))),
             detach_graph_after_rollout=bool(ifwd.get("detach_graph_after_rollout", True)),
+            rollouts_per_episode=int(ifwd.get("rollouts_per_episode", request_meta.get("rollouts_per_episode", 1))),
+            window_start=int(ifwd.get("window_start", request_meta.get("window_start", -1))),
+            window_end=int(ifwd.get("window_end", request_meta.get("window_end", -1))),
+            window_block_ids=tuple(int(x) for x in list(ifwd.get("window_block_ids", request_meta.get("window_block_ids", [])) or [])),
+            window_hash=int(ifwd.get("window_hash", request_meta.get("window_hash", -1))),
+            window_revisit_count=int(ifwd.get("window_revisit_count", request_meta.get("window_revisit_count", 0))),
+            unique_windows_seen=int(ifwd.get("unique_windows_seen", request_meta.get("unique_windows_seen", 0))),
+            is_repeated_window=bool(ifwd.get("is_repeated_window", request_meta.get("is_repeated_window", False))),
+            history_commit_target_indices=tuple(() if is_v3 else current_indices),
         )

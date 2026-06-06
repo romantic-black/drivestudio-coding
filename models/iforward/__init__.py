@@ -4,8 +4,10 @@ from .mamba import StreamingMambaCell, StreamingMambaCellState
 from .iforward_v6_state import IForwardV6BranchPointState, IForwardV6MemoryState
 from .resolver import (
     IFORWARD_CURRENT_ROLE,
+    IFORWARD_HISTORY_ROLE,
     IFORWARD_NEARBY_ROLE,
     IFORWARD_SCHEDULER_VERSION,
+    IFORWARD_V3_SCHEDULER_VERSION,
     IForwardResolvedBatch,
     IForwardResolvedStep,
     IForwardBatchResolver,
@@ -46,6 +48,44 @@ def __getattr__(name: str):
         from .context_adapter import IForwardContextAdapter
 
         return IForwardContextAdapter
+    if name in {
+        "IForwardGRUBranchPrepared",
+        "IForwardGRUBranchState",
+        "IForwardGRUMemoryState",
+        "IForwardGRUPrepared",
+        "IForwardTimeAwarePointGRU",
+    }:
+        from .gru_memory import (
+            IForwardGRUBranchPrepared,
+            IForwardGRUBranchState,
+            IForwardGRUMemoryState,
+            IForwardGRUPrepared,
+            IForwardTimeAwarePointGRU,
+        )
+
+        return {
+            "IForwardGRUBranchPrepared": IForwardGRUBranchPrepared,
+            "IForwardGRUBranchState": IForwardGRUBranchState,
+            "IForwardGRUMemoryState": IForwardGRUMemoryState,
+            "IForwardGRUPrepared": IForwardGRUPrepared,
+            "IForwardTimeAwarePointGRU": IForwardTimeAwarePointGRU,
+        }[name]
+    if name in {"IForwardHistoryBranchEMA", "IForwardHistoryEMAState", "IForwardResidualPack"}:
+        from .history_ema import IForwardHistoryBranchEMA, IForwardHistoryEMAState, IForwardResidualPack
+
+        return {
+            "IForwardHistoryBranchEMA": IForwardHistoryBranchEMA,
+            "IForwardHistoryEMAState": IForwardHistoryEMAState,
+            "IForwardResidualPack": IForwardResidualPack,
+        }[name]
+    if name in {"IForwardAttributeGate", "IForwardGatePack", "IForwardHistoryGate"}:
+        from .history_gate import IForwardAttributeGate, IForwardGatePack, IForwardHistoryGate
+
+        return {
+            "IForwardAttributeGate": IForwardAttributeGate,
+            "IForwardGatePack": IForwardGatePack,
+            "IForwardHistoryGate": IForwardHistoryGate,
+        }[name]
     if name == "IForwardStage6Bridge":
         from .bridge import IForwardStage6Bridge
 
@@ -64,8 +104,10 @@ __all__ = [
     "BranchMemoryState",
     "DenseMambaState",
     "IFORWARD_CURRENT_ROLE",
+    "IFORWARD_HISTORY_ROLE",
     "IFORWARD_NEARBY_ROLE",
     "IFORWARD_SCHEDULER_VERSION",
+    "IFORWARD_V3_SCHEDULER_VERSION",
     "RANDOM_WINDOW_ASSEMBLY_MODE",
     "RANDOM_WINDOW_MODEL_FAMILY",
     "RANDOM_WINDOW_SCHEDULER_VERSION",
@@ -79,7 +121,17 @@ __all__ = [
     "IForwardPointMambaMemory",
     "IForwardLocalConflictXcpe",
     "IForwardContextAdapter",
+    "IForwardAttributeGate",
+    "IForwardGatePack",
+    "IForwardGRUBranchPrepared",
+    "IForwardGRUBranchState",
+    "IForwardGRUMemoryState",
+    "IForwardGRUPrepared",
+    "IForwardHistoryBranchEMA",
+    "IForwardHistoryEMAState",
+    "IForwardHistoryGate",
     "IForwardModel",
+    "IForwardResidualPack",
     "IForwardResolvedBatch",
     "IForwardResolvedStep",
     "IForwardRolloutOutput",
@@ -88,6 +140,7 @@ __all__ = [
     "IForwardShortWindowHistory",
     "IForwardStage6Bridge",
     "IForwardState",
+    "IForwardTimeAwarePointGRU",
     "IForwardTrainer",
     "KeyedMambaState",
     "StreamingMambaCell",

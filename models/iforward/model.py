@@ -13,11 +13,15 @@ from models.streetforward.stage6_0 import DeltaPack, LocalGSState
 
 from .bridge import IForwardStage6Bridge
 from .context_adapter import IForwardContextAdapter
+from .delta_ops import gate_delta_pack
+from .gru_memory import IForwardGRUMemoryState, IForwardTimeAwarePointGRU
+from .history_ema import IForwardHistoryEMAState
+from .history_gate import IForwardHistoryGate
 from .iforward_v6_state import IForwardV6MemoryState
 from .local_conflict_xcpe import IForwardLocalConflictXcpe
 from .memory import IForwardMemoryStepContext, IForwardSceneMemory
 from .point_mamba_memory import IForwardPointMambaMemory
-from .resolver import IForwardBatchResolver, IForwardResolvedBatch
+from .resolver import IFORWARD_V3_SCHEDULER_VERSION, IForwardBatchResolver, IForwardResolvedBatch
 from .state import IForwardMemoryState, IForwardShortWindowHistory, IForwardState
 from .utils import cfg_ensure_child, cfg_get, cfg_set, clone_config
 
@@ -356,6 +360,19 @@ class IForwardModel(nn.Module):
     to supply V4 observation/render/updater primitives.
     """
 
+    @staticmethod
+    def _validate_v3_scheduler_contract(config: Any) -> None:
+        scheduler_cfg = cfg_get(config, "scheduler_iforward", {}) or {}
+        if not bool(cfg_get(scheduler_cfg, "enable", False)):
+            return
+        version = str(cfg_get(scheduler_cfg, "version", ""))
+        if version == IFORWARD_V3_SCHEDULER_VERSION:
+            return
+        raise ValueError(
+            "IForward v3 requires scheduler_iforward.version=iforward_v3_random_window "
+            f"when scheduler_iforward is enabled, got {version!r}."
+        )
+
     def __init__(
         self,
         config: Any = None,
@@ -377,7 +394,12 @@ class IForwardModel(nn.Module):
 
                 self.resolver = IForwardRandomWindowBatchResolver()
             else:
-                self.resolver = IForwardBatchResolver()
+                scheduler_cfg = cfg_get(config, "scheduler_iforward", {}) or {}
+                scheduler_version = str(cfg_get(scheduler_cfg, "version", "iforward_v1"))
+                if scheduler_version == IFORWARD_V3_SCHEDULER_VERSION:
+                    self.resolver = IForwardBatchResolver(expected_scheduler_version=IFORWARD_V3_SCHEDULER_VERSION)
+                else:
+                    self.resolver = IForwardBatchResolver()
 
         if bridge is None:
             runtime = phase_a_runtime
@@ -395,11 +417,66 @@ class IForwardModel(nn.Module):
         event_dim = int(getattr(self.bridge, "event_dim", 48))
         iforward_cfg = cfg_get(cfg_get(config, "model", {}) or {}, "iforward", {}) or {}
         self.iforward_version = str(cfg_get(iforward_cfg, "version", "v1"))
+        self.is_v3_gru_history_gate = self.iforward_version == "v3_gru_history_gate"
         self.is_v6_point_mamba_xcpe = self.iforward_version == "v6_point_mamba_xcpe"
+        if self.is_v3_gru_history_gate:
+            self._validate_v3_scheduler_contract(config)
         debug_cfg = cfg_get(iforward_cfg, "debug", {}) or {}
         self.enable_nvtx_ranges = bool(cfg_get(debug_cfg, "nvtx_ranges", False))
         memory_cfg = cfg_get(iforward_cfg, "memory", {}) or {}
-        if self.is_v6_point_mamba_xcpe:
+        if self.is_v3_gru_history_gate:
+            point_gru_cfg = cfg_get(iforward_cfg, "point_gru", {}) or {}
+            ctx_dim = int(cfg_get(point_gru_cfg, "ctx_dim", 48))
+            self.point_gru = IForwardTimeAwarePointGRU(
+                event_dim=event_dim,
+                hidden_dim=int(cfg_get(point_gru_cfg, "hidden_dim", 48)),
+                ctx_dim=ctx_dim,
+                dt_clip=float(cfg_get(point_gru_cfg, "dt_clip", 32.0)),
+                hard_valid_required=bool(cfg_get(point_gru_cfg, "hard_valid_required", True)),
+                hard_support_min_optimizer=float(cfg_get(point_gru_cfg, "hard_support_min_optimizer", 0.0)),
+            )
+            history_cfg_v3 = cfg_get(iforward_cfg, "history_memory", {}) or {}
+            support_cfg = cfg_get(history_cfg_v3, "support", {}) or {}
+            residual_cfg = cfg_get(history_cfg_v3, "residual", {}) or {}
+            update_cfg = cfg_get(history_cfg_v3, "update", {}) or {}
+            self.v3_history_support_betas = {
+                "fast_beta_visible": float(cfg_get(support_cfg, "fast_ema_beta_visible", 0.35)),
+                "fast_beta_invisible": float(cfg_get(support_cfg, "fast_ema_beta_invisible", 0.60)),
+                "slow_beta_visible": float(cfg_get(support_cfg, "slow_ema_beta_visible", 0.90)),
+                "slow_beta_invisible": float(cfg_get(support_cfg, "slow_ema_beta_invisible", 0.95)),
+            }
+            self.v3_history_residual_betas = {
+                "fast_beta": float(cfg_get(residual_cfg, "fast_error_beta", 0.35)),
+                "slow_beta": float(cfg_get(residual_cfg, "slow_error_beta", 0.90)),
+            }
+            self.v3_history_update_betas = {
+                "fast_beta": float(cfg_get(update_cfg, "fast_ema_beta", 0.45)),
+                "slow_beta": float(cfg_get(update_cfg, "slow_ema_beta", 0.92)),
+            }
+            support_min_cfg = cfg_get(history_cfg_v3, "support_min", {}) or {}
+            self.v3_history_support_min = {
+                "bg": float(cfg_get(support_min_cfg, "bg", 0.0)),
+                "distant": float(cfg_get(support_min_cfg, "distant", 0.0)),
+                "rigid": float(cfg_get(support_min_cfg, "rigid", 0.0)),
+            }
+            gate_cfg = cfg_get(iforward_cfg, "history_gate", {}) or {}
+            hidden_gate_cfg = cfg_get(cfg_get(gate_cfg, "hidden_gate", {}) or {}, "weights", {}) or {}
+            self.history_gate = IForwardHistoryGate(
+                event_dim=event_dim,
+                ctx_dim=ctx_dim,
+                history_embed_dim=int(cfg_get(gate_cfg, "history_embed_dim", 16)),
+                hidden_dim=int(cfg_get(gate_cfg, "hidden_dim", 64)),
+                branch_embed_dim=int(cfg_get(gate_cfg, "branch_embed_dim", 8)),
+                min_gate=dict(cfg_get(gate_cfg, "min_gate", {}) or {}),
+                init_bias=dict(cfg_get(gate_cfg, "init_bias", {}) or {}),
+                branch_bias=dict(cfg_get(gate_cfg, "branch_bias", {}) or {}),
+                hidden_gate_weights=dict(hidden_gate_cfg),
+                cold_open_uninitialized=bool(cfg_get(gate_cfg, "cold_open_uninitialized", True)),
+                bind_with_mask_update=bool(cfg_get(gate_cfg, "bind_with_mask_update", True)),
+                support_min=self.v3_history_support_min,
+            )
+            self.memory = None
+        elif self.is_v6_point_mamba_xcpe:
             point_cfg = cfg_get(memory_cfg, "point_mamba", {}) or {}
             write_policy_cfg = cfg_get(point_cfg, "write_policy", {}) or {}
             point_ctx_dim = int(cfg_get(point_cfg, "output_dim", cfg_get(point_cfg, "model_dim", 16)))
@@ -472,7 +549,11 @@ class IForwardModel(nn.Module):
             )
         history_cfg = cfg_get(iforward_cfg, "short_window_history", {}) or {}
         self.history_max_entries = int(cfg_get(history_cfg, "max_entries", 24))
-        self.history_max_memory_entries = 0 if self.is_v6_point_mamba_xcpe else int(cfg_get(history_cfg, "max_memory_entries", 8))
+        self.history_max_memory_entries = (
+            0
+            if self.is_v6_point_mamba_xcpe or self.is_v3_gru_history_gate
+            else int(cfg_get(history_cfg, "max_memory_entries", 8))
+        )
         loss_cfg = cfg_get(iforward_cfg, "loss", {}) or {}
         self.loss_current_weight = float(cfg_get(cfg_get(loss_cfg, "current", {}) or {}, "weight", 1.0))
         self.loss_nearby_weight = float(
@@ -482,9 +563,13 @@ class IForwardModel(nn.Module):
                 _loss_float(config, ["losses", "phase_a", "nearby_render", "weight"], 0.25) if config is not None else 0.25,
             )
         )
-        self.loss_in_rollout_history_weight = float(
-            cfg_get(cfg_get(loss_cfg, "in_rollout_history", {}) or {}, "weight", 0.1)
-        )
+        in_rollout_history_loss_cfg = cfg_get(loss_cfg, "in_rollout_history", {}) or {}
+        self.loss_in_rollout_history_weight = float(cfg_get(in_rollout_history_loss_cfg, "weight", 0.1))
+        history_warmup_cfg = cfg_get(in_rollout_history_loss_cfg, "warmup", {}) or {}
+        self.loss_in_rollout_history_warmup_enable = bool(cfg_get(history_warmup_cfg, "enable", False))
+        self.loss_in_rollout_history_warmup_steps = int(cfg_get(history_warmup_cfg, "steps", 0))
+        self.loss_in_rollout_history_warmup_start_step = int(cfg_get(history_warmup_cfg, "start_step", 0))
+        self.loss_in_rollout_history_warmup_start_factor = float(cfg_get(history_warmup_cfg, "start_factor", 0.0))
         self.loss_short_window_history_weight = float(
             cfg_get(cfg_get(loss_cfg, "short_window_history", {}) or {}, "weight", 0.1)
         )
@@ -493,7 +578,14 @@ class IForwardModel(nn.Module):
         self.allow_missing_carried_state_reset = bool(
             cfg_get(train_ifwd_cfg, "allow_missing_carried_state_reset", False)
         )
-        if self.is_v6_point_mamba_xcpe:
+        if self.is_v3_gru_history_gate:
+            self.allowed_ablations = {
+                "full",
+                "no_gru",
+                "no_history_gate",
+                "freeze_write",
+            }
+        elif self.is_v6_point_mamba_xcpe:
             self.allowed_ablations = {
                 "full",
                 "point_only",
@@ -543,7 +635,17 @@ class IForwardModel(nn.Module):
 
     def init_iforward_state_from_batch_assets(self, batch: Dict[str, Any], resolved: IForwardResolvedBatch) -> IForwardState:
         local_state, node_bg, node_distant, node_rigid = self.bridge.make_local_state(batch=batch)
-        memory_state = IForwardV6MemoryState.empty() if self.is_v6_point_mamba_xcpe else IForwardMemoryState.empty()
+        history_ema = None
+        if self.is_v3_gru_history_gate:
+            point_gru = getattr(self, "point_gru", None)
+            if point_gru is None:
+                raise RuntimeError("IForward-v3 point_gru is not initialized.")
+            memory_state = point_gru.init_state(local_state)
+            history_ema = IForwardHistoryEMAState.from_local_state(local_state)
+        elif self.is_v6_point_mamba_xcpe:
+            memory_state = IForwardV6MemoryState.empty()
+        else:
+            memory_state = IForwardMemoryState.empty()
         return IForwardState(
             local_gs=local_state,
             memory=memory_state,
@@ -554,6 +656,7 @@ class IForwardModel(nn.Module):
             scene_id=int(resolved.scene_id),
             segment_id=int(resolved.segment_id),
             episode_id=int(resolved.episode_id),
+            history_ema=history_ema,
             node_state_bg=node_bg,
             node_state_distant=node_distant,
             node_state_rigid=node_rigid,
@@ -567,7 +670,21 @@ class IForwardModel(nn.Module):
             "metric_valid": 0.0,
             "valid_ratio": 0.0,
             "skipped_no_valid_pixels": 0.0,
-        }
+            }
+
+    def _history_rollout_loss_weight_for_step(self, global_step: int) -> float:
+        base = float(self.loss_in_rollout_history_weight)
+        if not bool(self.loss_in_rollout_history_warmup_enable):
+            return base
+        warmup_steps = int(self.loss_in_rollout_history_warmup_steps)
+        if warmup_steps <= 0:
+            return base
+        start_step = int(self.loss_in_rollout_history_warmup_start_step)
+        step = max(0, int(global_step) - start_step)
+        progress = min(max(float(step) / float(warmup_steps), 0.0), 1.0)
+        start_factor = min(max(float(self.loss_in_rollout_history_warmup_start_factor), 0.0), 1.0)
+        factor = start_factor + (1.0 - start_factor) * progress
+        return float(base * factor)
 
     def _render_final_losses(
         self,
@@ -655,6 +772,7 @@ class IForwardModel(nn.Module):
         losses = {
             "current": current_loss,
             "current_latest": current_loss,
+            "history": in_rollout_history_loss,
             "nearby": nearby_loss,
             "in_rollout_history": in_rollout_history_loss,
             "short_window_history": short_history_loss,
@@ -668,6 +786,9 @@ class IForwardModel(nn.Module):
             "current_num_refs": float(current_stats.get("num_refs", len(resolved.current_latest_target_indices))),
             "current_latest_num_refs": float(current_stats.get("num_refs", len(resolved.current_latest_target_indices))),
             "history_rollout_num_refs": float(
+                in_rollout_stats.get("num_refs", len(resolved.history_rollout_target_indices))
+            ),
+            "history_num_refs": float(
                 in_rollout_stats.get("num_refs", len(resolved.history_rollout_target_indices))
             ),
             "in_rollout_history_num_refs": float(
@@ -690,6 +811,7 @@ class IForwardModel(nn.Module):
                         stats[f"current_latest_{metric}"] = float(value)
                     if prefix == "history_rollout":
                         stats[f"in_rollout_history_{metric}"] = float(value)
+                        stats[f"history_{metric}"] = float(value)
         return losses, stats, pred_rgbs, gt_images, image_refs, image_roles
 
     def _build_v6_context(
@@ -742,6 +864,79 @@ class IForwardModel(nn.Module):
                 aux.update({str(k): float(v) for k, v in source.items() if isinstance(v, (int, float))})
         return next_memory, ctx_pack, aux
 
+    def _ensure_v3_state(
+        self,
+        *,
+        local_state: LocalGSState,
+        memory_state: Any,
+        history_ema: Optional[IForwardHistoryEMAState],
+    ) -> tuple[IForwardGRUMemoryState, IForwardHistoryEMAState]:
+        point_gru = getattr(self, "point_gru", None)
+        if point_gru is None:
+            raise RuntimeError("IForward-v3 point_gru is not initialized.")
+        def branch_ok(state_branch: Any, local_branch: Any) -> bool:
+            expected_rows = int(local_branch.means.shape[0]) if local_branch is not None else 0
+            h = getattr(state_branch, "h", None)
+            return (
+                torch.is_tensor(h)
+                and int(h.shape[0]) == int(expected_rows)
+                and int(h.shape[1]) == int(point_gru.hidden_dim)
+            )
+
+        memory_ok = (
+            isinstance(memory_state, IForwardGRUMemoryState)
+            and branch_ok(memory_state.bg, local_state.bg)
+            and branch_ok(memory_state.distant, local_state.distant)
+            and branch_ok(memory_state.rigid, local_state.rigid)
+        )
+        if not memory_ok:
+            memory_state = point_gru.init_state(local_state)
+
+        def history_ok(hist_branch: Any, local_branch: Any) -> bool:
+            expected_rows = int(local_branch.means.shape[0]) if local_branch is not None else 0
+            if hist_branch is None:
+                return expected_rows == 0
+            support_fast = getattr(hist_branch, "support_fast", None)
+            return torch.is_tensor(support_fast) and int(support_fast.shape[0]) == int(expected_rows)
+
+        history_state_ok = (
+            history_ema is not None
+            and history_ok(history_ema.bg, local_state.bg)
+            and history_ok(history_ema.distant, local_state.distant)
+            and history_ok(history_ema.rigid, local_state.rigid)
+        )
+        if not history_state_ok:
+            history_ema = IForwardHistoryEMAState.from_local_state(local_state)
+        return memory_state, history_ema
+
+    @staticmethod
+    def _legacy_step_block_exit(step: Any, next_step: Optional[Any]) -> bool:
+        if next_step is None:
+            return True
+        step_block = getattr(step, "block_id", getattr(step, "episode_block_idx", getattr(step, "rollout_block_rank", None)))
+        next_block = getattr(
+            next_step,
+            "block_id",
+            getattr(next_step, "episode_block_idx", getattr(next_step, "rollout_block_rank", None)),
+        )
+        if step_block is not None and next_block is not None:
+            return int(step_block) != int(next_block)
+        return int(next_step.source_frame_idx) != int(step.source_frame_idx)
+
+    @classmethod
+    def _resolved_step_block_flags(cls, step: Any, next_step: Optional[Any]) -> tuple[bool, bool]:
+        is_block_enter = (
+            bool(getattr(step, "is_block_enter"))
+            if hasattr(step, "is_block_enter")
+            else bool(int(getattr(step, "repeat_idx", 0)) == 0)
+        )
+        is_block_exit = (
+            bool(getattr(step, "is_block_exit"))
+            if hasattr(step, "is_block_exit")
+            else cls._legacy_step_block_exit(step, next_step)
+        )
+        return bool(is_block_enter), bool(is_block_exit)
+
     def forward_rollout(
         self,
         batch: Dict[str, Any],
@@ -753,6 +948,8 @@ class IForwardModel(nn.Module):
         if ablation_name not in self.allowed_ablations:
             raise ValueError(f"unsupported IForward ablation={ablation_name!r}")
         resolved = self.resolver.resolve(batch)
+        global_step = int(batch.get("global_step", 0) or 0)
+        in_rollout_history_loss_weight = self._history_rollout_loss_weight_for_step(global_step)
         if bool(resolved.reset_scene_state_before_rollout):
             state = self.init_iforward_state_from_batch_assets(batch, resolved)
             prior_state_for_history = None
@@ -780,6 +977,13 @@ class IForwardModel(nn.Module):
             state.node_state_distant = node_distant
             state.node_state_rigid = node_rigid
         memory_state = state.memory
+        history_ema = state.history_ema
+        if self.is_v3_gru_history_gate:
+            memory_state, history_ema = self._ensure_v3_state(
+                local_state=local_state,
+                memory_state=memory_state,
+                history_ema=history_ema,
+            )
         working_history = state.history
         history_entries_before = int(len(working_history.entries))
         memory_entries_before = int(len(working_history.memory_entries))
@@ -811,7 +1015,8 @@ class IForwardModel(nn.Module):
                 event = self.bridge.build_event(local_state=local_state, measurement=measurement)
             timings["event_ms"] += (time.perf_counter() - t0) * 1000.0
             next_step = resolved.steps[step_pos + 1] if step_pos + 1 < len(resolved.steps) else None
-            is_frame_exit = next_step is None or int(next_step.source_frame_idx) != int(step.source_frame_idx)
+            is_block_enter, is_block_exit = self._resolved_step_block_flags(step, next_step)
+            is_frame_exit = bool(is_block_exit)
             step_context = IForwardMemoryStepContext(
                 step_idx=int(step.step_idx),
                 source_frame_idx=int(step.source_frame_idx),
@@ -822,10 +1027,29 @@ class IForwardModel(nn.Module):
                 rollout_pos_code=float(step.rollout_pos_code),
                 global_step=int(global_step),
                 is_frame_exit=bool(is_frame_exit),
+                episode_visit_idx=int(getattr(step, "episode_visit_idx", -1)),
+                rollout_visit_idx=int(getattr(step, "rollout_visit_idx", getattr(step, "rollout_block_rank", -1))),
+                optimizer_step_idx_in_episode=int(getattr(step, "optimizer_step_idx_in_episode", -1)),
             )
             t0 = time.perf_counter()
             with self._nvtx_range("iforward/memory"):
-                if self.is_v6_point_mamba_xcpe:
+                if self.is_v3_gru_history_gate:
+                    point_gru = getattr(self, "point_gru", None)
+                    if point_gru is None or history_ema is None:
+                        raise RuntimeError("IForward-v3 modules are not initialized.")
+                    memory_aux = {}
+                    if bool(is_block_enter):
+                        memory_aux.update(history_ema.record_block_support_snapshot(event=event, local_state=local_state))
+                    ctx_memory, gru_prepared, gru_read_aux = point_gru.read(
+                        event=event,
+                        local_state=local_state,
+                        state=memory_state,
+                        step_context=step_context,
+                        ablation=ablation_name,
+                    )
+                    memory_aux.update(gru_read_aux)
+                    short_entries = []
+                elif self.is_v6_point_mamba_xcpe:
                     memory_state, ctx_memory, memory_aux = self._build_v6_context(
                         event=event,
                         local_state=local_state,
@@ -852,11 +1076,81 @@ class IForwardModel(nn.Module):
             )
             t0 = time.perf_counter()
             with self._nvtx_range("iforward/update"):
-                local_state, delta, update_aux = self.bridge.apply_update(
-                    local_state=local_state,
-                    event=event,
-                    ctx_memory=ctx_memory,
-                )
+                if self.is_v3_gru_history_gate:
+                    if history_ema is None:
+                        raise RuntimeError("IForward-v3 history EMA is not initialized.")
+                    history_gate = getattr(self, "history_gate", None)
+                    point_gru = getattr(self, "point_gru", None)
+                    if history_gate is None or point_gru is None:
+                        raise RuntimeError("IForward-v3 modules are not initialized.")
+                    delta_raw, pred_aux = self.bridge.predict_delta(
+                        local_state=local_state,
+                        event=event,
+                        ctx_memory=ctx_memory,
+                    )
+                    delta_scoped = self.bridge.apply_branch_scope_event_rows(delta_raw)
+                    gate_pack = history_gate(
+                        event=event,
+                        ctx_memory=ctx_memory,
+                        history_ema=history_ema,
+                        local_state=local_state,
+                        ablation=ablation_name,
+                    )
+                    delta_gated_event = gate_delta_pack(delta_scoped, gate_pack)
+                    delta = self.bridge.expand_rigid_delta(
+                        delta=delta_gated_event,
+                        event=event,
+                        local_state=local_state,
+                    )
+                    local_state = self.bridge.apply_delta_only(local_state=local_state, delta=delta)
+                    update_aux = {}
+                    if isinstance(pred_aux, dict):
+                        update_aux.update({str(k): float(v) for k, v in pred_aux.items() if isinstance(v, (int, float))})
+                    if isinstance(gate_pack.aux, dict):
+                        update_aux.update({str(k): float(v) for k, v in gate_pack.aux.items() if isinstance(v, (int, float))})
+                    if bool(getattr(step, "record_update_norm", True)):
+                        update_aux.update(
+                            history_ema.record_update_norm(
+                                delta=delta,
+                                update_betas=self.v3_history_update_betas,
+                            )
+                        )
+                    memory_state, gru_write_aux = point_gru.write_after_update(
+                        prepared=gru_prepared,
+                        state=memory_state,
+                        delta_raw=delta_gated_event,
+                        gate=gate_pack,
+                        step_context=step_context,
+                        ablation=ablation_name,
+                    )
+                    update_aux.update(gru_write_aux)
+                    if bool(getattr(step, "commit_residual_on_exit", is_block_exit)):
+                        residual_pack = self.bridge.compute_block_residual_history(
+                            local_state=local_state,
+                            batch=batch,
+                            source_indices=list(step.source_indices),
+                            source_frame_idx=int(step.source_frame_idx),
+                        )
+                        update_aux.update(
+                            history_ema.commit_residual(
+                                residual_pack,
+                                residual_betas=self.v3_history_residual_betas,
+                                support_min=self.v3_history_support_min,
+                            )
+                        )
+                    if bool(getattr(step, "commit_support_on_exit", is_block_exit)):
+                        update_aux.update(
+                            history_ema.commit_block_support(
+                                support_betas=self.v3_history_support_betas,
+                                support_min=self.v3_history_support_min,
+                            )
+                        )
+                else:
+                    local_state, delta, update_aux = self.bridge.apply_update(
+                        local_state=local_state,
+                        event=event,
+                        ctx_memory=ctx_memory,
+                    )
             timings["update_ms"] += (time.perf_counter() - t0) * 1000.0
             t0 = time.perf_counter()
             reg_loss, reg_stats = self.bridge.delta_regularization(delta, local_state=local_state)
@@ -872,6 +1166,8 @@ class IForwardModel(nn.Module):
                 "num_source_indices": float(len(step.source_indices)),
                 "commit_observation_memory": float(1.0 if step.commit_observation_memory else 0.0),
                 "update_optimizer_memory": float(1.0 if step.update_optimizer_memory else 0.0),
+                "is_block_enter": float(1.0 if is_block_enter else 0.0),
+                "is_block_exit": float(1.0 if is_block_exit else 0.0),
                 "is_frame_exit": float(1.0 if is_frame_exit else 0.0),
                 "short_entries_added": float(len(short_entries)),
                 "memory_entries_after_step": float(len(working_history.memory_entries)),
@@ -899,14 +1195,16 @@ class IForwardModel(nn.Module):
         total = (
             self.loss_current_weight * final_losses["current"]
             + self.loss_nearby_weight * final_losses["nearby"]
-            + self.loss_in_rollout_history_weight * final_losses["in_rollout_history"]
+            + float(in_rollout_history_loss_weight) * final_losses["in_rollout_history"]
             + self.loss_short_window_history_weight * final_losses["short_window_history"]
             + self.loss_delta_reg_weight * final_losses["delta_regularization"]
         )
         if not torch.isfinite(total).all():
             raise RuntimeError("IForward rollout loss became NaN/Inf.")
 
-        history_indices = tuple(resolved.history_commit_target_indices or resolved.current_target_indices)
+        history_indices = tuple(()) if self.is_v3_gru_history_gate else tuple(
+            resolved.history_commit_target_indices or resolved.current_target_indices
+        )
         history = working_history.commit_targets(batch, history_indices)
         history_entries_after = int(len(history.entries))
         memory_entries_after = int(len(history.memory_entries))
@@ -917,10 +1215,14 @@ class IForwardModel(nn.Module):
             scene_id=int(resolved.scene_id),
             segment_id=int(resolved.segment_id),
             episode_id=int(resolved.episode_id),
+            history_ema=history_ema,
             node_state_bg=state.node_state_bg,
             node_state_distant=state.node_state_distant,
             node_state_rigid=state.node_state_rigid,
         )
+        memory_tokens = memory_state.count_tokens() if hasattr(memory_state, "count_tokens") else {}
+        if self.is_v3_gru_history_gate and history_ema is not None:
+            memory_tokens = {**memory_tokens, **history_ema.count_tokens()}
         stats: Dict[str, Any] = {
             **final_stats,
             "inner_K": int(resolved.inner_K),
@@ -934,7 +1236,7 @@ class IForwardModel(nn.Module):
             "unique_windows_seen": int(resolved.unique_windows_seen),
             "is_repeated_window": bool(resolved.is_repeated_window),
             "blocks_per_rollout": int(len(resolved.window_block_ids)) if resolved.window_block_ids else 0,
-            "repeats_per_block": 2 if str(resolved.scheduler_version) == "random_window_v1" else 0,
+            "repeats_per_block": int(resolved.steps[0].repeats_per_block) if resolved.steps else 0,
             "num_source_views": int(len(resolved.source_refs)),
             "num_targets": int(len(resolved.target_refs)),
             "num_gaussians_bg": int(local_state.bg.means.shape[0]),
@@ -948,11 +1250,19 @@ class IForwardModel(nn.Module):
             "memory_entries_after": int(memory_entries_after),
             "loss_weight/current": float(self.loss_current_weight),
             "loss_weight/nearby": float(self.loss_nearby_weight),
-            "loss_weight/in_rollout_history": float(self.loss_in_rollout_history_weight),
+            "loss_weight/in_rollout_history": float(in_rollout_history_loss_weight),
+            "loss_weight/in_rollout_history_base": float(self.loss_in_rollout_history_weight),
+            "loss_weight/in_rollout_history_warmup_factor": (
+                float(in_rollout_history_loss_weight) / float(self.loss_in_rollout_history_weight)
+                if float(self.loss_in_rollout_history_weight) > 0.0
+                else 0.0
+            ),
             "loss_weight/short_window_history": float(self.loss_short_window_history_weight),
             "loss_weight/delta_regularization": float(self.loss_delta_reg_weight),
-            "memory_tokens": memory_state.count_tokens(),
+            "memory_tokens": memory_tokens,
         }
+        if self.is_v3_gru_history_gate and history_ema is not None:
+            stats.update(history_ema.stats())
         current_psnr = stats.get("current_psnr")
         history_psnr = stats.get("history_rollout_psnr")
         short_psnr = stats.get("short_window_history_psnr")
