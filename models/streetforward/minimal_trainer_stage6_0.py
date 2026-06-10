@@ -1711,7 +1711,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         )
 
     def _local_to_node_states_detached(self, local_state: LocalGSState) -> tuple[NodeStateBackground, Optional[NodeStateDistant], Optional[NodeStateRigid]]:
-        return local_state.to_node_states_detached()
+        return local_state.to(device=self.device).to_node_states_detached()
 
     def _observe_v4_measurement(
         self,

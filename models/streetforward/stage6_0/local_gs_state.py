@@ -50,6 +50,18 @@ class LocalBranchState:
         yield self.sh_rest
         yield self.hidden
 
+    def to(self, *, device: torch.device, dtype: Optional[torch.dtype] = None) -> "LocalBranchState":
+        out_dtype = dtype or self.means.dtype
+        return LocalBranchState(
+            means=self.means.to(device=device, dtype=out_dtype),
+            scales_log=self.scales_log.to(device=device, dtype=out_dtype),
+            quats=self.quats.to(device=device, dtype=out_dtype),
+            opacity_logit=self.opacity_logit.to(device=device, dtype=out_dtype),
+            sh_dc=self.sh_dc.to(device=device, dtype=out_dtype),
+            sh_rest=self.sh_rest.to(device=device, dtype=out_dtype),
+            hidden=self.hidden.to(device=device, dtype=out_dtype),
+        )
+
 
 @dataclass
 class LocalGSState:
@@ -88,6 +100,41 @@ class LocalGSState:
             yield from self.distant.iter_tensors()
         if self.rigid is not None:
             yield from self.rigid.iter_tensors()
+
+    @staticmethod
+    def _rigid_template_to(
+        rigid: Optional[NodeStateRigid],
+        *,
+        device: torch.device,
+        dtype: Optional[torch.dtype],
+    ) -> Optional[NodeStateRigid]:
+        if rigid is None:
+            return None
+        out_dtype = dtype or rigid.means.dtype
+        return NodeStateRigid(
+            means=rigid.means.to(device=device, dtype=out_dtype),
+            scales_log=rigid.scales_log.to(device=device, dtype=out_dtype),
+            quats=rigid.quats.to(device=device, dtype=out_dtype),
+            opacity_logit=rigid.opacity_logit.to(device=device, dtype=out_dtype),
+            sh_dc=rigid.sh_dc.to(device=device, dtype=out_dtype),
+            sh_rest=rigid.sh_rest.to(device=device, dtype=out_dtype),
+            point_ids=rigid.point_ids.to(device=device),
+            instances_quats=rigid.instances_quats.to(device=device, dtype=out_dtype),
+            instances_trans=rigid.instances_trans.to(device=device, dtype=out_dtype),
+            instances_fv=rigid.instances_fv.to(device=device),
+            instance_ids=list(rigid.instance_ids),
+            frame_ids=list(rigid.frame_ids),
+            cur_frame=int(rigid.cur_frame),
+        )
+
+    def to(self, *, device: torch.device, dtype: Optional[torch.dtype] = None) -> "LocalGSState":
+        out_dtype = dtype or self.bg.means.dtype
+        return LocalGSState(
+            bg=self.bg.to(device=device, dtype=out_dtype),
+            distant=self.distant.to(device=device, dtype=out_dtype) if self.distant is not None else None,
+            rigid=self.rigid.to(device=device, dtype=out_dtype) if self.rigid is not None else None,
+            rigid_template=self._rigid_template_to(self.rigid_template, device=device, dtype=out_dtype),
+        )
 
     def assert_finite(self, label: str = "local_G") -> None:
         for idx, tensor in enumerate(self.iter_tensors()):

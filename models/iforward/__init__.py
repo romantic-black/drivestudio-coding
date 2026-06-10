@@ -86,6 +86,18 @@ def __getattr__(name: str):
             "IForwardGatePack": IForwardGatePack,
             "IForwardHistoryGate": IForwardHistoryGate,
         }[name]
+    if name == "IForwardHistorySafeProjection":
+        from .history_safe_projection import IForwardHistorySafeProjection
+
+        return IForwardHistorySafeProjection
+    if name in {"GradientBankAttr", "HistoryGradientBank", "HistoryGradientBranchBank"}:
+        from .history_gradient_bank import GradientBankAttr, HistoryGradientBank, HistoryGradientBranchBank
+
+        return {
+            "GradientBankAttr": GradientBankAttr,
+            "HistoryGradientBank": HistoryGradientBank,
+            "HistoryGradientBranchBank": HistoryGradientBranchBank,
+        }[name]
     if name == "IForwardStage6Bridge":
         from .bridge import IForwardStage6Bridge
 
@@ -103,6 +115,7 @@ def __getattr__(name: str):
 __all__ = [
     "BranchMemoryState",
     "DenseMambaState",
+    "GradientBankAttr",
     "IFORWARD_CURRENT_ROLE",
     "IFORWARD_HISTORY_ROLE",
     "IFORWARD_NEARBY_ROLE",
@@ -130,6 +143,7 @@ __all__ = [
     "IForwardHistoryBranchEMA",
     "IForwardHistoryEMAState",
     "IForwardHistoryGate",
+    "IForwardHistorySafeProjection",
     "IForwardModel",
     "IForwardResidualPack",
     "IForwardResolvedBatch",
@@ -142,6 +156,8 @@ __all__ = [
     "IForwardState",
     "IForwardTimeAwarePointGRU",
     "IForwardTrainer",
+    "HistoryGradientBank",
+    "HistoryGradientBranchBank",
     "KeyedMambaState",
     "StreamingMambaCell",
     "StreamingMambaCellState",

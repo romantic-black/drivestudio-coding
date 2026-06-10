@@ -139,6 +139,22 @@ class FakeV3Bridge(nn.Module):
         return delta.bg.means.pow(2).mean() * 0.0, {"delta_l2": 0.0}
 
 
+class FakeHSPBridge(FakeV3Bridge):
+    def __init__(self) -> None:
+        super().__init__()
+        self.hsp_probe_calls = 0
+
+    def predict_delta(self, *, local_state, event, ctx_memory: ContextPack):
+        delta, aux = super().predict_delta(local_state=local_state, event=event, ctx_memory=ctx_memory)
+        aux["fake_raw_means_norm"] = float(delta.bg.means.detach().norm(dim=-1).mean().item())
+        return delta, aux
+
+    def history_probe_loss(self, *, local_state, batch, target_indices, mask_policy):
+        _ = batch, target_indices, mask_policy
+        self.hsp_probe_calls += 1
+        return local_state.bg.means[:, 0].sum(), {"num_refs": float(len(target_indices)), "psnr": 9.0}
+
+
 def _v3_cfg() -> Dict[str, Any]:
     return {
         "model": {
@@ -151,6 +167,35 @@ def _v3_cfg() -> Dict[str, Any]:
         },
         "losses": {"phase_a": {"nearby_render": {"weight": 0.0}}},
     }
+
+
+def _v3_hsp_cfg(*, damage_loss_enable: bool = True) -> Dict[str, Any]:
+    cfg = _v3_cfg()
+    cfg["model"]["iforward"]["history_safe_projection"] = {
+        "enable": True,
+        "mode": "project_delta",
+        "probe": {"frequency": "block_enter", "reuse_within_block": True, "frames_per_block": 1, "cams_per_frame": 1},
+        "attrs": {"means": True, "scales": False, "opacity": False, "sh": False, "quat": False},
+        "projection": {
+            "strength": {"start_step": 0, "warmup_steps": 0, "start_value": 1.0, "end_value": 1.0},
+            "attr_strength_scale": {"means": 1.0},
+            "tau_norm": {"means": 0.0},
+        },
+        "damage_loss": {
+            "enable": bool(damage_loss_enable),
+            "type": "cosine_conflict",
+            "weight": 0.05,
+            "attr_weights": {"means": 1.0},
+        },
+    }
+    cfg["model"]["iforward"]["loss"] = {
+        "current": {"weight": 0.0},
+        "nearby": {"weight": 0.0},
+        "in_rollout_history": {"weight": 0.0},
+        "short_window_history": {"weight": 0.0},
+        "delta_regularization": {"weight": 0.0},
+    }
+    return cfg
 
 
 def _batch_b1r2() -> Dict[str, Any]:
@@ -223,6 +268,33 @@ def _batch_b1r2() -> Dict[str, Any]:
         "_iforward": ifwd,
         "targets": [{"gt_image": torch.zeros(1, 1, 3), "frame_idx": f, "cam_idx": c} for f, c in target_refs],
     }
+
+
+def _batch_b1r2_with_history_probe_target() -> Dict[str, Any]:
+    batch = _batch_b1r2()
+    target_refs = [(5, 0), (10, 0), (10, 1), (10, 2)]
+    target_roles = ["final_current_recon"] * len(target_refs)
+    ifwd = dict(batch["_iforward"])
+    ifwd.update(
+        {
+            "target_refs_flat": target_refs,
+            "target_roles_flat": target_roles,
+            "input_frame_indices": [5, 10],
+        }
+    )
+    request_meta = dict(batch["request_meta"])
+    request_meta.update(
+        {
+            "target_image_refs": target_refs,
+            "target_image_roles": target_roles,
+            "iforward": ifwd,
+        }
+    )
+    out = dict(batch)
+    out["_iforward"] = ifwd
+    out["request_meta"] = request_meta
+    out["targets"] = [{"gt_image": torch.zeros(1, 1, 3), "frame_idx": f, "cam_idx": c} for f, c in target_refs]
+    return out
 
 
 def _batch_b1r2_history_flags_disabled() -> Dict[str, Any]:
@@ -356,6 +428,46 @@ def test_iforward_v3_history_loss_weight_warmup() -> None:
     batch["global_step"] = 100
     out_end = model.forward_rollout(batch)
     assert out_end.stats["loss_weight/in_rollout_history"] == pytest.approx(1.0)
+
+
+def test_iforward_v3_hsp_projects_delta_and_reuses_block_probe_cache() -> None:
+    bridge = FakeHSPBridge()
+    model = IForwardModel(config=_v3_hsp_cfg(), device=torch.device("cpu"), bridge=bridge, resolver=IForwardBatchResolver())
+
+    out = model.forward_rollout(_batch_b1r2_with_history_probe_target(), ablation="no_history_gate")
+
+    assert torch.isfinite(out.loss)
+    assert bridge.hsp_probe_calls == 1
+    assert out.per_step[0]["hsp/enabled"] == pytest.approx(1.0)
+    assert out.per_step[0]["hsp/cache_hit"] == pytest.approx(0.0)
+    assert out.per_step[1]["hsp/cache_hit"] == pytest.approx(1.0)
+    assert out.stats["loss_weight/hsp_damage"] == pytest.approx(0.05)
+    assert out.stats["hsp/damage_loss"] > 0.0
+    assert out.stats["hsp/cos_damage_loss"] > 0.0
+    assert out.stats["hsp/probe_num_refs"] == pytest.approx(1.0)
+    assert out.next_state.local_gs.bg.means[:, 0].detach().abs().max().item() < 1.0e-5
+    assert out.per_step[0]["v3/gru/bg_delta_means_norm_mean"] < out.per_step[0]["fake_raw_means_norm"]
+    assert torch.allclose(out.loss, out.losses["hsp_damage_loss"] * 0.05)
+
+
+def test_iforward_v3_hsp_damage_loss_enable_false_keeps_probe_but_removes_total_loss() -> None:
+    bridge = FakeHSPBridge()
+    model = IForwardModel(
+        config=_v3_hsp_cfg(damage_loss_enable=False),
+        device=torch.device("cpu"),
+        bridge=bridge,
+        resolver=IForwardBatchResolver(),
+    )
+
+    out = model.forward_rollout(_batch_b1r2_with_history_probe_target(), ablation="no_history_gate")
+
+    assert torch.isfinite(out.loss)
+    assert bridge.hsp_probe_calls == 1
+    assert out.stats["loss_weight/hsp_damage"] == pytest.approx(0.0)
+    assert out.stats["hsp/cos_damage_loss"] > 0.0
+    assert out.stats["hsp/damage_loss"] == pytest.approx(0.0)
+    assert out.losses["hsp_damage_loss"].item() == pytest.approx(0.0)
+    assert out.loss.item() == pytest.approx(0.0)
 
 
 def test_iforward_v3_guard_requires_v3_scheduler_version_when_scheduler_enabled() -> None:

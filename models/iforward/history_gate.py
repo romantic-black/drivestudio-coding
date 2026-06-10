@@ -86,10 +86,14 @@ class IForwardHistoryGate(nn.Module):
         cold_open_uninitialized: bool = True,
         bind_with_mask_update: bool = True,
         support_min: Optional[Dict[str, float]] = None,
+        grad_feature_dim: int = 0,
+        grad_embed_dim: int = 16,
+        grad_prior_scale_init: float = 0.0,
     ) -> None:
         super().__init__()
         self.event_dim = int(event_dim)
         self.ctx_dim = int(ctx_dim)
+        self.grad_feature_dim = int(grad_feature_dim)
         self.cold_open_uninitialized = bool(cold_open_uninitialized)
         self.bind_with_mask_update = bool(bind_with_mask_update)
         self.support_min = {
@@ -110,6 +114,20 @@ class IForwardHistoryGate(nn.Module):
             nn.GELU(),
             nn.Linear(int(hidden_dim), len(GATE_ATTRS)),
         )
+        if int(self.grad_feature_dim) > 0:
+            self.grad_prior_embed = nn.Sequential(
+                nn.Linear(int(self.grad_feature_dim), int(grad_embed_dim)),
+                nn.LayerNorm(int(grad_embed_dim)),
+                nn.GELU(),
+                nn.Linear(int(grad_embed_dim), int(grad_embed_dim)),
+                nn.GELU(),
+            )
+            self.grad_prior_logits = nn.Linear(int(grad_embed_dim), len(GATE_ATTRS))
+            self.grad_prior_scale = nn.Parameter(torch.tensor(float(grad_prior_scale_init), dtype=torch.float32))
+        else:
+            self.grad_prior_embed = None
+            self.grad_prior_logits = None
+            self.grad_prior_scale = None
         min_gate = dict(min_gate or {})
         self.register_buffer(
             "min_gate_values",
@@ -141,6 +159,23 @@ class IForwardHistoryGate(nn.Module):
                 dtype=torch.float32,
             ),
         )
+
+    def _grad_prior_logit_delta(self, grad_features: Optional[torch.Tensor], *, ref: torch.Tensor, n: int) -> torch.Tensor:
+        if (
+            grad_features is None
+            or self.grad_prior_embed is None
+            or self.grad_prior_logits is None
+            or self.grad_prior_scale is None
+        ):
+            return ref.new_zeros((int(n), len(GATE_ATTRS)))
+        features = grad_features.to(device=ref.device, dtype=ref.dtype)
+        if features.dim() != 2 or int(features.shape[0]) != int(n) or int(features.shape[1]) != int(self.grad_feature_dim):
+            raise ValueError(
+                "IForward HGV2 grad feature mismatch: "
+                f"got {tuple(features.shape)}, expected ({int(n)}, {int(self.grad_feature_dim)})"
+            )
+        scale = self.grad_prior_scale.to(device=ref.device, dtype=ref.dtype)
+        return scale * self.grad_prior_logits(self.grad_prior_embed(features))
 
     @staticmethod
     def empty_gate(ref: torch.Tensor) -> IForwardAttributeGate:
@@ -203,6 +238,7 @@ class IForwardHistoryGate(nn.Module):
         support_now: Optional[torch.Tensor],
         valid_now: Optional[torch.Tensor],
         obs_code: Optional[torch.Tensor],
+        grad_features: Optional[torch.Tensor] = None,
         ablation: str = "full",
     ) -> tuple[Optional[IForwardAttributeGate], Dict[str, float]]:
         if event_x is None:
@@ -250,6 +286,7 @@ class IForwardHistoryGate(nn.Module):
         branch_ids = torch.full((n,), branch_id, device=event_x.device, dtype=torch.long)
         x = torch.cat([event_x, ctx.to(device=event_x.device, dtype=event_x.dtype), hist_embed, self.branch_embed(branch_ids)], dim=-1)
         logits = self.gate_mlp(x)
+        logits = logits + self._grad_prior_logit_delta(grad_features, ref=event_x, n=n)
         logits = logits + self.branch_bias_table[branch_id].to(device=event_x.device, dtype=event_x.dtype).view(1, -1)
         raw_gate = torch.sigmoid(logits)
         min_gate = self.min_gate_values.to(device=event_x.device, dtype=event_x.dtype).view(1, -1)
@@ -290,6 +327,7 @@ class IForwardHistoryGate(nn.Module):
         ctx_memory: ContextPack,
         history_ema: IForwardHistoryEMAState,
         local_state: LocalGSState,
+        grad_features: Optional[Any] = None,
         ablation: str = "full",
     ) -> IForwardGatePack:
         aux: Dict[str, float] = {}
@@ -302,6 +340,7 @@ class IForwardHistoryGate(nn.Module):
             support_now=event.support_bg,
             valid_now=event.valid_bg,
             obs_code=event.obs_code_bg,
+            grad_features=None if grad_features is None else getattr(getattr(grad_features, "bg", None), "features", None),
             ablation=str(ablation),
         )
         if bg is None:
@@ -318,6 +357,9 @@ class IForwardHistoryGate(nn.Module):
                 support_now=event.support_distant,
                 valid_now=event.valid_distant,
                 obs_code=event.obs_code_distant,
+                grad_features=(
+                    None if grad_features is None else getattr(getattr(grad_features, "distant", None), "features", None)
+                ),
                 ablation=str(ablation),
             )
             aux.update(d_aux)
@@ -334,6 +376,7 @@ class IForwardHistoryGate(nn.Module):
                 support_now=event.support_rigid,
                 valid_now=event.valid_rigid,
                 obs_code=event.obs_code_rigid,
+                grad_features=None if grad_features is None else getattr(getattr(grad_features, "rigid", None), "features", None),
                 ablation=str(ablation),
             )
             aux.update(r_aux)

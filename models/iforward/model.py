@@ -17,6 +17,13 @@ from .delta_ops import gate_delta_pack
 from .gru_memory import IForwardGRUMemoryState, IForwardTimeAwarePointGRU
 from .history_ema import IForwardHistoryEMAState
 from .history_gate import IForwardHistoryGate
+from .history_gate_v2_features import (
+    HGV2_GRAD_FEATURE_DIM,
+    compute_history_gate_v2_features,
+    history_gate_v2_auxiliary_loss,
+)
+from .history_gradient_bank import HGV2_ATTRS, build_history_gradient_bank_from_loss
+from .history_safe_projection import IForwardHistorySafeProjection
 from .iforward_v6_state import IForwardV6MemoryState
 from .local_conflict_xcpe import IForwardLocalConflictXcpe
 from .memory import IForwardMemoryStepContext, IForwardSceneMemory
@@ -419,6 +426,7 @@ class IForwardModel(nn.Module):
         self.iforward_version = str(cfg_get(iforward_cfg, "version", "v1"))
         self.is_v3_gru_history_gate = self.iforward_version == "v3_gru_history_gate"
         self.is_v6_point_mamba_xcpe = self.iforward_version == "v6_point_mamba_xcpe"
+        self.history_safe_projection = None
         if self.is_v3_gru_history_gate:
             self._validate_v3_scheduler_contract(config)
         debug_cfg = cfg_get(iforward_cfg, "debug", {}) or {}
@@ -459,6 +467,10 @@ class IForwardModel(nn.Module):
                 "distant": float(cfg_get(support_min_cfg, "distant", 0.0)),
                 "rigid": float(cfg_get(support_min_cfg, "rigid", 0.0)),
             }
+            hgv2_cfg = cfg_get(iforward_cfg, "history_gate_v2", {}) or {}
+            self.history_gate_v2_cfg = hgv2_cfg
+            self.history_gate_v2_enabled = bool(cfg_get(hgv2_cfg, "enable", False))
+            hgv2_features_cfg = cfg_get(hgv2_cfg, "features", {}) or {}
             gate_cfg = cfg_get(iforward_cfg, "history_gate", {}) or {}
             hidden_gate_cfg = cfg_get(cfg_get(gate_cfg, "hidden_gate", {}) or {}, "weights", {}) or {}
             self.history_gate = IForwardHistoryGate(
@@ -474,9 +486,20 @@ class IForwardModel(nn.Module):
                 cold_open_uninitialized=bool(cfg_get(gate_cfg, "cold_open_uninitialized", True)),
                 bind_with_mask_update=bool(cfg_get(gate_cfg, "bind_with_mask_update", True)),
                 support_min=self.v3_history_support_min,
+                grad_feature_dim=HGV2_GRAD_FEATURE_DIM if bool(self.history_gate_v2_enabled) else 0,
+                grad_embed_dim=int(cfg_get(hgv2_features_cfg, "grad_embed_dim", 16)),
+                grad_prior_scale_init=float(cfg_get(hgv2_features_cfg, "grad_prior_scale_init", 0.0)),
+            )
+            hsp_cfg = cfg_get(iforward_cfg, "history_safe_projection", {}) or {}
+            self.history_safe_projection = (
+                IForwardHistorySafeProjection(hsp_cfg)
+                if bool(cfg_get(hsp_cfg, "enable", False)) and not bool(self.history_gate_v2_enabled)
+                else None
             )
             self.memory = None
         elif self.is_v6_point_mamba_xcpe:
+            self.history_gate_v2_cfg = {}
+            self.history_gate_v2_enabled = False
             point_cfg = cfg_get(memory_cfg, "point_mamba", {}) or {}
             write_policy_cfg = cfg_get(point_cfg, "write_policy", {}) or {}
             point_ctx_dim = int(cfg_get(point_cfg, "output_dim", cfg_get(point_cfg, "model_dim", 16)))
@@ -523,6 +546,8 @@ class IForwardModel(nn.Module):
             )
             self.memory = None
         else:
+            self.history_gate_v2_cfg = {}
+            self.history_gate_v2_enabled = False
             self.memory = IForwardSceneMemory(
                 event_dim=event_dim,
                 model_dim=int(cfg_get(memory_cfg, "model_dim", event_dim)),
@@ -547,6 +572,7 @@ class IForwardModel(nn.Module):
                     cfg_get(cfg_get(memory_cfg, "write_gate", {}) or {}, "hard_support_min_optimizer", 0.0)
                 ),
             )
+            self.history_safe_projection = None
         history_cfg = cfg_get(iforward_cfg, "short_window_history", {}) or {}
         self.history_max_entries = int(cfg_get(history_cfg, "max_entries", 24))
         self.history_max_memory_entries = (
@@ -574,6 +600,26 @@ class IForwardModel(nn.Module):
             cfg_get(cfg_get(loss_cfg, "short_window_history", {}) or {}, "weight", 0.1)
         )
         self.loss_delta_reg_weight = float(cfg_get(cfg_get(loss_cfg, "delta_regularization", {}) or {}, "weight", 1.0))
+        hsp_cfg = cfg_get(iforward_cfg, "history_safe_projection", {}) or {}
+        hsp_damage_cfg = cfg_get(hsp_cfg, "damage_loss", {}) or {}
+        self.hsp_damage_loss_weight = (
+            float(cfg_get(hsp_damage_cfg, "weight", 0.0))
+            if (
+                self.is_v3_gru_history_gate
+                and bool(cfg_get(hsp_cfg, "enable", False))
+                and not bool(getattr(self, "history_gate_v2_enabled", False))
+                and bool(cfg_get(hsp_damage_cfg, "enable", True))
+            )
+            else 0.0
+        )
+        hgv2_aux_cfg = cfg_get(getattr(self, "history_gate_v2_cfg", {}) or {}, "auxiliary_loss", {}) or {}
+        self.loss_hgv2_gate_weight = (
+            float(cfg_get(hgv2_aux_cfg, "weight", 1.0))
+            if self.is_v3_gru_history_gate
+            and bool(getattr(self, "history_gate_v2_enabled", False))
+            and bool(cfg_get(hgv2_aux_cfg, "enable", True))
+            else 0.0
+        )
         train_ifwd_cfg = cfg_get(cfg_get(config, "training", {}) or {}, "iforward", {}) or {}
         self.allow_missing_carried_state_reset = bool(
             cfg_get(train_ifwd_cfg, "allow_missing_carried_state_reset", False)
@@ -635,6 +681,7 @@ class IForwardModel(nn.Module):
 
     def init_iforward_state_from_batch_assets(self, batch: Dict[str, Any], resolved: IForwardResolvedBatch) -> IForwardState:
         local_state, node_bg, node_distant, node_rigid = self.bridge.make_local_state(batch=batch)
+        local_state = local_state.to(device=self.device)
         history_ema = None
         if self.is_v3_gru_history_gate:
             point_gru = getattr(self, "point_gru", None)
@@ -657,6 +704,7 @@ class IForwardModel(nn.Module):
             segment_id=int(resolved.segment_id),
             episode_id=int(resolved.episode_id),
             history_ema=history_ema,
+            history_gradient_bank=None,
             node_state_bg=node_bg,
             node_state_distant=node_distant,
             node_state_rigid=node_rigid,
@@ -967,12 +1015,15 @@ class IForwardModel(nn.Module):
             if tuple(state.cache_key) != tuple(resolved.cache_key):
                 raise ValueError(f"IForward carried state key {state.cache_key} does not match batch {resolved.cache_key}.")
 
-        local_state = state.local_gs
+        local_state = state.local_gs.to(device=self.device)
+        state.local_gs = local_state
         if hasattr(self.bridge, "sync_local_state_template_from_batch"):
             node_bg, node_distant, node_rigid = self.bridge.sync_local_state_template_from_batch(
                 local_state=local_state,
                 batch=batch,
             )
+            local_state = local_state.to(device=self.device)
+            state.local_gs = local_state
             state.node_state_bg = node_bg
             state.node_state_distant = node_distant
             state.node_state_rigid = node_rigid
@@ -984,12 +1035,24 @@ class IForwardModel(nn.Module):
                 memory_state=memory_state,
                 history_ema=history_ema,
             )
+        history_gradient_bank = None
+        if self.is_v3_gru_history_gate and bool(getattr(self, "history_gate_v2_enabled", False)):
+            history_gradient_bank = getattr(state, "history_gradient_bank", None)
+            if history_gradient_bank is not None:
+                history_gradient_bank = history_gradient_bank.to(device=self.device)
         working_history = state.history
         history_entries_before = int(len(working_history.entries))
         memory_entries_before = int(len(working_history.memory_entries))
         per_step: List[Dict[str, float]] = []
         reg_terms: List[torch.Tensor] = []
         reg_stats_sum: Dict[str, float] = {}
+        hsp_losses: List[torch.Tensor] = []
+        hsp_stats_sum: Dict[str, float] = {}
+        hsp_stats_count = 0
+        hgv2_losses: List[torch.Tensor] = []
+        hgv2_stats_sum: Dict[str, float] = {}
+        hgv2_stats_count = 0
+        block_hsp_cache: Dict[str, Any] = {}
         timings: Dict[str, float] = {
             "observe_ms": 0.0,
             "event_ms": 0.0,
@@ -1016,6 +1079,8 @@ class IForwardModel(nn.Module):
             timings["event_ms"] += (time.perf_counter() - t0) * 1000.0
             next_step = resolved.steps[step_pos + 1] if step_pos + 1 < len(resolved.steps) else None
             is_block_enter, is_block_exit = self._resolved_step_block_flags(step, next_step)
+            if bool(is_block_enter):
+                block_hsp_cache = {}
             is_frame_exit = bool(is_block_exit)
             step_context = IForwardMemoryStepContext(
                 step_idx=int(step.step_idx),
@@ -1089,21 +1154,97 @@ class IForwardModel(nn.Module):
                         ctx_memory=ctx_memory,
                     )
                     delta_scoped = self.bridge.apply_branch_scope_event_rows(delta_raw)
+                    update_aux = {}
+                    hgv2_features = None
+                    if bool(getattr(self, "history_gate_v2_enabled", False)):
+                        bank_valid = history_gradient_bank is not None and bool(getattr(history_gradient_bank, "valid", False))
+                        source_rollout_id = (
+                            int(getattr(history_gradient_bank, "source_rollout_id", -1)) if bank_valid else -1
+                        )
+                        rollout_id = int(getattr(resolved, "rollout_id_global", -1))
+                        update_aux.update(
+                            {
+                                "hgv2/bank_valid": 1.0 if bank_valid else 0.0,
+                                "hgv2/bank_source_history_loss": (
+                                    float(getattr(history_gradient_bank, "source_history_loss", 0.0)) if bank_valid else 0.0
+                                ),
+                                "hgv2/bank_source_history_num_refs": (
+                                    float(getattr(history_gradient_bank, "source_history_num_refs", 0)) if bank_valid else 0.0
+                                ),
+                                "hgv2/bank_rollout_gap": (
+                                    float(rollout_id - source_rollout_id)
+                                    if bank_valid and rollout_id >= 0 and source_rollout_id >= 0
+                                    else 0.0
+                                ),
+                            }
+                        )
+                        if bank_valid:
+                            hgv2_features = compute_history_gate_v2_features(
+                                bank=history_gradient_bank,
+                                event=event,
+                                delta_event=delta_scoped,
+                                local_state=local_state,
+                                cfg=getattr(self, "history_gate_v2_cfg", {}) or {},
+                            )
+                            if hgv2_features is not None and isinstance(hgv2_features.aux, dict):
+                                update_aux.update(
+                                    {str(k): float(v) for k, v in hgv2_features.aux.items() if isinstance(v, (int, float))}
+                                )
+                        else:
+                            for attr in HGV2_ATTRS:
+                                update_aux[f"hgv2/damage_pos_ratio/{attr}"] = 0.0
                     gate_pack = history_gate(
                         event=event,
                         ctx_memory=ctx_memory,
                         history_ema=history_ema,
                         local_state=local_state,
+                        grad_features=hgv2_features,
                         ablation=ablation_name,
                     )
+                    hgv2_aux: Dict[str, float] = {}
+                    if hgv2_features is not None and float(getattr(self, "loss_hgv2_gate_weight", 0.0)) > 0.0:
+                        hgv2_loss, hgv2_aux = history_gate_v2_auxiliary_loss(
+                            gate=gate_pack,
+                            features=hgv2_features,
+                            cfg=getattr(self, "history_gate_v2_cfg", {}) or {},
+                        )
+                        hgv2_losses.append(hgv2_loss)
+                        update_aux.update({str(k): float(v) for k, v in hgv2_aux.items() if isinstance(v, (int, float))})
+                    if hgv2_features is not None:
+                        hgv2_stats_count += 1
+                        for key, value in {**(hgv2_features.aux or {}), **hgv2_aux}.items():
+                            if isinstance(value, (int, float)):
+                                hgv2_stats_sum[str(key)] = hgv2_stats_sum.get(str(key), 0.0) + float(value)
                     delta_gated_event = gate_delta_pack(delta_scoped, gate_pack)
+                    hsp = getattr(self, "history_safe_projection", None)
+                    if hsp is not None:
+                        delta_safe_event, hsp_aux, hsp_loss = hsp(
+                            local_state=local_state,
+                            event=event,
+                            delta_event=delta_gated_event,
+                            resolved=resolved,
+                            batch=batch,
+                            step=step,
+                            step_context=step_context,
+                            history_ema=history_ema,
+                            bridge=self.bridge,
+                            probe_cache=block_hsp_cache,
+                        )
+                        delta_gated_event = delta_safe_event
+                        hsp_losses.append(hsp_loss)
+                        update_aux.update(
+                            {str(k): float(v) for k, v in hsp_aux.items() if isinstance(v, (int, float))}
+                        )
+                        hsp_stats_count += 1
+                        for key, value in hsp_aux.items():
+                            if isinstance(value, (int, float)):
+                                hsp_stats_sum[str(key)] = hsp_stats_sum.get(str(key), 0.0) + float(value)
                     delta = self.bridge.expand_rigid_delta(
                         delta=delta_gated_event,
                         event=event,
                         local_state=local_state,
                     )
                     local_state = self.bridge.apply_delta_only(local_state=local_state, delta=delta)
-                    update_aux = {}
                     if isinstance(pred_aux, dict):
                         update_aux.update({str(k): float(v) for k, v in pred_aux.items() if isinstance(v, (int, float))})
                     if isinstance(gate_pack.aux, dict):
@@ -1190,7 +1331,28 @@ class IForwardModel(nn.Module):
             delta_reg = torch.stack(reg_terms).mean()
         else:
             delta_reg = local_state.bg.means.new_tensor(0.0)
+        if hsp_losses:
+            hsp_damage_loss = torch.stack(hsp_losses).mean()
+        else:
+            hsp_damage_loss = local_state.bg.means.new_tensor(0.0)
+        if hgv2_losses:
+            hgv2_gate_loss = torch.stack(hgv2_losses).mean()
+        else:
+            hgv2_gate_loss = local_state.bg.means.new_tensor(0.0)
         final_losses["delta_regularization"] = delta_reg
+        final_losses["hsp_damage_loss"] = hsp_damage_loss
+        final_losses["hgv2_gate"] = hgv2_gate_loss
+
+        next_history_gradient_bank = None
+        if self.is_v3_gru_history_gate and bool(getattr(self, "history_gate_v2_enabled", False)):
+            history_num_refs = int(float(final_stats.get("in_rollout_history_num_refs", 0.0)))
+            next_history_gradient_bank = build_history_gradient_bank_from_loss(
+                loss_history=final_losses["in_rollout_history"],
+                final_local_state=local_state,
+                rollout_id=int(getattr(resolved, "rollout_id_global", -1)),
+                history_num_refs=history_num_refs,
+                cfg=getattr(self, "history_gate_v2_cfg", {}) or {},
+            )
 
         total = (
             self.loss_current_weight * final_losses["current"]
@@ -1198,6 +1360,8 @@ class IForwardModel(nn.Module):
             + float(in_rollout_history_loss_weight) * final_losses["in_rollout_history"]
             + self.loss_short_window_history_weight * final_losses["short_window_history"]
             + self.loss_delta_reg_weight * final_losses["delta_regularization"]
+            + self.hsp_damage_loss_weight * final_losses["hsp_damage_loss"]
+            + float(getattr(self, "loss_hgv2_gate_weight", 0.0)) * final_losses["hgv2_gate"]
         )
         if not torch.isfinite(total).all():
             raise RuntimeError("IForward rollout loss became NaN/Inf.")
@@ -1216,6 +1380,7 @@ class IForwardModel(nn.Module):
             segment_id=int(resolved.segment_id),
             episode_id=int(resolved.episode_id),
             history_ema=history_ema,
+            history_gradient_bank=next_history_gradient_bank,
             node_state_bg=state.node_state_bg,
             node_state_distant=state.node_state_distant,
             node_state_rigid=state.node_state_rigid,
@@ -1259,6 +1424,45 @@ class IForwardModel(nn.Module):
             ),
             "loss_weight/short_window_history": float(self.loss_short_window_history_weight),
             "loss_weight/delta_regularization": float(self.loss_delta_reg_weight),
+            "loss_weight/hsp_damage": float(self.hsp_damage_loss_weight),
+            "loss_weight/hgv2_gate": float(getattr(self, "loss_hgv2_gate_weight", 0.0)),
+            "hsp/damage_loss": float(hsp_damage_loss.detach().item()) if hsp_damage_loss.numel() else 0.0,
+            "hgv2/loss_gate_aux": float(hgv2_gate_loss.detach().item()) if hgv2_gate_loss.numel() else 0.0,
+            "hgv2/enabled": bool(getattr(self, "history_gate_v2_enabled", False)),
+            "hgv2/bank_valid": (
+                1.0
+                if history_gradient_bank is not None and bool(getattr(history_gradient_bank, "valid", False))
+                else 0.0
+            ),
+            "hgv2/bank_source_history_loss": (
+                float(getattr(history_gradient_bank, "source_history_loss", 0.0))
+                if history_gradient_bank is not None and bool(getattr(history_gradient_bank, "valid", False))
+                else 0.0
+            ),
+            "hgv2/bank_source_history_num_refs": (
+                float(getattr(history_gradient_bank, "source_history_num_refs", 0))
+                if history_gradient_bank is not None and bool(getattr(history_gradient_bank, "valid", False))
+                else 0.0
+            ),
+            "hgv2/bank_rollout_gap": (
+                float(int(getattr(resolved, "rollout_id_global", -1)) - int(getattr(history_gradient_bank, "source_rollout_id", -1)))
+                if history_gradient_bank is not None
+                and bool(getattr(history_gradient_bank, "valid", False))
+                and int(getattr(resolved, "rollout_id_global", -1)) >= 0
+                and int(getattr(history_gradient_bank, "source_rollout_id", -1)) >= 0
+                else 0.0
+            ),
+            "hgv2/next_bank_valid": (
+                1.0
+                if next_history_gradient_bank is not None and bool(getattr(next_history_gradient_bank, "valid", False))
+                else 0.0
+            ),
+            "hgv2/grad_prior_scale": (
+                float(getattr(self.history_gate, "grad_prior_scale").detach().item())
+                if self.is_v3_gru_history_gate
+                and getattr(self.history_gate, "grad_prior_scale", None) is not None
+                else 0.0
+            ),
             "memory_tokens": memory_tokens,
         }
         if self.is_v3_gru_history_gate and history_ema is not None:
@@ -1273,6 +1477,15 @@ class IForwardModel(nn.Module):
         stats.update({key: float(value) for key, value in timings.items()})
         for key, value in reg_stats_sum.items():
             stats[f"delta_reg/{key}_mean"] = float(value) / float(max(len(reg_terms), 1))
+        for key, value in hsp_stats_sum.items():
+            stats[str(key)] = float(value) / float(max(int(hsp_stats_count), 1))
+        for key, value in hgv2_stats_sum.items():
+            stats[str(key)] = float(value) / float(max(int(hgv2_stats_count), 1))
+        if bool(getattr(self, "history_gate_v2_enabled", False)):
+            for attr in HGV2_ATTRS:
+                stats.setdefault(f"hgv2/damage_pos_ratio/{attr}", 0.0)
+                stats.setdefault(f"hgv2/gate_harmful_mean/{attr}", 0.0)
+                stats.setdefault(f"hgv2/gate_safe_mean/{attr}", 0.0)
         return IForwardRolloutOutput(
             loss=total,
             next_state=next_state,

@@ -455,6 +455,23 @@ class IForwardStage6Bridge:
             gt_images_out=gt_images_out,
         )
 
+    def history_probe_loss(
+        self,
+        *,
+        local_state: LocalGSState,
+        batch: Dict[str, Any],
+        target_indices: List[int],
+        mask_policy: str,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        return self.render_loss(
+            local_state=local_state,
+            batch=batch,
+            target_indices=[int(x) for x in target_indices],
+            mask_policy=str(mask_policy),
+            pred_rgbs_out=None,
+            gt_images_out=None,
+        )
+
     def render_loss_for_targets(
         self,
         *,

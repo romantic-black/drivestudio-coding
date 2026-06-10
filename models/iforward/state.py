@@ -8,6 +8,8 @@ import torch
 from models.streetforward.node_states import NodeStateBackground, NodeStateDistant, NodeStateRigid
 from models.streetforward.stage6_0.local_gs_state import LocalBranchState, LocalGSState
 
+from .history_gradient_bank import HistoryGradientBank
+
 
 @dataclass
 class KeyedMambaState:
@@ -344,6 +346,7 @@ class IForwardState:
     segment_id: int
     episode_id: int
     history_ema: Optional[Any] = None
+    history_gradient_bank: Optional[HistoryGradientBank] = None
     node_state_bg: Optional[NodeStateBackground] = None
     node_state_distant: Optional[NodeStateDistant] = None
     node_state_rigid: Optional[NodeStateRigid] = None
@@ -361,6 +364,7 @@ class IForwardState:
             segment_id=int(self.segment_id),
             episode_id=int(self.episode_id),
             history_ema=None if self.history_ema is None else self.history_ema.detach(),
+            history_gradient_bank=None if self.history_gradient_bank is None else self.history_gradient_bank.detach(),
             node_state_bg=None,
             node_state_distant=None,
             node_state_rigid=None,
