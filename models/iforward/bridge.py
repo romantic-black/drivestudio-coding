@@ -99,6 +99,30 @@ class IForwardStage6Bridge:
             source_frame_idx=int(source_frame_idx),
         )
 
+    def observe_planning(
+        self,
+        *,
+        local_state: LocalGSState,
+        batch: Dict[str, Any],
+        source_indices: List[int],
+        source_frame_idx: int,
+    ) -> Dict[str, Any]:
+        old_grad_mode = getattr(self.runtime, "stage6_source_evidence_grad_mode", None)
+        had_grad_mode = hasattr(self.runtime, "stage6_source_evidence_grad_mode")
+        if had_grad_mode:
+            setattr(self.runtime, "stage6_source_evidence_grad_mode", "no_grad_v4")
+        try:
+            with torch.no_grad():
+                return self.observe(
+                    local_state=local_state,
+                    batch=batch,
+                    source_indices=source_indices,
+                    source_frame_idx=int(source_frame_idx),
+                )
+        finally:
+            if had_grad_mode:
+                setattr(self.runtime, "stage6_source_evidence_grad_mode", old_grad_mode)
+
     def build_event(
         self,
         *,

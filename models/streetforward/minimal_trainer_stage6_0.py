@@ -903,6 +903,9 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 getattr(self, "stage5_2_feat_2d_channels", getattr(self, "feat_2d_channels", 32)),
             )
         )
+        self.stage6_near_debug_check_spconv_order = bool(
+            self._cfg_get(near_cfg, "debug_check_spconv_order", False)
+        )
         if int(self.stage6_feat_2d_dim) != int(getattr(self, "stage5_2_feat_2d_channels", self.stage6_feat_2d_dim)):
             raise ValueError(
                 "Stage6_0 Phase A P0 expects struct_event_decoder.feat_2d_dim to match the V4 lifted feature dim."
@@ -1905,11 +1908,20 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             raise ValueError(f"Stage6 near bg feature row mismatch: {int(feat_2d_bg.shape[0])} vs {num_bg}")
         if obs_bg.dim() != 2 or int(obs_bg.shape[0]) != num_bg or int(obs_bg.shape[1]) != 2:
             raise ValueError(f"Stage6 near obs_bg must be [N_bg,2], got {tuple(obs_bg.shape)}")
+        near_aabb_min, near_aabb_max = self._stage6_aabb(feat_2d_bg)
+
+        def clamp_near_coords(coords: torch.Tensor) -> torch.Tensor:
+            # The near xCPE voxel layout is strict about the fixed segment AABB.
+            # Clamp only the coordinates used for grid indexing; state/render params
+            # stay unchanged so routing and supervision semantics are preserved.
+            lo = near_aabb_min.to(device=coords.device, dtype=coords.dtype)
+            hi = near_aabb_max.to(device=coords.device, dtype=coords.dtype)
+            return coords.clamp(min=lo, max=hi)
 
         feat_parts = [feat_2d_bg]
         acc_parts = [acc_w_bg.reshape(-1)]
         obs_parts = [obs_bg]
-        coords_parts = [local_state.bg.means]
+        coords_parts = [clamp_near_coords(local_state.bg.means)]
         branch_ids = [torch.zeros((num_bg,), dtype=torch.long, device=self.device)]
         params_bg = self._build_params_for_embed(local_state.bg, coord_space="world")
 
@@ -1925,7 +1937,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             feat_parts.append(feat_2d_rigid_s[rows_in_s])
             acc_parts.append(acc_w_rigid_s.reshape(-1)[rows_in_s])
             obs_parts.append(obs_rigid_s[rows_in_s])
-            coords_parts.append(route.means_world_S[route.inside_mask_S])
+            coords_parts.append(clamp_near_coords(route.means_world_S[route.inside_mask_S]))
             branch_ids.append(torch.ones((num_rigid_in,), dtype=torch.long, device=self.device))
             params_rigid_in = self._build_rigid_params_for_embed_source_world(
                 rigid_node,
@@ -1946,6 +1958,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 "path": "near",
                 "support_threshold_bg": float(getattr(self, "bg_src_backproject_support_min", 0.0)),
                 "support_threshold_rigid": float(getattr(self, "rigid_src_backproject_support_min", 0.0)),
+                "debug_check_spconv_order": bool(getattr(self, "stage6_near_debug_check_spconv_order", False)),
             },
         )
 

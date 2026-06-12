@@ -81,6 +81,32 @@ class _XCPEResidualLayer(nn.Module):
         xx = coords_bzyx[:, 3].long()
         return (((b * z + zz) * y + yy) * x + xx).long()
 
+    @classmethod
+    def _remap_features_to_input_order(
+        cls,
+        *,
+        features: torch.Tensor,
+        out_indices_bzyx: torch.Tensor,
+        input_indices_bzyx: torch.Tensor,
+        spatial_shape_zyx: torch.Tensor,
+    ) -> torch.Tensor:
+        if tuple(out_indices_bzyx.shape) != tuple(input_indices_bzyx.shape):
+            raise RuntimeError("spconv SubMConv3d changed active voxel count.")
+        out_indices = out_indices_bzyx.to(device=input_indices_bzyx.device, dtype=input_indices_bzyx.dtype)
+        if torch.equal(out_indices, input_indices_bzyx):
+            return features
+        input_hash = cls._hash_bzyx(input_indices_bzyx, spatial_shape_zyx)
+        output_hash = cls._hash_bzyx(out_indices, spatial_shape_zyx)
+        output_hash_sorted, order = torch.sort(output_hash)
+        pos = torch.searchsorted(output_hash_sorted, input_hash)
+        in_range = pos < int(output_hash_sorted.shape[0])
+        if not bool(in_range.all().item()):
+            raise RuntimeError("spconv SubMConv3d output is missing input voxels.")
+        matched = output_hash_sorted[pos] == input_hash
+        if not bool(matched.all().item()):
+            raise RuntimeError("spconv SubMConv3d output voxel set differs from input voxel set.")
+        return features.index_select(0, order.index_select(0, pos).to(device=features.device))
+
     def _neighbor_mean_3x3x3(
         self,
         voxel_feat: torch.Tensor,
@@ -156,16 +182,12 @@ class _XCPEResidualLayer(nn.Module):
                 batch_size=int(batch_size),
             )
             conv_sparse = self.conv(sp_tensor)
-            if debug_check_output_order:
-                out_indices = conv_sparse.indices.to(
-                    device=indices_bzyx.device,
-                    dtype=indices_bzyx.dtype,
-                )
-                if not torch.equal(out_indices, indices_bzyx):
-                    raise RuntimeError(
-                        "spconv SubMConv3d changed voxel order; need remap by indices."
-                    )
-            conv_out = conv_sparse.features
+            conv_out = self._remap_features_to_input_order(
+                features=conv_sparse.features,
+                out_indices_bzyx=conv_sparse.indices,
+                input_indices_bzyx=indices_bzyx,
+                spatial_shape_zyx=spatial_shape_zyx,
+            )
         else:
             conv_in = self._neighbor_mean_3x3x3(voxel_feat, unique_key_bxyz, spatial_shape_zyx)
             conv_out = self.conv(conv_in)

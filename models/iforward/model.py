@@ -11,6 +11,12 @@ import torch.nn as nn
 
 from models.streetforward.stage6_0 import DeltaPack, LocalGSState
 
+from .adc_lite import (
+    ADC_STAT_PREFIX,
+    adc_bank_stats,
+    apply_bg_clone_episode_local,
+    build_adc_lite_bank_from_losses,
+)
 from .bridge import IForwardStage6Bridge
 from .context_adapter import IForwardContextAdapter
 from .delta_ops import gate_delta_pack
@@ -427,6 +433,10 @@ class IForwardModel(nn.Module):
         self.is_v3_gru_history_gate = self.iforward_version == "v3_gru_history_gate"
         self.is_v6_point_mamba_xcpe = self.iforward_version == "v6_point_mamba_xcpe"
         self.history_safe_projection = None
+        self.adc_lite_cfg = cfg_get(iforward_cfg, "adc_lite", {}) or {}
+        self.adc_lite_enabled = bool(cfg_get(self.adc_lite_cfg, "enable", False))
+        if bool(self.adc_lite_enabled) and not self.is_v3_gru_history_gate:
+            raise ValueError("model.iforward.adc_lite.enable currently requires version=v3_gru_history_gate")
         if self.is_v3_gru_history_gate:
             self._validate_v3_scheduler_contract(config)
         debug_cfg = cfg_get(iforward_cfg, "debug", {}) or {}
@@ -705,10 +715,121 @@ class IForwardModel(nn.Module):
             episode_id=int(resolved.episode_id),
             history_ema=history_ema,
             history_gradient_bank=None,
+            adc_bank=None,
+            adc_meta=None,
             node_state_bg=node_bg,
             node_state_distant=node_distant,
             node_state_rigid=node_rigid,
         )
+
+    def _adc_lite_aabb(
+        self,
+        local_state: LocalGSState,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if not hasattr(self.bridge, "stage6_aabb"):
+            return None, None
+        aabb_min, aabb_max = self.bridge.stage6_aabb(local_state.bg.means)
+        return aabb_min.to(device=self.device), aabb_max.to(device=self.device)
+
+    def _adc_lite_near_voxel_size(self) -> Optional[float]:
+        model_cfg = cfg_get(self.config, "model", {}) or {}
+        stage6_cfg = cfg_get(model_cfg, "stage6_0", {}) or {}
+        struct_cfg = cfg_get(stage6_cfg, "struct_event_decoder", {}) or {}
+        near_cfg = cfg_get(struct_cfg, "near", {}) or {}
+        value = cfg_get(near_cfg, "voxel_size", None)
+        if value is None:
+            legacy_struct_cfg = cfg_get(model_cfg, "struct_decoder", {}) or {}
+            legacy_near_cfg = cfg_get(legacy_struct_cfg, "near", {}) or {}
+            value = cfg_get(legacy_near_cfg, "voxel_size", None)
+        return None if value is None else float(value)
+
+    def _adc_lite_rollout_start_planning(
+        self,
+        *,
+        state: IForwardState,
+        local_state: LocalGSState,
+        batch: Dict[str, Any],
+        resolved: IForwardResolvedBatch,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Dict[str, float]]:
+        cfg = getattr(self, "adc_lite_cfg", {}) or {}
+        planning_cfg = cfg_get(cfg, "planning", {}) or {}
+        enabled = bool(cfg_get(planning_cfg, "enable", False))
+        stats: Dict[str, float] = {
+            f"{ADC_STAT_PREFIX}/planning/pass_enabled": 1.0 if enabled else 0.0,
+            f"{ADC_STAT_PREFIX}/planning/pass_ran": 0.0,
+        }
+        if not enabled:
+            return None, None, stats
+        bank = getattr(state, "adc_bank", None)
+        if bank is None or not bool(getattr(bank, "valid", False)):
+            stats[f"{ADC_STAT_PREFIX}/planning/skipped_no_bank"] = 1.0
+            return None, None, stats
+        steps = list(getattr(resolved, "steps", []) or [])
+        if not steps:
+            stats[f"{ADC_STAT_PREFIX}/planning/skipped_no_steps"] = 1.0
+            return None, None, stats
+        scope = str(cfg_get(planning_cfg, "scope", "first_step")).lower()
+        if scope in {"block_enter", "block_enters"}:
+            selected = [step for step in steps if bool(getattr(step, "is_block_enter", False))]
+        elif scope in {"all", "all_steps"}:
+            selected = steps
+        else:
+            selected = steps[:1]
+        max_steps = max(1, int(cfg_get(planning_cfg, "max_steps_per_rollout", 1)))
+        selected = selected[:max_steps]
+        if not selected:
+            stats[f"{ADC_STAT_PREFIX}/planning/skipped_no_selected_steps"] = 1.0
+            return None, None, stats
+
+        n_bg = int(local_state.bg.means.shape[0])
+        support_sum: Optional[torch.Tensor] = None
+        valid_any: Optional[torch.Tensor] = None
+        used = 0
+        observe_planning = getattr(self.bridge, "observe_planning", None)
+        with torch.no_grad():
+            for step in selected:
+                if callable(observe_planning):
+                    measurement = observe_planning(
+                        local_state=local_state,
+                        batch=batch,
+                        source_indices=list(step.source_indices),
+                        source_frame_idx=int(step.source_frame_idx),
+                    )
+                else:
+                    measurement = self.bridge.observe(
+                        local_state=local_state,
+                        batch=batch,
+                        source_indices=list(step.source_indices),
+                        source_frame_idx=int(step.source_frame_idx),
+                    )
+                event = self.bridge.build_event(local_state=local_state, measurement=measurement)
+                support = getattr(event, "support_bg", None)
+                if not torch.is_tensor(support) or int(support.shape[0]) != n_bg:
+                    continue
+                support_flat = support.detach().to(device=self.device, dtype=torch.float32).reshape(n_bg, -1).mean(dim=-1)
+                valid = getattr(event, "valid_bg", None)
+                if torch.is_tensor(valid) and int(valid.shape[0]) == n_bg:
+                    valid_flat = valid.detach().to(device=self.device, dtype=torch.bool).reshape(n_bg, -1).any(dim=-1)
+                else:
+                    valid_flat = torch.isfinite(support_flat)
+                support_sum = support_flat if support_sum is None else support_sum + support_flat
+                valid_any = valid_flat if valid_any is None else (valid_any | valid_flat)
+                used += 1
+        if support_sum is None or valid_any is None or used <= 0:
+            stats[f"{ADC_STAT_PREFIX}/planning/skipped_no_support"] = 1.0
+            return None, None, stats
+        support_avg = support_sum / float(max(used, 1))
+        stats.update(
+            {
+                f"{ADC_STAT_PREFIX}/planning/pass_ran": 1.0,
+                f"{ADC_STAT_PREFIX}/planning/pass_steps": float(used),
+                f"{ADC_STAT_PREFIX}/planning/pass_visible_ratio": float(valid_any.float().mean().item()),
+                f"{ADC_STAT_PREFIX}/planning/pass_support_mean": float(support_avg[valid_any].mean().item())
+                if bool(valid_any.any().item())
+                else 0.0,
+            }
+        )
+        return support_avg, valid_any, stats
 
     @staticmethod
     def _zero_loss(ref: torch.Tensor) -> tuple[torch.Tensor, Dict[str, float]]:
@@ -1027,6 +1148,38 @@ class IForwardModel(nn.Module):
             state.node_state_bg = node_bg
             state.node_state_distant = node_distant
             state.node_state_rigid = node_rigid
+        adc_apply_stats: Dict[str, float] = {
+            f"{ADC_STAT_PREFIX}/enabled": 1.0 if bool(getattr(self, "adc_lite_enabled", False)) else 0.0,
+            f"{ADC_STAT_PREFIX}/bank_valid": 0.0,
+            f"{ADC_STAT_PREFIX}/applied": 0.0,
+            f"{ADC_STAT_PREFIX}/num_cloned_this_rollout": 0.0,
+            f"{ADC_STAT_PREFIX}/num_cloned_episode": float(
+                getattr(getattr(state, "adc_meta", None), "num_bg_clones_created_episode", 0)
+            ),
+            f"{ADC_STAT_PREFIX}/bg_count_before": float(local_state.bg.means.shape[0]),
+            f"{ADC_STAT_PREFIX}/bg_count_after": float(local_state.bg.means.shape[0]),
+        }
+        if bool(getattr(self, "adc_lite_enabled", False)):
+            adc_aabb_min, adc_aabb_max = self._adc_lite_aabb(local_state)
+            planning_support_bg, planning_valid_bg, adc_planning_stats = self._adc_lite_rollout_start_planning(
+                state=state,
+                local_state=local_state,
+                batch=batch,
+                resolved=resolved,
+            )
+            state, adc_apply_stats = apply_bg_clone_episode_local(
+                state=state,
+                cfg=getattr(self, "adc_lite_cfg", {}) or {},
+                rollout_id=int(getattr(resolved, "rollout_id_global", -1)),
+                device=self.device,
+                planning_support_bg=planning_support_bg,
+                planning_valid_bg=planning_valid_bg,
+                aabb_min=adc_aabb_min,
+                aabb_max=adc_aabb_max,
+                voxel_size=self._adc_lite_near_voxel_size(),
+            )
+            adc_apply_stats.update(adc_planning_stats)
+            local_state = state.local_gs
         memory_state = state.memory
         history_ema = state.history_ema
         if self.is_v3_gru_history_gate:
@@ -1353,6 +1506,24 @@ class IForwardModel(nn.Module):
                 history_num_refs=history_num_refs,
                 cfg=getattr(self, "history_gate_v2_cfg", {}) or {},
             )
+        next_adc_bank = None
+        if bool(getattr(self, "adc_lite_enabled", False)):
+            adc_aabb_min, adc_aabb_max = self._adc_lite_aabb(local_state)
+            next_adc_bank = build_adc_lite_bank_from_losses(
+                loss_current=final_losses["current"],
+                loss_history=final_losses.get("in_rollout_history"),
+                final_local_state=local_state,
+                cfg=getattr(self, "adc_lite_cfg", {}) or {},
+                rollout_id=int(getattr(resolved, "rollout_id_global", -1)),
+                episode_id=int(getattr(resolved, "episode_id", -1)),
+                num_current_refs=int(float(final_stats.get("current_num_refs", len(resolved.current_latest_target_indices)))),
+                num_history_refs=int(
+                    float(final_stats.get("in_rollout_history_num_refs", len(resolved.history_rollout_target_indices)))
+                ),
+                adc_meta=getattr(state, "adc_meta", None),
+                aabb_min=adc_aabb_min,
+                aabb_max=adc_aabb_max,
+            )
 
         total = (
             self.loss_current_weight * final_losses["current"]
@@ -1381,6 +1552,8 @@ class IForwardModel(nn.Module):
             episode_id=int(resolved.episode_id),
             history_ema=history_ema,
             history_gradient_bank=next_history_gradient_bank,
+            adc_bank=next_adc_bank,
+            adc_meta=getattr(state, "adc_meta", None),
             node_state_bg=state.node_state_bg,
             node_state_distant=state.node_state_distant,
             node_state_rigid=state.node_state_rigid,
@@ -1413,6 +1586,7 @@ class IForwardModel(nn.Module):
             "history_entries_after": int(history_entries_after),
             "memory_entries_before": int(memory_entries_before),
             "memory_entries_after": int(memory_entries_after),
+            **adc_apply_stats,
             "loss_weight/current": float(self.loss_current_weight),
             "loss_weight/nearby": float(self.loss_nearby_weight),
             "loss_weight/in_rollout_history": float(in_rollout_history_loss_weight),
@@ -1486,6 +1660,7 @@ class IForwardModel(nn.Module):
                 stats.setdefault(f"hgv2/damage_pos_ratio/{attr}", 0.0)
                 stats.setdefault(f"hgv2/gate_harmful_mean/{attr}", 0.0)
                 stats.setdefault(f"hgv2/gate_safe_mean/{attr}", 0.0)
+        stats.update(adc_bank_stats(next_adc_bank))
         return IForwardRolloutOutput(
             loss=total,
             next_state=next_state,

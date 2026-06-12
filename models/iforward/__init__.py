@@ -90,6 +90,13 @@ def __getattr__(name: str):
         from .history_safe_projection import IForwardHistorySafeProjection
 
         return IForwardHistorySafeProjection
+    if name in {"IForwardADCBank", "IForwardADCStateMeta"}:
+        from .adc_lite import IForwardADCBank, IForwardADCStateMeta
+
+        return {
+            "IForwardADCBank": IForwardADCBank,
+            "IForwardADCStateMeta": IForwardADCStateMeta,
+        }[name]
     if name in {"GradientBankAttr", "HistoryGradientBank", "HistoryGradientBranchBank"}:
         from .history_gradient_bank import GradientBankAttr, HistoryGradientBank, HistoryGradientBranchBank
 
@@ -135,6 +142,8 @@ __all__ = [
     "IForwardLocalConflictXcpe",
     "IForwardContextAdapter",
     "IForwardAttributeGate",
+    "IForwardADCBank",
+    "IForwardADCStateMeta",
     "IForwardGatePack",
     "IForwardGRUBranchPrepared",
     "IForwardGRUBranchState",
