@@ -23,6 +23,15 @@ class IForwardAttributeGate:
     opacity: torch.Tensor
     sh: torch.Tensor
     hidden: torch.Tensor
+    raw_means: Optional[torch.Tensor] = None
+    raw_scales: Optional[torch.Tensor] = None
+    raw_quat: Optional[torch.Tensor] = None
+    raw_opacity: Optional[torch.Tensor] = None
+    raw_sh: Optional[torch.Tensor] = None
+    raw_hidden: Optional[torch.Tensor] = None
+    mask_update: Optional[torch.Tensor] = None
+    support_now: Optional[torch.Tensor] = None
+    initialized: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -180,12 +189,45 @@ class IForwardHistoryGate(nn.Module):
     @staticmethod
     def empty_gate(ref: torch.Tensor) -> IForwardAttributeGate:
         z = ref.new_zeros((0, 1))
-        return IForwardAttributeGate(means=z, scales=z, quat=z, opacity=z, sh=z, hidden=z)
+        b = torch.zeros((0, 1), device=ref.device, dtype=torch.bool)
+        return IForwardAttributeGate(
+            means=z,
+            scales=z,
+            quat=z,
+            opacity=z,
+            sh=z,
+            hidden=z,
+            raw_means=z,
+            raw_scales=z,
+            raw_quat=z,
+            raw_opacity=z,
+            raw_sh=z,
+            raw_hidden=z,
+            mask_update=b,
+            support_now=z,
+            initialized=z,
+        )
 
     @staticmethod
     def ones_gate(event_x: torch.Tensor) -> IForwardAttributeGate:
         one = event_x.new_ones((int(event_x.shape[0]), 1))
-        return IForwardAttributeGate(means=one, scales=one, quat=one, opacity=one, sh=one, hidden=one)
+        return IForwardAttributeGate(
+            means=one,
+            scales=one,
+            quat=one,
+            opacity=one,
+            sh=one,
+            hidden=one,
+            raw_means=one,
+            raw_scales=one,
+            raw_quat=one,
+            raw_opacity=one,
+            raw_sh=one,
+            raw_hidden=one,
+            mask_update=torch.ones((int(event_x.shape[0]), 1), device=event_x.device, dtype=torch.bool),
+            support_now=one,
+            initialized=one,
+        )
 
     def _history_raw(
         self,
@@ -258,11 +300,13 @@ class IForwardHistoryGate(nn.Module):
             branch=str(branch),
         )
         if str(ablation) == "no_history_gate":
-            gate = event_x.new_ones((n, len(GATE_ATTRS)))
+            gate_raw = event_x.new_ones((n, len(GATE_ATTRS)))
+            gate = gate_raw
             if bool(self.bind_with_mask_update):
                 gate = gate * mask_update.expand_as(gate)
             hidden_weights = self.hidden_gate_weights.to(device=event_x.device, dtype=event_x.dtype).view(1, -1)
             hidden = (gate * hidden_weights).sum(dim=-1, keepdim=True)
+            raw_hidden = (gate_raw * hidden_weights).sum(dim=-1, keepdim=True)
             out = IForwardAttributeGate(
                 means=gate[:, 0:1],
                 scales=gate[:, 1:2],
@@ -270,10 +314,20 @@ class IForwardHistoryGate(nn.Module):
                 opacity=gate[:, 3:4],
                 sh=gate[:, 4:5],
                 hidden=hidden,
+                raw_means=gate_raw[:, 0:1],
+                raw_scales=gate_raw[:, 1:2],
+                raw_quat=gate_raw[:, 2:3],
+                raw_opacity=gate_raw[:, 3:4],
+                raw_sh=gate_raw[:, 4:5],
+                raw_hidden=raw_hidden,
+                mask_update=mask_update > 0,
+                support_now=support,
+                initialized=initialized,
             )
             return out, {
                 f"v3/gate/{branch}_rows": float(n),
                 f"v3/gate/{branch}_means_mean": float(out.means.detach().mean().item()),
+                f"v3/gate/{branch}_raw_means_mean": float(out.raw_means.detach().mean().item()),
                 f"v3/gate/{branch}_mask_update_ratio": float(mask_update.detach().mean().item()),
                 f"v3/gate/{branch}_bypass": 1.0,
             }
@@ -294,10 +348,12 @@ class IForwardHistoryGate(nn.Module):
         cold = initialized <= 0
         if bool(self.cold_open_uninitialized):
             gate = torch.where(cold.expand_as(gate), torch.ones_like(gate), gate)
+        gate_raw = gate
         if bool(self.bind_with_mask_update):
             gate = gate * mask_update.expand_as(gate)
         hidden_weights = self.hidden_gate_weights.to(device=event_x.device, dtype=event_x.dtype).view(1, -1)
         hidden = (gate * hidden_weights).sum(dim=-1, keepdim=True)
+        raw_hidden = (gate_raw * hidden_weights).sum(dim=-1, keepdim=True)
         out = IForwardAttributeGate(
             means=gate[:, 0:1],
             scales=gate[:, 1:2],
@@ -305,6 +361,15 @@ class IForwardHistoryGate(nn.Module):
             opacity=gate[:, 3:4],
             sh=gate[:, 4:5],
             hidden=hidden,
+            raw_means=gate_raw[:, 0:1],
+            raw_scales=gate_raw[:, 1:2],
+            raw_quat=gate_raw[:, 2:3],
+            raw_opacity=gate_raw[:, 3:4],
+            raw_sh=gate_raw[:, 4:5],
+            raw_hidden=raw_hidden,
+            mask_update=mask_update > 0,
+            support_now=support,
+            initialized=initialized,
         )
         aux = {
             f"v3/gate/{branch}_rows": float(n),
@@ -314,6 +379,7 @@ class IForwardHistoryGate(nn.Module):
             f"v3/gate/{branch}_opacity_mean": float(out.opacity.detach().mean().item()),
             f"v3/gate/{branch}_sh_mean": float(out.sh.detach().mean().item()),
             f"v3/gate/{branch}_hidden_mean": float(out.hidden.detach().mean().item()),
+            f"v3/gate/{branch}_raw_means_mean": float(out.raw_means.detach().mean().item()),
             f"v3/gate/{branch}_mask_update_ratio": float(mask_update.detach().mean().item()),
             f"v3/gate/{branch}_cold_open_ratio": float(cold.detach().to(dtype=torch.float32).mean().item()),
             f"v3/gate/{branch}_support_now_mean": float(support.detach().mean().item()),

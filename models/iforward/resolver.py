@@ -9,6 +9,7 @@ ImageRef = Tuple[int, int]
 
 IFORWARD_SCHEDULER_VERSION = "iforward_v1"
 IFORWARD_V3_SCHEDULER_VERSION = "iforward_v3_random_window"
+IFORWARD_V4_SCHEDULER_VERSION = "iforward_v4_coverage_ordered"
 IFORWARD_MODEL_FAMILY = "IForward"
 IFORWARD_CURRENT_ROLE = "final_current_recon"
 IFORWARD_HISTORY_ROLE = "final_history_replay"
@@ -319,6 +320,8 @@ class IForwardBatchResolver:
                 f"IForward requires scheduler_version={self.expected_scheduler_version!r}, got {scheduler_version!r}."
             )
         is_v3 = scheduler_version == IFORWARD_V3_SCHEDULER_VERSION
+        is_v4 = scheduler_version == IFORWARD_V4_SCHEDULER_VERSION
+        is_explicit_iforward = bool(is_v3 or is_v4)
         model_family = str(ifwd.get("model_family", request_meta.get("model_family", self.expected_model_family)))
         if model_family != self.expected_model_family:
             raise ValueError(f"IForward requires model_family={self.expected_model_family!r}, got {model_family!r}.")
@@ -390,7 +393,7 @@ class IForwardBatchResolver:
             episode_visit_idx = int(step.get("episode_visit_idx", -1))
             rollout_visit_idx = int(step.get("rollout_visit_idx", step.get("rollout_block_rank", rollout_block_rank)))
             optimizer_step_idx = int(step.get("optimizer_step_idx_in_episode", -1))
-            if is_v3:
+            if is_explicit_iforward:
                 missing = [
                     name
                     for name in (
@@ -405,9 +408,9 @@ class IForwardBatchResolver:
                     if name not in step
                 ]
                 if missing:
-                    raise ValueError(f"IForward v3 step requires explicit fields: {missing}")
+                    raise ValueError(f"IForward {scheduler_version} step requires explicit fields: {missing}")
                 if episode_visit_idx < 0 or optimizer_step_idx < 0:
-                    raise ValueError("IForward v3 requires non-negative visit and optimizer clocks.")
+                    raise ValueError(f"IForward {scheduler_version} requires non-negative visit and optimizer clocks.")
             source_indices = self._resolve_source_indices(
                 step_idx=k,
                 step=step,
@@ -485,13 +488,13 @@ class IForwardBatchResolver:
         if not input_frame_indices:
             raise ValueError("IForward requires non-empty input_frame_indices.")
         latest_input_frame_idx = int(input_frame_indices[-1])
-        if is_v3:
+        if is_explicit_iforward:
             history_rollout_indices = tuple(int(x) for x in target_indices_by_role.get(self.history_role, []))
             current_latest_indices = tuple(int(x) for x in current_indices)
             current_refs = {target_refs[int(idx)] for idx in current_indices}
             history_refs = {target_refs[int(idx)] for idx in history_rollout_indices}
             if current_refs & history_refs:
-                raise ValueError("IForward v3 history refs must be disjoint from current refs.")
+                raise ValueError(f"IForward {scheduler_version} history refs must be disjoint from current refs.")
         else:
             history_frames = set(int(x) for x in input_frame_indices[:-1])
             current_latest_indices = tuple(
@@ -545,5 +548,5 @@ class IForwardBatchResolver:
             window_revisit_count=int(ifwd.get("window_revisit_count", request_meta.get("window_revisit_count", 0))),
             unique_windows_seen=int(ifwd.get("unique_windows_seen", request_meta.get("unique_windows_seen", 0))),
             is_repeated_window=bool(ifwd.get("is_repeated_window", request_meta.get("is_repeated_window", False))),
-            history_commit_target_indices=tuple(() if is_v3 else current_indices),
+            history_commit_target_indices=tuple(() if is_explicit_iforward else current_indices),
         )

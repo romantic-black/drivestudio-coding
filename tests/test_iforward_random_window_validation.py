@@ -134,12 +134,16 @@ class _FakeValidationModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.carried_flags = []
+        self.modes = []
+        self.window_hashes_by_mode = {}
 
     def forward_rollout(self, batch, *, carried_state=None, ablation=None):
-        _ = ablation
+        mode = str(ablation or "full")
         ifwd = batch["_iforward"]
         rollout_idx = int(ifwd["rollout_idx_in_episode"])
         self.carried_flags.append(carried_state is not None)
+        self.modes.append(mode)
+        self.window_hashes_by_mode.setdefault(mode, []).append(int(ifwd["window_hash"]))
         return _FakeValidationOutput(rollout_idx=rollout_idx, ifwd=ifwd)
 
 
@@ -305,10 +309,19 @@ def test_iforward_v3_validation_carries_state_and_reports_history(monkeypatch):
 
     rollout_rows = [row for row in rows if row["split"] == "iforward_validation"]
     global_rows = [row for row in rows if row["split"] == "iforward_validation_global"]
-    assert len(rollout_rows) == 3
-    assert len(global_rows) == 1
-    assert [row["rollout_shape"] for row in rollout_rows] == ["r8b1", "r4b2", "r2b4"]
-    assert model.carried_flags == [False, True, True]
-    assert [row["history_rollout_num_refs"] for row in rollout_rows] == [0.0, 3.0, 9.0]
-    assert rollout_rows[1]["history_rollout_psnr"] == pytest.approx(12.0)
-    assert global_rows[0]["history_rollout_psnr"] == pytest.approx(12.5)
+    assert len(rollout_rows) == 6
+    assert len(global_rows) == 3
+    full_rows = [row for row in rollout_rows if row["mode"] == "full_adc"]
+    no_adc_rows = [row for row in rollout_rows if row["mode"] == "no_adc"]
+    assert [row["rollout_shape"] for row in full_rows] == ["r8b1", "r4b2", "r2b4"]
+    assert [row["rollout_shape"] for row in no_adc_rows] == ["r8b1", "r4b2", "r2b4"]
+    assert model.carried_flags == [False, True, True, False, True, True]
+    assert model.modes == ["full_adc", "full_adc", "full_adc", "no_adc", "no_adc", "no_adc"]
+    assert model.window_hashes_by_mode["full_adc"] == model.window_hashes_by_mode["no_adc"]
+    assert [row["history_rollout_num_refs"] for row in full_rows] == [0.0, 3.0, 9.0]
+    assert full_rows[1]["history_rollout_psnr"] == pytest.approx(12.0)
+    assert full_rows[1]["delta_full_minus_noadc_current_psnr"] == pytest.approx(0.0)
+    global_by_mode = {row["mode"]: row for row in global_rows}
+    assert global_by_mode["full_adc"]["history_rollout_psnr"] == pytest.approx(12.5)
+    assert global_by_mode["no_adc"]["history_rollout_psnr"] == pytest.approx(12.5)
+    assert global_by_mode["full_minus_no_adc"]["current_psnr"] == pytest.approx(0.0)

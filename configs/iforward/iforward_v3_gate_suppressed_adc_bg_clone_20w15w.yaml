@@ -1,0 +1,1002 @@
+output_name: experiment008_selector_v3_gate_suppressed_adc_bg_clone_resume2w_20w15w
+initialization:
+  phase_b_from_phase_a:
+    enable: false
+    checkpoint: ''
+    required: false
+    weights_only: true
+    export_type: stage6_0_phase_a_for_phase_b
+    reject_plain_model_state_dict: true
+data:
+  data_root: /root/autodl-tmp/nuScenes/
+  dataset: nuscenes
+  start_timestep: 0
+  end_timestep: -1
+  train_scene_ids:
+  - 14
+  - 16
+  - 24
+  - 32
+  - 40
+  - 99
+  - 107
+  - 115
+  - 123
+  - 131
+  - 139
+  - 147
+  - 155
+  - 163
+  - 171
+  - 179
+  - 195
+  - 214
+  - 17
+  - 25
+  - 33
+  - 41
+  - 49
+  - 100
+  - 108
+  - 116
+  - 124
+  - 132
+  - 140
+  - 148
+  - 156
+  - 164
+  - 172
+  - 180
+  - 188
+  - 196
+  - 215
+  - 10
+  - 18
+  - 26
+  - 34
+  - 42
+  - 93
+  - 101
+  - 109
+  - 117
+  - 125
+  - 133
+  - 141
+  - 149
+  - 157
+  - 165
+  - 173
+  - 181
+  - 189
+  - 197
+  - 216
+  - 11
+  - 19
+  - 27
+  - 35
+  - 43
+  - 94
+  - 102
+  - 110
+  - 118
+  - 126
+  - 134
+  - 142
+  - 150
+  - 158
+  - 166
+  - 174
+  - 182
+  - 190
+  - 198
+  - 217
+  - 12
+  - 20
+  - 36
+  - 44
+  - 95
+  - 103
+  - 111
+  - 119
+  - 127
+  - 135
+  - 143
+  - 151
+  - 159
+  - 167
+  - 175
+  - 183
+  - 191
+  - 199
+  - 218
+  - 13
+  - 21
+  - 29
+  - 37
+  - 45
+  - 96
+  - 104
+  - 112
+  - 120
+  - 128
+  - 136
+  - 144
+  - 152
+  - 160
+  - 168
+  - 176
+  - 184
+  - 192
+  - 200
+  - 22
+  - 30
+  - 38
+  - 46
+  - 97
+  - 105
+  - 113
+  - 121
+  - 129
+  - 137
+  - 145
+  - 153
+  - 161
+  - 169
+  - 177
+  - 185
+  - 193
+  - 201
+  - 15
+  - 23
+  - 31
+  - 39
+  - 47
+  - 98
+  - 106
+  - 114
+  - 122
+  - 130
+  - 138
+  - 146
+  - 154
+  - 162
+  - 170
+  - 178
+  - 186
+  - 194
+  eval_scene_ids:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  preload_device: cpu
+  sky_mask_semantics: one_is_sky
+  pixel_source:
+    cameras:
+    - 0
+    - 1
+    - 2
+    downscale_when_loading:
+    - 3
+    - 3
+    - 3
+    downscale: 1
+    undistort: false
+    load_sky_mask: true
+    load_dynamic_mask: true
+    load_egocar_mask: true
+    load_depth_maps: true
+    load_objects: true
+  lidar_source:
+    load_lidar: true
+  assets:
+    root: /root/autodl-tmp/streetforward_assets_pt20w_15w
+  scene_asset_cache_max_items: 32
+  segment_static_cache_max_items: 64
+  image_meta_cache_max_items: 8192
+  view_pack_cache_max_items: 1024
+dataset:
+  num_source_keyframes: 1
+  num_target_keyframes: 3
+  segment_overlap_ratio: 0.25
+  min_keyframes_per_scene: 2
+  min_keyframes_per_segment: 4
+  segment_aabb:
+  - - -15.0
+    - -10.0
+    - 0.0
+  - - 15.0
+    - 4.8
+    - 40.0
+  pointcloud:
+    type: hybrid
+    lidar_sparsity: full
+    monocular_chosen_cam_ids:
+    - 0
+    - 1
+    - 2
+    monocular_sparsity: full
+    monocular_filter_sky: true
+    monocular_depth_consistency: false
+    monocular_downscale: 2
+    monocular_dynamic_recovery_bbox_expand_xyz_m:
+    - 0.5
+    - 0.2
+    - 0.5
+    monocular_dynamic_recovery_max_points_per_instance: 5000
+    near_max_points: 200000
+    distant_max_points: 150000
+    max_dynamic_points_per_segment: 50000
+    dynamic_point_balance:
+      enable: true
+      mode: bbox_volume
+      reference_volume_m3: 13.0
+      volume_exponent: 0.5
+      min_scale: 0.25
+      max_scale: 3.0
+      min_points_per_instance: 512
+    static_instance_motion:
+      enable: true
+      traj_length_thresh_m: 0.5
+scheduler_iforward:
+  enable: true
+  version: iforward_v3_random_window
+  fail_fast: true
+  traversal:
+    fixed_scene_id: null
+    fixed_segment_id: null
+    seed: null
+    scene_order: shuffle_per_epoch
+    segment_order: shuffle_per_epoch
+    traversal_mode: episode_serial
+  episode:
+    source_mode: keyframes
+    blocks_per_episode: 8
+    episode_stride: 8
+    allow_short_last_episode: false
+    min_blocks_per_episode: 8
+    rollouts_per_episode: 8
+    block_source_frame_policy: random_within_keyframe_per_visit
+    reset_scene_state_policy: episode_begin
+  rollout:
+    window_policy: random_with_replacement
+    delivery_order_policy: chronological_inside_window
+    allow_short_final_rollout: false
+    min_blocks_per_rollout: 1
+    avoid_single_block_tail: false
+    max_inner_K: 8
+    detach_graph_after_rollout: true
+    shapes:
+    - name: r2b1
+      blocks_per_rollout: 1
+      repeats_per_block: 2
+      prob: 0.2
+    - name: r4b1
+      blocks_per_rollout: 1
+      repeats_per_block: 4
+      prob: 0.3
+    - name: r6b1
+      blocks_per_rollout: 1
+      repeats_per_block: 6
+      prob: 0.25
+    - name: r8b1
+      blocks_per_rollout: 1
+      repeats_per_block: 8
+      prob: 0.25
+    shapes_schedule:
+    - start_step: 20000
+      shapes:
+      - name: r8b1
+        blocks_per_rollout: 1
+        repeats_per_block: 8
+        prob: 0.5
+      - name: r4b2
+        blocks_per_rollout: 2
+        repeats_per_block: 4
+        prob: 0.5
+    - start_step: 30000
+      shapes:
+      - name: r8b1
+        blocks_per_rollout: 1
+        repeats_per_block: 8
+        prob: 0.3
+      - name: r4b2
+        blocks_per_rollout: 2
+        repeats_per_block: 4
+        prob: 0.4
+      - name: r2b4
+        blocks_per_rollout: 4
+        repeats_per_block: 2
+        prob: 0.3
+  evidence:
+    camera_policy: all_cams
+    cams_per_input: null
+    fixed_cam_ids: null
+    allow_camera_dropout: false
+    mask_policy: non_sky_non_egocar
+  memory:
+    observation_commit_policy: first_repeat_only
+    optimizer_memory_update_policy: every_repeat
+    reset_policy: episode_begin
+    carry_policy: across_rollouts_until_episode_end
+  loss_timing:
+    policy: rollout_final_only
+    intermediate_step_loss: false
+  supervision:
+    current:
+      enable: true
+      role_name: final_current_recon
+      frame_policy: all_rollout_input_frames
+      camera_policy: all_cams
+      required: true
+    nearby:
+      enable: true
+      role_name: final_nearby_rollout
+      scope: current_rollout_random_block
+      policy: random_unsupervised_frame_in_random_rollout_block
+      frames_per_rollout: 2
+      insufficient_policy: use_available_or_skip_if_none
+      camera_policy: all_cams
+      max_refs_per_rollout: 24
+      add_to_evidence: false
+      mask_policy: non_sky_non_egocar
+    history_replay:
+      enable: true
+      role_name: final_history_replay
+      camera_policy: all_cams
+      max_frames_per_rollout: 8
+  leakage_check:
+    enable: true
+    same_scene_segment_required: true
+    forbid_test_refs_in_train: true
+    target_role_count_match_required: true
+    nearby_not_in_evidence: true
+    nearby_not_input_frame: true
+    current_supervision_must_cover_all_inputs: true
+  preload:
+    emit_hints: true
+    warm_current_rollout_refs: true
+    warm_next_rollout_refs: true
+    warm_episode_chain: false
+    hint_scope_for_exact_refs: v9_role_refs
+scheduler_v9:
+  enable: false
+  phase: phase_A_block_local_unroll
+  phase_A:
+    nearby_supervision:
+      enable: false
+model:
+  stage: '6_0'
+  phase: phase_A_block_local_unroll
+  backprojector_version: v4
+  scale_init_value: 0.1
+  sh_degree: 1
+  voxel_size: 0.2
+  sparseConv_outdim: 16
+  feat_2d_channels: 16
+  feat_2d_downscale: 1
+  param_embed_dim: 32
+  offset_gru_hidden_dim: 32
+  feature_extractor:
+    type: dinov2_unet_fusion
+    dino:
+      model_name: vit_base_patch14_reg4_dinov2
+      pretrained: true
+      freeze: true
+      weights_path: null
+      out_channels: 16
+      intermediate_layers:
+      - 4
+      - 8
+      - 11
+      pad_to_patch_multiple: 14
+    residual_unet:
+      in_channels: 6
+      feat_channels: 16
+      base_channels: 16
+      feature_downscale: 1
+      depth: 4
+      bilinear: true
+    fusion:
+      hidden_channels: 32
+      out_channels: 16
+  use_fused_cuda_backproject_v2: true
+  use_fused_cuda_backproject_v3: true
+  use_fused_cuda_backproject_v4: true
+  fused_cuda_backproject_v4_force_fallback: false
+  struct_decoder:
+    type: routed_near_far
+    feat_2d_channels: 16
+    param_embed_dim: 32
+    branch_embed_dim: 8
+    support_embed_dim: 8
+    history_embed_dim: 16
+    token:
+      use_2d_feat: true
+      use_support: true
+      use_branch_embed: true
+      use_param_embed: true
+      use_anchor_rgb: false
+      use_hidden_state: false
+      zero_invalid_2d_feat: true
+    near:
+      type: xcpe
+      branches:
+      - bg
+      - rigid_in
+      channels: 32
+      voxel_size: 0.2
+      sparse_backend: spconv
+      clamp_grid_coord: false
+      xcpe:
+        num_layers: 2
+        kernel_size: 3
+        residual_scale_init: 0.005
+        norm: layernorm
+        act: gelu
+    far:
+      type: mlp
+      branches:
+      - distant
+      - rigid_out
+      channels: 32
+      hidden_dim: 32
+      num_layers: 2
+      norm: layernorm
+      act: gelu
+      history_embed:
+        enable: false
+    knn_attention:
+      enable: true
+      k: 8
+  iforward:
+    version: v3_gru_history_gate
+    debug:
+      enable_memory_aux_stats: false
+      log_per_k_metrics: false
+      log_per_k_aux_interval: 1000
+      nvtx_ranges: false
+    point_gru:
+      hidden_dim: 32
+      ctx_dim: 32
+      dt_clip: 32
+      hard_valid_required: true
+      hard_support_min_optimizer: 0.0
+    history_memory:
+      record_on: block_exit
+      support_min:
+        bg: 0.0
+        distant: 0.0
+        rigid: 0.0
+      support:
+        fast_ema_beta_visible: 0.35
+        fast_ema_beta_invisible: 0.6
+        slow_ema_beta_visible: 0.9
+        slow_ema_beta_invisible: 0.95
+      residual:
+        fast_error_beta: 0.35
+        slow_error_beta: 0.9
+      update:
+        target: means
+        record_on: every_repeat
+        fast_ema_beta: 0.45
+        slow_ema_beta: 0.92
+    history_gate:
+      cold_open_uninitialized: true
+      bind_with_mask_update: true
+      history_embed_dim: 16
+      hidden_dim: 32
+      branch_embed_dim: 8
+      min_gate:
+        means: 0.03
+        scales: 0.03
+        quat: 0.01
+        opacity: 0.05
+        sh: 0.05
+      init_bias:
+        means: -1.4
+        scales: -1.7
+        quat: -2.0
+        opacity: -0.4
+        sh: 0.4
+      branch_bias:
+        bg:
+          means: 0.0
+          scales: 0.0
+          quat: -0.2
+          opacity: 0.0
+          sh: 0.1
+        distant:
+          means: -1.0
+          scales: -0.3
+          quat: -1.0
+          opacity: 0.0
+          sh: 0.0
+        rigid:
+          means: -0.2
+          scales: -0.2
+          quat: -0.3
+          opacity: 0.1
+          sh: 0.2
+      hidden_gate:
+        mode: weighted_sum
+        weights:
+          means: 0.2
+          scales: 0.0
+          quat: 0.0
+          opacity: 0.3
+          sh: 0.5
+    adc_lite:
+      enable: true
+      version: gate_suppressed_update_v1
+      scope:
+        branch: bg
+        operation: clone
+        lifetime: episode_local
+        apply_at: rollout_start
+        build_bank_at: rollout_end
+      start_step: 20000
+      require_history_for_clone: true
+      enable_policy:
+        min_blocks_per_rollout: 1
+        log_only_before_start: true
+      bank:
+        dtype: fp16
+        min_score_topk_mean: 1.0e-3
+      score:
+        type: relative_gate_suppressed_update
+        gate_ref:
+          mode: median
+        formula:
+          delta_demand_norm_times_relative_gate_suppression: true
+        attr_normalize:
+          mode: rollout_percentile
+          percentile: 95.0
+          eps: 1.0e-8
+        attr_merge: rms
+        repeat_merge: max
+        score_clip: 10.0
+      candidate:
+        exclude_clones_as_parent: true
+        exclude_boundary_parents: true
+        boundary_margin_eps: 1.0e-4
+        alpha_min: 0.005
+        scale_min: 1.0e-4
+        min_score: 1.0e-4
+        min_score_percentile: 95.0
+        min_count: 2
+        require_history: true
+        require_support: true
+        min_support: 0.2
+        require_low_gate: true
+        gate_percentile_max: 50.0
+        require_high_delta_demand: true
+        delta_demand_percentile_min: 50.0
+        require_gate_contrast: true
+        min_gate_contrast: 0.03
+      planning:
+        enable: true
+        scope: first_step
+        max_steps_per_rollout: 1
+        require_visible: true
+        min_support: 0.2
+        support_score_weight: 0.0
+        support_normalize_percentile: 95.0
+        eps: 1.0e-8
+      budget:
+        max_new_points_per_rollout: 1000
+        max_new_points_per_episode: 8000
+        max_total_bg_points_episode: 208000
+        cooldown_rollouts: 2
+      clone:
+        opacity_split: alpha_preserving
+        mean_jitter_std_scale: 0.05
+        aabb_eps: 1.0e-5
+        scale_init: parent
+        quat_init: parent
+        sh_init: parent
+        local_hidden_init: parent
+        gru_memory_init: zero_unseen
+        history_ema_init: cold_open
+        hgv2_gradient_init: zero_invalid
+      logging:
+        enable: true
+        log_suppression_score: true
+        log_parent_stats: true
+        log_clone_counts: true
+        log_alpha_mass_check: true
+    history_gate_v2:
+      enable: true
+      source: previous_rollout_history_gradient
+      bank:
+        update_on: rollout_end
+        clear_on_episode_reset: true
+        if_no_history_loss: invalidate
+        storage: full_state
+        dtype: fp16
+        normalize: per_row
+        min_grad_norm: 1.0e-8
+      attrs:
+        means: true
+        scales: true
+        quat: true
+        opacity: true
+        sh: true
+      features:
+        include_cos: true
+        include_pos: true
+        include_neg: true
+        include_log_norm: true
+        include_valid: true
+        grad_embed_dim: 16
+        grad_prior_scale_init: 0.0
+      auxiliary_loss:
+        enable: true
+        weight: 1.0
+        close_weight: 0.02
+        safe_open_weight: 0.002
+        tau_cos: 0.05
+        tau_safe: 0.10
+        detach_damage: true
+        attr_weights:
+          means: 0.25
+          scales: 0.25
+          quat: 0.10
+          opacity: 1.00
+          sh: 1.00
+    history_safe_projection:
+      enable: false
+      mode: damage_loss_only
+      probe:
+        frequency: block_enter
+        reuse_within_block: true
+        frames_per_block: 1
+        cams_per_frame: 1
+        mask_policy: non_sky_non_egocar
+      attrs:
+        means: true
+        scales: true
+        opacity: true
+        sh: true
+        quat: false
+      projection:
+        strength:
+          start_step: 0
+          warmup_steps: 0
+          start_value: 0.0
+          end_value: 0.0
+        attr_strength_scale:
+          means: 1.0
+          scales: 1.0
+          opacity: 1.0
+          sh: 1.0
+        tau_norm:
+          means: 0.0
+          scales: 0.0
+          opacity: 0.0
+          sh: 0.0
+      damage_loss:
+        enable: true
+        type: cosine_conflict
+        weight: 0.01
+        attr_weights:
+          means: 1.0
+          scales: 0.5
+          opacity: 0.7
+          sh: 0.7
+    memory:
+      point_mamba:
+        enable: true
+        model_dim: 16
+        output_dim: 16
+        state_dim: 4
+        conv_kernel: 2
+        dense_point_memory: true
+        branches:
+          bg: true
+          distant: true
+          rigid: true
+        write_policy:
+          update_optimizer_memory: every_repeat
+          hard_valid_required: true
+          hard_support_min_commit: 0.0
+          hard_support_min_optimizer: 0.0
+          learnable_soft_gate: false
+      cell_mamba:
+        enable: false
+      global_mamba:
+        enable: false
+    local_conflict:
+      enable: true
+      type: post_event_xcpe
+      sparse_backend: spconv
+      hidden_dim: 32
+      output_dim: 32
+      num_blocks: 1
+      kernel_size: 3
+      voxel_size: 0.25
+      route:
+        bg_near: xcpe
+        rigid_near: xcpe_shared_with_bg
+        distant: point_mlp
+    context_adapter:
+      enable: true
+      output_dim: 32
+      output_scale_init: 1.0
+      output_scale_learnable: false
+      zero_last: false
+    short_window_history:
+      max_entries: 0
+      max_memory_entries: 0
+    loss:
+      current:
+        weight: 1.0
+      nearby:
+        weight: 0.2
+      in_rollout_history:
+        weight: 0.8
+        warmup:
+          enable: true
+          start_step: 0
+          steps: 40000
+          start_factor: 0.25
+      short_window_history:
+        weight: 1.0
+      delta_regularization:
+        weight: 1.0
+    trainability:
+      train_memory: true
+      train_point_gru: true
+      train_history_gate: true
+      train_point_mamba: true
+      train_local_conflict_xcpe: true
+      train_context_adapter: true
+      train_vsm_ctx_adapter: true
+      train_measurement_frontend: true
+      unfreeze_updater_base_after_step: 0
+      train_stage6_struct_decoder: true
+      unfreeze_struct_decoder_after_step: 0
+  stage6_0:
+    fail_fast: true
+    phase_a_mode: from_scratch
+    base_measurement:
+      type: stage5_4_v4
+      mode: from_scratch
+      require_fused_v4: true
+      require_obs_code: true
+      obs_code_dim: 2
+      source_evidence_grad_mode: train_2d_detach_alpha
+      train_2d_frontend: true
+      train_residual_unet: true
+      train_fusion_neck: true
+      train_v4_lift: true
+      train_dinov2: false
+      detach_v4_outputs: false
+    local_rollout:
+      source: scheduler_iforward
+      use_scheduler_inner_K: true
+      local_G_no_detach_between_steps: true
+      detach_persistent_state_at_block_start: true
+      writeback_policy: none
+      writeback_after_optimizer_step: false
+    render:
+      grouped_multiview_train: true
+    struct_event_decoder:
+      enable: true
+      event_dim: 32
+      feat_2d_dim: 16
+      support_embed_dim: 4
+      branch_embed_dim: 4
+      token:
+        token_dim: 32
+        zero_invalid_2d_feat: true
+        use_2d_feat: true
+        use_support: true
+        use_branch_embed: true
+        use_param_obs_embed: true
+      param_obs_codec:
+        enable: true
+        raw_param_mode: stage5_normalize_params_17
+        obs_code_dim: 2
+        support_dim: 2
+        branch_embed_dim: 4
+        output_dim: 16
+        detach_params: true
+        detach_obs_code: true
+        detach_acc_w: true
+        norm: layernorm
+        activation: gelu
+      near:
+        type: xcpe
+        sparse_backend: spconv
+        num_blocks: 2
+        kernel_size: 3
+        voxel_size: 0.25
+        debug_check_spconv_order: true
+      far:
+        type: point_mlp
+        hidden_dim: 32
+        num_layers: 2
+    event_encoder:
+      enable: false
+      mode: disabled_direct_concat_mlp
+    current_context_adapter:
+      enable: false
+    posterior_updater:
+      enable: true
+      input_event: true
+      input_current_ctx: false
+      input_vsm_ctx: true
+      hidden_dim: 32
+      event_dim: 32
+      stage_hidden_dim: 32
+      phase_b_hooks:
+        accept_vsm_ctx: true
+        vsm_ctx_dim: 32
+        vsm_ctx_adapter_init: zero_last
+      branch_scope:
+        bg:
+          enable: true
+          update_means: true
+          update_scales: true
+          update_quat: true
+          update_opacity: true
+          update_sh: true
+        distant:
+          enable: true
+          update_means: false
+          update_scales: false
+          update_quat: false
+          update_opacity: true
+          update_sh: true
+        rigid:
+          enable: true
+          update_means: true
+          update_scales: true
+          update_quat: true
+          update_opacity: true
+          update_sh: true
+      clamps:
+        means_max_step_m: 0.25
+        scales_log_max_step: 0.08
+        quat_axis_angle_max_step_rad: 0.08
+        opacity_logit_max_step: 0.25
+        sh_max_step: 0.1
+        hidden_max_step: 1.0
+    vsm:
+      enable: false
+    query_decoder:
+      enable: false
+  branches:
+    bg:
+      src_backproject_support_min: 0.01
+    distant:
+      src_backproject_support_min: 0.01
+    rigid:
+      src_backproject_support_min: 0.01
+  history_memory:
+    enable: false
+  update_gate:
+    enable: false
+  view_transient:
+    enable: false
+losses:
+  phase_a:
+    block_render:
+      enable: true
+      weight: 1.0
+      step_gamma: 1.0
+      mask_policy: non_sky_non_egocar
+    nearby_render:
+      enable: true
+      weight: 0.1
+      warmup_steps: 1
+      final_step_only: true
+      mask_policy: non_sky_non_egocar
+    regularization:
+      delta_l2_weight: 0.001
+      opacity_delta_l2_weight: 0.0005
+      sh_delta_l2_weight: 0.0005
+      scale_barrier_weight: 0.002
+    disabled:
+      query_observation: true
+      prefix_render: true
+  photometric:
+    exclude_sky_region: true
+  rgb:
+    w: 1.0
+  ssim:
+    w: 0.05
+  mask:
+    w: 0.02
+    opacity_loss_type: bce
+    require_sky_mask: true
+  opacity_entropy:
+    w: 0.0
+optimizer:
+  type: adamw
+  lr:
+    default: 0.0001
+    point_gru: 0.0001
+    history_gate: 0.0001
+    point_mamba: 0.0001
+    local_conflict_xcpe: 0.0001
+    context_adapter: 0.0001
+    vsm_ctx_adapter: 0.0002
+    stage6_posterior_updater_base: 0.0001
+    stage6_struct_decoder: 0.0001
+    measurement_frontend: 0.0001
+    stage6_measurement_frontend_residual_unet: 0.0001
+    stage6_measurement_frontend_fusion_neck: 0.0001
+  betas:
+  - 0.9
+  - 0.95
+  eps: 1.0e-08
+  weight_decay: 0.0001
+training:
+  max_iterations: 600000
+  start_step: 20001
+  resume_checkpoint: /root/autodl-tmp/outputs/iforward_stage1_0/experiment008_gate_suppressed_adc_bg_clone_fromscratch_20w15w/checkpoints/iforward_v3_gru_history_gate_step20000.pt
+  iforward:
+    allow_missing_carried_state_reset: false
+  log_interval: 50
+  save_checkpoint_freq: 10000
+  seed: 41
+  amp:
+    enable: false
+  grad_clip:
+    enable: true
+    max_norm: 1.0
+validation_v7:
+  eval_enable: false
+validation_v8:
+  eval_enable: false
+validation_v9:
+  enable: false
+iforward_validation:
+  enable: true
+  run_at_train_start: true
+  interval_steps: 1000
+  segments_per_scene: 1
+  rollouts_per_segment: 5
+  tensorboard_images:
+    enable: true
+    max_images_per_role: 2
+eval:
+  enable_psnr: true
+  run_test_at_end: false
+  metric_interval: 10
+  heavy_metric_interval: 50
+logging:
+  output_root: /root/autodl-tmp/outputs
+  project: iforward_stage1_0
+  log_dir: null
+  image_interval_blocks: 500
+  image_interval: 500
+  image_trigger:
+    mode: raw_step_interval
+    interval_blocks_equiv: 500
+  enable_jsonl_metrics: true
+  metrics_history_append: false
+  train_step_metrics_interval: 50
+  train_monitor:
+    enable_heavy_metrics: false
+    include_per_view_metrics: false
+    include_extra_result_metrics: false
+    enable_low_psnr_image_dump: false
+  use_tensorboard: true
+  performance:
+    enable: true
+    phase_timing: false
+    cuda_memory: true
+    cleanup_metrics_interval_steps: 0
+    live_tensor_summary_interval_steps: 0
+    live_tensor_summary_topk: 0
+    empty_cache_interval_steps: 0
+log_dir: null

@@ -13,9 +13,12 @@ from models.streetforward.stage6_0 import DeltaPack, LocalGSState
 
 from .adc_lite import (
     ADC_STAT_PREFIX,
+    GateSuppressedADCAccumulator,
     adc_bank_stats,
     apply_bg_clone_episode_local,
     build_adc_lite_bank_from_losses,
+    build_gate_suppressed_adc_bank,
+    ensure_adc_meta_for_state,
 )
 from .bridge import IForwardStage6Bridge
 from .context_adapter import IForwardContextAdapter
@@ -34,7 +37,7 @@ from .iforward_v6_state import IForwardV6MemoryState
 from .local_conflict_xcpe import IForwardLocalConflictXcpe
 from .memory import IForwardMemoryStepContext, IForwardSceneMemory
 from .point_mamba_memory import IForwardPointMambaMemory
-from .resolver import IFORWARD_V3_SCHEDULER_VERSION, IForwardBatchResolver, IForwardResolvedBatch
+from .resolver import IFORWARD_V3_SCHEDULER_VERSION, IFORWARD_V4_SCHEDULER_VERSION, IForwardBatchResolver, IForwardResolvedBatch
 from .state import IForwardMemoryState, IForwardShortWindowHistory, IForwardState
 from .utils import cfg_ensure_child, cfg_get, cfg_set, clone_config
 
@@ -379,10 +382,11 @@ class IForwardModel(nn.Module):
         if not bool(cfg_get(scheduler_cfg, "enable", False)):
             return
         version = str(cfg_get(scheduler_cfg, "version", ""))
-        if version == IFORWARD_V3_SCHEDULER_VERSION:
+        if version in {IFORWARD_V3_SCHEDULER_VERSION, IFORWARD_V4_SCHEDULER_VERSION}:
             return
         raise ValueError(
-            "IForward v3 requires scheduler_iforward.version=iforward_v3_random_window "
+            "IForward v3/v4 requires scheduler_iforward.version=iforward_v3_random_window "
+            "or iforward_v4_coverage_ordered "
             f"when scheduler_iforward is enabled, got {version!r}."
         )
 
@@ -409,8 +413,8 @@ class IForwardModel(nn.Module):
             else:
                 scheduler_cfg = cfg_get(config, "scheduler_iforward", {}) or {}
                 scheduler_version = str(cfg_get(scheduler_cfg, "version", "iforward_v1"))
-                if scheduler_version == IFORWARD_V3_SCHEDULER_VERSION:
-                    self.resolver = IForwardBatchResolver(expected_scheduler_version=IFORWARD_V3_SCHEDULER_VERSION)
+                if scheduler_version in {IFORWARD_V3_SCHEDULER_VERSION, IFORWARD_V4_SCHEDULER_VERSION}:
+                    self.resolver = IForwardBatchResolver(expected_scheduler_version=scheduler_version)
                 else:
                     self.resolver = IForwardBatchResolver()
 
@@ -435,6 +439,11 @@ class IForwardModel(nn.Module):
         self.history_safe_projection = None
         self.adc_lite_cfg = cfg_get(iforward_cfg, "adc_lite", {}) or {}
         self.adc_lite_enabled = bool(cfg_get(self.adc_lite_cfg, "enable", False))
+        self.adc_lite_version = str(cfg_get(self.adc_lite_cfg, "version", "fixed_score_v1"))
+        self.adc_lite_gate_suppressed = self.adc_lite_version.lower() in {
+            "gate_suppressed_update",
+            "gate_suppressed_update_v1",
+        }
         if bool(self.adc_lite_enabled) and not self.is_v3_gru_history_gate:
             raise ValueError("model.iforward.adc_lite.enable currently requires version=v3_gru_history_gate")
         if self.is_v3_gru_history_gate:
@@ -637,8 +646,10 @@ class IForwardModel(nn.Module):
         if self.is_v3_gru_history_gate:
             self.allowed_ablations = {
                 "full",
+                "full_adc",
                 "no_gru",
                 "no_history_gate",
+                "no_adc",
                 "freeze_write",
             }
         elif self.is_v6_point_mamba_xcpe:
@@ -742,6 +753,34 @@ class IForwardModel(nn.Module):
             legacy_near_cfg = cfg_get(legacy_struct_cfg, "near", {}) or {}
             value = cfg_get(legacy_near_cfg, "voxel_size", None)
         return None if value is None else float(value)
+
+    def _adc_lite_policy_stats(
+        self,
+        *,
+        global_step: int,
+        resolved: IForwardResolvedBatch,
+    ) -> Tuple[bool, Dict[str, float]]:
+        cfg = getattr(self, "adc_lite_cfg", {}) or {}
+        policy_cfg = cfg_get(cfg, "enable_policy", {}) or {}
+        start_step = int(cfg_get(cfg, "start_step", 0))
+        min_blocks = int(cfg_get(policy_cfg, "min_blocks_per_rollout", 1))
+        blocks = int(len(getattr(resolved, "window_block_ids", []) or []))
+        if blocks <= 0:
+            blocks = len({int(getattr(step, "block_id", idx)) for idx, step in enumerate(getattr(resolved, "steps", []) or [])})
+        step_ok = int(global_step) >= int(start_step)
+        blocks_ok = int(blocks) >= int(min_blocks)
+        allowed = bool(step_ok and blocks_ok)
+        return allowed, {
+            f"{ADC_STAT_PREFIX}/policy/start_step": float(start_step),
+            f"{ADC_STAT_PREFIX}/policy/min_blocks_per_rollout": float(min_blocks),
+            f"{ADC_STAT_PREFIX}/policy/blocks_per_rollout": float(blocks),
+            f"{ADC_STAT_PREFIX}/policy/step_ok": 1.0 if bool(step_ok) else 0.0,
+            f"{ADC_STAT_PREFIX}/policy/blocks_ok": 1.0 if bool(blocks_ok) else 0.0,
+            f"{ADC_STAT_PREFIX}/policy/apply_build_allowed": 1.0 if bool(allowed) else 0.0,
+            f"{ADC_STAT_PREFIX}/policy/log_only_before_start": (
+                1.0 if bool(cfg_get(policy_cfg, "log_only_before_start", False)) else 0.0
+            ),
+        }
 
     def _adc_lite_rollout_start_planning(
         self,
@@ -938,6 +977,28 @@ class IForwardModel(nn.Module):
         appended = len(pred_rgbs) - before
         image_refs.extend([tuple(int(x) for x in resolved.target_refs[int(i)]) for i in nearby_indices[:appended]])
         image_roles.extend(["nearby"] * int(appended))
+        eval_role_stats: Dict[str, float] = {}
+        for eval_role in ("eval_recon_all_blocks", "eval_nearby_nvs_all_blocks"):
+            eval_indices = list(resolved.target_indices_by_role.get(eval_role, ()))
+            if not eval_indices:
+                continue
+            before = len(pred_rgbs)
+            _eval_loss, eval_stats = self.bridge.render_loss(
+                local_state=local_state,
+                batch=batch,
+                target_indices=eval_indices,
+                mask_policy=str(getattr(self.bridge, "current_mask_policy", "non_sky_non_egocar")),
+                pred_rgbs_out=pred_rgbs,
+                gt_images_out=gt_images,
+            )
+            appended = len(pred_rgbs) - before
+            image_refs.extend([tuple(int(x) for x in resolved.target_refs[int(i)]) for i in eval_indices[:appended]])
+            image_roles.extend([eval_role] * int(appended))
+            safe_prefix = str(eval_role).replace("/", "_")
+            for metric in ("psnr", "ssim", "l1", "valid_ratio", "num_refs", "num_metric_refs", "metric_valid"):
+                value = eval_stats.get(metric)
+                if value is not None and math.isfinite(float(value)):
+                    eval_role_stats[f"{safe_prefix}_{metric}"] = float(value)
         losses = {
             "current": current_loss,
             "current_latest": current_loss,
@@ -966,6 +1027,7 @@ class IForwardModel(nn.Module):
             "nearby_num_refs": float(nearby_stats.get("num_refs", len(resolved.nearby_target_indices))),
             "short_window_history_num_refs": float(short_history_stats.get("num_refs", 0.0)),
         }
+        stats.update(eval_role_stats)
         for prefix, item in (
             ("current", current_stats),
             ("nearby", nearby_stats),
@@ -1116,6 +1178,8 @@ class IForwardModel(nn.Module):
         ablation_name = str(ablation or "full")
         if ablation_name not in self.allowed_ablations:
             raise ValueError(f"unsupported IForward ablation={ablation_name!r}")
+        module_ablation_name = "full" if ablation_name in {"full_adc", "no_adc"} else ablation_name
+        adc_disabled_by_ablation = ablation_name == "no_adc"
         resolved = self.resolver.resolve(batch)
         global_step = int(batch.get("global_step", 0) or 0)
         in_rollout_history_loss_weight = self._history_rollout_loss_weight_for_step(global_step)
@@ -1150,7 +1214,10 @@ class IForwardModel(nn.Module):
             state.node_state_rigid = node_rigid
         adc_apply_stats: Dict[str, float] = {
             f"{ADC_STAT_PREFIX}/enabled": 1.0 if bool(getattr(self, "adc_lite_enabled", False)) else 0.0,
+            f"{ADC_STAT_PREFIX}/disabled_by_ablation": 1.0 if bool(adc_disabled_by_ablation) else 0.0,
             f"{ADC_STAT_PREFIX}/bank_valid": 0.0,
+            f"{ADC_STAT_PREFIX}/bank_dropped_without_apply": 0.0,
+            f"{ADC_STAT_PREFIX}/bank_shape_mismatch": 0.0,
             f"{ADC_STAT_PREFIX}/applied": 0.0,
             f"{ADC_STAT_PREFIX}/num_cloned_this_rollout": 0.0,
             f"{ADC_STAT_PREFIX}/num_cloned_episode": float(
@@ -1158,28 +1225,52 @@ class IForwardModel(nn.Module):
             ),
             f"{ADC_STAT_PREFIX}/bg_count_before": float(local_state.bg.means.shape[0]),
             f"{ADC_STAT_PREFIX}/bg_count_after": float(local_state.bg.means.shape[0]),
+            "adc_suppressed/parent_gate_mean": 0.0,
+            "adc_suppressed/parent_delta_demand_mean": 0.0,
+            "adc_suppressed/parent_support_mean": 0.0,
+            "adc_suppressed/selected_parent_suppression_rank_percentile": 0.0,
         }
         if bool(getattr(self, "adc_lite_enabled", False)):
-            adc_aabb_min, adc_aabb_max = self._adc_lite_aabb(local_state)
-            planning_support_bg, planning_valid_bg, adc_planning_stats = self._adc_lite_rollout_start_planning(
-                state=state,
+            adc_policy_allowed, adc_policy_stats = self._adc_lite_policy_stats(global_step=global_step, resolved=resolved)
+            state.adc_meta = ensure_adc_meta_for_state(
                 local_state=local_state,
-                batch=batch,
-                resolved=resolved,
-            )
-            state, adc_apply_stats = apply_bg_clone_episode_local(
-                state=state,
-                cfg=getattr(self, "adc_lite_cfg", {}) or {},
-                rollout_id=int(getattr(resolved, "rollout_id_global", -1)),
+                adc_meta=getattr(state, "adc_meta", None),
                 device=self.device,
-                planning_support_bg=planning_support_bg,
-                planning_valid_bg=planning_valid_bg,
-                aabb_min=adc_aabb_min,
-                aabb_max=adc_aabb_max,
-                voxel_size=self._adc_lite_near_voxel_size(),
             )
-            adc_apply_stats.update(adc_planning_stats)
-            local_state = state.local_gs
+            bank = getattr(state, "adc_bank", None)
+            bank_valid = bank is not None and bool(getattr(bank, "valid", False))
+            if bool(adc_disabled_by_ablation) or not bool(adc_policy_allowed):
+                state.adc_bank = None
+                adc_apply_stats.update(adc_policy_stats)
+                adc_apply_stats.update(
+                    {
+                        f"{ADC_STAT_PREFIX}/bank_valid": 1.0 if bool(bank_valid) else 0.0,
+                        f"{ADC_STAT_PREFIX}/bank_dropped_without_apply": 1.0 if bool(bank_valid) else 0.0,
+                        f"{ADC_STAT_PREFIX}/num_cloned_episode": float(state.adc_meta.num_bg_clones_created_episode),
+                    }
+                )
+            else:
+                adc_aabb_min, adc_aabb_max = self._adc_lite_aabb(local_state)
+                planning_support_bg, planning_valid_bg, adc_planning_stats = self._adc_lite_rollout_start_planning(
+                    state=state,
+                    local_state=local_state,
+                    batch=batch,
+                    resolved=resolved,
+                )
+                state, adc_apply_stats = apply_bg_clone_episode_local(
+                    state=state,
+                    cfg=getattr(self, "adc_lite_cfg", {}) or {},
+                    rollout_id=int(getattr(resolved, "rollout_id_global", -1)),
+                    device=self.device,
+                    planning_support_bg=planning_support_bg,
+                    planning_valid_bg=planning_valid_bg,
+                    aabb_min=adc_aabb_min,
+                    aabb_max=adc_aabb_max,
+                    voxel_size=self._adc_lite_near_voxel_size(),
+                )
+                adc_apply_stats.update(adc_planning_stats)
+                adc_apply_stats.update(adc_policy_stats)
+                local_state = state.local_gs
         memory_state = state.memory
         history_ema = state.history_ema
         if self.is_v3_gru_history_gate:
@@ -1214,6 +1305,13 @@ class IForwardModel(nn.Module):
             "delta_reg_ms": 0.0,
             "final_render_ms": 0.0,
         }
+        adc_suppression_accumulator = None
+        if (
+            bool(getattr(self, "adc_lite_enabled", False))
+            and bool(getattr(self, "adc_lite_gate_suppressed", False))
+            and not bool(adc_disabled_by_ablation)
+        ):
+            adc_suppression_accumulator = GateSuppressedADCAccumulator.from_local_state(local_state)
 
         global_step = int(batch.get("global_step", 0))
         for step_pos, step in enumerate(resolved.steps):
@@ -1263,7 +1361,7 @@ class IForwardModel(nn.Module):
                         local_state=local_state,
                         state=memory_state,
                         step_context=step_context,
-                        ablation=ablation_name,
+                        ablation=module_ablation_name,
                     )
                     memory_aux.update(gru_read_aux)
                     short_entries = []
@@ -1273,7 +1371,7 @@ class IForwardModel(nn.Module):
                         local_state=local_state,
                         memory_state=memory_state,
                         step_context=step_context,
-                        ablation=ablation_name,
+                        ablation=module_ablation_name,
                     )
                     short_entries = []
                 else:
@@ -1285,7 +1383,7 @@ class IForwardModel(nn.Module):
                         step_context=step_context,
                         commit_observation_memory=bool(step.commit_observation_memory),
                         update_optimizer_memory=bool(step.update_optimizer_memory),
-                        ablation=ablation_name,
+                        ablation=module_ablation_name,
                     )
             timings["memory_ms"] += (time.perf_counter() - t0) * 1000.0
             working_history = working_history.commit_memory_entries(
@@ -1352,8 +1450,16 @@ class IForwardModel(nn.Module):
                         history_ema=history_ema,
                         local_state=local_state,
                         grad_features=hgv2_features,
-                        ablation=ablation_name,
+                        ablation=module_ablation_name,
                     )
+                    if adc_suppression_accumulator is not None:
+                        update_aux.update(
+                            adc_suppression_accumulator.accumulate_from_bg_delta_gate(
+                                delta_bg=delta_scoped.bg,
+                                gate_bg=gate_pack.bg,
+                                cfg=getattr(self, "adc_lite_cfg", {}) or {},
+                            )
+                        )
                     hgv2_aux: Dict[str, float] = {}
                     if hgv2_features is not None and float(getattr(self, "loss_hgv2_gate_weight", 0.0)) > 0.0:
                         hgv2_loss, hgv2_aux = history_gate_v2_auxiliary_loss(
@@ -1415,7 +1521,7 @@ class IForwardModel(nn.Module):
                         delta_raw=delta_gated_event,
                         gate=gate_pack,
                         step_context=step_context,
-                        ablation=ablation_name,
+                        ablation=module_ablation_name,
                     )
                     update_aux.update(gru_write_aux)
                     if bool(getattr(step, "commit_residual_on_exit", is_block_exit)):
@@ -1477,7 +1583,7 @@ class IForwardModel(nn.Module):
                 batch=batch,
                 resolved=resolved,
                 carried_state=prior_state_for_history,
-                ablation=ablation_name,
+                ablation=module_ablation_name,
             )
         timings["final_render_ms"] += (time.perf_counter() - t0) * 1000.0
         if reg_terms:
@@ -1507,23 +1613,44 @@ class IForwardModel(nn.Module):
                 cfg=getattr(self, "history_gate_v2_cfg", {}) or {},
             )
         next_adc_bank = None
+        adc_build_stats: Dict[str, float] = {}
         if bool(getattr(self, "adc_lite_enabled", False)):
-            adc_aabb_min, adc_aabb_max = self._adc_lite_aabb(local_state)
-            next_adc_bank = build_adc_lite_bank_from_losses(
-                loss_current=final_losses["current"],
-                loss_history=final_losses.get("in_rollout_history"),
-                final_local_state=local_state,
-                cfg=getattr(self, "adc_lite_cfg", {}) or {},
-                rollout_id=int(getattr(resolved, "rollout_id_global", -1)),
-                episode_id=int(getattr(resolved, "episode_id", -1)),
-                num_current_refs=int(float(final_stats.get("current_num_refs", len(resolved.current_latest_target_indices)))),
-                num_history_refs=int(
+            adc_policy_allowed, _ = self._adc_lite_policy_stats(global_step=global_step, resolved=resolved)
+            if not bool(adc_disabled_by_ablation) and bool(adc_policy_allowed):
+                adc_aabb_min, adc_aabb_max = self._adc_lite_aabb(local_state)
+                num_current_refs = int(float(final_stats.get("current_num_refs", len(resolved.current_latest_target_indices))))
+                num_history_refs = int(
                     float(final_stats.get("in_rollout_history_num_refs", len(resolved.history_rollout_target_indices)))
-                ),
-                adc_meta=getattr(state, "adc_meta", None),
-                aabb_min=adc_aabb_min,
-                aabb_max=adc_aabb_max,
-            )
+                )
+                if bool(getattr(self, "adc_lite_gate_suppressed", False)):
+                    next_adc_bank = build_gate_suppressed_adc_bank(
+                        accumulator=adc_suppression_accumulator,
+                        final_local_state=local_state,
+                        history_ema=history_ema,
+                        cfg=getattr(self, "adc_lite_cfg", {}) or {},
+                        rollout_id=int(getattr(resolved, "rollout_id_global", -1)),
+                        episode_id=int(getattr(resolved, "episode_id", -1)),
+                        num_current_refs=num_current_refs,
+                        num_history_refs=num_history_refs,
+                        adc_meta=getattr(state, "adc_meta", None),
+                        aabb_min=adc_aabb_min,
+                        aabb_max=adc_aabb_max,
+                        diagnostics=adc_build_stats,
+                    )
+                else:
+                    next_adc_bank = build_adc_lite_bank_from_losses(
+                        loss_current=final_losses["current"],
+                        loss_history=final_losses.get("in_rollout_history"),
+                        final_local_state=local_state,
+                        cfg=getattr(self, "adc_lite_cfg", {}) or {},
+                        rollout_id=int(getattr(resolved, "rollout_id_global", -1)),
+                        episode_id=int(getattr(resolved, "episode_id", -1)),
+                        num_current_refs=num_current_refs,
+                        num_history_refs=num_history_refs,
+                        adc_meta=getattr(state, "adc_meta", None),
+                        aabb_min=adc_aabb_min,
+                        aabb_max=adc_aabb_max,
+                    )
 
         total = (
             self.loss_current_weight * final_losses["current"]
@@ -1660,7 +1787,43 @@ class IForwardModel(nn.Module):
                 stats.setdefault(f"hgv2/damage_pos_ratio/{attr}", 0.0)
                 stats.setdefault(f"hgv2/gate_harmful_mean/{attr}", 0.0)
                 stats.setdefault(f"hgv2/gate_safe_mean/{attr}", 0.0)
+        adc_applied_compare_stats: Dict[str, Any] = {}
+        if float(adc_apply_stats.get(f"{ADC_STAT_PREFIX}/applied", 0.0)) > 0.0:
+            for key in (
+                "adc_suppressed/parent_gate_mean",
+                "adc_suppressed/all_gate_mean",
+                "adc_suppressed/parent_delta_demand_mean",
+                "adc_suppressed/all_delta_demand_mean",
+                "adc_suppressed/parent_support_mean",
+                "adc_suppressed/all_support_mean",
+                "adc_suppressed/selected_parent_suppression_rank_percentile",
+                "adc_suppressed/gate_distribution_p20",
+                "adc_suppressed/gate_distribution_p50",
+                "adc_suppressed/gate_distribution_p80",
+                "adc/raw_score/selected_rank_percentile",
+                "adc/planning_score/selected_rank_percentile",
+                "adc/final_score/selected_rank_percentile",
+                "adc/raw_score/parent_mean",
+                "adc/planning_score/parent_mean",
+                "adc/final_score/parent_mean",
+                "adc/parent_gate_mean",
+                "adc/all_gate_mean",
+                "adc/parent_delta_demand_mean",
+                "adc/all_delta_demand_mean",
+                "adc/parent_gate_contrast",
+                "adc/gate_distribution_p20",
+                "adc/gate_distribution_p50",
+                "adc/gate_distribution_p80",
+            ):
+                if key in adc_apply_stats:
+                    adc_applied_compare_stats[key] = adc_apply_stats[key]
+        if adc_suppression_accumulator is not None:
+            adc_budget_cfg = cfg_get(getattr(self, "adc_lite_cfg", {}) or {}, "budget", {}) or {}
+            adc_topk = int(cfg_get(adc_budget_cfg, "max_new_points_per_rollout", 1000))
+            stats.update(adc_suppression_accumulator.stats(topk=adc_topk))
+        stats.update(adc_build_stats)
         stats.update(adc_bank_stats(next_adc_bank))
+        stats.update(adc_applied_compare_stats)
         return IForwardRolloutOutput(
             loss=total,
             next_state=next_state,

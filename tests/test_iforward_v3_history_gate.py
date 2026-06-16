@@ -43,6 +43,9 @@ def test_iforward_v3_history_gate_cold_open_hard_mask_min_gate_and_empty_branche
 
     cold = gate(event=event, ctx_memory=ctx, history_ema=hist, local_state=local)
     assert torch.allclose(cold.bg.means[:, 0], torch.tensor([1.0, 0.0, 0.0]))
+    assert torch.allclose(cold.bg.raw_means[:, 0], torch.tensor([1.0, 1.0, 1.0]))
+    assert cold.bg.mask_update[:, 0].tolist() == [True, False, False]
+    assert torch.allclose(cold.bg.support_now[:, 0], torch.tensor([1.0, 0.1, 1.0]))
     assert cold.distant is None
     assert cold.rigid is None
 
@@ -51,6 +54,9 @@ def test_iforward_v3_history_gate_cold_open_hard_mask_min_gate_and_empty_branche
     assert warm.bg.means[0].item() >= 0.2
     assert warm.bg.means[1].item() == 0.0
     assert warm.bg.means[2].item() == 0.0
+    assert warm.bg.raw_means[1].item() == 1.0
+    assert warm.bg.raw_means[2].item() == 1.0
 
     bypass = gate(event=event, ctx_memory=ctx, history_ema=hist, local_state=local, ablation="no_history_gate")
     assert torch.allclose(bypass.bg.means[:, 0], torch.tensor([1.0, 0.0, 0.0]))
+    assert torch.allclose(bypass.bg.raw_means[:, 0], torch.ones(3))

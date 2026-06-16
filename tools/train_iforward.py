@@ -16,6 +16,10 @@ import torch
 from omegaconf import OmegaConf
 
 import tools.train_minimal_streetforward_stage4_3_multi_scene_v4 as base
+from datasets.iforward_coverage_validation import (
+    iforward_coverage_validation_cfg,
+    write_iforward_coverage_validation_rows,
+)
 from datasets.train_scheduler_iforward import TrainSchedulerIForward
 from models.iforward import IForwardTrainer
 from tools.train_minimal_streetforward_stage4_3_iforward_common import (
@@ -331,11 +335,17 @@ def _write_iforward_validation_rows(
     if callable(reset_bridge):
         reset_bridge()
     model.eval()
+    allowed_ablations = set(str(x) for x in (getattr(model, "allowed_ablations", None) or ()))
+    validation_modes = (
+        ("full_adc", "no_adc")
+        if not allowed_ablations or {"full_adc", "no_adc"}.issubset(allowed_ablations)
+        else ("full",)
+    )
     try:
         with torch.no_grad():
             for scene_id, segment_id in segments:
                 scheduler = _make_validation_scheduler(cfg, dataset, int(scene_id), int(segment_id))
-                carried_state = None
+                fixed_rollouts: List[Tuple[int, Dict[str, Any], Dict[str, Any]]] = []
                 for rollout_idx in range(int(val_cfg["rollouts_per_segment"])):
                     raw_batch = scheduler.next_batch()
                     ifwd_meta = dict(raw_batch.get("_iforward", {}) or {})
@@ -349,50 +359,116 @@ def _write_iforward_validation_rows(
                         view_selection=None,
                     )
                     minimal_batch["global_step"] = int(trigger_step)
-                    out = model.forward_rollout(minimal_batch, carried_state=carried_state, ablation="full")
-                    stats = dict(out.stats or {})
-                    losses = {name: _safe_float(value.detach().item()) for name, value in out.losses.items()}
-                    resolved = getattr(out, "resolved", None)
-                    carry_after = bool(getattr(resolved, "carry_scene_state_after_rollout", False))
-                    episode_end = bool(getattr(resolved, "episode_end_after_rollout", False))
-                    row = {
-                        "step": int(trigger_step),
-                        "split": "iforward_validation",
-                        "trigger_step": int(trigger_step),
-                        "trigger_train_episode_counter": int(trigger_train_episode_counter),
-                        "scene_id": int(scene_id),
-                        "segment_id": int(segment_id),
-                        "rollout_idx": int(rollout_idx),
-                        "rollout_shape": str(
-                            ifwd_meta.get("shape_name", ifwd_meta.get("requested_shape_name", "unknown"))
+                    fixed_rollouts.append((int(rollout_idx), ifwd_meta, minimal_batch))
+
+                segment_rows: List[Dict[str, Any]] = []
+                segment_outputs: List[Tuple[Dict[str, Any], Any]] = []
+                for mode in validation_modes:
+                    carried_state = None
+                    if callable(reset_bridge):
+                        reset_bridge()
+                    if hasattr(model, "reset_iforward_state_cache"):
+                        model.reset_iforward_state_cache()
+                    for rollout_idx, ifwd_meta, minimal_batch in fixed_rollouts:
+                        out = model.forward_rollout(minimal_batch, carried_state=carried_state, ablation=mode)
+                        stats = dict(out.stats or {})
+                        losses = {name: _safe_float(value.detach().item()) for name, value in out.losses.items()}
+                        resolved = getattr(out, "resolved", None)
+                        carry_after = bool(getattr(resolved, "carry_scene_state_after_rollout", False))
+                        episode_end = bool(getattr(resolved, "episode_end_after_rollout", False))
+                        row = {
+                            "step": int(trigger_step),
+                            "split": "iforward_validation",
+                            "mode": str(mode),
+                            "trigger_step": int(trigger_step),
+                            "trigger_train_episode_counter": int(trigger_train_episode_counter),
+                            "scene_id": int(scene_id),
+                            "segment_id": int(segment_id),
+                            "rollout_idx": int(rollout_idx),
+                            "rollout_shape": str(
+                                ifwd_meta.get("shape_name", ifwd_meta.get("requested_shape_name", "unknown"))
+                            ),
+                            "inference_only": True,
+                            "loss": _safe_float(out.loss.detach().item()),
+                            "current_loss": losses.get("current", losses.get("current_latest", float("nan"))),
+                            "history_rollout_loss": losses.get("in_rollout_history", float("nan")),
+                            "nearby_loss": losses.get("nearby", float("nan")),
+                            "current_psnr": _safe_float(stats.get("current_psnr", stats.get("current_latest_psnr"))),
+                            "history_rollout_psnr": _safe_float(stats.get("history_rollout_psnr")),
+                            "nearby_psnr": _safe_float(stats.get("nearby_psnr")),
+                            "current_valid_ratio": _safe_float(
+                                stats.get("current_valid_ratio", stats.get("current_latest_valid_ratio"))
+                            ),
+                            "history_rollout_valid_ratio": _safe_float(stats.get("in_rollout_history_valid_ratio")),
+                            "nearby_valid_ratio": _safe_float(stats.get("nearby_valid_ratio")),
+                            "current_num_refs": _safe_float(
+                                stats.get("current_num_refs", stats.get("current_latest_num_refs"))
+                            ),
+                            "history_rollout_num_refs": _safe_float(stats.get("history_rollout_num_refs")),
+                            "nearby_num_refs": _safe_float(stats.get("nearby_num_refs")),
+                            "adc_applied": _safe_float(stats.get("adc_lite/applied", 0.0), 0.0),
+                            "adc_num_cloned_this_rollout": _safe_float(
+                                stats.get("adc_lite/num_cloned_this_rollout", 0.0), 0.0
+                            ),
+                            "adc_num_cloned_episode": _safe_float(stats.get("adc_lite/num_cloned_episode", 0.0), 0.0),
+                            "adc_bg_count_before": _safe_float(stats.get("adc_lite/bg_count_before", 0.0), 0.0),
+                            "adc_bg_count_after": _safe_float(stats.get("adc_lite/bg_count_after", 0.0), 0.0),
+                            "adc_parent_score_mean": _safe_float(stats.get("adc_lite/parent_score_mean", 0.0), 0.0),
+                            "adc_parent_gate_mean": _safe_float(stats.get("adc_suppressed/parent_gate_mean", 0.0), 0.0),
+                            "adc_parent_delta_demand_mean": _safe_float(
+                                stats.get("adc_suppressed/parent_delta_demand_mean", 0.0), 0.0
+                            ),
+                            "adc_suppression_score_topk_mean": _safe_float(
+                                stats.get("adc_suppressed/score_topk_mean", 0.0), 0.0
+                            ),
+                            "carry_scene_state_after_rollout": bool(carry_after),
+                            "episode_end_after_rollout": bool(episode_end),
+                        }
+                        segment_rows.append(row)
+                        segment_outputs.append((row, out))
+                        if bool(carry_after) and not bool(episode_end):
+                            next_state = getattr(out, "next_state", None)
+                            detach = getattr(next_state, "detach_for_next_rollout", None)
+                            carried_state = detach() if callable(detach) else next_state
+                        else:
+                            carried_state = None
+                            if callable(reset_bridge):
+                                reset_bridge()
+                            if hasattr(model, "reset_iforward_state_cache"):
+                                model.reset_iforward_state_cache()
+
+                by_mode_rollout = {(str(row["mode"]), int(row["rollout_idx"])): row for row in segment_rows}
+                for rollout_idx, _, _ in fixed_rollouts:
+                    full_row = by_mode_rollout.get(("full_adc", int(rollout_idx)))
+                    no_row = by_mode_rollout.get(("no_adc", int(rollout_idx)))
+                    if full_row is None or no_row is None:
+                        continue
+                    deltas = {
+                        "delta_full_minus_noadc_current_psnr": full_row["current_psnr"] - no_row["current_psnr"],
+                        "delta_full_minus_noadc_history_rollout_psnr": (
+                            full_row["history_rollout_psnr"] - no_row["history_rollout_psnr"]
                         ),
-                        "inference_only": True,
-                        "loss": _safe_float(out.loss.detach().item()),
-                        "current_loss": losses.get("current", losses.get("current_latest", float("nan"))),
-                        "history_rollout_loss": losses.get("in_rollout_history", float("nan")),
-                        "nearby_loss": losses.get("nearby", float("nan")),
-                        "current_psnr": _safe_float(stats.get("current_psnr", stats.get("current_latest_psnr"))),
-                        "history_rollout_psnr": _safe_float(stats.get("history_rollout_psnr")),
-                        "nearby_psnr": _safe_float(stats.get("nearby_psnr")),
-                        "current_valid_ratio": _safe_float(
-                            stats.get("current_valid_ratio", stats.get("current_latest_valid_ratio"))
-                        ),
-                        "history_rollout_valid_ratio": _safe_float(stats.get("in_rollout_history_valid_ratio")),
-                        "nearby_valid_ratio": _safe_float(stats.get("nearby_valid_ratio")),
-                        "current_num_refs": _safe_float(stats.get("current_num_refs", stats.get("current_latest_num_refs"))),
-                        "history_rollout_num_refs": _safe_float(stats.get("history_rollout_num_refs")),
-                        "nearby_num_refs": _safe_float(stats.get("nearby_num_refs")),
-                        "carry_scene_state_after_rollout": bool(carry_after),
-                        "episode_end_after_rollout": bool(episode_end),
+                        "delta_full_minus_noadc_nearby_psnr": full_row["nearby_psnr"] - no_row["nearby_psnr"],
                     }
+                    full_row.update(deltas)
+                    no_row.update(deltas)
+
+                for row, out in segment_outputs:
+                    row.setdefault("delta_full_minus_noadc_current_psnr", float("nan"))
+                    row.setdefault("delta_full_minus_noadc_history_rollout_psnr", float("nan"))
+                    row.setdefault("delta_full_minus_noadc_nearby_psnr", float("nan"))
                     rows.append(row)
                     if metrics_fh is not None:
                         base._write_metrics_history(metrics_fh, row)
                     if writer is not None:
-                        tag = f"iforward_validation/scene_{int(scene_id):03d}_segment_{int(segment_id):03d}"
+                        tag = (
+                            f"iforward_validation/{str(row['mode'])}/"
+                            f"scene_{int(scene_id):03d}_segment_{int(segment_id):03d}"
+                        )
                         writer.add_scalar(f"{tag}/current_psnr", float(row["current_psnr"]), int(trigger_step))
                         writer.add_scalar(f"{tag}/history_rollout_psnr", float(row["history_rollout_psnr"]), int(trigger_step))
                         writer.add_scalar(f"{tag}/nearby_psnr", float(row["nearby_psnr"]), int(trigger_step))
+                        writer.add_scalar(f"{tag}/adc_applied", float(row["adc_applied"]), int(trigger_step))
                         if bool(val_cfg["tensorboard_images_enable"]):
                             _write_iforward_validation_tb_images(
                                 writer=writer,
@@ -400,19 +476,9 @@ def _write_iforward_validation_rows(
                                 step=int(trigger_step),
                                 scene_id=int(scene_id),
                                 segment_id=int(segment_id),
-                                rollout_idx=int(rollout_idx),
+                                rollout_idx=int(row["rollout_idx"]),
                                 max_images_per_role=int(val_cfg["tensorboard_images_max_per_role"]),
                             )
-                    if bool(carry_after) and not bool(episode_end):
-                        next_state = getattr(out, "next_state", None)
-                        detach = getattr(next_state, "detach_for_next_rollout", None)
-                        carried_state = detach() if callable(detach) else next_state
-                    else:
-                        carried_state = None
-                        if callable(reset_bridge):
-                            reset_bridge()
-                        if hasattr(model, "reset_iforward_state_cache"):
-                            model.reset_iforward_state_cache()
     finally:
         if hasattr(model, "_state_cache"):
             model._state_cache = saved_cache
@@ -421,29 +487,74 @@ def _write_iforward_validation_rows(
         model.train(was_training)
 
     if rows:
-        global_row = {
-            "step": int(trigger_step),
-            "split": "iforward_validation_global",
-            "trigger_step": int(trigger_step),
-            "trigger_train_episode_counter": int(trigger_train_episode_counter),
-            "num_rollouts": int(len(rows)),
-            "current_psnr": _mean([float(r["current_psnr"]) for r in rows]),
-            "history_rollout_psnr": _mean([float(r["history_rollout_psnr"]) for r in rows]),
-            "nearby_psnr": _mean([float(r["nearby_psnr"]) for r in rows]),
-            "current_valid_ratio": _mean([float(r["current_valid_ratio"]) for r in rows]),
-            "history_rollout_valid_ratio": _mean([float(r["history_rollout_valid_ratio"]) for r in rows]),
-            "nearby_valid_ratio": _mean([float(r["nearby_valid_ratio"]) for r in rows]),
-        }
-        if metrics_fh is not None:
-            base._write_metrics_history(metrics_fh, global_row)
-        if writer is not None:
-            writer.add_scalar("iforward_validation/global/current_psnr", float(global_row["current_psnr"]), int(trigger_step))
-            writer.add_scalar(
-                "iforward_validation/global/history_rollout_psnr",
-                float(global_row["history_rollout_psnr"]),
-                int(trigger_step),
+        global_rows: List[Dict[str, Any]] = []
+        for mode in validation_modes:
+            mode_rows = [r for r in rows if str(r.get("mode")) == mode]
+            if not mode_rows:
+                continue
+            global_rows.append(
+                {
+                    "step": int(trigger_step),
+                    "split": "iforward_validation_global",
+                    "mode": mode,
+                    "trigger_step": int(trigger_step),
+                    "trigger_train_episode_counter": int(trigger_train_episode_counter),
+                    "num_rollouts": int(len(mode_rows)),
+                    "current_psnr": _mean([float(r["current_psnr"]) for r in mode_rows]),
+                    "history_rollout_psnr": _mean([float(r["history_rollout_psnr"]) for r in mode_rows]),
+                    "nearby_psnr": _mean([float(r["nearby_psnr"]) for r in mode_rows]),
+                    "current_valid_ratio": _mean([float(r["current_valid_ratio"]) for r in mode_rows]),
+                    "history_rollout_valid_ratio": _mean([float(r["history_rollout_valid_ratio"]) for r in mode_rows]),
+                    "nearby_valid_ratio": _mean([float(r["nearby_valid_ratio"]) for r in mode_rows]),
+                    "adc_applied_ratio": _mean([float(r["adc_applied"]) for r in mode_rows]),
+                    "adc_num_cloned_mean": _mean([float(r["adc_num_cloned_this_rollout"]) for r in mode_rows]),
+                    "adc_bg_count_after_mean": _mean([float(r["adc_bg_count_after"]) for r in mode_rows]),
+                }
             )
-            writer.add_scalar("iforward_validation/global/nearby_psnr", float(global_row["nearby_psnr"]), int(trigger_step))
+        by_mode = {str(r["mode"]): r for r in global_rows}
+        if "full_adc" in by_mode and "no_adc" in by_mode:
+            full = by_mode["full_adc"]
+            no_adc = by_mode["no_adc"]
+            global_rows.append(
+                {
+                    "step": int(trigger_step),
+                    "split": "iforward_validation_global",
+                    "mode": "full_minus_no_adc",
+                    "trigger_step": int(trigger_step),
+                    "trigger_train_episode_counter": int(trigger_train_episode_counter),
+                    "num_rollouts": int(min(full["num_rollouts"], no_adc["num_rollouts"])),
+                    "current_psnr": float(full["current_psnr"]) - float(no_adc["current_psnr"]),
+                    "history_rollout_psnr": float(full["history_rollout_psnr"]) - float(no_adc["history_rollout_psnr"]),
+                    "nearby_psnr": float(full["nearby_psnr"]) - float(no_adc["nearby_psnr"]),
+                    "current_valid_ratio": float("nan"),
+                    "history_rollout_valid_ratio": float("nan"),
+                    "nearby_valid_ratio": float("nan"),
+                    "adc_applied_ratio": float(full.get("adc_applied_ratio", 0.0)),
+                    "adc_num_cloned_mean": float(full.get("adc_num_cloned_mean", 0.0)),
+                    "adc_bg_count_after_mean": float(full.get("adc_bg_count_after_mean", 0.0)),
+                }
+            )
+        for global_row in global_rows:
+            if metrics_fh is not None:
+                base._write_metrics_history(metrics_fh, global_row)
+            if writer is not None:
+                mode = str(global_row.get("mode", "all"))
+                writer.add_scalar(
+                    f"iforward_validation/global/{mode}/current_psnr",
+                    float(global_row["current_psnr"]),
+                    int(trigger_step),
+                )
+                writer.add_scalar(
+                    f"iforward_validation/global/{mode}/history_rollout_psnr",
+                    float(global_row["history_rollout_psnr"]),
+                    int(trigger_step),
+                )
+                writer.add_scalar(
+                    f"iforward_validation/global/{mode}/nearby_psnr",
+                    float(global_row["nearby_psnr"]),
+                    int(trigger_step),
+                )
+        if writer is not None:
             flush = getattr(writer, "flush", None)
             if callable(flush):
                 flush()
@@ -451,6 +562,12 @@ def _write_iforward_validation_rows(
 
 def _iforward_train_start_hook(**kwargs: Any) -> None:
     cfg = kwargs["cfg"]
+    coverage_cfg = iforward_coverage_validation_cfg(cfg)
+    if bool(coverage_cfg["enable"]) and bool(coverage_cfg["run_at_train_start"]):
+        call_kwargs = dict(kwargs)
+        call_kwargs.setdefault("convert_batch_to_minimal_format", base.convert_batch_to_minimal_format)
+        call_kwargs.setdefault("write_metrics_history", base._write_metrics_history)
+        write_iforward_coverage_validation_rows(**call_kwargs)
     val_cfg = _iforward_validation_cfg(cfg)
     if bool(val_cfg["enable"]) and bool(val_cfg["run_at_train_start"]):
         _write_iforward_validation_rows(**kwargs)
@@ -458,9 +575,16 @@ def _iforward_train_start_hook(**kwargs: Any) -> None:
 
 def _iforward_step_end_hook(**kwargs: Any) -> None:
     cfg = kwargs["cfg"]
+    coverage_cfg = iforward_coverage_validation_cfg(cfg)
+    coverage_interval = int(coverage_cfg["interval_steps"])
     val_cfg = _iforward_validation_cfg(cfg)
     interval = int(val_cfg["interval_steps"])
     step = int(kwargs.get("trigger_step", 0))
+    if bool(coverage_cfg["enable"]) and coverage_interval > 0 and step >= 0 and (step + 1) % int(coverage_interval) == 0:
+        call_kwargs = dict(kwargs)
+        call_kwargs.setdefault("convert_batch_to_minimal_format", base.convert_batch_to_minimal_format)
+        call_kwargs.setdefault("write_metrics_history", base._write_metrics_history)
+        write_iforward_coverage_validation_rows(**call_kwargs)
     if not bool(val_cfg["enable"]) or interval <= 0:
         return
     if step < 0 or (step + 1) % int(interval) != 0:

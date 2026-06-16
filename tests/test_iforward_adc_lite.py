@@ -7,18 +7,24 @@ import torch
 
 from models.iforward import IForwardBatchResolver, IForwardModel, IForwardShortWindowHistory, IForwardState
 from models.iforward.adc_lite import (
+    GateSuppressedADCAccumulator,
     IForwardADCBank,
+    IForwardADCStateMeta,
     _deterministic_jitter,
     apply_bg_clone_episode_local,
     build_adc_lite_bank_from_losses,
+    build_gate_suppressed_adc_bank,
+    compute_gate_suppressed_score,
 )
 from models.iforward.gru_memory import IForwardGRUMemoryState
 from models.iforward.history_ema import IForwardHistoryEMAState
+from models.iforward.history_gate import IForwardAttributeGate
 from models.iforward.history_gradient_bank import build_history_gradient_bank_from_loss
 from models.streetforward.node_states import NodeStateBackground
 from models.streetforward.stage6_0 import LocalGSState
+from models.streetforward.stage6_0.posterior_updater import BranchDelta
 
-from test_iforward_v3_rollout import FakeV3Bridge, _batch_b1r2_with_history_probe_target, _v3_cfg
+from test_iforward_v3_rollout import FakeV3Bridge, _batch_b1r2_with_history_probe_target, _batch_same_source_two_blocks, _v3_cfg
 
 
 def _node_state(n: int = 3) -> NodeStateBackground:
@@ -72,6 +78,336 @@ def _adc_cfg(*, max_new: int = 2, max_episode: int = 4, max_total: int = 8) -> D
             "local_hidden_init": "parent",
         },
     }
+
+
+def _gate_suppressed_cfg(*, max_new: int = 1, min_blocks: int = 2) -> Dict[str, Any]:
+    cfg = _adc_cfg(max_new=max_new, max_episode=4, max_total=8)
+    cfg.update(
+        {
+            "version": "gate_suppressed_update_v1",
+            "start_step": 0,
+            "enable_policy": {"min_blocks_per_rollout": int(min_blocks), "log_only_before_start": True},
+            "score": {
+                "type": "gate_suppressed_update",
+                "attr_normalize": {"mode": "rollout_percentile", "percentile": 100.0, "eps": 1.0e-8},
+                "attr_merge": "rms",
+                "repeat_merge": "max",
+                "score_clip": 10.0,
+            },
+            "candidate": {
+                "exclude_clones_as_parent": True,
+                "exclude_boundary_parents": False,
+                "alpha_min": 0.005,
+                "scale_min": 1.0e-4,
+                "min_score": 0.0,
+                "min_score_percentile": 0.0,
+                "min_count": 1,
+                "require_history": True,
+                "require_support": True,
+            },
+            "planning": {"enable": False},
+        }
+    )
+    return cfg
+
+
+def _relative_gate_suppressed_cfg(*, max_new: int = 1, min_blocks: int = 2) -> Dict[str, Any]:
+    cfg = _gate_suppressed_cfg(max_new=max_new, min_blocks=min_blocks)
+    cfg["score"] = {
+        "type": "relative_gate_suppressed_update",
+        "gate_ref": {"mode": "median"},
+        "attr_normalize": {"mode": "rollout_percentile", "percentile": 100.0, "eps": 1.0e-8},
+        "attr_merge": "rms",
+        "repeat_merge": "max",
+        "score_clip": 10.0,
+    }
+    return cfg
+
+
+def _branch_delta_for_test(local: LocalGSState, means: torch.Tensor) -> BranchDelta:
+    n = int(local.bg.means.shape[0])
+    ref = local.bg.means
+    return BranchDelta(
+        means=means,
+        scales_log=ref.new_zeros(n, 3),
+        quat_axis_angle=ref.new_zeros(n, 3),
+        opacity_logit=ref.new_zeros(n, 1),
+        sh=ref.new_zeros(n, 12),
+        hidden=ref.new_zeros(n, int(local.bg.hidden.shape[1])),
+        confidence=ref.new_ones(n, 1),
+        noop=ref.new_zeros(n, 1),
+    )
+
+
+def test_gate_suppressed_score_uses_raw_gate_and_hard_mask_only_as_filter() -> None:
+    local = _local_state(3)
+    delta = _branch_delta_for_test(
+        local,
+        torch.tensor([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 0.0]]),
+    )
+    effective_zero = torch.zeros(3, 1)
+    raw_means = torch.tensor([[0.0], [0.0], [1.0]])
+    gate = IForwardAttributeGate(
+        means=effective_zero,
+        scales=torch.ones(3, 1),
+        quat=torch.ones(3, 1),
+        opacity=torch.ones(3, 1),
+        sh=torch.ones(3, 1),
+        hidden=torch.ones(3, 1),
+        raw_means=raw_means,
+        raw_scales=torch.ones(3, 1),
+        raw_quat=torch.ones(3, 1),
+        raw_opacity=torch.ones(3, 1),
+        raw_sh=torch.ones(3, 1),
+        raw_hidden=torch.ones(3, 1),
+        mask_update=torch.tensor([[True], [False], [True]]),
+        support_now=torch.ones(3, 1),
+        initialized=torch.ones(3, 1),
+    )
+
+    score, gate_mean, demand, support, mask = compute_gate_suppressed_score(
+        delta_bg=delta,
+        gate_bg=gate,
+        cfg=_gate_suppressed_cfg(),
+    )
+
+    assert score[0].item() > 0.0
+    assert score[1].item() == pytest.approx(0.0)
+    assert score[2].item() == pytest.approx(0.0)
+    assert mask.tolist() == [True, False, True]
+    assert gate_mean[2].item() > gate_mean[0].item()
+    assert demand[0].item() > 0.0
+    assert support.tolist() == [1.0, 0.0, 1.0]
+
+
+def test_relative_gate_suppressed_score_requires_gate_contrast() -> None:
+    local = _local_state(3)
+    delta = _branch_delta_for_test(
+        local,
+        torch.tensor([[2.0, 0.0, 0.0], [2.0, 0.0, 0.0], [2.0, 0.0, 0.0]]),
+    )
+
+    def _gate(values: torch.Tensor) -> IForwardAttributeGate:
+        col = values.reshape(3, 1)
+        return IForwardAttributeGate(
+            means=col,
+            scales=col,
+            quat=col,
+            opacity=col,
+            sh=col,
+            hidden=col,
+            raw_means=col,
+            raw_scales=col,
+            raw_quat=col,
+            raw_opacity=col,
+            raw_sh=col,
+            raw_hidden=col,
+            mask_update=torch.ones(3, 1, dtype=torch.bool),
+            support_now=torch.ones(3, 1),
+            initialized=torch.ones(3, 1),
+        )
+
+    score, gate_mean, _, _, _ = compute_gate_suppressed_score(
+        delta_bg=delta,
+        gate_bg=_gate(torch.tensor([0.05, 0.15, 0.25])),
+        cfg=_relative_gate_suppressed_cfg(),
+    )
+    assert gate_mean.tolist() == pytest.approx([0.05, 0.15, 0.25])
+    assert score[0].item() > 0.0
+    assert score[1].item() == pytest.approx(0.0)
+    assert score[2].item() == pytest.approx(0.0)
+
+    flat_score, _, _, _, _ = compute_gate_suppressed_score(
+        delta_bg=delta,
+        gate_bg=_gate(torch.tensor([0.05, 0.05, 0.05])),
+        cfg=_relative_gate_suppressed_cfg(),
+    )
+    assert flat_score.tolist() == pytest.approx([0.0, 0.0, 0.0])
+
+
+def test_gate_suppressed_accumulator_uses_score_max_and_tracks_counts() -> None:
+    local = _local_state(3)
+    acc = GateSuppressedADCAccumulator.from_local_state(local)
+    acc.accumulate(
+        score=torch.tensor([0.2, 0.8, 0.0]),
+        gate_mean=torch.tensor([0.5, 0.4, 0.0]),
+        delta_demand=torch.tensor([1.0, 2.0, 0.0]),
+        support=torch.tensor([1.0, 1.0, 0.0]),
+        mask=torch.tensor([True, True, False]),
+    )
+    acc.accumulate(
+        score=torch.tensor([0.9, 0.1, 0.7]),
+        gate_mean=torch.tensor([0.3, 0.6, 0.2]),
+        delta_demand=torch.tensor([3.0, 4.0, 5.0]),
+        support=torch.ones(3),
+        mask=torch.tensor([True, True, True]),
+    )
+
+    assert acc.score_max.tolist() == pytest.approx([0.9, 0.8, 0.7])
+    assert acc.score_sum.tolist() == pytest.approx([1.1, 0.9, 0.7])
+    assert acc.score_count.tolist() == pytest.approx([2.0, 2.0, 1.0])
+
+
+def test_gate_suppressed_bank_candidate_filters_and_no_grad_build() -> None:
+    local = _local_state(5)
+    history_ema = IForwardHistoryEMAState.from_local_state(local)
+    history_ema.bg.initialized[:] = torch.tensor([[1.0], [1.0], [0.0], [1.0], [1.0]])
+    local.bg.opacity_logit.data[4] = -20.0
+    acc = GateSuppressedADCAccumulator.from_local_state(local)
+    acc.score_max = torch.tensor([10.0, 9.0, 8.0, 7.0, 6.0])
+    acc.score_sum = acc.score_max.clone()
+    acc.score_count = torch.tensor([2.0, 1.0, 2.0, 2.0, 2.0])
+    acc.gate_sum = torch.tensor([0.2, 0.3, 0.4, 0.5, 0.6]) * acc.score_count.clamp_min(1.0)
+    acc.delta_demand_sum = torch.ones(5) * acc.score_count.clamp_min(1.0)
+    acc.support_sum = torch.tensor([1.0, 1.0, 1.0, 0.0, 1.0]) * acc.score_count.clamp_min(1.0)
+    meta = IForwardADCStateMeta(
+        original_bg_count=4,
+        parent_index=torch.full((5,), -1, dtype=torch.long),
+        birth_rollout_id=torch.full((5,), -1, dtype=torch.long),
+        cooldown_until_rollout=torch.tensor([-1, 99, -1, -1, -1], dtype=torch.long),
+    )
+    cfg = _gate_suppressed_cfg()
+    cfg["candidate"]["min_count"] = 2
+    cfg["candidate"]["min_score_percentile"] = 0.0
+
+    with torch.no_grad():
+        bank = build_gate_suppressed_adc_bank(
+            accumulator=acc,
+            final_local_state=local,
+            history_ema=history_ema,
+            cfg=cfg,
+            rollout_id=4,
+            episode_id=7,
+            num_current_refs=1,
+            num_history_refs=1,
+            adc_meta=meta,
+        )
+
+    assert bank is not None
+    assert bank.score_type == "gate_suppressed_update"
+    assert bank.candidate_mask.tolist() == [True, False, False, False, False]
+    assert bank.score[0].item() == pytest.approx(10.0)
+    assert bank.score_count[0].item() == pytest.approx(2.0)
+    assert bank.parent_gate_mean[0].item() == pytest.approx(0.2)
+
+
+def test_gate_suppressed_bank_low_topk_guard_blocks_random_clone() -> None:
+    local = _local_state(3)
+    history_ema = IForwardHistoryEMAState.from_local_state(local)
+    history_ema.bg.initialized[:] = 1.0
+    acc = GateSuppressedADCAccumulator.from_local_state(local)
+    acc.score_max = torch.tensor([1.0e-5, 2.0e-5, 3.0e-5])
+    acc.score_sum = acc.score_max.clone()
+    acc.score_count = torch.ones(3)
+    acc.gate_sum = torch.ones(3) * 0.2
+    acc.delta_demand_sum = torch.ones(3) * 0.01
+    acc.support_sum = torch.ones(3)
+    cfg = _gate_suppressed_cfg(max_new=2)
+    cfg["candidate"]["min_score"] = 0.0
+    cfg["candidate"]["min_score_percentile"] = 0.0
+    cfg["bank"]["min_score_topk_mean"] = 1.0e-3
+    diagnostics: Dict[str, float] = {}
+
+    bank = build_gate_suppressed_adc_bank(
+        accumulator=acc,
+        final_local_state=local,
+        history_ema=history_ema,
+        cfg=cfg,
+        rollout_id=0,
+        episode_id=0,
+        num_current_refs=1,
+        num_history_refs=1,
+        diagnostics=diagnostics,
+    )
+
+    assert bank is None
+    assert diagnostics["adc_lite/bank_low_score_topk_mean"] == pytest.approx(1.0)
+    assert diagnostics["adc_lite/bank/min_score_topk_mean"] == pytest.approx(1.0e-3)
+    assert diagnostics["adc_suppressed/candidate_count_pre_guard"] == pytest.approx(3.0)
+    assert diagnostics["adc_suppressed/score_topk_mean_pre_guard"] < 1.0e-3
+
+
+def test_gate_suppressed_bank_low_gate_high_demand_filters_and_contrast() -> None:
+    local = _local_state(4)
+    history_ema = IForwardHistoryEMAState.from_local_state(local)
+    history_ema.bg.initialized[:] = 1.0
+    acc = GateSuppressedADCAccumulator.from_local_state(local)
+    acc.score_max = torch.tensor([4.0, 3.0, 2.0, 1.0])
+    acc.score_sum = acc.score_max.clone()
+    acc.score_count = torch.ones(4)
+    acc.gate_sum = torch.tensor([0.10, 0.20, 0.30, 0.40])
+    acc.delta_demand_sum = torch.tensor([10.0, 9.0, 1.0, 8.0])
+    acc.support_sum = torch.ones(4)
+    cfg = _relative_gate_suppressed_cfg(max_new=1)
+    cfg["candidate"].update(
+        {
+            "min_score_percentile": 0.0,
+            "require_low_gate": True,
+            "gate_percentile_max": 40.0,
+            "require_high_delta_demand": True,
+            "delta_demand_percentile_min": 60.0,
+            "require_gate_contrast": True,
+            "min_gate_contrast": 0.03,
+        }
+    )
+    diagnostics: Dict[str, float] = {}
+
+    bank = build_gate_suppressed_adc_bank(
+        accumulator=acc,
+        final_local_state=local,
+        history_ema=history_ema,
+        cfg=cfg,
+        rollout_id=0,
+        episode_id=0,
+        num_current_refs=1,
+        num_history_refs=1,
+        diagnostics=diagnostics,
+    )
+
+    assert bank is not None
+    assert bank.score_type == "relative_gate_suppressed_update"
+    assert bank.candidate_mask.tolist() == [True, True, False, False]
+    assert diagnostics["adc_suppressed/candidate_count_after_gate_filter"] == pytest.approx(2.0)
+    assert diagnostics["adc_suppressed/candidate_count_after_delta_filter"] == pytest.approx(2.0)
+    assert diagnostics["adc/parent_gate_contrast_pre_guard"] > 0.03
+
+
+def test_gate_suppressed_bank_gate_contrast_guard_blocks_flat_gate_distribution() -> None:
+    local = _local_state(3)
+    history_ema = IForwardHistoryEMAState.from_local_state(local)
+    history_ema.bg.initialized[:] = 1.0
+    acc = GateSuppressedADCAccumulator.from_local_state(local)
+    acc.score_max = torch.tensor([4.0, 3.0, 2.0])
+    acc.score_sum = acc.score_max.clone()
+    acc.score_count = torch.ones(3)
+    acc.gate_sum = torch.tensor([0.150, 0.151, 0.152])
+    acc.delta_demand_sum = torch.tensor([10.0, 9.0, 8.0])
+    acc.support_sum = torch.ones(3)
+    cfg = _relative_gate_suppressed_cfg(max_new=1)
+    cfg["candidate"].update(
+        {
+            "min_score_percentile": 0.0,
+            "require_gate_contrast": True,
+            "min_gate_contrast": 0.03,
+        }
+    )
+    diagnostics: Dict[str, float] = {}
+
+    bank = build_gate_suppressed_adc_bank(
+        accumulator=acc,
+        final_local_state=local,
+        history_ema=history_ema,
+        cfg=cfg,
+        rollout_id=0,
+        episode_id=0,
+        num_current_refs=1,
+        num_history_refs=1,
+        diagnostics=diagnostics,
+    )
+
+    assert bank is None
+    assert diagnostics["adc_lite/bank_low_gate_contrast"] == pytest.approx(1.0)
+    assert diagnostics["adc/parent_gate_contrast_pre_guard"] < 0.03
 
 
 def test_adc_lite_bank_scores_current_history_conflict() -> None:
@@ -314,6 +650,19 @@ def _adc_model_cfg() -> Dict[str, Any]:
     return cfg
 
 
+def _gate_suppressed_model_cfg(*, min_blocks: int = 2) -> Dict[str, Any]:
+    cfg = _v3_cfg()
+    cfg["model"]["iforward"]["adc_lite"] = _gate_suppressed_cfg(max_new=1, min_blocks=int(min_blocks))
+    cfg["model"]["iforward"]["loss"] = {
+        "current": {"weight": 1.0},
+        "nearby": {"weight": 0.0},
+        "in_rollout_history": {"weight": 1.0},
+        "short_window_history": {"weight": 0.0},
+        "delta_regularization": {"weight": 0.0},
+    }
+    return cfg
+
+
 def _non_reset_next_rollout(batch: Dict[str, Any], rollout_id: int) -> Dict[str, Any]:
     out = dict(batch)
     ifwd = dict(batch["_iforward"])
@@ -324,6 +673,33 @@ def _non_reset_next_rollout(batch: Dict[str, Any], rollout_id: int) -> Dict[str,
     request_meta["iforward"] = ifwd
     out["_iforward"] = ifwd
     out["request_meta"] = request_meta
+    return out
+
+
+def _batch_same_source_two_blocks_with_history_probe_target() -> Dict[str, Any]:
+    batch = _batch_same_source_two_blocks()
+    target_refs = [(5, 0), (10, 0), (10, 1), (10, 2)]
+    target_roles = ["final_current_recon"] * len(target_refs)
+    ifwd = dict(batch["_iforward"])
+    ifwd.update(
+        {
+            "target_refs_flat": target_refs,
+            "target_roles_flat": target_roles,
+            "input_frame_indices": [5, 10],
+        }
+    )
+    request_meta = dict(batch["request_meta"])
+    request_meta.update(
+        {
+            "target_image_refs": target_refs,
+            "target_image_roles": target_roles,
+            "iforward": ifwd,
+        }
+    )
+    out = dict(batch)
+    out["_iforward"] = ifwd
+    out["request_meta"] = request_meta
+    out["targets"] = [{"gt_image": torch.zeros(1, 1, 3), "frame_idx": f, "cam_idx": c} for f, c in target_refs]
     return out
 
 
@@ -356,6 +732,96 @@ def test_iforward_adc_lite_two_rollout_bank_create_consume() -> None:
     assert out1.next_state.adc_meta.num_bg_clones_created_episode == 1
     assert out1.next_state.adc_bank is not None
     assert out1.next_state.adc_bank.source_rollout_id == 1
+
+
+def test_iforward_gate_suppressed_adc_no_grad_two_rollout_bank_create_consume() -> None:
+    bridge = FakeV3Bridge()
+    model = IForwardModel(
+        config=_gate_suppressed_model_cfg(),
+        device=torch.device("cpu"),
+        bridge=bridge,
+        resolver=IForwardBatchResolver(),
+    )
+    batch0 = _batch_same_source_two_blocks_with_history_probe_target()
+
+    with torch.no_grad():
+        out0 = model.forward_rollout(batch0)
+
+    assert out0.next_state.adc_bank is not None
+    assert out0.next_state.adc_bank.score_type == "gate_suppressed_update"
+    assert out0.stats["adc_lite/next_bank_valid"] == pytest.approx(1.0)
+    assert out0.stats["adc_lite/score_type_gate_suppressed"] == pytest.approx(1.0)
+    assert out0.stats["adc_suppressed/accum_valid_rows"] > 0.0
+
+    with torch.no_grad():
+        out1 = model.forward_rollout(
+            _non_reset_next_rollout(_batch_same_source_two_blocks_with_history_probe_target(), 1),
+            carried_state=out0.next_state.detach_for_next_rollout(),
+        )
+
+    assert out1.stats["adc_lite/bank_valid"] == pytest.approx(1.0)
+    assert out1.stats["adc_lite/applied"] == pytest.approx(1.0)
+    assert out1.stats["adc_lite/num_cloned_this_rollout"] == pytest.approx(1.0)
+    assert out1.next_state.local_gs.bg.means.shape[0] == 3
+    assert out1.next_state.adc_bank is not None
+    assert out1.next_state.adc_bank.source_rollout_id == 1
+    assert out1.stats["adc/raw_score/selected_rank_percentile"] > 0.0
+    assert out1.stats["adc/planning_score/selected_rank_percentile"] > 0.0
+    assert out1.stats["adc/final_score/selected_rank_percentile"] > 0.0
+    assert "adc/parent_gate_contrast" in out1.stats
+
+
+def test_iforward_gate_suppressed_adc_single_block_allowed_by_policy() -> None:
+    bridge = FakeV3Bridge()
+    model = IForwardModel(
+        config=_gate_suppressed_model_cfg(min_blocks=1),
+        device=torch.device("cpu"),
+        bridge=bridge,
+        resolver=IForwardBatchResolver(),
+    )
+
+    with torch.no_grad():
+        out0 = model.forward_rollout(_batch_b1r2_with_history_probe_target())
+
+    assert out0.stats["adc_lite/policy/blocks_per_rollout"] == pytest.approx(1.0)
+    assert out0.stats["adc_lite/policy/blocks_ok"] == pytest.approx(1.0)
+    assert out0.stats["adc_lite/policy/apply_build_allowed"] == pytest.approx(1.0)
+    assert out0.stats["adc_lite/next_bank_valid"] == pytest.approx(1.0)
+    assert out0.next_state.adc_bank is not None
+
+    with torch.no_grad():
+        out1 = model.forward_rollout(
+            _non_reset_next_rollout(_batch_b1r2_with_history_probe_target(), 1),
+            carried_state=out0.next_state.detach_for_next_rollout(),
+        )
+
+    assert out1.stats["adc_lite/bank_valid"] == pytest.approx(1.0)
+    assert out1.stats["adc_lite/applied"] == pytest.approx(1.0)
+    assert out1.stats["adc_lite/num_cloned_this_rollout"] == pytest.approx(1.0)
+
+
+def test_iforward_gate_suppressed_adc_no_adc_ablation_drops_bank_and_builds_none() -> None:
+    bridge = FakeV3Bridge()
+    model = IForwardModel(
+        config=_gate_suppressed_model_cfg(),
+        device=torch.device("cpu"),
+        bridge=bridge,
+        resolver=IForwardBatchResolver(),
+    )
+    out0 = model.forward_rollout(_batch_same_source_two_blocks_with_history_probe_target())
+    assert out0.next_state.adc_bank is not None
+
+    out1 = model.forward_rollout(
+        _non_reset_next_rollout(_batch_same_source_two_blocks_with_history_probe_target(), 1),
+        carried_state=out0.next_state.detach_for_next_rollout(),
+        ablation="no_adc",
+    )
+
+    assert out1.stats["adc_lite/bank_valid"] == pytest.approx(1.0)
+    assert out1.stats["adc_lite/bank_dropped_without_apply"] == pytest.approx(1.0)
+    assert out1.stats["adc_lite/applied"] == pytest.approx(0.0)
+    assert out1.next_state.local_gs.bg.means.shape[0] == 2
+    assert out1.next_state.adc_bank is None
 
 
 def test_iforward_adc_lite_rollout_start_planning_pass_runs() -> None:

@@ -2467,10 +2467,10 @@ class MultiSceneDatasetV4:
         include_test: bool = False,
     ) -> Dict[str, Any]:
         plan_scheduler_version = str(getattr(plan, "scheduler_version", ""))
-        if plan_scheduler_version not in {"iforward_v1", "iforward_v3_random_window"}:
+        if plan_scheduler_version not in {"iforward_v1", "iforward_v3_random_window", "iforward_v4_coverage_ordered"}:
             raise ValueError(
                 "expected IForwardRolloutPlan.scheduler_version == 'iforward_v1' "
-                "or 'iforward_v3_random_window'"
+                "or 'iforward_v3_random_window' or 'iforward_v4_coverage_ordered'"
             )
         if int(scene_id) != int(getattr(plan, "scene_id")) or int(segment_id) != int(getattr(plan, "segment_id")):
             raise ValueError(
@@ -2484,8 +2484,13 @@ class MultiSceneDatasetV4:
         )
         target_refs_raw = [(int(ref[0]), int(ref[1])) for ref in list(getattr(plan, "target_refs_flat", []) or [])]
         target_roles_raw = [str(x) for x in list(getattr(plan, "target_roles_flat", []) or [])]
-        self._assert_no_iforward_ref_role_conflicts(target_refs_raw, target_roles_raw)
-        target_refs, target_roles = self._dedupe_v9_refs_roles_keep_order(target_refs_raw, target_roles_raw)
+        if plan_scheduler_version == "iforward_v4_coverage_ordered":
+            # V4 final eval intentionally allows one image ref to appear under
+            # both rollout-supervision and eval-only roles on the last rollout.
+            target_refs, target_roles = [tuple(x) for x in target_refs_raw], [str(x) for x in target_roles_raw]
+        else:
+            self._assert_no_iforward_ref_role_conflicts(target_refs_raw, target_roles_raw)
+            target_refs, target_roles = self._dedupe_v9_refs_roles_keep_order(target_refs_raw, target_roles_raw)
         if len(evidence_refs) == 0:
             raise ValueError("IForward request requires non-empty evidence refs")
         if len(target_refs) == 0:

@@ -7,6 +7,7 @@ import torch
 
 from models.streetforward.stage6_0 import LocalGSState
 from models.streetforward.stage6_0.local_gs_state import LocalBranchState
+from models.streetforward.stage6_0.posterior_updater import BranchDelta
 
 from .gru_memory import IForwardGRUBranchState, IForwardGRUMemoryState
 from .history_ema import IForwardHistoryBranchEMA, IForwardHistoryEMAState
@@ -15,6 +16,19 @@ from .utils import cfg_get
 
 
 ADC_STAT_PREFIX = "adc_lite"
+
+
+def _optional_detach_clone(value: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    return None if value is None else value.detach().clone()
+
+
+def _optional_to(
+    value: Optional[torch.Tensor],
+    *,
+    device: torch.device,
+    dtype: Optional[torch.dtype] = None,
+) -> Optional[torch.Tensor]:
+    return None if value is None else value.to(device=device, dtype=dtype or value.dtype)
 
 
 @dataclass
@@ -33,6 +47,13 @@ class IForwardADCBank:
     score_topk_mean: torch.Tensor
     score_p90: torch.Tensor
     score_p99: torch.Tensor
+    score_type: str = "fixed_score_v1"
+    score_max: Optional[torch.Tensor] = None
+    score_sum: Optional[torch.Tensor] = None
+    score_count: Optional[torch.Tensor] = None
+    parent_gate_mean: Optional[torch.Tensor] = None
+    parent_delta_demand: Optional[torch.Tensor] = None
+    parent_support_mean: Optional[torch.Tensor] = None
 
     def detach(self) -> "IForwardADCBank":
         return IForwardADCBank(
@@ -50,6 +71,13 @@ class IForwardADCBank:
             score_topk_mean=self.score_topk_mean.detach().clone(),
             score_p90=self.score_p90.detach().clone(),
             score_p99=self.score_p99.detach().clone(),
+            score_type=str(self.score_type),
+            score_max=_optional_detach_clone(self.score_max),
+            score_sum=_optional_detach_clone(self.score_sum),
+            score_count=_optional_detach_clone(self.score_count),
+            parent_gate_mean=_optional_detach_clone(self.parent_gate_mean),
+            parent_delta_demand=_optional_detach_clone(self.parent_delta_demand),
+            parent_support_mean=_optional_detach_clone(self.parent_support_mean),
         )
 
     def to(self, *, device: torch.device, dtype: Optional[torch.dtype] = None) -> "IForwardADCBank":
@@ -69,6 +97,13 @@ class IForwardADCBank:
             score_topk_mean=self.score_topk_mean.to(device=device, dtype=out_dtype),
             score_p90=self.score_p90.to(device=device, dtype=out_dtype),
             score_p99=self.score_p99.to(device=device, dtype=out_dtype),
+            score_type=str(self.score_type),
+            score_max=_optional_to(self.score_max, device=device, dtype=out_dtype),
+            score_sum=_optional_to(self.score_sum, device=device, dtype=out_dtype),
+            score_count=_optional_to(self.score_count, device=device, dtype=out_dtype),
+            parent_gate_mean=_optional_to(self.parent_gate_mean, device=device, dtype=out_dtype),
+            parent_delta_demand=_optional_to(self.parent_delta_demand, device=device, dtype=out_dtype),
+            parent_support_mean=_optional_to(self.parent_support_mean, device=device, dtype=out_dtype),
         )
 
 
@@ -181,6 +216,27 @@ def _masked_percentile(values: torch.Tensor, mask: torch.Tensor, percentile: flo
         device=values.device,
         dtype=values.dtype,
     )
+
+
+def _score_type_is_gate_suppressed(score_type: str) -> bool:
+    return str(score_type).lower() in {
+        "gate_suppressed_update",
+        "gate_suppressed_update_v1",
+        "relative_gate_suppressed_update",
+        "relative_gate_suppressed_update_v1",
+    }
+
+
+def _percentile_from_mode(mode: Any, default: float = 50.0) -> float:
+    raw = str(mode).strip().lower()
+    if raw in {"median", "p50"}:
+        return 50.0
+    if raw.startswith("p"):
+        raw = raw[1:]
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return float(default)
 
 
 def _masked_topk_mean(values: torch.Tensor, mask: torch.Tensor, k: int) -> torch.Tensor:
@@ -327,6 +383,426 @@ def _build_candidate_mask(
             safe_parent = ((branch.means.detach() > (lo + margin)) & (branch.means.detach() < (hi - margin))).all(dim=-1)
             mask = mask & safe_parent
     return mask
+
+
+def _attr_norm(x: torch.Tensor) -> torch.Tensor:
+    if int(x.numel()) == 0:
+        return x.new_zeros((int(x.shape[0]),), dtype=torch.float32)
+    flat = x.detach().reshape(int(x.shape[0]), -1).to(dtype=torch.float32)
+    return torch.sqrt(flat.square().mean(dim=-1).clamp_min(0.0))
+
+
+def _gate_column(gate: Any, raw_name: str, effective_name: str, ref: torch.Tensor) -> torch.Tensor:
+    value = getattr(gate, raw_name, None)
+    if value is None:
+        value = getattr(gate, effective_name)
+    out = value.detach().to(device=ref.device, dtype=torch.float32)
+    if out.dim() == 1:
+        out = out.unsqueeze(-1)
+    if out.dim() != 2 or int(out.shape[0]) != int(ref.shape[0]):
+        raise ValueError(
+            f"gate-suppressed ADC gate row mismatch for {effective_name}: "
+            f"got {tuple(out.shape)}, expected rows={int(ref.shape[0])}"
+        )
+    if int(out.shape[1]) != 1:
+        out = out.reshape(int(ref.shape[0]), -1).mean(dim=-1, keepdim=True)
+    return out
+
+
+def _optional_bool_column(value: Optional[torch.Tensor], *, n: int, ref: torch.Tensor, default: bool) -> torch.Tensor:
+    if value is None:
+        return torch.full((int(n),), bool(default), device=ref.device, dtype=torch.bool)
+    out = value.detach().to(device=ref.device)
+    if out.dim() == 2 and int(out.shape[1]) == 1:
+        out = out[:, 0]
+    else:
+        out = out.reshape(int(n), -1).any(dim=-1)
+    if int(out.shape[0]) != int(n):
+        raise ValueError(f"gate-suppressed ADC bool row mismatch: got {tuple(out.shape)}, expected rows={int(n)}")
+    return out.to(dtype=torch.bool)
+
+
+def _optional_float_column(value: Optional[torch.Tensor], *, n: int, ref: torch.Tensor, default: float) -> torch.Tensor:
+    if value is None:
+        return ref.detach().new_full((int(n),), float(default), dtype=torch.float32)
+    out = value.detach().to(device=ref.device, dtype=torch.float32)
+    if out.dim() == 2 and int(out.shape[1]) == 1:
+        out = out[:, 0]
+    else:
+        out = out.reshape(int(n), -1).mean(dim=-1)
+    if int(out.shape[0]) != int(n):
+        raise ValueError(f"gate-suppressed ADC float row mismatch: got {tuple(out.shape)}, expected rows={int(n)}")
+    return out
+
+
+def _masked_percentile_clamped(values: torch.Tensor, mask: torch.Tensor, percentile: float, eps: float) -> torch.Tensor:
+    selected = values.detach().reshape(-1)[mask.detach().reshape(-1).to(dtype=torch.bool)]
+    selected = selected[torch.isfinite(selected)]
+    if int(selected.numel()) == 0:
+        return values.detach().new_tensor(float(eps), dtype=torch.float32)
+    q = min(max(float(percentile) / 100.0, 0.0), 1.0)
+    return torch.quantile(selected.to(dtype=torch.float32), q).to(device=values.device).clamp_min(float(eps))
+
+
+def _rank_percentile_for_indices(
+    scores: torch.Tensor,
+    candidate_mask: torch.Tensor,
+    selected_idx: torch.Tensor,
+) -> torch.Tensor:
+    candidate_scores = scores.detach().reshape(-1)[candidate_mask.detach().reshape(-1).to(dtype=torch.bool)]
+    candidate_scores = candidate_scores[torch.isfinite(candidate_scores)]
+    selected = scores.detach().reshape(-1)[selected_idx.detach().reshape(-1).to(dtype=torch.long)]
+    selected = selected[torch.isfinite(selected)]
+    if int(candidate_scores.numel()) == 0 or int(selected.numel()) == 0:
+        return scores.detach().new_tensor(0.0)
+    return torch.stack([(candidate_scores <= value).to(dtype=torch.float32).mean() for value in selected]).mean()
+
+
+def compute_gate_suppressed_score(
+    *,
+    delta_bg: BranchDelta,
+    gate_bg: Any,
+    cfg: Any,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return per-bg-row suppression score and diagnostics.
+
+    The score uses the learned pre-mask gate. `mask_update` is only a hard
+    validity filter so unsupported rows are not counted as history suppression.
+    """
+
+    ref = delta_bg.means
+    n = int(ref.shape[0])
+    if n == 0:
+        z = ref.detach().new_zeros((0,), dtype=torch.float32)
+        return z, z, z, z, torch.zeros((0,), device=ref.device, dtype=torch.bool)
+
+    score_cfg = cfg_get(cfg, "score", {}) or {}
+    score_type = str(cfg_get(score_cfg, "type", "gate_suppressed_update")).lower()
+    norm_cfg = cfg_get(score_cfg, "attr_normalize", {}) or {}
+    percentile = _float_cfg(norm_cfg, "percentile", 95.0)
+    eps = _float_cfg(norm_cfg, "eps", 1.0e-8)
+    score_clip = _float_cfg(score_cfg, "score_clip", 10.0)
+
+    mask_update = _optional_bool_column(getattr(gate_bg, "mask_update", None), n=n, ref=ref, default=True)
+    support = _optional_float_column(getattr(gate_bg, "support_now", None), n=n, ref=ref, default=1.0)
+
+    attr_specs = (
+        ("means", delta_bg.means, _gate_column(gate_bg, "raw_means", "means", ref)),
+        ("scales", delta_bg.scales_log, _gate_column(gate_bg, "raw_scales", "scales", ref)),
+        ("quat", delta_bg.quat_axis_angle, _gate_column(gate_bg, "raw_quat", "quat", ref)),
+        ("opacity", delta_bg.opacity_logit, _gate_column(gate_bg, "raw_opacity", "opacity", ref)),
+        ("sh", delta_bg.sh, _gate_column(gate_bg, "raw_sh", "sh", ref)),
+    )
+    supp_normed: List[torch.Tensor] = []
+    demand_normed: List[torch.Tensor] = []
+    demand_norms: List[torch.Tensor] = []
+    gate_values: List[torch.Tensor] = []
+    for _, delta_attr, gate_attr in attr_specs:
+        delta_f = delta_attr.detach().to(dtype=torch.float32)
+        gate_f = gate_attr.to(device=delta_attr.device, dtype=torch.float32)
+        supp = _attr_norm((1.0 - gate_f).to(device=delta_attr.device, dtype=delta_f.dtype) * delta_f)
+        demand = _attr_norm(delta_f)
+        denom = _masked_percentile_clamped(demand, mask_update, percentile, eps)
+        normed = (supp / denom).clamp(min=0.0, max=float(score_clip))
+        normed = torch.where(torch.isfinite(normed), normed, torch.zeros_like(normed))
+        demand_norm = (demand / denom).clamp(min=0.0, max=float(score_clip))
+        demand_norm = torch.where(torch.isfinite(demand_norm), demand_norm, torch.zeros_like(demand_norm))
+        supp_normed.append(normed)
+        demand_normed.append(demand_norm)
+        demand_norms.append(torch.where(torch.isfinite(demand), demand, torch.zeros_like(demand)))
+        gate_values.append(gate_f.reshape(n, -1).mean(dim=-1).to(device=ref.device))
+
+    score_stack = torch.stack(supp_normed, dim=0)
+    demand_norm_stack = torch.stack(demand_normed, dim=0)
+    demand_stack = torch.stack(demand_norms, dim=0)
+    gate_stack = torch.stack(gate_values, dim=0)
+    if score_type in {"relative_gate_suppressed_update", "relative_gate_suppressed_update_v1"}:
+        gate_mean_tmp = gate_stack.mean(dim=0)
+        demand_norm = torch.sqrt(demand_norm_stack.square().mean(dim=0).clamp_min(0.0))
+        rel_cfg = cfg_get(score_cfg, "gate_ref", {}) or {}
+        gate_ref_pct = _percentile_from_mode(
+            cfg_get(rel_cfg, "mode", cfg_get(rel_cfg, "percentile", "median")),
+            default=50.0,
+        )
+        gate_ref = _masked_percentile_clamped(gate_mean_tmp, mask_update, gate_ref_pct, eps)
+        relative_gate_suppression = (gate_ref - gate_mean_tmp).clamp_min(0.0) / gate_ref.clamp_min(float(eps))
+        score = (demand_norm * relative_gate_suppression).clamp(min=0.0, max=float(score_clip))
+        score = torch.where(torch.isfinite(score), score, torch.zeros_like(score))
+    else:
+        score = torch.sqrt(score_stack.square().mean(dim=0).clamp_min(0.0))
+    delta_demand = torch.sqrt(demand_stack.square().mean(dim=0).clamp_min(0.0))
+    gate_mean = gate_stack.mean(dim=0)
+    valid = mask_update & torch.isfinite(score) & torch.isfinite(delta_demand) & torch.isfinite(gate_mean)
+    score = torch.where(valid, score, torch.zeros_like(score))
+    delta_demand = torch.where(valid, delta_demand, torch.zeros_like(delta_demand))
+    gate_mean = torch.where(valid, gate_mean, torch.zeros_like(gate_mean))
+    support = torch.where(valid, support, torch.zeros_like(support))
+    return score, gate_mean, delta_demand, support, valid
+
+
+class GateSuppressedADCAccumulator:
+    def __init__(self, *, num_bg: int, device: torch.device) -> None:
+        n = int(num_bg)
+        self.score_sum = torch.zeros((n,), device=device, dtype=torch.float32)
+        self.score_max = torch.zeros((n,), device=device, dtype=torch.float32)
+        self.score_count = torch.zeros((n,), device=device, dtype=torch.float32)
+        self.gate_sum = torch.zeros((n,), device=device, dtype=torch.float32)
+        self.delta_demand_sum = torch.zeros((n,), device=device, dtype=torch.float32)
+        self.support_sum = torch.zeros((n,), device=device, dtype=torch.float32)
+
+    @classmethod
+    def from_local_state(cls, local_state: LocalGSState) -> "GateSuppressedADCAccumulator":
+        return cls(num_bg=int(local_state.bg.means.shape[0]), device=local_state.bg.means.device)
+
+    def accumulate(
+        self,
+        *,
+        score: torch.Tensor,
+        gate_mean: torch.Tensor,
+        delta_demand: torch.Tensor,
+        support: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> Dict[str, float]:
+        n = int(self.score_sum.numel())
+        for name, value in (
+            ("score", score),
+            ("gate_mean", gate_mean),
+            ("delta_demand", delta_demand),
+            ("support", support),
+            ("mask", mask),
+        ):
+            if int(value.reshape(-1).numel()) != n:
+                raise ValueError(f"gate-suppressed ADC {name} rows mismatch: got {int(value.numel())}, expected {n}")
+        valid = mask.detach().reshape(-1).to(device=self.score_sum.device, dtype=torch.bool)
+        score_f = score.detach().reshape(-1).to(device=self.score_sum.device, dtype=torch.float32)
+        gate_f = gate_mean.detach().reshape(-1).to(device=self.score_sum.device, dtype=torch.float32)
+        demand_f = delta_demand.detach().reshape(-1).to(device=self.score_sum.device, dtype=torch.float32)
+        support_f = support.detach().reshape(-1).to(device=self.score_sum.device, dtype=torch.float32)
+        valid = valid & torch.isfinite(score_f) & torch.isfinite(gate_f) & torch.isfinite(demand_f) & torch.isfinite(support_f)
+        valid_f = valid.to(dtype=torch.float32)
+        score_f = torch.where(valid, score_f, torch.zeros_like(score_f))
+        self.score_sum += score_f
+        self.score_max = torch.maximum(self.score_max, score_f)
+        self.score_count += valid_f
+        self.gate_sum += torch.where(valid, gate_f, torch.zeros_like(gate_f))
+        self.delta_demand_sum += torch.where(valid, demand_f, torch.zeros_like(demand_f))
+        self.support_sum += torch.where(valid, support_f, torch.zeros_like(support_f))
+        return {
+            "adc_suppressed/step_valid_rows": float(valid_f.sum().item()),
+            "adc_suppressed/step_score_mean": float(score_f[valid].mean().item()) if bool(valid.any().item()) else 0.0,
+        }
+
+    def accumulate_from_bg_delta_gate(self, *, delta_bg: BranchDelta, gate_bg: Any, cfg: Any) -> Dict[str, float]:
+        score, gate_mean, delta_demand, support, mask = compute_gate_suppressed_score(
+            delta_bg=delta_bg,
+            gate_bg=gate_bg,
+            cfg=cfg,
+        )
+        return self.accumulate(
+            score=score,
+            gate_mean=gate_mean,
+            delta_demand=delta_demand,
+            support=support,
+            mask=mask,
+        )
+
+    def averaged(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        denom = self.score_count.clamp_min(1.0)
+        return self.gate_sum / denom, self.delta_demand_sum / denom, self.support_sum / denom
+
+    def stats(self, *, topk: int = 0) -> Dict[str, float]:
+        valid = self.score_count > 0
+        score = self.score_max
+        gate_mean, delta_demand, support = self.averaged()
+        k = int(topk) if int(topk) > 0 else max(1, min(1000, int(valid.detach().to(dtype=torch.long).sum().item())))
+        return {
+            "adc_suppressed/accum_valid_rows": float(valid.detach().to(dtype=torch.float32).sum().item()),
+            "adc_suppressed/score_mean": float(score.detach()[valid].mean().item()) if bool(valid.any().item()) else 0.0,
+            "adc_suppressed/score_topk_mean": float(_masked_topk_mean(score, valid, k).detach().item()),
+            "adc_suppressed/score_p90": float(_masked_percentile(score, valid, 90.0).detach().item()),
+            "adc_suppressed/score_p99": float(_masked_percentile(score, valid, 99.0).detach().item()),
+            "adc_suppressed/gate_mean": float(gate_mean.detach()[valid].mean().item()) if bool(valid.any().item()) else 0.0,
+            "adc_suppressed/delta_demand_mean": (
+                float(delta_demand.detach()[valid].mean().item()) if bool(valid.any().item()) else 0.0
+            ),
+            "adc_suppressed/support_mean": float(support.detach()[valid].mean().item()) if bool(valid.any().item()) else 0.0,
+            "adc_suppressed/all_gate_mean": (
+                float(gate_mean.detach()[valid].mean().item()) if bool(valid.any().item()) else 0.0
+            ),
+            "adc_suppressed/all_delta_demand_mean": (
+                float(delta_demand.detach()[valid].mean().item()) if bool(valid.any().item()) else 0.0
+            ),
+            "adc_suppressed/all_support_mean": (
+                float(support.detach()[valid].mean().item()) if bool(valid.any().item()) else 0.0
+            ),
+        }
+
+
+def build_gate_suppressed_adc_bank(
+    *,
+    accumulator: Optional[GateSuppressedADCAccumulator],
+    final_local_state: LocalGSState,
+    history_ema: Optional[IForwardHistoryEMAState],
+    cfg: Mapping[str, Any],
+    rollout_id: int,
+    episode_id: int,
+    num_current_refs: int,
+    num_history_refs: int,
+    adc_meta: Optional[IForwardADCStateMeta] = None,
+    aabb_min: Optional[torch.Tensor] = None,
+    aabb_max: Optional[torch.Tensor] = None,
+    diagnostics: Optional[Dict[str, float]] = None,
+) -> Optional[IForwardADCBank]:
+    diagnostics = diagnostics if diagnostics is not None else {}
+    if accumulator is None or not bool(cfg_get(cfg, "enable", False)):
+        return None
+    branch = final_local_state.bg
+    n = int(branch.means.shape[0])
+    if n == 0 or int(accumulator.score_max.numel()) != n:
+        diagnostics[f"{ADC_STAT_PREFIX}/bank_shape_mismatch"] = 1.0
+        return None
+    if int(num_current_refs) <= 0:
+        return None
+    candidate_cfg = cfg_get(cfg, "candidate", {}) or {}
+    require_history = _bool_cfg(candidate_cfg, "require_history", True)
+    if require_history and int(num_history_refs) <= 0:
+        return None
+
+    score = accumulator.score_max.detach().to(device=branch.means.device, dtype=torch.float32)
+    score_sum = accumulator.score_sum.detach().to(device=branch.means.device, dtype=torch.float32)
+    score_count = accumulator.score_count.detach().to(device=branch.means.device, dtype=torch.float32)
+    gate_mean, delta_demand, support_mean = accumulator.averaged()
+    gate_mean = gate_mean.detach().to(device=branch.means.device, dtype=torch.float32)
+    delta_demand = delta_demand.detach().to(device=branch.means.device, dtype=torch.float32)
+    support_mean = support_mean.detach().to(device=branch.means.device, dtype=torch.float32)
+
+    min_count = int(cfg_get(candidate_cfg, "min_count", 1))
+    mask = torch.isfinite(score) & (score_count >= int(min_count))
+    if require_history:
+        initialized = None if history_ema is None else getattr(history_ema.bg, "initialized", None)
+        if initialized is None or int(initialized.numel()) != n:
+            return None
+        init_mask = initialized.detach().to(device=branch.means.device).reshape(n, -1).mean(dim=-1) > 0.0
+        mask = mask & init_mask
+    if _bool_cfg(candidate_cfg, "require_support", False):
+        min_support = _float_cfg(candidate_cfg, "min_support", 0.0)
+        mask = mask & torch.isfinite(support_mean) & (support_mean > float(min_support))
+        diagnostics["adc_suppressed/support_threshold"] = float(min_support)
+        diagnostics["adc_suppressed/candidate_count_after_support_filter"] = float(
+            mask.detach().to(dtype=torch.float32).sum().item()
+        )
+
+    base_mask = _build_candidate_mask(
+        final_local_state=final_local_state,
+        adc_meta=adc_meta,
+        cfg=cfg,
+        score=score,
+        rollout_id=int(rollout_id),
+        aabb_min=aabb_min,
+        aabb_max=aabb_max,
+    )
+    mask = mask & base_mask
+    filter_ref_mask = mask.clone()
+    diagnostics["adc_suppressed/base_candidate_count"] = float(filter_ref_mask.detach().to(dtype=torch.float32).sum().item())
+    if bool(filter_ref_mask.any().item()):
+        gate_p20 = _masked_percentile(gate_mean, filter_ref_mask, 20.0)
+        gate_p50 = _masked_percentile(gate_mean, filter_ref_mask, 50.0)
+        gate_p80 = _masked_percentile(gate_mean, filter_ref_mask, 80.0)
+        for prefix in ("adc", "adc_suppressed"):
+            diagnostics[f"{prefix}/gate_distribution_p20"] = float(gate_p20.detach().item())
+            diagnostics[f"{prefix}/gate_distribution_p50"] = float(gate_p50.detach().item())
+            diagnostics[f"{prefix}/gate_distribution_p80"] = float(gate_p80.detach().item())
+    if _bool_cfg(candidate_cfg, "require_low_gate", False) and bool(filter_ref_mask.any().item()):
+        gate_pct = _float_cfg(candidate_cfg, "gate_percentile_max", 40.0)
+        gate_threshold = _masked_percentile(gate_mean, filter_ref_mask, gate_pct)
+        mask = mask & (gate_mean <= gate_threshold)
+        diagnostics["adc_suppressed/gate_threshold"] = float(gate_threshold.detach().item())
+        diagnostics["adc_suppressed/candidate_count_after_gate_filter"] = float(
+            mask.detach().to(dtype=torch.float32).sum().item()
+        )
+    if _bool_cfg(candidate_cfg, "require_high_delta_demand", False) and bool(filter_ref_mask.any().item()):
+        demand_pct = _float_cfg(candidate_cfg, "delta_demand_percentile_min", 60.0)
+        demand_threshold = _masked_percentile(delta_demand, filter_ref_mask, demand_pct)
+        mask = mask & (delta_demand >= demand_threshold)
+        diagnostics["adc_suppressed/delta_demand_threshold"] = float(demand_threshold.detach().item())
+        diagnostics["adc_suppressed/candidate_count_after_delta_filter"] = float(
+            mask.detach().to(dtype=torch.float32).sum().item()
+        )
+    percentile_raw = cfg_get(candidate_cfg, "min_score_percentile", None)
+    if percentile_raw is not None and bool(mask.any().item()):
+        pct_threshold = _masked_percentile(score, mask, float(percentile_raw))
+        mask = mask & (score >= pct_threshold)
+    score = torch.where(mask, score, torch.zeros_like(score))
+    if not bool(mask.any().item()):
+        diagnostics["adc_suppressed/candidate_count_pre_guard"] = 0.0
+        return None
+
+    budget_cfg = cfg_get(cfg, "budget", {}) or {}
+    topk = int(cfg_get(budget_cfg, "max_new_points_per_rollout", 2000))
+    if _bool_cfg(candidate_cfg, "require_gate_contrast", False):
+        gate_ref_cfg = cfg_get(cfg_get(cfg, "score", {}) or {}, "gate_ref", {}) or {}
+        gate_ref_pct = _percentile_from_mode(
+            cfg_get(candidate_cfg, "gate_ref_mode", cfg_get(gate_ref_cfg, "mode", "median")),
+            default=50.0,
+        )
+        gate_ref = _masked_percentile(gate_mean, filter_ref_mask, gate_ref_pct)
+        probe_k = min(max(1, int(topk)), int(mask.detach().to(dtype=torch.long).sum().item()))
+        if probe_k > 0:
+            probe_score = torch.where(mask, score, torch.full_like(score, -torch.inf))
+            probe_parent = torch.topk(probe_score, k=probe_k, largest=True).indices
+            probe_gate_mean = gate_mean.detach()[probe_parent].mean()
+        else:
+            probe_gate_mean = gate_mean.detach().new_tensor(0.0)
+        gate_contrast = gate_ref - probe_gate_mean
+        min_gate_contrast = _float_cfg(candidate_cfg, "min_gate_contrast", 0.0)
+        diagnostics["adc/parent_gate_contrast_pre_guard"] = float(gate_contrast.detach().item())
+        diagnostics["adc_suppressed/parent_gate_contrast_pre_guard"] = float(gate_contrast.detach().item())
+        diagnostics["adc_suppressed/gate_ref"] = float(gate_ref.detach().item())
+        if float(gate_contrast.detach().item()) < float(min_gate_contrast):
+            diagnostics[f"{ADC_STAT_PREFIX}/bank_low_gate_contrast"] = 1.0
+            return None
+        diagnostics[f"{ADC_STAT_PREFIX}/bank_low_gate_contrast"] = 0.0
+    score_topk_mean = _masked_topk_mean(score, mask, topk)
+    score_p90 = _masked_percentile(score, mask, 90.0)
+    score_p99 = _masked_percentile(score, mask, 99.0)
+    min_score_topk_mean_raw = cfg_get(cfg_get(cfg, "bank", {}) or {}, "min_score_topk_mean", None)
+    diagnostics["adc_suppressed/candidate_count_pre_guard"] = float(mask.detach().to(dtype=torch.float32).sum().item())
+    diagnostics["adc_suppressed/score_topk_mean_pre_guard"] = float(score_topk_mean.detach().item())
+    diagnostics["adc_suppressed/score_p99_pre_guard"] = float(score_p99.detach().item())
+    if min_score_topk_mean_raw is not None:
+        min_score_topk_mean = float(min_score_topk_mean_raw)
+        diagnostics[f"{ADC_STAT_PREFIX}/bank/min_score_topk_mean"] = float(min_score_topk_mean)
+        if float(score_topk_mean.detach().item()) < float(min_score_topk_mean):
+            diagnostics[f"{ADC_STAT_PREFIX}/bank_low_score_topk_mean"] = 1.0
+            return None
+        diagnostics[f"{ADC_STAT_PREFIX}/bank_low_score_topk_mean"] = 0.0
+    dtype = _storage_dtype(cfg, branch.means.dtype)
+    zeros = torch.zeros_like(score)
+    bank = IForwardADCBank(
+        valid=True,
+        source_rollout_id=int(rollout_id),
+        source_episode_id=int(episode_id),
+        source_num_current_refs=int(num_current_refs),
+        source_num_history_refs=int(num_history_refs),
+        score=score.detach().to(dtype=dtype),
+        abs_grad_current=zeros.detach().to(dtype=dtype),
+        abs_grad_history=zeros.detach().to(dtype=dtype),
+        scale_score=zeros.detach().to(dtype=dtype),
+        conflict_score=zeros.detach().to(dtype=dtype),
+        candidate_mask=mask.detach().to(dtype=torch.bool),
+        score_topk_mean=score_topk_mean.detach().reshape(()).to(dtype=dtype),
+        score_p90=score_p90.detach().reshape(()).to(dtype=dtype),
+        score_p99=score_p99.detach().reshape(()).to(dtype=dtype),
+        score_type=str(cfg_get(cfg_get(cfg, "score", {}) or {}, "type", "gate_suppressed_update")),
+        score_max=accumulator.score_max.detach().to(dtype=dtype),
+        score_sum=score_sum.detach().to(dtype=dtype),
+        score_count=score_count.detach().to(dtype=dtype),
+        parent_gate_mean=gate_mean.detach().to(dtype=dtype),
+        parent_delta_demand=delta_demand.detach().to(dtype=dtype),
+        parent_support_mean=support_mean.detach().to(dtype=dtype),
+    )
+    bank.valid = bool(bank.candidate_mask.any().item())
+    return bank if bool(bank.valid) else None
 
 
 def build_adc_lite_bank_from_losses(
@@ -764,12 +1240,34 @@ def _empty_apply_stats(*, enabled: bool, bank_valid: bool, bg_count: int) -> Dic
     return {
         f"{ADC_STAT_PREFIX}/enabled": 1.0 if bool(enabled) else 0.0,
         f"{ADC_STAT_PREFIX}/bank_valid": 1.0 if bool(bank_valid) else 0.0,
+        f"{ADC_STAT_PREFIX}/bank_dropped_without_apply": 0.0,
+        f"{ADC_STAT_PREFIX}/bank_shape_mismatch": 0.0,
         f"{ADC_STAT_PREFIX}/applied": 0.0,
         f"{ADC_STAT_PREFIX}/num_cloned_this_rollout": 0.0,
         f"{ADC_STAT_PREFIX}/bg_count_before": float(bg_count),
         f"{ADC_STAT_PREFIX}/bg_count_after": float(bg_count),
         f"{ADC_STAT_PREFIX}/planning/enabled": 0.0,
         f"{ADC_STAT_PREFIX}/planning/applied": 0.0,
+        f"{ADC_STAT_PREFIX}/candidate_count_after_planning": 0.0,
+        f"{ADC_STAT_PREFIX}/clone_fraction_of_candidates": 0.0,
+        "adc_suppressed/parent_gate_mean": 0.0,
+        "adc_suppressed/parent_delta_demand_mean": 0.0,
+        "adc_suppressed/parent_support_mean": 0.0,
+        "adc_suppressed/selected_parent_suppression_rank_percentile": 0.0,
+        "adc/raw_score/selected_rank_percentile": 0.0,
+        "adc/planning_score/selected_rank_percentile": 0.0,
+        "adc/final_score/selected_rank_percentile": 0.0,
+        "adc/raw_score/parent_mean": 0.0,
+        "adc/planning_score/parent_mean": 0.0,
+        "adc/final_score/parent_mean": 0.0,
+        "adc/parent_gate_mean": 0.0,
+        "adc/all_gate_mean": 0.0,
+        "adc/parent_delta_demand_mean": 0.0,
+        "adc/all_delta_demand_mean": 0.0,
+        "adc/parent_gate_contrast": 0.0,
+        "adc/gate_distribution_p20": 0.0,
+        "adc/gate_distribution_p50": 0.0,
+        "adc/gate_distribution_p80": 0.0,
     }
 
 
@@ -847,12 +1345,12 @@ def apply_bg_clone_episode_local(
                     float(support.detach()[valid].mean().item()) if bool(valid.any().item()) else 0.0
                 )
                 support_weight = _float_cfg(planning_cfg, "support_score_weight", 0.25)
+                stats[f"{ADC_STAT_PREFIX}/planning/support_score_weight"] = float(support_weight)
                 if float(support_weight) != 0.0:
                     norm_pct = _float_cfg(planning_cfg, "support_normalize_percentile", 95.0)
                     eps = _float_cfg(planning_cfg, "eps", 1.0e-8)
                     support_score = _normalize01(support.clamp_min(0.0), percentile=norm_pct, eps=eps)
                     ranked_score = ranked_score * (1.0 + float(support_weight) * support_score.to(dtype=ranked_score.dtype))
-                    stats[f"{ADC_STAT_PREFIX}/planning/support_score_weight"] = float(support_weight)
     valid_count = int(candidate.sum().item())
     if valid_count <= 0:
         stats[f"{ADC_STAT_PREFIX}/no_candidates"] = 1.0
@@ -864,6 +1362,14 @@ def apply_bg_clone_episode_local(
 
     parent_alpha = torch.sigmoid(local_state.bg.opacity_logit.detach()[parent_idx]).reshape(k, -1).mean(dim=-1)
     parent_scale = torch.exp(local_state.bg.scales_log.detach()[parent_idx]).reshape(k, -1).amax(dim=-1)
+    raw_rank_percentile = _rank_percentile_for_indices(bank.score, candidate, parent_idx)
+    planning_rank_percentile = _rank_percentile_for_indices(ranked_score, candidate, parent_idx)
+    final_rank_percentile = _rank_percentile_for_indices(masked_score, candidate, parent_idx)
+    all_valid = (
+        bank.score_count.detach().reshape(-1).to(device=device, dtype=torch.float32) > 0
+        if bank.score_count is not None and int(bank.score_count.numel()) == int(bank.score.numel())
+        else candidate
+    )
     clone_branch, clone_aux = _clone_local_bg_branch(
         local_state.bg,
         parent_idx=parent_idx,
@@ -906,13 +1412,67 @@ def apply_bg_clone_episode_local(
             f"{ADC_STAT_PREFIX}/parent_score_mean": float(top.values.detach().mean().item()) if k else 0.0,
             f"{ADC_STAT_PREFIX}/parent_alpha_mean": float(parent_alpha.detach().mean().item()) if k else 0.0,
             f"{ADC_STAT_PREFIX}/parent_scale_mean": float(parent_scale.detach().mean().item()) if k else 0.0,
+            f"{ADC_STAT_PREFIX}/candidate_count_after_planning": float(valid_count),
+            f"{ADC_STAT_PREFIX}/clone_fraction_of_candidates": float(k) / float(max(valid_count, 1)),
             f"{ADC_STAT_PREFIX}/parent_conflict_mean": (
                 float(bank.conflict_score.detach()[parent_idx].mean().item()) if k else 0.0
             ),
+            f"{ADC_STAT_PREFIX}/score_type_gate_suppressed": (
+                1.0 if _score_type_is_gate_suppressed(str(getattr(bank, "score_type", ""))) else 0.0
+            ),
+            "adc_suppressed/parent_score_mean": float(top.values.detach().mean().item()) if k else 0.0,
+            "adc_suppressed/selected_parent_suppression_rank_percentile": (
+                float(raw_rank_percentile.detach().item()) if k else 0.0
+            ),
+            "adc/raw_score/selected_rank_percentile": float(raw_rank_percentile.detach().item()) if k else 0.0,
+            "adc/planning_score/selected_rank_percentile": (
+                float(planning_rank_percentile.detach().item()) if k else 0.0
+            ),
+            "adc/final_score/selected_rank_percentile": float(final_rank_percentile.detach().item()) if k else 0.0,
+            "adc/raw_score/parent_mean": float(bank.score.detach()[parent_idx].mean().item()) if k else 0.0,
+            "adc/planning_score/parent_mean": float(ranked_score.detach()[parent_idx].mean().item()) if k else 0.0,
+            "adc/final_score/parent_mean": float(top.values.detach().mean().item()) if k else 0.0,
             f"{ADC_STAT_PREFIX}/bank_source_rollout_id": float(bank.source_rollout_id),
             f"{ADC_STAT_PREFIX}/bank_source_episode_id": float(bank.source_episode_id),
         }
     )
+    if bank.parent_gate_mean is not None:
+        parent_gate_mean = float(bank.parent_gate_mean.detach()[parent_idx].mean().item()) if k else 0.0
+        all_gate_mean = (
+            float(bank.parent_gate_mean.detach().float()[all_valid].mean().item()) if bool(all_valid.any().item()) else 0.0
+        )
+        stats["adc_suppressed/parent_gate_mean"] = parent_gate_mean
+        stats["adc_suppressed/all_gate_mean"] = all_gate_mean
+        stats["adc/parent_gate_mean"] = parent_gate_mean
+        stats["adc/all_gate_mean"] = all_gate_mean
+        stats["adc/parent_gate_contrast"] = all_gate_mean - parent_gate_mean
+        stats["adc/gate_distribution_p20"] = float(_masked_percentile(bank.parent_gate_mean.float(), all_valid, 20.0).item())
+        stats["adc/gate_distribution_p50"] = float(_masked_percentile(bank.parent_gate_mean.float(), all_valid, 50.0).item())
+        stats["adc/gate_distribution_p80"] = float(_masked_percentile(bank.parent_gate_mean.float(), all_valid, 80.0).item())
+        stats["adc_suppressed/gate_distribution_p20"] = stats["adc/gate_distribution_p20"]
+        stats["adc_suppressed/gate_distribution_p50"] = stats["adc/gate_distribution_p50"]
+        stats["adc_suppressed/gate_distribution_p80"] = stats["adc/gate_distribution_p80"]
+        stats[f"{ADC_STAT_PREFIX}/parent_gate_mean"] = stats["adc_suppressed/parent_gate_mean"]
+    if bank.parent_delta_demand is not None:
+        parent_delta_mean = float(bank.parent_delta_demand.detach()[parent_idx].mean().item()) if k else 0.0
+        all_delta_mean = (
+            float(bank.parent_delta_demand.detach().float()[all_valid].mean().item())
+            if bool(all_valid.any().item())
+            else 0.0
+        )
+        stats["adc_suppressed/parent_delta_demand_mean"] = parent_delta_mean
+        stats["adc_suppressed/all_delta_demand_mean"] = all_delta_mean
+        stats["adc/parent_delta_demand_mean"] = parent_delta_mean
+        stats["adc/all_delta_demand_mean"] = all_delta_mean
+        stats[f"{ADC_STAT_PREFIX}/parent_delta_demand_mean"] = stats["adc_suppressed/parent_delta_demand_mean"]
+    if bank.parent_support_mean is not None:
+        stats["adc_suppressed/parent_support_mean"] = (
+            float(bank.parent_support_mean.detach()[parent_idx].mean().item()) if k else 0.0
+        )
+        stats["adc_suppressed/all_support_mean"] = (
+            float(bank.parent_support_mean.detach().float()[all_valid].mean().item()) if bool(all_valid.any().item()) else 0.0
+        )
+        stats[f"{ADC_STAT_PREFIX}/parent_support_mean"] = stats["adc_suppressed/parent_support_mean"]
     return state, stats
 
 
@@ -920,6 +1480,7 @@ def adc_bank_stats(bank: Optional[IForwardADCBank], *, prefix: str = ADC_STAT_PR
     if bank is None or not bool(getattr(bank, "valid", False)):
         return {
             f"{prefix}/next_bank_valid": 0.0,
+            f"{prefix}/score_type_gate_suppressed": 0.0,
             f"{prefix}/score/topk_mean": 0.0,
             f"{prefix}/score/p90": 0.0,
             f"{prefix}/score/p99": 0.0,
@@ -929,9 +1490,17 @@ def adc_bank_stats(bank: Optional[IForwardADCBank], *, prefix: str = ADC_STAT_PR
             f"{prefix}/score/conflict_topk_mean": 0.0,
         }
     mask = bank.candidate_mask.detach().to(dtype=torch.bool)
+    all_valid = (
+        bank.score_count.detach().reshape(-1).to(dtype=torch.float32) > 0
+        if bank.score_count is not None and int(bank.score_count.numel()) == int(bank.score.numel())
+        else mask
+    )
     k = int(mask.sum().item())
-    return {
+    out = {
         f"{prefix}/next_bank_valid": 1.0,
+        f"{prefix}/score_type_gate_suppressed": (
+            1.0 if _score_type_is_gate_suppressed(str(getattr(bank, "score_type", ""))) else 0.0
+        ),
         f"{prefix}/score/topk_mean": float(bank.score_topk_mean.detach().item()),
         f"{prefix}/score/p90": float(bank.score_p90.detach().item()),
         f"{prefix}/score/p99": float(bank.score_p99.detach().item()),
@@ -939,15 +1508,50 @@ def adc_bank_stats(bank: Optional[IForwardADCBank], *, prefix: str = ADC_STAT_PR
         f"{prefix}/score/abs_grad_history_topk_mean": float(_masked_topk_mean(bank.abs_grad_history.float(), mask, k).item()),
         f"{prefix}/score/scale_topk_mean": float(_masked_topk_mean(bank.scale_score.float(), mask, k).item()),
         f"{prefix}/score/conflict_topk_mean": float(_masked_topk_mean(bank.conflict_score.float(), mask, k).item()),
+        "adc_suppressed/score_mean": float(bank.score.detach().float()[mask].mean().item()) if k else 0.0,
+        "adc_suppressed/score_topk_mean": float(bank.score_topk_mean.detach().item()),
+        "adc_suppressed/score_p90": float(bank.score_p90.detach().item()),
+        "adc_suppressed/score_p99": float(bank.score_p99.detach().item()),
+        "adc_suppressed/candidate_count": float(k),
     }
+    if bank.parent_gate_mean is not None:
+        out["adc_suppressed/all_gate_mean"] = (
+            float(bank.parent_gate_mean.detach().float()[all_valid].mean().item()) if bool(all_valid.any().item()) else 0.0
+        )
+        out["adc/gate_distribution_p20"] = float(_masked_percentile(bank.parent_gate_mean.float(), all_valid, 20.0).item())
+        out["adc/gate_distribution_p50"] = float(_masked_percentile(bank.parent_gate_mean.float(), all_valid, 50.0).item())
+        out["adc/gate_distribution_p80"] = float(_masked_percentile(bank.parent_gate_mean.float(), all_valid, 80.0).item())
+        out["adc_suppressed/gate_distribution_p20"] = out["adc/gate_distribution_p20"]
+        out["adc_suppressed/gate_distribution_p50"] = out["adc/gate_distribution_p50"]
+        out["adc_suppressed/gate_distribution_p80"] = out["adc/gate_distribution_p80"]
+    if bank.parent_delta_demand is not None:
+        out["adc_suppressed/all_delta_demand_mean"] = (
+            float(bank.parent_delta_demand.detach().float()[all_valid].mean().item())
+            if bool(all_valid.any().item())
+            else 0.0
+        )
+    if bank.parent_support_mean is not None:
+        out["adc_suppressed/all_support_mean"] = (
+            float(bank.parent_support_mean.detach().float()[all_valid].mean().item()) if bool(all_valid.any().item()) else 0.0
+        )
+    out.setdefault("adc_suppressed/all_gate_mean", 0.0)
+    out.setdefault("adc_suppressed/all_delta_demand_mean", 0.0)
+    out.setdefault("adc_suppressed/all_support_mean", 0.0)
+    out.setdefault("adc/gate_distribution_p20", 0.0)
+    out.setdefault("adc/gate_distribution_p50", 0.0)
+    out.setdefault("adc/gate_distribution_p80", 0.0)
+    return out
 
 
 __all__ = [
     "ADC_STAT_PREFIX",
+    "GateSuppressedADCAccumulator",
     "IForwardADCBank",
     "IForwardADCStateMeta",
     "adc_bank_stats",
     "apply_bg_clone_episode_local",
     "build_adc_lite_bank_from_losses",
+    "build_gate_suppressed_adc_bank",
+    "compute_gate_suppressed_score",
     "ensure_adc_meta_for_state",
 ]

@@ -582,4 +582,6 @@ class IForwardStage6Bridge:
             "rigid": int(len(getattr(self.runtime, "node_states_rigid", {}) or {})),
             "sky": int(len(getattr(self.runtime, "node_states_sky", {}) or {})),
         }
-        return {f"before_{k}": int(v) for k, v in before.items()} | {f"after_{k}": int(v) for k, v in after.items()}
+        stats = {f"before_{k}": int(v) for k, v in before.items()}
+        stats.update({f"after_{k}": int(v) for k, v in after.items()})
+        return stats
