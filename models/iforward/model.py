@@ -436,6 +436,10 @@ class IForwardModel(nn.Module):
         self.iforward_version = str(cfg_get(iforward_cfg, "version", "v1"))
         self.is_v3_gru_history_gate = self.iforward_version == "v3_gru_history_gate"
         self.is_v6_point_mamba_xcpe = self.iforward_version == "v6_point_mamba_xcpe"
+        self.is_stage2_0_biggs_parent_lifting = self.iforward_version in {
+            "stage2_0_biggs_parent_lifting",
+            "stage2_0_biggs_cuda_exact_diagonal_projector",
+        }
         self.history_safe_projection = None
         self.adc_lite_cfg = cfg_get(iforward_cfg, "adc_lite", {}) or {}
         self.adc_lite_enabled = bool(cfg_get(self.adc_lite_cfg, "enable", False))
@@ -446,6 +450,24 @@ class IForwardModel(nn.Module):
         }
         if bool(self.adc_lite_enabled) and not self.is_v3_gru_history_gate:
             raise ValueError("model.iforward.adc_lite.enable currently requires version=v3_gru_history_gate")
+        if self.is_stage2_0_biggs_parent_lifting:
+            biggs_cfg = cfg_get(iforward_cfg, "biggs", {}) or {}
+            if bool(cfg_get(biggs_cfg, "enable", True)) is not True:
+                raise ValueError(f"{self.iforward_version} requires model.iforward.biggs.enable=true")
+            if bool(cfg_get(cfg_get(iforward_cfg, "history_gate", {}) or {}, "enable", False)):
+                raise ValueError("stage2_0_biggs_parent_lifting requires history_gate.enable=false")
+            if bool(cfg_get(cfg_get(iforward_cfg, "history_gate_v2", {}) or {}, "enable", False)):
+                raise ValueError("stage2_0_biggs_parent_lifting requires history_gate_v2.enable=false")
+            if bool(self.adc_lite_enabled):
+                raise ValueError("stage2_0_biggs_parent_lifting requires adc_lite.enable=false")
+            observe_cfg = cfg_get(biggs_cfg, "observe", {}) or {}
+            if bool(cfg_get(observe_cfg, "parent_scene_for_lifting", True)) is not True:
+                raise ValueError("stage2_0_biggs_parent_lifting requires parent_scene_for_lifting=true")
+            skip_cfg = cfg_get(biggs_cfg, "child_observation_skip", {}) or {}
+            if bool(cfg_get(skip_cfg, "enable", False)) and (
+                bool(cfg_get(skip_cfg, "trainable", False)) or not bool(cfg_get(skip_cfg, "no_grad", True))
+            ):
+                raise ValueError("stage2_0_biggs_parent_lifting forbids trainable child_observation_skip")
         if self.is_v3_gru_history_gate:
             self._validate_v3_scheduler_contract(config)
         debug_cfg = cfg_get(iforward_cfg, "debug", {}) or {}
@@ -564,6 +586,11 @@ class IForwardModel(nn.Module):
                 output_scale_learnable=bool(cfg_get(adapter_cfg, "output_scale_learnable", False)),
             )
             self.memory = None
+        elif self.is_stage2_0_biggs_parent_lifting:
+            self.history_gate_v2_cfg = {}
+            self.history_gate_v2_enabled = False
+            self.memory = None
+            self.history_safe_projection = None
         else:
             self.history_gate_v2_cfg = {}
             self.history_gate_v2_enabled = False
@@ -596,7 +623,7 @@ class IForwardModel(nn.Module):
         self.history_max_entries = int(cfg_get(history_cfg, "max_entries", 24))
         self.history_max_memory_entries = (
             0
-            if self.is_v6_point_mamba_xcpe or self.is_v3_gru_history_gate
+            if self.is_v6_point_mamba_xcpe or self.is_v3_gru_history_gate or self.is_stage2_0_biggs_parent_lifting
             else int(cfg_get(history_cfg, "max_memory_entries", 8))
         )
         loss_cfg = cfg_get(iforward_cfg, "loss", {}) or {}
@@ -731,6 +758,7 @@ class IForwardModel(nn.Module):
             node_state_bg=node_bg,
             node_state_distant=node_distant,
             node_state_rigid=node_rigid,
+            biggs_state=None,
         )
 
     def _adc_lite_aabb(
@@ -1313,16 +1341,55 @@ class IForwardModel(nn.Module):
         ):
             adc_suppression_accumulator = GateSuppressedADCAccumulator.from_local_state(local_state)
 
+        observe_batch = batch
+        if self.is_stage2_0_biggs_parent_lifting:
+            if int(resolved.scene_id) < 0 or int(resolved.segment_id) < 0:
+                raise ValueError(
+                    "IForward Stage2 BigGS resolved batch missing valid scene_id/segment_id: "
+                    f"scene_id={int(resolved.scene_id)} segment_id={int(resolved.segment_id)} "
+                    f"batch_keys={sorted(str(k) for k in batch.keys())}"
+                )
+            observe_batch = dict(batch)
+            ifwd_meta = dict(resolved.meta or {})
+            ifwd_meta["scene_id"] = int(resolved.scene_id)
+            ifwd_meta["segment_id"] = int(resolved.segment_id)
+            ifwd_meta["episode_id"] = int(resolved.episode_id)
+            ifwd_meta["rollout_id_global"] = int(resolved.rollout_id_global)
+            request_meta = dict(observe_batch.get("request_meta") or {})
+            request_meta["scene_id"] = int(resolved.scene_id)
+            request_meta["segment_id"] = int(resolved.segment_id)
+            request_meta["episode_id"] = int(resolved.episode_id)
+            request_meta["rollout_id_global"] = int(resolved.rollout_id_global)
+            request_meta["iforward"] = ifwd_meta
+            observe_batch["scene_id"] = int(resolved.scene_id)
+            observe_batch["segment_id"] = int(resolved.segment_id)
+            observe_batch["request_meta"] = request_meta
+            observe_batch["_iforward"] = ifwd_meta
+
         global_step = int(batch.get("global_step", 0))
         for step_pos, step in enumerate(resolved.steps):
             t0 = time.perf_counter()
             with self._nvtx_range("iforward/observe"):
-                measurement = self.bridge.observe(
-                    local_state=local_state,
-                    batch=batch,
-                    source_indices=list(step.source_indices),
-                    source_frame_idx=int(step.source_frame_idx),
-                )
+                observe_kwargs = {
+                    "local_state": local_state,
+                    "batch": observe_batch,
+                    "source_indices": list(step.source_indices),
+                    "source_frame_idx": int(step.source_frame_idx),
+                }
+                if self.is_stage2_0_biggs_parent_lifting:
+                    observe_kwargs["biggs_state"] = getattr(state, "biggs_state", None)
+                    observe_kwargs["biggs_scene_id"] = int(resolved.scene_id)
+                    observe_kwargs["biggs_segment_id"] = int(resolved.segment_id)
+                    observe_kwargs["biggs_episode_id"] = int(resolved.episode_id)
+                measurement = self.bridge.observe(**observe_kwargs)
+                if (
+                    self.is_stage2_0_biggs_parent_lifting
+                    and isinstance(measurement, dict)
+                    and measurement.get("biggs_state") is not None
+                ):
+                    next_biggs_state = measurement["biggs_state"]
+                    detach_biggs = getattr(next_biggs_state, "detach", None)
+                    state.biggs_state = detach_biggs() if callable(detach_biggs) else next_biggs_state
             timings["observe_ms"] += (time.perf_counter() - t0) * 1000.0
             t0 = time.perf_counter()
             with self._nvtx_range("iforward/event"):
@@ -1373,6 +1440,13 @@ class IForwardModel(nn.Module):
                         step_context=step_context,
                         ablation=module_ablation_name,
                     )
+                    short_entries = []
+                elif self.is_stage2_0_biggs_parent_lifting:
+                    ctx_memory = None
+                    memory_aux = {
+                        "iforward/stage2_0_memory_bypass": 1.0,
+                        "iforward/biggs/memory_noop": 1.0,
+                    }
                     short_entries = []
                 else:
                     memory_state, ctx_memory, memory_aux, short_entries = self.memory(
@@ -1572,6 +1646,8 @@ class IForwardModel(nn.Module):
                 "short_entries_added": float(len(short_entries)),
                 "memory_entries_after_step": float(len(working_history.memory_entries)),
             }
+            if isinstance(measurement, dict):
+                item.update({str(k): float(v) for k, v in measurement.items() if isinstance(v, (int, float))})
             item.update({str(k): float(v) for k, v in memory_aux.items() if isinstance(v, (int, float))})
             item.update({str(k): float(v) for k, v in update_aux.items() if isinstance(v, (int, float))})
             per_step.append(item)
@@ -1681,6 +1757,7 @@ class IForwardModel(nn.Module):
             history_gradient_bank=next_history_gradient_bank,
             adc_bank=next_adc_bank,
             adc_meta=getattr(state, "adc_meta", None),
+            biggs_state=getattr(state, "biggs_state", None),
             node_state_bg=state.node_state_bg,
             node_state_distant=state.node_state_distant,
             node_state_rigid=state.node_state_rigid,
@@ -1776,6 +1853,30 @@ class IForwardModel(nn.Module):
         if current_psnr is not None and short_psnr is not None:
             stats["psnr_gap/current_minus_short_history"] = float(current_psnr) - float(short_psnr)
         stats.update({key: float(value) for key, value in timings.items()})
+        per_step_metric_keys = sorted(
+            {
+                str(key)
+                for item in per_step
+                for key, value in item.items()
+                if isinstance(value, (int, float))
+                and (
+                    str(key).startswith("iforward/")
+                    or str(key).startswith("num_parent_")
+                    or str(key) == "src_backproject_pass_count"
+                )
+            }
+        )
+        for key in per_step_metric_keys:
+            values = [
+                float(item[key])
+                for item in per_step
+                if key in item and isinstance(item.get(key), (int, float)) and math.isfinite(float(item[key]))
+            ]
+            if not values:
+                continue
+            stats[str(key)] = float(values[-1])
+            stats[f"{key}_last"] = float(values[-1])
+            stats[f"{key}_mean"] = float(sum(values) / float(len(values)))
         for key, value in reg_stats_sum.items():
             stats[f"delta_reg/{key}_mean"] = float(value) / float(max(len(reg_terms), 1))
         for key, value in hsp_stats_sum.items():

@@ -85,12 +85,23 @@ def _route_random_window_entrypoint_if_needed(default_config: str) -> bool:
 def _iforward_validation_cfg(cfg: Any) -> Dict[str, Any]:
     raw = _cfg_get(cfg, "iforward_validation", {}) or {}
     tb_images_raw = _cfg_get(raw, "tensorboard_images", {}) or {}
+    modes_raw = _cfg_get(raw, "modes", None)
+    modes = None
+    if modes_raw is not None:
+        if isinstance(modes_raw, str):
+            modes = [modes_raw]
+        else:
+            modes = [str(x) for x in modes_raw]
+    rollout_shapes = [dict(x) for x in list(_cfg_get(raw, "rollout_shapes", []) or [])]
     return {
         "enable": bool(_cfg_get(raw, "enable", False)),
         "run_at_train_start": bool(_cfg_get(raw, "run_at_train_start", True)),
         "interval_steps": int(_cfg_get(raw, "interval_steps", 1000)),
         "segments_per_scene": int(_cfg_get(raw, "segments_per_scene", 1)),
         "rollouts_per_segment": int(_cfg_get(raw, "rollouts_per_segment", 1)),
+        "modes": modes,
+        "use_train_rollout_shapes": bool(_cfg_get(raw, "use_train_rollout_shapes", False)),
+        "rollout_shapes": rollout_shapes,
         "tensorboard_images_enable": bool(_cfg_get(tb_images_raw, "enable", True)),
         "tensorboard_images_max_per_role": int(_cfg_get(tb_images_raw, "max_images_per_role", 2)),
     }
@@ -210,6 +221,7 @@ def _first_valid_iforward_eval_segments(cfg: Any, dataset: Any) -> List[Tuple[in
 
 def _make_validation_scheduler(cfg: Any, dataset: Any, scene_id: int, segment_id: int) -> TrainSchedulerIForward:
     sched = _cfg_get(cfg, "scheduler_iforward", {}) or {}
+    val_cfg = _iforward_validation_cfg(cfg)
     scheduler_version = str(_cfg_get(sched, "version", "iforward_v1"))
     episode_cfg = copy.deepcopy(dict(_cfg_get(sched, "episode", {}) or {}))
     rollout_cfg = copy.deepcopy(dict(_cfg_get(sched, "rollout", {}) or {}))
@@ -239,31 +251,57 @@ def _make_validation_scheduler(cfg: Any, dataset: Any, scene_id: int, segment_id
             }
         )
     else:
-        episode_cfg.update(
-            {
-                "blocks_per_episode": 4,
-                "episode_stride": 4,
-                "allow_short_last_episode": False,
-                "min_blocks_per_episode": 4,
-                "rollouts_per_episode": int(_cfg_get(episode_cfg, "rollouts_per_episode", 1)),
-            }
-        )
-        rollout_cfg.update(
-            {
-                "allow_short_final_rollout": False,
-                "min_blocks_per_rollout": 4,
-                "avoid_single_block_tail": True,
-                "shapes": [
-                    {
-                        "name": "b4_r2",
-                        "blocks_per_rollout": 4,
-                        "repeats_per_block": 2,
-                        "prob": 1.0,
-                    }
-                ],
-                "shapes_schedule": [],
-            }
-        )
+        configured_shapes = [dict(x) for x in list(val_cfg.get("rollout_shapes", []) or [])]
+        if not configured_shapes and bool(val_cfg.get("use_train_rollout_shapes", False)):
+            configured_shapes = [dict(x) for x in list(_cfg_get(rollout_cfg, "shapes", []) or [])]
+        if configured_shapes:
+            blocks = [int(_cfg_get(shape, "blocks_per_rollout", 1)) for shape in configured_shapes]
+            max_blocks = max(blocks) if blocks else 1
+            min_blocks = min(blocks) if blocks else 1
+            episode_cfg.update(
+                {
+                    "blocks_per_episode": int(max_blocks),
+                    "episode_stride": int(max_blocks),
+                    "allow_short_last_episode": False,
+                    "min_blocks_per_episode": int(min_blocks),
+                    "rollouts_per_episode": 1,
+                }
+            )
+            rollout_cfg.update(
+                {
+                    "allow_short_final_rollout": False,
+                    "min_blocks_per_rollout": int(min_blocks),
+                    "avoid_single_block_tail": False,
+                    "shapes": configured_shapes,
+                    "shapes_schedule": [],
+                }
+            )
+        else:
+            episode_cfg.update(
+                {
+                    "blocks_per_episode": 4,
+                    "episode_stride": 4,
+                    "allow_short_last_episode": False,
+                    "min_blocks_per_episode": 4,
+                    "rollouts_per_episode": int(_cfg_get(episode_cfg, "rollouts_per_episode", 1)),
+                }
+            )
+            rollout_cfg.update(
+                {
+                    "allow_short_final_rollout": False,
+                    "min_blocks_per_rollout": 4,
+                    "avoid_single_block_tail": True,
+                    "shapes": [
+                        {
+                            "name": "b4_r2",
+                            "blocks_per_rollout": 4,
+                            "repeats_per_block": 2,
+                            "prob": 1.0,
+                        }
+                    ],
+                    "shapes_schedule": [],
+                }
+            )
     traversal_cfg = copy.deepcopy(dict(_cfg_get(sched, "traversal", {}) or {}))
     traversal_cfg.update(
         {
@@ -335,12 +373,17 @@ def _write_iforward_validation_rows(
     if callable(reset_bridge):
         reset_bridge()
     model.eval()
-    allowed_ablations = set(str(x) for x in (getattr(model, "allowed_ablations", None) or ()))
-    validation_modes = (
-        ("full_adc", "no_adc")
-        if not allowed_ablations or {"full_adc", "no_adc"}.issubset(allowed_ablations)
-        else ("full",)
-    )
+    configured_modes = val_cfg.get("modes")
+    if configured_modes:
+        validation_modes = tuple(str(x) for x in configured_modes)
+    else:
+        inner_model = getattr(model, "model", model)
+        allowed_ablations = set(str(x) for x in (getattr(inner_model, "allowed_ablations", None) or ()))
+        validation_modes = (
+            ("full_adc", "no_adc")
+            if not allowed_ablations or {"full_adc", "no_adc"}.issubset(allowed_ablations)
+            else ("full",)
+        )
     try:
         with torch.no_grad():
             for scene_id, segment_id in segments:

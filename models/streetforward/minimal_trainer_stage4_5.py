@@ -175,7 +175,9 @@ class MinimalStreetForwardStage4_5(MinimalStreetForwardStage4_2):
             return_debug_stats=False,
         )
         scene_rgbs, scene_accs = scene_render_out
-        scene_rgb_batch = torch.stack(scene_rgbs, dim=0).detach()
+        scene_rgb_batch = torch.stack(scene_rgbs, dim=0)
+        if bool(getattr(self, "stage6_detach_source_render_for_cnn", True)):
+            scene_rgb_batch = scene_rgb_batch.detach()
         image_batch = torch.stack([img.to(self.device) for img in source_images], dim=0)
         if image_batch.dim() == 4 and image_batch.shape[1] == 3:
             image_batch = image_batch.permute(0, 2, 3, 1)

@@ -87,6 +87,47 @@ class _FakeDataset:
         }
 
 
+class _MultiSceneFakeDataset(_FakeDataset):
+    def __init__(self, *, scene_ids=(1, 2, 3), segment_ids=(0, 1), **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.scene_ids = [int(x) for x in scene_ids]
+        self.segment_ids = [int(x) for x in segment_ids]
+
+    def list_training_scene_ids(self):
+        return list(self.scene_ids)
+
+    def list_segment_ids(self, scene_id):
+        assert int(scene_id) in set(self.scene_ids)
+        return list(self.segment_ids)
+
+    def get_segment_index(self, scene_id, segment_id):
+        assert int(scene_id) in set(self.scene_ids)
+        assert int(segment_id) in set(self.segment_ids)
+        return SimpleNamespace(
+            scene_id=int(scene_id),
+            segment_id=int(segment_id),
+            num_cams=int(self.num_cams),
+            frame_indices=list(self.frames),
+            test_frame_indices=[],
+            train_frame_set=set(self.frames),
+            test_frame_set=set(),
+            keyframe_indices=list(self.keyframe_to_frames.keys()),
+            keyframe_to_frames=dict(self.keyframe_to_frames),
+            frame_to_keyframe=dict(self.frame_to_keyframe),
+            segment_first_frame_idx=min(self.frames),
+            train_image_refs=tuple((int(f), int(c)) for f in self.frames for c in range(int(self.num_cams))),
+            test_image_refs=tuple(),
+        )
+
+    def validate_image_ref(self, scene_id, segment_id, ref, purpose="train"):
+        frame_idx, cam_idx = int(ref[0]), int(ref[1])
+        assert int(scene_id) in set(self.scene_ids)
+        assert int(segment_id) in set(self.segment_ids)
+        assert str(purpose) == "train"
+        assert frame_idx in set(self.frames)
+        assert 0 <= cam_idx < int(self.num_cams)
+
+
 def _scheduler(ds: _FakeDataset, **kwargs) -> TrainSchedulerIForward:
     blocks = int(kwargs.get("blocks_per_rollout", 2))
     repeats = int(kwargs.get("repeats_per_block", 3))
@@ -162,6 +203,82 @@ def _scheduler(ds: _FakeDataset, **kwargs) -> TrainSchedulerIForward:
         fixed_scene_id=1,
         fixed_segment_id=0,
     )
+
+
+def _round_robin_scheduler(ds: _MultiSceneFakeDataset, *, seed: int = 7) -> TrainSchedulerIForward:
+    return TrainSchedulerIForward(
+        dataset=ds,
+        episode_cfg={
+            "source_mode": "keyframes",
+            "blocks_per_episode": 2,
+            "episode_stride": 2,
+            "allow_short_last_episode": False,
+            "min_blocks_per_episode": 2,
+            "rollouts_per_episode": 1,
+            "block_source_frame_policy": "random_within_keyframe_once_per_episode",
+        },
+        rollout_cfg={
+            "block_selection_policy": "next_contiguous",
+            "delivery_order_policy": "chronological",
+            "allow_short_final_rollout": False,
+            "min_blocks_per_rollout": 1,
+            "avoid_single_block_tail": False,
+            "detach_graph_after_rollout": True,
+            "shapes": [{"name": "b1_r2", "blocks_per_rollout": 1, "repeats_per_block": 2, "prob": 1.0}],
+        },
+        traversal_cfg={
+            "traversal_mode": "scene_round_robin_episode",
+            "forbid_consecutive_same_scene": True,
+            "scene_order": "ascending",
+            "segment_order": "shuffle_per_epoch",
+            "seed": int(seed),
+        },
+        evidence_cfg={"camera_policy": "all_cams", "allow_camera_dropout": False},
+        supervision_cfg={
+            "current": {
+                "enable": True,
+                "role_name": "final_current_recon",
+                "frame_policy": "all_input_frames",
+                "camera_policy": "all_cams",
+            },
+            "nearby": {"enable": False},
+            "history_replay": {"enable": False},
+        },
+        memory_cfg={
+            "observation_commit_policy": "first_repeat_only",
+            "optimizer_memory_update_policy": "every_repeat",
+            "reset_policy": "episode_begin",
+            "carry_policy": "across_rollouts_until_episode_end",
+        },
+        loss_timing_cfg={"policy": "rollout_final_only", "intermediate_step_loss": False},
+        leakage_check_cfg={"enable": True, "forbid_test_refs_in_train": True},
+        preload_cfg={"emit_hints": False},
+        include_test=False,
+    )
+
+
+def test_scene_round_robin_episode_avoids_consecutive_scene_when_possible():
+    ds = _MultiSceneFakeDataset(num_keyframes=8, scene_ids=(1, 2, 3), segment_ids=(0, 1))
+    sched = _round_robin_scheduler(ds)
+
+    scenes = [int(sched.next_batch()["_iforward"]["scene_id"]) for _ in range(12)]
+
+    assert set(scenes[:3]) == {1, 2, 3}
+    assert all(a != b for a, b in zip(scenes, scenes[1:]))
+
+
+def test_scene_round_robin_state_dict_preserves_plan_cursor():
+    ds = _MultiSceneFakeDataset(num_keyframes=8, scene_ids=(1, 2, 3), segment_ids=(0, 1))
+    sched = _round_robin_scheduler(ds, seed=11)
+    _ = sched.next_batch()
+    state = sched.state_dict()
+
+    restored = _round_robin_scheduler(ds, seed=999)
+    restored.load_state_dict(state)
+
+    expected = [sched.next_batch()["_iforward"]["scene_id"] for _ in range(5)]
+    actual = [restored.next_batch()["_iforward"]["scene_id"] for _ in range(5)]
+    assert actual == expected
 
 
 def _scheduler_v3(ds: _FakeDataset, **kwargs) -> TrainSchedulerIForward:

@@ -1,0 +1,500 @@
+output_name: iforward_stage2_0_biggs_cuda_exact_diag_30w20w
+
+# IForward BigGS Stage 2.0 entrypoint.
+# This is distinct from configs/minimal_streetforward_stage2_0.yaml, which is the
+# older Minimal StreetForward Stage 2.0 multi-target/no-proxy experiment.
+
+initialization:
+  phase_b_from_phase_a:
+    enable: false
+    checkpoint: ""
+    required: false
+    weights_only: true
+    export_type: stage6_0_phase_a_for_phase_b
+    reject_plain_model_state_dict: true
+
+data:
+  data_root: "/root/autodl-tmp/nuScenes/"
+  dataset: "nuscenes"
+  start_timestep: 0
+  end_timestep: -1
+  preload_device: cpu
+  sky_mask_semantics: one_is_sky
+  train_scene_ids: [14, 16, 24, 32, 40, 99, 107, 115, 123, 131, 139, 147, 155, 163, 171, 179, 195, 214,]
+  eval_scene_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  pixel_source:
+    cameras: [0, 1, 2]
+    downscale_when_loading: [3, 3, 3]
+    downscale: 1
+    undistort: false
+    load_sky_mask: true
+    load_dynamic_mask: true
+    load_egocar_mask: true
+    load_depth_maps: true
+    load_objects: true
+  lidar_source:
+    load_lidar: true
+  assets:
+    root: "/root/autodl-tmp/streetforward_assets_pt30w_20w"
+  scene_asset_cache_max_items: 32
+  segment_static_cache_max_items: 64
+  image_meta_cache_max_items: 8192
+  view_pack_cache_max_items: 1024
+
+dataset:
+  num_source_keyframes: 1
+  num_target_keyframes: 3
+  segment_overlap_ratio: 0.25
+  min_keyframes_per_scene: 2
+  min_keyframes_per_segment: 4
+  segment_aabb:
+    - [-15.0, -10.0, 0.0]
+    - [15.0, 4.8, 40.0]
+  pointcloud:
+    type: hybrid
+    lidar_sparsity: full
+    monocular_chosen_cam_ids: [0, 1, 2]
+    monocular_sparsity: full
+    monocular_filter_sky: true
+    monocular_depth_consistency: false
+    monocular_downscale: 2
+    monocular_dynamic_recovery_bbox_expand_xyz_m: [0.5, 0.2, 0.5]
+    monocular_dynamic_recovery_max_points_per_instance: 5000
+    dynamic_point_balance:
+      enable: true
+      mode: bbox_volume
+      reference_volume_m3: 13.0
+      volume_exponent: 0.5
+      min_scale: 0.25
+      max_scale: 3.0
+      min_points_per_instance: 512
+    near_max_points: 300000
+    distant_max_points: 200000
+    max_dynamic_points_per_segment: 100000
+    static_instance_motion:
+      enable: true
+      traj_length_thresh_m: 0.5
+
+scheduler_iforward:
+  enable: true
+  version: iforward_v1
+  fail_fast: true
+  traversal:
+    fixed_scene_id: null
+    fixed_segment_id: null
+    seed: null
+    scene_order: shuffle_per_epoch
+    segment_order: shuffle_per_epoch
+    traversal_mode: scene_round_robin_episode
+    forbid_consecutive_same_scene: true
+  episode:
+    source_mode: keyframes
+    blocks_per_episode: 8
+    episode_stride: 8
+    allow_short_last_episode: false
+    min_blocks_per_episode: 4
+    rollouts_per_episode: 1
+    block_source_frame_policy: random_within_keyframe_per_rollout
+    reset_scene_state_policy: episode_begin
+  rollout:
+    block_selection_policy: random_start_contiguous
+    delivery_order_policy: chronological
+    allow_short_final_rollout: false
+    min_blocks_per_rollout: 1
+    avoid_single_block_tail: false
+    max_inner_K: 8
+    detach_graph_after_rollout: true
+    shapes:
+      - {name: b1_r8, blocks_per_rollout: 1, repeats_per_block: 8, prob: 0.35}
+      - {name: b1_r6, blocks_per_rollout: 1, repeats_per_block: 6, prob: 0.30}
+      - {name: b1_r4, blocks_per_rollout: 1, repeats_per_block: 4, prob: 0.25}
+      - {name: b1_r2, blocks_per_rollout: 1, repeats_per_block: 2, prob: 0.10}
+    shapes_schedule: []
+  evidence:
+    camera_policy: all_cams
+    cams_per_input: null
+    fixed_cam_ids: null
+    allow_camera_dropout: false
+    mask_policy: non_sky_non_egocar
+  memory:
+    observation_commit_policy: first_repeat_only
+    optimizer_memory_update_policy: every_repeat
+    reset_policy: episode_begin
+    carry_policy: across_rollouts_until_episode_end
+  loss_timing:
+    policy: rollout_final_only
+    intermediate_step_loss: false
+  supervision:
+    current:
+      enable: true
+      role_name: final_current_recon
+      frame_policy: all_input_frames
+      camera_policy: all_cams
+      required: true
+    nearby:
+      enable: false
+      role_name: final_nearby_rollout
+      scope: rollout_keyframe_span
+      policy: random_non_input_frames
+      frames_per_rollout: 1
+      insufficient_policy: use_available_or_skip_if_none
+      camera_policy: all_cams
+      max_refs_per_rollout: 24
+      add_to_evidence: false
+      mask_policy: non_sky_non_egocar
+    history_replay:
+      enable: false
+  leakage_check:
+    enable: true
+    same_scene_segment_required: true
+    forbid_test_refs_in_train: true
+    target_role_count_match_required: true
+    nearby_not_in_evidence: true
+    nearby_not_input_frame: true
+    current_supervision_must_cover_all_inputs: true
+  preload:
+    emit_hints: true
+    warm_current_rollout_refs: true
+    warm_next_rollout_refs: true
+    warm_episode_chain: false
+    hint_scope_for_exact_refs: v9_role_refs
+
+scheduler_v9:
+  enable: false
+  phase: phase_A_block_local_unroll
+  phase_A:
+    nearby_supervision:
+      enable: false
+
+model:
+  stage: "6_0"
+  phase: "phase_A_block_local_unroll"
+  backprojector_version: "v4"
+  scale_init_value: 0.1
+  sh_degree: 1
+  voxel_size: 0.2
+  sparseConv_outdim: 48
+  feat_2d_channels: 48
+  feat_2d_downscale: 1
+  feature_extractor:
+    type: dinov2_unet_fusion
+    dino:
+      model_name: vit_base_patch14_reg4_dinov2
+      pretrained: true
+      freeze: true
+      weights_path: null
+      out_channels: 48
+      intermediate_layers: [4, 8, 11]
+      pad_to_patch_multiple: 14
+    residual_unet:
+      in_channels: 6
+      feat_channels: 48
+      base_channels: 48
+      feature_downscale: 1
+      depth: 4
+      bilinear: true
+    fusion:
+      hidden_channels: 96
+      out_channels: 48
+  use_fused_cuda_backproject_v2: true
+  use_fused_cuda_backproject_v3: true
+  use_fused_cuda_backproject_v4: true
+  fused_cuda_backproject_v4_force_fallback: false
+  struct_decoder:
+    type: routed_near_far
+    feat_2d_channels: 48
+    far:
+      hidden_dim: 96
+    knn_attention:
+      enable: true
+      k: 8
+  iforward:
+    version: stage2_0_biggs_cuda_exact_diagonal_projector
+    debug:
+      enable_memory_aux_stats: false
+      log_per_k_metrics: false
+      log_per_k_aux_interval: 1000
+      nvtx_ranges: false
+    short_window_history:
+      max_entries: 24
+      max_memory_entries: 0
+    biggs:
+      enable: true
+      observe:
+        parent_scene_for_lifting: true
+        parent_scene_for_cnn: true
+        return_debug_stats: false
+      assignment:
+        method: branch_aware_voxel_cap
+        cache_scope: scene_segment_topology
+        ignore_episode_id: true
+        cache_max_items: 64
+        cache_device_copy: true
+        builder: vectorized_sort_segment
+        sort_children: none
+        radius_voxel_safety_factor: 2.0
+        mass_init: tau_area
+        bg:
+          voxel_size: 0.5
+          target_children_per_parent: 16
+          max_children_per_parent: 32
+          max_parent_radius: 1.0
+        distant:
+          voxel_size: 3.0
+          target_children_per_parent: 32
+          max_children_per_parent: 64
+          max_parent_radius: 6.0
+        rigid:
+          voxel_size: 0.3
+          target_children_per_parent: 16
+          max_children_per_parent: 32
+          max_parent_radius: 0.6
+      parent_projector:
+        backend: cuda_exact_diag
+        covariance_mode: diagonal
+        mass_mode: dynamic_tau_area
+        allow_cpu_fallback: true
+        allow_torch_fallback: true
+        grad_to_local_state: true
+        min_scale: 1.0e-3
+        max_scale_bg: 0.60
+        max_scale_distant: 3.0
+        max_scale_rigid: 0.45
+        opacity_cap: 0.90
+        opacity_min: 1.0e-6
+        tau_parent_scale_bg: 0.5
+        tau_parent_scale_distant: 0.7
+        tau_parent_scale_rigid: 0.5
+        eps: 1.0e-6
+        min_child_mass: 1.0e-8
+        finite_check: false
+        stats_interval: 100
+      child_decoder:
+        mode: low_rank_basis
+        rank: 8
+        hidden_dim: 128
+        num_layers: 2
+        zero_init_last: true
+        mean_preserve: true
+        child_code_parent_local_frame: false
+        detach_child_code_inputs: false
+        detach_child_params: false
+        detach_parent_params: false
+    history_gate:
+      enable: false
+    history_gate_v2:
+      enable: false
+    adc_lite:
+      enable: false
+    child_observation_skip:
+      enable: false
+    loss:
+      current: {weight: 1.0}
+      nearby: {weight: 0.0}
+      in_rollout_history: {weight: 0.0}
+      short_window_history: {weight: 0.0}
+      delta_regularization: {weight: 1.0}
+    trainability:
+      train_vsm_ctx_adapter: false
+      train_measurement_frontend: true
+      unfreeze_updater_base_after_step: 0
+      train_stage6_struct_decoder: true
+      unfreeze_struct_decoder_after_step: 0
+      train_biggs_child_decoder: true
+  stage6_0:
+    fail_fast: true
+    phase_a_mode: from_scratch
+    base_measurement:
+      type: stage5_4_v4
+      mode: from_scratch
+      require_fused_v4: true
+      require_obs_code: true
+      obs_code_dim: 2
+      source_evidence_grad_mode: train_2d_detach_alpha
+      train_2d_frontend: true
+      train_residual_unet: true
+      train_fusion_neck: true
+      train_v4_lift: false
+      train_dinov2: false
+      detach_v4_outputs: false
+      detach_source_render_for_cnn: false
+    local_rollout:
+      source: scheduler_iforward
+      use_scheduler_inner_K: true
+      local_G_no_detach_between_steps: true
+      detach_persistent_state_at_block_start: true
+      writeback_policy: none
+      writeback_after_optimizer_step: false
+    render:
+      grouped_multiview_train: true
+    struct_event_decoder:
+      enable: true
+      event_dim: 96
+      feat_2d_dim: 48
+      support_embed_dim: 8
+      branch_embed_dim: 8
+      token:
+        token_dim: 96
+        zero_invalid_2d_feat: true
+      param_obs_codec:
+        enable: true
+        obs_code_dim: 2
+        support_dim: 2
+        branch_embed_dim: 8
+        output_dim: 48
+        detach_params: false
+        detach_obs_code: false
+        detach_acc_w: false
+        norm: layernorm
+        activation: gelu
+      near:
+        type: xcpe
+        sparse_backend: spconv
+        num_blocks: 2
+        kernel_size: 3
+        voxel_size: 0.25
+      far:
+        type: point_mlp
+        hidden_dim: 96
+        num_layers: 2
+    event_encoder:
+      enable: false
+    current_context_adapter:
+      enable: false
+    posterior_updater:
+      enable: true
+      input_event: true
+      input_current_ctx: false
+      input_vsm_ctx: true
+      hidden_dim: 96
+      event_dim: 96
+      stage_hidden_dim: 96
+      phase_b_hooks:
+        accept_vsm_ctx: true
+        vsm_ctx_dim: 96
+        vsm_ctx_adapter_init: zero_last
+      branch_scope:
+        bg: {enable: true, update_means: true, update_scales: true, update_quat: true, update_opacity: true, update_sh: true}
+        distant: {enable: true, update_means: false, update_scales: false, update_quat: false, update_opacity: true, update_sh: true}
+        rigid: {enable: true, update_means: true, update_scales: true, update_quat: true, update_opacity: true, update_sh: true}
+      clamps:
+        means_max_step_m: 0.25
+        scales_log_max_step: 0.08
+        quat_axis_angle_max_step_rad: 0.08
+        opacity_logit_max_step: 0.25
+        sh_max_step: 0.10
+        hidden_max_step: 1.0
+    vsm:
+      enable: false
+    query_decoder:
+      enable: false
+  branches:
+    bg:
+      src_backproject_support_min: 1.0e-2
+    distant:
+      src_backproject_support_min: 1.0e-2
+    rigid:
+      src_backproject_support_min: 1.0e-2
+  history_memory:
+    enable: false
+  update_gate:
+    enable: false
+  view_transient:
+    enable: false
+
+losses:
+  phase_a:
+    block_render:
+      enable: true
+      weight: 1.0
+      step_gamma: 1.0
+      mask_policy: non_sky_non_egocar
+    nearby_render:
+      enable: false
+      weight: 0.0
+      warmup_steps: 1
+      final_step_only: true
+      mask_policy: non_sky_non_egocar
+    regularization:
+      delta_l2_weight: 0.001
+      opacity_delta_l2_weight: 0.0005
+      sh_delta_l2_weight: 0.0005
+      scale_barrier_weight: 0.002
+  photometric:
+    exclude_sky_region: true
+  rgb: {w: 1.0}
+  ssim: {w: 0.05}
+  mask: {w: 0.02, opacity_loss_type: bce, require_sky_mask: true}
+  opacity_entropy: {w: 0.0}
+
+optimizer:
+  type: adamw
+  lr:
+    default: 1.0e-4
+    vsm_ctx_adapter: 2.0e-4
+    stage6_posterior_updater_base: 1.0e-5
+    stage6_struct_decoder: 1.0e-5
+    biggs_child_decoder: 1.0e-4
+    measurement_frontend: 1.0e-5
+    stage6_measurement_frontend_residual_unet: 1.0e-5
+    stage6_measurement_frontend_fusion_neck: 1.0e-5
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 1.0e-4
+
+training:
+  max_iterations: 3000010
+  start_step: 0
+  resume_checkpoint: ""
+  iforward:
+    allow_missing_carried_state_reset: false
+  log_interval: 1000
+  save_checkpoint_freq: 10000
+  seed: 41
+  amp:
+    enable: false
+  grad_clip:
+    enable: true
+    max_norm: 1.0
+
+validation_v8:
+  eval_enable: false
+
+validation_v9:
+  enable: false
+
+iforward_validation:
+  enable: true
+  modes: [full]
+  run_at_train_start: true
+  interval_steps: 1000
+  segments_per_scene: 1
+  rollouts_per_segment: 1
+  use_train_rollout_shapes: false
+  rollout_shapes:
+    - {name: b1_r4, blocks_per_rollout: 1, repeats_per_block: 4, prob: 1.0}
+
+logging:
+  output_root: /root/autodl-tmp/outputs
+  project: iforward_stage2_0_biggs
+  log_dir: null
+  image_interval_blocks: 500
+  image_interval: 500
+  image_trigger:
+    mode: raw_step_interval
+    interval_blocks_equiv: 500
+  enable_jsonl_metrics: true
+  metrics_history_append: false
+  train_step_metrics_interval: 50
+  train_monitor:
+    enable_heavy_metrics: false
+    include_per_view_metrics: false
+    include_extra_result_metrics: false
+    enable_low_psnr_image_dump: false
+  use_tensorboard: true
+
+eval:
+  enable_psnr: true
+  run_test_at_end: false
+  metric_interval: 10
+  heavy_metric_interval: 50

@@ -9,6 +9,7 @@ from models.streetforward.node_states import NodeStateBackground, NodeStateDista
 from models.streetforward.stage6_0.local_gs_state import LocalBranchState, LocalGSState
 
 from .adc_lite import IForwardADCBank, IForwardADCStateMeta
+from .biggs_state import IForwardBigGSState
 from .history_gradient_bank import HistoryGradientBank
 
 
@@ -350,6 +351,7 @@ class IForwardState:
     history_gradient_bank: Optional[HistoryGradientBank] = None
     adc_bank: Optional[IForwardADCBank] = None
     adc_meta: Optional[IForwardADCStateMeta] = None
+    biggs_state: Optional[IForwardBigGSState] = None
     node_state_bg: Optional[NodeStateBackground] = None
     node_state_distant: Optional[NodeStateDistant] = None
     node_state_rigid: Optional[NodeStateRigid] = None
@@ -370,6 +372,7 @@ class IForwardState:
             history_gradient_bank=None if self.history_gradient_bank is None else self.history_gradient_bank.detach(),
             adc_bank=None if self.adc_bank is None else self.adc_bank.detach(),
             adc_meta=None if self.adc_meta is None else self.adc_meta.detach(),
+            biggs_state=None if self.biggs_state is None else self.biggs_state.detach(),
             node_state_bg=None,
             node_state_distant=None,
             node_state_rigid=None,

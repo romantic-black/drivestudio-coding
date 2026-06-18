@@ -98,6 +98,18 @@ def __getattr__(name: str):
             "IForwardADCBank": IForwardADCBank,
             "IForwardADCStateMeta": IForwardADCStateMeta,
         }[name]
+    if name in {"BigGSBranchAssignment", "BigGSRigidActiveAssignment", "IForwardBigGSState"}:
+        from .biggs_state import BigGSBranchAssignment, BigGSRigidActiveAssignment, IForwardBigGSState
+
+        return {
+            "BigGSBranchAssignment": BigGSBranchAssignment,
+            "BigGSRigidActiveAssignment": BigGSRigidActiveAssignment,
+            "IForwardBigGSState": IForwardBigGSState,
+        }[name]
+    if name == "BigGSToFineEventDecoder":
+        from .biggs_event_decoder import BigGSToFineEventDecoder
+
+        return BigGSToFineEventDecoder
     if name in {"GradientBankAttr", "HistoryGradientBank", "HistoryGradientBranchBank"}:
         from .history_gradient_bank import GradientBankAttr, HistoryGradientBank, HistoryGradientBranchBank
 
@@ -121,6 +133,9 @@ def __getattr__(name: str):
     raise AttributeError(name)
 
 __all__ = [
+    "BigGSBranchAssignment",
+    "BigGSRigidActiveAssignment",
+    "BigGSToFineEventDecoder",
     "BranchMemoryState",
     "DenseMambaState",
     "GradientBankAttr",
@@ -134,6 +149,7 @@ __all__ = [
     "RANDOM_WINDOW_MODEL_FAMILY",
     "RANDOM_WINDOW_SCHEDULER_VERSION",
     "IForwardBatchResolver",
+    "IForwardBigGSState",
     "IForwardRandomWindowBatchResolver",
     "IForwardRandomWindowPlan",
     "IForwardRandomWindowStep",

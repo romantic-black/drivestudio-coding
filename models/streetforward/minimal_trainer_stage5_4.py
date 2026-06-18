@@ -151,13 +151,15 @@ class MinimalStreetForwardStage5_4(MinimalStreetForwardStage5_3):
         height: int,
         width: int,
         backprojector_override=None,
+        return_debug_stats: Optional[bool] = None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         num_gaussians = int(gaussians_scene["means"].shape[0])
         if num_gaussians == 0:
             self._stage5_4_obs_code_all = None
             return None, None
         backprojector_impl = backprojector_override if backprojector_override is not None else self.feature_backprojector
-        feat_2d_all, acc_w, obs_code, bp_stats = self.alpha_t_extractor_v4.render_and_backproject_streaming_fused_multi_camera(
+        debug_stats = True if return_debug_stats is None else bool(return_debug_stats)
+        bp_out = self.alpha_t_extractor_v4.render_and_backproject_streaming_fused_multi_camera(
             gaussians=gaussians_scene,
             cameras=source_views,
             features_2d=features_2d,
@@ -168,9 +170,15 @@ class MinimalStreetForwardStage5_4(MinimalStreetForwardStage5_3):
             source_pair_valid_mask=source_pair_valid_mask,
             return_accumulated_weights=True,
             return_obs_code=True,
-            return_debug_stats=True,
+            return_debug_stats=debug_stats,
         )
-        merge_debug_stats_as_perf_floats(self._perf_acc, "2d_bp_scene_", bp_stats)
+        if debug_stats:
+            feat_2d_all, acc_w, obs_code, bp_stats = bp_out
+        else:
+            feat_2d_all, acc_w, obs_code = bp_out
+            bp_stats = {}
+        if debug_stats:
+            merge_debug_stats_as_perf_floats(self._perf_acc, "2d_bp_scene_", bp_stats)
         self._perf_acc["2d_bp_scene_call_count"] = float(self._perf_acc.get("2d_bp_scene_call_count", 0.0) + 1.0)
         self._stage5_4_obs_code_all = obs_code.detach()
         return feat_2d_all, acc_w

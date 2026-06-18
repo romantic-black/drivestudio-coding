@@ -72,11 +72,25 @@ class IForwardTrainer(nn.Module):
         decoder = getattr(runtime, "stage6_struct_event_decoder", None) if runtime is not None else None
         return decoder if isinstance(decoder, nn.Module) else None
 
+    def _biggs_child_decoder(self) -> Optional[nn.Module]:
+        runtime = self._phase_a_runtime()
+        decoder = getattr(runtime, "biggs_child_decoder", None) if runtime is not None else None
+        return decoder if isinstance(decoder, nn.Module) else None
+
     def _is_v6_point_mamba_xcpe(self) -> bool:
         if bool(getattr(self.model, "is_v6_point_mamba_xcpe", False)):
             return True
         iforward_cfg = cfg_get(cfg_get(self.config, "model", {}) or {}, "iforward", {}) or {}
         return str(cfg_get(iforward_cfg, "version", "")) == "v6_point_mamba_xcpe"
+
+    def _is_stage2_0_biggs_parent_lifting(self) -> bool:
+        if bool(getattr(self.model, "is_stage2_0_biggs_parent_lifting", False)):
+            return True
+        iforward_cfg = cfg_get(cfg_get(self.config, "model", {}) or {}, "iforward", {}) or {}
+        return str(cfg_get(iforward_cfg, "version", "")) in {
+            "stage2_0_biggs_parent_lifting",
+            "stage2_0_biggs_cuda_exact_diagonal_projector",
+        }
 
     def _is_v3_gru_history_gate(self) -> bool:
         if bool(getattr(self.model, "is_v3_gru_history_gate", False)):
@@ -155,6 +169,12 @@ class IForwardTrainer(nn.Module):
                 "stage6_posterior_updater_base": updater_base,
                 "stage6_struct_decoder": self._named_params(struct_decoder, "stage6_struct_event_decoder"),
             }
+        elif self._is_stage2_0_biggs_parent_lifting():
+            groups = {
+                "vsm_ctx_adapter": adapter_named,
+                "stage6_posterior_updater_base": updater_base,
+                "stage6_struct_decoder": self._named_params(struct_decoder, "stage6_struct_event_decoder"),
+            }
         else:
             memory = getattr(self.model, "memory", None)
             memory_named = self._named_params(memory if isinstance(memory, nn.Module) else None, "memory")
@@ -172,6 +192,9 @@ class IForwardTrainer(nn.Module):
                 "stage6_posterior_updater_base": updater_base,
                 "stage6_struct_decoder": self._named_params(struct_decoder, "stage6_struct_event_decoder"),
             }
+        biggs_named = self._named_params(self._biggs_child_decoder(), "biggs_child_decoder")
+        if biggs_named:
+            groups["biggs_child_decoder"] = biggs_named
         measurement_groups = self._measurement_frontend_params()
         iforward_cfg = cfg_get(cfg_get(self.config, "model", {}) or {}, "iforward", {}) or {}
         trainability = cfg_get(iforward_cfg, "trainability", {}) or {}
@@ -216,6 +239,7 @@ class IForwardTrainer(nn.Module):
             "vsm_ctx_adapter": float(cfg_get(lr_cfg, "vsm_ctx_adapter", 2.0e-4)),
             "stage6_posterior_updater_base": float(cfg_get(lr_cfg, "stage6_posterior_updater_base", 1.0e-5)),
             "stage6_struct_decoder": float(cfg_get(lr_cfg, "stage6_struct_decoder", 0.0)),
+            "biggs_child_decoder": float(cfg_get(lr_cfg, "biggs_child_decoder", fallback)),
             "stage6_measurement_frontend_residual_unet": float(
                 cfg_get(lr_cfg, "stage6_measurement_frontend_residual_unet", cfg_get(lr_cfg, "measurement_frontend", fallback))
             ),
@@ -247,6 +271,7 @@ class IForwardTrainer(nn.Module):
         train_struct = bool(cfg_get(trainability, "train_stage6_struct_decoder", False))
         unfreeze_struct_step = int(cfg_get(trainability, "unfreeze_struct_decoder_after_step", 10**12))
         train_measurement = bool(cfg_get(trainability, "train_measurement_frontend", False))
+        train_biggs_child_decoder = bool(cfg_get(trainability, "train_biggs_child_decoder", True))
 
         self._set_all_model_requires_grad(False)
         if self._is_v3_gru_history_gate():
@@ -279,6 +304,7 @@ class IForwardTrainer(nn.Module):
         self._set_group_requires_grad("stage6_posterior_updater_base", updater_train)
         struct_train = bool(train_struct and int(global_step) >= int(unfreeze_struct_step))
         self._set_group_requires_grad("stage6_struct_decoder", struct_train)
+        self._set_group_requires_grad("biggs_child_decoder", train_biggs_child_decoder)
         for group_name in (
             "stage6_measurement_frontend_residual_unet",
             "stage6_measurement_frontend_fusion_neck",
@@ -293,6 +319,8 @@ class IForwardTrainer(nn.Module):
             if name == "stage6_posterior_updater_base" and not updater_train:
                 lr = 0.0
             if name == "stage6_struct_decoder" and not struct_train:
+                lr = 0.0
+            if name == "biggs_child_decoder" and not train_biggs_child_decoder:
                 lr = 0.0
             if name.startswith("stage6_measurement_frontend") and not train_measurement:
                 lr = 0.0
@@ -582,14 +610,15 @@ class IForwardTrainer(nn.Module):
         final.update(adapter_metrics)
         final.update(self._random_window_revisit_metrics(out))
         for name, value in out.stats.items():
+            out_name = str(name) if str(name).startswith("iforward/") else f"iforward/{name}"
             if isinstance(value, bool):
-                final[f"iforward/{name}"] = bool(value)
+                final[out_name] = bool(value)
             elif isinstance(value, int):
-                final[f"iforward/{name}"] = int(value)
+                final[out_name] = int(value)
             elif isinstance(value, float) and math.isfinite(float(value)):
-                final[f"iforward/{name}"] = float(value)
+                final[out_name] = float(value)
             elif isinstance(value, str):
-                final[f"iforward/{name}"] = value
+                final[out_name] = value
         memory_tokens = out.stats.get("memory_tokens")
         if isinstance(memory_tokens, dict):
             for name, value in memory_tokens.items():

@@ -235,6 +235,69 @@ def _cfg_v3():
     }
 
 
+def _cfg_v1_validation_shape():
+    return {
+        "data": {"eval_scene_ids": [1]},
+        "scheduler_iforward": {
+            "version": "iforward_v1",
+            "traversal": {
+                "scene_order": "ascending",
+                "segment_order": "ascending",
+                "traversal_mode": "scene_round_robin_episode",
+                "seed": 41,
+            },
+            "episode": {
+                "source_mode": "keyframes",
+                "blocks_per_episode": 8,
+                "episode_stride": 8,
+                "allow_short_last_episode": False,
+                "min_blocks_per_episode": 4,
+                "rollouts_per_episode": 1,
+                "block_source_frame_policy": "random_within_keyframe_per_rollout",
+            },
+            "rollout": {
+                "block_selection_policy": "random_start_contiguous",
+                "delivery_order_policy": "chronological",
+                "allow_short_final_rollout": False,
+                "min_blocks_per_rollout": 1,
+                "avoid_single_block_tail": False,
+                "detach_graph_after_rollout": True,
+                "shapes": [
+                    {"name": "b1_r8", "blocks_per_rollout": 1, "repeats_per_block": 8, "prob": 1.0},
+                ],
+            },
+            "evidence": {"camera_policy": "all_cams", "mask_policy": "non_sky_non_egocar"},
+            "supervision": {
+                "current": {
+                    "enable": True,
+                    "role_name": "final_current_recon",
+                    "frame_policy": "all_input_frames",
+                    "camera_policy": "all_cams",
+                },
+                "nearby": {"enable": False},
+                "history_replay": {"enable": False},
+            },
+            "memory": {
+                "observation_commit_policy": "first_repeat_only",
+                "optimizer_memory_update_policy": "every_repeat",
+                "reset_policy": "episode_begin",
+                "carry_policy": "across_rollouts_until_episode_end",
+            },
+            "loss_timing": {"policy": "rollout_final_only", "intermediate_step_loss": False},
+            "leakage_check": {"enable": True, "forbid_test_refs_in_train": True},
+        },
+        "iforward_validation": {
+            "enable": True,
+            "segments_per_scene": 1,
+            "rollouts_per_segment": 1,
+            "rollout_shapes": [
+                {"name": "b1_r4", "blocks_per_rollout": 1, "repeats_per_block": 4, "prob": 1.0},
+            ],
+            "tensorboard_images": {"enable": False, "max_images_per_role": 2},
+        },
+    }
+
+
 def test_fixed_random_window_starts_are_deterministic_and_allow_repeats():
     a = fixed_random_window_starts(num_blocks=4, rollouts=8, seed=20260604, scene_id=1, segment_id=0)
     b = fixed_random_window_starts(num_blocks=4, rollouts=8, seed=20260604, scene_id=1, segment_id=0)
@@ -288,6 +351,21 @@ def test_iforward_v3_validation_scheduler_uses_fixed_v3_history_shapes():
         for frame_idx in history_frames:
             assert {(frame_idx, cam_idx) for cam_idx in range(ds.num_cams)} <= history_refs
         assert history_refs.isdisjoint({tuple(ref) for ref in batch["final_supervision"]["current_refs"]})
+
+
+def test_iforward_validation_scheduler_uses_configured_v1_rollout_shape():
+    scheduler = train_ifwd._make_validation_scheduler(
+        _cfg_v1_validation_shape(),
+        _FakeValidationDataset(num_keyframes=4, num_cams=3),
+        1,
+        0,
+    )
+
+    batch = scheduler.next_batch()["_iforward"]
+
+    assert batch["shape_name"] == "b1_r4"
+    assert batch["blocks_per_rollout"] == 1
+    assert batch["repeats_per_block"] == 4
 
 
 def test_iforward_v3_validation_carries_state_and_reports_history(monkeypatch):

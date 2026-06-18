@@ -1,4 +1,5 @@
 # Minimal StreetForward Stage 2.0 — multi-target, no proxy
+# Not IForward BigGS Stage 2.0; use configs/iforward/iforward_stage2_0_biggs_parent_lifting.yaml for that.
 # Same model as Stage 1.1; multiple targets (e.g. 3), loss = mean(loss_i), single backward.
 # Use with: python tools/train_minimal_streetforward_stage2_0.py --config_file configs/minimal_streetforward_stage2_0.yaml overfit_batch_path=./data/overfit_batches/scene0_seg0_batch.pt
 

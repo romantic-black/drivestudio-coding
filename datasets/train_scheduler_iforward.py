@@ -363,8 +363,11 @@ class TrainSchedulerIForward:
             )
 
         traversal_mode = str(_cfg_get(self.traversal_cfg, "traversal_mode", _cfg_get(self.traversal_cfg, "mode", "episode_serial")))
-        if traversal_mode != "episode_serial":
-            raise ValueError("scheduler_iforward IForward v1 requires traversal.traversal_mode=episode_serial")
+        if traversal_mode not in ("episode_serial", "scene_round_robin_episode"):
+            raise ValueError(
+                "scheduler_iforward IForward v1 requires traversal.traversal_mode="
+                "episode_serial or scene_round_robin_episode"
+            )
         for name in ("scene_order", "segment_order"):
             val = str(_cfg_get(self.traversal_cfg, name, "shuffle_per_epoch" if name == "scene_order" else "ascending"))
             if val not in ("ascending", "shuffle_per_epoch"):
@@ -949,11 +952,13 @@ class TrainSchedulerIForward:
             self.rng.shuffle(scene_ids)
 
         specs: List[Dict[str, Any]] = []
+        specs_by_scene: Dict[int, List[Dict[str, Any]]] = {}
         blocks_per_episode = int(_cfg_get(self.episode_cfg, "blocks_per_episode", 8))
         episode_stride = int(_cfg_get(self.episode_cfg, "episode_stride", blocks_per_episode))
         allow_short = bool(_cfg_get(self.episode_cfg, "allow_short_last_episode", True))
         min_blocks = int(_cfg_get(self.episode_cfg, "min_blocks_per_episode", 2))
         for scene_id in scene_ids:
+            scene_specs: List[Dict[str, Any]] = []
             if self.fixed_segment_id is not None:
                 segment_ids = [int(self.fixed_segment_id)]
             else:
@@ -969,7 +974,7 @@ class TrainSchedulerIForward:
                         pass
                     elif not allow_short or len(window) < min_blocks:
                         continue
-                    specs.append(
+                    scene_specs.append(
                         {
                             "scene_id": int(scene_id),
                             "segment_id": int(segment_id),
@@ -977,8 +982,36 @@ class TrainSchedulerIForward:
                             "keyframe_window": [int(x) for x in window],
                         }
                     )
+            if scene_specs:
+                specs_by_scene[int(scene_id)] = scene_specs
+                specs.extend(scene_specs)
         if not specs:
             raise ValueError("scheduler_iforward found no valid episode windows")
+        traversal_mode = str(_cfg_get(self.traversal_cfg, "traversal_mode", _cfg_get(self.traversal_cfg, "mode", "episode_serial")))
+        if traversal_mode == "scene_round_robin_episode":
+            for scene_id in list(specs_by_scene.keys()):
+                self.rng.shuffle(specs_by_scene[int(scene_id)])
+            forbid_same = bool(_cfg_get(self.traversal_cfg, "forbid_consecutive_same_scene", False))
+            active_scenes = [int(scene_id) for scene_id in scene_ids if int(scene_id) in specs_by_scene]
+            round_robin_specs: List[Dict[str, Any]] = []
+            last_scene: Optional[int] = None
+            while active_scenes:
+                if bool(forbid_same) and len(active_scenes) > 1 and last_scene is not None and active_scenes[0] == int(last_scene):
+                    active_scenes = active_scenes[1:] + active_scenes[:1]
+                next_active: List[int] = []
+                for scene_id in active_scenes:
+                    bucket = specs_by_scene[int(scene_id)]
+                    if not bucket:
+                        continue
+                    spec = bucket.pop()
+                    round_robin_specs.append(spec)
+                    last_scene = int(scene_id)
+                    if bucket:
+                        next_active.append(int(scene_id))
+                if str(_cfg_get(self.traversal_cfg, "scene_order", "shuffle_per_epoch")) == "shuffle_per_epoch":
+                    self.rng.shuffle(next_active)
+                active_scenes = next_active
+            specs = round_robin_specs
         self._episode_plan = specs
         self._episode_plan_cursor = 0
 

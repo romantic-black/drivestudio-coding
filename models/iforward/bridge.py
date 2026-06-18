@@ -91,12 +91,20 @@ class IForwardStage6Bridge:
         batch: Dict[str, Any],
         source_indices: List[int],
         source_frame_idx: int,
+        biggs_state: Optional[Any] = None,
+        biggs_scene_id: Optional[int] = None,
+        biggs_segment_id: Optional[int] = None,
+        biggs_episode_id: Optional[int] = None,
     ) -> Dict[str, Any]:
         return self.runtime._observe_v4_measurement(
             local_state=local_state,
             batch=batch,
             source_indices=[int(x) for x in source_indices],
             source_frame_idx=int(source_frame_idx),
+            biggs_state=biggs_state,
+            biggs_scene_id=biggs_scene_id,
+            biggs_segment_id=biggs_segment_id,
+            biggs_episode_id=biggs_episode_id,
         )
 
     def observe_planning(
@@ -106,6 +114,10 @@ class IForwardStage6Bridge:
         batch: Dict[str, Any],
         source_indices: List[int],
         source_frame_idx: int,
+        biggs_state: Optional[Any] = None,
+        biggs_scene_id: Optional[int] = None,
+        biggs_segment_id: Optional[int] = None,
+        biggs_episode_id: Optional[int] = None,
     ) -> Dict[str, Any]:
         old_grad_mode = getattr(self.runtime, "stage6_source_evidence_grad_mode", None)
         had_grad_mode = hasattr(self.runtime, "stage6_source_evidence_grad_mode")
@@ -118,6 +130,10 @@ class IForwardStage6Bridge:
                     batch=batch,
                     source_indices=source_indices,
                     source_frame_idx=int(source_frame_idx),
+                    biggs_state=biggs_state,
+                    biggs_scene_id=biggs_scene_id,
+                    biggs_segment_id=biggs_segment_id,
+                    biggs_episode_id=biggs_episode_id,
                 )
         finally:
             if had_grad_mode:

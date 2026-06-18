@@ -222,6 +222,46 @@ class LocalGSState:
                     raise RuntimeError("Persistent writeback tensor must be detached.")
         return bg, distant, rigid
 
+    def to_node_states_grad(self) -> Tuple[NodeStateBackground, Optional[NodeStateDistant], Optional[NodeStateRigid]]:
+        bg = NodeStateBackground(
+            means=self.bg.means,
+            scales_log=self.bg.scales_log,
+            quats=self.bg.quats,
+            opacity_logit=self.bg.opacity_logit,
+            sh_dc=self.bg.sh_dc,
+            sh_rest=self.bg.sh_rest,
+        )
+        distant = None
+        if self.distant is not None:
+            distant = NodeStateDistant(
+                means=self.distant.means,
+                scales_log=self.distant.scales_log,
+                quats=self.distant.quats,
+                opacity_logit=self.distant.opacity_logit,
+                sh_dc=self.distant.sh_dc,
+                sh_rest=self.distant.sh_rest,
+            )
+        rigid = None
+        if self.rigid is not None:
+            if self.rigid_template is None:
+                raise ValueError("rigid local state is present without rigid_template")
+            rigid = NodeStateRigid(
+                means=self.rigid.means,
+                scales_log=self.rigid.scales_log,
+                quats=self.rigid.quats,
+                opacity_logit=self.rigid.opacity_logit,
+                sh_dc=self.rigid.sh_dc,
+                sh_rest=self.rigid.sh_rest,
+                point_ids=self.rigid_template.point_ids,
+                instances_quats=self.rigid_template.instances_quats,
+                instances_trans=self.rigid_template.instances_trans,
+                instances_fv=self.rigid_template.instances_fv,
+                instance_ids=list(self.rigid_template.instance_ids),
+                frame_ids=list(self.rigid_template.frame_ids),
+                cur_frame=int(self.rigid_template.cur_frame),
+            )
+        return bg, distant, rigid
+
     def writeback_detached(
         self,
         *,

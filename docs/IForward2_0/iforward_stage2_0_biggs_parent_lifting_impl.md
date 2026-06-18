@@ -1716,3 +1716,640 @@ stage 2_4: parent alphaT distillation / optional parent-only faster render path
 ```
 
 但 stage 2_0 不应提前引入这些复杂度。
+
+---
+
+## 18. 暂存区实现说明
+
+本节对照上文设计方案，记录当前 **git 暂存区** 中已落地的代码。统计：14 个文件，约 +3189 行。
+
+### 18.1 实现进度对照
+
+| 阶段 | 方案章节 | 状态 | 说明 |
+|------|----------|------|------|
+| P0 | §15.1 数据结构 + fake test | **已完成** | assignment / projector / child decoder / state 均已实现并有单元测试 |
+| P1 | §15.2 parent observe path | **已完成** | parent scene render + V4 alpha/T lifting，输出 `[M,C]` 而非 fine `[N,C]` |
+| P2 | §15.3 parent encode + fine decode | **已完成** | parent struct encoder → `BigGSToFineEventDecoder` → fine `EventPack`，posterior updater 原样消费 |
+| P3 | §15.4 单帧 validation / ablation | **未做** | 配置里 `iforward_validation.enable=true`，但 broadcast/residual_mlp 等 ablation 脚本尚未接入 |
+
+### 18.2 变更文件清单
+
+```text
+configs/iforward/iforward_stage2_0_biggs_parent_lifting.yaml   # 新增：IForward BigGS Stage 2.0 专用入口
+configs/minimal_streetforward_stage2_0.yaml                      # 注释：与 BigGS 版区分
+models/iforward/biggs_state.py                                   # 新增：assignment / episode cache 数据结构
+models/iforward/biggs_assignment.py                              # 新增：branch-aware voxel + cap 建图
+models/iforward/biggs_parent_projector.py                        # 新增：weighted moment matching 投影 parent GS
+models/iforward/biggs_event_decoder.py                           # 新增：parent → fine EventPack 解码
+models/iforward/__init__.py                                      # 导出 BigGS 类型
+models/iforward/bridge.py                                        # observe 透传 biggs_state / scene ids
+models/iforward/model.py                                         # stage2_0 版本开关、配置校验、state 携带
+models/iforward/state.py                                         # IForwardState.biggs_state
+models/iforward/trainer.py                                       # biggs_child_decoder 优化器组
+models/streetforward/minimal_trainer_stage5_4.py                 # backproject 可选 return_debug_stats
+models/streetforward/minimal_trainer_stage6_0.py                 # observe + event 主路径（见 §18.4）
+tests/test_iforward_biggs_stage2_0.py                            # 合并单元 / 集成 / CUDA 测试
+```
+
+**与 §7.1 方案差异**：未新增独立 `biggs_observe.py`；observe / event 逻辑直接写在 `minimal_trainer_stage6_0.py` 的 `_observe_stage2_0_biggs_measurement` 与 `_build_stage2_0_biggs_event_from_measurement` 中。BigGS 模块仍放在 `models/iforward/`，与方案建议一致。
+
+### 18.3 配置入口
+
+训练入口配置：
+
+```text
+configs/iforward/iforward_stage2_0_biggs_parent_lifting.yaml
+```
+
+关键开关：
+
+```yaml
+model:
+  iforward:
+    version: stage2_0_biggs_parent_lifting
+    biggs:
+      enable: true
+      observe:
+        parent_scene_for_lifting: true
+        parent_scene_for_cnn: true
+      child_decoder:
+        mode: low_rank_basis   # 亦支持 broadcast / residual_mlp
+```
+
+与旧版 `configs/minimal_streetforward_stage2_0.yaml`（Minimal StreetForward 多 target 实验）明确分离；后者文件头已加注释指向 BigGS 配置。
+
+**fast-fail 契约**（`model.py` 与 `minimal_trainer_stage6_0.py` 双重校验）：
+
+```text
+biggs.enable 必须为 true
+history_gate / history_gate_v2 / adc_lite 必须关闭
+parent_scene_for_lifting 必须为 true
+禁止 trainable child_observation_skip
+stage2_0 + no_grad_v4 时 2D frontend 必须冻结且 detach_v4_outputs=true
+```
+
+### 18.4 已实现数据流
+
+```text
+IForwardModel.forward_rollout
+  │
+  ├─ 注入 batch scene_id / segment_id / episode_id（BigGS assignment cache 需要）
+  ├─ bridge.observe(..., biggs_state=state.biggs_state)
+  │     └─ runtime._observe_v4_measurement
+  │           └─ _observe_stage2_0_biggs_measurement   # biggs_enabled 时短路
+  │                 ├─ build_biggs_assignments（episode 内 child→parent 固定，按 scene/segment 缓存）
+  │                 ├─ project_biggs_parents / project_biggs_active_rigid_parents
+  │                 ├─ 拼接 parent_scene [M_bg+M_d+M_r]
+  │                 ├─ parent source render → CNN residual
+  │                 └─ AlphaTWeightExtractorV4 fused multi-cam → parent_feat_2d [M,C]
+  │
+  ├─ bridge.build_event → _build_stage6_event_from_measurement
+  │     └─ _build_stage2_0_biggs_event_from_measurement   # measurement.biggs_enabled 时
+  │           ├─ parent Stage6StructInput（near: bg+rigid_in, far: distant+rigid_out）
+  │           ├─ stage6_struct_event_decoder → parent EventPack [M,*]
+  │           └─ BigGSToFineEventDecoder → fine EventPack [N,*]
+  │
+  ├─ memory bypass（stage2_0 不建 fine memory）
+  └─ stage6_posterior_updater → LocalGSState.apply_delta（与 fine baseline 相同）
+```
+
+**`IForwardState.biggs_state`**：每次 observe 后从 measurement 写回；`detach()` 时 assignment 落 CPU，episode 内 parent id 稳定。
+
+**日志**：observe 返回 `iforward/biggs/*`、`num_parent_*` 等标量；`IForwardModel` 在 rollout 结束时聚合为 `*_last` / `*_mean`。
+
+### 18.5 各模块实现要点
+
+#### `biggs_assignment.py`
+
+- `build_biggs_branch_assignment`：`branch_aware_voxel_cap`，按 branch 独立 voxel，rigid 按 `object_id` 分组。
+- `build_rigid_active_assignment`：仅对当前 source frame 的 `route.S` 子集建 active parent 映射。
+- child mass：`mass_init=tau_area`（`opacity * scale_xy_area`）。
+- 超 cap 时沿最长轴二分 `_split_group`；空 branch / singleton parent 不报错。
+
+#### `biggs_parent_projector.py`
+
+- `project_biggs_parents`：scatter weighted mean（means / SH）+ moment matching covariance → scales / quats。
+- `opacity_cap`、`max_scale_{bg,distant,rigid}` 可配置。
+- rigid active 路径用 world-space `means_world_S` / `quats_world_S`，只投影当前帧可见 child。
+
+#### `biggs_event_decoder.py`
+
+- `BigGSToFineEventDecoder`：`broadcast` / `residual_mlp` / `low_rank_basis`（默认 `low_rank_basis`）。
+- `mean_preserve=true` 时 residual 在 pre-norm 空间做均值保持；`zero_init_last=true` 初始 fine≈parent broadcast。
+- `detach_child_code_inputs` / `detach_child_params` / `detach_parent_params` 默认 true。
+- 输出 fine `EventPack` 行数对齐 `N_bg`、`N_distant`、`len(route.S)`；`route` 仍为原始 fine rigid route。
+
+#### `minimal_trainer_stage6_0.py` 钩子
+
+| 方法 | 作用 |
+|------|------|
+| `_stage2_0_get_or_build_biggs_state` | scene/segment/child 数匹配则复用 cache，否则重建 assignment |
+| `_observe_stage2_0_biggs_measurement` | 完整 parent observe；返回 `biggs_enabled=True` 的 measurement dict |
+| `_build_stage2_0_parent_struct_input_near/far` | parent feat/acc/obs/coords → `Stage6StructInput` |
+| `_build_stage2_0_biggs_event_from_measurement` | parent encode + child decode |
+| `_observe_v4_measurement` | `stage2_0_biggs_enabled` 时走 BigGS 分支 |
+| `_build_stage6_event_from_measurement` | `measurement["biggs_enabled"]` 时走 BigGS 分支 |
+
+#### `trainer.py`
+
+- stage2_0 优化器组：`vsm_ctx_adapter`、`stage6_posterior_updater_base`、`stage6_struct_decoder`、`biggs_child_decoder`。
+- **不要求** fine `memory` 模块（与 v6 / v3 类似）。
+- `train_biggs_child_decoder` 默认 true；LR 键 `optimizer.lr.biggs_child_decoder`。
+
+#### `minimal_trainer_stage5_4.py`
+
+- `_backproject_scene_features_multi_camera` 新增 `return_debug_stats`；BigGS observe 可通过配置关闭 debug stats 以降低开销。
+
+### 18.6 测试（`tests/test_iforward_biggs_stage2_0.py`）
+
+方案 §5 建议拆成多个文件；实现合并为单文件，覆盖：
+
+| 测试 | 对应方案 |
+|------|----------|
+| `test_biggs_assignment_caps_empty_singleton_instance_and_state_to_detach` | §5.1 assignment |
+| `test_biggs_parent_projector_weighted_mean_clamps_opacity_and_sh_shape` | §5.1 projector |
+| `test_biggs_active_rigid_projection_uses_active_child_subset` | §5.1 rigid active |
+| `test_biggs_child_decoder_modes_shapes_and_zero_init_broadcast` | §5.1 decoder 三 mode |
+| `test_biggs_low_rank_decoder_mean_preserves_residual` | §5.1 mean-preserve |
+| `test_biggs_low_rank_zero_init_has_nonzero_gradient` | zero-init 可训练性 |
+| `test_stage2_0_biggs_event_builder_returns_fine_event_and_updater_consumes` | §5.1 EventPack + updater |
+| `test_stage6_event_builder_disabled_path_uses_legacy_struct_event` | 非 BigGS 路径回归 |
+| `test_iforward_state_detach_keeps_biggs_assignment` | state 持久化 |
+| `test_iforward_trainer_biggs_child_decoder_group_and_trainability` | §14 optimizer |
+| `test_stage2_0_biggs_config_conflicts_fast_fail` | 配置契约 |
+| `test_stage2_0_biggs_observe_cuda_parent_shape` | §5.2 CUDA parent lifting shape |
+
+运行：
+
+```bash
+pytest tests/test_iforward_biggs_stage2_0.py -q
+# CUDA observe 测试：
+pytest tests/test_iforward_biggs_stage2_0.py::test_stage2_0_biggs_observe_cuda_parent_shape -q
+```
+
+### 18.7 尚未实现 / 后续工作
+
+对照方案文档，暂存区 **未包含**：
+
+```text
+独立 biggs_observe.py 模块（逻辑已内联 stage6 runtime）
+§3 完整日志字段（parent render PSNR 对比、显存 aux 等；部分 compression 指标已有）
+§4 validation suite（parent render / lifting shape / decode precision 自动化）
+broadcast vs low_rank ablation 脚本（§15.4 P3）
+gsplat 侧改动（§6 结论：仍不需要新 kernel）
+diagnostic_fine_scene_for_cnn / diagnostic_parent_vs_fine_render 配置项
+child_observation_skip frozen DINOv2 路径
+history / ADC / Mamba（stage 2_0 刻意禁用）
+```
+
+建议下一步：在真实 nuScenes segment 上跑 `iforward_stage2_0_biggs_parent_lifting.yaml`，对照 fine baseline 验证 `iforward/biggs/compression_total_active` 与单帧 PSNR，再推进 §15.4 ablation。
+
+---
+
+## 19. 流程图
+
+下文 **Stage 1** 指 IForward fine-GS 基线（`model.iforward.version: v1`，如 `configs/iforward/iforward_v5_baseline.yaml`）；**Stage 2** 指 BigGS parent-lifting（`stage2_0_biggs_parent_lifting`）。
+
+### 19.1 Stage 1 vs Stage 2 总览
+
+```mermaid
+flowchart TB
+    subgraph SHARED["两阶段共用"]
+        SCH[scheduler_iforward<br/>episode / rollout / loss_timing]
+        LS[LocalGSState<br/>N fine GS × bg/distant/rigid]
+        BR[IForwardStage6Bridge]
+        PU[Stage6PosteriorUpdater]
+        AD[LocalGSState.apply_delta]
+        REN[render + photometric loss]
+    end
+
+    subgraph S1["Stage 1 — fine 直连"]
+        O1["_observe_v4_measurement<br/>fine scene render + V4 lifting"]
+        F1["feat_2d_* [N,C]"]
+        E1["stage6_struct_event_decoder<br/>输入 N tokens"]
+        EV1["fine EventPack [N, event_dim]"]
+        M1["IForwardSceneMemory<br/>GRU / cell memory"]
+        C1["ctx_memory + vsm_ctx"]
+    end
+
+    subgraph S2["Stage 2 — BigGS parent-lifting"]
+        A2["build_biggs_assignments<br/>child→parent 固定"]
+        P2["project_biggs_parents<br/>M parent GS"]
+        O2["_observe_stage2_0_biggs_measurement<br/>parent scene render + V4 lifting"]
+        F2["parent_feat_2d_* [M,C]"]
+        E2["stage6_struct_event_decoder<br/>输入 M parent tokens"]
+        PE2["parent EventPack [M, event_dim]"]
+        D2["BigGSToFineEventDecoder"]
+        EV2["fine EventPack [N, event_dim]"]
+        M2["memory bypass"]
+        BS2["IForwardState.biggs_state<br/>assignment cache"]
+    end
+
+    SCH --> LS
+    LS --> BR
+
+    BR -->|Stage 1| O1 --> F1 --> E1 --> EV1 --> M1 --> C1 --> PU
+    BR -->|Stage 2| A2 --> P2 --> O2 --> F2 --> E2 --> PE2 --> D2 --> EV2 --> M2 --> PU
+
+    PU --> AD --> REN
+    BS2 -.->|episode 内复用| A2
+```
+
+### 19.2 Stage 2 单步 rollout 详图
+
+```mermaid
+flowchart TD
+    START([forward_rollout 一步]) --> INJ[注入 scene_id / segment_id / episode_id 到 batch]
+    INJ --> OBS{bridge.observe}
+
+  OBS --> CACHE{biggs_state<br/>child 数 & ids 匹配?}
+    CACHE -->|是| REUSE[复用 assignment]
+    CACHE -->|否| BUILD[build_biggs_assignments<br/>branch_aware_voxel_cap]
+    REUSE --> PROJ
+    BUILD --> PROJ[project_biggs_parents<br/>bg / distant / rigid_active]
+
+    PROJ --> SCENE[拼接 parent_scene<br/>M = M_bg + M_d + M_r]
+    SCENE --> CNN[parent source render<br/>→ CNN residual features_2d]
+    CNN --> LIFT[AlphaTWeightExtractorV4<br/>fused multi-cam backproject]
+    LIFT --> MEAS[measurement dict<br/>parent_feat_2d_* / assign_* / route]
+    MEAS --> SAVE[state.biggs_state ← measurement]
+
+    SAVE --> EVT{bridge.build_event}
+    EVT --> NEAR[_build_stage2_0_parent_struct_input_near<br/>bg + rigid_in]
+    EVT --> FAR[_build_stage2_0_parent_struct_input_far<br/>distant + rigid_out]
+    NEAR --> ENC[stage6_struct_event_decoder]
+    FAR --> ENC
+    ENC --> PEVT[parent EventPack]
+    PEVT --> DEC[BigGSToFineEventDecoder<br/>low_rank_basis]
+    DEC --> FEVT[fine EventPack<br/>行数 = N_bg, N_d, len route.S]
+
+    FEVT --> MEM[memory = None<br/>ctx_memory = 0]
+    MEM --> UPD[stage6_posterior_updater<br/>+ vsm_ctx_adapter]
+    UPD --> DELTA[fine delta]
+    DELTA --> APPLY[local_state.apply_delta]
+    APPLY --> LOSS[rollout-final render loss]
+```
+
+### 19.3 Observe 阶段分支对比
+
+```mermaid
+flowchart LR
+    subgraph S1O["Stage 1 observe"]
+        LS1[LocalGSState → NodeStates]
+        R1[_route_rigid_source_points]
+        FINE[fine gaussians_scene<br/>N 个 GS]
+        R1 --> FINE
+        FINE --> R1N[fine source render]
+        R1N --> L1[V4 lifting on fine scene]
+        L1 --> OUT1["measurement:<br/>feat_2d_bg [N_bg,C]<br/>feat_2d_distant [N_d,C]<br/>feat_2d_rigid_S [N_rS,C]"]
+    end
+
+    subgraph S2O["Stage 2 observe"]
+        LS2[LocalGSState → NodeStates]
+        R2[_route_rigid_source_points]
+        ASG[build_biggs_assignments]
+        PRJ[project → parent params]
+        PAR[parent gaussians_scene<br/>M 个 GS, M≪N]
+        LS2 --> ASG --> PRJ --> PAR
+        R2 --> PAR
+        PAR --> R2N[parent source render]
+        R2N --> L2[V4 lifting on parent scene]
+        L2 --> OUT2["measurement:<br/>parent_feat_2d_* [M_*,C]<br/>assign_* / biggs_state<br/>route 仍为 fine route"]
+    end
+```
+
+### 19.4 Event 阶段分支对比
+
+```mermaid
+flowchart LR
+    subgraph S1E["Stage 1 event"]
+        M1[measurement fine feat_2d_*]
+        SI1[Stage6StructInput<br/>coords = fine means]
+        M1 --> SI1
+        SI1 --> D1[stage6_struct_event_decoder]
+        D1 --> E1[fine EventPack<br/>直接输出]
+    end
+
+    subgraph S2E["Stage 2 event"]
+        M2[measurement parent_feat_2d_*]
+        SI2[Stage6StructInput<br/>coords = parent means]
+        M2 --> SI2
+        SI2 --> D2[stage6_struct_event_decoder]
+        D2 --> P2[parent EventPack<br/>M rows]
+        P2 --> CD[BigGSToFineEventDecoder<br/>child_code + low_rank_basis]
+        CD --> E2[fine EventPack<br/>N rows, 与 Stage 1 同 shape]
+    end
+
+    E1 --> PU[posterior_updater]
+    E2 --> PU
+```
+
+---
+
+## 20. 关键组件对照表（Stage 1 vs Stage 2）
+
+### 20.1 总览差异
+
+| 维度 | Stage 1（`version: v1`） | Stage 2（`stage2_0_biggs_parent_lifting`） |
+|------|--------------------------|--------------------------------------------|
+| 配置入口 | `iforward_v5_baseline.yaml` 等 | `iforward_stage2_0_biggs_parent_lifting.yaml` |
+| 2D lifting 参与 GS | **N** 个 fine GS | **M** 个 parent GS（`M ≪ N`，压缩比见 `compression_total_active`） |
+| 2D 特征张量 | `feat_2d_bg` `[N_bg,C]` | `parent_feat_2d_bg` `[M_bg,C]` |
+| Struct encoder 输入规模 | N tokens（near/far 各按 fine 分行） | M tokens（parent coords / params） |
+| Event 产出路径 | struct_decoder → fine EventPack | struct_decoder → parent EventPack → **child decoder** → fine EventPack |
+| Posterior / delta | 相同 `Stage6PosteriorUpdater` + `apply_delta` | 相同（消费 fine EventPack，不感知 BigGS） |
+| IForward memory | `IForwardSceneMemory`（GRU + cell keys） | **禁用**（`memory=None`，`ctx_memory=0`） |
+| History gate / ADC | 可选（v3/v4 配置） | **强制关闭** |
+| 2D frontend 训练 | 通常 `train_2d_detach_alpha`，可训 UNet/fusion | `no_grad_v4`，frontend **冻结** |
+| 新增可训练模块 | `memory` + struct_decoder + updater | `biggs_child_decoder` + struct_decoder + updater |
+| 跨 step 额外状态 | `IForwardMemoryState` + short window history | `IForwardState.biggs_state`（assignment cache，CPU detach） |
+| Scheduler / loss 角色 | `scheduler_iforward`，current-only 或 +history | 相同 scheduler；stage2_0 配置为 **current-only** |
+
+### 20.2 组件 / 函数 / 变量明细
+
+| 组件 | 文件 / 入口 | 功能 | 关键变量 / 数据结构 | Stage 1 | Stage 2 |
+|------|-------------|------|---------------------|---------|---------|
+| Rollout 编排 | `models/iforward/model.py` · `IForwardModel.forward_rollout` | 解析 batch、逐步 observe→event→memory→update | `resolved.steps`, `local_state`, `state` | ✓ | ✓（额外注入 scene/segment id，写回 `biggs_state`） |
+| Bridge | `models/iforward/bridge.py` · `IForwardStage6Bridge` | 薄封装 Stage6 runtime | `observe()`, `build_event()`, `predict_delta()` | ✓ | ✓（observe 多传 `biggs_state`, `biggs_scene_id` 等） |
+| Fine 场景状态 | `stage6_0/local_gs_state.py` · `LocalGSState` | 持久化 fine GS 参数 | `bg/distant/rigid` branches，`N_*` 行数 | ✓ 唯一几何状态 | ✓ 唯一几何状态（delta 仍写回 fine） |
+| Observe（fine） | `minimal_trainer_stage6_0.py` · `_observe_v4_measurement` | fine render + V4 lifting | `feat_2d_bg`, `acc_w_bg`, `obs_bg`, `route` | ✓ 默认路径 | ✗（`stage2_0_biggs_enabled` 时短路） |
+| Observe（BigGS） | `minimal_trainer_stage6_0.py` · `_observe_stage2_0_biggs_measurement` | assignment → project → parent render → parent lifting | `parent_feat_2d_*`, `assign_*`, `biggs_state`, `num_parent_*` | ✗ | ✓ |
+| Rigid 路由 | `minimal_trainer_stage6_0.py` · `_route_rigid_source_points` | 当前帧可见 rigid 子集 | `route.S`, `route.S_in`, `route.S_out`, `inside_mask_S` | ✓ | ✓（lifting 在 parent 上，route 语义不变） |
+| Assignment | `biggs_assignment.py` · `build_biggs_assignments` | fine→parent 分组（voxel+cap） | `child_to_parent`, `parent_count`, `child_mass` | — | ✓ |
+| Assignment 状态 | `biggs_state.py` · `IForwardBigGSState` | episode 内固定 child→parent | `bg/distant/rigid: BigGSBranchAssignment`, `scene_id`, `segment_id` | — | ✓（挂在 `IForwardState`） |
+| Parent 投影 | `biggs_parent_projector.py` · `project_biggs_parents` | moment matching → parent GS 参数 | `BigGSParentProjection.params`（means, scales_log, quats, opacity, SH） | — | ✓ |
+| Rigid active 投影 | `project_biggs_active_rigid_parents` | 仅 `route.S` 子集投影到 active parent | `assign_rigid_active`, `parent_params_rigid_active` | — | ✓ |
+| V4 Backproject | `minimal_trainer_stage5_4.py` · `_backproject_scene_features_multi_camera` | alpha/T 加权反投影 2D 特征 | `feat_2d_all [?,C]`, `acc_w`, `obs_code` | 输入 fine scene，`? = N` | 输入 parent scene，`? = M` |
+| Struct 输入（near） | `_build_stage6_struct_input_near` / `_build_stage2_0_parent_struct_input_near` | 组装 `Stage6StructInput` | `feat_2d`, `coords`, `branch_id`, `split_0/1` | fine coords | parent coords |
+| Struct 输入（far） | `_build_stage6_struct_input_far` / `_build_stage2_0_parent_struct_input_far` | distant + rigid_out | 同上 | fine | parent |
+| Event encoder | `stage6_struct_event_decoder` | xCPE near + point MLP far → EventPack | `event_bg [*,D]`, `event_distant`, `event_rigid`, `D=event_dim` | `* = N_*` | 中间态 `* = M_*` |
+| Child decoder | `biggs_event_decoder.py` · `BigGSToFineEventDecoder` | parent event 解回 fine 行数 | `child_to_parent`, `child_code`, `mode=low_rank_basis` | — | ✓ |
+| Event 汇总 | `_build_stage6_event_from_measurement` | 按 `biggs_enabled` 分支 | `measurement["biggs_enabled"]` | `False` → legacy | `True` → `_build_stage2_0_biggs_event_from_measurement` |
+| Memory | `models/iforward/memory.py` · `IForwardSceneMemory` | 历史 event → ctx_memory | `IForwardMemoryState`, `ctx_bg/distant/rigid` | ✓ | ✗ bypass |
+| Context adapter | `context_adapter.py` · `IForwardContextAdapter` | event + memory → updater 输入 | `vsm_ctx` | ✓ | ✓（无 memory 项） |
+| Posterior | `stage6_0` · `Stage6PosteriorUpdater` | fine event → delta | `delta` per branch | ✓ | ✓ |
+| Trainer 参数组 | `models/iforward/trainer.py` · `IForwardTrainer` | AdamW 分组 | `memory`, `stage6_struct_decoder`, `biggs_child_decoder` | 含 `memory` | 含 `biggs_child_decoder`，**不含** `memory` |
+| 配置开关 | `model.iforward.version` | 选择代码路径 | `v1` vs `stage2_0_biggs_parent_lifting` | `v1` | `stage2_0_biggs_parent_lifting` |
+| BigGS 配置 | `model.iforward.biggs.*` | assignment / projector / decoder 超参 | `assignment.bg.voxel_size`, `child_decoder.rank` | 不存在 | ✓ |
+
+### 20.3 关键张量 shape 对照
+
+| 符号 | 含义 | Stage 1 | Stage 2 |
+|------|------|---------|---------|
+| `N_bg`, `N_d`, `N_rS` | fine GS 行数（bg / distant / rigid 当前帧） | lifting & event 全程使用 | 仅 child decoder 输出 & updater 输入使用 |
+| `M_bg`, `M_d`, `M_rS` | parent GS 行数 | — | lifting & struct encoder 使用 |
+| `C` | 2D 特征维 | `feat_2d_channels`（通常 24） | 相同 |
+| `D` | event 维 | `struct_event_decoder.event_dim`（通常 48） | parent/fine EventPack 均为 `D` |
+| `child_to_parent` | fine i → parent j | — | `[N_branch]` long，episode 内固定 |
+| `route.S` | 当前帧 rigid fine 索引 | `[N_rS]` | 相同；decoder 输出 `event_rigid` 行数 = `len(S)` |
+| `compression_total_active` | `(N_bg+N_d+N_rS) / (M_bg+M_d+M_rS)` | ≈ 1（无压缩） | 日志指标，目标 > 1 |
+
+### 20.4 `measurement` dict 字段对照
+
+| 字段 | Stage 1 | Stage 2 |
+|------|---------|---------|
+| `biggs_enabled` | 无 / `False` | `True` |
+| `feat_2d_bg` | `[N_bg, C]` | 不使用 |
+| `parent_feat_2d_bg` | 不使用 | `[M_bg, C]` |
+| `acc_w_bg` / `parent_acc_w_bg` | fine `[N_bg]` | parent `[M_bg]` |
+| `obs_bg` / `parent_obs_bg` | fine `[N_bg, 2]` | parent `[M_bg, 2]` |
+| `assign_bg` | 无 | `BigGSBranchAssignment` |
+| `biggs_state` | 无 | `IForwardBigGSState`（写回 `IForwardState`） |
+| `route` | fine rigid route | **相同** fine rigid route |
+| `iforward/biggs/*` 指标 | 无 | 压缩比、parent 统计、timing 等 |
+
+### 20.5 不变部分（两阶段相同）
+
+```text
+scheduler_iforward（episode / rollout / loss_timing）
+LocalGSState 初始化与 apply_delta（fine GS 仍是唯一可写几何）
+Stage6PosteriorUpdater 接口与 branch clamps
+render + photometric / mask / delta_regularization loss 结构
+bridge.predict_delta / apply_update 调用链
+gsplat / AlphaTWeightExtractorV4（无新 kernel，仅换 gaussians_scene 规模）
+```
+
+Stage 2 的核心假设：**posterior updater 仍按 N 个 fine GS 做 delta 预测**；BigGS 只压缩 observe + 3D event reasoning 阶段的 token 数，不改变最终状态空间维度。
+
+---
+
+## 21. Scheduler 调度逻辑（`iforward_stage2_0_biggs_parent_lifting.yaml`）
+
+实现：`datasets/train_scheduler_iforward.py` · `TrainSchedulerIForward`（`version: iforward_v1`）。
+
+本节针对当前 Stage 2.0 配置中的 `scheduler_iforward` 块；与模型路径无关，Stage 1 v1 基线共用同一 scheduler 实现，仅超参不同。
+
+### 21.1 当前配置关键参数
+
+| 节点 | 值 | 含义 |
+|------|-----|------|
+| `traversal.traversal_mode` | `episode_serial` | 一次只跑完一个 episode 的全部 rollout，再切下一个 episode |
+| `traversal.scene_order` / `segment_order` | `shuffle_per_epoch` | 每个 epoch 打乱 scene / segment 顺序 |
+| `episode.blocks_per_episode` | 8 | 每个 episode 含 8 个连续 keyframe block |
+| `episode.episode_stride` | 8 | 沿 segment keyframe 轴不重叠滑窗（步长 = 窗长） |
+| `episode.rollouts_per_episode` | 8 | 每个 episode **固定 8 次** optimizer step（8 个 rollout） |
+| `episode.block_source_frame_policy` | `random_within_keyframe_per_rollout` | **每个 rollout** 在其 block 的 keyframe 内重新随机选一帧作 source |
+| `episode.reset_scene_state_policy` | `episode_begin` | 仅 episode 第 1 个 rollout 重置 3D 状态 |
+| `rollout.block_selection_policy` | `random_start_contiguous` | 每次 rollout 在 episode 内**随机选一个起始 block**（本配置 `blocks_per_rollout=1` 即随机单 block） |
+| `rollout.shapes` | `b1_r8/r6/r4/r2` | 每次 rollout 只覆盖 **1 个 block**，重复 8/6/4/2 次 → `inner_K` = 8/6/4/2 |
+| `rollout.max_inner_K` | 8 | 限制单 rollout 最多 8 个 observe 步 |
+| `evidence.camera_policy` | `all_cams` | 每步 3 相机 (cam 0,1,2) 同时作 evidence |
+| `loss_timing.policy` | `rollout_final_only` | 仅 rollout 最后一步 backward + render loss |
+| `supervision.current` | enable | 监督 = rollout 输入帧 × 3 cam；`nearby` / `history_replay` 关闭 |
+| `memory.*` | episode_begin + carry | Stage 2 模型侧 memory 已 bypass；scheduler 仍下发 step 级 memory 标志 |
+
+**本配置下的数量关系**：
+
+```text
+inner_K = blocks_per_rollout × repeats_per_block = 1 × {8,6,4,2}
+每 rollout 只访问 1 个 block，但重复 K 次（同帧多步 observe→event→update）
+每 episode = 8 rollouts → 8 次 optimizer step
+```
+
+### 21.2 全局调度流程
+
+```mermaid
+flowchart TD
+    EPOCH["_rebuild_epoch_plan<br/>shuffle scenes/segments<br/>切 keyframe 滑窗"] --> PLAN["episode_plan 队列<br/>每项: scene, segment, 8-keyframe window"]
+    PLAN --> ENSURE["_ensure_episode_with_rollout_available"]
+    ENSURE --> EP_BEGIN{当前 episode?}
+    EP_BEGIN -->|无| START["_start_next_episode<br/>episode_begin 事件<br/>rollout_idx=0"]
+    EP_BEGIN -->|有| BUILD
+    START --> BUILD["_build_rollout_plan"]
+    BUILD --> SHAPE["按 prob 采样 shape<br/>b1_r8 / r6 / r4 / r2"]
+    SHAPE --> BLOCK["_select_episode_blocks<br/>random_start_contiguous<br/>选 1 个 block_idx ∈ [0,7]"]
+    BLOCK --> FRAME["random_within_keyframe_per_rollout<br/>该 block 的 keyframe 内随机选 source frame"]
+    FRAME --> STEPS["展开 inner_K 步<br/>每步: 3cam evidence<br/>repeat_idx=0 时 commit_obs"]
+    STEPS --> SUP["final_supervision<br/>current = 输入帧×3cam<br/>nearby 关闭"]
+    SUP --> BATCH["_batch_from_plan → next_batch"]
+    BATCH --> TRAIN["trainer: forward_rollout<br/>仅最后一步算 loss"]
+    TRAIN --> ADV["rollout_idx++<br/>global_step++<br/>记录 used_rollout_starts"]
+    ADV --> END{rollout_idx ≥ 8?}
+    END -->|是| EP_END["episode_end<br/>清空 _current_episode"]
+    END -->|否| BUILD
+    EP_END --> ENSURE
+```
+
+### 21.3 Episode 窗口如何切出
+
+假设某 segment 有 keyframe 索引 `[kf0, kf1, …, kf23]`，`blocks_per_episode=8`，`episode_stride=8`，`allow_short_last_episode=false`：
+
+```mermaid
+flowchart LR
+    subgraph SEG["segment keyframes"]
+        K0["kf0–kf7"] --> K1["kf8–kf15"] --> K2["kf16–kf23"]
+    end
+    K0 --> EP0["Episode 0<br/>window pos 0<br/>blocks [0..7]"]
+    K1 --> EP1["Episode 1<br/>window pos 8<br/>blocks [0..7]"]
+    K2 --> EP2["Episode 2<br/>若不足 8 则丢弃"]
+```
+
+每个 episode 内部 block 编号恒为 `0..7`，对应 8 个 keyframe；`episode_id` / `scene_id` / `segment_id` 在 episode 内不变（BigGS assignment cache 依赖此三元组）。
+
+### 21.4 单次 Rollout 内部（以 `b1_r8` 为例）
+
+假设 episode 有 8 个 block，本次采样到 shape=`b1_r8`，随机选中 **block 3**（keyframe `kf3`），keyframe 内候选 train frames `{12, 13, 14}`，随机到 **frame 13**：
+
+```mermaid
+flowchart TD
+    R0["Rollout 开始<br/>rollout_idx=0 → reset 3D state<br/>rollout_idx>0 → carry state + biggs_state"]
+    R0 --> S0["Step 0: block=3, frame=13, repeat=0<br/>evidence: (13,0),(13,1),(13,2)<br/>commit_observation_memory=true"]
+    S0 --> S1["Step 1: block=3, frame=13, repeat=1<br/>update_optimizer_memory=true"]
+    S1 --> S2["Step 2..6: 同上"]
+    S2 --> S7["Step 7: block=3, repeat=7<br/>is_block_exit=true"]
+    S7 --> LOSS["rollout_final_only<br/>render loss on current supervision<br/>frames=[13] × 3 cams"]
+    LOSS --> DET["detach_graph_after_rollout"]
+```
+
+**delivery_order_policy=chronological**：多 block 时按 block 序号交付；本配置 `blocks_per_rollout=1`，每 rollout 只有 1 个 block，K 步全是同一 block 的重复访问。
+
+### 21.5 示例 A：一个 Episode 的 8 次 Rollout 时间线
+
+虚构 segment `scene=14, seg=0`，keyframe window = `[100,105,110,115,120,125,130,135]`（block 0..7）：
+
+```mermaid
+gantt
+    title Episode（8 rollouts，状态在 rollout 间 carry）
+    dateFormat X
+    axisFormat %s
+
+    section Rollout0
+    reset state :milestone, r0, 0, 0
+    b1_r8 block2 frame102 :r0work, 0, 8
+
+    section Rollout1
+    carry state :milestone, r1, 8, 8
+    b1_r6 block5 frame127 :r1work, 8, 14
+
+    section Rollout2
+    b1_r4 block2 frame101 :r2work, 14, 18
+
+    section Rollout3
+    b1_r8 block7 frame138 :r3work, 18, 26
+
+    section Rollout4
+    b1_r2 block0 frame100 :r4work, 26, 28
+
+    section Rollout5
+    b1_r6 block4 frame122 :r5work, 28, 34
+
+    section Rollout6
+    b1_r8 block1 frame106 :r6work, 34, 42
+
+    section Rollout7
+    b1_r4 block6 frame133 :r7work, 42, 46
+    episode_end :milestone, end, 46, 46
+```
+
+要点：
+
+- **block 可重复**：rollout 0 与 rollout 2 都访问 block 2，但 `random_within_keyframe_per_rollout` 可能选不同 frame（102 vs 101）。
+- **起始 block 去重**：`used_rollout_starts` 尽量覆盖未用过的 block；8 次 rollout + 8 个 block 时，倾向于每个 block 至少被选中一次（随机，非保证）。
+- **避免连续相邻起点**：若上次从 block 2 开始，下次优先不从 block 3 开始（`last_rollout_start_block_idx + blocks_per_rollout` 被排除）。
+
+### 21.6 示例 B：`random_start_contiguous` 选 block
+
+`blocks_per_rollout=1` 时，有效起点 = `{0,1,2,3,4,5,6,7}`：
+
+```mermaid
+flowchart TD
+    START["新 rollout"] --> USED{"还有未用过的<br/>start ∈ [0,7]?"}
+    USED -->|是| AVAIL["available = 未使用起点"]
+    USED -->|否| RESET["available = 全部 0..7"]
+    AVAIL --> AVOID{"上次 start=s<br/>排除 s+1?"}
+    RESET --> PICK
+    AVOID -->|有其它可选| PICK["rng.choice(available)<br/>例: start=5 → block 5"]
+    AVOID -->|无可排除| PICK
+    PICK --> RECORD["used_rollout_starts += 5<br/>episode_blocks = [5]"]
+```
+
+与 `next_contiguous`（按 `block_cursor` 顺序扫完 episode）不同：本配置 **不保证** 8 个 rollout 按时间顺序覆盖 block 0→7，而是**随机单 block 重复 K 次**。
+
+### 21.7 示例 C：Shape 采样与 `inner_K`
+
+| 采样结果 | blocks | repeats | inner_K | 单 rollout 计算量 |
+|----------|--------|---------|---------|-------------------|
+| `b1_r8` (35%) | 1 | 8 | 8 | 8 次 observe→event→update，1 次 loss |
+| `b1_r6` (30%) | 1 | 6 | 6 | 6 步 |
+| `b1_r4` (25%) | 1 | 4 | 4 | 4 步 |
+| `b1_r2` (10%) | 1 | 2 | 2 | 2 步 |
+
+```mermaid
+flowchart LR
+    SHAPE["rng.choices(shapes, weights=prob)"] --> K["inner_K = 1 × repeats"]
+    K --> STEPS["len(plan.steps) = inner_K"]
+    STEPS --> LOSS["仅 step inner_K-1 后<br/>rollout_final loss"]
+```
+
+`max_inner_K=8` 与最大 shape 一致，不会截断。
+
+### 21.8 Step 级 memory / loss 标志（scheduler → model）
+
+| Step 字段 | 本配置取值 | 含义 |
+|-----------|------------|------|
+| `commit_observation_memory` | `repeat_idx == 0` | 每个 block 第一次 repeat 提交 observation memory |
+| `update_optimizer_memory` | 每步 `true` | 每 repeat 更新 optimizer memory 槽 |
+| `allow_step_render_loss` | `false` | 中间步不算 loss |
+| `is_block_enter` / `is_block_exit` | repeat 0 / last | 供模型侧 block 边界逻辑（HSP 等；Stage 2 多数 bypass） |
+| `reset_scene_state_before_rollout` | 仅 `rollout_idx==0` | 初始化 `LocalGSState`；Stage 2 同时重建/复用 `biggs_state` |
+| `carry_scene_state_after_rollout` | `rollout_idx < 7` | rollout 间保留 fine GS + detached biggs assignment |
+| `detach_graph_after_rollout` | `true` | 每次 rollout backward 后断图 |
+
+Stage 2 模型：`memory=None`，但 scheduler 契约不变，便于与 Stage 1 共用 dataloader / trainer 管线。
+
+### 21.9 Supervision 与 Evidence
+
+```mermaid
+flowchart LR
+    subgraph EVIDENCE["每步 Evidence（训练输入）"]
+        E1["source frame f"]
+        E2["3 cameras → 6 refs<br/>(f,0)(f,1)(f,2)"]
+    end
+    subgraph TARGET["Rollout 结束监督"]
+        T1["current: 输入帧 f × 3 cam<br/>role=final_current_recon"]
+        T2["nearby: 关闭"]
+        T3["history_replay: 关闭"]
+    end
+    EVIDENCE --> MODEL["observe + event + update × inner_K"]
+    MODEL --> TARGET
+```
+
+`mask_policy: non_sky_non_egocar`：sky / egocar 区域不参与 photometric loss。
+
+### 21.10 与 Stage 1 v1 基线 scheduler 的差异（同实现、不同超参）
+
+| 维度 | Stage 2 当前 yaml | 典型 Stage 1（如 `iforward_v5_baseline`） |
+|------|-------------------|------------------------------------------|
+| `rollouts_per_episode` | 8（显式预算） | 常不设置 → 扫完 block_cursor 才结束 |
+| `block_selection_policy` | `random_start_contiguous` | 常 `next_contiguous` |
+| `blocks_per_rollout` | 1 | 2~4（一次 rollout 覆盖多 block） |
+| `block_source_frame_policy` | `per_rollout` 重采样 | 常 `once_per_episode` 固定 frame_chain |
+| `supervision.nearby` | 关闭 | 常开启 |
+| `memory`（模型） | bypass | `IForwardSceneMemory` 生效 |
+
+**训练命令入口**（scheduler 由 dataset materializer 构造）：
+
+```bash
+python tools/train_iforward.py \
+  --config_file configs/iforward/iforward_stage2_0_biggs_parent_lifting.yaml
+```
