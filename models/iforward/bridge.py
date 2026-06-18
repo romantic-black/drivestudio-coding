@@ -92,6 +92,7 @@ class IForwardStage6Bridge:
         source_indices: List[int],
         source_frame_idx: int,
         biggs_state: Optional[Any] = None,
+        biggs_parent_runtime: Optional[Any] = None,
         biggs_scene_id: Optional[int] = None,
         biggs_segment_id: Optional[int] = None,
         biggs_episode_id: Optional[int] = None,
@@ -102,9 +103,26 @@ class IForwardStage6Bridge:
             source_indices=[int(x) for x in source_indices],
             source_frame_idx=int(source_frame_idx),
             biggs_state=biggs_state,
+            biggs_parent_runtime=biggs_parent_runtime,
             biggs_scene_id=biggs_scene_id,
             biggs_segment_id=biggs_segment_id,
             biggs_episode_id=biggs_episode_id,
+        )
+
+    def update_biggs_parent_runtime(
+        self,
+        *,
+        runtime: Any,
+        old_local_state: LocalGSState,
+        new_local_state: LocalGSState,
+    ) -> Any:
+        updater = getattr(self.runtime, "_stage2_0_update_parent_runtime", None)
+        if not callable(updater):
+            return runtime
+        return updater(
+            runtime=runtime,
+            old_local_state=old_local_state,
+            new_local_state=new_local_state,
         )
 
     def observe_planning(

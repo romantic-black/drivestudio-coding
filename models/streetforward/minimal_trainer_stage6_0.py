@@ -25,7 +25,13 @@ from models.iforward.biggs_parent_projector import (
     project_biggs_active_rigid_parents,
     project_biggs_parents,
 )
-from models.iforward.biggs_state import IForwardBigGSState
+from models.iforward.biggs_parent_stats import (
+    init_parent_branch_runtime,
+    projection_from_runtime,
+    update_parent_branch_runtime,
+)
+from models.iforward.biggs_state import BigGSBlockRuntime, IForwardBigGSState
+from models.iforward.dino_feature_cache import DINOFeatureCache
 from models.streetforward.minimal_trainer_stage4_0 import spatial_hw_from_image_tensor
 from models.streetforward.minimal_trainer_stage5_4 import MinimalStreetForwardStage5_4
 from models.streetforward.node_states import NodeStateBackground, NodeStateDistant, NodeStateRigid
@@ -358,6 +364,8 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         biggs_enabled = ifwd_version in {
             "stage2_0_biggs_parent_lifting",
             "stage2_0_biggs_cuda_exact_diagonal_projector",
+            "stage2_0_biggs_incremental_whdd",
+            "stage2_0_biggs_compact16_residualonly",
         }
         if bool(biggs_enabled):
             if bool(self._cfg_get(biggs_cfg, "enable", True)) is not True:
@@ -400,6 +408,8 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         train_fusion_neck = bool(self._cfg_get(base_measurement, "train_fusion_neck", train_2d_frontend))
         train_v4_lift = bool(self._cfg_get(base_measurement, "train_v4_lift", False))
         train_dinov2 = bool(self._cfg_get(base_measurement, "train_dinov2", False))
+        feature_extractor_cfg = self._cfg_get(model_cfg, "feature_extractor", {}) or {}
+        feature_extractor_type = str(self._cfg_get(feature_extractor_cfg, "type", "")).strip().lower()
         if train_dinov2:
             raise ValueError("Stage6_0 Phase A P0 requires base_measurement.train_dinov2=false.")
         if phase_a_mode == "updater_only":
@@ -431,9 +441,12 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 raise ValueError("Stage6_0 Phase A from_scratch requires base_measurement.detach_v4_outputs=false.")
             elif not train_2d_frontend:
                 raise ValueError("Stage6_0 Phase A from_scratch requires base_measurement.train_2d_frontend=true.")
-            elif not train_residual_unet or not train_fusion_neck:
+            elif not train_residual_unet:
+                raise ValueError("Stage6_0 Phase A from_scratch requires train_residual_unet=true.")
+            elif feature_extractor_type != "residual_only" and not train_fusion_neck:
                 raise ValueError(
-                    "Stage6_0 Phase A from_scratch requires train_residual_unet=true and train_fusion_neck=true."
+                    "Stage6_0 Phase A from_scratch requires train_fusion_neck=true unless "
+                    "model.feature_extractor.type=residual_only."
                 )
         if bool(self._cfg_get(self._cfg_get(stage6, "vsm", {}) or {}, "enable", False)):
             raise ValueError("Stage6_0 Phase A must not enable VSM.")
@@ -463,7 +476,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         if str(self._cfg_get(far_cfg, "type", "point_mlp")) not in {"point_mlp", "mlp"}:
             raise ValueError("Stage6_0 Phase A requires struct_event_decoder.far.type=point_mlp.")
         token_dim = int(self._cfg_get(token_cfg, "token_dim", 48))
-        event_dim = int(self._cfg_get(struct_cfg, "event_dim", self._cfg_get(self._cfg_get(stage6, "posterior_updater", {}) or {}, "event_dim", 48)))
+        event_dim = int(self._cfg_get(struct_cfg, "event_dim", token_dim))
         if int(event_dim) != int(token_dim):
             raise ValueError(
                 f"Stage6_0 Phase A requires struct_event_decoder.event_dim==token.token_dim, "
@@ -867,7 +880,12 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         biggs_cfg = self._cfg_get(iforward_cfg, "biggs", {}) or {}
         is_stage2_biggs = (
             str(self._cfg_get(iforward_cfg, "version", ""))
-            in {"stage2_0_biggs_parent_lifting", "stage2_0_biggs_cuda_exact_diagonal_projector"}
+            in {
+                "stage2_0_biggs_parent_lifting",
+                "stage2_0_biggs_cuda_exact_diagonal_projector",
+                "stage2_0_biggs_incremental_whdd",
+                "stage2_0_biggs_compact16_residualonly",
+            }
             and bool(self._cfg_get(biggs_cfg, "enable", True))
         )
         self.stage6_phase = str(self._cfg_get(model_cfg, "phase", "phase_A_block_local_unroll"))
@@ -904,6 +922,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
 
         train_residual_unet = bool(self._cfg_get(base_measurement, "train_residual_unet", True))
         train_fusion_neck = bool(self._cfg_get(base_measurement, "train_fusion_neck", True))
+        train_dino_adapter = bool(self._cfg_get(base_measurement, "train_dino_adapter", False))
 
         def mark_trainable(module: nn.Module, prefix: str) -> None:
             for name, param in module.named_parameters(recurse=True):
@@ -921,6 +940,13 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 mark_trainable(image_feature_extractor.fusion_neck, "image_feature_extractor.fusion_neck")
         elif train_fusion_neck and not hasattr(image_feature_extractor, "residual_unet"):
             mark_trainable(image_feature_extractor, "image_feature_extractor")
+
+        dino_adapter = getattr(image_feature_extractor, "dino_adapter", None)
+        if train_dino_adapter and isinstance(dino_adapter, nn.Module):
+            for attr_name in ("proj", "fuse"):
+                module = getattr(dino_adapter, attr_name, None)
+                if isinstance(module, nn.Module):
+                    mark_trainable(module, f"image_feature_extractor.dino_adapter.{attr_name}")
 
         if self.stage6_train_v4_lift:
             for attr_name in ("feature_backprojector", "alpha_t_extractor_v4"):
@@ -950,14 +976,15 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             self._cfg_get(render_cfg, "grouped_multiview_train", True)
         )
         token_dim = int(self._cfg_get(token_cfg, "token_dim", 48))
-        self.stage6_event_dim = int(self._cfg_get(struct_cfg, "event_dim", self._cfg_get(updater_cfg, "event_dim", token_dim)))
+        self.stage6_event_dim = int(self._cfg_get(struct_cfg, "event_dim", token_dim))
         if int(self.stage6_event_dim) != int(token_dim):
             raise ValueError(
                 f"Stage6_0 struct_event_decoder.event_dim must equal token.token_dim ({int(token_dim)}), "
                 f"got {int(self.stage6_event_dim)}."
             )
-        self.stage6_ctx_dim = self.stage6_event_dim
-        self.stage6_hidden_dim = int(self._cfg_get(updater_cfg, "stage_hidden_dim", self.stage6_event_dim))
+        self.stage6_posterior_event_dim = int(self._cfg_get(updater_cfg, "event_dim", self.stage6_event_dim))
+        self.stage6_ctx_dim = self.stage6_posterior_event_dim
+        self.stage6_hidden_dim = max(int(self._cfg_get(updater_cfg, "stage_hidden_dim", self.stage6_event_dim)), 0)
         self.stage6_feat_2d_dim = int(
             self._cfg_get(
                 struct_cfg,
@@ -1021,8 +1048,8 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 if (value := self._cfg_get(cfg, key, None)) is not None
             }
         self.stage6_posterior_updater = Stage6PosteriorUpdater(
-            event_dim=self.stage6_event_dim,
-            ctx_dim=self.stage6_event_dim,
+            event_dim=self.stage6_posterior_event_dim,
+            ctx_dim=self.stage6_posterior_event_dim,
             hidden_dim=int(self._cfg_get(updater_cfg, "hidden_dim", 96)),
             stage_hidden_dim=self.stage6_hidden_dim,
             sh_degree=int(self.sh_degree),
@@ -1033,18 +1060,39 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             sh_max_step=float(self._cfg_get(clamp_cfg, "sh_max_step", 0.10)),
             hidden_max_step=float(self._cfg_get(clamp_cfg, "hidden_max_step", 1.0)),
             accept_vsm_ctx=bool(self._cfg_get(phase_b_hooks, "accept_vsm_ctx", True)),
-            vsm_ctx_dim=int(self._cfg_get(phase_b_hooks, "vsm_ctx_dim", self.stage6_event_dim)),
+            vsm_ctx_dim=int(self._cfg_get(phase_b_hooks, "vsm_ctx_dim", self.stage6_posterior_event_dim)),
             branch_clamps=branch_clamps,
+            output_hidden=bool(self._cfg_get(updater_cfg, "output_hidden", True)),
+            output_confidence=bool(self._cfg_get(updater_cfg, "output_confidence", True)),
+            output_noop=bool(self._cfg_get(updater_cfg, "output_noop", True)),
         ).to(self.device)
         ifwd_version = str(self._cfg_get(iforward_cfg, "version", ""))
         self.stage2_0_biggs_enabled = ifwd_version in {
             "stage2_0_biggs_parent_lifting",
             "stage2_0_biggs_cuda_exact_diagonal_projector",
+            "stage2_0_biggs_incremental_whdd",
+            "stage2_0_biggs_compact16_residualonly",
         }
         self.stage2_0_biggs_cfg = dict(biggs_cfg or {})
         self.stage2_0_biggs_assignment_cfg = self._cfg_get(biggs_cfg, "assignment", {}) or {}
         self.stage2_0_biggs_projector_cfg = self._cfg_get(biggs_cfg, "parent_projector", {}) or {}
+        self.stage2_0_biggs_parent_state_cfg = self._cfg_get(biggs_cfg, "parent_state", {}) or {}
         self.stage2_0_biggs_observe_cfg = self._cfg_get(biggs_cfg, "observe", {}) or {}
+        parent_state_policy = str(self._cfg_get(self.stage2_0_biggs_parent_state_cfg, "exact_refresh_policy", "block_enter")).lower()
+        if parent_state_policy not in {"block_enter", "none"}:
+            raise ValueError(
+                "stage2_0 BigGS parent_state.exact_refresh_policy currently supports "
+                f"'block_enter' or 'none', got {parent_state_policy!r}."
+            )
+        self._stage2_0_biggs_parent_runtime_block_counter = 0
+        self._stage2_0_biggs_parent_last_drift_block = -1
+        projector_backend = str(self._cfg_get(self.stage2_0_biggs_projector_cfg, "backend", "")).lower()
+        if projector_backend in {"cuda_exact_diag_forward_only", "cuda_exact_diagonal_forward_only"}:
+            if bool(self._cfg_get(self.stage2_0_biggs_projector_cfg, "grad_to_local_state", False)):
+                raise ValueError("cuda_exact_diag_forward_only requires parent_projector.grad_to_local_state=false")
+            grad_mode = str(self._cfg_get(self.stage2_0_biggs_projector_cfg, "grad_mode", "stop_geometry")).lower()
+            if grad_mode != "stop_geometry":
+                raise ValueError("cuda_exact_diag_forward_only requires parent_projector.grad_mode=stop_geometry")
         self.stage2_0_biggs_assignment_cache_scope = str(
             self._cfg_get(self.stage2_0_biggs_assignment_cfg, "cache_scope", "episode")
         )
@@ -1066,6 +1114,28 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         self.stage2_0_biggs_return_debug_stats = bool(
             self._cfg_get(self.stage2_0_biggs_observe_cfg, "return_debug_stats", True)
         )
+        dino_cache_cfg = (
+            self._cfg_get(self._cfg_get(self._cfg_get(model_cfg, "feature_extractor", {}) or {}, "dino", {}) or {}, "cache", {})
+            or {}
+        )
+        self.dino_feature_cache = None
+        self.dino_feature_cache_level = "adapter_output"
+        if bool(self.stage2_0_biggs_enabled) and bool(self._cfg_get(dino_cache_cfg, "enable", False)):
+            level = str(self._cfg_get(dino_cache_cfg, "level", "adapter_output")).lower()
+            if level not in {"adapter_output", "backbone_intermediate"}:
+                raise ValueError(
+                    "Stage2_0 BigGS DINO cache supports level=adapter_output or "
+                    f"backbone_intermediate, got {level!r}"
+                )
+            self.dino_feature_cache_level = level
+            self.dino_feature_cache = DINOFeatureCache(
+                dtype=str(self._cfg_get(dino_cache_cfg, "dtype", "float16")),
+                cpu_pinned=bool(self._cfg_get(dino_cache_cfg, "cpu_pinned", True)),
+                cpu_max_items=int(self._cfg_get(dino_cache_cfg, "cpu_max_items", 64)),
+                gpu_max_items=int(self._cfg_get(dino_cache_cfg, "gpu_max_items", 2)),
+                async_copy=bool(self._cfg_get(dino_cache_cfg, "async_copy", True)),
+                fail_if_trainable=bool(self._cfg_get(dino_cache_cfg, "fail_if_trainable", True)),
+            )
         self.biggs_child_decoder: Optional[BigGSToFineEventDecoder] = None
         if bool(self.stage2_0_biggs_enabled):
             child_cfg = self._cfg_get(biggs_cfg, "child_decoder", {}) or {}
@@ -2131,6 +2201,51 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             raise ValueError("BigGS parent scene requires at least one part")
         return {key: torch.cat([part[key] for part in parts], dim=0) for key in parts[0].keys()}
 
+    def _stage2_0_dino_cache_key(
+        self,
+        *,
+        batch: Dict[str, Any],
+        source_indices: List[int],
+        source_views: List[Any],
+        source_images: List[torch.Tensor],
+        source_frame_idx: int,
+        height: int,
+        width: int,
+    ) -> Optional[tuple[Any, ...]]:
+        if getattr(self, "dino_feature_cache", None) is None:
+            return None
+        extractor = getattr(self, "image_feature_extractor", None)
+        if extractor is None or not hasattr(extractor, "get_feature_resolution"):
+            return None
+        scene_id, segment_id, _episode_id = self._stage2_0_biggs_ids_from_batch(batch)
+        feature_hw = extractor.get_feature_resolution(int(height), int(width))
+        fingerprint = (
+            extractor.dino_adapter.fingerprint()  # type: ignore[attr-defined]
+            if hasattr(extractor, "dino_adapter") and hasattr(extractor.dino_adapter, "fingerprint")
+            else str(type(extractor))
+        )
+
+        def view_key(view: Any) -> Any:
+            for name in ("camera_id", "cam_id", "image_id", "frame_id", "uid", "id"):
+                value = getattr(view, name, None)
+                if isinstance(value, (str, int)):
+                    return (name, value)
+            return str(type(view))
+
+        image_hw = tuple(tuple(int(x) for x in spatial_hw_from_image_tensor(img)) for img in source_images)
+        return (
+            f"stage2_0_biggs_dino_{str(getattr(self, 'dino_feature_cache_level', 'adapter_output'))}",
+            int(scene_id),
+            int(segment_id),
+            int(source_frame_idx),
+            tuple(int(x) for x in source_indices),
+            tuple(view_key(view) for view in source_views),
+            image_hw,
+            (int(height), int(width)),
+            (int(feature_hw[0]), int(feature_hw[1])),
+            fingerprint,
+        )
+
     def _stage2_0_fine_scene_from_state(
         self,
         *,
@@ -2190,6 +2305,8 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 f"{prefix}/parent_scale_max": 0.0,
                 f"{prefix}/parent_scale_clip_ratio": 0.0,
                 f"{prefix}/projector_backend_id": 0.0,
+                f"{prefix}/parent_runtime_init_backend_id": 0.0,
+                f"{prefix}/parent_runtime_update_backend_id": 0.0,
             }
         interval = int(self._cfg_get(getattr(self, "stage2_0_biggs_projector_cfg", {}) or {}, "stats_interval", 1) or 1)
         if interval > 1:
@@ -2205,6 +2322,8 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                     f"{prefix}/parent_scale_max": 0.0,
                     f"{prefix}/parent_scale_clip_ratio": 0.0,
                     f"{prefix}/projector_backend_id": float((projection.aux_stats or {}).get("projector_backend_id", 0.0)),
+                    f"{prefix}/parent_runtime_init_backend_id": float((projection.aux_stats or {}).get("parent_runtime_init_backend_id", 0.0)),
+                    f"{prefix}/parent_runtime_update_backend_id": float((projection.aux_stats or {}).get("parent_runtime_update_backend_id", 0.0)),
                 }
         params = projection.params
         ref = params["means"]
@@ -2232,6 +2351,8 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             f"{prefix}/parent_scale_max": float(scales.detach().max().item()) if scales.numel() else 0.0,
             f"{prefix}/parent_scale_clip_ratio": scale_clip_ratio,
             f"{prefix}/projector_backend_id": float((projection.aux_stats or {}).get("projector_backend_id", 0.0)),
+            f"{prefix}/parent_runtime_init_backend_id": float((projection.aux_stats or {}).get("parent_runtime_init_backend_id", 0.0)),
+            f"{prefix}/parent_runtime_update_backend_id": float((projection.aux_stats or {}).get("parent_runtime_update_backend_id", 0.0)),
         }
 
     def _observe_stage2_0_biggs_measurement(
@@ -2242,13 +2363,26 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         source_indices: List[int],
         source_frame_idx: int,
         biggs_state: Optional[IForwardBigGSState] = None,
+        biggs_parent_runtime: Optional[BigGSBlockRuntime] = None,
         biggs_scene_id: Optional[int] = None,
         biggs_segment_id: Optional[int] = None,
         biggs_episode_id: Optional[int] = None,
     ) -> Dict[str, Any]:
+        observe_total_t0 = time.perf_counter()
+        biggs_observe_perf: Dict[str, float] = {}
+
+        def _record_observe_time(name: str, start: float) -> None:
+            biggs_observe_perf[f"iforward/biggs/time_observe_{name}_ms"] = float((time.perf_counter() - start) * 1000.0)
+
         projector_cfg = getattr(self, "stage2_0_biggs_projector_cfg", {}) or {}
         detach_local = not bool(self._cfg_get(projector_cfg, "grad_to_local_state", False))
-        bg_m, distant_m, rigid_m = self._local_to_node_states(local_state, detach=detach_local)
+        t0 = time.perf_counter()
+        if bool(detach_local):
+            bg_m, distant_m, rigid_m = local_state.to(device=self.device).to_node_states_detached_view()
+        else:
+            bg_m, distant_m, rigid_m = self._local_to_node_states(local_state, detach=False)
+        _record_observe_time("local_state_view", t0)
+        t0 = time.perf_counter()
         if rigid_m is not None:
             mask_src_rigid = self._stage6_rigid_point_valid_mask(rigid_m, int(source_frame_idx))
             S = torch.nonzero(mask_src_rigid, as_tuple=False).squeeze(1)
@@ -2273,6 +2407,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 int(source_frame_idx),
                 torch.zeros((0,), dtype=torch.long, device=self.device),
             )
+        _record_observe_time("rigid_route", t0)
         t0 = time.perf_counter()
         state_cpu, state, assignment_cache_stats = self._stage2_0_get_or_build_biggs_state_for_observe(
             existing=biggs_state,
@@ -2289,6 +2424,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             else None,
         )
         time_assignment_ms = (time.perf_counter() - t0) * 1000.0
+        biggs_observe_perf["iforward/biggs/time_observe_assignment_ms"] = float(time_assignment_ms)
         if state.bg is None:
             raise RuntimeError("BigGS stage2_0 requires bg assignment")
         self._mem_debug(
@@ -2301,15 +2437,101 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             parent_rigid=int(state.rigid.num_parents) if state.rigid is not None else 0,
         )
         t0 = time.perf_counter()
-        bg_proj = self._stage2_0_project_branch(branch=bg_m, assignment=state.bg, branch_name="bg")
-        self._mem_debug("biggs/after_project_bg", m_bg=int(bg_proj.num_parents))
-        distant_proj = None
-        if distant_m is not None and state.distant is not None:
-            distant_proj = self._stage2_0_project_branch(branch=distant_m, assignment=state.distant, branch_name="distant")
-            self._mem_debug("biggs/after_project_distant", m_distant=int(distant_proj.num_parents))
+        parent_state_mode = str(self._cfg_get(getattr(self, "stage2_0_biggs_parent_state_cfg", {}) or {}, "mode", "none")).lower()
+        parent_runtime_enabled = parent_state_mode == "incremental_sufficient_stats"
+        runtime_reuse = (
+            bool(parent_runtime_enabled)
+            and isinstance(biggs_parent_runtime, BigGSBlockRuntime)
+            and int(biggs_parent_runtime.source_frame_idx) == int(source_frame_idx)
+            and biggs_parent_runtime.bg is not None
+        )
         active_rigid = None
         rigid_proj_active = None
-        if rigid_m is not None and state.rigid is not None:
+        next_parent_runtime = biggs_parent_runtime if bool(runtime_reuse) else None
+
+        if bool(runtime_reuse) and biggs_parent_runtime is not None:
+            t_reuse = time.perf_counter()
+            bg_proj = projection_from_runtime(biggs_parent_runtime.bg)  # type: ignore[arg-type]
+            distant_proj = (
+                projection_from_runtime(biggs_parent_runtime.distant)
+                if biggs_parent_runtime.distant is not None
+                else None
+            )
+            active_rigid = biggs_parent_runtime.rigid_active_assignment
+            rigid_proj_active = (
+                projection_from_runtime(biggs_parent_runtime.rigid_active)
+                if biggs_parent_runtime.rigid_active is not None
+                else None
+            )
+            _record_observe_time("parent_runtime_reuse", t_reuse)
+        else:
+            t_bg_distant = time.perf_counter()
+            if bool(parent_runtime_enabled):
+                projector_cfg_runtime = self._stage2_0_parent_runtime_cfg_for_branch("bg")
+                bg_runtime = init_parent_branch_runtime(
+                    params={
+                        "means": bg_m.means,
+                        "scales_log": bg_m.scales_log,
+                        "quats": bg_m.quats,
+                        "opacity_logit": bg_m.opacity_logit,
+                        "sh_dc": bg_m.sh_dc,
+                        "sh_rest": bg_m.sh_rest,
+                    },
+                    child_to_parent=state.bg.child_to_parent,
+                    parent_count=state.bg.parent_count,
+                    child_mass=state.bg.child_mass,
+                    cfg=projector_cfg_runtime,
+                    child_order=state.bg.child_order,
+                    parent_start=state.bg.parent_start,
+                    max_scale=self._stage2_0_biggs_max_scale("bg"),
+                    assignment_signature="bg",
+                )
+                bg_proj = projection_from_runtime(bg_runtime)
+                distant_runtime = None
+                distant_proj = None
+                if distant_m is not None and state.distant is not None:
+                    projector_cfg_runtime = self._stage2_0_parent_runtime_cfg_for_branch("distant")
+                    distant_runtime = init_parent_branch_runtime(
+                        params={
+                            "means": distant_m.means,
+                            "scales_log": distant_m.scales_log,
+                            "quats": distant_m.quats,
+                            "opacity_logit": distant_m.opacity_logit,
+                            "sh_dc": distant_m.sh_dc,
+                            "sh_rest": distant_m.sh_rest,
+                        },
+                        child_to_parent=state.distant.child_to_parent,
+                        parent_count=state.distant.parent_count,
+                        child_mass=state.distant.child_mass,
+                        cfg=projector_cfg_runtime,
+                        child_order=state.distant.child_order,
+                        parent_start=state.distant.parent_start,
+                        max_scale=self._stage2_0_biggs_max_scale("distant"),
+                        assignment_signature="distant",
+                    )
+                    distant_proj = projection_from_runtime(distant_runtime)
+                next_parent_runtime = BigGSBlockRuntime(
+                    bg=bg_runtime,
+                    distant=distant_runtime,
+                    bg_assignment=state.bg,
+                    distant_assignment=state.distant,
+                    source_frame_idx=int(source_frame_idx),
+                    exact_refresh_count=1,
+                    incremental_update_count=0,
+                )
+            else:
+                bg_proj = self._stage2_0_project_branch(branch=bg_m, assignment=state.bg, branch_name="bg")
+                distant_proj = None
+                if distant_m is not None and state.distant is not None:
+                    distant_proj = self._stage2_0_project_branch(branch=distant_m, assignment=state.distant, branch_name="distant")
+            _record_observe_time("parent_project_bg_distant", t_bg_distant)
+
+        self._mem_debug("biggs/after_project_bg", m_bg=int(bg_proj.num_parents))
+        if distant_proj is not None:
+            self._mem_debug("biggs/after_project_distant", m_distant=int(distant_proj.num_parents))
+
+        t_rigid_project = time.perf_counter()
+        if not bool(runtime_reuse) and rigid_m is not None and state.rigid is not None:
             active_rigid = build_rigid_active_assignment(
                 rigid_assignment=state.rigid,
                 fine_S=route.S,
@@ -2317,41 +2539,90 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             )
             if active_rigid is not None and int(active_rigid.active_parent_global.numel()) > 0:
                 s = active_rigid.fine_S.long().to(device=rigid_m.means.device)
-                projector_cfg = dict(getattr(self, "stage2_0_biggs_projector_cfg", {}) or {})
+                projector_cfg = (
+                    self._stage2_0_parent_runtime_cfg_for_branch("rigid")
+                    if bool(parent_runtime_enabled)
+                    else dict(getattr(self, "stage2_0_biggs_projector_cfg", {}) or {})
+                )
                 max_scale = float(self._cfg_get(projector_cfg, "max_scale_rigid", 1.0))
                 projector_cfg["tau_parent_scale"] = self._stage2_0_biggs_tau_parent_scale("rigid")
-                rigid_proj_active = project_biggs_active_rigid_parents(
-                    means_world_S=route.means_world_S,
-                    quats_world_S=route.quats_world_S,
-                    scales_log_S=rigid_m.scales_log.index_select(0, s),
-                    opacity_logit_S=rigid_m.opacity_logit.index_select(0, s),
-                    sh_dc_S=rigid_m.sh_dc.index_select(0, s),
-                    sh_rest_S=rigid_m.sh_rest.index_select(0, s),
-                    child_to_active_parent_S=active_rigid.child_to_active_parent_S,
-                    child_mass_S=active_rigid.child_mass_S,
-                    active_parent_count=active_rigid.active_parent_count,
-                    cfg=projector_cfg,
-                    max_scale=max_scale,
-                    active_child_order_S=active_rigid.active_child_order_S,
-                    active_parent_start=active_rigid.active_parent_start,
-                )
+                rigid_params = {
+                    "means": route.means_world_S,
+                    "quats": route.quats_world_S,
+                    "scales_log": rigid_m.scales_log.index_select(0, s),
+                    "opacity_logit": rigid_m.opacity_logit.index_select(0, s),
+                    "sh_dc": rigid_m.sh_dc.index_select(0, s),
+                    "sh_rest": rigid_m.sh_rest.index_select(0, s),
+                }
+                if bool(parent_runtime_enabled):
+                    rigid_runtime = init_parent_branch_runtime(
+                        params=rigid_params,
+                        child_to_parent=active_rigid.child_to_active_parent_S,
+                        parent_count=active_rigid.active_parent_count,
+                        child_mass=active_rigid.child_mass_S,
+                        cfg=projector_cfg,
+                        child_order=active_rigid.active_child_order_S,
+                        parent_start=active_rigid.active_parent_start,
+                        max_scale=max_scale,
+                        assignment_signature="rigid_active",
+                    )
+                    rigid_proj_active = projection_from_runtime(rigid_runtime)
+                    if next_parent_runtime is not None:
+                        next_parent_runtime.rigid_active = rigid_runtime
+                        next_parent_runtime.rigid_active_assignment = active_rigid
+                else:
+                    rigid_proj_active = project_biggs_active_rigid_parents(
+                        means_world_S=route.means_world_S,
+                        quats_world_S=route.quats_world_S,
+                        scales_log_S=rigid_m.scales_log.index_select(0, s),
+                        opacity_logit_S=rigid_m.opacity_logit.index_select(0, s),
+                        sh_dc_S=rigid_m.sh_dc.index_select(0, s),
+                        sh_rest_S=rigid_m.sh_rest.index_select(0, s),
+                        child_to_active_parent_S=active_rigid.child_to_active_parent_S,
+                        child_mass_S=active_rigid.child_mass_S,
+                        active_parent_count=active_rigid.active_parent_count,
+                        cfg=projector_cfg,
+                        max_scale=max_scale,
+                        active_child_order_S=active_rigid.active_child_order_S,
+                        active_parent_start=active_rigid.active_parent_start,
+                    )
             else:
                 rigid_proj_active = self._stage2_0_empty_projection_like(
                     bg_m.means,
                     sh_rest_bases=int(bg_m.sh_rest.shape[1]),
                 )
+                if next_parent_runtime is not None:
+                    next_parent_runtime.rigid_active_assignment = active_rigid
             self._mem_debug(
                 "biggs/after_project_rigid_active",
                 m_rigid=int(rigid_proj_active.num_parents) if rigid_proj_active is not None else 0,
             )
-        elif rigid_m is None:
+        elif not bool(runtime_reuse) and rigid_m is None:
             active_rigid = build_rigid_active_assignment(
                 rigid_assignment=None,
                 fine_S=route.S,
                 inside_mask_S=route.inside_mask_S,
             )
+            if next_parent_runtime is not None:
+                next_parent_runtime.rigid_active_assignment = active_rigid
         time_parent_project_ms = (time.perf_counter() - t0) * 1000.0
+        _record_observe_time("parent_project_rigid_active", t_rigid_project)
+        if bool(parent_runtime_enabled) and not bool(runtime_reuse) and next_parent_runtime is not None:
+            self._stage2_0_biggs_parent_runtime_block_counter = (
+                int(getattr(self, "_stage2_0_biggs_parent_runtime_block_counter", 0)) + 1
+            )
+            next_parent_runtime.block_id = int(self._stage2_0_biggs_parent_runtime_block_counter)
+        drift_stats: Dict[str, float] = {}
+        if bool(parent_runtime_enabled) and bool(runtime_reuse):
+            drift_stats = self._stage2_0_maybe_check_parent_runtime_drift(
+                runtime=next_parent_runtime,
+                bg=bg_m,
+                distant=distant_m,
+                rigid=rigid_m,
+                source_frame_idx=int(source_frame_idx),
+            )
 
+        t_scene_source = time.perf_counter()
         parts = [self._stage2_0_scene_parts_from_params(bg_proj.params)]
         if distant_proj is not None and int(distant_proj.num_parents) > 0:
             parts.append(self._stage2_0_scene_parts_from_params(distant_proj.params))
@@ -2365,7 +2636,17 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         cnn_scene = parent_scene
         if not bool(parent_scene_for_cnn):
             cnn_scene = self._stage2_0_fine_scene_from_state(bg=bg_m, distant=distant_m, rigid=rigid_m, route=route)
+        _record_observe_time("parent_scene_source", t_scene_source)
         t0 = time.perf_counter()
+        dino_cache_key = self._stage2_0_dino_cache_key(
+            batch=batch,
+            source_indices=source_indices,
+            source_views=source_views,
+            source_images=source_images,
+            source_frame_idx=int(source_frame_idx),
+            height=height,
+            width=width,
+        )
         cnn_inputs = self._render_source_scene_only_for_cnn(
             gaussians_scene=cnn_scene,
             source_views=source_views,
@@ -2374,6 +2655,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             source_egocar_masks=source_egocar_masks,
             height=height,
             width=width,
+            dino_cache_key=dino_cache_key,
         )
         time_parent_render_cnn_ms = (time.perf_counter() - t0) * 1000.0
         self._mem_debug("biggs/after_parent_render_cnn")
@@ -2405,6 +2687,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         self._mem_debug("biggs/after_parent_lifting")
         if feat_all is None or acc_all is None:
             raise RuntimeError("BigGS parent lifting returned empty features")
+        t_slice_stats = time.perf_counter()
         obs_all = self._stage5_4_obs_code_all
         if obs_all is None:
             raise RuntimeError("BigGS parent lifting expected V4 obs_code")
@@ -2448,10 +2731,13 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 max_scale=self._stage2_0_biggs_max_scale("rigid"),
             ),
         }
+        _record_observe_time("slice_stats", t_slice_stats)
+        _record_observe_time("total", observe_total_t0)
         return {
             "biggs_enabled": True,
             "biggs_mode": "parent_lifting_event_decode",
             "biggs_state": state_cpu.detach(),
+            "biggs_parent_runtime": next_parent_runtime,
             "route": route,
             "source_frame_idx": int(source_frame_idx),
             "assign_bg": state.bg,
@@ -2490,9 +2776,16 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "iforward/biggs/time_parent_project_ms": float(time_parent_project_ms),
             "iforward/biggs/time_parent_render_cnn_ms": float(time_parent_render_cnn_ms),
             "iforward/biggs/time_parent_lifting_ms": float(time_parent_lifting_ms),
+            "iforward/biggs/parent_runtime_reuse": 1.0 if bool(runtime_reuse) else 0.0,
+            "iforward/biggs/exact_refresh_count": float(getattr(next_parent_runtime, "exact_refresh_count", 0) if next_parent_runtime is not None else 0),
+            "iforward/biggs/incremental_update_count": float(getattr(next_parent_runtime, "incremental_update_count", 0) if next_parent_runtime is not None else 0),
             **assignment_cache_stats,
             **stats,
             **bp_delta_stats,
+            **biggs_observe_perf,
+            **drift_stats,
+            **dict(cnn_inputs.get("dino_cache_stats", {}) or {}),
+            **dict(cnn_inputs.get("cnn_perf_stats", {}) or {}),
             "src_backproject_pass_count": 1,
         }
 
@@ -2504,6 +2797,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         source_indices: List[int],
         source_frame_idx: int,
         biggs_state: Optional[IForwardBigGSState] = None,
+        biggs_parent_runtime: Optional[BigGSBlockRuntime] = None,
         biggs_scene_id: Optional[int] = None,
         biggs_segment_id: Optional[int] = None,
         biggs_episode_id: Optional[int] = None,
@@ -2518,6 +2812,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                     source_indices=source_indices,
                     source_frame_idx=int(source_frame_idx),
                     biggs_state=biggs_state,
+                    biggs_parent_runtime=biggs_parent_runtime,
                     biggs_scene_id=biggs_scene_id,
                     biggs_segment_id=biggs_segment_id,
                     biggs_episode_id=biggs_episode_id,
@@ -2597,6 +2892,429 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 "obs_rigid_S": obs_rigid_s,
                 "source_frame_idx": int(source_frame_idx),
             }
+
+    @staticmethod
+    def _stage2_0_params_from_node_state(branch: Any) -> Dict[str, torch.Tensor]:
+        return {
+            "means": branch.means,
+            "scales_log": branch.scales_log,
+            "quats": branch.quats,
+            "opacity_logit": branch.opacity_logit,
+            "sh_dc": branch.sh_dc,
+            "sh_rest": branch.sh_rest,
+        }
+
+    def _stage2_0_projector_cfg_for_branch(self, branch_name: str) -> Dict[str, Any]:
+        projector_cfg = dict(getattr(self, "stage2_0_biggs_projector_cfg", {}) or {})
+        projector_cfg["tau_parent_scale"] = self._stage2_0_biggs_tau_parent_scale(str(branch_name))
+        return projector_cfg
+
+    def _stage2_0_parent_runtime_cfg_for_branch(self, branch_name: str) -> Dict[str, Any]:
+        runtime_cfg = self._stage2_0_projector_cfg_for_branch(str(branch_name))
+        parent_state_cfg = getattr(self, "stage2_0_biggs_parent_state_cfg", {}) or {}
+        runtime_cfg["child_cache_dtype"] = str(self._cfg_get(parent_state_cfg, "child_cache_dtype", "float32"))
+        return runtime_cfg
+
+    @staticmethod
+    def _stage2_0_max_abs_param_error(a: torch.Tensor, b: torch.Tensor) -> float:
+        if tuple(a.shape) != tuple(b.shape):
+            raise RuntimeError(f"BigGS parent drift check shape mismatch: runtime={tuple(a.shape)} exact={tuple(b.shape)}")
+        if int(a.numel()) == 0:
+            return 0.0
+        return float((a.detach().float() - b.detach().to(device=a.device).float()).abs().max().item())
+
+    @staticmethod
+    def _stage2_0_reanchored_weighted_second(stats_obj: Any, target_anchor: Optional[torch.Tensor]) -> torch.Tensor:
+        second = stats_obj.weighted_second_sum.detach().float()
+        if target_anchor is None:
+            return second
+        target = target_anchor.detach().to(device=second.device).float()
+        source_anchor = stats_obj.second_anchor
+        if source_anchor is None:
+            source = torch.zeros_like(target)
+        else:
+            source = source_anchor.detach().to(device=second.device).float()
+        if tuple(source.shape) != tuple(target.shape):
+            raise RuntimeError(
+                f"BigGS parent drift check second-anchor shape mismatch: source={tuple(source.shape)} target={tuple(target.shape)}"
+            )
+        mass = stats_obj.weight_sum.detach().to(device=second.device).float().reshape(-1, 1)
+        mass_safe = mass.clamp_min(1.0e-8)
+        mean = stats_obj.weighted_mean_sum.detach().to(device=second.device).float() / mass_safe
+        return second + mass * ((mean - target).square() - (mean - source).square())
+
+    def _stage2_0_check_parent_runtime_branch_drift(
+        self,
+        *,
+        branch_name: str,
+        runtime: Any,
+        params: Dict[str, torch.Tensor],
+        child_to_parent: torch.Tensor,
+        parent_count: torch.Tensor,
+        child_mass: torch.Tensor,
+        child_order: Optional[torch.Tensor] = None,
+        parent_start: Optional[torch.Tensor] = None,
+    ) -> Dict[str, float]:
+        cfg = self._stage2_0_parent_runtime_cfg_for_branch(str(branch_name))
+        exact = init_parent_branch_runtime(
+            params=params,
+            child_to_parent=child_to_parent,
+            parent_count=parent_count,
+            child_mass=child_mass,
+            cfg=cfg,
+            child_order=child_order,
+            parent_start=parent_start,
+            max_scale=self._stage2_0_biggs_max_scale(str(branch_name)),
+            assignment_signature=f"{branch_name}_drift_exact",
+        )
+        stats: Dict[str, float] = {}
+        max_err = 0.0
+        for key in ("means", "scales_log", "opacity_logit", "sh_dc", "sh_rest"):
+            err = self._stage2_0_max_abs_param_error(runtime.params[key], exact.params[key])
+            stats[f"iforward/biggs/drift_{branch_name}_{key}_max"] = float(err)
+            max_err = max(max_err, float(err))
+        for key in (
+            "weight_sum",
+            "weighted_mean_sum",
+            "tau_area_sum",
+            "weighted_sh_dc_sum",
+            "weighted_sh_rest_sum",
+        ):
+            err = self._stage2_0_max_abs_param_error(getattr(runtime.stats, key), getattr(exact.stats, key))
+            stats[f"iforward/biggs/drift_{branch_name}_stats_{key}_max"] = float(err)
+        runtime_second = self._stage2_0_reanchored_weighted_second(runtime.stats, exact.stats.second_anchor)
+        exact_second = exact.stats.weighted_second_sum.detach().to(device=runtime_second.device).float()
+        second_err = self._stage2_0_max_abs_param_error(runtime_second, exact_second)
+        stats[f"iforward/biggs/drift_{branch_name}_stats_weighted_second_sum_max"] = float(second_err)
+        if runtime.stats.second_anchor is not None and exact.stats.second_anchor is not None:
+            anchor_err = self._stage2_0_max_abs_param_error(runtime.stats.second_anchor, exact.stats.second_anchor)
+            stats[f"iforward/biggs/drift_{branch_name}_second_anchor_max"] = float(anchor_err)
+        stats[f"iforward/biggs/drift_{branch_name}_max"] = float(max_err)
+        return stats
+
+    def _stage2_0_parent_runtime_drift_stats_for_nodes(
+        self,
+        *,
+        runtime: BigGSBlockRuntime,
+        bg: Any,
+        distant: Optional[Any],
+        rigid: Optional[Any],
+        source_frame_idx: int,
+    ) -> Dict[str, float]:
+        stats: Dict[str, float] = {}
+        if runtime.bg is not None and runtime.bg_assignment is not None:
+            stats.update(
+                self._stage2_0_check_parent_runtime_branch_drift(
+                    branch_name="bg",
+                    runtime=runtime.bg,
+                    params=self._stage2_0_params_from_node_state(bg),
+                    child_to_parent=runtime.bg_assignment.child_to_parent,
+                    parent_count=runtime.bg_assignment.parent_count,
+                    child_mass=runtime.bg_assignment.child_mass,
+                    child_order=runtime.bg_assignment.child_order,
+                    parent_start=runtime.bg_assignment.parent_start,
+                )
+            )
+        if runtime.distant is not None and runtime.distant_assignment is not None and distant is not None:
+            stats.update(
+                self._stage2_0_check_parent_runtime_branch_drift(
+                    branch_name="distant",
+                    runtime=runtime.distant,
+                    params=self._stage2_0_params_from_node_state(distant),
+                    child_to_parent=runtime.distant_assignment.child_to_parent,
+                    parent_count=runtime.distant_assignment.parent_count,
+                    child_mass=runtime.distant_assignment.child_mass,
+                    child_order=runtime.distant_assignment.child_order,
+                    parent_start=runtime.distant_assignment.parent_start,
+                )
+            )
+        active = runtime.rigid_active_assignment
+        if runtime.rigid_active is not None and active is not None and rigid is not None and int(active.fine_S.numel()) > 0:
+            s = active.fine_S.long().to(device=self.device)
+            route = self._route_rigid_source_points(rigid, int(source_frame_idx), s)
+            stats.update(
+                self._stage2_0_check_parent_runtime_branch_drift(
+                    branch_name="rigid",
+                    runtime=runtime.rigid_active,
+                    params={
+                        "means": route.means_world_S,
+                        "quats": route.quats_world_S,
+                        "scales_log": rigid.scales_log.index_select(0, s),
+                        "opacity_logit": rigid.opacity_logit.index_select(0, s),
+                        "sh_dc": rigid.sh_dc.index_select(0, s),
+                        "sh_rest": rigid.sh_rest.index_select(0, s),
+                    },
+                    child_to_parent=active.child_to_active_parent_S,
+                    parent_count=active.active_parent_count,
+                    child_mass=active.child_mass_S,
+                    child_order=active.active_child_order_S,
+                    parent_start=active.active_parent_start,
+                )
+            )
+        return stats
+
+    @staticmethod
+    def _stage2_0_parent_runtime_drift_max(stats: Dict[str, float]) -> float:
+        return max(
+            (
+                float(v)
+                for k, v in stats.items()
+                if k.endswith("_max") and "_stats_" not in k and "_second_anchor_" not in k
+            ),
+            default=0.0,
+        )
+
+    @staticmethod
+    def _stage2_0_parent_runtime_drift_detail(stats: Dict[str, float], *, limit: int = 16) -> str:
+        detail_items = [
+            (float(value), key)
+            for key, value in stats.items()
+            if key.endswith("_max")
+            and "_stats_" not in key
+            and "_second_anchor_" not in key
+            and float(value) > 0.0
+        ]
+        detail_items.sort(reverse=True)
+        return ", ".join(f"{key}={value:.6g}" for value, key in detail_items[: int(limit)])
+
+    def _stage2_0_maybe_check_parent_runtime_drift(
+        self,
+        *,
+        runtime: Optional[BigGSBlockRuntime],
+        bg: Any,
+        distant: Optional[Any],
+        rigid: Optional[Any],
+        source_frame_idx: int,
+    ) -> Dict[str, float]:
+        if runtime is None:
+            return {}
+        parent_state_cfg = getattr(self, "stage2_0_biggs_parent_state_cfg", {}) or {}
+        interval = int(self._cfg_get(parent_state_cfg, "drift_check_interval_blocks", 0) or 0)
+        if interval <= 0:
+            return {}
+        block_idx = int(getattr(self, "_stage2_0_biggs_parent_runtime_block_counter", 0))
+        if block_idx <= 0 or block_idx % int(interval) != 0:
+            return {}
+        if int(getattr(self, "_stage2_0_biggs_parent_last_drift_block", -1)) == block_idx:
+            return {}
+        self._stage2_0_biggs_parent_last_drift_block = block_idx
+        stats: Dict[str, float] = {"iforward/biggs/drift_checked": 1.0, "iforward/biggs/drift_block_idx": float(block_idx)}
+        stats.update(
+            self._stage2_0_parent_runtime_drift_stats_for_nodes(
+                runtime=runtime,
+                bg=bg,
+                distant=distant,
+                rigid=rigid,
+                source_frame_idx=int(source_frame_idx),
+            )
+        )
+        threshold = float(self._cfg_get(parent_state_cfg, "drift_fail_threshold", 0.0) or 0.0)
+        total_max = self._stage2_0_parent_runtime_drift_max(stats)
+        stats["iforward/biggs/drift_max"] = float(total_max)
+        if threshold > 0.0 and total_max > threshold:
+            detail = self._stage2_0_parent_runtime_drift_detail(stats)
+            raise RuntimeError(
+                f"BigGS parent runtime drift check failed: max_error={total_max:.6g} "
+                f"> threshold={threshold:.6g} at block={block_idx}. {detail}"
+            )
+        return stats
+
+    @torch.no_grad()
+    def _stage2_0_update_parent_runtime(
+        self,
+        *,
+        runtime: Optional[BigGSBlockRuntime],
+        old_local_state: LocalGSState,
+        new_local_state: LocalGSState,
+    ) -> Optional[BigGSBlockRuntime]:
+        if runtime is None:
+            return None
+        parent_state_mode = str(self._cfg_get(getattr(self, "stage2_0_biggs_parent_state_cfg", {}) or {}, "mode", "none")).lower()
+        if parent_state_mode != "incremental_sufficient_stats":
+            return runtime
+        old_bg, old_distant, old_rigid = old_local_state.to(device=self.device).to_node_states_detached_view()
+        new_bg, new_distant, new_rigid = new_local_state.to(device=self.device).to_node_states_detached_view()
+        update_backend = str(
+            self._cfg_get(getattr(self, "stage2_0_biggs_parent_state_cfg", {}) or {}, "update_backend", "incremental")
+        ).lower()
+        if update_backend in {"exact", "exact_refresh", "reference_exact", "reference_refresh"}:
+            bg_runtime = None
+            if runtime.bg_assignment is not None:
+                bg_cfg = self._stage2_0_parent_runtime_cfg_for_branch("bg")
+                bg_runtime = init_parent_branch_runtime(
+                    params=self._stage2_0_params_from_node_state(new_bg),
+                    child_to_parent=runtime.bg_assignment.child_to_parent,
+                    parent_count=runtime.bg_assignment.parent_count,
+                    child_mass=runtime.bg_assignment.child_mass,
+                    cfg=bg_cfg,
+                    child_order=runtime.bg_assignment.child_order,
+                    parent_start=runtime.bg_assignment.parent_start,
+                    max_scale=self._stage2_0_biggs_max_scale("bg"),
+                    assignment_signature="bg",
+                )
+            distant_runtime = None
+            if runtime.distant_assignment is not None and new_distant is not None:
+                distant_cfg = self._stage2_0_parent_runtime_cfg_for_branch("distant")
+                distant_runtime = init_parent_branch_runtime(
+                    params=self._stage2_0_params_from_node_state(new_distant),
+                    child_to_parent=runtime.distant_assignment.child_to_parent,
+                    parent_count=runtime.distant_assignment.parent_count,
+                    child_mass=runtime.distant_assignment.child_mass,
+                    cfg=distant_cfg,
+                    child_order=runtime.distant_assignment.child_order,
+                    parent_start=runtime.distant_assignment.parent_start,
+                    max_scale=self._stage2_0_biggs_max_scale("distant"),
+                    assignment_signature="distant",
+                )
+            rigid_runtime = None
+            active = runtime.rigid_active_assignment
+            if active is not None and new_rigid is not None and int(active.fine_S.numel()) > 0:
+                s = active.fine_S.long().to(device=self.device)
+                route_new = self._route_rigid_source_points(new_rigid, int(runtime.source_frame_idx), s)
+                rigid_cfg = self._stage2_0_parent_runtime_cfg_for_branch("rigid")
+                rigid_runtime = init_parent_branch_runtime(
+                    params={
+                        "means": route_new.means_world_S,
+                        "quats": route_new.quats_world_S,
+                        "scales_log": new_rigid.scales_log.index_select(0, s),
+                        "opacity_logit": new_rigid.opacity_logit.index_select(0, s),
+                        "sh_dc": new_rigid.sh_dc.index_select(0, s),
+                        "sh_rest": new_rigid.sh_rest.index_select(0, s),
+                    },
+                    child_to_parent=active.child_to_active_parent_S,
+                    parent_count=active.active_parent_count,
+                    child_mass=active.child_mass_S,
+                    cfg=rigid_cfg,
+                    child_order=active.active_child_order_S,
+                    parent_start=active.active_parent_start,
+                    max_scale=self._stage2_0_biggs_max_scale("rigid"),
+                    assignment_signature="rigid_active",
+                )
+            refreshed_runtime = BigGSBlockRuntime(
+                bg=bg_runtime,
+                distant=distant_runtime,
+                rigid_active=rigid_runtime,
+                bg_assignment=runtime.bg_assignment,
+                distant_assignment=runtime.distant_assignment,
+                rigid_active_assignment=runtime.rigid_active_assignment,
+                source_frame_idx=int(runtime.source_frame_idx),
+                block_id=int(runtime.block_id),
+                exact_refresh_count=int(runtime.exact_refresh_count) + 1,
+                incremental_update_count=int(runtime.incremental_update_count),
+            )
+            parent_state_cfg = getattr(self, "stage2_0_biggs_parent_state_cfg", {}) or {}
+            interval = int(self._cfg_get(parent_state_cfg, "drift_check_interval_blocks", 0) or 0)
+            threshold = float(self._cfg_get(parent_state_cfg, "drift_fail_threshold", 0.0) or 0.0)
+            block_id = int(getattr(refreshed_runtime, "block_id", -1))
+            if interval > 0 and block_id > 0 and block_id % int(interval) == 0:
+                update_drift = self._stage2_0_parent_runtime_drift_stats_for_nodes(
+                    runtime=refreshed_runtime,
+                    bg=new_bg,
+                    distant=new_distant,
+                    rigid=new_rigid,
+                    source_frame_idx=int(refreshed_runtime.source_frame_idx),
+                )
+                update_max = self._stage2_0_parent_runtime_drift_max(update_drift)
+                if threshold > 0.0 and update_max > threshold:
+                    detail = self._stage2_0_parent_runtime_drift_detail(update_drift)
+                    raise RuntimeError(
+                        f"BigGS parent runtime drift check failed immediately after exact refresh: "
+                        f"max_error={update_max:.6g} > threshold={threshold:.6g} "
+                        f"at block={block_id}. {detail}"
+                    )
+            return refreshed_runtime
+        if update_backend not in {"incremental", "incremental_sufficient_stats"}:
+            raise ValueError(f"unsupported BigGS parent_state.update_backend={update_backend!r}")
+
+        bg_runtime = runtime.bg
+        if bg_runtime is not None and runtime.bg_assignment is not None:
+            bg_cfg = self._stage2_0_parent_runtime_cfg_for_branch("bg")
+            bg_runtime = update_parent_branch_runtime(
+                runtime=bg_runtime,
+                old_params=self._stage2_0_params_from_node_state(old_bg),
+                new_params=self._stage2_0_params_from_node_state(new_bg),
+                child_to_parent=runtime.bg_assignment.child_to_parent,
+                parent_count=runtime.bg_assignment.parent_count,
+                child_mass=runtime.bg_assignment.child_mass,
+                cfg=bg_cfg,
+                child_order=runtime.bg_assignment.child_order,
+                parent_start=runtime.bg_assignment.parent_start,
+                max_scale=self._stage2_0_biggs_max_scale("bg"),
+            )
+
+        distant_runtime = runtime.distant
+        if (
+            distant_runtime is not None
+            and runtime.distant_assignment is not None
+            and old_distant is not None
+            and new_distant is not None
+        ):
+            distant_cfg = self._stage2_0_parent_runtime_cfg_for_branch("distant")
+            distant_runtime = update_parent_branch_runtime(
+                runtime=distant_runtime,
+                old_params=self._stage2_0_params_from_node_state(old_distant),
+                new_params=self._stage2_0_params_from_node_state(new_distant),
+                child_to_parent=runtime.distant_assignment.child_to_parent,
+                parent_count=runtime.distant_assignment.parent_count,
+                child_mass=runtime.distant_assignment.child_mass,
+                cfg=distant_cfg,
+                child_order=runtime.distant_assignment.child_order,
+                parent_start=runtime.distant_assignment.parent_start,
+                max_scale=self._stage2_0_biggs_max_scale("distant"),
+            )
+
+        rigid_runtime = runtime.rigid_active
+        active = runtime.rigid_active_assignment
+        if (
+            rigid_runtime is not None
+            and active is not None
+            and old_rigid is not None
+            and new_rigid is not None
+            and int(active.fine_S.numel()) > 0
+        ):
+            s = active.fine_S.long().to(device=self.device)
+            route_old = self._route_rigid_source_points(old_rigid, int(runtime.source_frame_idx), s)
+            route_new = self._route_rigid_source_points(new_rigid, int(runtime.source_frame_idx), s)
+            rigid_cfg = self._stage2_0_parent_runtime_cfg_for_branch("rigid")
+            rigid_runtime = update_parent_branch_runtime(
+                runtime=rigid_runtime,
+                old_params={
+                    "means": route_old.means_world_S,
+                    "quats": route_old.quats_world_S,
+                    "scales_log": old_rigid.scales_log.index_select(0, s),
+                    "opacity_logit": old_rigid.opacity_logit.index_select(0, s),
+                    "sh_dc": old_rigid.sh_dc.index_select(0, s),
+                    "sh_rest": old_rigid.sh_rest.index_select(0, s),
+                },
+                new_params={
+                    "means": route_new.means_world_S,
+                    "quats": route_new.quats_world_S,
+                    "scales_log": new_rigid.scales_log.index_select(0, s),
+                    "opacity_logit": new_rigid.opacity_logit.index_select(0, s),
+                    "sh_dc": new_rigid.sh_dc.index_select(0, s),
+                    "sh_rest": new_rigid.sh_rest.index_select(0, s),
+                },
+                child_to_parent=active.child_to_active_parent_S,
+                parent_count=active.active_parent_count,
+                child_mass=active.child_mass_S,
+                cfg=rigid_cfg,
+                child_order=active.active_child_order_S,
+                parent_start=active.active_parent_start,
+                max_scale=self._stage2_0_biggs_max_scale("rigid"),
+            )
+
+        return BigGSBlockRuntime(
+            bg=bg_runtime,
+            distant=distant_runtime,
+            rigid_active=rigid_runtime,
+            bg_assignment=runtime.bg_assignment,
+            distant_assignment=runtime.distant_assignment,
+            rigid_active_assignment=runtime.rigid_active_assignment,
+            source_frame_idx=int(runtime.source_frame_idx),
+            block_id=int(runtime.block_id),
+            exact_refresh_count=int(runtime.exact_refresh_count),
+            incremental_update_count=int(runtime.incremental_update_count) + 1,
+        )
 
     @staticmethod
     def _mask_branch_delta(delta: BranchDelta, scope: Dict[str, bool]) -> BranchDelta:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 
@@ -26,6 +26,10 @@ class BigGSBranchAssignment:
     num_parents: int
     object_id: Optional[torch.Tensor] = None
     parent_object_id: Optional[torch.Tensor] = None
+    child_basis: Optional[torch.Tensor] = None
+    basis_valid: Optional[torch.Tensor] = None
+    basis_weight_sum: Optional[torch.Tensor] = None
+    basis_version: int = 1
 
     def to(self, *, device: torch.device) -> "BigGSBranchAssignment":
         return BigGSBranchAssignment(
@@ -39,6 +43,10 @@ class BigGSBranchAssignment:
             num_parents=int(self.num_parents),
             object_id=_to_optional(self.object_id, device=device),
             parent_object_id=_to_optional(self.parent_object_id, device=device),
+            child_basis=_to_optional(self.child_basis, device=device),
+            basis_valid=_to_optional(self.basis_valid, device=device),
+            basis_weight_sum=_to_optional(self.basis_weight_sum, device=device),
+            basis_version=int(self.basis_version),
         )
 
     def detach(self) -> "BigGSBranchAssignment":
@@ -53,6 +61,10 @@ class BigGSBranchAssignment:
             num_parents=int(self.num_parents),
             object_id=_detach_optional(self.object_id),
             parent_object_id=_detach_optional(self.parent_object_id),
+            child_basis=_detach_optional(self.child_basis),
+            basis_valid=_detach_optional(self.basis_valid),
+            basis_weight_sum=_detach_optional(self.basis_weight_sum),
+            basis_version=int(self.basis_version),
         )
 
     @property
@@ -71,6 +83,9 @@ class BigGSRigidActiveAssignment:
     child_mass_S: torch.Tensor
     parent_inside_mask: torch.Tensor
     child_inside_mask_S: torch.Tensor
+    child_basis_S: Optional[torch.Tensor] = None
+    basis_valid: Optional[torch.Tensor] = None
+    basis_weight_sum: Optional[torch.Tensor] = None
 
     def to(self, *, device: torch.device) -> "BigGSRigidActiveAssignment":
         return BigGSRigidActiveAssignment(
@@ -83,6 +98,9 @@ class BigGSRigidActiveAssignment:
             child_mass_S=self.child_mass_S.to(device=device),
             parent_inside_mask=self.parent_inside_mask.to(device=device),
             child_inside_mask_S=self.child_inside_mask_S.to(device=device),
+            child_basis_S=_to_optional(self.child_basis_S, device=device),
+            basis_valid=_to_optional(self.basis_valid, device=device),
+            basis_weight_sum=_to_optional(self.basis_weight_sum, device=device),
         )
 
     def detach(self) -> "BigGSRigidActiveAssignment":
@@ -96,7 +114,57 @@ class BigGSRigidActiveAssignment:
             child_mass_S=self.child_mass_S.detach().clone().cpu(),
             parent_inside_mask=self.parent_inside_mask.detach().clone().cpu(),
             child_inside_mask_S=self.child_inside_mask_S.detach().clone().cpu(),
+            child_basis_S=_detach_optional(self.child_basis_S),
+            basis_valid=_detach_optional(self.basis_valid),
+            basis_weight_sum=_detach_optional(self.basis_weight_sum),
         )
+
+
+@dataclass
+class BigGSParentStats:
+    weight_sum: torch.Tensor
+    weighted_mean_sum: torch.Tensor
+    # Weighted second moment is stored in a numerically stable parent-local
+    # frame: sum_i w_i * (diag_cov_i + (mean_i - second_anchor_p)^2).
+    weighted_second_sum: torch.Tensor
+    tau_area_sum: torch.Tensor
+    weighted_sh_dc_sum: torch.Tensor
+    weighted_sh_rest_sum: torch.Tensor
+    parent_count: torch.Tensor
+    second_anchor: Optional[torch.Tensor] = None
+
+
+@dataclass
+class BigGSChildContributionCache:
+    mass: torch.Tensor
+    tau_area: torch.Tensor
+    diag_cov: torch.Tensor
+
+
+@dataclass
+class BigGSParentBranchRuntime:
+    stats: BigGSParentStats
+    params: Dict[str, torch.Tensor]
+    child_cache: BigGSChildContributionCache
+    child_mass_mean: torch.Tensor
+    assignment_signature: str = ""
+    init_backend_id: float = 0.0
+    update_backend_id: float = 0.0
+    covariance_mode_id: float = 1.0
+
+
+@dataclass
+class BigGSBlockRuntime:
+    bg: Optional[BigGSParentBranchRuntime] = None
+    distant: Optional[BigGSParentBranchRuntime] = None
+    rigid_active: Optional[BigGSParentBranchRuntime] = None
+    bg_assignment: Optional[BigGSBranchAssignment] = None
+    distant_assignment: Optional[BigGSBranchAssignment] = None
+    rigid_active_assignment: Optional[BigGSRigidActiveAssignment] = None
+    source_frame_idx: int = -1
+    block_id: int = -1
+    exact_refresh_count: int = 0
+    incremental_update_count: int = 0
 
 
 @dataclass
@@ -134,6 +202,10 @@ class IForwardBigGSState:
 
 __all__ = [
     "BigGSBranchAssignment",
+    "BigGSBlockRuntime",
+    "BigGSChildContributionCache",
+    "BigGSParentBranchRuntime",
+    "BigGSParentStats",
     "BigGSRigidActiveAssignment",
     "IForwardBigGSState",
 ]

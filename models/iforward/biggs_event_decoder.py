@@ -63,6 +63,8 @@ class BigGSToFineEventDecoder(nn.Module):
         self,
         *,
         event_dim: int = 48,
+        parent_event_dim: Optional[int] = None,
+        fine_event_dim: Optional[int] = None,
         mode: str = "low_rank_basis",
         rank: int = 4,
         hidden_dim: int = 64,
@@ -77,11 +79,17 @@ class BigGSToFineEventDecoder(nn.Module):
         detach_child_params: Optional[bool] = None,
         detach_parent_params: Optional[bool] = None,
         child_code_parent_local_frame: bool = True,
+        residual_scale_per_branch: bool = False,
+        whdd_chunk_size: int = 65536,
+        fused_cuda: bool = False,
     ) -> None:
         super().__init__()
-        self.event_dim = int(event_dim)
+        self.parent_event_dim = int(parent_event_dim) if parent_event_dim is not None else int(event_dim)
+        self.fine_event_dim = int(fine_event_dim) if fine_event_dim is not None else int(event_dim)
+        self.event_dim = int(self.fine_event_dim)
         self.mode = str(mode)
         self.rank = int(rank)
+        self.fused_cuda = bool(fused_cuda)
         self.mean_preserve = bool(mean_preserve)
         self.detach_child_code_inputs = bool(detach_child_code_inputs)
         self.detach_child_params = (
@@ -91,30 +99,55 @@ class BigGSToFineEventDecoder(nn.Module):
             bool(detach_parent_params) if detach_parent_params is not None else bool(detach_child_code_inputs)
         )
         self.child_code_parent_local_frame = bool(child_code_parent_local_frame)
+        self.residual_scale_per_branch = bool(residual_scale_per_branch)
+        self.whdd_chunk_size = max(int(whdd_chunk_size), 1)
+        mode_l = str(self.mode).lower()
+        if mode_l != "whdd_compact_fixed_basis" and int(self.parent_event_dim) != int(self.fine_event_dim):
+            raise ValueError(
+                f"BigGS child decoder mode={self.mode!r} requires parent_event_dim == fine_event_dim; "
+                f"got parent={int(self.parent_event_dim)} fine={int(self.fine_event_dim)}"
+            )
         self.branch_embed = nn.Embedding(3, int(branch_embed_dim))
         self.child_code_dim = 13 + int(branch_embed_dim)
         self.residual_mlp = _mlp(
-            self.child_code_dim + int(event_dim),
+            self.child_code_dim + int(self.fine_event_dim),
             int(hidden_dim),
-            int(event_dim),
+            int(self.fine_event_dim),
             int(num_layers),
         )
-        self.basis_mlp = _mlp(int(event_dim), int(hidden_dim), int(rank) * int(event_dim), int(num_layers))
+        self.basis_mlp = _mlp(
+            int(self.parent_event_dim),
+            int(hidden_dim),
+            int(rank) * int(self.fine_event_dim),
+            int(num_layers),
+        )
         self.coeff_mlp = _mlp(self.child_code_dim, int(hidden_dim), int(rank), int(num_layers))
+        self.base_proj: nn.Module
+        if mode_l == "whdd_compact_fixed_basis":
+            self.base_proj = nn.Linear(int(self.parent_event_dim), int(self.fine_event_dim))
+        else:
+            self.base_proj = nn.Identity()
+        self.detail_head = nn.Sequential(
+            nn.LayerNorm(int(self.parent_event_dim)),
+            nn.Linear(int(self.parent_event_dim), int(rank) * int(self.fine_event_dim)),
+        )
         if bool(zero_init_last):
-            mode_l = str(self.mode).lower()
             if mode_l == "low_rank_basis":
                 _zero_last_linear(self.coeff_mlp)
             elif mode_l == "residual_mlp":
                 _zero_last_linear(self.residual_mlp)
+            elif mode_l in {"whdd_fixed_basis", "whdd_compact_fixed_basis"}:
+                _zero_last_linear(self.detail_head)
         scale = torch.tensor(float(residual_scale_init), dtype=torch.float32)
         if bool(residual_scale_learnable):
-            self.residual_scale = nn.Parameter(scale)
+            init = scale.repeat(3) if bool(self.residual_scale_per_branch) else scale
+            self.residual_scale = nn.Parameter(init)
         else:
-            self.register_buffer("residual_scale", scale)
+            init = scale.repeat(3) if bool(self.residual_scale_per_branch) else scale
+            self.register_buffer("residual_scale", init)
         norm_l = str(final_norm).lower()
         if norm_l == "layernorm":
-            self.final_norm = nn.LayerNorm(int(event_dim))
+            self.final_norm = nn.LayerNorm(int(self.fine_event_dim))
         elif norm_l in {"identity", "none"}:
             self.final_norm = nn.Identity()
         else:
@@ -122,8 +155,12 @@ class BigGSToFineEventDecoder(nn.Module):
 
     @classmethod
     def from_config(cls, cfg: Any, *, event_dim: int) -> "BigGSToFineEventDecoder":
+        parent_event_dim = cfg_get(cfg, "parent_event_dim", event_dim)
+        fine_event_dim = cfg_get(cfg, "fine_event_dim", event_dim)
         return cls(
             event_dim=int(event_dim),
+            parent_event_dim=int(parent_event_dim),
+            fine_event_dim=int(fine_event_dim),
             mode=str(cfg_get(cfg, "mode", "low_rank_basis")),
             rank=int(cfg_get(cfg, "rank", 4)),
             hidden_dim=int(cfg_get(cfg, "hidden_dim", 64)),
@@ -138,7 +175,49 @@ class BigGSToFineEventDecoder(nn.Module):
             detach_child_params=cfg_get(cfg, "detach_child_params", None),
             detach_parent_params=cfg_get(cfg, "detach_parent_params", None),
             child_code_parent_local_frame=bool(cfg_get(cfg, "child_code_parent_local_frame", True)),
+            residual_scale_per_branch=bool(cfg_get(cfg, "residual_scale_per_branch", False)),
+            whdd_chunk_size=int(cfg_get(cfg, "whdd_chunk_size", 65536)),
+            fused_cuda=bool(cfg_get(cfg, "fused_cuda", False)),
         )
+
+    def _residual_scale_for_branch(self, *, branch_id: int, ref: torch.Tensor) -> torch.Tensor:
+        scale = self.residual_scale.to(device=ref.device, dtype=ref.dtype)
+        if scale.dim() == 0:
+            return scale
+        idx = max(0, min(int(branch_id), int(scale.numel()) - 1))
+        return scale[idx]
+
+    def _decode_whdd_residual(
+        self,
+        *,
+        parent_event: torch.Tensor,
+        parent_id: torch.Tensor,
+        child_basis: torch.Tensor,
+    ) -> torch.Tensor:
+        n = int(parent_id.numel())
+        if n == 0:
+            return parent_event.new_zeros((0, int(self.fine_event_dim)))
+        detail = self.detail_head(parent_event).reshape(
+            int(parent_event.shape[0]),
+            int(self.rank),
+            int(self.fine_event_dim),
+        )
+        basis = child_basis.to(device=parent_event.device, dtype=parent_event.dtype)
+        if int(basis.shape[0]) != n:
+            raise ValueError("BigGS WHDD child_basis row mismatch")
+        if int(basis.shape[1]) < int(self.rank):
+            raise ValueError(f"BigGS WHDD child_basis rank {int(basis.shape[1])} < decoder rank {self.rank}")
+        basis = basis[:, : int(self.rank)].detach()
+        out_chunks = []
+        chunk = int(self.whdd_chunk_size)
+        pid = parent_id.long().to(device=parent_event.device)
+        for start in range(0, n, chunk):
+            end = min(start + chunk, n)
+            pid_c = pid[start:end]
+            detail_c = detail.index_select(0, pid_c)
+            basis_c = basis[start:end]
+            out_chunks.append(torch.einsum("nr,nre->ne", basis_c, detail_c))
+        return torch.cat(out_chunks, dim=0) if out_chunks else parent_event.new_zeros((0, int(self.fine_event_dim)))
 
     def _child_code(
         self,
@@ -215,12 +294,13 @@ class BigGSToFineEventDecoder(nn.Module):
         parent_params: Dict[str, torch.Tensor],
         branch_id: int,
         route_flag: Optional[torch.Tensor] = None,
+        child_basis: Optional[torch.Tensor] = None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Dict[str, float]]:
         n = int(parent_id.numel())
         if n == 0:
             ref = child_params["means"]
             return (
-                ref.new_zeros((0, self.event_dim)),
+                ref.new_zeros((0, self.fine_event_dim)),
                 _broadcast_optional(parent_support, parent_id),
                 _broadcast_optional(parent_valid, parent_id),
                 _broadcast_optional(parent_obs, parent_id),
@@ -228,17 +308,37 @@ class BigGSToFineEventDecoder(nn.Module):
             )
         if parent_event is None:
             raise RuntimeError("BigGS child decoder requires parent_event for non-empty branch")
+        if int(parent_event.shape[-1]) != int(self.parent_event_dim):
+            raise ValueError(
+                f"BigGS parent_event dim mismatch: got {int(parent_event.shape[-1])}, "
+                f"expected {int(self.parent_event_dim)}"
+            )
         if int(parent_event.shape[0]) <= int(parent_id.max().item()):
             raise ValueError("BigGS parent_id exceeds parent_event rows")
         pid = parent_id.long().to(device=parent_event.device)
-        parent_e = parent_event.index_select(0, pid)
         mode = str(self.mode).lower()
-        residual_scale = self.residual_scale.to(device=parent_event.device, dtype=parent_event.dtype)
+        residual_scale = self._residual_scale_for_branch(branch_id=int(branch_id), ref=parent_event)
         if mode == "broadcast":
+            parent_e = parent_event.index_select(0, pid)
             fine = parent_e
             residual = parent_e.new_zeros(parent_e.shape)
             scaled_residual = residual
+        elif mode in {"whdd_fixed_basis", "whdd_compact_fixed_basis"}:
+            if child_basis is None:
+                raise RuntimeError("BigGS WHDD decoder requires assignment child_basis")
+            residual = self._decode_whdd_residual(
+                parent_event=parent_event,
+                parent_id=pid,
+                child_basis=child_basis,
+            )
+            scaled_residual = residual_scale * residual
+            if mode == "whdd_compact_fixed_basis":
+                base = self.base_proj(parent_event).index_select(0, pid)
+            else:
+                base = parent_event.index_select(0, pid)
+            fine = base + scaled_residual
         else:
+            parent_e = parent_event.index_select(0, pid)
             def prepare_param_dict(params: Dict[str, torch.Tensor], *, detach: bool) -> Dict[str, torch.Tensor]:
                 out = {}
                 for key, value in params.items():
@@ -267,7 +367,11 @@ class BigGSToFineEventDecoder(nn.Module):
                     )
                     residual = residual - mean.index_select(0, pid)
             elif mode == "low_rank_basis":
-                basis = self.basis_mlp(parent_event).reshape(int(parent_event.shape[0]), int(self.rank), int(self.event_dim))
+                basis = self.basis_mlp(parent_event).reshape(
+                    int(parent_event.shape[0]),
+                    int(self.rank),
+                    int(self.fine_event_dim),
+                )
                 coeff = self.coeff_mlp(code)
                 if self.mean_preserve:
                     mean = _scatter_weighted_mean(
@@ -302,7 +406,7 @@ class BigGSToFineEventDecoder(nn.Module):
             "scaled_child_residual_norm": (
                 float(scaled_residual.detach().norm(dim=-1).mean().item()) if scaled_residual.numel() else 0.0
             ),
-            "residual_scale": float(residual_scale.detach().abs().item()),
+            "residual_scale": float(residual_scale.detach().abs().reshape(-1).mean().item()),
             "mean_preserve_error": mean_preserve_error,
         }
         return (
@@ -345,6 +449,7 @@ class BigGSToFineEventDecoder(nn.Module):
             child_params=self._branch_params(local_state.bg),
             parent_params=measurement["parent_params_bg"],
             branch_id=0,
+            child_basis=assign_bg.child_basis,
         )
         event_distant = support_distant = valid_distant = obs_distant = None
         aux_distant: Dict[str, float] = {}
@@ -366,6 +471,7 @@ class BigGSToFineEventDecoder(nn.Module):
                 child_params=self._branch_params(local_state.distant),
                 parent_params=measurement["parent_params_distant"],
                 branch_id=1,
+                child_basis=assign_distant.child_basis,
             )
         event_rigid = support_rigid = valid_rigid = obs_rigid = None
         aux_rigid: Dict[str, float] = {}
@@ -394,10 +500,11 @@ class BigGSToFineEventDecoder(nn.Module):
                 parent_params=measurement["parent_params_rigid_active"],
                 branch_id=2,
                 route_flag=route_flag,
+                child_basis=active.child_basis_S,
             )
         aux = {
             **dict(getattr(parent_event_pack, "aux", {}) or {}),
-            "iforward/biggs/decoder_mode_id": float({"broadcast": 0, "residual_mlp": 1, "low_rank_basis": 2}.get(str(self.mode).lower(), -1)),
+            "iforward/biggs/decoder_mode_id": float({"broadcast": 0, "residual_mlp": 1, "low_rank_basis": 2, "whdd_fixed_basis": 3, "whdd_compact_fixed_basis": 4}.get(str(self.mode).lower(), -1)),
             "iforward/biggs/decoder_rank": float(self.rank),
             "iforward/biggs/parent_event_norm_bg": (
                 float(parent_event_pack.event_bg.detach().norm(dim=-1).mean().item())
@@ -420,6 +527,15 @@ class BigGSToFineEventDecoder(nn.Module):
             "iforward/biggs/child_residual_norm_rigid": aux_rigid.get("child_residual_norm", 0.0),
             "iforward/biggs/scaled_child_residual_norm_rigid": aux_rigid.get("scaled_child_residual_norm", 0.0),
             "iforward/biggs/mean_preserve_error_rigid": aux_rigid.get("mean_preserve_error", 0.0),
+            "iforward/whdd/gamma_bg": float(self._residual_scale_for_branch(branch_id=0, ref=parent_event_pack.event_bg).detach().item())
+            if parent_event_pack.event_bg is not None
+            else 0.0,
+            "iforward/whdd/gamma_distant": float(self._residual_scale_for_branch(branch_id=1, ref=parent_event_pack.event_bg).detach().item())
+            if parent_event_pack.event_bg is not None
+            else 0.0,
+            "iforward/whdd/gamma_rigid": float(self._residual_scale_for_branch(branch_id=2, ref=parent_event_pack.event_bg).detach().item())
+            if parent_event_pack.event_bg is not None
+            else 0.0,
         }
         return EventPack(
             event_bg=event_bg,

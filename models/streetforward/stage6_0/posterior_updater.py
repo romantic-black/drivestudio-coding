@@ -97,11 +97,17 @@ class Stage6PosteriorUpdater(nn.Module):
         accept_vsm_ctx: bool = True,
         vsm_ctx_dim: int = 48,
         branch_clamps: Optional[Dict[str, Dict[str, float]]] = None,
+        output_hidden: bool = True,
+        output_confidence: bool = True,
+        output_noop: bool = True,
     ) -> None:
         super().__init__()
         self.event_dim = int(event_dim)
         self.ctx_dim = int(ctx_dim)
-        self.stage_hidden_dim = int(stage_hidden_dim)
+        self.stage_hidden_dim = max(int(stage_hidden_dim), 0)
+        self.output_hidden = bool(output_hidden) and int(self.stage_hidden_dim) > 0
+        self.output_confidence = bool(output_confidence)
+        self.output_noop = bool(output_noop)
         self.sh_dim = int(_num_sh_bases(int(sh_degree)) * 3)
         self.means_max_step_m = float(means_max_step_m)
         self.scales_log_max_step = float(scales_log_max_step)
@@ -138,9 +144,9 @@ class Stage6PosteriorUpdater(nn.Module):
         self.head_quat = nn.Linear(int(hidden_dim), 3)
         self.head_opacity = nn.Linear(int(hidden_dim), 1)
         self.head_sh = nn.Linear(int(hidden_dim), self.sh_dim)
-        self.head_hidden = nn.Linear(int(hidden_dim), int(stage_hidden_dim))
-        self.head_confidence = nn.Linear(int(hidden_dim), 1)
-        self.head_noop = nn.Linear(int(hidden_dim), 1)
+        self.head_hidden = nn.Linear(int(hidden_dim), self.stage_hidden_dim) if self.output_hidden else None
+        self.head_confidence = nn.Linear(int(hidden_dim), 1) if self.output_confidence else None
+        self.head_noop = nn.Linear(int(hidden_dim), 1) if self.output_noop else None
         self.accept_vsm_ctx = bool(accept_vsm_ctx)
         self.vsm_ctx_adapter: Optional[nn.Linear]
         if self.accept_vsm_ctx:
@@ -181,8 +187,8 @@ class Stage6PosteriorUpdater(nn.Module):
                 quat_axis_angle=z3,
                 opacity_logit=z1,
                 sh=event.new_zeros((n, self.sh_dim)),
-                hidden=event.new_zeros((n, self.stage_hidden_dim)),
-                confidence=z1,
+                hidden=event.new_zeros((n, self.stage_hidden_dim if self.output_hidden else 0)),
+                confidence=z1 if self.output_confidence else event.new_zeros((n, 0)),
                 noop=z1,
             )
         ctx_in = event if ctx_current is None else ctx_current
@@ -191,17 +197,27 @@ class Stage6PosteriorUpdater(nn.Module):
                 raise ValueError("ctx_vsm was provided but vsm ctx adapter is disabled")
             ctx_in = ctx_in + self.vsm_ctx_adapter(ctx_vsm)
         h = self.trunk(ctx_in)
-        noop = torch.sigmoid(self.head_noop(h))
+        noop = torch.sigmoid(self.head_noop(h)) if self.head_noop is not None else event.new_zeros((int(event.shape[0]), 1))
         gate = 1.0 - noop
         clamps = self.branch_clamps.get(str(branch_name), self.branch_clamps["bg"])
+        hidden = (
+            gate * float(clamps["hidden_max_step"]) * torch.tanh(self.head_hidden(h))
+            if self.head_hidden is not None
+            else event.new_zeros((int(event.shape[0]), 0))
+        )
+        confidence = (
+            torch.sigmoid(self.head_confidence(h))
+            if self.head_confidence is not None
+            else event.new_zeros((int(event.shape[0]), 0))
+        )
         delta = BranchDelta(
             means=gate * float(clamps["means_max_step_m"]) * torch.tanh(self.head_means(h)),
             scales_log=gate * float(clamps["scales_log_max_step"]) * torch.tanh(self.head_scales(h)),
             quat_axis_angle=gate * float(clamps["quat_axis_angle_max_step_rad"]) * torch.tanh(self.head_quat(h)),
             opacity_logit=gate * float(clamps["opacity_logit_max_step"]) * torch.tanh(self.head_opacity(h)),
             sh=gate * float(clamps["sh_max_step"]) * torch.tanh(self.head_sh(h)),
-            hidden=gate * float(clamps["hidden_max_step"]) * torch.tanh(self.head_hidden(h)),
-            confidence=torch.sigmoid(self.head_confidence(h)),
+            hidden=hidden,
+            confidence=confidence,
             noop=noop,
         )
         for name, value in delta.__dict__.items():

@@ -2353,3 +2353,189 @@ flowchart LR
 python tools/train_iforward.py \
   --config_file configs/iforward/iforward_stage2_0_biggs_parent_lifting.yaml
 ```
+
+---
+
+## 22. 三分支（bg / distant / rigid）梯度反传与 Mask 对比
+
+实现入口：`minimal_trainer_stage6_0.py`、`stage6_0/struct_event_decoder.py`、`stage6_0/posterior_updater.py`、`stage6_0/phase_a_losses.py`、`iforward/model.py`。
+
+Stage 2.0 与 Stage 1 **共用** posterior / render / branch_scope 路径；差异主要在 observe（parent lifting）、`detach_v4_outputs`、memory bypass。
+
+### 22.1 端到端梯度路径总览
+
+```mermaid
+flowchart TB
+    subgraph OBS["Observe（每步，可能 no_grad）"]
+        PIX["像素 mask：non_sky_non_egocar<br/>source_pair_valid_mask"]
+        BP["V4 backproject → acc_w per GS"]
+        SUP["per-branch support_min<br/>valid = acc_w > threshold"]
+        ZIF["zero_invalid_2d_feat<br/>feat *= valid"]
+    end
+
+    subgraph ENC["Event encode（可训：struct_decoder + child_decoder）"]
+        ROUTE["bg→near xCPE<br/>distant→far MLP<br/>rigid→in=near / out=far"]
+        EV["EventPack: event_* / valid_* / support_*"]
+    end
+
+    subgraph UPD["Update（可训：posterior + vsm_adapter）"]
+        PU["Stage6PosteriorUpdater<br/>三分支独立 trunk→delta"]
+        SCOPE["branch_scope 掩码 delta 分量"]
+        RIG["rigid: expand route.S → 全 N"]
+        AD["local_state.apply_delta"]
+    end
+
+    subgraph LOSS["Loss（rollout 末步）"]
+        REN["三分支拼 scene → 单次 rasterize"]
+        LMASK["像素 mask：non_sky_non_egocar"]
+        L["masked_rgb_loss + delta_reg"]
+    end
+
+    PIX --> BP --> SUP --> ZIF --> ROUTE --> EV --> PU --> SCOPE --> RIG --> AD
+    AD --> REN --> LMASK --> L
+    L -.->|backward| AD
+    L -.->|backward| ENC
+```
+
+**要点**：render loss 是 **整场景一次光栅化**，像素 mask **不按分支**；梯度按 alpha blending 自动分配到可见的 bg / distant / rigid GS。
+
+### 22.2 Mask 类型对照表
+
+| Mask 层级 | 作用域 | bg | distant | rigid | 是否阻断梯度 |
+|-----------|--------|-----|---------|-------|--------------|
+| `source_pair_valid_mask` | 2D 像素（每 cam） | 共用 | 共用 | 共用 | 被 mask 像素不参与 backproject → 该 GS `acc_w` 低 |
+| `src_backproject_support_min` | per-GS（分支阈值） | `branches.bg` | `branches.distant` | `branches.rigid` | `valid=false` 时 `feat_2d` 置零 → struct 输入梯度≈0 |
+| `zero_invalid_2d_feat` | per-GS 特征 | near 路径 | far 路径 | in→near / out→far | 同上（乘法 mask） |
+| `EventPack.valid_*` | per-GS event 行 | `valid_bg` | `valid_distant` | `valid_rigid`（`len(S)`） | **不**直接挡 posterior；Stage1 memory 写入门控 |
+| `EventPack.support_*` | per-GS 标量 | `acc_w` 或 log1p | 同左 | 同左 | memory `hard_support_min` 写入门控 |
+| `route.inside_mask_S` | rigid 路由 | — | — | AABB 内→near | 决定 event 走 near 还是 far encoder |
+| `_stage6_rigid_point_valid_mask` | rigid 渲染子集 | — | — | 当前 `frame_idx` 可见实例 | 不可见帧 rigid **不参与该帧 render** |
+| `branch_scope` | delta 分量 | 见 §22.3 | 仅 opacity+SH | 全属性（配置可调） | **硬零**被禁用的 delta 分量 |
+| `posterior noop` gate | per-GS delta 幅度 | 三分支均有 | 同左 | 同左 | `gate=1-noop` 缩放全部 delta head |
+| `target_valid_mask` | loss 像素 | 共用 | 共用 | 共用 | sky/egocar 像素 loss=0 |
+
+当前 Stage 2.0 配置（`iforward_stage2_0_biggs_parent_lifting.yaml`）：
+
+```yaml
+branches:
+  bg:      { src_backproject_support_min: 1.0e-2 }
+  distant: { src_backproject_support_min: 1.0e-2 }
+  rigid:   { src_backproject_support_min: 1.0e-2 }
+posterior_updater.branch_scope:
+  bg:      { update_means/scales/quat/opacity/sh: true }
+  distant: { update_means/scales/quat: false, update_opacity/sh: true }
+  rigid:   { update_means/scales/quat/opacity/sh: true }
+base_measurement:
+  detach_v4_outputs: true   # Stage2：feat_2d 进 encoder 前 detach
+```
+
+### 22.3 三分支核心对比
+
+| 维度 | **bg**（背景 / near） | **distant**（远景 / far） | **rigid**（动态刚体） |
+|------|----------------------|---------------------------|----------------------|
+| Struct 路径 | `near` xCPE sparse conv | `far` point MLP | `S_in`→near；`S_out`→far |
+| `branch_id` | 0（near）/ 0（far 无） | 0（far） | 1（near & far 内均为 rigid 嵌入） |
+| Observe 行数 | `N_bg` 或 parent `M_bg` | `N_d` 或 `M_d` | 仅 `route.S`（当前帧可见 fine 点） |
+| support 阈值 meta 键 | `support_threshold_bg` | `support_threshold_distant` | `support_threshold_rigid` / `rigid_out` |
+| Posterior 输入行数 | `N_bg` | `N_d`（可无 distant 分支） | `len(route.S)` |
+| `branch_scope` 默认 | **全参数可更新** | **仅 opacity + SH** | **全参数可更新** |
+| Render 拼 scene | 始终加入 | 有 distant 则加入 | 仅 `_stage6_rigid_point_valid_mask(frame)` 为真的点，再变到 world |
+| Delta 行对齐 | 1:1 `N_bg` | 1:1 `N_d` | `route.S` 子集 → `_expand_branch_delta` 填满 `N_rigid` |
+| Stage2 parent lifting | parent scene 的 bg 段 | parent distant 段 | active rigid parent 段 |
+| Stage2 2D 梯度 | **切断**（`detach_v4_outputs`） | 同左 | 同左 |
+| Stage2 memory | bypass | bypass | bypass |
+
+### 22.4 各阶段梯度是否到达
+
+| 模块 | bg | distant | rigid | 说明 |
+|------|----|---------|-------|------|
+| DINOv2 / UNet（2D frontend） | ✗ Stage2 | ✗ | ✗ | `no_grad_v4` + `detach_v4_outputs` |
+| V4 backproject（gsplat） | 无参数 | 无参数 | 无参数 | 仅影响 `acc_w` 统计量 |
+| `stage6_struct_event_decoder` | ✓ | ✓ | ✓（in/out 两路） | `valid` 行 `feat_2d` 被置零，有效行有梯度 |
+| `biggs_child_decoder` | ✓ | ✓（有 distant 时） | ✓ | broadcast parent `valid/support` 到 fine 行 |
+| `stage6_posterior_updater` | ✓ | ✓（有 event 时） | ✓ | 每分支独立 MLP；`noop` gate 可微 |
+| `vsm_ctx_adapter` | ✓（Stage2 常关闭 VSM→0） | ✓ | ✓ | `ctx_memory=None` 时仅 event 进 trunk |
+| `apply_delta` → `local_state` | 全属性 | **仅 opacity+SH** 写入 | 全属性（仅 `route.S` 行非零 delta） |
+| Render loss → GS 参数 | ✓ 经光栅化 | ✓ | ✓（可见帧点） | **不按分支拆 loss**；distant 的 means 仍参与渲染、可收渲染梯度，但 **delta 不更新 means** |
+| `delta_regularization` | ✓ 计入均值 | ✓ | ✓ | 三分支 delta L2 平均；`scale_barrier` 对三分支 `scales_log` |
+
+### 22.5 rigid 分支特殊逻辑（流程图）
+
+```mermaid
+flowchart LR
+    subgraph OBS_R["Observe"]
+        S["route.S = 当前帧可见 rigid fine 索引"]
+        IN["inside_mask_S = 点在 segment AABB 内"]
+    end
+    subgraph ENC_R["Encode"]
+        NEAR["S_in → near xCPE"]
+        FAR["S_out → far MLP"]
+        MERGE["event_rigid[S] 拼回 len(S)"]
+    end
+    subgraph DEL_R["Delta"]
+        D_S["posterior → delta_rigid len(S)"]
+        EXP["_expand_branch_delta → N_rigid<br/>非 S 行 delta=0"]
+    end
+    subgraph REN_R["Render @ frame t"]
+        VM["_stage6_rigid_point_valid_mask(t)"]
+        W["_rigid_local_to_world"]
+    end
+    S --> IN --> NEAR
+    IN --> FAR
+    NEAR --> MERGE
+    FAR --> MERGE
+    MERGE --> D_S --> EXP
+    EXP --> VM --> W
+```
+
+- **Observe / event 只用 `route.S`**，不是全部 `N_rigid`。
+- **Delta 先算 `len(S)` 行，再 scatter 到全长**；非当前帧活跃点本步 delta 恒为 0。
+- **Render 按目标帧再滤一次**；与 observe 用的 `source_frame_idx` 可不同（rollout-final 监督帧）。
+
+### 22.6 distant 的「渲染有、delta 几何无」
+
+配置 `distant.update_means/scales/quat=false` 时：
+
+```text
+渲染：distant GS 仍拼进 gaussians_scene → 参与 photometric loss → means/scales/quat 可收到渲染梯度
+更新：posterior 预测的 means/scales/quat delta 被 branch_scope 置零 → apply_delta 不改几何
+仅 opacity + SH 经 delta 每步更新
+```
+
+这是 **有意设计**：远景主要靠外观（opacity/SH）适配，几何由初始化 / 点云资产固定。
+
+### 22.7 Stage 1 vs Stage 2 在 mask/梯度上的差异
+
+| 项目 | Stage 1（v1 + memory） | Stage 2.0（BigGS） |
+|------|------------------------|---------------------|
+| 2D feat 梯度 | 可训 frontend 时回传到 UNet/DINO | **切断**（frozen frontend） |
+| Observe token 规模 | fine `N_*` | parent `M_*`（压缩） |
+| Memory 写入门控 | `valid` + `support` + `hard_valid_required` | memory bypass，**不用** event valid 写 memory |
+| History gate | 可用 `valid_now` 调 gate | 强制关闭 |
+| Render / branch_scope / rigid 路由 | 相同机制 | 相同机制 |
+| Child decoder | 无 | parent `valid/support` broadcast 到 fine `EventPack` |
+
+### 22.8 配置调参速查
+
+| 目标 | 建议改动 |
+|------|----------|
+| 提高某分支 2D lifting 有效点比例 | 降低对应 `branches.*.src_backproject_support_min` |
+| 禁止 distant 几何漂移 | 保持 `distant.update_means/scales/quat=false`（默认） |
+| 完全关闭 distant 更新 | `branch_scope.distant.enable=false`（Phase B 模式） |
+| 恢复 2D frontend 训练 | `source_evidence_grad_mode=train_2d_detach_alpha` + `detach_v4_outputs=false`（非 Stage2 主线） |
+| rigid 仅更新外观 | `branch_scope.rigid.update_means/scales/quat=false` |
+| loss 排除动态区域 | `mask_policy=valid_non_sky_non_egocar_non_dynamic`（需 target 带 `dynamic_mask`） |
+
+### 22.9 代码锚点
+
+| 逻辑 | 文件 · 符号 |
+|------|-------------|
+| per-branch support 阈值 → valid | `struct_event_decoder.py` · `Stage6NearXcpeEventDecoder` / `Stage6FarMLPEventDecoder` |
+| rigid in/out 合并 | `struct_event_decoder.py` · `Stage6RoutedStructEventDecoder.forward` |
+| branch_scope 掩 delta | `minimal_trainer_stage6_0.py` · `_mask_branch_delta` / `_apply_branch_scope` |
+| rigid delta 扩展 | `minimal_trainer_stage6_0.py` · `_expand_branch_delta` |
+| 拼 render scene | `minimal_trainer_stage6_0.py` · `_render_params_for_frame` |
+| 像素 loss mask | `phase_a_losses.py` · `target_valid_mask` / `masked_rgb_loss` |
+| source 像素 mask | `minimal_trainer_stage4_5.py` · `_build_source_pair_valid_mask` |
+| Stage1 memory 写入门控 | `iforward/memory.py` · `hard_write = write & valid & support` |
+| BigGS valid broadcast | `biggs_event_decoder.py` · `_decode_branch` |

@@ -136,10 +136,11 @@ def project_biggs_parent_diag_reference_tensors(
 
     rot = _quat_to_rotmat(_normalize_quat(quats))
     child_diag_cov = (rot.square() * scales.square()[:, None, :]).sum(dim=-1)
-    second = child_diag_cov + means.square()
+    child_anchor = parent_means.index_select(0, pid)
+    second = child_diag_cov + (means - child_anchor).square()
     weighted_second = means.new_zeros((m, 3))
     weighted_second.index_add_(0, pid, second * mass[:, None])
-    var = weighted_second / mass_safe[:, None] - parent_means.square()
+    var = weighted_second / mass_safe[:, None]
     var = torch.clamp(
         var + eps_f,
         min=min_scale_f * min_scale_f,

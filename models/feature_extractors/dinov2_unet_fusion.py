@@ -121,6 +121,15 @@ class DINOv2BackboneAdapter(nn.Module):
         self.freeze_backbone = bool(freeze)
         self._set_backbone_trainable(trainable=not self.freeze_backbone)
 
+    def fingerprint(self) -> tuple:
+        return (
+            str(self.model_name),
+            str(self.weights_path),
+            tuple(int(x) for x in self.intermediate_layers),
+            int(self.pad_to_patch_multiple),
+            int(self.fuse[-1].out_channels) if isinstance(self.fuse[-1], nn.Conv2d) else -1,
+        )
+
     def train(self, mode: bool = True):
         super().train(mode)
         if self.freeze_backbone:
@@ -138,7 +147,7 @@ class DINOv2BackboneAdapter(nn.Module):
         x = F.pad(x, (0, pw, 0, ph), mode="replicate")
         return x, ph, pw
 
-    def forward(self, rgb: torch.Tensor, *, target_hw: tuple[int, int]) -> torch.Tensor:
+    def extract_backbone_intermediates(self, rgb: torch.Tensor) -> tuple[torch.Tensor, ...]:
         if rgb.dim() != 4:
             raise ValueError(f"DINOv2BackboneAdapter expects 4D tensor, got {tuple(rgb.shape)}")
         if int(rgb.shape[1]) != 3:
@@ -167,7 +176,14 @@ class DINOv2BackboneAdapter(nn.Module):
             )
         if not isinstance(feats, list) or len(feats) != len(self.intermediate_layers):
             raise RuntimeError("Unexpected DINO intermediates output format.")
+        return tuple(feats)
 
+    def adapt_backbone_intermediates(
+        self,
+        feats: Sequence[torch.Tensor],
+        *,
+        target_hw: tuple[int, int],
+    ) -> torch.Tensor:
         h_t, w_t = int(target_hw[0]), int(target_hw[1])
         proj_feats = []
         for i, feat in enumerate(feats):
@@ -180,6 +196,10 @@ class DINOv2BackboneAdapter(nn.Module):
 
         fused = self.fuse(torch.cat(proj_feats, dim=1))
         return fused.permute(0, 2, 3, 1).contiguous()
+
+    def forward(self, rgb: torch.Tensor, *, target_hw: tuple[int, int]) -> torch.Tensor:
+        feats = self.extract_backbone_intermediates(rgb)
+        return self.adapt_backbone_intermediates(feats, target_hw=target_hw)
 
 
 class FusionNeck2D(nn.Module):
@@ -279,15 +299,79 @@ class DINOv2UNetFusionExtractor(nn.Module):
             f"got {tuple(images.shape)}"
         )
 
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
+    def dino_fingerprint(self) -> tuple:
+        return (
+            self.dino_adapter.fingerprint(),
+            tuple(int(x) for x in self.get_feature_resolution(128, 128)),
+        )
+
+    def dino_adapter_has_trainable_params(self) -> bool:
+        return any(bool(p.requires_grad) for p in self.dino_adapter.parameters())
+
+    def extract_residual_feature(self, images: torch.Tensor) -> torch.Tensor:
         x6 = self._to_nchw_6(images)
-        rgb = x6[:, :3, :, :]
+        return self.residual_unet(x6)
 
-        unet_feat = self.residual_unet(x6)  # [B, Hf, Wf, C_u]
-        target_hw = (int(unet_feat.shape[1]), int(unet_feat.shape[2]))
-        dino_feat = self.dino_adapter(rgb, target_hw=target_hw)  # [B, Hf, Wf, C_d]
+    def extract_dino_feature(
+        self,
+        rgb: torch.Tensor,
+        *,
+        target_hw: tuple[int, int],
+        detach: bool = True,
+    ) -> torch.Tensor:
+        if rgb.dim() != 4:
+            raise ValueError(f"DINO cache expects 4D RGB tensor, got {tuple(rgb.shape)}")
+        if int(rgb.shape[1]) != 3:
+            if int(rgb.shape[-1]) == 3:
+                rgb = rgb.permute(0, 3, 1, 2).contiguous()
+            else:
+                raise ValueError(f"DINO cache expects RGB [B,3,H,W] or [B,H,W,3], got {tuple(rgb.shape)}")
+        if bool(detach):
+            with torch.no_grad():
+                return self.dino_adapter(rgb, target_hw=target_hw).detach()
+        return self.dino_adapter(rgb, target_hw=target_hw)
 
-        fused = torch.cat([dino_feat, unet_feat], dim=-1)
+    def extract_dino_backbone_intermediates(self, rgb: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        if rgb.dim() != 4:
+            raise ValueError(f"DINO cache expects 4D RGB tensor, got {tuple(rgb.shape)}")
+        if int(rgb.shape[1]) != 3:
+            if int(rgb.shape[-1]) == 3:
+                rgb = rgb.permute(0, 3, 1, 2).contiguous()
+            else:
+                raise ValueError(f"DINO cache expects RGB [B,3,H,W] or [B,H,W,3], got {tuple(rgb.shape)}")
+        return self.dino_adapter.extract_backbone_intermediates(rgb)
+
+    def adapt_dino_backbone_intermediates(
+        self,
+        feats: Sequence[torch.Tensor],
+        *,
+        target_hw: tuple[int, int],
+    ) -> torch.Tensor:
+        return self.dino_adapter.adapt_backbone_intermediates(feats, target_hw=target_hw)
+
+    def fuse_features(self, dino_feat: torch.Tensor, residual_feat: torch.Tensor) -> torch.Tensor:
+        fused = torch.cat([dino_feat, residual_feat], dim=-1)
         fused_nchw = fused.permute(0, 3, 1, 2).contiguous()
         out = self.fusion_neck(fused_nchw)
         return out.permute(0, 2, 3, 1).contiguous()
+
+    def forward(self, images: torch.Tensor, *, cached_dino: torch.Tensor | None = None) -> torch.Tensor:
+        x6 = self._to_nchw_6(images)
+        rgb = x6[:, :3, :, :]
+        unet_feat = self.residual_unet(x6)  # [B, Hf, Wf, C_u]
+        target_hw = (int(unet_feat.shape[1]), int(unet_feat.shape[2]))
+        dino_feat = cached_dino
+        if dino_feat is None:
+            dino_feat = self.extract_dino_feature(
+                rgb,
+                target_hw=target_hw,
+                detach=not self.dino_adapter_has_trainable_params(),
+            )
+        else:
+            dino_feat = dino_feat.to(device=unet_feat.device, dtype=unet_feat.dtype)
+            if tuple(dino_feat.shape[:3]) != tuple(unet_feat.shape[:3]):
+                raise ValueError(
+                    "cached DINO feature shape mismatch: "
+                    f"cached={tuple(dino_feat.shape)} residual={tuple(unet_feat.shape)}"
+                )
+        return self.fuse_features(dino_feat, unet_feat)

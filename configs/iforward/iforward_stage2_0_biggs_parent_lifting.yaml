@@ -1,4 +1,4 @@
-output_name: iforward_stage2_0_biggs_cuda_exact_diag_30w20w
+output_name: iforward_stage2_0_biggs_compact16_residualonly_30w20w
 
 # IForward BigGS Stage 2.0 entrypoint.
 # This is distinct from configs/minimal_streetforward_stage2_0.yaml, which is the
@@ -20,20 +20,38 @@ data:
   end_timestep: -1
   preload_device: cpu
   sky_mask_semantics: one_is_sky
-  train_scene_ids: [14, 16, 24, 32, 40, 99, 107, 115, 123, 131, 139, 147, 155, 163, 171, 179, 195, 214,]
+  train_scene_ids: [14, 16, 24, 32, 40, 99, 107, 115, 123, 131, 139, 147, 155, 163, 171, 179, 195, 214,
+    17, 25, 33, 41, 49, 100, 108, 116, 124, 132, 140, 148, 156, 164, 172, 180, 188, 196, 215,
+    10, 18, 26, 34, 42, 93, 101, 109, 117, 125, 133, 141, 149, 157, 165, 173, 181, 189, 197, 216,
+    11, 19, 27, 35, 43, 94, 102, 110, 118, 126, 134, 142, 150, 158, 166, 174, 182, 190, 198, 217,
+    12, 20, 36, 44, 95, 103, 111, 119, 127, 135, 143, 151, 159, 167, 175, 183, 191, 199, 218,
+    13, 21, 29, 37, 45, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200,
+    22, 30, 38, 46, 97, 105, 113, 121, 129, 137, 145, 153, 161, 169, 177, 185, 193, 201,
+    15, 23, 31, 39, 47, 98, 106, 114, 122, 130, 138, 146, 154, 162, 170, 178, 186, 194]
   eval_scene_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
   pixel_source:
+    type: datasets.nuscenes.nuscenes_sourceloader.NuScenesPixelSource
     cameras: [0, 1, 2]
     downscale_when_loading: [3, 3, 3]
     downscale: 1
     undistort: false
+    test_image_stride: 0
+    max_test_images: 0
     load_sky_mask: true
     load_dynamic_mask: true
     load_egocar_mask: true
     load_depth_maps: true
     load_objects: true
+    load_smpl: false
+    sampler:
+      buffer_downscale: 8
+      buffer_ratio: 0.5
+      start_enhance_weight: 3
   lidar_source:
+    type: datasets.nuscenes.nuscenes_sourceloader.NuScenesLiDARSource
     load_lidar: true
+    lidar_downsample_factor: 1
+    lidar_percentile: 0.02
   assets:
     root: "/root/autodl-tmp/streetforward_assets_pt30w_20w"
   scene_asset_cache_max_items: 32
@@ -47,6 +65,7 @@ dataset:
   segment_overlap_ratio: 0.25
   min_keyframes_per_scene: 2
   min_keyframes_per_segment: 4
+  preload_scene_count: 2
   segment_aabb:
     - [-15.0, -10.0, 0.0]
     - [15.0, 4.8, 40.0]
@@ -89,11 +108,11 @@ scheduler_iforward:
     forbid_consecutive_same_scene: true
   episode:
     source_mode: keyframes
-    blocks_per_episode: 8
-    episode_stride: 8
+    blocks_per_episode: 4
+    episode_stride: 1
     allow_short_last_episode: false
     min_blocks_per_episode: 4
-    rollouts_per_episode: 1
+    rollouts_per_episode: 8
     block_source_frame_policy: random_within_keyframe_per_rollout
     reset_scene_state_policy: episode_begin
   rollout:
@@ -102,13 +121,13 @@ scheduler_iforward:
     allow_short_final_rollout: false
     min_blocks_per_rollout: 1
     avoid_single_block_tail: false
-    max_inner_K: 8
+    max_inner_K: 20
     detach_graph_after_rollout: true
     shapes:
-      - {name: b1_r8, blocks_per_rollout: 1, repeats_per_block: 8, prob: 0.35}
-      - {name: b1_r6, blocks_per_rollout: 1, repeats_per_block: 6, prob: 0.30}
       - {name: b1_r4, blocks_per_rollout: 1, repeats_per_block: 4, prob: 0.25}
-      - {name: b1_r2, blocks_per_rollout: 1, repeats_per_block: 2, prob: 0.10}
+      - {name: b1_r6, blocks_per_rollout: 1, repeats_per_block: 6, prob: 0.25}
+      - {name: b1_r8, blocks_per_rollout: 1, repeats_per_block: 8, prob: 0.25}
+      - {name: b1_r10, blocks_per_rollout: 1, repeats_per_block: 10, prob: 0.25}
     shapes_schedule: []
   evidence:
     camera_policy: all_cams
@@ -173,43 +192,32 @@ model:
   scale_init_value: 0.1
   sh_degree: 1
   voxel_size: 0.2
-  sparseConv_outdim: 48
-  feat_2d_channels: 48
+  sparseConv_outdim: 64
+  feat_2d_channels: 16
   feat_2d_downscale: 1
   feature_extractor:
-    type: dinov2_unet_fusion
-    dino:
-      model_name: vit_base_patch14_reg4_dinov2
-      pretrained: true
-      freeze: true
-      weights_path: null
-      out_channels: 48
-      intermediate_layers: [4, 8, 11]
-      pad_to_patch_multiple: 14
+    type: residual_only
     residual_unet:
       in_channels: 6
-      feat_channels: 48
-      base_channels: 48
+      feat_channels: 16
+      base_channels: 24
       feature_downscale: 1
-      depth: 4
+      depth: 3
       bilinear: true
-    fusion:
-      hidden_channels: 96
-      out_channels: 48
   use_fused_cuda_backproject_v2: true
   use_fused_cuda_backproject_v3: true
   use_fused_cuda_backproject_v4: true
   fused_cuda_backproject_v4_force_fallback: false
   struct_decoder:
     type: routed_near_far
-    feat_2d_channels: 48
+    feat_2d_channels: 16
     far:
-      hidden_dim: 96
+      hidden_dim: 64
     knn_attention:
       enable: true
       k: 8
   iforward:
-    version: stage2_0_biggs_cuda_exact_diagonal_projector
+    version: stage2_0_biggs_compact16_residualonly
     debug:
       enable_memory_aux_stats: false
       log_per_k_metrics: false
@@ -228,11 +236,19 @@ model:
         method: branch_aware_voxel_cap
         cache_scope: scene_segment_topology
         ignore_episode_id: true
-        cache_max_items: 64
-        cache_device_copy: true
+        cache_max_items: 8
+        cache_device_copy: false
         builder: vectorized_sort_segment
         sort_children: none
         radius_voxel_safety_factor: 2.0
+        build_whdd_basis: true
+        whdd_basis:
+          type: weighted_parent_local_xyz
+          rank: 3
+          dtype: float16
+          min_std: 1.0e-4
+          rigid_space: canonical
+          active_rigid_recenter: true
         mass_init: tau_area
         bg:
           voxel_size: 0.5
@@ -250,12 +266,13 @@ model:
           max_children_per_parent: 32
           max_parent_radius: 0.6
       parent_projector:
-        backend: cuda_exact_diag
+        backend: cuda_exact_diag_forward_only
         covariance_mode: diagonal
         mass_mode: dynamic_tau_area
-        allow_cpu_fallback: true
-        allow_torch_fallback: true
-        grad_to_local_state: true
+        allow_cpu_fallback: false
+        allow_torch_fallback: false
+        grad_mode: stop_geometry
+        grad_to_local_state: false
         min_scale: 1.0e-3
         max_scale_bg: 0.60
         max_scale_distant: 3.0
@@ -269,17 +286,34 @@ model:
         min_child_mass: 1.0e-8
         finite_check: false
         stats_interval: 100
+      parent_state:
+        mode: incremental_sufficient_stats
+        exact_refresh_policy: block_enter
+        update_after_each_nonfinal_repeat: true
+        skip_update_on_block_exit: false
+        update_backend: incremental_sufficient_stats
+        stats_dtype: float32
+        child_cache_dtype: float32
+        drift_check_interval_blocks: 100
+        drift_fail_threshold: 1.0e-3
       child_decoder:
-        mode: low_rank_basis
-        rank: 8
-        hidden_dim: 128
+        mode: whdd_compact_fixed_basis
+        rank: 3
+        parent_event_dim: 64
+        fine_event_dim: 16
+        hidden_dim: 64
         num_layers: 2
         zero_init_last: true
         mean_preserve: true
+        residual_scale_init: 1.0e-2
+        residual_scale_learnable: true
+        residual_scale_per_branch: true
+        fused_cuda: false
+        whdd_chunk_size: 65536
         child_code_parent_local_frame: false
-        detach_child_code_inputs: false
-        detach_child_params: false
-        detach_parent_params: false
+        detach_child_code_inputs: true
+        detach_child_params: true
+        detach_parent_params: true
     history_gate:
       enable: false
     history_gate_v2:
@@ -313,11 +347,12 @@ model:
       source_evidence_grad_mode: train_2d_detach_alpha
       train_2d_frontend: true
       train_residual_unet: true
-      train_fusion_neck: true
+      train_fusion_neck: false
+      train_dino_adapter: false
       train_v4_lift: false
       train_dinov2: false
       detach_v4_outputs: false
-      detach_source_render_for_cnn: false
+      detach_source_render_for_cnn: true
     local_rollout:
       source: scheduler_iforward
       use_scheduler_inner_K: true
@@ -329,22 +364,22 @@ model:
       grouped_multiview_train: true
     struct_event_decoder:
       enable: true
-      event_dim: 96
-      feat_2d_dim: 48
-      support_embed_dim: 8
-      branch_embed_dim: 8
+      event_dim: 64
+      feat_2d_dim: 16
+      support_embed_dim: 4
+      branch_embed_dim: 4
       token:
-        token_dim: 96
+        token_dim: 64
         zero_invalid_2d_feat: true
       param_obs_codec:
         enable: true
         obs_code_dim: 2
         support_dim: 2
-        branch_embed_dim: 8
-        output_dim: 48
-        detach_params: false
-        detach_obs_code: false
-        detach_acc_w: false
+        branch_embed_dim: 4
+        output_dim: 24
+        detach_params: true
+        detach_obs_code: true
+        detach_acc_w: true
         norm: layernorm
         activation: gelu
       near:
@@ -355,7 +390,7 @@ model:
         voxel_size: 0.25
       far:
         type: point_mlp
-        hidden_dim: 96
+        hidden_dim: 64
         num_layers: 2
     event_encoder:
       enable: false
@@ -365,13 +400,16 @@ model:
       enable: true
       input_event: true
       input_current_ctx: false
-      input_vsm_ctx: true
-      hidden_dim: 96
-      event_dim: 96
-      stage_hidden_dim: 96
+      input_vsm_ctx: false
+      hidden_dim: 32
+      event_dim: 16
+      stage_hidden_dim: 0
+      output_hidden: false
+      output_confidence: false
+      output_noop: true
       phase_b_hooks:
-        accept_vsm_ctx: true
-        vsm_ctx_dim: 96
+        accept_vsm_ctx: false
+        vsm_ctx_dim: 16
         vsm_ctx_adapter_init: zero_last
       branch_scope:
         bg: {enable: true, update_means: true, update_scales: true, update_quat: true, update_opacity: true, update_sh: true}
@@ -431,13 +469,11 @@ optimizer:
   type: adamw
   lr:
     default: 1.0e-4
-    vsm_ctx_adapter: 2.0e-4
     stage6_posterior_updater_base: 1.0e-5
     stage6_struct_decoder: 1.0e-5
     biggs_child_decoder: 1.0e-4
     measurement_frontend: 1.0e-5
     stage6_measurement_frontend_residual_unet: 1.0e-5
-    stage6_measurement_frontend_fusion_neck: 1.0e-5
   betas: [0.9, 0.95]
   eps: 1.0e-8
   weight_decay: 1.0e-4
@@ -491,6 +527,13 @@ logging:
     include_per_view_metrics: false
     include_extra_result_metrics: false
     enable_low_psnr_image_dump: false
+  performance:
+    enable: true
+    phase_timing: true
+    cuda_memory: true
+    empty_cache_interval_steps: 0
+    cleanup_metrics_interval_steps: 50
+    live_tensor_summary_interval_steps: 0
   use_tensorboard: true
 
 eval:

@@ -29,8 +29,9 @@ class LocalBranchState:
             return y
 
         n = int(state.means.shape[0])
-        hidden = state.means.new_zeros((n, int(hidden_dim)))
-        hidden.requires_grad_(True)
+        hidden = state.means.new_zeros((n, max(int(hidden_dim), 0)))
+        if hidden.numel() > 0:
+            hidden.requires_grad_(True)
         return cls(
             means=_leaf(state.means),
             scales_log=_leaf(state.scales_log),
@@ -220,6 +221,46 @@ class LocalGSState:
             for value in node.__dict__.values():
                 if torch.is_tensor(value) and value.requires_grad:
                     raise RuntimeError("Persistent writeback tensor must be detached.")
+        return bg, distant, rigid
+
+    def to_node_states_detached_view(self) -> Tuple[NodeStateBackground, Optional[NodeStateDistant], Optional[NodeStateRigid]]:
+        bg = NodeStateBackground(
+            means=self.bg.means.detach(),
+            scales_log=self.bg.scales_log.detach(),
+            quats=self.bg.quats.detach(),
+            opacity_logit=self.bg.opacity_logit.detach(),
+            sh_dc=self.bg.sh_dc.detach(),
+            sh_rest=self.bg.sh_rest.detach(),
+        )
+        distant = None
+        if self.distant is not None:
+            distant = NodeStateDistant(
+                means=self.distant.means.detach(),
+                scales_log=self.distant.scales_log.detach(),
+                quats=self.distant.quats.detach(),
+                opacity_logit=self.distant.opacity_logit.detach(),
+                sh_dc=self.distant.sh_dc.detach(),
+                sh_rest=self.distant.sh_rest.detach(),
+            )
+        rigid = None
+        if self.rigid is not None:
+            if self.rigid_template is None:
+                raise ValueError("rigid local state is present without rigid_template")
+            rigid = NodeStateRigid(
+                means=self.rigid.means.detach(),
+                scales_log=self.rigid.scales_log.detach(),
+                quats=self.rigid.quats.detach(),
+                opacity_logit=self.rigid.opacity_logit.detach(),
+                sh_dc=self.rigid.sh_dc.detach(),
+                sh_rest=self.rigid.sh_rest.detach(),
+                point_ids=self.rigid_template.point_ids.detach(),
+                instances_quats=self.rigid_template.instances_quats.detach(),
+                instances_trans=self.rigid_template.instances_trans.detach(),
+                instances_fv=self.rigid_template.instances_fv.detach(),
+                instance_ids=list(self.rigid_template.instance_ids),
+                frame_ids=list(self.rigid_template.frame_ids),
+                cur_frame=int(self.rigid_template.cur_frame),
+            )
         return bg, distant, rigid
 
     def to_node_states_grad(self) -> Tuple[NodeStateBackground, Optional[NodeStateDistant], Optional[NodeStateRigid]]:

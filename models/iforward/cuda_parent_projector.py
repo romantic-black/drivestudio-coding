@@ -244,6 +244,98 @@ def project_biggs_parent_diag_cuda_tensors(
     )
 
 
+@torch.no_grad()
+def project_biggs_parent_diag_cuda_forward_only_tensors(
+    *,
+    means: torch.Tensor,
+    scales_log: torch.Tensor,
+    quats: torch.Tensor,
+    opacity_logit: torch.Tensor,
+    sh_dc: torch.Tensor,
+    sh_rest: torch.Tensor,
+    child_mass: torch.Tensor,
+    child_order: torch.Tensor,
+    parent_start: torch.Tensor,
+    parent_count: torch.Tensor,
+    min_scale: float,
+    max_scale: float,
+    opacity_cap: float,
+    opacity_min: float,
+    tau_parent_scale: float,
+    eps: float,
+    min_mass: float,
+    mass_mode: str,
+) -> Tuple[torch.Tensor, ...]:
+    ext = _load_biggs_parent_projector_ext()
+    outputs = ext.biggs_parent_project_diag_forward(
+        means.contiguous(),
+        scales_log.contiguous(),
+        quats.contiguous(),
+        opacity_logit.contiguous(),
+        sh_dc.contiguous(),
+        sh_rest.contiguous(),
+        child_mass.to(device=means.device, dtype=means.dtype).contiguous(),
+        child_order.to(device=means.device, dtype=torch.long).contiguous(),
+        parent_start.to(device=means.device, dtype=torch.long).contiguous(),
+        parent_count.to(device=means.device, dtype=torch.long).contiguous(),
+        float(min_scale),
+        float(max_scale),
+        float(opacity_cap),
+        float(opacity_min),
+        float(tau_parent_scale),
+        float(eps),
+        float(min_mass),
+        int(mass_mode_to_id(mass_mode)),
+    )
+    return tuple(x.detach() for x in outputs)
+
+
+@torch.no_grad()
+def project_biggs_parent_diag_cuda_forward_only_with_stats_tensors(
+    *,
+    means: torch.Tensor,
+    scales_log: torch.Tensor,
+    quats: torch.Tensor,
+    opacity_logit: torch.Tensor,
+    sh_dc: torch.Tensor,
+    sh_rest: torch.Tensor,
+    child_mass: torch.Tensor,
+    child_order: torch.Tensor,
+    parent_start: torch.Tensor,
+    parent_count: torch.Tensor,
+    min_scale: float,
+    max_scale: float,
+    opacity_cap: float,
+    opacity_min: float,
+    tau_parent_scale: float,
+    eps: float,
+    min_mass: float,
+    mass_mode: str,
+) -> Tuple[torch.Tensor, ...]:
+    ext = _load_biggs_parent_projector_ext()
+    outputs = ext.biggs_parent_project_diag_forward_with_stats(
+        means.contiguous(),
+        scales_log.contiguous(),
+        quats.contiguous(),
+        opacity_logit.contiguous(),
+        sh_dc.contiguous(),
+        sh_rest.contiguous(),
+        child_mass.to(device=means.device, dtype=means.dtype).contiguous(),
+        child_order.to(device=means.device, dtype=torch.long).contiguous(),
+        parent_start.to(device=means.device, dtype=torch.long).contiguous(),
+        parent_count.to(device=means.device, dtype=torch.long).contiguous(),
+        float(min_scale),
+        float(max_scale),
+        float(opacity_cap),
+        float(opacity_min),
+        float(tau_parent_scale),
+        float(eps),
+        float(min_mass),
+        int(mass_mode_to_id(mass_mode)),
+    )
+    return tuple(x.detach() for x in outputs)
+
+
 def cuda_extension_available() -> bool:
     try:
         _load_biggs_parent_projector_ext()
@@ -254,5 +346,7 @@ def cuda_extension_available() -> bool:
 
 __all__ = [
     "cuda_extension_available",
+    "project_biggs_parent_diag_cuda_forward_only_tensors",
+    "project_biggs_parent_diag_cuda_forward_only_with_stats_tensors",
     "project_biggs_parent_diag_cuda_tensors",
 ]

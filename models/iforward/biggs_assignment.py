@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import replace
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -59,9 +60,159 @@ def _merged_branch_cfg(assignment_cfg: Any, branch: str) -> Dict[str, Any]:
         "sort_children": cfg_get(assignment_cfg, "sort_children", "morton"),
         "builder": cfg_get(assignment_cfg, "builder", "python_bucket"),
         "radius_voxel_safety_factor": cfg_get(assignment_cfg, "radius_voxel_safety_factor", 2.0),
+        "build_whdd_basis": cfg_get(assignment_cfg, "build_whdd_basis", False),
+        "whdd_basis": cfg_get(assignment_cfg, "whdd_basis", {}) or {},
     }
     base.update(_cfg_branch(assignment_cfg, branch))
     return base
+
+
+def _whdd_basis_cfg(cfg: Any) -> Dict[str, Any]:
+    return dict(cfg_get(cfg, "whdd_basis", {}) or {})
+
+
+def _whdd_basis_enabled(cfg: Any) -> bool:
+    return bool(cfg_get(cfg, "build_whdd_basis", False))
+
+
+def _whdd_basis_dtype(cfg: Any) -> torch.dtype:
+    dtype_l = str(cfg_get(_whdd_basis_cfg(cfg), "dtype", "float16")).lower()
+    if dtype_l in {"fp16", "float16", "half"}:
+        return torch.float16
+    if dtype_l in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    if dtype_l in {"fp32", "float32", "float"}:
+        return torch.float32
+    raise ValueError(f"unsupported BigGS WHDD basis dtype={dtype_l!r}")
+
+
+def _build_weighted_parent_local_xyz_basis(
+    *,
+    coords: torch.Tensor,
+    parent_id: torch.Tensor,
+    child_mass: torch.Tensor,
+    parent_count: torch.Tensor,
+    cfg: Any,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    n = int(coords.shape[0])
+    m = int(parent_count.numel())
+    if n == 0 or m == 0:
+        return (
+            coords.new_zeros((n, 3), dtype=_whdd_basis_dtype(cfg)),
+            torch.zeros((m, 3), dtype=torch.bool, device=coords.device),
+            coords.new_zeros((m,), dtype=torch.float32),
+        )
+    pid = parent_id.to(device=coords.device, dtype=torch.long).reshape(-1)
+    if int(pid.numel()) != n:
+        raise ValueError("BigGS WHDD basis parent_id length mismatch")
+    xyz = coords.detach().to(device=coords.device, dtype=torch.float32)
+    mass = child_mass.detach().to(device=coords.device, dtype=torch.float32).reshape(-1).clamp_min(1.0e-8)
+    weight_sum = xyz.new_zeros((m,))
+    weight_sum.index_add_(0, pid, mass)
+    denom = weight_sum.clamp_min(1.0e-8)
+    center_sum = xyz.new_zeros((m, 3))
+    center_sum.index_add_(0, pid, xyz * mass[:, None])
+    center = center_sum / denom[:, None]
+    rel = xyz - center.index_select(0, pid)
+    min_std = float(cfg_get(_whdd_basis_cfg(cfg), "min_std", 1.0e-4))
+    min_eigenvalue = float(cfg_get(_whdd_basis_cfg(cfg), "min_eigenvalue", float(min_std) ** 2))
+    cov_sum = xyz.new_zeros((m, 3, 3))
+    cov_sum.index_add_(0, pid, rel[:, :, None] * rel[:, None, :] * mass[:, None, None])
+    cov = cov_sum / denom[:, None, None]
+    cov = 0.5 * (cov + cov.transpose(-1, -2))
+    eigvals, eigvecs = torch.linalg.eigh(cov)
+    eigvals = eigvals.flip(-1)
+    eigvecs = eigvecs.flip(-1)
+    valid = eigvals >= float(min_eigenvalue)
+    inv_sqrt = torch.where(valid, torch.rsqrt(eigvals.clamp_min(float(min_eigenvalue))), torch.zeros_like(eigvals))
+    whitening = eigvecs * inv_sqrt[:, None, :]
+    basis = torch.bmm(rel[:, None, :], whitening.index_select(0, pid)).squeeze(1)
+    basis = torch.where(valid.index_select(0, pid), basis, torch.zeros_like(basis))
+    basis_dtype = _whdd_basis_dtype(cfg)
+    basis_q = basis.to(dtype=basis_dtype)
+    # Recenter after dtype quantization so fp16/bf16 storage does not reintroduce
+    # a static weighted mean in each parent group.
+    basis_q_f = basis_q.to(dtype=torch.float32)
+    q_mean_sum = xyz.new_zeros((m, 3))
+    q_mean_sum.index_add_(0, pid, basis_q_f * mass[:, None])
+    q_mean = q_mean_sum / denom[:, None]
+    basis_q_f = basis_q_f - q_mean.index_select(0, pid)
+    basis_q_f = torch.where(valid.index_select(0, pid), basis_q_f, torch.zeros_like(basis_q_f))
+    parent_has_children = parent_count.to(device=coords.device, dtype=torch.long).reshape(-1) > 0
+    valid = valid & parent_has_children[:, None]
+    return basis_q_f.to(dtype=basis_dtype), valid, weight_sum
+
+
+def _recenter_stored_child_basis(
+    *,
+    child_basis: torch.Tensor,
+    parent_id: torch.Tensor,
+    child_mass: torch.Tensor,
+    parent_count: torch.Tensor,
+    min_variance: float = 1.0e-8,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    n = int(child_basis.shape[0])
+    rank = int(child_basis.shape[1]) if child_basis.ndim >= 2 else 0
+    m = int(parent_count.numel())
+    if n == 0 or m == 0 or rank == 0:
+        return (
+            child_basis.new_zeros((n, rank)),
+            torch.zeros((m, rank), dtype=torch.bool, device=child_basis.device),
+            child_basis.new_zeros((m,), dtype=torch.float32),
+        )
+    pid = parent_id.to(device=child_basis.device, dtype=torch.long).reshape(-1)
+    if int(pid.numel()) != n:
+        raise ValueError("BigGS WHDD active basis parent_id length mismatch")
+    dtype = child_basis.dtype
+    phi = child_basis.detach().to(device=child_basis.device, dtype=torch.float32)
+    mass = child_mass.detach().to(device=child_basis.device, dtype=torch.float32).reshape(-1).clamp_min(1.0e-8)
+    weight_sum = phi.new_zeros((m,))
+    weight_sum.index_add_(0, pid, mass)
+    denom = weight_sum.clamp_min(1.0e-8)
+    mean_sum = phi.new_zeros((m, rank))
+    mean_sum.index_add_(0, pid, phi * mass[:, None])
+    mean = mean_sum / denom[:, None]
+    centered = phi - mean.index_select(0, pid)
+    var_sum = phi.new_zeros((m, rank))
+    var_sum.index_add_(0, pid, centered.square() * mass[:, None])
+    valid = (var_sum / denom[:, None]) >= float(min_variance)
+    valid = valid & (parent_count.to(device=child_basis.device, dtype=torch.long).reshape(-1) > 0)[:, None]
+    centered = torch.where(valid.index_select(0, pid), centered, torch.zeros_like(centered))
+    centered_q = centered.to(dtype=dtype)
+
+    # Recenter once more in the storage dtype to keep fp16/bf16 active subsets
+    # mean-preserving without changing the canonical basis scale.
+    centered_f = centered_q.to(dtype=torch.float32)
+    q_mean_sum = phi.new_zeros((m, rank))
+    q_mean_sum.index_add_(0, pid, centered_f * mass[:, None])
+    q_mean = q_mean_sum / denom[:, None]
+    centered_f = centered_f - q_mean.index_select(0, pid)
+    centered_f = torch.where(valid.index_select(0, pid), centered_f, torch.zeros_like(centered_f))
+    return centered_f.to(dtype=dtype), valid, weight_sum
+
+
+def _maybe_attach_whdd_basis(
+    assignment: BigGSBranchAssignment,
+    *,
+    coords: torch.Tensor,
+    cfg: Any,
+) -> BigGSBranchAssignment:
+    if not _whdd_basis_enabled(cfg):
+        return assignment
+    child_basis, basis_valid, basis_weight_sum = _build_weighted_parent_local_xyz_basis(
+        coords=coords,
+        parent_id=assignment.child_to_parent,
+        child_mass=assignment.child_mass,
+        parent_count=assignment.parent_count,
+        cfg=cfg,
+    )
+    return replace(
+        assignment,
+        child_basis=child_basis,
+        basis_valid=basis_valid,
+        basis_weight_sum=basis_weight_sum,
+        basis_version=1,
+    )
 
 
 def _sorted_group_children(means_cpu: torch.Tensor, children: Sequence[int], sort_mode: str) -> List[int]:
@@ -204,7 +355,7 @@ def _build_biggs_branch_assignment_python(
             child_order_list.append(int(child))
     child_order = torch.tensor(child_order_list, dtype=torch.long)
     parent_object_id = torch.tensor(parent_object, dtype=torch.long)
-    return BigGSBranchAssignment(
+    assignment = BigGSBranchAssignment(
         branch=str(branch),
         child_to_parent=child_to_parent.to(device=means.device),
         child_order=child_order.to(device=means.device),
@@ -216,6 +367,7 @@ def _build_biggs_branch_assignment_python(
         object_id=object_id.detach().clone().to(device=means.device) if object_id is not None else None,
         parent_object_id=parent_object_id.to(device=means.device),
     )
+    return _maybe_attach_whdd_basis(assignment, coords=means, cfg=branch_cfg)
 
 
 def _build_biggs_branch_assignment_vectorized(
@@ -337,7 +489,7 @@ def _build_biggs_branch_assignment_vectorized(
     first_object_per_bucket = object_values.index_select(0, first_child_per_bucket)
     parent_object_id = first_object_per_bucket.index_select(0, parent_bucket_id)
 
-    return BigGSBranchAssignment(
+    assignment = BigGSBranchAssignment(
         branch=str(branch),
         child_to_parent=child_to_parent,
         child_order=order,
@@ -349,6 +501,7 @@ def _build_biggs_branch_assignment_vectorized(
         object_id=object_values.detach().clone() if object_id is not None else None,
         parent_object_id=parent_object_id,
     )
+    return _maybe_attach_whdd_basis(assignment, coords=means, cfg=branch_cfg)
 
 
 def build_biggs_branch_assignment(
@@ -444,6 +597,9 @@ def build_rigid_active_assignment(
             child_mass_S=empty_f,
             parent_inside_mask=empty_b,
             child_inside_mask_S=empty_b,
+            child_basis_S=None,
+            basis_valid=None,
+            basis_weight_sum=None,
         )
     parent_global = rigid_assignment.child_to_parent.to(device=device)[fine_S.long()]
     inside = inside_mask_S.to(device=device, dtype=torch.bool).reshape(-1)
@@ -471,6 +627,19 @@ def build_rigid_active_assignment(
         rows = torch.nonzero(child_to_active == parent_idx, as_tuple=False).reshape(-1)
         counts[parent_idx] = int(rows.numel())
         ordered_rows.extend(int(x) for x in rows.tolist())
+    child_basis_S = None
+    basis_valid = None
+    basis_weight_sum = None
+    if rigid_assignment.child_basis is not None:
+        selected_basis = rigid_assignment.child_basis.to(device=device).index_select(0, fine_S.long())
+        child_basis_S, basis_valid, basis_weight_sum = _recenter_stored_child_basis(
+            child_basis=selected_basis,
+            parent_id=child_to_active,
+            child_mass=rigid_assignment.child_mass.to(device=device).index_select(0, fine_S.long()),
+            parent_count=counts,
+            min_variance=1.0e-8,
+        )
+
     return BigGSRigidActiveAssignment(
         fine_S=fine_S.detach().clone(),
         child_to_active_parent_S=child_to_active,
@@ -481,6 +650,9 @@ def build_rigid_active_assignment(
         child_mass_S=rigid_assignment.child_mass.to(device=device)[fine_S.long()],
         parent_inside_mask=torch.tensor(active_inside, dtype=torch.bool, device=device),
         child_inside_mask_S=inside,
+        child_basis_S=child_basis_S,
+        basis_valid=basis_valid,
+        basis_weight_sum=basis_weight_sum,
     )
 
 

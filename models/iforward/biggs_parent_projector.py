@@ -77,6 +77,8 @@ def _finite_check_enabled(cfg: Any) -> bool:
 
 def _backend_id(backend: str) -> float:
     backend_l = str(backend).lower()
+    if backend_l in {"cuda_exact_diag_forward_only", "cuda_exact_diagonal_forward_only"}:
+        return 3.0
     if backend_l in {"cuda_exact_diag", "cuda_exact_diagonal"}:
         return 2.0
     if backend_l in {"torch_exact_diag", "torch_diag_reference", "torch_diagonal", "diagonal"}:
@@ -206,14 +208,72 @@ def _project_params_to_parents_diag(
     used_backend = backend_l
 
     outputs = None
-    if backend_l in {"cuda_exact_diag", "cuda_exact_diagonal"}:
+    forward_only = backend_l in {"cuda_exact_diag_forward_only", "cuda_exact_diagonal_forward_only"}
+    if backend_l in {"cuda_exact_diag", "cuda_exact_diagonal"} or forward_only:
         if means.is_cuda:
             if child_order is None or parent_start is None:
-                raise ValueError("cuda_exact_diag requires grouped child_order and parent_start")
+                raise ValueError(f"{backend_l} requires grouped child_order and parent_start")
             try:
-                from .cuda_parent_projector import project_biggs_parent_diag_cuda_tensors
+                if forward_only:
+                    from .cuda_parent_projector import project_biggs_parent_diag_cuda_forward_only_tensors
 
-                outputs = project_biggs_parent_diag_cuda_tensors(
+                    outputs = project_biggs_parent_diag_cuda_forward_only_tensors(
+                        means=means,
+                        scales_log=params["scales_log"],
+                        quats=params["quats"],
+                        opacity_logit=params["opacity_logit"],
+                        sh_dc=params["sh_dc"],
+                        sh_rest=params["sh_rest"],
+                        child_mass=child_mass,
+                        child_order=child_order,
+                        parent_start=parent_start,
+                        parent_count=parent_count,
+                        min_scale=min_scale,
+                        max_scale=max_scale_f,
+                        opacity_cap=opacity_cap,
+                        opacity_min=opacity_min,
+                        tau_parent_scale=tau_parent_scale,
+                        eps=eps,
+                        min_mass=min_mass,
+                        mass_mode=mass_mode,
+                    )
+                else:
+                    from .cuda_parent_projector import project_biggs_parent_diag_cuda_tensors
+
+                    outputs = project_biggs_parent_diag_cuda_tensors(
+                        means=means,
+                        scales_log=params["scales_log"],
+                        quats=params["quats"],
+                        opacity_logit=params["opacity_logit"],
+                        sh_dc=params["sh_dc"],
+                        sh_rest=params["sh_rest"],
+                        child_mass=child_mass,
+                        child_order=child_order,
+                        parent_start=parent_start,
+                        parent_count=parent_count,
+                        min_scale=min_scale,
+                        max_scale=max_scale_f,
+                        opacity_cap=opacity_cap,
+                        opacity_min=opacity_min,
+                        tau_parent_scale=tau_parent_scale,
+                        eps=eps,
+                        min_mass=min_mass,
+                        mass_mode=mass_mode,
+                    )
+            except BaseException:
+                if not bool(cfg_get(cfg, "allow_torch_fallback", cfg_get(cfg, "allow_cpu_fallback", True))):
+                    raise
+                used_backend = "torch_exact_diag_fallback"
+                outputs = None
+        elif not bool(cfg_get(cfg, "allow_cpu_fallback", True)):
+            raise RuntimeError(f"{backend_l} requires CUDA tensors when allow_cpu_fallback=false")
+
+    if outputs is None:
+        if (backend_l in {"cuda_exact_diag", "cuda_exact_diagonal"} or forward_only) and means.is_cuda:
+            used_backend = "torch_exact_diag_fallback"
+        if forward_only:
+            with torch.no_grad():
+                outputs = project_biggs_parent_diag_reference_tensors(
                     means=means,
                     scales_log=params["scales_log"],
                     quats=params["quats"],
@@ -221,8 +281,7 @@ def _project_params_to_parents_diag(
                     sh_dc=params["sh_dc"],
                     sh_rest=params["sh_rest"],
                     child_mass=child_mass,
-                    child_order=child_order,
-                    parent_start=parent_start,
+                    child_to_parent=child_to_parent,
                     parent_count=parent_count,
                     min_scale=min_scale,
                     max_scale=max_scale_f,
@@ -233,36 +292,27 @@ def _project_params_to_parents_diag(
                     min_mass=min_mass,
                     mass_mode=mass_mode,
                 )
-            except BaseException:
-                if not bool(cfg_get(cfg, "allow_torch_fallback", cfg_get(cfg, "allow_cpu_fallback", True))):
-                    raise
-                used_backend = "torch_exact_diag_fallback"
-                outputs = None
-        elif not bool(cfg_get(cfg, "allow_cpu_fallback", True)):
-            raise RuntimeError("cuda_exact_diag requires CUDA tensors when allow_cpu_fallback=false")
-
-    if outputs is None:
-        if backend_l in {"cuda_exact_diag", "cuda_exact_diagonal"} and means.is_cuda:
-            used_backend = "torch_exact_diag_fallback"
-        outputs = project_biggs_parent_diag_reference_tensors(
-            means=means,
-            scales_log=params["scales_log"],
-            quats=params["quats"],
-            opacity_logit=params["opacity_logit"],
-            sh_dc=params["sh_dc"],
-            sh_rest=params["sh_rest"],
-            child_mass=child_mass,
-            child_to_parent=child_to_parent,
-            parent_count=parent_count,
-            min_scale=min_scale,
-            max_scale=max_scale_f,
-            opacity_cap=opacity_cap,
-            opacity_min=opacity_min,
-            tau_parent_scale=tau_parent_scale,
-            eps=eps,
-            min_mass=min_mass,
-            mass_mode=mass_mode,
-        )
+                outputs = tuple(x.detach() for x in outputs)
+        else:
+            outputs = project_biggs_parent_diag_reference_tensors(
+                means=means,
+                scales_log=params["scales_log"],
+                quats=params["quats"],
+                opacity_logit=params["opacity_logit"],
+                sh_dc=params["sh_dc"],
+                sh_rest=params["sh_rest"],
+                child_mass=child_mass,
+                child_to_parent=child_to_parent,
+                parent_count=parent_count,
+                min_scale=min_scale,
+                max_scale=max_scale_f,
+                opacity_cap=opacity_cap,
+                opacity_min=opacity_min,
+                tau_parent_scale=tau_parent_scale,
+                eps=eps,
+                min_mass=min_mass,
+                mass_mode=mass_mode,
+            )
 
     parent_means, parent_scales_log, parent_quats, parent_opacity_logit, parent_sh_dc, parent_sh_rest, mass_sum, mass_mean = outputs
     parent_params = {
@@ -273,6 +323,12 @@ def _project_params_to_parents_diag(
         "sh_dc": parent_sh_dc,
         "sh_rest": parent_sh_rest,
     }
+    if forward_only:
+        parent_params = {key: value.detach() for key, value in parent_params.items()}
+        mass_sum = mass_sum.detach()
+        mass_mean = mass_mean.detach()
+        if any(value.requires_grad for value in parent_params.values()) or mass_sum.requires_grad or mass_mean.requires_grad:
+            raise RuntimeError("BigGS forward-only parent projector produced tensors requiring grad")
     if _finite_check_enabled(cfg):
         for key, value in parent_params.items():
             if not torch.isfinite(value).all():
@@ -303,7 +359,16 @@ def _project_params_to_parents(
     parent_start: Optional[torch.Tensor] = None,
 ) -> BigGSParentProjection:
     backend = str(cfg_get(cfg, "backend", cfg_get(cfg, "mode", "torch_full_eigh"))).lower()
-    if backend in {"cuda_exact_diag", "cuda_exact_diagonal", "torch_exact_diag", "torch_diag_reference", "torch_diagonal", "diagonal"}:
+    if backend in {
+        "cuda_exact_diag",
+        "cuda_exact_diagonal",
+        "cuda_exact_diag_forward_only",
+        "cuda_exact_diagonal_forward_only",
+        "torch_exact_diag",
+        "torch_diag_reference",
+        "torch_diagonal",
+        "diagonal",
+    }:
         covariance_mode = str(cfg_get(cfg, "covariance_mode", "diagonal")).lower()
         if covariance_mode not in {"diagonal", "diag", "exact_diagonal"}:
             raise ValueError(f"{backend} requires covariance_mode=diagonal, got {covariance_mode!r}")

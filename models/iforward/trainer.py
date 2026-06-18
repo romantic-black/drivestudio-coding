@@ -90,6 +90,8 @@ class IForwardTrainer(nn.Module):
         return str(cfg_get(iforward_cfg, "version", "")) in {
             "stage2_0_biggs_parent_lifting",
             "stage2_0_biggs_cuda_exact_diagonal_projector",
+            "stage2_0_biggs_incremental_whdd",
+            "stage2_0_biggs_compact16_residualonly",
         }
 
     def _is_v3_gru_history_gate(self) -> bool:
@@ -171,10 +173,11 @@ class IForwardTrainer(nn.Module):
             }
         elif self._is_stage2_0_biggs_parent_lifting():
             groups = {
-                "vsm_ctx_adapter": adapter_named,
                 "stage6_posterior_updater_base": updater_base,
                 "stage6_struct_decoder": self._named_params(struct_decoder, "stage6_struct_event_decoder"),
             }
+            if adapter_named:
+                groups["vsm_ctx_adapter"] = adapter_named
         else:
             memory = getattr(self.model, "memory", None)
             memory_named = self._named_params(memory if isinstance(memory, nn.Module) else None, "memory")
@@ -473,6 +476,79 @@ class IForwardTrainer(nn.Module):
         if bool(enabled) and torch.cuda.is_available():
             torch.cuda.synchronize()
 
+    @staticmethod
+    def _cuda_memory_snapshot() -> Dict[str, int]:
+        if not torch.cuda.is_available():
+            return {}
+        device = torch.cuda.current_device()
+        allocated = int(torch.cuda.memory_allocated(device))
+        reserved = int(torch.cuda.memory_reserved(device))
+        peak_allocated = int(torch.cuda.max_memory_allocated(device))
+        peak_reserved = int(torch.cuda.max_memory_reserved(device))
+        try:
+            free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+            free_bytes = int(free_bytes)
+            total_bytes = int(total_bytes)
+            driver_used = int(total_bytes - free_bytes)
+        except Exception:
+            free_bytes = 0
+            total_bytes = 0
+            driver_used = 0
+        return {
+            "allocated": allocated,
+            "reserved": reserved,
+            "peak_allocated": peak_allocated,
+            "peak_reserved": peak_reserved,
+            "driver_used": driver_used,
+            "driver_free": free_bytes,
+            "driver_total": total_bytes,
+        }
+
+    @staticmethod
+    def _record_cuda_memory_snapshot(
+        metrics: Dict[str, float],
+        snapshots: Dict[str, Dict[str, int]],
+        label: str,
+        *,
+        baseline: Optional[Dict[str, int]],
+    ) -> None:
+        snap = IForwardTrainer._cuda_memory_snapshot()
+        if not snap:
+            return
+        snapshots[str(label)] = snap
+        scale = 1024.0 * 1024.0
+        prefix = f"perf/cuda/{label}"
+        metrics[f"{prefix}_allocated_mb"] = float(snap["allocated"] / scale)
+        metrics[f"{prefix}_reserved_mb"] = float(snap["reserved"] / scale)
+        metrics[f"{prefix}_peak_allocated_mb"] = float(snap["peak_allocated"] / scale)
+        metrics[f"{prefix}_peak_reserved_mb"] = float(snap["peak_reserved"] / scale)
+        metrics[f"{prefix}_driver_used_mb"] = float(snap["driver_used"] / scale)
+        metrics[f"{prefix}_driver_free_mb"] = float(snap["driver_free"] / scale)
+        metrics[f"{prefix}_driver_total_mb"] = float(snap["driver_total"] / scale)
+        metrics[f"{prefix}_reserved_minus_allocated_mb"] = float((snap["reserved"] - snap["allocated"]) / scale)
+        metrics[f"{prefix}_driver_used_minus_reserved_mb"] = float((snap["driver_used"] - snap["reserved"]) / scale)
+        if baseline:
+            metrics[f"{prefix}_allocated_delta_mb"] = float((snap["allocated"] - baseline["allocated"]) / scale)
+            metrics[f"{prefix}_reserved_delta_mb"] = float((snap["reserved"] - baseline["reserved"]) / scale)
+            metrics[f"{prefix}_driver_used_delta_mb"] = float((snap["driver_used"] - baseline["driver_used"]) / scale)
+
+    @staticmethod
+    def _record_cuda_phase_delta(
+        metrics: Dict[str, float],
+        snapshots: Dict[str, Dict[str, int]],
+        phase: str,
+        start_label: str,
+        end_label: str,
+    ) -> None:
+        start = snapshots.get(str(start_label))
+        end = snapshots.get(str(end_label))
+        if not start or not end:
+            return
+        scale = 1024.0 * 1024.0
+        prefix = f"perf/cuda/{phase}"
+        for name in ("allocated", "reserved", "driver_used"):
+            metrics[f"{prefix}_{name}_delta_mb"] = float((end[name] - start[name]) / scale)
+
     def _reset_bridge_runtime_node_state(self) -> Dict[str, int]:
         bridge = getattr(self.model, "bridge", None)
         reset = getattr(bridge, "reset_runtime_node_state", None)
@@ -486,19 +562,41 @@ class IForwardTrainer(nn.Module):
         step: Optional[int] = None,
         profile_phase_timing: bool = False,
         sync_cuda_timing: bool = False,
+        profile_cuda_memory: bool = False,
         scheduler_node_sync: Optional[Dict[str, Any]] = None,
         runtime_policy: Optional[Any] = None,
         ablation: Optional[str] = None,
     ) -> Dict[str, Any]:
         _ = (scheduler_node_sync, runtime_policy)
         profile_cuda = bool(profile_phase_timing or sync_cuda_timing)
+        profile_memory = bool(profile_cuda_memory and torch.cuda.is_available())
         timings: Dict[str, float] = {}
+        cuda_memory_metrics: Dict[str, float] = {}
+        cuda_memory_snapshots: Dict[str, Dict[str, int]] = {}
+        cuda_memory_baseline: Optional[Dict[str, int]] = None
+        if profile_memory:
+            cuda_memory_baseline = self._cuda_memory_snapshot()
+            if cuda_memory_baseline:
+                cuda_memory_snapshots["start"] = cuda_memory_baseline
+                self._record_cuda_memory_snapshot(
+                    cuda_memory_metrics,
+                    cuda_memory_snapshots,
+                    "start",
+                    baseline=cuda_memory_baseline,
+                )
         batch = dict(batch)
         batch["global_step"] = int(step or 0)
         self._apply_trainability_schedule(int(step or 0))
         t0 = time.perf_counter()
         resolved = self.model.resolver.resolve(batch)
         timings["resolve_ms"] = (time.perf_counter() - t0) * 1000.0
+        if profile_memory:
+            self._record_cuda_memory_snapshot(
+                cuda_memory_metrics,
+                cuda_memory_snapshots,
+                "after_resolve",
+                baseline=cuda_memory_baseline,
+            )
         t0 = time.perf_counter()
         key = tuple(resolved.cache_key)
         runtime_reset_before: Dict[str, int] = {}
@@ -508,22 +606,50 @@ class IForwardTrainer(nn.Module):
             runtime_reset_before = self._reset_bridge_runtime_node_state()
         carried = self._state_cache.get(key)
         timings["state_cache_ms"] = (time.perf_counter() - t0) * 1000.0
+        if profile_memory:
+            self._record_cuda_memory_snapshot(
+                cuda_memory_metrics,
+                cuda_memory_snapshots,
+                "after_state_cache_lookup",
+                baseline=cuda_memory_baseline,
+            )
 
         self.train(True)
         t0 = time.perf_counter()
         self.optimizer.zero_grad(set_to_none=True)
         timings["optimizer_ms"] = (time.perf_counter() - t0) * 1000.0
+        if profile_memory:
+            self._record_cuda_memory_snapshot(
+                cuda_memory_metrics,
+                cuda_memory_snapshots,
+                "after_zero_grad",
+                baseline=cuda_memory_baseline,
+            )
         self._sync_cuda(profile_cuda)
         t0 = time.perf_counter()
         out = self.model.forward_rollout(batch, carried_state=carried, ablation=ablation)
         self._sync_cuda(profile_cuda)
         timings["forward_ms"] = (time.perf_counter() - t0) * 1000.0
+        if profile_memory:
+            self._record_cuda_memory_snapshot(
+                cuda_memory_metrics,
+                cuda_memory_snapshots,
+                "after_forward",
+                baseline=cuda_memory_baseline,
+            )
         loss = out.loss
         self._sync_cuda(profile_cuda)
         t0 = time.perf_counter()
         loss.backward()
         self._sync_cuda(profile_cuda)
         timings["backward_ms"] = (time.perf_counter() - t0) * 1000.0
+        if profile_memory:
+            self._record_cuda_memory_snapshot(
+                cuda_memory_metrics,
+                cuda_memory_snapshots,
+                "after_backward",
+                baseline=cuda_memory_baseline,
+            )
         t0 = time.perf_counter()
         params_with_grad = [p for p in self.model.parameters() if p.requires_grad and p.grad is not None]
         grad_norm_unclipped = self._grad_norm(params_with_grad).to(device=loss.device)
@@ -542,12 +668,26 @@ class IForwardTrainer(nn.Module):
         group_metrics = self._optimizer_group_metrics()
         adapter_metrics = self._adapter_metrics()
         timings["grad_norm_ms"] = (time.perf_counter() - t0) * 1000.0
+        if profile_memory:
+            self._record_cuda_memory_snapshot(
+                cuda_memory_metrics,
+                cuda_memory_snapshots,
+                "after_grad_norm",
+                baseline=cuda_memory_baseline,
+            )
         self._sync_cuda(profile_cuda)
         t0 = time.perf_counter()
         self.optimizer.step()
         self.optimizer.zero_grad(set_to_none=True)
         self._sync_cuda(profile_cuda)
         timings["optimizer_ms"] += (time.perf_counter() - t0) * 1000.0
+        if profile_memory:
+            self._record_cuda_memory_snapshot(
+                cuda_memory_metrics,
+                cuda_memory_snapshots,
+                "after_optimizer",
+                baseline=cuda_memory_baseline,
+            )
 
         t0 = time.perf_counter()
         runtime_reset_after: Dict[str, int] = {}
@@ -557,6 +697,13 @@ class IForwardTrainer(nn.Module):
             self._state_cache.pop(key, None)
             runtime_reset_after = self._reset_bridge_runtime_node_state()
         timings["state_cache_ms"] += (time.perf_counter() - t0) * 1000.0
+        if profile_memory:
+            self._record_cuda_memory_snapshot(
+                cuda_memory_metrics,
+                cuda_memory_snapshots,
+                "after_state_cache_update",
+                baseline=cuda_memory_baseline,
+            )
 
         t0 = time.perf_counter()
         losses = {name: float(value.detach().item()) for name, value in out.losses.items()}
@@ -608,6 +755,43 @@ class IForwardTrainer(nn.Module):
             final[f"iforward/loss_{name}"] = float(value)
         final.update(group_metrics)
         final.update(adapter_metrics)
+        final.update(cuda_memory_metrics)
+        if profile_memory:
+            self._record_cuda_phase_delta(
+                final,
+                cuda_memory_snapshots,
+                "forward",
+                "after_zero_grad",
+                "after_forward",
+            )
+            self._record_cuda_phase_delta(
+                final,
+                cuda_memory_snapshots,
+                "backward",
+                "after_forward",
+                "after_backward",
+            )
+            self._record_cuda_phase_delta(
+                final,
+                cuda_memory_snapshots,
+                "grad_norm",
+                "after_backward",
+                "after_grad_norm",
+            )
+            self._record_cuda_phase_delta(
+                final,
+                cuda_memory_snapshots,
+                "optimizer_step",
+                "after_grad_norm",
+                "after_optimizer",
+            )
+            self._record_cuda_phase_delta(
+                final,
+                cuda_memory_snapshots,
+                "state_cache_update",
+                "after_optimizer",
+                "after_state_cache_update",
+            )
         final.update(self._random_window_revisit_metrics(out))
         for name, value in out.stats.items():
             out_name = str(name) if str(name).startswith("iforward/") else f"iforward/{name}"
@@ -642,6 +826,13 @@ class IForwardTrainer(nn.Module):
                     if math.isfinite(value_f):
                         final[f"iforward/k{k}/{name}"] = value_f
         final["logging_pack_ms"] = float((time.perf_counter() - t0) * 1000.0)
+        if profile_memory:
+            self._record_cuda_memory_snapshot(
+                final,
+                cuda_memory_snapshots,
+                "after_logging_pack",
+                baseline=cuda_memory_baseline,
+            )
         return final
 
     def reset_iforward_state_cache(self) -> None:

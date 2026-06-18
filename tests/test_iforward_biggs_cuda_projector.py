@@ -5,6 +5,7 @@ import torch
 
 from models.iforward.biggs_parent_projector import project_biggs_parents
 from models.iforward.biggs_parent_projector_diag import project_biggs_parent_diag_reference_tensors
+from models.iforward.biggs_parent_stats import init_parent_branch_runtime, projection_from_runtime
 from models.iforward.biggs_state import BigGSBranchAssignment
 
 
@@ -170,6 +171,21 @@ def test_biggs_diag_static_mass_does_not_route_mean_grad_through_opacity() -> No
     assert branch.opacity_logit.grad is None or float(branch.opacity_logit.grad.abs().sum().item()) == 0.0
 
 
+def test_biggs_diag_forward_only_has_no_grad_fn() -> None:
+    branch, assign = _inputs(torch.device("cpu"))
+    for tensor in (branch.means, branch.scales_log, branch.quats, branch.opacity_logit, branch.sh_dc, branch.sh_rest):
+        tensor.requires_grad_(True)
+    proj = project_biggs_parents(
+        branch=branch,
+        assignment=assign,
+        cfg=_cfg(backend="cuda_exact_diag_forward_only", allow_cpu_fallback=True),
+        max_scale=2.0,
+    )
+    assert all(not value.requires_grad for value in proj.params.values())
+    assert proj.child_mass_sum.requires_grad is False
+    assert proj.child_mass_mean.requires_grad is False
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_biggs_diag_cuda_forward_matches_reference() -> None:
     branch, assign = _inputs(torch.device("cuda"))
@@ -209,6 +225,66 @@ def test_biggs_diag_cuda_forward_matches_reference() -> None:
     ):
         assert torch.allclose(actual, expected, atol=5.0e-5, rtol=5.0e-4)
     assert proj.aux_stats["projector_backend_id"] == 2.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_biggs_parent_runtime_cuda_init_matches_torch_stats_and_cache() -> None:
+    branch, assign = _inputs(torch.device("cuda"))
+    params = {
+        "means": branch.means,
+        "scales_log": branch.scales_log,
+        "quats": branch.quats,
+        "opacity_logit": branch.opacity_logit,
+        "sh_dc": branch.sh_dc,
+        "sh_rest": branch.sh_rest,
+    }
+    common_cfg = _cfg(
+        backend="torch_exact_diag",
+        finite_check=False,
+        child_cache_dtype="float32",
+    )
+    ref_runtime = init_parent_branch_runtime(
+        params=params,
+        child_to_parent=assign.child_to_parent,
+        parent_count=assign.parent_count,
+        child_mass=assign.child_mass,
+        cfg=common_cfg,
+        child_order=assign.child_order,
+        parent_start=assign.parent_start,
+        max_scale=2.0,
+    )
+    cuda_runtime = init_parent_branch_runtime(
+        params=params,
+        child_to_parent=assign.child_to_parent,
+        parent_count=assign.parent_count,
+        child_mass=assign.child_mass,
+        cfg=_cfg(
+            backend="cuda_exact_diag_forward_only",
+            allow_torch_fallback=False,
+            allow_cpu_fallback=False,
+            finite_check=False,
+            child_cache_dtype="float32",
+        ),
+        child_order=assign.child_order,
+        parent_start=assign.parent_start,
+        max_scale=2.0,
+    )
+    for key in ("means", "scales_log", "quats", "opacity_logit", "sh_dc", "sh_rest"):
+        assert torch.allclose(cuda_runtime.params[key], ref_runtime.params[key], atol=5.0e-5, rtol=5.0e-4)
+    for key in ("weight_sum", "weighted_mean_sum", "weighted_second_sum", "tau_area_sum", "weighted_sh_dc_sum", "weighted_sh_rest_sum"):
+        assert torch.allclose(
+            getattr(cuda_runtime.stats, key),
+            getattr(ref_runtime.stats, key),
+            atol=5.0e-5,
+            rtol=5.0e-4,
+        )
+    assert torch.allclose(cuda_runtime.child_cache.mass, ref_runtime.child_cache.mass, atol=5.0e-5, rtol=5.0e-4)
+    assert torch.allclose(cuda_runtime.child_cache.tau_area, ref_runtime.child_cache.tau_area, atol=5.0e-5, rtol=5.0e-4)
+    assert torch.allclose(cuda_runtime.child_cache.diag_cov, ref_runtime.child_cache.diag_cov, atol=5.0e-5, rtol=5.0e-4)
+    proj = projection_from_runtime(cuda_runtime)
+    assert proj.aux_stats["projector_backend_id"] == 3.0
+    assert proj.aux_stats["parent_runtime_init_backend_id"] == 3.0
+    assert proj.aux_stats["parent_runtime_update_backend_id"] == 0.0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

@@ -8,6 +8,8 @@ import torch
 import torch.nn as nn
 
 from models.feature_extractors.dinov2_unet_fusion import DINOv2BackboneAdapter, DINOv2UNetFusionExtractor
+from models.feature_extractors.residual_only import ResidualOnlyFeatureExtractor
+from models.iforward.dino_feature_cache import DINOFeatureCache
 
 
 class _FakeBackbone(nn.Module):
@@ -138,6 +140,22 @@ def test_fusion_extractor_contract_rgb_only_for_dino_and_full_6ch_for_unet(fake_
     assert torch.allclose(spy_unet.last_multi, x_nchw)
 
 
+def test_residual_only_extractor_uses_6ch_unet_without_dino_or_fusion() -> None:
+    extractor = ResidualOnlyFeatureExtractor(
+        in_channels=6,
+        feat_channels=16,
+        base_channels=8,
+        feature_downscale=1,
+        depth=1,
+        bilinear=True,
+    )
+    x = torch.randn(2, 6, 8, 10)
+    out = extractor(x)
+    assert tuple(out.shape) == (2, 8, 10, 16)
+    assert not hasattr(extractor, "dino_adapter")
+    assert not hasattr(extractor, "fusion_neck")
+
+
 def test_fusion_extractor_accepts_channels_last_and_exposes_feature_resolution(fake_timm):
     _ = fake_timm
     extractor = DINOv2UNetFusionExtractor(
@@ -161,3 +179,107 @@ def test_fusion_extractor_accepts_channels_last_and_exposes_feature_resolution(f
     assert tuple(spy_unet.last_multi.shape) == (2, 6, 7, 9)
 
     assert extractor.get_feature_resolution(11, 13) == (5, 6)
+
+
+def test_fusion_extractor_cached_dino_matches_uncached_and_keeps_grad(fake_timm):
+    _ = fake_timm
+    extractor = DINOv2UNetFusionExtractor(
+        dino_model_name="vit_base_patch14_reg4_dinov2",
+        dino_pretrained=False,
+        dino_out_channels=8,
+        residual_feat_channels=8,
+        residual_base_channels=8,
+        fusion_hidden_channels=8,
+        fusion_out_channels=4,
+    )
+    extractor.eval()
+    x = torch.randn(1, 6, 32, 32)
+    residual = extractor.extract_residual_feature(x)
+    cached = extractor.extract_dino_feature(x[:, :3], target_hw=(int(residual.shape[1]), int(residual.shape[2])))
+    assert cached.requires_grad is False
+    out_cached = extractor(x, cached_dino=cached)
+    out_uncached = extractor(x)
+    assert torch.allclose(out_cached, out_uncached, atol=1.0e-6)
+    loss = out_cached.square().mean()
+    loss.backward()
+    residual_grad = sum(
+        float(p.grad.detach().abs().sum().item())
+        for p in extractor.residual_unet.parameters()
+        if p.grad is not None
+    )
+    fusion_grad = sum(
+        float(p.grad.detach().abs().sum().item())
+        for p in extractor.fusion_neck.parameters()
+        if p.grad is not None
+    )
+    assert residual_grad > 0.0
+    assert fusion_grad > 0.0
+
+
+def test_fusion_extractor_cached_backbone_intermediates_keep_adapter_grad(fake_timm):
+    _ = fake_timm
+    extractor = DINOv2UNetFusionExtractor(
+        dino_model_name="vit_base_patch14_reg4_dinov2",
+        dino_pretrained=False,
+        dino_out_channels=8,
+        residual_feat_channels=8,
+        residual_base_channels=8,
+        fusion_hidden_channels=8,
+        fusion_out_channels=4,
+    )
+    extractor.eval()
+    x = torch.randn(1, 6, 32, 32)
+    residual = extractor.extract_residual_feature(x)
+    target_hw = (int(residual.shape[1]), int(residual.shape[2]))
+    feats = extractor.extract_dino_backbone_intermediates(x[:, :3])
+    assert isinstance(feats, tuple)
+    cache = DINOFeatureCache(dtype="float16", cpu_pinned=False, cpu_max_items=1, gpu_max_items=1)
+    cached, stats = cache.get_or_compute(
+        key=("scene", 0),
+        device=torch.device("cpu"),
+        compute=lambda: feats,
+        trainable=False,
+    )
+    assert stats.miss == 1.0
+    assert isinstance(cached, tuple)
+    dino_feat = extractor.adapt_dino_backbone_intermediates(cached, target_hw=target_hw)
+    out = extractor.fuse_features(dino_feat, residual)
+    loss = out.square().mean()
+    loss.backward()
+    adapter_grad = sum(
+        float(p.grad.detach().abs().sum().item())
+        for p in list(extractor.dino_adapter.proj.parameters()) + list(extractor.dino_adapter.fuse.parameters())
+        if p.grad is not None
+    )
+    backbone_grad = sum(
+        float(p.grad.detach().abs().sum().item())
+        for p in extractor.dino_adapter.backbone.parameters()
+        if p.grad is not None
+    )
+    assert adapter_grad > 0.0
+    assert backbone_grad == 0.0
+
+
+def test_dino_feature_cache_lru_and_trainable_guard() -> None:
+    cache = DINOFeatureCache(dtype="float16", cpu_pinned=False, cpu_max_items=1, gpu_max_items=1)
+    calls = {"n": 0}
+
+    def compute() -> torch.Tensor:
+        calls["n"] += 1
+        return torch.full((1, 2, 2, 3), float(calls["n"]))
+
+    out1, stats1 = cache.get_or_compute(key=("a",), device=torch.device("cpu"), compute=compute, trainable=False)
+    out2, stats2 = cache.get_or_compute(key=("a",), device=torch.device("cpu"), compute=compute, trainable=False)
+    out3, stats3 = cache.get_or_compute(key=("b",), device=torch.device("cpu"), compute=compute, trainable=False)
+    out4, stats4 = cache.get_or_compute(key=("a",), device=torch.device("cpu"), compute=compute, trainable=False)
+    assert stats1.miss == 1.0
+    assert stats2.hit_l1 == 1.0
+    assert stats3.miss == 1.0
+    assert stats4.miss == 1.0
+    assert calls["n"] == 3
+    assert float(out1.mean().item()) == 1.0
+    assert float(out2.mean().item()) == 1.0
+    assert float(out3.mean().item()) == 2.0
+    assert float(out4.mean().item()) == 3.0
+    with pytest.raises(RuntimeError, match="cannot be used"):
+        cache.get_or_compute(key=("c",), device=torch.device("cpu"), compute=compute, trainable=True)

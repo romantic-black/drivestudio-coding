@@ -439,6 +439,8 @@ class IForwardModel(nn.Module):
         self.is_stage2_0_biggs_parent_lifting = self.iforward_version in {
             "stage2_0_biggs_parent_lifting",
             "stage2_0_biggs_cuda_exact_diagonal_projector",
+            "stage2_0_biggs_incremental_whdd",
+            "stage2_0_biggs_compact16_residualonly",
         }
         self.history_safe_projection = None
         self.adc_lite_cfg = cfg_get(iforward_cfg, "adc_lite", {}) or {}
@@ -468,6 +470,20 @@ class IForwardModel(nn.Module):
                 bool(cfg_get(skip_cfg, "trainable", False)) or not bool(cfg_get(skip_cfg, "no_grad", True))
             ):
                 raise ValueError("stage2_0_biggs_parent_lifting forbids trainable child_observation_skip")
+            parent_state_cfg = cfg_get(biggs_cfg, "parent_state", {}) or {}
+            exact_refresh_policy = str(cfg_get(parent_state_cfg, "exact_refresh_policy", "block_enter")).lower()
+            if exact_refresh_policy not in {"block_enter", "none"}:
+                raise ValueError(
+                    "stage2_0 BigGS parent_state.exact_refresh_policy currently supports "
+                    f"'block_enter' or 'none', got {exact_refresh_policy!r}."
+                )
+            self.stage2_0_biggs_parent_exact_refresh_policy = exact_refresh_policy
+            self.stage2_0_biggs_update_after_each_nonfinal_repeat = bool(
+                cfg_get(parent_state_cfg, "update_after_each_nonfinal_repeat", True)
+            )
+            self.stage2_0_biggs_skip_update_on_block_exit = bool(
+                cfg_get(parent_state_cfg, "skip_update_on_block_exit", True)
+            )
         if self.is_v3_gru_history_gate:
             self._validate_v3_scheduler_contract(config)
         debug_cfg = cfg_get(iforward_cfg, "debug", {}) or {}
@@ -1367,7 +1383,15 @@ class IForwardModel(nn.Module):
             observe_batch["_iforward"] = ifwd_meta
 
         global_step = int(batch.get("global_step", 0))
+        biggs_parent_runtime = None
         for step_pos, step in enumerate(resolved.steps):
+            next_step = resolved.steps[step_pos + 1] if step_pos + 1 < len(resolved.steps) else None
+            is_block_enter, is_block_exit = self._resolved_step_block_flags(step, next_step)
+            if bool(is_block_enter):
+                block_hsp_cache = {}
+                if self.is_stage2_0_biggs_parent_lifting:
+                    if str(getattr(self, "stage2_0_biggs_parent_exact_refresh_policy", "block_enter")) == "block_enter":
+                        biggs_parent_runtime = None
             t0 = time.perf_counter()
             with self._nvtx_range("iforward/observe"):
                 observe_kwargs = {
@@ -1378,6 +1402,7 @@ class IForwardModel(nn.Module):
                 }
                 if self.is_stage2_0_biggs_parent_lifting:
                     observe_kwargs["biggs_state"] = getattr(state, "biggs_state", None)
+                    observe_kwargs["biggs_parent_runtime"] = biggs_parent_runtime
                     observe_kwargs["biggs_scene_id"] = int(resolved.scene_id)
                     observe_kwargs["biggs_segment_id"] = int(resolved.segment_id)
                     observe_kwargs["biggs_episode_id"] = int(resolved.episode_id)
@@ -1390,15 +1415,14 @@ class IForwardModel(nn.Module):
                     next_biggs_state = measurement["biggs_state"]
                     detach_biggs = getattr(next_biggs_state, "detach", None)
                     state.biggs_state = detach_biggs() if callable(detach_biggs) else next_biggs_state
-            timings["observe_ms"] += (time.perf_counter() - t0) * 1000.0
+                    biggs_parent_runtime = measurement.get("biggs_parent_runtime", biggs_parent_runtime)
+            observe_step_ms = (time.perf_counter() - t0) * 1000.0
+            timings["observe_ms"] += observe_step_ms
             t0 = time.perf_counter()
             with self._nvtx_range("iforward/event"):
                 event = self.bridge.build_event(local_state=local_state, measurement=measurement)
-            timings["event_ms"] += (time.perf_counter() - t0) * 1000.0
-            next_step = resolved.steps[step_pos + 1] if step_pos + 1 < len(resolved.steps) else None
-            is_block_enter, is_block_exit = self._resolved_step_block_flags(step, next_step)
-            if bool(is_block_enter):
-                block_hsp_cache = {}
+            event_step_ms = (time.perf_counter() - t0) * 1000.0
+            timings["event_ms"] += event_step_ms
             is_frame_exit = bool(is_block_exit)
             step_context = IForwardMemoryStepContext(
                 step_idx=int(step.step_idx),
@@ -1459,11 +1483,13 @@ class IForwardModel(nn.Module):
                         update_optimizer_memory=bool(step.update_optimizer_memory),
                         ablation=module_ablation_name,
                     )
-            timings["memory_ms"] += (time.perf_counter() - t0) * 1000.0
+            memory_step_ms = (time.perf_counter() - t0) * 1000.0
+            timings["memory_ms"] += memory_step_ms
             working_history = working_history.commit_memory_entries(
                 short_entries,
                 detach=bool(getattr(self.memory, "short_entry_detach", True)) if self.memory is not None else True,
             )
+            old_local_state_before_update = local_state
             t0 = time.perf_counter()
             with self._nvtx_range("iforward/update"):
                 if self.is_v3_gru_history_gate:
@@ -1625,10 +1651,30 @@ class IForwardModel(nn.Module):
                         event=event,
                         ctx_memory=ctx_memory,
                     )
-            timings["update_ms"] += (time.perf_counter() - t0) * 1000.0
+                if self.is_stage2_0_biggs_parent_lifting and isinstance(measurement, dict):
+                    current_runtime = measurement.get("biggs_parent_runtime", biggs_parent_runtime)
+                    skip_exit = bool(getattr(self, "stage2_0_biggs_skip_update_on_block_exit", True))
+                    update_nonfinal = bool(getattr(self, "stage2_0_biggs_update_after_each_nonfinal_repeat", True))
+                    should_update_runtime = current_runtime is not None and (
+                        (not bool(is_block_exit) and bool(update_nonfinal))
+                        or (bool(is_block_exit) and not bool(skip_exit))
+                    )
+                    if bool(is_block_exit) and bool(skip_exit):
+                        biggs_parent_runtime = None
+                    elif bool(should_update_runtime):
+                        biggs_parent_runtime = self.bridge.update_biggs_parent_runtime(
+                            runtime=current_runtime,
+                            old_local_state=old_local_state_before_update,
+                            new_local_state=local_state,
+                        )
+                    else:
+                        biggs_parent_runtime = current_runtime
+            update_step_ms = (time.perf_counter() - t0) * 1000.0
+            timings["update_ms"] += update_step_ms
             t0 = time.perf_counter()
             reg_loss, reg_stats = self.bridge.delta_regularization(delta, local_state=local_state)
-            timings["delta_reg_ms"] += (time.perf_counter() - t0) * 1000.0
+            delta_reg_step_ms = (time.perf_counter() - t0) * 1000.0
+            timings["delta_reg_ms"] += delta_reg_step_ms
             reg_terms.append(reg_loss)
             for key, value in reg_stats.items():
                 if isinstance(value, (int, float)):
@@ -1645,6 +1691,11 @@ class IForwardModel(nn.Module):
                 "is_frame_exit": float(1.0 if is_frame_exit else 0.0),
                 "short_entries_added": float(len(short_entries)),
                 "memory_entries_after_step": float(len(working_history.memory_entries)),
+                "observe_ms": float(observe_step_ms),
+                "event_ms": float(event_step_ms),
+                "memory_ms": float(memory_step_ms),
+                "update_ms": float(update_step_ms),
+                "delta_reg_ms": float(delta_reg_step_ms),
             }
             if isinstance(measurement, dict):
                 item.update({str(k): float(v) for k, v in measurement.items() if isinstance(v, (int, float))})

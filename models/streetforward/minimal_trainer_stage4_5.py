@@ -12,7 +12,7 @@ import copy
 import logging
 import time
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Hashable, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -150,7 +150,8 @@ class MinimalStreetForwardStage4_5(MinimalStreetForwardStage4_2):
         source_egocar_masks: Optional[List[torch.Tensor]],
         height: int,
         width: int,
-    ) -> Dict[str, torch.Tensor]:
+        dino_cache_key: Optional[Hashable] = None,
+    ) -> Dict[str, Any]:
         if len(source_views) != len(source_images):
             raise ValueError(
                 f"Stage4.5 len(source_views)={len(source_views)} != len(source_images)={len(source_images)}."
@@ -166,6 +167,32 @@ class MinimalStreetForwardStage4_5(MinimalStreetForwardStage4_2):
                     f"Mismatch at idx={i}: {hw} vs ref={ref_hw}."
                 )
 
+        cnn_perf_stats: Dict[str, float] = {}
+        total_t0 = time.perf_counter()
+
+        def _elapsed(name: str, start: float) -> None:
+            cnn_perf_stats[f"iforward/cnn/{name}_ms"] = float((time.perf_counter() - start) * 1000.0)
+
+        def _tensor_mb(tensor: Optional[torch.Tensor]) -> float:
+            if tensor is None:
+                return 0.0
+            return float(tensor.numel() * tensor.element_size() / (1024.0 * 1024.0))
+
+        def _mark_cuda(label: str) -> None:
+            if not torch.cuda.is_available():
+                return
+            try:
+                device = torch.cuda.current_device()
+                allocated = int(torch.cuda.memory_allocated(device))
+                reserved = int(torch.cuda.memory_reserved(device))
+            except Exception:
+                return
+            scale = 1024.0 * 1024.0
+            cnn_perf_stats[f"iforward/cnn/{label}_allocated_mb"] = float(allocated / scale)
+            cnn_perf_stats[f"iforward/cnn/{label}_reserved_mb"] = float(reserved / scale)
+
+        _mark_cuda("start")
+        t0 = time.perf_counter()
         scene_render_out = self.alpha_t_extractor.render_rgb_only(
             gaussians_scene,
             source_views,
@@ -174,7 +201,12 @@ class MinimalStreetForwardStage4_5(MinimalStreetForwardStage4_2):
             return_acc=True,
             return_debug_stats=False,
         )
+        _elapsed("render_rgb", t0)
+        _mark_cuda("after_render_rgb")
         scene_rgbs, scene_accs = scene_render_out
+        cnn_perf_stats["iforward/cnn/source_render_rgbs_mb"] = float(sum(_tensor_mb(x) for x in scene_rgbs))
+        cnn_perf_stats["iforward/cnn/source_render_accs_mb"] = float(sum(_tensor_mb(x) for x in scene_accs))
+        t0 = time.perf_counter()
         scene_rgb_batch = torch.stack(scene_rgbs, dim=0)
         if bool(getattr(self, "stage6_detach_source_render_for_cnn", True)):
             scene_rgb_batch = scene_rgb_batch.detach()
@@ -189,15 +221,94 @@ class MinimalStreetForwardStage4_5(MinimalStreetForwardStage4_2):
                 align_corners=True,
             ).permute(0, 2, 3, 1)
         multi = torch.cat([image_batch, scene_rgb_batch], dim=-1)
-        features_2d = self.image_feature_extractor(multi)
+        _elapsed("prepare_inputs", t0)
+        _mark_cuda("after_prepare_inputs")
+        cnn_perf_stats["iforward/cnn/image_batch_mb"] = _tensor_mb(image_batch)
+        cnn_perf_stats["iforward/cnn/scene_rgb_batch_mb"] = _tensor_mb(scene_rgb_batch)
+        cnn_perf_stats["iforward/cnn/multi_input_mb"] = _tensor_mb(multi)
+        dino_cache_stats: Dict[str, float] = {}
+        cache = getattr(self, "dino_feature_cache", None)
+        extractor = self.image_feature_extractor
+        if (
+            dino_cache_key is not None
+            and cache is not None
+            and hasattr(extractor, "extract_residual_feature")
+            and hasattr(extractor, "extract_dino_feature")
+            and hasattr(extractor, "fuse_features")
+        ):
+            cache_level = str(getattr(self, "dino_feature_cache_level", "adapter_output")).lower()
+            t0 = time.perf_counter()
+            x6 = extractor._to_nchw_6(multi)  # type: ignore[attr-defined]
+            _elapsed("to_nchw6", t0)
+            t0 = time.perf_counter()
+            residual_feat = extractor.extract_residual_feature(x6)
+            _elapsed("residual_unet", t0)
+            _mark_cuda("after_residual_unet")
+            cnn_perf_stats["iforward/cnn/residual_feat_mb"] = _tensor_mb(residual_feat)
+            target_hw = (int(residual_feat.shape[1]), int(residual_feat.shape[2]))
+            rgb = x6[:, :3, :, :]
+            trainable = bool(
+                extractor.dino_adapter_has_trainable_params()  # type: ignore[attr-defined]
+                if hasattr(extractor, "dino_adapter_has_trainable_params")
+                else False
+            )
+            t0 = time.perf_counter()
+            if cache_level == "backbone_intermediate":
+                if not hasattr(extractor, "extract_dino_backbone_intermediates") or not hasattr(
+                    extractor,
+                    "adapt_dino_backbone_intermediates",
+                ):
+                    raise RuntimeError("DINO backbone_intermediate cache requires extractor split DINO adapter APIs")
+                cached_dino, stats = cache.get_or_compute(
+                    key=dino_cache_key,
+                    device=rgb.device,
+                    trainable=False,
+                    compute=lambda: extractor.extract_dino_backbone_intermediates(rgb),
+                )
+                if not isinstance(cached_dino, tuple):
+                    raise RuntimeError("DINO backbone_intermediate cache expected a tuple of intermediate tensors")
+                dino_feat = extractor.adapt_dino_backbone_intermediates(cached_dino, target_hw=target_hw)
+            else:
+                dino_feat, stats = cache.get_or_compute(
+                    key=dino_cache_key,
+                    device=rgb.device,
+                    trainable=trainable,
+                    compute=lambda: extractor.extract_dino_feature(rgb, target_hw=target_hw),
+                )
+                if not torch.is_tensor(dino_feat):
+                    raise RuntimeError("DINO adapter_output cache expected a tensor")
+            _elapsed("dino_cache_or_compute", t0)
+            _mark_cuda("after_dino")
+            dino_cache_stats = stats.as_dict()
+            cnn_perf_stats["iforward/cnn/dino_feat_mb"] = _tensor_mb(dino_feat)
+            t0 = time.perf_counter()
+            features_2d = extractor.fuse_features(
+                dino_feat.to(device=residual_feat.device, dtype=residual_feat.dtype),
+                residual_feat,
+            )
+            _elapsed("fusion", t0)
+            _mark_cuda("after_fusion")
+        else:
+            t0 = time.perf_counter()
+            features_2d = self.image_feature_extractor(multi)
+            _elapsed("feature_extractor", t0)
+            _mark_cuda("after_feature_extractor")
+        cnn_perf_stats["iforward/cnn/features_2d_mb"] = _tensor_mb(features_2d)
+        t0 = time.perf_counter()
         source_pair_valid_mask = self._build_source_pair_valid_mask(
             source_images=source_images,
             source_sky_masks=source_sky_masks,
             source_egocar_masks=source_egocar_masks,
         )
+        _elapsed("valid_mask", t0)
+        _mark_cuda("end")
+        cnn_perf_stats["iforward/cnn/source_pair_valid_mask_mb"] = _tensor_mb(source_pair_valid_mask)
+        cnn_perf_stats["iforward/cnn/total_ms"] = float((time.perf_counter() - total_t0) * 1000.0)
         return {
             "features_2d": features_2d,
             "source_pair_valid_mask": source_pair_valid_mask,
+            "dino_cache_stats": dino_cache_stats,
+            "cnn_perf_stats": cnn_perf_stats,
         }
 
     def _backproject_scene_features_multi_camera(

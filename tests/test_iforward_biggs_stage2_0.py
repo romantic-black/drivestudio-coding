@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -10,6 +11,7 @@ import torch.nn as nn
 from models.iforward.biggs_assignment import build_biggs_branch_assignment, build_biggs_assignments
 from models.iforward.biggs_event_decoder import BigGSToFineEventDecoder
 from models.iforward.biggs_parent_projector import _canonicalize_quat, project_biggs_active_rigid_parents, project_biggs_parents
+from models.iforward.biggs_parent_stats import init_parent_branch_runtime, update_parent_branch_runtime
 from models.iforward.biggs_state import BigGSBranchAssignment, BigGSRigidActiveAssignment, IForwardBigGSState
 from models.iforward.state import IForwardState
 from models.iforward.trainer import IForwardTrainer
@@ -255,6 +257,74 @@ def test_biggs_vectorized_assignment_fast_fails_unsafe_radius() -> None:
         )
 
 
+def test_biggs_whdd_basis_weighted_zero_mean_and_singleton_zero() -> None:
+    means = torch.tensor(
+        [
+            [-1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [3.0, 2.0, 1.0],
+        ],
+        dtype=torch.float32,
+    )
+    assign = build_biggs_branch_assignment(
+        branch="bg",
+        means=means,
+        scales_log=torch.full((3, 3), -2.0),
+        opacity_logit=torch.zeros((3, 1)),
+        cfg={
+            "builder": "vectorized_sort_segment",
+            "voxel_size": 10.0,
+            "max_children_per_parent": 2,
+            "sort_children": "none",
+            "build_whdd_basis": True,
+            "whdd_basis": {"dtype": "float32", "min_std": 1.0e-4},
+        },
+    )
+    assert assign.child_basis is not None
+    for parent in range(int(assign.num_parents)):
+        rows = torch.nonzero(assign.child_to_parent == parent, as_tuple=False).reshape(-1)
+        basis = assign.child_basis.index_select(0, rows).float()
+        weights = assign.child_mass.index_select(0, rows).reshape(-1, 1)
+        mean = (basis * weights).sum(dim=0) / weights.sum().clamp_min(1.0e-8)
+        assert torch.allclose(mean, torch.zeros_like(mean), atol=1.0e-5)
+        if int(rows.numel()) == 1:
+            assert torch.allclose(basis, torch.zeros_like(basis), atol=1.0e-6)
+
+
+def test_biggs_whdd_basis_weighted_orthonormal_for_full_rank_parent() -> None:
+    means = torch.tensor(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=torch.float32,
+    )
+    assign = build_biggs_branch_assignment(
+        branch="bg",
+        means=means,
+        scales_log=torch.full((4, 3), -2.0),
+        opacity_logit=torch.zeros((4, 1)),
+        cfg={
+            "builder": "vectorized_sort_segment",
+            "voxel_size": 10.0,
+            "max_children_per_parent": 8,
+            "sort_children": "none",
+            "build_whdd_basis": True,
+            "whdd_basis": {"dtype": "float32", "min_std": 1.0e-4},
+        },
+    )
+    assert assign.child_basis is not None
+    assert int(assign.num_parents) == 1
+    weights = assign.child_mass.reshape(-1, 1)
+    basis = assign.child_basis.float()
+    mean = (basis * weights).sum(dim=0) / weights.sum().clamp_min(1.0e-8)
+    gram = basis.T @ (basis * weights) / weights.sum().clamp_min(1.0e-8)
+    assert torch.allclose(mean, torch.zeros_like(mean), atol=1.0e-5)
+    assert torch.allclose(gram, torch.eye(3), atol=1.0e-5, rtol=1.0e-5)
+
+
 def _runtime_for_biggs_assignment_cache() -> MinimalStreetForwardStage6_0:
     runtime = MinimalStreetForwardStage6_0.__new__(MinimalStreetForwardStage6_0)
     nn.Module.__init__(runtime)
@@ -421,7 +491,15 @@ def _decoder_fixture(event_dim: int = 4) -> tuple[LocalGSState, dict[str, object
     rigid = _node_rigid(3)
     local_state = LocalGSState.from_node_states(bg=bg, distant=distant, rigid=rigid, hidden_dim=3)
     assign_bg = _manual_assignment([0, 0, 1], child_mass=[1.0, 3.0, 1.0], branch="bg")
+    assign_bg = replace(
+        assign_bg,
+        child_basis=torch.tensor([[-3.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0]]),
+    )
     assign_distant = _manual_assignment([0, 0], branch="distant")
+    assign_distant = replace(
+        assign_distant,
+        child_basis=torch.tensor([[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]]),
+    )
     active = BigGSRigidActiveAssignment(
         fine_S=torch.tensor([2, 0, 1], dtype=torch.long),
         child_to_active_parent_S=torch.tensor([0, 1, 0], dtype=torch.long),
@@ -432,6 +510,7 @@ def _decoder_fixture(event_dim: int = 4) -> tuple[LocalGSState, dict[str, object
         child_mass_S=torch.tensor([1.0, 1.0, 2.0]),
         parent_inside_mask=torch.tensor([True, False]),
         child_inside_mask_S=torch.tensor([True, False, True]),
+        child_basis_S=torch.tensor([[-2.0, 0.0, 0.0], [0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]),
     )
     route = SimpleNamespace(
         S=active.fine_S,
@@ -459,7 +538,7 @@ def _decoder_fixture(event_dim: int = 4) -> tuple[LocalGSState, dict[str, object
     parent_event = EventPack(
         event_bg=torch.arange(2 * event_dim, dtype=torch.float32).reshape(2, event_dim),
         event_distant=torch.full((1, event_dim), 10.0),
-        event_rigid=torch.tensor([[20.0, 21.0, 22.0, 23.0], [30.0, 31.0, 32.0, 33.0]])[:, :event_dim],
+        event_rigid=(torch.arange(2 * event_dim, dtype=torch.float32).reshape(2, event_dim) + 20.0),
         support_bg=torch.tensor([0.5, 0.25]),
         support_distant=torch.tensor([0.75]),
         support_rigid=torch.tensor([1.0, 0.1]),
@@ -474,7 +553,7 @@ def _decoder_fixture(event_dim: int = 4) -> tuple[LocalGSState, dict[str, object
     return local_state, measurement, parent_event
 
 
-@pytest.mark.parametrize("mode", ["broadcast", "residual_mlp", "low_rank_basis"])
+@pytest.mark.parametrize("mode", ["broadcast", "residual_mlp", "low_rank_basis", "whdd_fixed_basis"])
 def test_biggs_child_decoder_modes_shapes_and_zero_init_broadcast(mode: str) -> None:
     local_state, measurement, parent_event = _decoder_fixture(event_dim=4)
     decoder = BigGSToFineEventDecoder(
@@ -498,6 +577,52 @@ def test_biggs_child_decoder_modes_shapes_and_zero_init_broadcast(mode: str) -> 
     assert torch.equal(out.valid_rigid, torch.tensor([True, False, True]))
 
 
+def test_biggs_whdd_weighted_mean_preserves_parent_event() -> None:
+    local_state, measurement, parent_event = _decoder_fixture(event_dim=4)
+    decoder = BigGSToFineEventDecoder(
+        event_dim=4,
+        mode="whdd_fixed_basis",
+        rank=3,
+        hidden_dim=8,
+        zero_init_last=False,
+        residual_scale_init=1.0,
+        residual_scale_learnable=False,
+    )
+    out = decoder(parent_event_pack=parent_event, local_state=local_state, measurement=measurement)
+    assign = measurement["assign_bg"]
+    parent_bg = parent_event.event_bg.index_select(0, assign.child_to_parent)
+    residual = out.event_bg - parent_bg
+    weights = assign.child_mass.reshape(-1, 1)
+    parent0_mean = (residual[:2] * weights[:2]).sum(dim=0) / weights[:2].sum()
+    assert torch.allclose(parent0_mean, torch.zeros_like(parent0_mean), atol=1.0e-5)
+
+
+def test_biggs_compact_whdd_projects_parent64_to_fine16() -> None:
+    local_state, measurement, parent_event = _decoder_fixture(event_dim=64)
+    decoder = BigGSToFineEventDecoder(
+        event_dim=64,
+        parent_event_dim=64,
+        fine_event_dim=16,
+        mode="whdd_compact_fixed_basis",
+        rank=3,
+        hidden_dim=32,
+        zero_init_last=True,
+        residual_scale_init=1.0,
+        residual_scale_learnable=False,
+    )
+    out = decoder(parent_event_pack=parent_event, local_state=local_state, measurement=measurement)
+    assert tuple(out.event_bg.shape) == (3, 16)
+    assert tuple(out.event_distant.shape) == (2, 16)
+    assert tuple(out.event_rigid.shape) == (3, 16)
+
+    loss = out.event_bg.square().mean() + out.event_rigid.square().mean()
+    loss.backward()
+    base_grad = sum(float(p.grad.detach().abs().sum().item()) for p in decoder.base_proj.parameters() if p.grad is not None)
+    detail_grad = sum(float(p.grad.detach().abs().sum().item()) for p in decoder.detail_head.parameters() if p.grad is not None)
+    assert base_grad > 0.0
+    assert detail_grad > 0.0
+
+
 def test_biggs_low_rank_decoder_mean_preserves_residual() -> None:
     local_state, measurement, parent_event = _decoder_fixture(event_dim=4)
     decoder = BigGSToFineEventDecoder(
@@ -516,6 +641,181 @@ def test_biggs_low_rank_decoder_mean_preserves_residual() -> None:
     weights = assign.child_mass.reshape(-1, 1)
     parent0_mean = (residual[:2] * weights[:2]).sum(dim=0) / weights[:2].sum()
     assert torch.allclose(parent0_mean, torch.zeros_like(parent0_mean), atol=1.0e-5)
+
+
+def test_biggs_parent_stats_incremental_matches_exact_refresh() -> None:
+    old = _node_bg(5)
+    new = _node_bg(5)
+    new.means = new.means + torch.linspace(0.0, 0.04, 5).reshape(-1, 1)
+    new.opacity_logit = new.opacity_logit + torch.linspace(-0.02, 0.03, 5).reshape(-1, 1)
+    new.sh_dc = new.sh_dc + 0.01
+    assign = _manual_assignment([0, 0, 1, 1, 2], child_mass=[1.0, 2.0, 1.0, 1.5, 1.0])
+    cfg = {
+        "mass_mode": "dynamic_tau_area",
+        "min_scale": 1.0e-3,
+        "max_scale": 2.0,
+        "opacity_cap": 0.9,
+        "opacity_min": 1.0e-6,
+        "tau_parent_scale": 0.5,
+        "eps": 1.0e-6,
+        "min_child_mass": 1.0e-8,
+    }
+    runtime0 = init_parent_branch_runtime(
+        params=_params_from_branch(old),
+        child_to_parent=assign.child_to_parent,
+        parent_count=assign.parent_count,
+        child_mass=assign.child_mass,
+        cfg=cfg,
+        max_scale=2.0,
+    )
+    runtime1 = update_parent_branch_runtime(
+        runtime=runtime0,
+        old_params=_params_from_branch(old),
+        new_params=_params_from_branch(new),
+        child_to_parent=assign.child_to_parent,
+        parent_count=assign.parent_count,
+        child_mass=assign.child_mass,
+        cfg=cfg,
+        max_scale=2.0,
+    )
+    exact = init_parent_branch_runtime(
+        params=_params_from_branch(new),
+        child_to_parent=assign.child_to_parent,
+        parent_count=assign.parent_count,
+        child_mass=assign.child_mass,
+        cfg=cfg,
+        max_scale=2.0,
+    )
+    for key in ("means", "scales_log", "opacity_logit", "sh_dc", "sh_rest"):
+        assert torch.allclose(runtime1.params[key], exact.params[key], atol=2.0e-6, rtol=1.0e-5)
+
+
+def test_biggs_parent_stats_incremental_matches_exact_with_scale_opacity_mass_shift() -> None:
+    old = _node_bg(6)
+    new = _node_bg(6)
+    new.means = new.means + torch.linspace(-0.03, 0.04, 6).reshape(-1, 1)
+    new.scales_log = new.scales_log + torch.tensor(
+        [
+            [0.03, -0.01, 0.02],
+            [-0.02, 0.04, 0.01],
+            [0.01, 0.02, -0.03],
+            [0.04, -0.02, -0.01],
+            [-0.03, 0.01, 0.03],
+            [0.02, 0.03, -0.02],
+        ],
+        dtype=new.scales_log.dtype,
+    )
+    new.opacity_logit = new.opacity_logit + torch.linspace(-0.2, 0.25, 6).reshape(-1, 1)
+    new.quats = torch.nn.functional.normalize(
+        old.quats
+        + torch.tensor(
+            [
+                [0.0, 0.02, -0.01, 0.00],
+                [0.0, -0.01, 0.03, 0.01],
+                [0.0, 0.01, 0.00, -0.02],
+                [0.0, -0.02, -0.01, 0.02],
+                [0.0, 0.03, 0.01, -0.01],
+                [0.0, -0.01, 0.02, 0.03],
+            ],
+            dtype=old.quats.dtype,
+        ),
+        dim=-1,
+    )
+    new.sh_dc = new.sh_dc + torch.linspace(0.0, 0.02, 6).reshape(-1, 1)
+    assign = _manual_assignment([0, 0, 0, 1, 1, 1], child_mass=[1.0, 2.0, 0.8, 1.0, 1.5, 0.7])
+    cfg = {
+        "mass_mode": "dynamic_tau_area",
+        "min_scale": 1.0e-3,
+        "max_scale": 2.0,
+        "opacity_cap": 0.9,
+        "opacity_min": 1.0e-6,
+        "tau_parent_scale": 0.5,
+        "eps": 1.0e-6,
+        "min_child_mass": 1.0e-8,
+        "child_cache_dtype": "float32",
+    }
+    runtime0 = init_parent_branch_runtime(
+        params=_params_from_branch(old),
+        child_to_parent=assign.child_to_parent,
+        parent_count=assign.parent_count,
+        child_mass=assign.child_mass,
+        cfg=cfg,
+        max_scale=2.0,
+    )
+    runtime1 = update_parent_branch_runtime(
+        runtime=runtime0,
+        old_params=_params_from_branch(old),
+        new_params=_params_from_branch(new),
+        child_to_parent=assign.child_to_parent,
+        parent_count=assign.parent_count,
+        child_mass=assign.child_mass,
+        cfg=cfg,
+        max_scale=2.0,
+    )
+    exact = init_parent_branch_runtime(
+        params=_params_from_branch(new),
+        child_to_parent=assign.child_to_parent,
+        parent_count=assign.parent_count,
+        child_mass=assign.child_mass,
+        cfg=cfg,
+        max_scale=2.0,
+    )
+    for key in ("means", "scales_log", "opacity_logit", "sh_dc", "sh_rest"):
+        assert torch.allclose(runtime1.params[key], exact.params[key], atol=2.0e-6, rtol=1.0e-5)
+
+
+def test_biggs_parent_stats_incremental_matches_exact_after_multiple_updates() -> None:
+    states = [_node_bg(6) for _ in range(4)]
+    for idx, state in enumerate(states[1:], start=1):
+        base = states[idx - 1]
+        state.means = base.means + (0.01 * idx) * torch.linspace(-1.0, 1.0, 6).reshape(-1, 1)
+        state.scales_log = base.scales_log + (0.02 * idx) * torch.tensor(
+            [[1.0, -0.5, 0.25], [-0.25, 0.5, 1.0], [0.5, 1.0, -0.5], [-1.0, 0.25, 0.5], [0.25, -1.0, 0.5], [0.5, 0.25, -1.0]],
+            dtype=base.scales_log.dtype,
+        )
+        state.opacity_logit = base.opacity_logit + (0.05 * idx) * torch.linspace(-1.0, 1.0, 6).reshape(-1, 1)
+        state.sh_dc = base.sh_dc + 0.005 * idx
+    assign = _manual_assignment([0, 0, 0, 1, 1, 1], child_mass=[1.0, 2.0, 0.8, 1.0, 1.5, 0.7])
+    cfg = {
+        "mass_mode": "dynamic_tau_area",
+        "min_scale": 1.0e-3,
+        "max_scale": 2.0,
+        "opacity_cap": 0.9,
+        "opacity_min": 1.0e-6,
+        "tau_parent_scale": 0.5,
+        "eps": 1.0e-6,
+        "min_child_mass": 1.0e-8,
+        "child_cache_dtype": "float32",
+    }
+    runtime = init_parent_branch_runtime(
+        params=_params_from_branch(states[0]),
+        child_to_parent=assign.child_to_parent,
+        parent_count=assign.parent_count,
+        child_mass=assign.child_mass,
+        cfg=cfg,
+        max_scale=2.0,
+    )
+    for old, new in zip(states[:-1], states[1:]):
+        runtime = update_parent_branch_runtime(
+            runtime=runtime,
+            old_params=_params_from_branch(old),
+            new_params=_params_from_branch(new),
+            child_to_parent=assign.child_to_parent,
+            parent_count=assign.parent_count,
+            child_mass=assign.child_mass,
+            cfg=cfg,
+            max_scale=2.0,
+        )
+    exact = init_parent_branch_runtime(
+        params=_params_from_branch(states[-1]),
+        child_to_parent=assign.child_to_parent,
+        parent_count=assign.parent_count,
+        child_mass=assign.child_mass,
+        cfg=cfg,
+        max_scale=2.0,
+    )
+    for key in ("means", "scales_log", "opacity_logit", "sh_dc", "sh_rest"):
+        assert torch.allclose(runtime.params[key], exact.params[key], atol=3.0e-6, rtol=1.0e-5)
 
 
 def test_biggs_low_rank_zero_init_has_nonzero_gradient() -> None:
@@ -710,6 +1010,30 @@ def test_stage2_0_biggs_event_builder_returns_fine_event_and_updater_consumes() 
     delta, _ = updater(event=event, ctx_current=None, ctx_vsm=None)
     assert tuple(delta.bg.means.shape) == (3, 3)
     assert tuple(delta.rigid.means.shape) == (3, 3)
+
+
+def test_stage2_0_zero_hidden_updater_applies_to_local_state() -> None:
+    bg = _node_bg(2, sh_bases=0)
+    local_state = LocalGSState.from_node_states(bg=bg, distant=None, rigid=None, hidden_dim=0)
+    assert tuple(local_state.bg.hidden.shape) == (2, 0)
+    updater = Stage6PosteriorUpdater(
+        event_dim=16,
+        ctx_dim=16,
+        hidden_dim=32,
+        stage_hidden_dim=0,
+        sh_degree=0,
+        accept_vsm_ctx=False,
+        output_hidden=False,
+        output_confidence=False,
+        output_noop=True,
+    )
+    event = EventPack(event_bg=torch.randn(2, 16))
+    delta, _ = updater(event=event, ctx_current=None, ctx_vsm=None)
+    assert tuple(delta.bg.hidden.shape) == (2, 0)
+    assert tuple(delta.bg.confidence.shape) == (2, 0)
+    assert tuple(delta.bg.noop.shape) == (2, 1)
+    next_state = local_state.apply_delta(delta)
+    assert tuple(next_state.bg.hidden.shape) == (2, 0)
 
 
 def test_stage6_event_builder_disabled_path_uses_legacy_struct_event() -> None:

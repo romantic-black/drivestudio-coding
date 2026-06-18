@@ -329,6 +329,24 @@ def _write_scalar_row_to_tensorboard(writer: Any, prefix: str, row: Dict[str, An
             writer.add_scalar(f"{prefix}/{key}", float(value), int(step))
 
 
+def _cuda_driver_memory_metrics(prefix: str = "perf/cuda/row_driver") -> Dict[str, float]:
+    if not torch.cuda.is_available():
+        return {}
+    try:
+        free_bytes, total_bytes = torch.cuda.mem_get_info(torch.cuda.current_device())
+    except Exception:
+        return {}
+    scale = 1024.0 * 1024.0
+    free_b = int(free_bytes)
+    total_b = int(total_bytes)
+    used_b = int(total_b - free_b)
+    return {
+        f"{prefix}_used_mb": float(used_b / scale),
+        f"{prefix}_free_mb": float(free_b / scale),
+        f"{prefix}_total_mb": float(total_b / scale),
+    }
+
+
 def _checkpoint_prefix_for_cfg(cfg: Any) -> str:
     resolver = globals().get("CHECKPOINT_PREFIX_RESOLVER", None)
     if callable(resolver):
@@ -2772,13 +2790,19 @@ def main() -> None:
                 step_t0 = time.perf_counter()
             if perf_cfg["enable"] and perf_cfg["cuda_memory"] and torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats()
-            result = model.train_step(
-                minimal_batch,
-                step=step,
-                profile_phase_timing=bool(perf_cfg["enable"] and perf_cfg["phase_timing"]),
-                sync_cuda_timing=bool(perf_cfg["enable"] and perf_cfg["phase_timing"]),
-                scheduler_node_sync=scheduler_node_sync,
-            )
+            train_step_kwargs = {
+                "step": step,
+                "profile_phase_timing": bool(perf_cfg["enable"] and perf_cfg["phase_timing"]),
+                "sync_cuda_timing": bool(perf_cfg["enable"] and perf_cfg["phase_timing"]),
+                "scheduler_node_sync": scheduler_node_sync,
+            }
+            try:
+                train_step_params = inspect.signature(model.train_step).parameters
+            except (TypeError, ValueError):
+                train_step_params = {}
+            if "profile_cuda_memory" in train_step_params:
+                train_step_kwargs["profile_cuda_memory"] = bool(perf_cfg["enable"] and perf_cfg["cuda_memory"])
+            result = model.train_step(minimal_batch, **train_step_kwargs)
             if perf_cfg["enable"] and torch.cuda.is_available():
                 torch.cuda.synchronize()
             step_t1 = time.perf_counter()
@@ -2939,6 +2963,7 @@ def main() -> None:
                         train_step_row["mem_reserved_bytes"] = int(torch.cuda.memory_reserved())
                         train_step_row["peak_mem_bytes"] = int(torch.cuda.max_memory_allocated())
                         train_step_row["peak_mem_reserved_bytes"] = int(torch.cuda.max_memory_reserved())
+                        train_step_row.update(_cuda_driver_memory_metrics())
                     _write_metrics_history(metrics_fh, train_step_row)
                     if writer is not None:
                         writer.add_scalar("train/loss", float(loss_val), step)
@@ -3025,6 +3050,7 @@ def main() -> None:
                         train_step_row["mem_reserved_bytes"] = int(torch.cuda.memory_reserved())
                         train_step_row["peak_mem_bytes"] = int(torch.cuda.max_memory_allocated())
                         train_step_row["peak_mem_reserved_bytes"] = int(torch.cuda.max_memory_reserved())
+                        train_step_row.update(_cuda_driver_memory_metrics())
                     _write_metrics_history(metrics_fh, train_step_row)
                     if writer is not None:
                         writer.add_scalar("train/loss", float(loss_val), step)

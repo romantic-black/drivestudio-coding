@@ -210,12 +210,29 @@ def test_validate_stage5_3_config_requires_feature_extractor_block():
         trainer._validate_stage5_3_config(cfg)
 
 
-def test_validate_stage5_3_config_requires_dinov2_unet_fusion_type():
+def test_validate_stage5_3_config_requires_supported_feature_extractor_type():
     cfg = OmegaConf.load(str(Path("configs/minimal_streetforward_stage5_3_multi_scene_v8.yaml")))
     cfg.model.feature_extractor.type = "image_feature_extractor"
     trainer = MinimalStreetForwardStage5_3.__new__(MinimalStreetForwardStage5_3)
-    with pytest.raises(ValueError, match="requires model.feature_extractor.type='dinov2_unet_fusion'"):
+    with pytest.raises(ValueError, match="requires model.feature_extractor.type='dinov2_unet_fusion' or 'residual_only'"):
         trainer._validate_stage5_3_config(cfg)
+
+
+def test_validate_stage5_3_config_allows_residual_only_feature_extractor():
+    cfg = OmegaConf.load(str(Path("configs/minimal_streetforward_stage5_3_multi_scene_v8.yaml")))
+    cfg.model.feature_extractor = {
+        "type": "residual_only",
+        "residual_unet": {
+            "in_channels": 6,
+            "feat_channels": int(cfg.model.feat_2d_channels),
+            "base_channels": 24,
+            "feature_downscale": 1,
+            "depth": 3,
+            "bilinear": True,
+        },
+    }
+    trainer = MinimalStreetForwardStage5_3.__new__(MinimalStreetForwardStage5_3)
+    trainer._validate_stage5_3_config(cfg)
 
 
 def test_validate_stage5_3_config_allows_missing_dino_freeze_key():
