@@ -8,6 +8,7 @@ import torch.nn as nn
 from models.streetforward.math_utils import _normalize_quat, _quat_to_rotmat
 from models.streetforward.stage6_0.event_encoder import EventPack
 
+from .biggs_relational_decoder import GaussianRelationalLiftingDecoder
 from .biggs_state import BigGSBranchAssignment, BigGSRigidActiveAssignment
 from .utils import cfg_get
 
@@ -49,6 +50,13 @@ def _scatter_weighted_mean(
     return out / denom.clamp_min(1.0e-8)
 
 
+def _scatter_sum(values: torch.Tensor, parent_id: torch.Tensor, *, num_parents: int) -> torch.Tensor:
+    out = values.new_zeros((int(num_parents), int(values.shape[-1])))
+    if int(values.numel()) > 0:
+        out.index_add_(0, parent_id.long(), values)
+    return out
+
+
 def _broadcast_optional(x: Optional[torch.Tensor], parent_id: torch.Tensor) -> Optional[torch.Tensor]:
     if x is None:
         return None
@@ -81,7 +89,15 @@ class BigGSToFineEventDecoder(nn.Module):
         child_code_parent_local_frame: bool = True,
         residual_scale_per_branch: bool = False,
         whdd_chunk_size: int = 65536,
+        decode_chunk_size: Optional[int] = None,
         fused_cuda: bool = False,
+        relation_dim: int = 12,
+        detach_relation_inputs: bool = True,
+        relation_normalization: str = "none",
+        relation_rms_floor: float = 0.05,
+        relation_clip: float = 0.0,
+        rigid_relation_space: str = "world",
+        detail_head_init_std: float = 0.0,
     ) -> None:
         super().__init__()
         self.parent_event_dim = int(parent_event_dim) if parent_event_dim is not None else int(event_dim)
@@ -101,8 +117,10 @@ class BigGSToFineEventDecoder(nn.Module):
         self.child_code_parent_local_frame = bool(child_code_parent_local_frame)
         self.residual_scale_per_branch = bool(residual_scale_per_branch)
         self.whdd_chunk_size = max(int(whdd_chunk_size), 1)
+        self.decode_chunk_size = max(int(decode_chunk_size) if decode_chunk_size is not None else int(whdd_chunk_size), 1)
+        self.rigid_relation_space = str(rigid_relation_space).lower()
         mode_l = str(self.mode).lower()
-        if mode_l != "whdd_compact_fixed_basis" and int(self.parent_event_dim) != int(self.fine_event_dim):
+        if mode_l not in {"whdd_compact_fixed_basis", "gaussian_relational"} and int(self.parent_event_dim) != int(self.fine_event_dim):
             raise ValueError(
                 f"BigGS child decoder mode={self.mode!r} requires parent_event_dim == fine_event_dim; "
                 f"got parent={int(self.parent_event_dim)} fine={int(self.fine_event_dim)}"
@@ -152,6 +170,22 @@ class BigGSToFineEventDecoder(nn.Module):
             self.final_norm = nn.Identity()
         else:
             raise ValueError(f"unsupported BigGS child decoder final_norm={final_norm!r}")
+        self.grld_decoder: Optional[GaussianRelationalLiftingDecoder] = None
+        if mode_l == "gaussian_relational":
+            self.grld_decoder = GaussianRelationalLiftingDecoder(
+                parent_event_dim=int(self.parent_event_dim),
+                fine_event_dim=int(self.fine_event_dim),
+                relation_dim=int(relation_dim),
+                rank=int(rank),
+                fused_cuda=bool(fused_cuda),
+                detach_relation_inputs=bool(detach_relation_inputs),
+                decode_chunk_size=int(self.decode_chunk_size),
+                relation_normalization=str(relation_normalization),
+                relation_rms_floor=float(relation_rms_floor),
+                relation_clip=float(relation_clip),
+                rigid_relation_space=str(rigid_relation_space),
+                detail_head_init_std=float(detail_head_init_std),
+            )
 
     @classmethod
     def from_config(cls, cfg: Any, *, event_dim: int) -> "BigGSToFineEventDecoder":
@@ -177,7 +211,15 @@ class BigGSToFineEventDecoder(nn.Module):
             child_code_parent_local_frame=bool(cfg_get(cfg, "child_code_parent_local_frame", True)),
             residual_scale_per_branch=bool(cfg_get(cfg, "residual_scale_per_branch", False)),
             whdd_chunk_size=int(cfg_get(cfg, "whdd_chunk_size", 65536)),
+            decode_chunk_size=int(cfg_get(cfg, "decode_chunk_size", cfg_get(cfg, "whdd_chunk_size", 65536))),
             fused_cuda=bool(cfg_get(cfg, "fused_cuda", False)),
+            relation_dim=int(cfg_get(cfg, "relation_dim", 12)),
+            detach_relation_inputs=bool(cfg_get(cfg, "detach_relation_inputs", cfg_get(cfg, "detach_child_code_inputs", True))),
+            relation_normalization=str(cfg_get(cfg, "relation_normalization", "none")),
+            relation_rms_floor=float(cfg_get(cfg, "relation_rms_floor", 0.05)),
+            relation_clip=float(cfg_get(cfg, "relation_clip", 0.0)),
+            rigid_relation_space=str(cfg_get(cfg, "rigid_relation_space", "world")),
+            detail_head_init_std=float(cfg_get(cfg, "detail_head_init_std", 0.0)),
         )
 
     def _residual_scale_for_branch(self, *, branch_id: int, ref: torch.Tensor) -> torch.Tensor:
@@ -295,6 +337,10 @@ class BigGSToFineEventDecoder(nn.Module):
         branch_id: int,
         route_flag: Optional[torch.Tensor] = None,
         child_basis: Optional[torch.Tensor] = None,
+        child_cache: Optional[Any] = None,
+        parent_stats: Optional[Any] = None,
+        parent_start: Optional[torch.Tensor] = None,
+        child_order: Optional[torch.Tensor] = None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Dict[str, float]]:
         n = int(parent_id.numel())
         if n == 0:
@@ -318,6 +364,7 @@ class BigGSToFineEventDecoder(nn.Module):
         pid = parent_id.long().to(device=parent_event.device)
         mode = str(self.mode).lower()
         residual_scale = self._residual_scale_for_branch(branch_id=int(branch_id), ref=parent_event)
+        extra_aux: Dict[str, float] = {}
         if mode == "broadcast":
             parent_e = parent_event.index_select(0, pid)
             fine = parent_e
@@ -337,6 +384,25 @@ class BigGSToFineEventDecoder(nn.Module):
             else:
                 base = parent_event.index_select(0, pid)
             fine = base + scaled_residual
+        elif mode == "gaussian_relational":
+            if self.grld_decoder is None:
+                raise RuntimeError("BigGS gaussian_relational decoder was not initialized")
+            if child_cache is None or parent_stats is None or parent_start is None or child_order is None:
+                raise RuntimeError("BigGS gaussian_relational decoder requires runtime child_cache/stats and parent assignment order")
+            fine, parent_e, residual, extra_aux = self.grld_decoder.decode_branch(
+                parent_event=parent_event,
+                child_params=child_params,
+                parent_params=parent_params,
+                child_cache=child_cache,
+                parent_stats=parent_stats,
+                child_to_parent=pid,
+                parent_start=parent_start,
+                parent_count=parent_count,
+                child_order=child_order,
+                branch_id=int(branch_id),
+                branch_scale=residual_scale,
+            )
+            scaled_residual = residual
         else:
             parent_e = parent_event.index_select(0, pid)
             def prepare_param_dict(params: Dict[str, torch.Tensor], *, detach: bool) -> Dict[str, torch.Tensor]:
@@ -400,6 +466,8 @@ class BigGSToFineEventDecoder(nn.Module):
             active = parent_count.to(device=parent_event.device).reshape(-1) > 0
             if int(active.numel()) > 0:
                 mean_preserve_error = float(mean_residual[active].detach().norm(dim=-1).max().item())
+        if mode == "gaussian_relational" and "weighted_mean_error" in extra_aux:
+            mean_preserve_error = float(extra_aux.get("weighted_mean_error", mean_preserve_error))
         aux = {
             "fine_event_norm": float(fine.detach().norm(dim=-1).mean().item()) if fine.numel() else 0.0,
             "child_residual_norm": float(residual.detach().norm(dim=-1).mean().item()) if residual.numel() else 0.0,
@@ -409,6 +477,8 @@ class BigGSToFineEventDecoder(nn.Module):
             "residual_scale": float(residual_scale.detach().abs().reshape(-1).mean().item()),
             "mean_preserve_error": mean_preserve_error,
         }
+        for key, value in extra_aux.items():
+            aux[f"grld/{key}"] = float(value)
         return (
             fine,
             _broadcast_optional(parent_support, pid),
@@ -428,6 +498,46 @@ class BigGSToFineEventDecoder(nn.Module):
             "sh_rest": branch.sh_rest,
         }
 
+    @staticmethod
+    def _diag_cov_from_scales_quats(scales_log: torch.Tensor, quats: torch.Tensor) -> torch.Tensor:
+        scales = torch.exp(scales_log).clamp_min(1.0e-6)
+        rot = _quat_to_rotmat(_normalize_quat(quats))
+        return (rot.square() * scales.square().unsqueeze(-2)).sum(dim=-1).clamp_min(1.0e-8)
+
+    def _canonical_rigid_relation_parent_params(
+        self,
+        *,
+        child_params: Dict[str, torch.Tensor],
+        base_parent_params: Dict[str, torch.Tensor],
+        child_to_parent: torch.Tensor,
+        child_mass: torch.Tensor,
+        num_parents: int,
+    ) -> Dict[str, torch.Tensor]:
+        means = child_params["means"]
+        device = means.device
+        dtype = means.dtype
+        pid = child_to_parent.long().to(device=device)
+        mass = child_mass.reshape(-1, 1).to(device=device, dtype=dtype).clamp_min(1.0e-8)
+        diag_cov = self._diag_cov_from_scales_quats(
+            child_params["scales_log"].to(device=device, dtype=dtype),
+            child_params["quats"].to(device=device, dtype=dtype),
+        )
+        denom = _scatter_sum(mass, pid, num_parents=int(num_parents)).clamp_min(1.0e-8)
+        parent_means = _scatter_sum(means * mass, pid, num_parents=int(num_parents)) / denom
+        parent_second = _scatter_sum((diag_cov + means.square()) * mass, pid, num_parents=int(num_parents)) / denom
+        parent_diag_cov = (parent_second - parent_means.square()).clamp_min(1.0e-8)
+        parent_quats = means.new_zeros((int(num_parents), 4))
+        parent_quats[:, 0] = 1.0
+        parent_params = {
+            key: value.to(device=device, dtype=dtype)
+            for key, value in base_parent_params.items()
+        }
+        parent_params["means"] = parent_means
+        parent_params["scales_log"] = 0.5 * torch.log(parent_diag_cov)
+        parent_params["quats"] = parent_quats
+        child_params["diag_cov"] = diag_cov
+        return parent_params
+
     def forward(
         self,
         *,
@@ -436,6 +546,8 @@ class BigGSToFineEventDecoder(nn.Module):
         measurement: Dict[str, Any],
     ) -> EventPack:
         route = measurement["route"]
+        runtime = measurement.get("biggs_parent_runtime")
+        bg_runtime = getattr(runtime, "bg", None) if runtime is not None else None
         assign_bg: BigGSBranchAssignment = measurement["assign_bg"]
         event_bg, support_bg, valid_bg, obs_bg, aux_bg = self._decode_branch(
             parent_event=parent_event_pack.event_bg,
@@ -450,6 +562,10 @@ class BigGSToFineEventDecoder(nn.Module):
             parent_params=measurement["parent_params_bg"],
             branch_id=0,
             child_basis=assign_bg.child_basis,
+            child_cache=None if bg_runtime is None else bg_runtime.child_cache,
+            parent_stats=None if bg_runtime is None else bg_runtime.stats,
+            parent_start=assign_bg.parent_start,
+            child_order=assign_bg.child_order,
         )
         event_distant = support_distant = valid_distant = obs_distant = None
         aux_distant: Dict[str, float] = {}
@@ -459,6 +575,7 @@ class BigGSToFineEventDecoder(nn.Module):
             and assign_distant is not None
             and parent_event_pack.event_distant is not None
         ):
+            distant_runtime = getattr(runtime, "distant", None) if runtime is not None else None
             event_distant, support_distant, valid_distant, obs_distant, aux_distant = self._decode_branch(
                 parent_event=parent_event_pack.event_distant,
                 parent_support=parent_event_pack.support_distant,
@@ -472,13 +589,18 @@ class BigGSToFineEventDecoder(nn.Module):
                 parent_params=measurement["parent_params_distant"],
                 branch_id=1,
                 child_basis=assign_distant.child_basis,
+                child_cache=None if distant_runtime is None else distant_runtime.child_cache,
+                parent_stats=None if distant_runtime is None else distant_runtime.stats,
+                parent_start=assign_distant.parent_start,
+                child_order=assign_distant.child_order,
             )
         event_rigid = support_rigid = valid_rigid = obs_rigid = None
         aux_rigid: Dict[str, float] = {}
         active: Optional[BigGSRigidActiveAssignment] = measurement.get("assign_rigid_active")
         if local_state.rigid is not None and active is not None and int(active.fine_S.numel()) > 0:
+            rigid_runtime = getattr(runtime, "rigid_active", None) if runtime is not None else None
             s = active.fine_S.long().to(device=local_state.rigid.means.device)
-            child_params = {
+            world_child_params = {
                 "means": measurement["route"].means_world_S,
                 "scales_log": local_state.rigid.scales_log.index_select(0, s),
                 "quats": measurement["route"].quats_world_S,
@@ -486,6 +608,27 @@ class BigGSToFineEventDecoder(nn.Module):
                 "sh_dc": local_state.rigid.sh_dc.index_select(0, s),
                 "sh_rest": local_state.rigid.sh_rest.index_select(0, s),
             }
+            parent_params_rigid = measurement["parent_params_rigid_active"]
+            child_params = world_child_params
+            if str(self.mode).lower() == "gaussian_relational" and self.rigid_relation_space == "canonical":
+                child_params = {
+                    "means": local_state.rigid.means.index_select(0, s),
+                    "scales_log": local_state.rigid.scales_log.index_select(0, s),
+                    "quats": local_state.rigid.quats.index_select(0, s),
+                    "opacity_logit": local_state.rigid.opacity_logit.index_select(0, s),
+                    "sh_dc": local_state.rigid.sh_dc.index_select(0, s),
+                    "sh_rest": local_state.rigid.sh_rest.index_select(0, s),
+                }
+                child_mass_for_relation = (
+                    active.child_mass_S if rigid_runtime is None else rigid_runtime.child_cache.mass
+                )
+                parent_params_rigid = self._canonical_rigid_relation_parent_params(
+                    child_params=child_params,
+                    base_parent_params=parent_params_rigid,
+                    child_to_parent=active.child_to_active_parent_S,
+                    child_mass=child_mass_for_relation,
+                    num_parents=int(active.active_parent_count.numel()),
+                )
             route_flag = active.parent_inside_mask.to(device=active.child_to_active_parent_S.device)[active.child_to_active_parent_S.long()].float()
             event_rigid, support_rigid, valid_rigid, obs_rigid, aux_rigid = self._decode_branch(
                 parent_event=parent_event_pack.event_rigid,
@@ -497,14 +640,27 @@ class BigGSToFineEventDecoder(nn.Module):
                 parent_count=active.active_parent_count,
                 parent_mass_mean=measurement["parent_mass_mean_rigid_active"],
                 child_params=child_params,
-                parent_params=measurement["parent_params_rigid_active"],
+                parent_params=parent_params_rigid,
                 branch_id=2,
                 route_flag=route_flag,
                 child_basis=active.child_basis_S,
+                child_cache=None if rigid_runtime is None else rigid_runtime.child_cache,
+                parent_stats=None if rigid_runtime is None else rigid_runtime.stats,
+                parent_start=active.active_parent_start,
+                child_order=active.active_child_order_S,
             )
+        grld_branch_aux = {"bg": aux_bg, "distant": aux_distant, "rigid": aux_rigid}
+
+        def grld_max(name: str) -> float:
+            values = [float(aux.get(f"grld/{name}", 0.0)) for aux in grld_branch_aux.values()]
+            return max(values) if values else 0.0
+
+        def grld_sum(name: str) -> float:
+            return float(sum(float(aux.get(f"grld/{name}", 0.0)) for aux in grld_branch_aux.values()))
+
         aux = {
             **dict(getattr(parent_event_pack, "aux", {}) or {}),
-            "iforward/biggs/decoder_mode_id": float({"broadcast": 0, "residual_mlp": 1, "low_rank_basis": 2, "whdd_fixed_basis": 3, "whdd_compact_fixed_basis": 4}.get(str(self.mode).lower(), -1)),
+            "iforward/biggs/decoder_mode_id": float({"broadcast": 0, "residual_mlp": 1, "low_rank_basis": 2, "whdd_fixed_basis": 3, "whdd_compact_fixed_basis": 4, "gaussian_relational": 5}.get(str(self.mode).lower(), -1)),
             "iforward/biggs/decoder_rank": float(self.rank),
             "iforward/biggs/parent_event_norm_bg": (
                 float(parent_event_pack.event_bg.detach().norm(dim=-1).mean().item())
@@ -534,6 +690,31 @@ class BigGSToFineEventDecoder(nn.Module):
             if parent_event_pack.event_bg is not None
             else 0.0,
             "iforward/whdd/gamma_rigid": float(self._residual_scale_for_branch(branch_id=2, ref=parent_event_pack.event_bg).detach().item())
+            if parent_event_pack.event_bg is not None
+            else 0.0,
+            "iforward/grld/weighted_mean_error": grld_max("weighted_mean_error"),
+            "iforward/grld/relation_centering_error": grld_max("relation_centering_error"),
+            "iforward/grld/dynamic_mass_nan_ratio": grld_max("dynamic_mass_nan_ratio"),
+            "iforward/grld/relation_xyz_norm": grld_max("relation_xyz_norm"),
+            "iforward/grld/relation_cov_norm": grld_max("relation_cov_norm"),
+            "iforward/grld/relation_cov_norm_before_norm": grld_max("relation_cov_norm_before_norm"),
+            "iforward/grld/relation_cov_norm_after_norm": grld_max("relation_cov_norm_after_norm"),
+            "iforward/grld/relation_mass_norm": grld_max("relation_mass_norm"),
+            "iforward/grld/relation_opacity_norm": grld_max("relation_opacity_norm"),
+            "iforward/grld/relation_sh_norm": grld_max("relation_sh_norm"),
+            "iforward/grld/relation_channel_rms_min": grld_max("relation_channel_rms_min"),
+            "iforward/grld/relation_channel_rms_max": grld_max("relation_channel_rms_max"),
+            "iforward/grld/relation_ms": grld_sum("relation_ms"),
+            "iforward/grld/decode_ms": grld_sum("decode_ms"),
+            "iforward/grld/rigid_relation_world_mode": grld_max("rigid_relation_world_mode"),
+            "iforward/grld/rigid_relation_canonical_mode": grld_max("rigid_relation_canonical_mode"),
+            "iforward/grld/lambda_bg": float(self._residual_scale_for_branch(branch_id=0, ref=parent_event_pack.event_bg).detach().item())
+            if parent_event_pack.event_bg is not None
+            else 0.0,
+            "iforward/grld/lambda_distant": float(self._residual_scale_for_branch(branch_id=1, ref=parent_event_pack.event_bg).detach().item())
+            if parent_event_pack.event_bg is not None
+            else 0.0,
+            "iforward/grld/lambda_rigid": float(self._residual_scale_for_branch(branch_id=2, ref=parent_event_pack.event_bg).detach().item())
             if parent_event_pack.event_bg is not None
             else 0.0,
         }

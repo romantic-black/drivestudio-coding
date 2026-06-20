@@ -10,7 +10,7 @@ from __future__ import annotations
 import copy
 import math
 import sys
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from omegaconf import OmegaConf
@@ -93,18 +93,30 @@ def _iforward_validation_cfg(cfg: Any) -> Dict[str, Any]:
         else:
             modes = [str(x) for x in modes_raw]
     rollout_shapes = [dict(x) for x in list(_cfg_get(raw, "rollout_shapes", []) or [])]
+    fixed_shape_names = [str(x) for x in list(_cfg_get(raw, "fixed_shape_names", []) or [])]
     return {
         "enable": bool(_cfg_get(raw, "enable", False)),
         "run_at_train_start": bool(_cfg_get(raw, "run_at_train_start", True)),
         "interval_steps": int(_cfg_get(raw, "interval_steps", 1000)),
         "segments_per_scene": int(_cfg_get(raw, "segments_per_scene", 1)),
         "rollouts_per_segment": int(_cfg_get(raw, "rollouts_per_segment", 1)),
+        "blocks_per_episode": _cfg_get(raw, "blocks_per_episode", None),
         "modes": modes,
         "use_train_rollout_shapes": bool(_cfg_get(raw, "use_train_rollout_shapes", False)),
         "rollout_shapes": rollout_shapes,
+        "fixed_shape_names": fixed_shape_names,
         "tensorboard_images_enable": bool(_cfg_get(tb_images_raw, "enable", True)),
         "tensorboard_images_max_per_role": int(_cfg_get(tb_images_raw, "max_images_per_role", 2)),
     }
+
+
+def _max_inner_k_from_shapes(shapes: Sequence[Dict[str, Any]]) -> int:
+    max_k = 0
+    for shape in list(shapes or []):
+        blocks = int(_cfg_get(shape, "blocks_per_rollout", 1) or 1)
+        repeats = int(_cfg_get(shape, "repeats_per_block", 1) or 1)
+        max_k = max(int(max_k), int(blocks) * int(repeats))
+    return int(max_k)
 
 
 def _safe_float(value: Any, default: float = float("nan")) -> float:
@@ -258,24 +270,36 @@ def _make_validation_scheduler(cfg: Any, dataset: Any, scene_id: int, segment_id
             blocks = [int(_cfg_get(shape, "blocks_per_rollout", 1)) for shape in configured_shapes]
             max_blocks = max(blocks) if blocks else 1
             min_blocks = min(blocks) if blocks else 1
+            val_rollouts_per_segment = max(1, int(val_cfg.get("rollouts_per_segment", 1)))
+            configured_blocks_per_episode = val_cfg.get("blocks_per_episode", None)
+            if configured_blocks_per_episode is None:
+                blocks_per_episode = max(int(max_blocks), int(val_rollouts_per_segment))
+            else:
+                blocks_per_episode = max(int(configured_blocks_per_episode), int(max_blocks))
             episode_cfg.update(
                 {
-                    "blocks_per_episode": int(max_blocks),
-                    "episode_stride": int(max_blocks),
-                    "allow_short_last_episode": False,
+                    "blocks_per_episode": int(blocks_per_episode),
+                    "episode_stride": int(blocks_per_episode),
+                    "allow_short_last_episode": True,
                     "min_blocks_per_episode": int(min_blocks),
-                    "rollouts_per_episode": 1,
+                    "rollouts_per_episode": int(val_rollouts_per_segment),
                 }
             )
-            rollout_cfg.update(
-                {
-                    "allow_short_final_rollout": False,
-                    "min_blocks_per_rollout": int(min_blocks),
-                    "avoid_single_block_tail": False,
-                    "shapes": configured_shapes,
-                    "shapes_schedule": [],
-                }
-            )
+            rollout_update = {
+                "allow_short_final_rollout": False,
+                "min_blocks_per_rollout": int(min_blocks),
+                "avoid_single_block_tail": False,
+                "max_inner_K": max(
+                    int(_cfg_get(rollout_cfg, "max_inner_K", 0) or 0),
+                    _max_inner_k_from_shapes(configured_shapes),
+                ),
+                "shapes": configured_shapes,
+                "shapes_schedule": [],
+                "fixed_shape_names": [],
+            }
+            if val_cfg.get("fixed_shape_names"):
+                rollout_update["fixed_shape_names"] = [str(x) for x in list(val_cfg.get("fixed_shape_names", []) or [])]
+            rollout_cfg.update(rollout_update)
         else:
             episode_cfg.update(
                 {

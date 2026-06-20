@@ -2984,6 +2984,33 @@ class MultiSceneDatasetV4:
             "scope": str(scope),
         }
 
+    def build_preload_hint_light(
+        self,
+        *,
+        scene_id: int,
+        segment_id: int,
+        future_image_refs: Sequence[ImageRef],
+        scope: str = "next_block_exact",
+    ) -> Dict[str, Any]:
+        refs = [(int(x[0]), int(x[1])) for x in future_image_refs]
+        unique_frames = sorted({int(x[0]) for x in refs})
+        unique_cams = sorted({int(x[1]) for x in refs})
+        return {
+            "hint_version": 4,
+            "scene_id": int(scene_id),
+            "segment_id": int(segment_id),
+            "segment_asset_id": "",
+            "future_image_refs": refs,
+            "unique_frame_indices": unique_frames,
+            "unique_cam_indices": unique_cams,
+            "required_static": {
+                "segment_bundle": True,
+                "test_refs": False,
+            },
+            "scope": str(scope),
+            "lightweight": True,
+        }
+
     def submit_preload_hint(
         self,
         *,

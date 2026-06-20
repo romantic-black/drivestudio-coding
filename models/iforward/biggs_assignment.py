@@ -605,28 +605,23 @@ def build_rigid_active_assignment(
     inside = inside_mask_S.to(device=device, dtype=torch.bool).reshape(-1)
     if int(inside.numel()) != n_s:
         raise ValueError("inside_mask_S length mismatch for BigGS rigid active assignment")
-    active_key_to_idx: Dict[Tuple[int, int], int] = {}
-    active_parent_global: List[int] = []
-    active_inside: List[bool] = []
-    child_to_active = torch.empty((n_s,), dtype=torch.long, device=device)
-    for row in range(n_s):
-        key = (int(parent_global[row].item()), int(bool(inside[row].item())))
-        idx = active_key_to_idx.get(key)
-        if idx is None:
-            idx = len(active_parent_global)
-            active_key_to_idx[key] = idx
-            active_parent_global.append(int(key[0]))
-            active_inside.append(bool(key[1]))
-        child_to_active[row] = int(idx)
-    m = int(len(active_parent_global))
-    starts = torch.zeros((m,), dtype=torch.long, device=device)
-    counts = torch.zeros((m,), dtype=torch.long, device=device)
-    ordered_rows: List[int] = []
-    for parent_idx in range(m):
-        starts[parent_idx] = int(len(ordered_rows))
-        rows = torch.nonzero(child_to_active == parent_idx, as_tuple=False).reshape(-1)
-        counts[parent_idx] = int(rows.numel())
-        ordered_rows.extend(int(x) for x in rows.tolist())
+    key = parent_global.long() * 2 + inside.long()
+    unique_key, child_to_active, counts = torch.unique(
+        key,
+        sorted=True,
+        return_inverse=True,
+        return_counts=True,
+    )
+    child_to_active = child_to_active.long()
+    counts = counts.long()
+    m = int(unique_key.numel())
+    starts = torch.cumsum(counts, dim=0) - counts
+    try:
+        ordered_rows = torch.argsort(child_to_active, stable=True)
+    except TypeError:
+        ordered_rows = torch.argsort(child_to_active)
+    active_parent_global = torch.div(unique_key, 2, rounding_mode="floor").long()
+    active_inside = (unique_key.remainder(2) > 0)
     child_basis_S = None
     basis_valid = None
     basis_weight_sum = None
@@ -643,12 +638,12 @@ def build_rigid_active_assignment(
     return BigGSRigidActiveAssignment(
         fine_S=fine_S.detach().clone(),
         child_to_active_parent_S=child_to_active,
-        active_parent_global=torch.tensor(active_parent_global, dtype=torch.long, device=device),
+        active_parent_global=active_parent_global,
         active_parent_count=counts,
         active_parent_start=starts,
-        active_child_order_S=torch.tensor(ordered_rows, dtype=torch.long, device=device),
+        active_child_order_S=ordered_rows.long(),
         child_mass_S=rigid_assignment.child_mass.to(device=device)[fine_S.long()],
-        parent_inside_mask=torch.tensor(active_inside, dtype=torch.bool, device=device),
+        parent_inside_mask=active_inside.to(dtype=torch.bool),
         child_inside_mask_S=inside,
         child_basis_S=child_basis_S,
         basis_valid=basis_valid,

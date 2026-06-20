@@ -441,6 +441,7 @@ class IForwardModel(nn.Module):
             "stage2_0_biggs_cuda_exact_diagonal_projector",
             "stage2_0_biggs_incremental_whdd",
             "stage2_0_biggs_compact16_residualonly",
+            "stage2_0_biggs_grld_dinov2base_concat48",
         }
         self.history_safe_projection = None
         self.adc_lite_cfg = cfg_get(iforward_cfg, "adc_lite", {}) or {}
@@ -1346,6 +1347,7 @@ class IForwardModel(nn.Module):
             "event_ms": 0.0,
             "memory_ms": 0.0,
             "update_ms": 0.0,
+            "parent_runtime_update_ms": 0.0,
             "delta_reg_ms": 0.0,
             "final_render_ms": 0.0,
         }
@@ -1652,6 +1654,7 @@ class IForwardModel(nn.Module):
                         ctx_memory=ctx_memory,
                     )
                 if self.is_stage2_0_biggs_parent_lifting and isinstance(measurement, dict):
+                    parent_runtime_update_step_ms = 0.0
                     current_runtime = measurement.get("biggs_parent_runtime", biggs_parent_runtime)
                     skip_exit = bool(getattr(self, "stage2_0_biggs_skip_update_on_block_exit", True))
                     update_nonfinal = bool(getattr(self, "stage2_0_biggs_update_after_each_nonfinal_repeat", True))
@@ -1662,13 +1665,20 @@ class IForwardModel(nn.Module):
                     if bool(is_block_exit) and bool(skip_exit):
                         biggs_parent_runtime = None
                     elif bool(should_update_runtime):
+                        parent_runtime_t0 = time.perf_counter()
                         biggs_parent_runtime = self.bridge.update_biggs_parent_runtime(
                             runtime=current_runtime,
                             old_local_state=old_local_state_before_update,
                             new_local_state=local_state,
                         )
+                        parent_runtime_update_step_ms = (time.perf_counter() - parent_runtime_t0) * 1000.0
                     else:
                         biggs_parent_runtime = current_runtime
+                    update_aux["iforward/biggs/time_parent_runtime_update_ms"] = float(parent_runtime_update_step_ms)
+                    update_aux["iforward/biggs/parent_runtime_update_performed"] = float(
+                        1.0 if bool(should_update_runtime) else 0.0
+                    )
+                    timings["parent_runtime_update_ms"] += float(parent_runtime_update_step_ms)
             update_step_ms = (time.perf_counter() - t0) * 1000.0
             timings["update_ms"] += update_step_ms
             t0 = time.perf_counter()

@@ -92,6 +92,7 @@ class IForwardTrainer(nn.Module):
             "stage2_0_biggs_cuda_exact_diagonal_projector",
             "stage2_0_biggs_incremental_whdd",
             "stage2_0_biggs_compact16_residualonly",
+            "stage2_0_biggs_grld_dinov2base_concat48",
         }
 
     def _is_v3_gru_history_gate(self) -> bool:
@@ -652,17 +653,27 @@ class IForwardTrainer(nn.Module):
             )
         t0 = time.perf_counter()
         params_with_grad = [p for p in self.model.parameters() if p.requires_grad and p.grad is not None]
-        grad_norm_unclipped = self._grad_norm(params_with_grad).to(device=loss.device)
-        if not torch.isfinite(grad_norm_unclipped).all():
-            raise RuntimeError("IForward gradient norm became NaN/Inf.")
         grad_clip_cfg = cfg_get(cfg_get(self.config, "training", {}) or {}, "grad_clip", {}) or {}
         grad_clip_enable = bool(cfg_get(grad_clip_cfg, "enable", False))
         grad_clip_max_norm = float(cfg_get(grad_clip_cfg, "max_norm", 1.0))
-        grad_clip_applied = False
+        grad_clip_invoked = bool(grad_clip_enable and params_with_grad)
+        grad_clip_was_active = False
+        grad_clip_scale = 1.0
         if grad_clip_enable and params_with_grad:
-            torch.nn.utils.clip_grad_norm_(params_with_grad, max_norm=float(grad_clip_max_norm))
-            grad_clip_applied = True
-        grad_norm_after_clip = self._grad_norm(params_with_grad).to(device=loss.device)
+            unclipped = torch.nn.utils.clip_grad_norm_(params_with_grad, max_norm=float(grad_clip_max_norm))
+            grad_norm_unclipped = torch.as_tensor(unclipped, device=loss.device, dtype=loss.dtype)
+        else:
+            grad_norm_unclipped = self._grad_norm(params_with_grad).to(device=loss.device)
+        if not torch.isfinite(grad_norm_unclipped).all():
+            raise RuntimeError("IForward gradient norm became NaN/Inf.")
+        if grad_clip_enable and params_with_grad:
+            grad_norm_value = float(grad_norm_unclipped.detach().item())
+            if grad_norm_value > float(grad_clip_max_norm):
+                grad_clip_was_active = True
+                grad_clip_scale = float(grad_clip_max_norm) / max(float(grad_norm_value), 1.0e-12)
+            grad_norm_after_clip = grad_norm_unclipped.new_tensor(min(float(grad_norm_value), float(grad_clip_max_norm)))
+        else:
+            grad_norm_after_clip = grad_norm_unclipped
         if not torch.isfinite(grad_norm_after_clip).all():
             raise RuntimeError("IForward clipped gradient norm became NaN/Inf.")
         group_metrics = self._optimizer_group_metrics()
@@ -717,6 +728,10 @@ class IForwardTrainer(nn.Module):
             "iforward/rollout_id_global": float(out.resolved.rollout_id_global),
             "iforward/rollout_idx_in_episode": float(out.resolved.rollout_idx_in_episode),
             "iforward/rollouts_per_episode": int(out.resolved.rollouts_per_episode),
+            "iforward/state_age_rollouts": int(max(int(out.resolved.rollout_idx_in_episode), 0)),
+            "iforward/state_age_inner_steps": int(
+                out.resolved.steps[0].optimizer_step_idx_in_episode if out.resolved.steps else 0
+            ),
             "iforward/reset_scene_state_before_rollout": bool(out.resolved.reset_scene_state_before_rollout),
             "iforward/episode_end_after_rollout": bool(out.resolved.episode_end_after_rollout),
             "iforward/carry_scene_state_after_rollout": bool(out.resolved.carry_scene_state_after_rollout),
@@ -726,7 +741,10 @@ class IForwardTrainer(nn.Module):
             "iforward/grad_norm_unclipped": float(grad_norm_unclipped.detach().item()),
             "iforward/grad_norm_after_clip": float(grad_norm_after_clip.detach().item()),
             "iforward/grad_clip_max_norm": float(grad_clip_max_norm),
-            "iforward/grad_clip_applied": bool(grad_clip_applied),
+            "iforward/grad_clip_invoked": bool(grad_clip_invoked),
+            "iforward/grad_clip_was_active": bool(grad_clip_was_active),
+            "iforward/grad_clip_scale": float(grad_clip_scale),
+            "iforward/grad_clip_applied": bool(grad_clip_was_active),
             "iforward/runtime_node_state_reset_before": bool(runtime_reset_before),
             "iforward/runtime_node_state_reset_after": bool(runtime_reset_after),
             "num_targets": int(out.stats.get("num_targets", 0)),

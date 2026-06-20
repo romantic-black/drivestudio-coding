@@ -13,7 +13,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from models.feature_extractors import DINOv2UNetFusionExtractor, FeatureBackprojector, ResidualOnlyFeatureExtractor
+from models.feature_extractors import (
+    DINOv2ResidualConcatExtractor,
+    DINOv2UNetFusionExtractor,
+    FeatureBackprojector,
+    ResidualOnlyFeatureExtractor,
+)
 from models.streetforward.minimal_trainer_stage4_6 import BgRigidInGRUInputs, MinimalStreetForwardStage4_6, RigidRoute
 from models.streetforward.node_states import NodeStateBackground, NodeStateDistant, NodeStateRigid
 from models.streetforward.struct_decoders import (
@@ -249,9 +254,10 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
 
         feature_extractor_cfg = self._require_key(model_cfg, "feature_extractor", "model")
         feature_extractor_type = str(self._require_key(feature_extractor_cfg, "type", "model.feature_extractor")).strip().lower()
-        if feature_extractor_type not in {"dinov2_unet_fusion", "residual_only"}:
+        if feature_extractor_type not in {"dinov2_unet_fusion", "dinov2_residual_concat", "residual_only"}:
             raise ValueError(
-                "Stage5_3 requires model.feature_extractor.type='dinov2_unet_fusion' or 'residual_only'."
+                "Stage5_3 requires model.feature_extractor.type='dinov2_unet_fusion', "
+                "'dinov2_residual_concat', or 'residual_only'."
             )
 
     def _rebuild_optimizer_after_stage5_modules(self) -> None:
@@ -338,16 +344,16 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
 
         feature_extractor_cfg = self._require_key(model_cfg, "feature_extractor", "model")
         feature_extractor_type = str(self._require_key(feature_extractor_cfg, "type", "model.feature_extractor")).strip().lower()
-        if feature_extractor_type not in {"dinov2_unet_fusion", "residual_only"}:
+        if feature_extractor_type not in {"dinov2_unet_fusion", "dinov2_residual_concat", "residual_only"}:
             raise ValueError(
                 f"Stage5_3 unsupported model.feature_extractor.type={feature_extractor_type!r}. "
-                "Only 'dinov2_unet_fusion' and 'residual_only' are supported."
+                "Only 'dinov2_unet_fusion', 'dinov2_residual_concat', and 'residual_only' are supported."
             )
         residual_cfg = self._require_key(feature_extractor_cfg, "residual_unet", "model.feature_extractor")
         residual_feat_channels = int(
             self._require_key(residual_cfg, "feat_channels", "model.feature_extractor.residual_unet")
         )
-        if residual_feat_channels != feat_2d_channels_model:
+        if feature_extractor_type == "residual_only" and residual_feat_channels != feat_2d_channels_model:
             raise ValueError(
                 "Stage5_3 residual_unet.feat_channels must match model.feat_2d_channels "
                 f"({feat_2d_channels_model}), got {residual_feat_channels}."
@@ -365,6 +371,47 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
                 ),
                 depth=int(self._require_key(residual_cfg, "depth", "model.feature_extractor.residual_unet")),
                 bilinear=bool(self._require_key(residual_cfg, "bilinear", "model.feature_extractor.residual_unet")),
+            ).to(self.device)
+        elif feature_extractor_type == "dinov2_residual_concat":
+            dino_cfg = self._require_key(feature_extractor_cfg, "dino", "model.feature_extractor")
+            concat_cfg = feature_extractor_cfg.get("concat", {}) or {}
+            dino_out_channels = int(self._require_key(dino_cfg, "out_channels", "model.feature_extractor.dino"))
+            total_channels = int(residual_feat_channels + dino_out_channels)
+            if total_channels != feat_2d_channels_model:
+                raise ValueError(
+                    "Stage5_3 dinov2_residual_concat requires residual_unet.feat_channels + "
+                    "dino.out_channels == model.feat_2d_channels "
+                    f"({feat_2d_channels_model}), got {residual_feat_channels}+{dino_out_channels}={total_channels}."
+                )
+            self.image_feature_extractor = DINOv2ResidualConcatExtractor(
+                dino_model_name=str(self._require_key(dino_cfg, "model_name", "model.feature_extractor.dino")),
+                dino_pretrained=bool(self._require_key(dino_cfg, "pretrained", "model.feature_extractor.dino")),
+                dino_weights_path=dino_cfg.get("weights_path", None),
+                dino_freeze=bool(dino_cfg.get("freeze", True)),
+                dino_freeze_adapter=bool(dino_cfg.get("freeze_adapter", True)),
+                dino_out_channels=dino_out_channels,
+                dino_intermediate_layers=tuple(
+                    self._require_key(dino_cfg, "intermediate_layers", "model.feature_extractor.dino")
+                ),
+                dino_pad_to_patch_multiple=int(
+                    self._require_key(dino_cfg, "pad_to_patch_multiple", "model.feature_extractor.dino")
+                ),
+                residual_in_channels=int(
+                    self._require_key(residual_cfg, "in_channels", "model.feature_extractor.residual_unet")
+                ),
+                residual_feat_channels=residual_feat_channels,
+                residual_base_channels=int(
+                    self._require_key(residual_cfg, "base_channels", "model.feature_extractor.residual_unet")
+                ),
+                residual_feature_downscale=int(
+                    self._require_key(residual_cfg, "feature_downscale", "model.feature_extractor.residual_unet")
+                ),
+                residual_depth=int(self._require_key(residual_cfg, "depth", "model.feature_extractor.residual_unet")),
+                residual_bilinear=bool(
+                    self._require_key(residual_cfg, "bilinear", "model.feature_extractor.residual_unet")
+                ),
+                concat_order=tuple(concat_cfg.get("order", ("residual", "dino"))),
+                normalize_dino=str(concat_cfg.get("normalize_dino", "fixed_layernorm")),
             ).to(self.device)
         else:
             dino_cfg = self._require_key(feature_extractor_cfg, "dino", "model.feature_extractor")

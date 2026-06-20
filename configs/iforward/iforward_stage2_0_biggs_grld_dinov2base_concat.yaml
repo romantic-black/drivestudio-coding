@@ -1,4 +1,4 @@
-output_name: experiment001
+output_name: iforward_stage2_0_biggs_grld_dinov2base_concat48
 # IForward BigGS Stage 2.0 entrypoint.
 # This is distinct from configs/minimal_streetforward_stage2_0.yaml, which is the
 # older Minimal StreetForward Stage 2.0 multi-target/no-proxy experiment.
@@ -107,11 +107,11 @@ scheduler_iforward:
     forbid_consecutive_same_scene: true
   episode:
     source_mode: keyframes
-    blocks_per_episode: 8
+    blocks_per_episode: 4
     episode_stride: 4
     allow_short_last_episode: true
     min_blocks_per_episode: 4
-    rollouts_per_episode: 12
+    rollouts_per_episode: 4
     block_source_frame_policy: random_within_keyframe_per_rollout
     reset_scene_state_policy: episode_begin
   rollout:
@@ -120,16 +120,19 @@ scheduler_iforward:
     allow_short_final_rollout: false
     min_blocks_per_rollout: 1
     avoid_single_block_tail: false
-    max_inner_K: 20
+    max_inner_K: 10
     detach_graph_after_rollout: true
-    fixed_shape_names: [b1_r6, b1_r12]
+    fixed_shape_names: []
     shapes:
-      - {name: b1_r4, blocks_per_rollout: 1, repeats_per_block: 4, prob: 0.10}
-      - {name: b1_r6, blocks_per_rollout: 1, repeats_per_block: 6, prob: 0.20}
-      - {name: b1_r8, blocks_per_rollout: 1, repeats_per_block: 8, prob: 0.30}
-      - {name: b1_r10, blocks_per_rollout: 1, repeats_per_block: 10, prob: 0.20}
-      - {name: b1_r12, blocks_per_rollout: 1, repeats_per_block: 12, prob: 0.15}
-      - {name: b1_r16, blocks_per_rollout: 1, repeats_per_block: 16, prob: 0.05}
+      - {name: b1_r2, blocks_per_rollout: 1, repeats_per_block: 2, prob: 0.111111}
+      - {name: b1_r3, blocks_per_rollout: 1, repeats_per_block: 3, prob: 0.111111}
+      - {name: b1_r4, blocks_per_rollout: 1, repeats_per_block: 4, prob: 0.111111}
+      - {name: b1_r5, blocks_per_rollout: 1, repeats_per_block: 5, prob: 0.111111}
+      - {name: b1_r6, blocks_per_rollout: 1, repeats_per_block: 6, prob: 0.111111}
+      - {name: b1_r7, blocks_per_rollout: 1, repeats_per_block: 7, prob: 0.111111}
+      - {name: b1_r8, blocks_per_rollout: 1, repeats_per_block: 8, prob: 0.111111}
+      - {name: b1_r9, blocks_per_rollout: 1, repeats_per_block: 9, prob: 0.111111}
+      - {name: b1_r10, blocks_per_rollout: 1, repeats_per_block: 10, prob: 0.111112}
     shapes_schedule: []
   evidence:
     camera_policy: all_cams
@@ -195,31 +198,53 @@ model:
   sh_degree: 1
   voxel_size: 0.2
   sparseConv_outdim: 64
-  feat_2d_channels: 16
+  feat_2d_channels: 48
   feat_2d_downscale: 1
   feature_extractor:
-    type: residual_only
+    type: dinov2_residual_concat
     residual_unet:
       in_channels: 6
-      feat_channels: 16
-      base_channels: 24
+      feat_channels: 32
+      base_channels: 32
       feature_downscale: 1
       depth: 3
       bilinear: true
+    dino:
+      model_name: vit_base_patch14_reg4_dinov2
+      pretrained: true
+      freeze: true
+      freeze_adapter: true
+      weights_path: null
+      out_channels: 16
+      intermediate_layers: [4, 8, 11]
+      pad_to_patch_multiple: 14
+      cache:
+        enable: true
+        level: adapter_output
+        dtype: float16
+        cpu_pinned: true
+        cpu_max_items: 0
+        gpu_max_items: 2
+        async_copy: true
+        fail_if_trainable: true
+    concat:
+      order: [residual, dino]
+      trainable_fusion: false
+      normalize_dino: fixed_layernorm
   use_fused_cuda_backproject_v2: true
   use_fused_cuda_backproject_v3: true
   use_fused_cuda_backproject_v4: true
   fused_cuda_backproject_v4_force_fallback: false
   struct_decoder:
     type: routed_near_far
-    feat_2d_channels: 16
+    feat_2d_channels: 48
     far:
       hidden_dim: 64
     knn_attention:
       enable: true
       k: 8
   iforward:
-    version: stage2_0_biggs_compact16_residualonly
+    version: stage2_0_biggs_grld_dinov2base_concat48
     debug:
       enable_memory_aux_stats: false
       log_per_k_metrics: false
@@ -243,14 +268,7 @@ model:
         builder: vectorized_sort_segment
         sort_children: none
         radius_voxel_safety_factor: 2.0
-        build_whdd_basis: true
-        whdd_basis:
-          type: weighted_parent_local_xyz
-          rank: 3
-          dtype: float16
-          min_std: 1.0e-4
-          rigid_space: canonical
-          active_rigid_recenter: true
+        build_whdd_basis: false
         mass_init: tau_area
         bg:
           voxel_size: 0.5
@@ -300,20 +318,26 @@ model:
         drift_fail_threshold: 1.0e-3
         drift_fail_action: exact_refresh
       child_decoder:
-        mode: whdd_compact_fixed_basis
-        rank: 3
+        mode: gaussian_relational
+        rank: 4
         parent_event_dim: 64
         fine_event_dim: 16
+        relation_dim: 12
         hidden_dim: 64
         num_layers: 2
         zero_init_last: true
         mean_preserve: true
-        residual_scale_init: 1.0e-2
+        residual_scale_init: 3.0e-2
         residual_scale_learnable: true
         residual_scale_per_branch: true
-        fused_cuda: false
-        whdd_chunk_size: 65536
-        child_code_parent_local_frame: false
+        fused_cuda: true
+        decode_chunk_size: 65536
+        relation_normalization: sibling_rms
+        relation_rms_floor: 0.05
+        relation_clip: 5.0
+        rigid_relation_space: canonical
+        detail_head_init_std: 1.0e-3
+        detach_relation_inputs: true
         detach_child_code_inputs: true
         detach_child_params: true
         detach_parent_params: true
@@ -368,7 +392,7 @@ model:
     struct_event_decoder:
       enable: true
       event_dim: 64
-      feat_2d_dim: 16
+      feat_2d_dim: 48
       support_embed_dim: 4
       branch_embed_dim: 4
       token:
@@ -472,11 +496,11 @@ optimizer:
   type: adamw
   lr:
     default: 1.0e-4
-    stage6_posterior_updater_base: 1.0e-5
-    stage6_struct_decoder: 1.0e-5
+    stage6_posterior_updater_base: 1.0e-4
+    stage6_struct_decoder: 5.0e-5
     biggs_child_decoder: 1.0e-4
     measurement_frontend: 1.0e-5
-    stage6_measurement_frontend_residual_unet: 1.0e-5
+    stage6_measurement_frontend_residual_unet: 5.0e-5
   betas: [0.9, 0.95]
   eps: 1.0e-8
   weight_decay: 1.0e-4
@@ -506,12 +530,15 @@ iforward_validation:
   enable: true
   modes: [full]
   run_at_train_start: true
-  interval_steps: 1000
+  interval_steps: 500
   segments_per_scene: 1
   rollouts_per_segment: 1
   use_train_rollout_shapes: false
   rollout_shapes:
-    - {name: b1_r4, blocks_per_rollout: 1, repeats_per_block: 4, prob: 1.0}
+    - {name: b1_r8, blocks_per_rollout: 1, repeats_per_block: 8, prob: 1.0}
+    - {name: b1_r16, blocks_per_rollout: 1, repeats_per_block: 16, prob: 1.0}
+    - {name: b1_r32, blocks_per_rollout: 1, repeats_per_block: 32, prob: 1.0}
+    - {name: b1_r64, blocks_per_rollout: 1, repeats_per_block: 64, prob: 1.0}
 
 logging:
   output_root: /root/autodl-tmp/outputs

@@ -99,6 +99,11 @@ class DINOFeatureCache:
             out_items.append(cpu)
         return tuple(out_items)
 
+    def _to_cache_dtype_device(self, value: CacheValue, *, device: torch.device) -> CacheValue:
+        if torch.is_tensor(value):
+            return value.to(device=device, dtype=self.dtype).detach()
+        return tuple(x.to(device=device, dtype=self.dtype).detach() for x in value)
+
     @staticmethod
     def _to_device(value: CacheValue, *, device: torch.device, non_blocking: bool) -> CacheValue:
         if torch.is_tensor(value):
@@ -166,7 +171,8 @@ class DINOFeatureCache:
             return out, stats
 
         with torch.no_grad():
-            out = self._detach_value(compute())
+            out_compute = self._detach_value(compute())
+        out = self._to_cache_dtype_device(out_compute, device=device_obj)
         if self.gpu_max_items > 0:
             self._gpu[gpu_key] = out
             self._gpu.move_to_end(gpu_key)

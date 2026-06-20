@@ -366,6 +366,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "stage2_0_biggs_cuda_exact_diagonal_projector",
             "stage2_0_biggs_incremental_whdd",
             "stage2_0_biggs_compact16_residualonly",
+            "stage2_0_biggs_grld_dinov2base_concat48",
         }
         if bool(biggs_enabled):
             if bool(self._cfg_get(biggs_cfg, "enable", True)) is not True:
@@ -443,10 +444,10 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 raise ValueError("Stage6_0 Phase A from_scratch requires base_measurement.train_2d_frontend=true.")
             elif not train_residual_unet:
                 raise ValueError("Stage6_0 Phase A from_scratch requires train_residual_unet=true.")
-            elif feature_extractor_type != "residual_only" and not train_fusion_neck:
+            elif feature_extractor_type not in {"residual_only", "dinov2_residual_concat"} and not train_fusion_neck:
                 raise ValueError(
                     "Stage6_0 Phase A from_scratch requires train_fusion_neck=true unless "
-                    "model.feature_extractor.type=residual_only."
+                    "model.feature_extractor.type is residual_only or dinov2_residual_concat."
                 )
         if bool(self._cfg_get(self._cfg_get(stage6, "vsm", {}) or {}, "enable", False)):
             raise ValueError("Stage6_0 Phase A must not enable VSM.")
@@ -885,6 +886,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 "stage2_0_biggs_cuda_exact_diagonal_projector",
                 "stage2_0_biggs_incremental_whdd",
                 "stage2_0_biggs_compact16_residualonly",
+                "stage2_0_biggs_grld_dinov2base_concat48",
             }
             and bool(self._cfg_get(biggs_cfg, "enable", True))
         )
@@ -1072,6 +1074,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "stage2_0_biggs_cuda_exact_diagonal_projector",
             "stage2_0_biggs_incremental_whdd",
             "stage2_0_biggs_compact16_residualonly",
+            "stage2_0_biggs_grld_dinov2base_concat48",
         }
         self.stage2_0_biggs_cfg = dict(biggs_cfg or {})
         self.stage2_0_biggs_assignment_cfg = self._cfg_get(biggs_cfg, "assignment", {}) or {}
@@ -3112,11 +3115,18 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         total_max = self._stage2_0_parent_runtime_drift_max(stats)
         stats["iforward/biggs/drift_max"] = float(total_max)
         if threshold > 0.0 and total_max > threshold:
+            stats["iforward/biggs/drift_exceeded_threshold"] = 1.0
             detail = self._stage2_0_parent_runtime_drift_detail(stats)
+            action = str(self._cfg_get(parent_state_cfg, "drift_fail_action", "raise")).lower()
+            if action in {"exact_refresh", "refresh", "warn_and_refresh"}:
+                setattr(runtime, "_force_exact_refresh_due_to_drift", True)
+                stats["iforward/biggs/drift_exact_refresh_scheduled"] = 1.0
+                return stats
             raise RuntimeError(
                 f"BigGS parent runtime drift check failed: max_error={total_max:.6g} "
                 f"> threshold={threshold:.6g} at block={block_idx}. {detail}"
             )
+        stats["iforward/biggs/drift_exceeded_threshold"] = 0.0
         return stats
 
     @torch.no_grad()
@@ -3137,7 +3147,8 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         update_backend = str(
             self._cfg_get(getattr(self, "stage2_0_biggs_parent_state_cfg", {}) or {}, "update_backend", "incremental")
         ).lower()
-        if update_backend in {"exact", "exact_refresh", "reference_exact", "reference_refresh"}:
+        force_exact_refresh = bool(getattr(runtime, "_force_exact_refresh_due_to_drift", False))
+        if force_exact_refresh or update_backend in {"exact", "exact_refresh", "reference_exact", "reference_refresh"}:
             bg_runtime = None
             if runtime.bg_assignment is not None:
                 bg_cfg = self._stage2_0_parent_runtime_cfg_for_branch("bg")
@@ -3202,6 +3213,8 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 exact_refresh_count=int(runtime.exact_refresh_count) + 1,
                 incremental_update_count=int(runtime.incremental_update_count),
             )
+            if force_exact_refresh:
+                setattr(refreshed_runtime, "_exact_refresh_due_to_drift", True)
             parent_state_cfg = getattr(self, "stage2_0_biggs_parent_state_cfg", {}) or {}
             interval = int(self._cfg_get(parent_state_cfg, "drift_check_interval_blocks", 0) or 0)
             threshold = float(self._cfg_get(parent_state_cfg, "drift_fail_threshold", 0.0) or 0.0)

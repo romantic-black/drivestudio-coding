@@ -219,6 +219,9 @@ def _build_iforward_random_window_train_step_row(
         "memory_entries_after": _metric_int(result.get("iforward/memory_entries_after", 0), 0),
         "grad_norm_unclipped": _metric_float(result.get("iforward/grad_norm_unclipped")),
         "grad_norm_after_clip": _metric_float(result.get("iforward/grad_norm_after_clip")),
+        "grad_clip_invoked": _metric_bool(result.get("iforward/grad_clip_invoked", False)),
+        "grad_clip_was_active": _metric_bool(result.get("iforward/grad_clip_was_active", False)),
+        "grad_clip_scale": _metric_float(result.get("iforward/grad_clip_scale"), 1.0),
         "grad_clip_applied": _metric_bool(result.get("iforward/grad_clip_applied", False)),
         "step_time_ms": float(step_time_ms),
         "batch_fetch_ms": float(batch_fetch_ms),
@@ -315,6 +318,73 @@ def _build_iforward_random_window_diagnostics_row(
             value_f = float(value)
             if np.isfinite(value_f):
                 row[key] = value_f
+    return row
+
+
+def _build_iforward_scheduler_row(
+    *,
+    step: int,
+    result: Dict[str, Any],
+    scheduler_info: Dict[str, Any],
+) -> Dict[str, Any]:
+    row: Dict[str, Any] = {
+        "step": int(step),
+        "split": "iforward_scheduler",
+        "scheduler_version": str(result.get("iforward/scheduler_version", scheduler_info.get("scheduler_version", ""))),
+        "scene_id": _metric_int(result.get("iforward/scene_id", scheduler_info.get("scene_id", -1))),
+        "segment_id": _metric_int(result.get("iforward/segment_id", scheduler_info.get("segment_id", -1))),
+        "episode_id": _metric_int(result.get("iforward/episode_id", scheduler_info.get("episode_id", -1))),
+        "rollout_id_global": _metric_int(result.get("iforward/rollout_id_global", scheduler_info.get("rollout_id_global", -1))),
+        "rollout_idx": _metric_int(result.get("iforward/rollout_idx_in_episode", scheduler_info.get("rollout_idx_in_episode", -1))),
+        "rollouts_per_episode": _metric_int(result.get("iforward/rollouts_per_episode", scheduler_info.get("rollouts_per_episode", -1))),
+        "is_fresh_state": _metric_bool(result.get("iforward/reset_scene_state_before_rollout", False)),
+        "state_age_rollouts": _metric_int(result.get("iforward/state_age_rollouts", -1)),
+        "state_age_inner_steps": _metric_int(result.get("iforward/state_age_inner_steps", -1)),
+        "shape_name": str(result.get("iforward/shape_name", scheduler_info.get("shape_name", ""))),
+        "blocks_per_rollout": _metric_int(result.get("iforward/blocks_per_rollout", scheduler_info.get("T_steps", -1))),
+        "repeats_per_block": _metric_int(result.get("iforward/repeats_per_block", scheduler_info.get("R_steps", -1))),
+        "inner_K": _metric_int(result.get("iforward/inner_K", scheduler_info.get("inner_K", -1))),
+        "episode_end": _metric_bool(result.get("iforward/episode_end_after_rollout", False)),
+        "carry_after_rollout": _metric_bool(result.get("iforward/carry_scene_state_after_rollout", False)),
+        "window_start": _metric_int(result.get("iforward/window_start", scheduler_info.get("window_start", -1))),
+        "window_end": _metric_int(result.get("iforward/window_end", scheduler_info.get("window_end", -1))),
+        "window_block_ids": _metric_list_int(result.get("iforward/window_block_ids", scheduler_info.get("window_block_ids"))),
+    }
+    return row
+
+
+def _build_biggs_parent_drift_row(
+    *,
+    step: int,
+    result: Dict[str, Any],
+    scheduler_info: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    if float(result.get("iforward/biggs/drift_checked", 0.0) or 0.0) <= 0.0:
+        return None
+    row: Dict[str, Any] = {
+        "step": int(step),
+        "split": "biggs_parent_drift",
+        "scheduler_version": str(result.get("iforward/scheduler_version", scheduler_info.get("scheduler_version", ""))),
+        "scene_id": _metric_int(result.get("iforward/scene_id", scheduler_info.get("scene_id", -1))),
+        "segment_id": _metric_int(result.get("iforward/segment_id", scheduler_info.get("segment_id", -1))),
+        "episode_id": _metric_int(result.get("iforward/episode_id", scheduler_info.get("episode_id", -1))),
+        "rollout_id_global": _metric_int(result.get("iforward/rollout_id_global", scheduler_info.get("rollout_id_global", -1))),
+        "rollout_idx": _metric_int(result.get("iforward/rollout_idx_in_episode", scheduler_info.get("rollout_idx_in_episode", -1))),
+        "rollouts_per_episode": _metric_int(result.get("iforward/rollouts_per_episode", scheduler_info.get("rollouts_per_episode", -1))),
+        "shape_name": str(result.get("iforward/shape_name", scheduler_info.get("shape_name", ""))),
+        "inner_K": _metric_int(result.get("iforward/inner_K", scheduler_info.get("inner_K", -1))),
+        "exact_refresh_count": _metric_int(result.get("iforward/biggs/exact_refresh_count", 0), 0),
+        "incremental_update_count": _metric_int(result.get("iforward/biggs/incremental_update_count", 0), 0),
+    }
+    for key, value in result.items():
+        if not str(key).startswith("iforward/biggs/drift_"):
+            continue
+        if isinstance(value, bool):
+            row[str(key)] = bool(value)
+        elif isinstance(value, (int, float)):
+            value_f = float(value)
+            if np.isfinite(value_f):
+                row[str(key)] = value_f
     return row
 
 
@@ -2899,6 +2969,24 @@ def main() -> None:
             sum_num_gaussians_distant += int(result.get("num_gaussians_distant", 0))
             sum_num_gaussians_rigid += int(result.get("num_gaussians_rigid", 0))
             sum_num_gaussians_sky += int(result.get("num_gaussians_sky", 0))
+            if result.get("iforward/rollout_id_global", None) is not None:
+                scheduler_row = _build_iforward_scheduler_row(
+                    step=int(step),
+                    result=result,
+                    scheduler_info=scheduler_info,
+                )
+                _write_metrics_history(metrics_fh, scheduler_row)
+                drift_row = _build_biggs_parent_drift_row(
+                    step=int(step),
+                    result=result,
+                    scheduler_info=scheduler_info,
+                )
+                if drift_row is not None:
+                    _write_metrics_history(metrics_fh, drift_row)
+                    if writer is not None:
+                        drift_max = drift_row.get("iforward/biggs/drift_max", None)
+                        if isinstance(drift_max, (int, float)):
+                            writer.add_scalar("train/biggs_parent_drift/max", float(drift_max), int(step))
 
             current_block_idx_global = int(scheduler_info.get("block_idx_global", -1))
             if current_block_idx_global >= 0:

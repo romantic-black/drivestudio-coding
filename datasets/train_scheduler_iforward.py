@@ -2207,7 +2207,9 @@ class TrainSchedulerIForward:
 
         remaining_blocks = int(len(frame_chain) - block_cursor)
         if self._block_selection_policy() == "random_start_contiguous":
-            shape = self._sample_shape_for_episode_length(len(frame_chain))
+            shape = self._sample_shape_for_episode(episode, rng=self.rng)
+            if int(shape.blocks_per_rollout) > int(len(frame_chain)):
+                shape = self._sample_shape_for_episode_length(len(frame_chain))
         else:
             shape = self._sample_shape_for_remaining(remaining_blocks)
         requested_blocks = int(shape.blocks_per_rollout)
@@ -2419,6 +2421,14 @@ class TrainSchedulerIForward:
             target_roles_flat=[str(x) for x in target_roles],
             request_meta=request_meta,
             leakage_check=leakage_check,
+            rollouts_per_episode=int(rollout_budget or 1),
+            episode_num_blocks=int(len(episode_blocks)),
+            window_policy=str(self._block_selection_policy()),
+            window_start=int(rollout_start_block_idx),
+            window_end=int(selected_end),
+            window_block_ids=[int(x) for x in episode_blocks],
+            window_keyframe_indices=[int(x) for x in input_keyframes],
+            window_frame_indices=[int(x) for x in input_frames],
         )
         self._validate_plan(plan, sidx=sidx)
         return plan
@@ -2766,7 +2776,10 @@ class TrainSchedulerIForward:
         if not refs:
             return
         scope = str(_cfg_get(self.preload_cfg, "hint_scope_for_exact_refs", "v9_role_refs"))
-        hint = self.dataset.build_preload_hint(
+        build_hint = getattr(self.dataset, "build_preload_hint_light", None)
+        if build_hint is None:
+            build_hint = self.dataset.build_preload_hint
+        hint = build_hint(
             scene_id=int(plan.scene_id),
             segment_id=int(plan.segment_id),
             future_image_refs=refs,

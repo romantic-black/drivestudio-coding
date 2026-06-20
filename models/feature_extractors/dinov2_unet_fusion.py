@@ -189,6 +189,8 @@ class DINOv2BackboneAdapter(nn.Module):
         for i, feat in enumerate(feats):
             if not torch.is_tensor(feat) or feat.dim() != 4:
                 raise RuntimeError(f"Invalid DINO intermediate at idx={i}: expected BCHW tensor.")
+            proj_weight = next(self.proj[i].parameters())
+            feat = feat.to(device=proj_weight.device, dtype=proj_weight.dtype)
             p = self.proj[i](feat)
             if int(p.shape[-2]) != h_t or int(p.shape[-1]) != w_t:
                 p = F.interpolate(p, size=(h_t, w_t), mode="bilinear", align_corners=False)

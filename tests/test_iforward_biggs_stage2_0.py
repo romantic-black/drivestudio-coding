@@ -12,7 +12,9 @@ from models.iforward.biggs_assignment import build_biggs_branch_assignment, buil
 from models.iforward.biggs_event_decoder import BigGSToFineEventDecoder
 from models.iforward.biggs_parent_projector import _canonicalize_quat, project_biggs_active_rigid_parents, project_biggs_parents
 from models.iforward.biggs_parent_stats import init_parent_branch_runtime, update_parent_branch_runtime
-from models.iforward.biggs_state import BigGSBranchAssignment, BigGSRigidActiveAssignment, IForwardBigGSState
+from models.iforward.biggs_relational_decoder import grld_decode_reference
+from models.iforward.biggs_state import BigGSBlockRuntime, BigGSBranchAssignment, BigGSRigidActiveAssignment, IForwardBigGSState
+from models.iforward.cuda_grld_decode import grld_decode, grld_decode_available
 from models.iforward.state import IForwardState
 from models.iforward.trainer import IForwardTrainer
 from models.streetforward.minimal_trainer_stage6_0 import MinimalStreetForwardStage6_0
@@ -553,6 +555,72 @@ def _decoder_fixture(event_dim: int = 4) -> tuple[LocalGSState, dict[str, object
     return local_state, measurement, parent_event
 
 
+def _attach_grld_runtime(local_state: LocalGSState, measurement: dict[str, object]) -> None:
+    cfg = {
+        "mass_mode": "dynamic_tau_area",
+        "min_scale": 1.0e-3,
+        "max_scale": 2.0,
+        "opacity_cap": 0.9,
+        "opacity_min": 1.0e-6,
+        "tau_parent_scale": 0.5,
+        "eps": 1.0e-6,
+        "min_child_mass": 1.0e-8,
+        "child_cache_dtype": "float32",
+    }
+    assign_bg = measurement["assign_bg"]
+    assign_distant = measurement["assign_distant"]
+    active = measurement["assign_rigid_active"]
+    route = measurement["route"]
+    bg_runtime = init_parent_branch_runtime(
+        params=_params_from_branch(local_state.bg),
+        child_to_parent=assign_bg.child_to_parent,
+        parent_count=assign_bg.parent_count,
+        child_mass=assign_bg.child_mass,
+        cfg=cfg,
+        child_order=assign_bg.child_order,
+        parent_start=assign_bg.parent_start,
+        max_scale=2.0,
+    )
+    distant_runtime = init_parent_branch_runtime(
+        params=_params_from_branch(local_state.distant),
+        child_to_parent=assign_distant.child_to_parent,
+        parent_count=assign_distant.parent_count,
+        child_mass=assign_distant.child_mass,
+        cfg=cfg,
+        child_order=assign_distant.child_order,
+        parent_start=assign_distant.parent_start,
+        max_scale=2.0,
+    )
+    s = active.fine_S.long()
+    rigid_runtime = init_parent_branch_runtime(
+        params={
+            "means": route.means_world_S,
+            "scales_log": local_state.rigid.scales_log.index_select(0, s),
+            "quats": route.quats_world_S,
+            "opacity_logit": local_state.rigid.opacity_logit.index_select(0, s),
+            "sh_dc": local_state.rigid.sh_dc.index_select(0, s),
+            "sh_rest": local_state.rigid.sh_rest.index_select(0, s),
+        },
+        child_to_parent=active.child_to_active_parent_S,
+        parent_count=active.active_parent_count,
+        child_mass=active.child_mass_S,
+        cfg=cfg,
+        child_order=active.active_child_order_S,
+        parent_start=active.active_parent_start,
+        max_scale=2.0,
+    )
+    measurement["biggs_parent_runtime"] = BigGSBlockRuntime(
+        bg=bg_runtime,
+        distant=distant_runtime,
+        rigid_active=rigid_runtime,
+        bg_assignment=assign_bg,
+        distant_assignment=assign_distant,
+        rigid_active_assignment=active,
+        source_frame_idx=0,
+        block_id=1,
+    )
+
+
 @pytest.mark.parametrize("mode", ["broadcast", "residual_mlp", "low_rank_basis", "whdd_fixed_basis"])
 def test_biggs_child_decoder_modes_shapes_and_zero_init_broadcast(mode: str) -> None:
     local_state, measurement, parent_event = _decoder_fixture(event_dim=4)
@@ -621,6 +689,138 @@ def test_biggs_compact_whdd_projects_parent64_to_fine16() -> None:
     detail_grad = sum(float(p.grad.detach().abs().sum().item()) for p in decoder.detail_head.parameters() if p.grad is not None)
     assert base_grad > 0.0
     assert detail_grad > 0.0
+
+
+def test_biggs_grld_zero_init_is_parent_base_broadcast() -> None:
+    local_state, measurement, parent_event = _decoder_fixture(event_dim=64)
+    _attach_grld_runtime(local_state, measurement)
+    decoder = BigGSToFineEventDecoder(
+        event_dim=64,
+        parent_event_dim=64,
+        fine_event_dim=16,
+        mode="gaussian_relational",
+        rank=4,
+        fused_cuda=False,
+        residual_scale_init=1.0,
+        residual_scale_learnable=False,
+    )
+    out = decoder(parent_event_pack=parent_event, local_state=local_state, measurement=measurement)
+    expected_bg = decoder.grld_decoder.base_head(parent_event.event_bg).index_select(0, measurement["assign_bg"].child_to_parent)
+    assert tuple(out.event_bg.shape) == (3, 16)
+    assert torch.allclose(out.event_bg, expected_bg, atol=1.0e-6)
+    assert out.aux["iforward/biggs/decoder_mode_id"] == 5.0
+
+
+def test_biggs_grld_relation_changes_with_child_state_and_preserves_dynamic_mean() -> None:
+    local_state, measurement, parent_event = _decoder_fixture(event_dim=64)
+    _attach_grld_runtime(local_state, measurement)
+    decoder = BigGSToFineEventDecoder(
+        event_dim=64,
+        parent_event_dim=64,
+        fine_event_dim=16,
+        mode="gaussian_relational",
+        rank=4,
+        fused_cuda=False,
+        residual_scale_init=1.0,
+        residual_scale_learnable=False,
+    )
+    assert decoder.grld_decoder is not None
+    nn.init.normal_(decoder.grld_decoder.detail_head[-1].weight, std=0.05)
+    out0 = decoder(parent_event_pack=parent_event, local_state=local_state, measurement=measurement)
+    bg_1 = replace(
+        local_state.bg,
+        opacity_logit=local_state.bg.opacity_logit.detach().clone().requires_grad_(True),
+    )
+    with torch.no_grad():
+        bg_1.opacity_logit[0] += 0.5
+    local_state_1 = replace(local_state, bg=bg_1)
+    measurement_1 = dict(measurement)
+    _attach_grld_runtime(local_state_1, measurement_1)
+    out1 = decoder(parent_event_pack=parent_event, local_state=local_state_1, measurement=measurement_1)
+    assert not torch.allclose(out0.event_bg, out1.event_bg)
+    assert out1.aux["iforward/grld/weighted_mean_error"] < 1.0e-4
+    assert out1.aux["iforward/grld/relation_centering_error"] < 1.0e-4
+
+
+def test_biggs_grld_sibling_rms_normalization_and_canonical_rigid_metrics() -> None:
+    local_state, measurement, parent_event = _decoder_fixture(event_dim=64)
+    _attach_grld_runtime(local_state, measurement)
+    decoder = BigGSToFineEventDecoder(
+        event_dim=64,
+        parent_event_dim=64,
+        fine_event_dim=16,
+        mode="gaussian_relational",
+        rank=4,
+        fused_cuda=False,
+        residual_scale_init=0.03,
+        residual_scale_learnable=False,
+        relation_normalization="sibling_rms",
+        relation_rms_floor=0.05,
+        relation_clip=5.0,
+        rigid_relation_space="canonical",
+        detail_head_init_std=1.0e-3,
+    )
+    out = decoder(parent_event_pack=parent_event, local_state=local_state, measurement=measurement)
+    assert out.aux["iforward/grld/relation_centering_error"] < 1.0e-4
+    assert out.aux["iforward/grld/weighted_mean_error"] < 1.0e-4
+    assert out.aux["iforward/grld/rigid_relation_world_mode"] == 0.0
+    assert out.aux["iforward/grld/rigid_relation_canonical_mode"] == 1.0
+    assert out.aux["iforward/grld/relation_cov_norm_after_norm"] >= 0.0
+    assert out.aux["iforward/grld/relation_channel_rms_max"] >= out.aux["iforward/grld/relation_channel_rms_min"]
+
+
+def test_biggs_grld_relation_inputs_detached() -> None:
+    local_state, measurement, parent_event = _decoder_fixture(event_dim=64)
+    local_state.bg.means.requires_grad_(True)
+    local_state.bg.opacity_logit.requires_grad_(True)
+    _attach_grld_runtime(local_state, measurement)
+    decoder = BigGSToFineEventDecoder(
+        event_dim=64,
+        parent_event_dim=64,
+        fine_event_dim=16,
+        mode="gaussian_relational",
+        rank=4,
+        fused_cuda=False,
+        residual_scale_init=1.0,
+        residual_scale_learnable=False,
+        detach_relation_inputs=True,
+    )
+    assert decoder.grld_decoder is not None
+    nn.init.normal_(decoder.grld_decoder.detail_head[-1].weight, std=0.05)
+    out = decoder(parent_event_pack=parent_event, local_state=local_state, measurement=measurement)
+    out.event_bg.sum().backward()
+    assert local_state.bg.means.grad is None
+    assert local_state.bg.opacity_logit.grad is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not grld_decode_available(), reason="GRLD CUDA extension unavailable")
+def test_grld_cuda_decode_matches_reference_forward_backward() -> None:
+    device = torch.device("cuda")
+    torch.manual_seed(7)
+    base = torch.randn(3, 5, device=device, requires_grad=True)
+    detail = torch.randn(3, 4, 5, device=device, requires_grad=True)
+    gate = torch.randn(3, 4, device=device, requires_grad=True)
+    coeff = torch.randn(6, 4, device=device, requires_grad=True)
+    child_to_parent = torch.tensor([0, 0, 1, 2, 2, 2], dtype=torch.long, device=device)
+    child_order = torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.long, device=device)
+    parent_start = torch.tensor([0, 2, 3], dtype=torch.long, device=device)
+    parent_count = torch.tensor([2, 1, 3], dtype=torch.long, device=device)
+    scale = torch.tensor(0.25, device=device, requires_grad=True)
+    out_cuda = grld_decode(base, detail, gate, coeff, child_to_parent, child_order, parent_start, parent_count, scale)
+    out_ref = grld_decode_reference(
+        base=base,
+        detail=detail,
+        gate=gate,
+        coeff=coeff,
+        child_to_parent=child_to_parent,
+        branch_scale=scale,
+    )
+    assert torch.allclose(out_cuda, out_ref, atol=1.0e-6, rtol=1.0e-5)
+    grad = torch.randn_like(out_cuda)
+    cuda_grads = torch.autograd.grad(out_cuda, (base, detail, gate, coeff, scale), grad, retain_graph=True)
+    ref_grads = torch.autograd.grad(out_ref, (base, detail, gate, coeff, scale), grad)
+    for got, exp in zip(cuda_grads, ref_grads):
+        assert torch.allclose(got, exp, atol=2.0e-5, rtol=2.0e-4)
 
 
 def test_biggs_low_rank_decoder_mean_preserves_residual() -> None:
