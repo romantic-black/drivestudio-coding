@@ -14,6 +14,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _make_norm(norm: str, channels: int) -> nn.Module:
+    norm_l = str(norm).lower()
+    if norm_l in {"batchnorm", "batch_norm", "bn"}:
+        return nn.BatchNorm2d(int(channels))
+    if norm_l in {"groupnorm", "group_norm", "gn"}:
+        groups = min(8, int(channels))
+        while groups > 1 and int(channels) % groups != 0:
+            groups -= 1
+        return nn.GroupNorm(groups, int(channels))
+    if norm_l in {"identity", "none"}:
+        return nn.Identity()
+    raise ValueError(f"unsupported ImageFeatureExtractor norm={norm!r}")
+
+
 class DoubleConv(nn.Module):
     """
     Double convolution block: Conv2d -> BN -> ReLU -> Conv2d -> BN -> ReLU
@@ -25,16 +39,17 @@ class DoubleConv(nn.Module):
         in_channels: int,
         out_channels: int,
         mid_channels: int | None = None,
+        norm: str = "batchnorm",
     ) -> None:
         super().__init__()
         if mid_channels is None:
             mid_channels = out_channels
         self.double_conv = nn.Sequential(
             nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(mid_channels),
+            _make_norm(norm, mid_channels),
             nn.ReLU(inplace=True),
             nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
+            _make_norm(norm, out_channels),
             nn.ReLU(inplace=True),
         )
 
@@ -47,11 +62,11 @@ class Down(nn.Module):
     Downsampling block: MaxPool -> DoubleConv
     """
 
-    def __init__(self, in_channels: int, out_channels: int) -> None:
+    def __init__(self, in_channels: int, out_channels: int, norm: str = "batchnorm") -> None:
         super().__init__()
         self.maxpool_conv = nn.Sequential(
             nn.MaxPool2d(2),
-            DoubleConv(in_channels, out_channels),
+            DoubleConv(in_channels, out_channels, norm=norm),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -64,17 +79,22 @@ class Up(nn.Module):
     """
 
     def __init__(
-        self, in_channels: int, skip_channels: int, out_channels: int, bilinear: bool = True
+        self,
+        in_channels: int,
+        skip_channels: int,
+        out_channels: int,
+        bilinear: bool = True,
+        norm: str = "batchnorm",
     ) -> None:
         super().__init__()
         if bilinear:
             self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
             # After upsampling: in_channels, after concat with skip: in_channels + skip_channels
-            self.conv = DoubleConv(in_channels + skip_channels, out_channels)
+            self.conv = DoubleConv(in_channels + skip_channels, out_channels, norm=norm)
         else:
             self.up = nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2)
             # After transpose conv: in_channels // 2, after concat: in_channels // 2 + skip_channels
-            self.conv = DoubleConv(in_channels // 2 + skip_channels, out_channels)
+            self.conv = DoubleConv(in_channels // 2 + skip_channels, out_channels, norm=norm)
 
     def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
         """
@@ -108,6 +128,7 @@ class ImageFeatureExtractor(nn.Module):
         feature_downscale: int = 1,
         depth: int = 4,
         bilinear: bool = True,
+        norm: str = "batchnorm",
     ) -> None:
         """
         Args:
@@ -122,9 +143,10 @@ class ImageFeatureExtractor(nn.Module):
         self.feature_downscale = max(int(feature_downscale), 1)
         self.depth = depth
         self.bilinear = bilinear
+        self.norm = str(norm)
 
         # Encoder (downsampling path)
-        self.inc = DoubleConv(in_channels, base_channels)
+        self.inc = DoubleConv(in_channels, base_channels, norm=self.norm)
 
         # Build encoder layers and track channel sizes for skip connections
         self.downs = nn.ModuleList()
@@ -132,7 +154,7 @@ class ImageFeatureExtractor(nn.Module):
         ch = base_channels
         for i in range(depth):
             ch_next = min(ch * 2, 256)  # Cap at 256 channels to keep it lightweight
-            self.downs.append(Down(ch, ch_next))
+            self.downs.append(Down(ch, ch_next, norm=self.norm))
             encoder_channels.append(ch_next)
             ch = ch_next
 
@@ -147,7 +169,7 @@ class ImageFeatureExtractor(nn.Module):
             ch_skip = encoder_channels[-(i + 2)]  # Corresponding encoder level
             # Output channels (same as skip for intermediate, feat_channels for final)
             ch_out = ch_skip if i < depth - 1 else feat_channels
-            self.ups.append(Up(ch_in, ch_skip, ch_out, bilinear))
+            self.ups.append(Up(ch_in, ch_skip, ch_out, bilinear, norm=self.norm))
 
     def get_feature_resolution(self, height: int, width: int) -> tuple[int, int]:
         """

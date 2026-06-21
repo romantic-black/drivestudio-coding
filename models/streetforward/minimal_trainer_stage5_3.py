@@ -17,6 +17,7 @@ from models.feature_extractors import (
     DINOv2ResidualConcatExtractor,
     DINOv2UNetFusionExtractor,
     FeatureBackprojector,
+    FWHRDINOv2ResidualExtractor,
     ResidualOnlyFeatureExtractor,
 )
 from models.streetforward.minimal_trainer_stage4_6 import BgRigidInGRUInputs, MinimalStreetForwardStage4_6, RigidRoute
@@ -254,10 +255,10 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
 
         feature_extractor_cfg = self._require_key(model_cfg, "feature_extractor", "model")
         feature_extractor_type = str(self._require_key(feature_extractor_cfg, "type", "model.feature_extractor")).strip().lower()
-        if feature_extractor_type not in {"dinov2_unet_fusion", "dinov2_residual_concat", "residual_only"}:
+        if feature_extractor_type not in {"dinov2_unet_fusion", "dinov2_residual_concat", "fwhr_dinov2_residual", "residual_only"}:
             raise ValueError(
                 "Stage5_3 requires model.feature_extractor.type='dinov2_unet_fusion', "
-                "'dinov2_residual_concat', or 'residual_only'."
+                "'dinov2_residual_concat', 'fwhr_dinov2_residual', or 'residual_only'."
             )
 
     def _rebuild_optimizer_after_stage5_modules(self) -> None:
@@ -344,10 +345,10 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
 
         feature_extractor_cfg = self._require_key(model_cfg, "feature_extractor", "model")
         feature_extractor_type = str(self._require_key(feature_extractor_cfg, "type", "model.feature_extractor")).strip().lower()
-        if feature_extractor_type not in {"dinov2_unet_fusion", "dinov2_residual_concat", "residual_only"}:
+        if feature_extractor_type not in {"dinov2_unet_fusion", "dinov2_residual_concat", "fwhr_dinov2_residual", "residual_only"}:
             raise ValueError(
                 f"Stage5_3 unsupported model.feature_extractor.type={feature_extractor_type!r}. "
-                "Only 'dinov2_unet_fusion', 'dinov2_residual_concat', and 'residual_only' are supported."
+                "Only 'dinov2_unet_fusion', 'dinov2_residual_concat', 'fwhr_dinov2_residual', and 'residual_only' are supported."
             )
         residual_cfg = self._require_key(feature_extractor_cfg, "residual_unet", "model.feature_extractor")
         residual_feat_channels = int(
@@ -372,18 +373,32 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
                 depth=int(self._require_key(residual_cfg, "depth", "model.feature_extractor.residual_unet")),
                 bilinear=bool(self._require_key(residual_cfg, "bilinear", "model.feature_extractor.residual_unet")),
             ).to(self.device)
-        elif feature_extractor_type == "dinov2_residual_concat":
+        elif feature_extractor_type in {"dinov2_residual_concat", "fwhr_dinov2_residual"}:
             dino_cfg = self._require_key(feature_extractor_cfg, "dino", "model.feature_extractor")
             concat_cfg = feature_extractor_cfg.get("concat", {}) or {}
+            detail_cfg = feature_extractor_cfg.get("detail", {}) or {}
             dino_out_channels = int(self._require_key(dino_cfg, "out_channels", "model.feature_extractor.dino"))
             total_channels = int(residual_feat_channels + dino_out_channels)
             if total_channels != feat_2d_channels_model:
                 raise ValueError(
-                    "Stage5_3 dinov2_residual_concat requires residual_unet.feat_channels + "
+                    f"Stage5_3 {feature_extractor_type} requires residual_unet.feat_channels + "
                     "dino.out_channels == model.feat_2d_channels "
                     f"({feat_2d_channels_model}), got {residual_feat_channels}+{dino_out_channels}={total_channels}."
                 )
-            self.image_feature_extractor = DINOv2ResidualConcatExtractor(
+            extractor_cls = (
+                FWHRDINOv2ResidualExtractor
+                if feature_extractor_type == "fwhr_dinov2_residual"
+                else DINOv2ResidualConcatExtractor
+            )
+            kwargs = {}
+            if feature_extractor_type == "fwhr_dinov2_residual":
+                kwargs.update(
+                    {
+                        "detail_channels": int(detail_cfg.get("channels", 8)),
+                        "detail_init_std": float(detail_cfg.get("init_std", 1.0e-3)),
+                    }
+                )
+            self.image_feature_extractor = extractor_cls(
                 dino_model_name=str(self._require_key(dino_cfg, "model_name", "model.feature_extractor.dino")),
                 dino_pretrained=bool(self._require_key(dino_cfg, "pretrained", "model.feature_extractor.dino")),
                 dino_weights_path=dino_cfg.get("weights_path", None),
@@ -410,8 +425,10 @@ class MinimalStreetForwardStage5_3(MinimalStreetForwardStage4_6):
                 residual_bilinear=bool(
                     self._require_key(residual_cfg, "bilinear", "model.feature_extractor.residual_unet")
                 ),
+                residual_norm=str(residual_cfg.get("norm", "groupnorm" if feature_extractor_type == "fwhr_dinov2_residual" else "batchnorm")),
                 concat_order=tuple(concat_cfg.get("order", ("residual", "dino"))),
                 normalize_dino=str(concat_cfg.get("normalize_dino", "fixed_layernorm")),
+                **kwargs,
             ).to(self.device)
         else:
             dino_cfg = self._require_key(feature_extractor_cfg, "dino", "model.feature_extractor")

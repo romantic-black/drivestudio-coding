@@ -7,6 +7,7 @@ from .feature_fusion import FeatureFusion
 from .image_feature_extractor import ImageFeatureExtractor
 from .dinov2_unet_fusion import DINOv2BackboneAdapter, DINOv2UNetFusionExtractor, FusionNeck2D
 from .dinov2_residual_concat import DINOv2ResidualConcatExtractor
+from .fwhr_dinov2_residual import FWHRDINOv2ResidualExtractor, FWHRImageFeatures
 from .residual_only import ResidualOnlyFeatureExtractor
 
 __all__ = [
@@ -20,6 +21,8 @@ __all__ = [
     "ResidualOnlyFeatureExtractor",
     "DINOv2BackboneAdapter",
     "DINOv2ResidualConcatExtractor",
+    "FWHRDINOv2ResidualExtractor",
+    "FWHRImageFeatures",
     "FusionNeck2D",
     "DINOv2UNetFusionExtractor",
 ]

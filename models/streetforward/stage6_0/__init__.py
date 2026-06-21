@@ -1,6 +1,6 @@
 from .event_encoder import EventPack, Stage6EventEncoder, Stage6ParamEncoder
 from .local_gs_state import LocalGSState
-from .posterior_updater import ContextPack, CurrentContextAdapter, DeltaPack, Stage6PosteriorUpdater
+from .posterior_updater import AppearanceDetailPack, ContextPack, CurrentContextAdapter, DeltaPack, Stage6PosteriorUpdater
 from .struct_event_decoder import (
     Stage6FarMLPEventDecoder,
     Stage6NearXcpeEventDecoder,
@@ -35,6 +35,7 @@ from .vsm import Stage6BranchQueryPred, Stage6QueryDecoder, Stage6QueryPred, Sta
 
 __all__ = [
     "ContextPack",
+    "AppearanceDetailPack",
     "CurrentContextAdapter",
     "DeltaPack",
     "EventPack",

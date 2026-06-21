@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn as nn
+from omegaconf import OmegaConf
 
 from models.iforward.biggs_assignment import build_biggs_branch_assignment, build_biggs_assignments
 from models.iforward.biggs_event_decoder import BigGSToFineEventDecoder
@@ -15,11 +16,12 @@ from models.iforward.biggs_parent_stats import init_parent_branch_runtime, updat
 from models.iforward.biggs_relational_decoder import grld_decode_reference
 from models.iforward.biggs_state import BigGSBlockRuntime, BigGSBranchAssignment, BigGSRigidActiveAssignment, IForwardBigGSState
 from models.iforward.cuda_grld_decode import grld_decode, grld_decode_available
+from models.iforward.fwhr_lift import aggregate_fwhr_child_lift
 from models.iforward.state import IForwardState
 from models.iforward.trainer import IForwardTrainer
 from models.streetforward.minimal_trainer_stage6_0 import MinimalStreetForwardStage6_0
 from models.streetforward.node_states import NodeStateBackground, NodeStateDistant, NodeStateRigid
-from models.streetforward.stage6_0 import LocalGSState, Stage6PosteriorUpdater, Stage6StructInput
+from models.streetforward.stage6_0 import AppearanceDetailPack, LocalGSState, Stage6PosteriorUpdater, Stage6StructInput
 from models.streetforward.stage6_0.event_encoder import EventPack
 
 
@@ -1495,6 +1497,89 @@ def test_stage2_0_biggs_config_conflicts_fast_fail(iforward_overrides: dict[str,
     }
     with pytest.raises(ValueError, match=message):
         runtime._validate_stage6_0_phase_a_config(cfg)
+
+
+def test_fwhr_aggregate_parent_context_and_centered_detail() -> None:
+    context = torch.tensor(
+        [
+            [1.0, 0.0],
+            [3.0, 0.0],
+            [0.0, 4.0],
+            [2.0, 2.0],
+        ]
+    )
+    detail = torch.tensor(
+        [
+            [1.0],
+            [5.0],
+            [7.0],
+            [9.0],
+        ]
+    )
+    feature_weight = torch.tensor([1.0, 3.0, 2.0, 0.0])
+    features = torch.cat([context, detail], dim=-1)
+    feature_sum = (features * feature_weight[:, None]).requires_grad_(True)
+    support = torch.tensor([100.0, 1.0, 2.0, 0.0])
+    child_to_parent = torch.tensor([0, 0, 1, 1])
+    out = aggregate_fwhr_child_lift(
+        child_feature_sum=feature_sum,
+        child_weight_sum_feature=feature_weight,
+        child_support=support,
+        child_to_parent=child_to_parent,
+        num_parents=2,
+        context_dim=2,
+        detail_dim=1,
+        detail_valid_threshold=0.01,
+    )
+    assert torch.allclose(out.parent_context, torch.tensor([[2.5, 0.0], [0.0, 4.0]]), atol=1e-6)
+    assert torch.allclose(out.parent_obs_code, torch.zeros((2, 2)), atol=1e-6)
+    weighted_detail = torch.zeros((2, 1))
+    weighted_detail.index_add_(0, child_to_parent, out.child_detail.detach() * feature_weight[:, None])
+    assert float(weighted_detail.abs().max()) < 1e-5
+    assert out.child_detail_valid.tolist() == [True, True, True, False]
+    (out.parent_context.sum() + out.child_detail.sum()).backward()
+    assert feature_sum.grad is not None
+    assert float(feature_sum.grad.abs().sum()) > 0.0
+
+
+def test_posterior_appearance_detail_changes_only_opacity_and_sh() -> None:
+    torch.manual_seed(7)
+    updater = Stage6PosteriorUpdater(
+        event_dim=4,
+        hidden_dim=8,
+        stage_hidden_dim=0,
+        sh_degree=1,
+        output_hidden=False,
+        output_confidence=False,
+        output_noop=True,
+        appearance_detail_enable=True,
+        appearance_detail_dim=2,
+        appearance_detail_gate_init={"bg": 0.5, "distant": 0.5, "rigid": 0.5},
+    )
+    event = EventPack(event_bg=torch.randn(5, 4))
+    zeros = AppearanceDetailPack(detail_bg=torch.zeros(5, 2), valid_bg=torch.ones(5, dtype=torch.bool))
+    detail = AppearanceDetailPack(
+        detail_bg=torch.tensor([[1.0, -1.0], [0.5, 2.0], [-2.0, 0.2], [0.1, 0.3], [2.0, 1.0]]),
+        valid_bg=torch.ones(5, dtype=torch.bool),
+    )
+    delta_zero, _ = updater(event=event, appearance_detail=zeros)
+    delta_detail, aux = updater(event=event, appearance_detail=detail)
+    assert torch.allclose(delta_zero.bg.means, delta_detail.bg.means, atol=1e-6)
+    assert torch.allclose(delta_zero.bg.scales_log, delta_detail.bg.scales_log, atol=1e-6)
+    assert torch.allclose(delta_zero.bg.quat_axis_angle, delta_detail.bg.quat_axis_angle, atol=1e-6)
+    assert torch.allclose(delta_zero.bg.noop, delta_detail.bg.noop, atol=1e-6)
+    assert not torch.allclose(delta_zero.bg.opacity_logit, delta_detail.bg.opacity_logit)
+    assert not torch.allclose(delta_zero.bg.sh, delta_detail.bg.sh)
+    assert "posterior/detail_gate_bg" in aux
+
+
+def test_fwhr_config_allows_fine_lifting_flags() -> None:
+    cfg = OmegaConf.load("configs/iforward/iforward_stage2_0_fwhr_lift_grld_dinov2base.yaml")
+    assert cfg.model.iforward.version == "stage2_0_fwhr_lift_grld_dinov2base"
+    assert cfg.model.feature_extractor.type == "fwhr_dinov2_residual"
+    assert cfg.model.iforward.biggs.observe.parent_scene_for_lifting is False
+    assert cfg.model.iforward.biggs.lifting.type == "fwhr"
+    assert cfg.model.stage6_0.posterior_updater.appearance_detail.enable is True
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")

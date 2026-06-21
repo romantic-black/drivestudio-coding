@@ -242,7 +242,12 @@ class IForwardStage6Bridge:
         updater = getattr(self.runtime, "stage6_posterior_updater", None)
         if not callable(updater):
             raise RuntimeError("IForward v3 requires runtime.stage6_posterior_updater to predict deltas.")
-        delta, aux = updater(event=event, ctx_current=None, ctx_vsm=ctx_memory)
+        delta, aux = updater(
+            event=event,
+            ctx_current=None,
+            ctx_vsm=ctx_memory,
+            appearance_detail=getattr(event, "appearance_detail", None),
+        )
         out = {**dict(getattr(event, "aux", {}) or {}), **dict(aux or {})}
         out.update(self._ctx_adapter_stats(event=event, ctx_memory=ctx_memory))
         out.update(self._branch_delta_norms(delta.bg, branch="bg_raw"))

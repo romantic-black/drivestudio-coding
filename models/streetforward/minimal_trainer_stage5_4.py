@@ -152,10 +152,13 @@ class MinimalStreetForwardStage5_4(MinimalStreetForwardStage5_3):
         width: int,
         backprojector_override=None,
         return_debug_stats: Optional[bool] = None,
+        return_raw_lift: bool = False,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         num_gaussians = int(gaussians_scene["means"].shape[0])
         if num_gaussians == 0:
             self._stage5_4_obs_code_all = None
+            if bool(return_raw_lift):
+                return None, None, None
             return None, None
         backprojector_impl = backprojector_override if backprojector_override is not None else self.feature_backprojector
         debug_stats = True if return_debug_stats is None else bool(return_debug_stats)
@@ -171,8 +174,15 @@ class MinimalStreetForwardStage5_4(MinimalStreetForwardStage5_3):
             return_accumulated_weights=True,
             return_obs_code=True,
             return_debug_stats=debug_stats,
+            return_raw_sums=bool(return_raw_lift),
         )
-        if debug_stats:
+        if bool(return_raw_lift):
+            if debug_stats:
+                feat_sum, weight_sum_feature, acc_w, obs_code, bp_stats = bp_out
+            else:
+                feat_sum, weight_sum_feature, acc_w, obs_code = bp_out
+                bp_stats = {}
+        elif debug_stats:
             feat_2d_all, acc_w, obs_code, bp_stats = bp_out
         else:
             feat_2d_all, acc_w, obs_code = bp_out
@@ -181,6 +191,8 @@ class MinimalStreetForwardStage5_4(MinimalStreetForwardStage5_3):
             merge_debug_stats_as_perf_floats(self._perf_acc, "2d_bp_scene_", bp_stats)
         self._perf_acc["2d_bp_scene_call_count"] = float(self._perf_acc.get("2d_bp_scene_call_count", 0.0) + 1.0)
         self._stage5_4_obs_code_all = obs_code.detach()
+        if bool(return_raw_lift):
+            return feat_sum, weight_sum_feature, acc_w
         return feat_2d_all, acc_w
 
     def _build_struct_decoder_input_near(self, **kwargs) -> Any:

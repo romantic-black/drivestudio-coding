@@ -94,17 +94,25 @@ def _iforward_validation_cfg(cfg: Any) -> Dict[str, Any]:
             modes = [str(x) for x in modes_raw]
     rollout_shapes = [dict(x) for x in list(_cfg_get(raw, "rollout_shapes", []) or [])]
     fixed_shape_names = [str(x) for x in list(_cfg_get(raw, "fixed_shape_names", []) or [])]
+    shape_eval_mode = str(_cfg_get(raw, "shape_eval_mode", "sample")).lower()
+    if shape_eval_mode == "independent_all" and rollout_shapes:
+        rollouts_per_segment = max(int(_cfg_get(raw, "rollouts_per_segment", 1)), len(rollout_shapes))
+        if not fixed_shape_names:
+            fixed_shape_names = [str(shape.get("name", "")) for shape in rollout_shapes if str(shape.get("name", ""))]
+    else:
+        rollouts_per_segment = int(_cfg_get(raw, "rollouts_per_segment", 1))
     return {
         "enable": bool(_cfg_get(raw, "enable", False)),
         "run_at_train_start": bool(_cfg_get(raw, "run_at_train_start", True)),
         "interval_steps": int(_cfg_get(raw, "interval_steps", 1000)),
         "segments_per_scene": int(_cfg_get(raw, "segments_per_scene", 1)),
-        "rollouts_per_segment": int(_cfg_get(raw, "rollouts_per_segment", 1)),
+        "rollouts_per_segment": int(rollouts_per_segment),
         "blocks_per_episode": _cfg_get(raw, "blocks_per_episode", None),
         "modes": modes,
         "use_train_rollout_shapes": bool(_cfg_get(raw, "use_train_rollout_shapes", False)),
         "rollout_shapes": rollout_shapes,
         "fixed_shape_names": fixed_shape_names,
+        "shape_eval_mode": shape_eval_mode,
         "tensorboard_images_enable": bool(_cfg_get(tb_images_raw, "enable", True)),
         "tensorboard_images_max_per_role": int(_cfg_get(tb_images_raw, "max_images_per_role", 2)),
     }

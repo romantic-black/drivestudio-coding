@@ -93,6 +93,7 @@ class IForwardTrainer(nn.Module):
             "stage2_0_biggs_incremental_whdd",
             "stage2_0_biggs_compact16_residualonly",
             "stage2_0_biggs_grld_dinov2base_concat48",
+            "stage2_0_fwhr_lift_grld_dinov2base",
         }
 
     def _is_v3_gru_history_gate(self) -> bool:
@@ -121,6 +122,7 @@ class IForwardTrainer(nn.Module):
         residual_prefixes = (
             "image_feature_extractor.residual",
             "image_feature_extractor.residual_unet",
+            "image_feature_extractor.detail_head",
         )
         fusion_prefixes = (
             "image_feature_extractor.fusion",

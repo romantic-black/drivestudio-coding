@@ -315,9 +315,14 @@ class IForwardBatchResolver:
         ifwd = self._extract_iforward_meta(batch)
         request_meta = dict(batch.get("request_meta") or {})
         scheduler_version = str(ifwd.get("scheduler_version", request_meta.get("scheduler_version", "")))
-        if scheduler_version != self.expected_scheduler_version:
+        allowed_versions = {
+            self.expected_scheduler_version,
+            IFORWARD_V3_SCHEDULER_VERSION,
+            IFORWARD_V4_SCHEDULER_VERSION,
+        }
+        if scheduler_version not in allowed_versions:
             raise ValueError(
-                f"IForward requires scheduler_version={self.expected_scheduler_version!r}, got {scheduler_version!r}."
+                f"IForward requires scheduler_version in {sorted(allowed_versions)!r}, got {scheduler_version!r}."
             )
         is_v3 = scheduler_version == IFORWARD_V3_SCHEDULER_VERSION
         is_v4 = scheduler_version == IFORWARD_V4_SCHEDULER_VERSION

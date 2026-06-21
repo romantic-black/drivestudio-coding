@@ -442,6 +442,7 @@ class IForwardModel(nn.Module):
             "stage2_0_biggs_incremental_whdd",
             "stage2_0_biggs_compact16_residualonly",
             "stage2_0_biggs_grld_dinov2base_concat48",
+            "stage2_0_fwhr_lift_grld_dinov2base",
         }
         self.history_safe_projection = None
         self.adc_lite_cfg = cfg_get(iforward_cfg, "adc_lite", {}) or {}
@@ -464,7 +465,9 @@ class IForwardModel(nn.Module):
             if bool(self.adc_lite_enabled):
                 raise ValueError("stage2_0_biggs_parent_lifting requires adc_lite.enable=false")
             observe_cfg = cfg_get(biggs_cfg, "observe", {}) or {}
-            if bool(cfg_get(observe_cfg, "parent_scene_for_lifting", True)) is not True:
+            lifting_cfg = cfg_get(biggs_cfg, "lifting", {}) or {}
+            is_fwhr = str(cfg_get(lifting_cfg, "type", "")).lower() == "fwhr"
+            if not bool(is_fwhr) and bool(cfg_get(observe_cfg, "parent_scene_for_lifting", True)) is not True:
                 raise ValueError("stage2_0_biggs_parent_lifting requires parent_scene_for_lifting=true")
             skip_cfg = cfg_get(biggs_cfg, "child_observation_skip", {}) or {}
             if bool(cfg_get(skip_cfg, "enable", False)) and (

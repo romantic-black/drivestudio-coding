@@ -229,6 +229,8 @@ class MinimalStreetForwardStage4_5(MinimalStreetForwardStage4_2):
         dino_cache_stats: Dict[str, float] = {}
         cache = getattr(self, "dino_feature_cache", None)
         extractor = self.image_feature_extractor
+        fwhr_detail_2d = None
+        fwhr_aux_stats: Dict[str, float] = {}
         if (
             dino_cache_key is not None
             and cache is not None
@@ -286,8 +288,26 @@ class MinimalStreetForwardStage4_5(MinimalStreetForwardStage4_2):
                 dino_feat.to(device=residual_feat.device, dtype=residual_feat.dtype),
                 residual_feat,
             )
+            if hasattr(extractor, "detail_head"):
+                fwhr_detail_2d = extractor.detail_head(residual_feat)  # type: ignore[attr-defined]
+                fwhr_aux_stats["iforward/cnn/fwhr_detail_feat_mb"] = _tensor_mb(fwhr_detail_2d)
+                fwhr_aux_stats["iforward/cnn/fwhr_detail_feature_rms"] = float(
+                    fwhr_detail_2d.detach().float().square().mean().sqrt().item()
+                ) if int(fwhr_detail_2d.numel()) > 0 else 0.0
             _elapsed("fusion", t0)
             _mark_cuda("after_fusion")
+        elif hasattr(extractor, "forward_fwhr"):
+            t0 = time.perf_counter()
+            fwhr_features = extractor.forward_fwhr(multi)  # type: ignore[attr-defined]
+            features_2d = fwhr_features.context
+            fwhr_detail_2d = fwhr_features.detail
+            for key, value in dict(getattr(fwhr_features, "aux", {}) or {}).items():
+                if torch.is_tensor(value):
+                    fwhr_aux_stats[f"iforward/cnn/{key}"] = float(value.item())
+                elif isinstance(value, (int, float)):
+                    fwhr_aux_stats[f"iforward/cnn/{key}"] = float(value)
+            _elapsed("feature_extractor_fwhr", t0)
+            _mark_cuda("after_feature_extractor_fwhr")
         else:
             t0 = time.perf_counter()
             features_2d = self.image_feature_extractor(multi)
@@ -306,9 +326,10 @@ class MinimalStreetForwardStage4_5(MinimalStreetForwardStage4_2):
         cnn_perf_stats["iforward/cnn/total_ms"] = float((time.perf_counter() - total_t0) * 1000.0)
         return {
             "features_2d": features_2d,
+            "fwhr_detail_2d": fwhr_detail_2d,
             "source_pair_valid_mask": source_pair_valid_mask,
             "dino_cache_stats": dino_cache_stats,
-            "cnn_perf_stats": cnn_perf_stats,
+            "cnn_perf_stats": {**cnn_perf_stats, **fwhr_aux_stats},
         }
 
     def _backproject_scene_features_multi_camera(

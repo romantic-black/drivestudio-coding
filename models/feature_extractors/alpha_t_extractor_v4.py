@@ -145,6 +145,7 @@ class AlphaTWeightExtractorV4(AlphaTWeightExtractorV3):
         return_accumulated_weights: bool = False,
         return_obs_code: bool = False,
         return_debug_stats: bool = False,
+        return_raw_sums: bool = False,
     ) -> Union[
         torch.Tensor,
         Tuple[torch.Tensor, torch.Tensor],
@@ -270,7 +271,7 @@ class AlphaTWeightExtractorV4(AlphaTWeightExtractorV3):
             )
         fused_ms = float((time.perf_counter() - t_fused) * 1000.0)
         feat_out = feat_sum / (weight_sum_feature.unsqueeze(-1) + eps)
-        if orig_dtype != torch.float32:
+        if orig_dtype != torch.float32 and not bool(return_raw_sums):
             feat_out = feat_out.to(orig_dtype)
             obs_code = obs_code.to(orig_dtype)
             if return_accumulated_weights:
@@ -323,6 +324,14 @@ class AlphaTWeightExtractorV4(AlphaTWeightExtractorV3):
             "obs_overlap_mean": float(obs_code[:, 1].float().mean().item()) if obs_code.numel() > 0 else 0.0,
         }
 
+        if bool(return_raw_sums):
+            if not bool(return_accumulated_weights):
+                raise ValueError("return_raw_sums=True requires return_accumulated_weights=True")
+            if not bool(return_obs_code):
+                raise ValueError("return_raw_sums=True requires return_obs_code=True")
+            if return_debug_stats:
+                return feat_sum, weight_sum_feature, weight_sum_support, obs_code, stats
+            return feat_sum, weight_sum_feature, weight_sum_support, obs_code
         if return_accumulated_weights and return_obs_code and return_debug_stats:
             return feat_out, weight_sum_support, obs_code, stats
         if return_accumulated_weights and return_obs_code:

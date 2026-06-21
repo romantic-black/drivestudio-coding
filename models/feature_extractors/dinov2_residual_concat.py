@@ -29,6 +29,7 @@ class DINOv2ResidualConcatExtractor(nn.Module):
         residual_feature_downscale: int = 1,
         residual_depth: int = 3,
         residual_bilinear: bool = True,
+        residual_norm: str = "batchnorm",
         concat_order: Sequence[str] = ("residual", "dino"),
         normalize_dino: str = "fixed_layernorm",
     ) -> None:
@@ -59,6 +60,7 @@ class DINOv2ResidualConcatExtractor(nn.Module):
             feature_downscale=int(residual_feature_downscale),
             depth=int(residual_depth),
             bilinear=bool(residual_bilinear),
+            norm=str(residual_norm),
         )
         self.dino_adapter = DINOv2BackboneAdapter(
             model_name=str(dino_model_name),

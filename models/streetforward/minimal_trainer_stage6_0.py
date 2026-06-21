@@ -32,11 +32,13 @@ from models.iforward.biggs_parent_stats import (
 )
 from models.iforward.biggs_state import BigGSBlockRuntime, IForwardBigGSState
 from models.iforward.dino_feature_cache import DINOFeatureCache
+from models.iforward.fwhr_lift import aggregate_fwhr_child_lift
 from models.streetforward.minimal_trainer_stage4_0 import spatial_hw_from_image_tensor
 from models.streetforward.minimal_trainer_stage5_4 import MinimalStreetForwardStage5_4
 from models.streetforward.node_states import NodeStateBackground, NodeStateDistant, NodeStateRigid
 from models.streetforward.struct_decoders.common import cat_param_dict
 from models.streetforward.stage6_0 import (
+    AppearanceDetailPack,
     ContextPack,
     LocalGSState,
     PHASE_B_NAME,
@@ -367,6 +369,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "stage2_0_biggs_incremental_whdd",
             "stage2_0_biggs_compact16_residualonly",
             "stage2_0_biggs_grld_dinov2base_concat48",
+            "stage2_0_fwhr_lift_grld_dinov2base",
         }
         if bool(biggs_enabled):
             if bool(self._cfg_get(biggs_cfg, "enable", True)) is not True:
@@ -378,7 +381,9 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             if bool(self._cfg_get(self._cfg_get(iforward_cfg, "adc_lite", {}) or {}, "enable", False)):
                 raise ValueError("stage2_0_biggs_parent_lifting requires adc_lite.enable=false")
             observe_cfg = self._cfg_get(biggs_cfg, "observe", {}) or {}
-            if bool(self._cfg_get(observe_cfg, "parent_scene_for_lifting", True)) is not True:
+            lifting_cfg = self._cfg_get(biggs_cfg, "lifting", {}) or {}
+            is_fwhr = str(self._cfg_get(lifting_cfg, "type", "")).lower() == "fwhr"
+            if not bool(is_fwhr) and bool(self._cfg_get(observe_cfg, "parent_scene_for_lifting", True)) is not True:
                 raise ValueError("stage2_0_biggs_parent_lifting requires parent_scene_for_lifting=true")
             skip_cfg = self._cfg_get(biggs_cfg, "child_observation_skip", {}) or {}
             if bool(self._cfg_get(skip_cfg, "enable", False)) and (
@@ -444,10 +449,10 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 raise ValueError("Stage6_0 Phase A from_scratch requires base_measurement.train_2d_frontend=true.")
             elif not train_residual_unet:
                 raise ValueError("Stage6_0 Phase A from_scratch requires train_residual_unet=true.")
-            elif feature_extractor_type not in {"residual_only", "dinov2_residual_concat"} and not train_fusion_neck:
+            elif feature_extractor_type not in {"residual_only", "dinov2_residual_concat", "fwhr_dinov2_residual"} and not train_fusion_neck:
                 raise ValueError(
                     "Stage6_0 Phase A from_scratch requires train_fusion_neck=true unless "
-                    "model.feature_extractor.type is residual_only or dinov2_residual_concat."
+                    "model.feature_extractor.type is residual_only, dinov2_residual_concat, or fwhr_dinov2_residual."
                 )
         if bool(self._cfg_get(self._cfg_get(stage6, "vsm", {}) or {}, "enable", False)):
             raise ValueError("Stage6_0 Phase A must not enable VSM.")
@@ -887,6 +892,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 "stage2_0_biggs_incremental_whdd",
                 "stage2_0_biggs_compact16_residualonly",
                 "stage2_0_biggs_grld_dinov2base_concat48",
+                "stage2_0_fwhr_lift_grld_dinov2base",
             }
             and bool(self._cfg_get(biggs_cfg, "enable", True))
         )
@@ -934,6 +940,9 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         if hasattr(image_feature_extractor, "residual_unet"):
             if train_residual_unet:
                 mark_trainable(image_feature_extractor.residual_unet, "image_feature_extractor.residual_unet")
+                detail_head = getattr(image_feature_extractor, "detail_head", None)
+                if isinstance(detail_head, nn.Module):
+                    mark_trainable(detail_head, "image_feature_extractor.detail_head")
         elif train_residual_unet:
             mark_trainable(image_feature_extractor, "image_feature_extractor")
 
@@ -1049,6 +1058,8 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 for key in clamp_keys
                 if (value := self._cfg_get(cfg, key, None)) is not None
             }
+        appearance_detail_cfg = self._cfg_get(updater_cfg, "appearance_detail", {}) or {}
+        appearance_detail_gate_init = self._cfg_get(appearance_detail_cfg, "gate_init", {}) or {}
         self.stage6_posterior_updater = Stage6PosteriorUpdater(
             event_dim=self.stage6_posterior_event_dim,
             ctx_dim=self.stage6_posterior_event_dim,
@@ -1067,6 +1078,10 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             output_hidden=bool(self._cfg_get(updater_cfg, "output_hidden", True)),
             output_confidence=bool(self._cfg_get(updater_cfg, "output_confidence", True)),
             output_noop=bool(self._cfg_get(updater_cfg, "output_noop", True)),
+            appearance_detail_enable=bool(self._cfg_get(appearance_detail_cfg, "enable", False)),
+            appearance_detail_dim=int(self._cfg_get(appearance_detail_cfg, "detail_dim", 8)),
+            appearance_detail_gate_init=dict(appearance_detail_gate_init),
+            appearance_detail_gate_max=float(self._cfg_get(appearance_detail_cfg, "gate_max", 1.0)),
         ).to(self.device)
         ifwd_version = str(self._cfg_get(iforward_cfg, "version", ""))
         self.stage2_0_biggs_enabled = ifwd_version in {
@@ -1075,12 +1090,14 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "stage2_0_biggs_incremental_whdd",
             "stage2_0_biggs_compact16_residualonly",
             "stage2_0_biggs_grld_dinov2base_concat48",
+            "stage2_0_fwhr_lift_grld_dinov2base",
         }
         self.stage2_0_biggs_cfg = dict(biggs_cfg or {})
         self.stage2_0_biggs_assignment_cfg = self._cfg_get(biggs_cfg, "assignment", {}) or {}
         self.stage2_0_biggs_projector_cfg = self._cfg_get(biggs_cfg, "parent_projector", {}) or {}
         self.stage2_0_biggs_parent_state_cfg = self._cfg_get(biggs_cfg, "parent_state", {}) or {}
         self.stage2_0_biggs_observe_cfg = self._cfg_get(biggs_cfg, "observe", {}) or {}
+        self.stage2_0_biggs_lifting_cfg = self._cfg_get(biggs_cfg, "lifting", {}) or {}
         parent_state_policy = str(self._cfg_get(self.stage2_0_biggs_parent_state_cfg, "exact_refresh_policy", "block_enter")).lower()
         if parent_state_policy not in {"block_enter", "none"}:
             raise ValueError(
@@ -2290,6 +2307,139 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         }
         return BigGSParentProjection(params=params, child_mass_sum=ref.new_zeros((0,)), child_mass_mean=ref.new_zeros((0,)))
 
+    def _stage2_0_fwhr_child_to_parent_global(
+        self,
+        *,
+        state: IForwardBigGSState,
+        active_rigid: Any,
+        num_bg: int,
+        num_distant: int,
+        num_rigid_s: int,
+        num_parent_bg: int,
+        num_parent_distant: int,
+    ) -> torch.Tensor:
+        if state.bg is None:
+            raise RuntimeError("FW-HR requires bg assignment")
+        parts = [state.bg.child_to_parent.long()]
+        if int(num_distant) > 0:
+            if state.distant is None:
+                raise RuntimeError("FW-HR distant points require distant assignment")
+            parts.append(state.distant.child_to_parent.long() + int(num_parent_bg))
+        if int(num_rigid_s) > 0:
+            if active_rigid is None:
+                raise RuntimeError("FW-HR rigid points require active rigid assignment")
+            rigid_parent = active_rigid.child_to_active_parent_S.long() + int(num_parent_bg + num_parent_distant)
+            if int(rigid_parent.numel()) != int(num_rigid_s):
+                raise RuntimeError(
+                    f"FW-HR rigid active assignment row mismatch: {int(rigid_parent.numel())} vs {int(num_rigid_s)}"
+                )
+            parts.append(rigid_parent)
+        out = torch.cat(parts, dim=0) if parts else torch.zeros((0,), dtype=torch.long, device=self.device)
+        expected = int(num_bg + num_distant + num_rigid_s)
+        if int(out.numel()) != expected:
+            raise RuntimeError(f"FW-HR child_to_parent row mismatch: {int(out.numel())} vs {expected}")
+        return out
+
+    def _stage2_0_fwhr_lift_from_fine_scene(
+        self,
+        *,
+        fine_scene: Dict[str, torch.Tensor],
+        source_views: List[Any],
+        cnn_inputs: Dict[str, Any],
+        height: int,
+        width: int,
+        child_to_parent_global: torch.Tensor,
+        num_parents: int,
+        context_dim: int,
+        detail_dim: int,
+        num_bg: int,
+        num_distant: int,
+        num_rigid_s: int,
+    ) -> Tuple[Any, Dict[str, float]]:
+        detail_2d = cnn_inputs.get("fwhr_detail_2d")
+        if detail_2d is None or not torch.is_tensor(detail_2d):
+            raise RuntimeError("FW-HR lifting requires image_feature_extractor.forward_fwhr/detail output")
+        context_2d = cnn_inputs["features_2d"]
+        if context_2d.dim() != 4 or detail_2d.dim() != 4:
+            raise ValueError("FW-HR context/detail feature maps must be [V,H,W,C]")
+        if tuple(context_2d.shape[:3]) != tuple(detail_2d.shape[:3]):
+            raise ValueError(
+                "FW-HR context/detail spatial mismatch: "
+                f"context={tuple(context_2d.shape)} detail={tuple(detail_2d.shape)}"
+            )
+        if int(context_2d.shape[-1]) != int(context_dim):
+            raise ValueError(f"FW-HR context dim mismatch: got {int(context_2d.shape[-1])}, expected {context_dim}")
+        if int(detail_2d.shape[-1]) != int(detail_dim):
+            raise ValueError(f"FW-HR detail dim mismatch: got {int(detail_2d.shape[-1])}, expected {detail_dim}")
+        feat_2d = torch.cat([context_2d, detail_2d.to(device=context_2d.device, dtype=context_2d.dtype)], dim=-1)
+        child_feature_sum, child_weight_sum_feature, child_support = self._backproject_scene_features_multi_camera(
+            gaussians_scene=fine_scene,
+            source_views=source_views,
+            features_2d=feat_2d,
+            source_pair_valid_mask=cnn_inputs["source_pair_valid_mask"],
+            height=int(height),
+            width=int(width),
+            return_debug_stats=bool(getattr(self, "stage2_0_biggs_return_debug_stats", True)),
+            return_raw_lift=True,
+        )
+        if child_feature_sum is None or child_weight_sum_feature is None or child_support is None:
+            raise RuntimeError("FW-HR fine lifting returned empty features")
+        thresholds = []
+        if int(num_bg) > 0:
+            thresholds.append(
+                torch.full(
+                    (int(num_bg),),
+                    float(getattr(self, "bg_src_backproject_support_min", 0.0)),
+                    device=child_feature_sum.device,
+                    dtype=child_feature_sum.dtype,
+                )
+            )
+        if int(num_distant) > 0:
+            thresholds.append(
+                torch.full(
+                    (int(num_distant),),
+                    float(getattr(self, "distant_src_backproject_support_min", 0.0)),
+                    device=child_feature_sum.device,
+                    dtype=child_feature_sum.dtype,
+                )
+            )
+        if int(num_rigid_s) > 0:
+            thresholds.append(
+                torch.full(
+                    (int(num_rigid_s),),
+                    float(getattr(self, "rigid_src_backproject_support_min", 0.0)),
+                    device=child_feature_sum.device,
+                    dtype=child_feature_sum.dtype,
+                )
+            )
+        detail_valid_threshold = (
+            torch.cat(thresholds, dim=0)
+            if thresholds
+            else torch.zeros((0,), device=child_feature_sum.device, dtype=child_feature_sum.dtype)
+        )
+        lift = aggregate_fwhr_child_lift(
+            child_feature_sum=child_feature_sum,
+            child_weight_sum_feature=child_weight_sum_feature,
+            child_support=child_support,
+            child_to_parent=child_to_parent_global.to(device=child_feature_sum.device),
+            num_parents=int(num_parents),
+            context_dim=int(context_dim),
+            detail_dim=int(detail_dim),
+            eps=float(self._cfg_get(getattr(self, "stage2_0_biggs_lifting_cfg", {}) or {}, "eps", 1.0e-6)),
+            detail_valid_threshold=detail_valid_threshold,
+            parent_obs_mode=str(self._cfg_get(getattr(self, "stage2_0_biggs_lifting_cfg", {}) or {}, "parent_obs_mode", "zero")),
+        )
+        stats: Dict[str, float] = {
+            "iforward/fwhr/context_dim": float(context_dim),
+            "iforward/fwhr/detail_dim": float(detail_dim),
+        }
+        for key, value in dict(lift.aux or {}).items():
+            if torch.is_tensor(value):
+                stats[f"iforward/fwhr/{key}"] = float(value.item())
+            elif isinstance(value, (int, float)):
+                stats[f"iforward/fwhr/{key}"] = float(value)
+        return lift, stats
+
     def _stage2_0_biggs_projection_stats(
         self,
         *,
@@ -2635,10 +2785,17 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         self._mem_debug("biggs/after_parent_scene", num_parent=int(parent_scene["means"].shape[0]))
         source_views, source_images, source_sky_masks, source_egocar_masks = self._source_subset(batch, source_indices)
         height, width = spatial_hw_from_image_tensor(source_images[0])
+        lifting_cfg = getattr(self, "stage2_0_biggs_lifting_cfg", {}) or {}
+        fwhr_enabled = str(self._cfg_get(lifting_cfg, "type", "")).lower() == "fwhr"
         parent_scene_for_cnn = bool(self._cfg_get(getattr(self, "stage2_0_biggs_observe_cfg", {}) or {}, "parent_scene_for_cnn", True))
         cnn_scene = parent_scene
-        if not bool(parent_scene_for_cnn):
-            cnn_scene = self._stage2_0_fine_scene_from_state(bg=bg_m, distant=distant_m, rigid=rigid_m, route=route)
+        fine_scene = None
+        if bool(fwhr_enabled) or not bool(parent_scene_for_cnn):
+            fine_scene = self._stage2_0_fine_scene_from_state(bg=bg_m, distant=distant_m, rigid=rigid_m, route=route)
+        if bool(fwhr_enabled):
+            cnn_scene = fine_scene
+        elif not bool(parent_scene_for_cnn):
+            cnn_scene = fine_scene
         _record_observe_time("parent_scene_source", t_scene_source)
         t0 = time.perf_counter()
         dino_cache_key = self._stage2_0_dino_cache_key(
@@ -2668,15 +2825,81 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             if str(k).startswith("2d_bp_scene_")
         }
         t0 = time.perf_counter()
-        feat_all, acc_all = self._backproject_scene_features_multi_camera(
-            gaussians_scene=parent_scene,
-            source_views=source_views,
-            features_2d=cnn_inputs["features_2d"],
-            source_pair_valid_mask=cnn_inputs["source_pair_valid_mask"],
-            height=height,
-            width=width,
-            return_debug_stats=bool(getattr(self, "stage2_0_biggs_return_debug_stats", True)),
-        )
+        fwhr_stats: Dict[str, float] = {}
+        m_bg = int(bg_proj.num_parents)
+        m_d = int(distant_proj.num_parents) if distant_proj is not None else 0
+        m_r = int(rigid_proj_active.num_parents) if rigid_proj_active is not None else 0
+        num_parent = int(m_bg + m_d + m_r)
+        child_detail_bg = None
+        child_detail_d = None
+        child_detail_r = None
+        child_detail_valid_bg = None
+        child_detail_valid_d = None
+        child_detail_valid_r = None
+        child_detail_support_bg = None
+        child_detail_support_d = None
+        child_detail_support_r = None
+        if bool(fwhr_enabled):
+            if fine_scene is None:
+                raise RuntimeError("FW-HR expected fine_scene to be built")
+            context_dim = int(self._cfg_get(lifting_cfg, "context_dim", int(cnn_inputs["features_2d"].shape[-1])))
+            detail_dim = int(self._cfg_get(lifting_cfg, "detail_dim", 8))
+            if not bool(self._cfg_get(lifting_cfg, "fused_cuda", True)):
+                raise RuntimeError("FW-HR training path requires biggs.lifting.fused_cuda=true")
+            child_to_parent_global = self._stage2_0_fwhr_child_to_parent_global(
+                state=state,
+                active_rigid=active_rigid,
+                num_bg=int(bg_m.means.shape[0]),
+                num_distant=int(distant_m.means.shape[0]) if distant_m is not None else 0,
+                num_rigid_s=int(route.S.numel()),
+                num_parent_bg=int(m_bg),
+                num_parent_distant=int(m_d),
+            )
+            fwhr_lift, fwhr_stats = self._stage2_0_fwhr_lift_from_fine_scene(
+                fine_scene=fine_scene,
+                source_views=source_views,
+                cnn_inputs=cnn_inputs,
+                height=height,
+                width=width,
+                child_to_parent_global=child_to_parent_global,
+                num_parents=int(num_parent),
+                context_dim=int(context_dim),
+                detail_dim=int(detail_dim),
+                num_bg=int(bg_m.means.shape[0]),
+                num_distant=int(distant_m.means.shape[0]) if distant_m is not None else 0,
+                num_rigid_s=int(route.S.numel()),
+            )
+            feat_all = fwhr_lift.parent_context
+            acc_all = fwhr_lift.parent_support
+            obs_all = fwhr_lift.parent_obs_code
+            num_bg_f = int(bg_m.means.shape[0])
+            num_d_f = int(distant_m.means.shape[0]) if distant_m is not None else 0
+            num_r_f = int(route.S.numel())
+            cstart = 0
+            child_detail_bg = fwhr_lift.child_detail[cstart : cstart + num_bg_f]
+            child_detail_valid_bg = fwhr_lift.child_detail_valid[cstart : cstart + num_bg_f]
+            child_detail_support_bg = fwhr_lift.child_detail_support[cstart : cstart + num_bg_f]
+            cstart += num_bg_f
+            if num_d_f > 0:
+                child_detail_d = fwhr_lift.child_detail[cstart : cstart + num_d_f]
+                child_detail_valid_d = fwhr_lift.child_detail_valid[cstart : cstart + num_d_f]
+                child_detail_support_d = fwhr_lift.child_detail_support[cstart : cstart + num_d_f]
+            cstart += num_d_f
+            if num_r_f > 0:
+                child_detail_r = fwhr_lift.child_detail[cstart : cstart + num_r_f]
+                child_detail_valid_r = fwhr_lift.child_detail_valid[cstart : cstart + num_r_f]
+                child_detail_support_r = fwhr_lift.child_detail_support[cstart : cstart + num_r_f]
+        else:
+            feat_all, acc_all = self._backproject_scene_features_multi_camera(
+                gaussians_scene=parent_scene,
+                source_views=source_views,
+                features_2d=cnn_inputs["features_2d"],
+                source_pair_valid_mask=cnn_inputs["source_pair_valid_mask"],
+                height=height,
+                width=width,
+                return_debug_stats=bool(getattr(self, "stage2_0_biggs_return_debug_stats", True)),
+            )
+            obs_all = self._stage5_4_obs_code_all
         time_parent_lifting_ms = (time.perf_counter() - t0) * 1000.0
         perf_after = {
             str(k): float(v)
@@ -2691,13 +2914,9 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         if feat_all is None or acc_all is None:
             raise RuntimeError("BigGS parent lifting returned empty features")
         t_slice_stats = time.perf_counter()
-        obs_all = self._stage5_4_obs_code_all
         if obs_all is None:
             raise RuntimeError("BigGS parent lifting expected V4 obs_code")
         obs_all = obs_all.to(device=feat_all.device, dtype=feat_all.dtype)
-        m_bg = int(bg_proj.num_parents)
-        m_d = int(distant_proj.num_parents) if distant_proj is not None else 0
-        m_r = int(rigid_proj_active.num_parents) if rigid_proj_active is not None else 0
         if int(feat_all.shape[0]) != int(m_bg + m_d + m_r):
             raise RuntimeError("BigGS parent lifting row mismatch")
         start = 0
@@ -2713,7 +2932,6 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         acc_r = acc_all[start : start + m_r] if m_r > 0 else None
         obs_r = obs_all[start : start + m_r] if m_r > 0 else None
         num_fine = int(bg_m.means.shape[0]) + (int(distant_m.means.shape[0]) if distant_m is not None else 0) + int(route.S.numel())
-        num_parent = int(m_bg + m_d + m_r)
         stats = {
             **self._stage2_0_biggs_projection_stats(
                 prefix="iforward/biggs/bg",
@@ -2733,12 +2951,13 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 parent_count=active_rigid.active_parent_count if active_rigid is not None else None,
                 max_scale=self._stage2_0_biggs_max_scale("rigid"),
             ),
+            **fwhr_stats,
         }
         _record_observe_time("slice_stats", t_slice_stats)
         _record_observe_time("total", observe_total_t0)
         return {
             "biggs_enabled": True,
-            "biggs_mode": "parent_lifting_event_decode",
+            "biggs_mode": "fwhr_lift_event_decode" if bool(fwhr_enabled) else "parent_lifting_event_decode",
             "biggs_state": state_cpu.detach(),
             "biggs_parent_runtime": next_parent_runtime,
             "route": route,
@@ -2765,6 +2984,15 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "parent_params_rigid_active": None if rigid_proj_active is None else rigid_proj_active.params,
             "parent_coords_rigid_S": None if rigid_proj_active is None else rigid_proj_active.params["means"],
             "parent_mass_mean_rigid_active": None if rigid_proj_active is None else rigid_proj_active.child_mass_mean,
+            "child_detail_bg": child_detail_bg,
+            "child_detail_distant": child_detail_d,
+            "child_detail_rigid_S": child_detail_r,
+            "child_detail_valid_bg": child_detail_valid_bg,
+            "child_detail_valid_distant": child_detail_valid_d,
+            "child_detail_valid_rigid_S": child_detail_valid_r,
+            "child_detail_support_bg": child_detail_support_bg,
+            "child_detail_support_distant": child_detail_support_d,
+            "child_detail_support_rigid_S": child_detail_support_r,
             "num_bg": int(bg_m.means.shape[0]),
             "num_distant": int(distant_m.means.shape[0]) if distant_m is not None else 0,
             "num_rigid_S": int(route.S.numel()),
@@ -2775,6 +3003,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "iforward/biggs/num_parent_total": float(num_parent),
             "iforward/biggs/compression_total_active": float(num_fine) / float(max(num_parent, 1)),
             "iforward/biggs/parent_scene_for_cnn": 1.0 if bool(parent_scene_for_cnn) else 0.0,
+            "iforward/fwhr/enabled": 1.0 if bool(fwhr_enabled) else 0.0,
             "iforward/biggs/time_assignment_ms": float(time_assignment_ms),
             "iforward/biggs/time_parent_project_ms": float(time_parent_project_ms),
             "iforward/biggs/time_parent_render_cnn_ms": float(time_parent_render_cnn_ms),
@@ -3808,9 +4037,22 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             local_state=local_state,
             measurement=measurement,
         )
+        if torch.is_tensor(measurement.get("child_detail_bg")):
+            fine_event.appearance_detail = AppearanceDetailPack(
+                detail_bg=measurement["child_detail_bg"],
+                detail_distant=measurement.get("child_detail_distant"),
+                detail_rigid=measurement.get("child_detail_rigid_S"),
+                valid_bg=measurement.get("child_detail_valid_bg"),
+                valid_distant=measurement.get("child_detail_valid_distant"),
+                valid_rigid=measurement.get("child_detail_valid_rigid_S"),
+            )
         aux = dict(getattr(fine_event, "aux", {}) or {})
         for key, value in measurement.items():
-            if not (str(key).startswith("iforward/biggs/") or str(key).startswith("num_parent_")):
+            if not (
+                str(key).startswith("iforward/biggs/")
+                or str(key).startswith("iforward/fwhr/")
+                or str(key).startswith("num_parent_")
+            ):
                 continue
             if isinstance(value, (int, float)):
                 aux[str(key)] = float(value)
@@ -3893,7 +4135,12 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         event: Any,
         ctx_vsm: Optional[ContextPack] = None,
     ) -> tuple[LocalGSState, DeltaPack, Dict[str, Any]]:
-        delta, aux = self.stage6_posterior_updater(event=event, ctx_current=None, ctx_vsm=ctx_vsm)
+        delta, aux = self.stage6_posterior_updater(
+            event=event,
+            ctx_current=None,
+            ctx_vsm=ctx_vsm,
+            appearance_detail=getattr(event, "appearance_detail", None),
+        )
         self._mem_debug("encode/after_posterior")
         route = event.route
         if delta.rigid is not None and local_state.rigid is not None:
