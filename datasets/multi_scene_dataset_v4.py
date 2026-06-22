@@ -63,6 +63,7 @@ _V4_CACHE_MAX_ITEM_KEYS = (
 _EGO_MASK_MISSING = object()
 
 _EXPECTED_ASSET_COORDINATE_FRAME = "seg0_camera_opencv"
+_IFORWARD_STAGE2_1_SCHEDULER_VERSION = "iforward_stage2_1_parent_temporal"
 
 
 @dataclass(frozen=True)
@@ -2467,10 +2468,16 @@ class MultiSceneDatasetV4:
         include_test: bool = False,
     ) -> Dict[str, Any]:
         plan_scheduler_version = str(getattr(plan, "scheduler_version", ""))
-        if plan_scheduler_version not in {"iforward_v1", "iforward_v3_random_window", "iforward_v4_coverage_ordered"}:
+        if plan_scheduler_version not in {
+            "iforward_v1",
+            "iforward_v3_random_window",
+            "iforward_v4_coverage_ordered",
+            _IFORWARD_STAGE2_1_SCHEDULER_VERSION,
+        }:
             raise ValueError(
                 "expected IForwardRolloutPlan.scheduler_version == 'iforward_v1' "
-                "or 'iforward_v3_random_window' or 'iforward_v4_coverage_ordered'"
+                "or 'iforward_v3_random_window' or 'iforward_v4_coverage_ordered' "
+                f"or '{_IFORWARD_STAGE2_1_SCHEDULER_VERSION}'"
             )
         if int(scene_id) != int(getattr(plan, "scene_id")) or int(segment_id) != int(getattr(plan, "segment_id")):
             raise ValueError(
@@ -2484,7 +2491,7 @@ class MultiSceneDatasetV4:
         )
         target_refs_raw = [(int(ref[0]), int(ref[1])) for ref in list(getattr(plan, "target_refs_flat", []) or [])]
         target_roles_raw = [str(x) for x in list(getattr(plan, "target_roles_flat", []) or [])]
-        if plan_scheduler_version == "iforward_v4_coverage_ordered":
+        if plan_scheduler_version in {"iforward_v4_coverage_ordered", _IFORWARD_STAGE2_1_SCHEDULER_VERSION}:
             # V4 final eval intentionally allows one image ref to appear under
             # both rollout-supervision and eval-only roles on the last rollout.
             target_refs, target_roles = [tuple(x) for x in target_refs_raw], [str(x) for x in target_roles_raw]

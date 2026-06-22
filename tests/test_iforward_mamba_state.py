@@ -10,6 +10,9 @@ from models.iforward.context_adapter import IForwardContextAdapter
 from models.iforward.iforward_v6_state import IForwardV6MemoryState
 from models.iforward.local_conflict_xcpe import IForwardLocalConflictXcpe
 from models.iforward.memory import IForwardMemoryStepContext, IForwardSceneMemory
+from models.iforward.parent_temporal_keys import ParentTemporalKeys
+from models.iforward.parent_temporal_mamba import ParentTemporalMemory
+from models.iforward.parent_temporal_state import ParentTemporalState
 from models.iforward.point_mamba_memory import IForwardPointMambaMemory
 from models.streetforward.node_states import NodeStateBackground, NodeStateDistant, NodeStateRigid
 from models.streetforward.stage6_0 import EventPack, LocalGSState
@@ -34,6 +37,102 @@ def test_streaming_mamba_cell_shapes_grad_and_no_write():
     assert state2.conv_state.shape == (4, 7, 2)
     assert state2.ssm_state.shape == (4, 7, 3)
     assert bool(state2.seen.all())
+
+
+def test_parent_temporal_preview_no_write_and_unseen_zero_context():
+    torch.manual_seed(1)
+    memory = ParentTemporalMemory(event_dim=4, ctx_dim=3, model_dim=5, state_dim=2, conv_kernel=2)
+    state = ParentTemporalState.empty()
+    event = EventPack(
+        event_bg=torch.randn(3, 4),
+        valid_bg=torch.ones(3, dtype=torch.bool),
+    )
+    keys = ParentTemporalKeys(bg=torch.arange(3))
+    preview = memory.preview(event=event, state=state, keys=keys)
+    assert preview.event.event_bg.shape == (3, 4)
+    assert state.bg.dense is None
+    assert preview.aux["iforward/parent_temporal/bg_preview_seen_ratio"] == 0.0
+
+
+def test_parent_temporal_block_exit_single_commit_and_same_block_preview_equivalence():
+    torch.manual_seed(2)
+    memory = ParentTemporalMemory(event_dim=4, ctx_dim=3, model_dim=5, state_dim=2, conv_kernel=2)
+    state0 = ParentTemporalState.empty()
+    event = EventPack(event_bg=torch.randn(2, 4), valid_bg=torch.ones(2, dtype=torch.bool))
+    keys = ParentTemporalKeys(bg=torch.arange(2))
+    for _ in range(8):
+        _ = memory.preview(event=event, state=state0, keys=keys)
+    state_many, _ = memory.commit(event=event, state=state0, keys=keys, block_id=10)
+
+    state0b = ParentTemporalState.empty()
+    _ = memory.preview(event=event, state=state0b, keys=keys)
+    state_one, _ = memory.commit(event=event, state=state0b, keys=keys, block_id=10)
+    assert state_many.bg.dense is not None
+    assert state_one.bg.dense is not None
+    assert torch.allclose(state_many.bg.dense.conv_state, state_one.bg.dense.conv_state)
+    assert torch.allclose(state_many.bg.dense.ssm_state, state_one.bg.dense.ssm_state)
+    assert int(state_many.last_committed_block_id) == 10
+
+
+def test_parent_temporal_rigid_duplicate_key_commit_aggregation_and_detach():
+    torch.manual_seed(3)
+    memory = ParentTemporalMemory(event_dim=4, ctx_dim=3, model_dim=5, state_dim=2, conv_kernel=2)
+    event = EventPack(
+        event_bg=torch.zeros(0, 4),
+        event_rigid=torch.randn(3, 4),
+        valid_rigid=torch.ones(3, dtype=torch.bool),
+    )
+    keys = ParentTemporalKeys(bg=torch.zeros(0, dtype=torch.long), rigid=torch.tensor([7, 7, 9], dtype=torch.long))
+    state, aux = memory.commit(event=event, state=ParentTemporalState.empty(), keys=keys, block_id=1)
+    assert state.rigid.keyed is not None
+    assert torch.equal(state.rigid.keyed.keys.cpu(), torch.tensor([7, 9]))
+    assert aux["iforward/parent_temporal/rigid_committed"] == 3.0
+    detached = state.detach()
+    assert detached.rigid.keyed is not None
+    assert detached.rigid.keyed.conv_state.data_ptr() != state.rigid.keyed.conv_state.data_ptr()
+
+
+def test_parent_temporal_cross_block_loss_backprops_to_commit_token():
+    torch.manual_seed(4)
+    memory = ParentTemporalMemory(event_dim=4, ctx_dim=3, model_dim=5, state_dim=2, conv_kernel=2)
+    event_a = torch.randn(2, 4, requires_grad=True)
+    state_a, _ = memory.commit(
+        event=EventPack(event_bg=event_a, valid_bg=torch.ones(2, dtype=torch.bool)),
+        state=ParentTemporalState.empty(),
+        keys=ParentTemporalKeys(bg=torch.arange(2)),
+        block_id=1,
+    )
+    event_b = torch.randn(2, 4, requires_grad=True)
+    preview = memory.preview(
+        event=EventPack(event_bg=event_b, valid_bg=torch.ones(2, dtype=torch.bool)),
+        state=state_a,
+        keys=ParentTemporalKeys(bg=torch.arange(2)),
+    )
+    loss = preview.event.event_bg.square().mean()
+    loss.backward()
+    assert event_a.grad is not None
+    assert float(event_a.grad.detach().abs().sum().item()) > 0.0
+    grad_norm = 0.0
+    for param in memory.parameters():
+        if param.grad is not None:
+            grad_norm += float(param.grad.detach().abs().sum().item())
+    assert grad_norm > 0.0
+
+
+def test_parent_temporal_empty_state_clears_committed_memory():
+    torch.manual_seed(5)
+    memory = ParentTemporalMemory(event_dim=4, ctx_dim=3, model_dim=5, state_dim=2, conv_kernel=2)
+    state, _ = memory.commit(
+        event=EventPack(event_bg=torch.randn(2, 4), valid_bg=torch.ones(2, dtype=torch.bool)),
+        state=ParentTemporalState.empty(),
+        keys=ParentTemporalKeys(bg=torch.arange(2)),
+        block_id=3,
+    )
+    assert state.count_tokens()["parent_temporal_bg_dense_seen"] == 2.0
+    reset = ParentTemporalState.empty()
+    counts = reset.count_tokens()
+    assert counts["parent_temporal_bg_dense_seen"] == 0.0
+    assert counts["parent_temporal_last_committed_block_id"] == -1.0
 
 
 def test_iforward_memory_state_and_history_detach():

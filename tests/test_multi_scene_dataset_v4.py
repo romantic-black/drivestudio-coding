@@ -271,9 +271,13 @@ def test_v4_iforward_request_materializer_writes_mapping_meta(tmp_path):
     steps = [
         IForwardStepPlan(
             step_idx=0,
+            block_id=0,
             episode_block_idx=0,
             rollout_block_rank=0,
             repeat_idx=0,
+            repeats_per_block=1,
+            is_block_enter=True,
+            is_block_exit=True,
             source_keyframe_idx=0,
             source_frame_idx=0,
             evidence_refs=[(0, 0)],
@@ -291,9 +295,13 @@ def test_v4_iforward_request_materializer_writes_mapping_meta(tmp_path):
         ),
         IForwardStepPlan(
             step_idx=1,
+            block_id=1,
             episode_block_idx=1,
             rollout_block_rank=1,
             repeat_idx=0,
+            repeats_per_block=1,
+            is_block_enter=True,
+            is_block_exit=True,
             source_keyframe_idx=1,
             source_frame_idx=1,
             evidence_refs=[(1, 0)],
@@ -401,9 +409,13 @@ def test_v4_iforward_requires_stable_dynamic_row_space(tmp_path):
     ds.initialize()
     step = IForwardStepPlan(
         step_idx=0,
+        block_id=0,
         episode_block_idx=0,
         rollout_block_rank=0,
         repeat_idx=0,
+        repeats_per_block=1,
+        is_block_enter=True,
+        is_block_exit=True,
         source_keyframe_idx=0,
         source_frame_idx=0,
         evidence_refs=[(0, 0)],

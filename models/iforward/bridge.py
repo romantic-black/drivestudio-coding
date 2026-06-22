@@ -125,6 +125,29 @@ class IForwardStage6Bridge:
             new_local_state=new_local_state,
         )
 
+    def build_stage2_1_parent_inputs(
+        self,
+        *,
+        local_state: LocalGSState,
+        measurement: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        builder = getattr(self.runtime, "_build_stage2_1_parent_inputs_from_measurement", None)
+        if not callable(builder):
+            raise RuntimeError("Stage2_1 requires runtime._build_stage2_1_parent_inputs_from_measurement.")
+        return builder(local_state=local_state, measurement=measurement)
+
+    def decode_stage2_1_biggs_child_event(
+        self,
+        *,
+        parent_event: EventPack,
+        local_state: LocalGSState,
+        measurement: Dict[str, Any],
+    ) -> EventPack:
+        decoder = getattr(self.runtime, "_decode_stage2_1_biggs_child_event", None)
+        if not callable(decoder):
+            raise RuntimeError("Stage2_1 requires runtime._decode_stage2_1_biggs_child_event.")
+        return decoder(parent_event=parent_event, local_state=local_state, measurement=measurement)
+
     def observe_planning(
         self,
         *,
@@ -508,6 +531,7 @@ class IForwardStage6Bridge:
         mask_policy: str,
         pred_rgbs_out: Optional[List[torch.Tensor]] = None,
         gt_images_out: Optional[List[torch.Tensor]] = None,
+        return_per_ref_loss: bool = False,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         return self.runtime._render_loss_for_indices(
             local_state=local_state,
@@ -516,6 +540,7 @@ class IForwardStage6Bridge:
             mask_policy=str(mask_policy),
             pred_rgbs_out=pred_rgbs_out,
             gt_images_out=gt_images_out,
+            return_per_ref_loss=bool(return_per_ref_loss),
         )
 
     def history_probe_loss(

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Optional, Tuple
 
-from datasets.train_scheduler_iforward import TrainSchedulerIForward
+from datasets.train_scheduler_iforward import IFORWARD_STAGE2_1_SCHEDULER_VERSION, TrainSchedulerIForward
 
 
 def _cfg_get(node: Any, key: str, default: Any = None) -> Any:
@@ -43,10 +43,16 @@ def build_train_scheduler_iforward_from_cfg(
     if _cfg_get(sched, "enable", False) is not True:
         raise ValueError("scheduler_iforward.enable must be true")
     version = str(_cfg_get(sched, "version", "iforward_v1"))
-    if version not in {"iforward_v1", "iforward_v3_random_window", "iforward_v4_coverage_ordered"}:
+    if version not in {
+        "iforward_v1",
+        "iforward_v3_random_window",
+        "iforward_v4_coverage_ordered",
+        IFORWARD_STAGE2_1_SCHEDULER_VERSION,
+    }:
         raise ValueError(
             "scheduler_iforward.version must be iforward_v1, "
-            "iforward_v3_random_window, or iforward_v4_coverage_ordered"
+            "iforward_v3_random_window, iforward_v4_coverage_ordered, "
+            f"or {IFORWARD_STAGE2_1_SCHEDULER_VERSION}"
         )
 
     fixed_scene_id, fixed_segment_id = resolve_fixed_scene_segment_iforward(cfg)

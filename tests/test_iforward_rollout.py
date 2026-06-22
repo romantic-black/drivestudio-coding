@@ -330,6 +330,31 @@ def test_iforward_forward_rollout_carries_memory_and_renders_only_final():
     assert out.image_roles == ["current_latest", "history_rollout", "nearby"]
 
 
+def test_iforward_skips_history_render_when_effective_history_weight_zero():
+    cfg = {
+        "model": {
+            "iforward": {
+                "loss": {
+                    "in_rollout_history": {
+                        "weight": 0.5,
+                        "warmup": {"enable": True, "start_step": 100, "steps": 100, "start_factor": 0.0},
+                    }
+                }
+            }
+        }
+    }
+    bridge = FakeIForwardBridge()
+    model = IForwardModel(config=cfg, device=torch.device("cpu"), bridge=bridge, resolver=IForwardBatchResolver())
+    batch = _batch()
+    batch["global_step"] = 0
+    out = model.forward_rollout(batch)
+    assert torch.isfinite(out.loss)
+    assert bridge.render_calls == [(3, 4, 5), (6, 7, 8)]
+    assert out.stats["history_rollout_num_refs"] == 0.0
+    assert out.stats["loss_weight/in_rollout_history"] == 0.0
+    assert out.image_roles == ["current_latest", "nearby"]
+
+
 def test_iforward_trainer_detaches_carry_and_discards_on_episode_end():
     bridge = FakeIForwardBridge()
     model = IForwardModel(config=None, device=torch.device("cpu"), bridge=bridge, resolver=IForwardBatchResolver())

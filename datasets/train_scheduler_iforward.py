@@ -13,6 +13,7 @@ ImageRef = Tuple[int, int]
 IFORWARD_SCHEDULER_VERSION = "iforward_v1"
 IFORWARD_V3_SCHEDULER_VERSION = "iforward_v3_random_window"
 IFORWARD_V4_SCHEDULER_VERSION = "iforward_v4_coverage_ordered"
+IFORWARD_STAGE2_1_SCHEDULER_VERSION = "iforward_stage2_1_parent_temporal"
 IFORWARD_MODEL_FAMILY = "IForward"
 
 
@@ -340,8 +341,16 @@ class TrainSchedulerIForward:
     def _is_v4(self) -> bool:
         return str(self.version) == IFORWARD_V4_SCHEDULER_VERSION
 
+    def _is_stage2_1(self) -> bool:
+        return str(self.version) == IFORWARD_STAGE2_1_SCHEDULER_VERSION
+
+    def _is_v4_like(self) -> bool:
+        return self._is_v4() or self._is_stage2_1()
+
     def _scheduler_version(self) -> str:
-        if self._is_v4():
+        if self._is_stage2_1():
+            return IFORWARD_STAGE2_1_SCHEDULER_VERSION
+        if self._is_v4_like():
             return IFORWARD_V4_SCHEDULER_VERSION
         return IFORWARD_V3_SCHEDULER_VERSION if self._is_v3() else IFORWARD_SCHEDULER_VERSION
 
@@ -353,13 +362,14 @@ class TrainSchedulerIForward:
         if version in (IFORWARD_V3_SCHEDULER_VERSION,):
             self._validate_static_cfg_v3()
             return
-        if version in (IFORWARD_V4_SCHEDULER_VERSION,):
+        if version in (IFORWARD_V4_SCHEDULER_VERSION, IFORWARD_STAGE2_1_SCHEDULER_VERSION):
             self._validate_static_cfg_v4()
             return
         if version not in (IFORWARD_SCHEDULER_VERSION, "iforward_v1"):
             raise ValueError(
                 f"scheduler_iforward.version must be {IFORWARD_SCHEDULER_VERSION!r} "
-                f"or {IFORWARD_V3_SCHEDULER_VERSION!r} or {IFORWARD_V4_SCHEDULER_VERSION!r}, got {version!r}"
+                f"or {IFORWARD_V3_SCHEDULER_VERSION!r} or {IFORWARD_V4_SCHEDULER_VERSION!r} "
+                f"or {IFORWARD_STAGE2_1_SCHEDULER_VERSION!r}, got {version!r}"
             )
 
         traversal_mode = str(_cfg_get(self.traversal_cfg, "traversal_mode", _cfg_get(self.traversal_cfg, "mode", "episode_serial")))
@@ -540,9 +550,14 @@ class TrainSchedulerIForward:
             raise ValueError("scheduler_iforward v3 requires leakage_check.enable=true")
 
     def _validate_static_cfg_v4(self) -> None:
+        is_stage2_1 = self._is_stage2_1()
         traversal_mode = str(_cfg_get(self.traversal_cfg, "traversal_mode", _cfg_get(self.traversal_cfg, "mode", "episode_serial")))
-        if traversal_mode != "episode_serial":
-            raise ValueError("scheduler_iforward v4 requires traversal.traversal_mode=episode_serial")
+        allowed_traversal = {"episode_serial", "scene_round_robin_episode"} if bool(is_stage2_1) else {"episode_serial"}
+        if traversal_mode not in allowed_traversal:
+            raise ValueError(
+                "scheduler_iforward v4/stage2_1 requires traversal.traversal_mode in "
+                f"{sorted(allowed_traversal)!r}"
+            )
         for name in ("scene_order", "segment_order"):
             val = str(_cfg_get(self.traversal_cfg, name, "shuffle_per_epoch"))
             if val not in ("ascending", "shuffle_per_epoch"):
@@ -550,7 +565,7 @@ class TrainSchedulerIForward:
 
         if str(_cfg_get(self.episode_cfg, "source_mode", "keyframes")) != "keyframes":
             raise ValueError("scheduler_iforward v4 requires episode.source_mode=keyframes")
-        if _cfg_get(self.episode_cfg, "rollouts_per_episode", None) is not None:
+        if _cfg_get(self.episode_cfg, "rollouts_per_episode", None) is not None and not bool(is_stage2_1):
             raise ValueError("scheduler_iforward v4 derives rollouts_per_episode; remove episode.rollouts_per_episode")
         frame_policy = str(_cfg_get(self.episode_cfg, "block_source_frame_policy", "random_within_keyframe_once_per_episode"))
         if frame_policy != "random_within_keyframe_once_per_episode":
@@ -601,8 +616,12 @@ class TrainSchedulerIForward:
         memory_update = str(_cfg_get(self.memory_cfg, "optimizer_memory_update_policy", "every_repeat"))
         reset_policy = str(_cfg_get(self.memory_cfg, "reset_policy", "episode_begin"))
         carry_policy = str(_cfg_get(self.memory_cfg, "carry_policy", "across_rollouts_until_episode_end"))
-        if memory_commit != "first_repeat_only" or memory_update != "every_repeat":
-            raise ValueError("scheduler_iforward v4 requires first-repeat observation commit and every-repeat optimizer update")
+        expected_memory_update = "block_exit_only" if bool(is_stage2_1) else "every_repeat"
+        if memory_commit != "first_repeat_only" or memory_update != expected_memory_update:
+            raise ValueError(
+                "scheduler_iforward v4/stage2_1 requires first-repeat observation commit and "
+                f"{expected_memory_update} optimizer update"
+            )
         if reset_policy != "episode_begin" or carry_policy != "across_rollouts_until_episode_end":
             raise ValueError("scheduler_iforward v4 requires episode_begin reset and episode carry")
 
@@ -640,7 +659,7 @@ class TrainSchedulerIForward:
         raw = [dict(x) for x in list(_cfg_get(self.rollout_cfg, "shapes", []) or [])]
         if raw:
             return raw
-        if self._is_v4():
+        if self._is_v4_like():
             return [
                 {"name": "r8b1", "blocks_per_rollout": 1, "repeats_per_block": 8, "prob": 0.30},
                 {"name": "r4b2", "blocks_per_rollout": 2, "repeats_per_block": 4, "prob": 0.40},
@@ -831,7 +850,7 @@ class TrainSchedulerIForward:
         return None if raw is None else int(raw)
 
     def _rollout_budget_reached(self, episode: Dict[str, Any]) -> bool:
-        if self._is_v4():
+        if self._is_v4_like():
             return int(episode.get("rollout_idx_in_episode", 0)) >= len(
                 list(episode.get("rollout_start_sequence", []) or [])
             )
@@ -848,7 +867,7 @@ class TrainSchedulerIForward:
         return max(0, int(len(frame_chain)) - int(episode.get("block_cursor", 0)))
 
     def _should_skip_episode_tail(self, episode: Dict[str, Any]) -> bool:
-        if self._is_v3() or self._is_v4():
+        if self._is_v3() or self._is_v4_like():
             return False
         if self._random_start_uses_rollout_budget():
             frame_chain = [int(x) for x in list(episode.get("frame_chain", []) or [])]
@@ -1072,6 +1091,15 @@ class TrainSchedulerIForward:
             target_repeats_per_block=int(target_repeats),
             start_offset=int(start_offset),
         )
+        explicit_rollouts = _cfg_get(self.episode_cfg, "rollouts_per_episode", None)
+        if self._is_stage2_1() and explicit_rollouts is not None:
+            budget = max(int(explicit_rollouts), 1)
+            if len(starts) < budget:
+                base = list(starts) or [int(start_offset) % max(int(len(keyframe_window)), 1)]
+                extra = [base[i % len(base)] for i in range(budget - len(starts))]
+                starts = list(starts) + extra
+            else:
+                starts = list(starts)[:budget]
         wrap_count = 0
         for start in starts:
             _, wrap = window_blocks_from_start(
@@ -1120,7 +1148,7 @@ class TrainSchedulerIForward:
         self._emit(
             {
                 "type": "episode_begin",
-                "scheduler_version": IFORWARD_V4_SCHEDULER_VERSION,
+                "scheduler_version": self._scheduler_version(),
                 "global_step": int(self.global_step),
                 "scene_id": int(spec["scene_id"]),
                 "segment_id": int(spec["segment_id"]),
@@ -1135,7 +1163,7 @@ class TrainSchedulerIForward:
         )
 
     def _start_next_episode(self) -> None:
-        if self._is_v4():
+        if self._is_v4_like():
             self._start_next_episode_v4()
             return
         if self._episode_plan_cursor >= len(self._episode_plan):
@@ -1400,6 +1428,9 @@ class TrainSchedulerIForward:
         history_cfg = dict(_cfg_get(self.supervision_cfg, "history_replay", {}) or {})
         if not bool(_cfg_get(history_cfg, "enable", True)):
             return [], 0, True, "history_disabled", []
+        start_step = _cfg_get(history_cfg, "start_step", None)
+        if start_step is not None and int(self.global_step) < int(start_step):
+            return [], 0, True, f"history_start_step_{int(start_step)}", []
         if str(_cfg_get(history_cfg, "camera_policy", "all_cams")) != "all_cams":
             raise ValueError("scheduler_iforward v4 requires history_replay.camera_policy=all_cams")
         current = {int(x) for x in current_block_ids}
@@ -1710,7 +1741,7 @@ class TrainSchedulerIForward:
                         evidence_frame_indices=[int(frame_idx) for _ in evidence_refs],
                         evidence_cam_indices=[int(cam_idx) for _, cam_idx in evidence_refs],
                         commit_observation_memory=bool(int(repeat_idx) == 0),
-                        update_optimizer_memory=True,
+                        update_optimizer_memory=bool(is_exit) if self._is_stage2_1() else True,
                         detach_before_step=False,
                         detach_after_step=False,
                         allow_step_render_loss=False,
@@ -1787,7 +1818,7 @@ class TrainSchedulerIForward:
         }
         block_frame_map_snapshot = {int(k): int(v) for k, v in dict(episode.get("block_frame_map", {}) or {}).items()}
         request_meta = {
-            "scheduler_version": IFORWARD_V4_SCHEDULER_VERSION,
+            "scheduler_version": self._scheduler_version(),
             "model_family": IFORWARD_MODEL_FAMILY,
             "loss_timing_policy": "rollout_final_only",
             "scene_id": int(episode["scene_id"]),
@@ -1881,7 +1912,7 @@ class TrainSchedulerIForward:
             for idx in range(len(frame_chain))
         ]
         plan = IForwardRolloutPlan(
-            scheduler_version=IFORWARD_V4_SCHEDULER_VERSION,
+            scheduler_version=self._scheduler_version(),
             scene_id=int(episode["scene_id"]),
             segment_id=int(episode["segment_id"]),
             episode_id=int(episode["episode_id"]),
@@ -2193,7 +2224,7 @@ class TrainSchedulerIForward:
         return plan
 
     def _build_rollout_plan(self, episode: Dict[str, Any]) -> IForwardRolloutPlan:
-        if self._is_v4():
+        if self._is_v4_like():
             return self._build_v4_rollout_plan(episode)
         if self._is_v3():
             return self._build_v3_rollout_plan(episode)
@@ -2434,8 +2465,12 @@ class TrainSchedulerIForward:
         return plan
 
     def _validate_v4_plan(self, plan: IForwardRolloutPlan, *, sidx: Any) -> None:
-        if str(plan.scheduler_version) != IFORWARD_V4_SCHEDULER_VERSION:
-            raise ValueError(f"expected scheduler_version={IFORWARD_V4_SCHEDULER_VERSION}")
+        is_stage2_1 = str(plan.scheduler_version) == IFORWARD_STAGE2_1_SCHEDULER_VERSION
+        if str(plan.scheduler_version) not in {IFORWARD_V4_SCHEDULER_VERSION, IFORWARD_STAGE2_1_SCHEDULER_VERSION}:
+            raise ValueError(
+                f"expected scheduler_version={IFORWARD_V4_SCHEDULER_VERSION} "
+                f"or {IFORWARD_STAGE2_1_SCHEDULER_VERSION}"
+            )
         if int(plan.inner_K) != int(plan.blocks_per_rollout) * int(plan.repeats_per_block):
             raise ValueError("IForward v4 inner_K must equal blocks_per_rollout * repeats_per_block")
         if len(plan.steps) != int(plan.inner_K):
@@ -2476,7 +2511,10 @@ class TrainSchedulerIForward:
                 raise ValueError("IForward v4 forbids intermediate step render loss")
             if bool(step.commit_observation_memory) != (int(step.repeat_idx) == 0):
                 raise ValueError("IForward v4 commit_observation_memory must be first repeat only")
-            if not bool(step.update_optimizer_memory):
+            expected_update = bool(step.is_block_exit) if bool(is_stage2_1) else True
+            if bool(step.update_optimizer_memory) != bool(expected_update):
+                if bool(is_stage2_1):
+                    raise ValueError("IForward Stage2_1 update_optimizer_memory must be true only on block exit")
                 raise ValueError("IForward v4 update_optimizer_memory must be true for every repeat")
             if int(step.block_id) != int(step.episode_block_idx):
                 raise ValueError("IForward v4 step.block_id must match episode_block_idx")
@@ -2542,7 +2580,7 @@ class TrainSchedulerIForward:
                 self.dataset.validate_image_ref(int(plan.scene_id), int(plan.segment_id), tuple(ref), purpose="train")
 
     def _validate_plan(self, plan: IForwardRolloutPlan, *, sidx: Any) -> None:
-        if str(plan.scheduler_version) == IFORWARD_V4_SCHEDULER_VERSION:
+        if str(plan.scheduler_version) in {IFORWARD_V4_SCHEDULER_VERSION, IFORWARD_STAGE2_1_SCHEDULER_VERSION}:
             self._validate_v4_plan(plan, sidx=sidx)
             return
         if str(plan.scheduler_version) == IFORWARD_V3_SCHEDULER_VERSION:
@@ -2911,7 +2949,7 @@ class TrainSchedulerIForward:
         first_source_ref = plan.evidence_refs_flat[0] if plan.evidence_refs_flat else (-1, -1)
         meta = dict(plan.request_meta)
         self._last_info = {
-            "scheduler_version": IFORWARD_V4_SCHEDULER_VERSION,
+            "scheduler_version": self._scheduler_version(),
             "model_family": IFORWARD_MODEL_FAMILY,
             "global_step": int(self.global_step),
             "scene_id": int(plan.scene_id),
@@ -2970,7 +3008,7 @@ class TrainSchedulerIForward:
         self._emit(
             {
                 "type": "rollout_batch_emitted",
-                "scheduler_version": IFORWARD_V4_SCHEDULER_VERSION,
+                "scheduler_version": self._scheduler_version(),
                 "global_step": int(self.global_step),
                 "scene_id": int(plan.scene_id),
                 "segment_id": int(plan.segment_id),
@@ -3002,7 +3040,7 @@ class TrainSchedulerIForward:
             self._emit(
                 {
                     "type": "episode_end",
-                    "scheduler_version": IFORWARD_V4_SCHEDULER_VERSION,
+                    "scheduler_version": self._scheduler_version(),
                     "global_step": int(self.global_step),
                     "scene_id": int(plan.scene_id),
                     "segment_id": int(plan.segment_id),
@@ -3130,7 +3168,7 @@ class TrainSchedulerIForward:
             self.load_state_dict(state)
 
     def next_batch(self) -> Dict[str, Any]:
-        if self._is_v4():
+        if self._is_v4_like():
             return self._next_batch_v4()
         if self._is_v3():
             return self._next_batch_v3()
@@ -3299,6 +3337,7 @@ class TrainSchedulerIForward:
 __all__ = [
     "IFORWARD_MODEL_FAMILY",
     "IFORWARD_SCHEDULER_VERSION",
+    "IFORWARD_STAGE2_1_SCHEDULER_VERSION",
     "IFORWARD_V3_SCHEDULER_VERSION",
     "IFORWARD_V4_SCHEDULER_VERSION",
     "IForwardFinalSupervisionPlan",

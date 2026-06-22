@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Union
+from typing import Any, Dict, Optional, Union
 
 import torch
 
@@ -10,7 +10,7 @@ import torch
 class FWHRLiftOutput:
     parent_context: torch.Tensor
     parent_support: torch.Tensor
-    parent_obs_code: torch.Tensor
+    parent_obs_code: Optional[torch.Tensor]
     child_detail: torch.Tensor
     child_detail_support: torch.Tensor
     child_detail_valid: torch.Tensor
@@ -53,8 +53,8 @@ def aggregate_fwhr_child_lift(
     if int(child_support.numel()) != n:
         raise ValueError(f"child_support row mismatch: {int(child_support.numel())} vs {n}")
     obs_mode = str(parent_obs_mode).strip().lower()
-    if obs_mode != "zero":
-        raise ValueError(f"unsupported FW-HR parent_obs_mode={parent_obs_mode!r}; use 'zero' until exact view weights exist")
+    if obs_mode not in {"zero", "none"}:
+        raise ValueError(f"unsupported FW-HR parent_obs_mode={parent_obs_mode!r}; expected 'zero' or 'none'")
 
     device = child_feature_sum.device
     dtype = child_feature_sum.dtype
@@ -88,7 +88,7 @@ def aggregate_fwhr_child_lift(
         parent_support.index_add_(0, pid, support)
 
     parent_context = parent_context_sum / parent_context_weight.unsqueeze(-1).clamp_min(float(eps))
-    parent_obs_code = child_feature_sum.new_zeros((m, 2))
+    parent_obs_code = child_feature_sum.new_zeros((m, 2)) if obs_mode == "zero" else None
     parent_detail_mean = parent_detail_sum / parent_detail_weight.unsqueeze(-1).clamp_min(float(eps))
     child_detail_raw = detail_sum / w_feat.unsqueeze(-1).clamp_min(float(eps))
     child_detail = child_detail_raw - parent_detail_mean.index_select(0, pid) if n > 0 and m > 0 else child_detail_raw
@@ -105,7 +105,8 @@ def aggregate_fwhr_child_lift(
     aux = {
         "weighted_mean_error": mean_error,
         "valid_child_ratio": valid.detach().float().mean() if int(valid.numel()) > 0 else child_feature_sum.new_tensor(0.0),
-        "parent_obs_zero_mode": child_feature_sum.new_tensor(1.0),
+        "parent_obs_zero_mode": child_feature_sum.new_tensor(1.0 if obs_mode == "zero" else 0.0),
+        "parent_obs_none_mode": child_feature_sum.new_tensor(1.0 if obs_mode == "none" else 0.0),
     }
     return FWHRLiftOutput(
         parent_context=parent_context,

@@ -7,6 +7,7 @@ from .resolver import (
     IFORWARD_HISTORY_ROLE,
     IFORWARD_NEARBY_ROLE,
     IFORWARD_SCHEDULER_VERSION,
+    IFORWARD_STAGE2_1_SCHEDULER_VERSION,
     IFORWARD_V3_SCHEDULER_VERSION,
     IFORWARD_V4_SCHEDULER_VERSION,
     IForwardResolvedBatch,
@@ -110,6 +111,19 @@ def __getattr__(name: str):
         from .biggs_event_decoder import BigGSToFineEventDecoder
 
         return BigGSToFineEventDecoder
+    if name in {"ParentSpatialBackbone", "ParentStructInput", "Stage6ParentParamSupportCodec"}:
+        from .parent_spatial_backbone import ParentSpatialBackbone, ParentStructInput, Stage6ParentParamSupportCodec
+
+        return {
+            "ParentSpatialBackbone": ParentSpatialBackbone,
+            "ParentStructInput": ParentStructInput,
+            "Stage6ParentParamSupportCodec": Stage6ParentParamSupportCodec,
+        }[name]
+    if name in {"ParentTemporalMemory", "ParentTemporalState"}:
+        from .parent_temporal_mamba import ParentTemporalMemory
+        from .parent_temporal_state import ParentTemporalState
+
+        return {"ParentTemporalMemory": ParentTemporalMemory, "ParentTemporalState": ParentTemporalState}[name]
     if name in {"GradientBankAttr", "HistoryGradientBank", "HistoryGradientBranchBank"}:
         from .history_gradient_bank import GradientBankAttr, HistoryGradientBank, HistoryGradientBranchBank
 
@@ -143,6 +157,7 @@ __all__ = [
     "IFORWARD_HISTORY_ROLE",
     "IFORWARD_NEARBY_ROLE",
     "IFORWARD_SCHEDULER_VERSION",
+    "IFORWARD_STAGE2_1_SCHEDULER_VERSION",
     "IFORWARD_V3_SCHEDULER_VERSION",
     "IFORWARD_V4_SCHEDULER_VERSION",
     "RANDOM_WINDOW_ASSEMBLY_MODE",
@@ -186,6 +201,11 @@ __all__ = [
     "HistoryGradientBank",
     "HistoryGradientBranchBank",
     "KeyedMambaState",
+    "ParentSpatialBackbone",
+    "ParentStructInput",
+    "ParentTemporalMemory",
+    "ParentTemporalState",
+    "Stage6ParentParamSupportCodec",
     "StreamingMambaCell",
     "StreamingMambaCellState",
 ]

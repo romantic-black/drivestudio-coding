@@ -32,12 +32,23 @@ from .history_gate_v2_features import (
     history_gate_v2_auxiliary_loss,
 )
 from .history_gradient_bank import HGV2_ATTRS, build_history_gradient_bank_from_loss
+from .history_damage_loss import HistoryDamageProbe, history_damage_hinge
 from .history_safe_projection import IForwardHistorySafeProjection
 from .iforward_v6_state import IForwardV6MemoryState
 from .local_conflict_xcpe import IForwardLocalConflictXcpe
 from .memory import IForwardMemoryStepContext, IForwardSceneMemory
+from .parent_spatial_backbone import ParentSpatialBackbone
+from .parent_temporal_keys import ParentTemporalKeys, build_parent_temporal_keys
+from .parent_temporal_mamba import ParentTemporalMemory
+from .parent_temporal_state import ParentTemporalState
 from .point_mamba_memory import IForwardPointMambaMemory
-from .resolver import IFORWARD_V3_SCHEDULER_VERSION, IFORWARD_V4_SCHEDULER_VERSION, IForwardBatchResolver, IForwardResolvedBatch
+from .resolver import (
+    IFORWARD_STAGE2_1_SCHEDULER_VERSION,
+    IFORWARD_V3_SCHEDULER_VERSION,
+    IFORWARD_V4_SCHEDULER_VERSION,
+    IForwardBatchResolver,
+    IForwardResolvedBatch,
+)
 from .state import IForwardMemoryState, IForwardShortWindowHistory, IForwardState
 from .utils import cfg_ensure_child, cfg_get, cfg_set, clone_config
 
@@ -413,7 +424,11 @@ class IForwardModel(nn.Module):
             else:
                 scheduler_cfg = cfg_get(config, "scheduler_iforward", {}) or {}
                 scheduler_version = str(cfg_get(scheduler_cfg, "version", "iforward_v1"))
-                if scheduler_version in {IFORWARD_V3_SCHEDULER_VERSION, IFORWARD_V4_SCHEDULER_VERSION}:
+                if scheduler_version in {
+                    IFORWARD_V3_SCHEDULER_VERSION,
+                    IFORWARD_V4_SCHEDULER_VERSION,
+                    IFORWARD_STAGE2_1_SCHEDULER_VERSION,
+                }:
                     self.resolver = IForwardBatchResolver(expected_scheduler_version=scheduler_version)
                 else:
                     self.resolver = IForwardBatchResolver()
@@ -436,6 +451,7 @@ class IForwardModel(nn.Module):
         self.iforward_version = str(cfg_get(iforward_cfg, "version", "v1"))
         self.is_v3_gru_history_gate = self.iforward_version == "v3_gru_history_gate"
         self.is_v6_point_mamba_xcpe = self.iforward_version == "v6_point_mamba_xcpe"
+        self.is_stage2_1_parent_temporal = self.iforward_version == "stage2_1_fwhr_parent_ptv3_temporal_mamba"
         self.is_stage2_0_biggs_parent_lifting = self.iforward_version in {
             "stage2_0_biggs_parent_lifting",
             "stage2_0_biggs_cuda_exact_diagonal_projector",
@@ -443,6 +459,7 @@ class IForwardModel(nn.Module):
             "stage2_0_biggs_compact16_residualonly",
             "stage2_0_biggs_grld_dinov2base_concat48",
             "stage2_0_fwhr_lift_grld_dinov2base",
+            "stage2_1_fwhr_parent_ptv3_temporal_mamba",
         }
         self.history_safe_projection = None
         self.adc_lite_cfg = cfg_get(iforward_cfg, "adc_lite", {}) or {}
@@ -611,6 +628,44 @@ class IForwardModel(nn.Module):
             self.history_gate_v2_enabled = False
             self.memory = None
             self.history_safe_projection = None
+            if self.is_stage2_1_parent_temporal:
+                parent_spatial_cfg = cfg_get(iforward_cfg, "parent_spatial", {}) or {}
+                parent_ptv3_cfg = cfg_get(parent_spatial_cfg, "ptv3", {}) or {}
+                parent_support_cfg = cfg_get(parent_spatial_cfg, "support_threshold", {}) or {}
+                self.parent_spatial_backbone = ParentSpatialBackbone(
+                    context_dim=int(cfg_get(parent_spatial_cfg, "context_dim", 48)),
+                    event_dim=int(cfg_get(parent_spatial_cfg, "event_dim", 64)),
+                    token_dim=int(cfg_get(parent_spatial_cfg, "token_dim", cfg_get(parent_spatial_cfg, "event_dim", 64))),
+                    param_support_dim=int(cfg_get(parent_spatial_cfg, "param_support_dim", 24)),
+                    support_embed_dim=int(cfg_get(parent_spatial_cfg, "support_embed_dim", 4)),
+                    branch_embed_dim=int(cfg_get(parent_spatial_cfg, "branch_embed_dim", 4)),
+                    near_depth=int(cfg_get(parent_ptv3_cfg, "depth", 4)),
+                    near_heads=int(cfg_get(parent_ptv3_cfg, "num_heads", 4)),
+                    near_patch_size=int(cfg_get(parent_ptv3_cfg, "patch_size", 64)),
+                    near_orders=tuple(cfg_get(parent_ptv3_cfg, "orders", ("z", "z_trans"))),
+                    support_threshold_bg=float(cfg_get(parent_support_cfg, "bg", 0.0)),
+                    support_threshold_distant=float(cfg_get(parent_support_cfg, "distant", 0.0)),
+                    support_threshold_rigid=float(cfg_get(parent_support_cfg, "rigid", 0.0)),
+                    support_threshold_rigid_out=float(cfg_get(parent_support_cfg, "rigid_out", cfg_get(parent_support_cfg, "rigid", 0.0))),
+                    xcpe_backend=str(cfg_get(parent_ptv3_cfg, "xcpe_backend", "fallback_neighbor_mean")),
+                    xcpe_voxel_size=float(cfg_get(parent_ptv3_cfg, "xcpe_voxel_size", 0.5)),
+                    use_xcpe=bool(cfg_get(parent_ptv3_cfg, "use_xcpe", True)),
+                    zero_invalid_context=bool(cfg_get(parent_spatial_cfg, "zero_invalid_context", True)),
+                )
+                parent_temporal_cfg = cfg_get(iforward_cfg, "parent_temporal_mamba", {}) or {}
+                self.parent_temporal_mamba = ParentTemporalMemory(
+                    event_dim=int(cfg_get(parent_temporal_cfg, "event_dim", cfg_get(parent_spatial_cfg, "event_dim", 64))),
+                    ctx_dim=int(cfg_get(parent_temporal_cfg, "ctx_dim", 32)),
+                    model_dim=int(cfg_get(parent_temporal_cfg, "model_dim", 32)),
+                    state_dim=int(cfg_get(parent_temporal_cfg, "state_dim", 8)),
+                    conv_kernel=int(cfg_get(parent_temporal_cfg, "conv_kernel", 2)),
+                    adapter_hidden_dim=int(cfg_get(parent_temporal_cfg, "adapter_hidden_dim", 64)),
+                    dense_bg=bool(cfg_get(parent_temporal_cfg, "dense_bg", True)),
+                    dense_distant=bool(cfg_get(parent_temporal_cfg, "dense_distant", True)),
+                )
+            else:
+                self.parent_spatial_backbone = None
+                self.parent_temporal_mamba = None
         else:
             self.history_gate_v2_cfg = {}
             self.history_gate_v2_enabled = False
@@ -665,6 +720,14 @@ class IForwardModel(nn.Module):
         self.loss_short_window_history_weight = float(
             cfg_get(cfg_get(loss_cfg, "short_window_history", {}) or {}, "weight", 0.1)
         )
+        history_damage_cfg = cfg_get(loss_cfg, "history_damage", {}) or {}
+        self.loss_history_damage_enable = bool(cfg_get(history_damage_cfg, "enable", False))
+        self.loss_history_damage_target_weight = float(cfg_get(history_damage_cfg, "weight", 0.0))
+        self.loss_history_damage_margin = float(cfg_get(history_damage_cfg, "margin", 0.0))
+        history_damage_warmup_cfg = cfg_get(history_damage_cfg, "warmup", {}) or {}
+        self.loss_history_damage_warmup_enable = bool(cfg_get(history_damage_warmup_cfg, "enable", True))
+        self.loss_history_damage_warmup_start_step = int(cfg_get(history_damage_warmup_cfg, "start_step", 10000))
+        self.loss_history_damage_warmup_steps = int(cfg_get(history_damage_warmup_cfg, "steps", 15000))
         self.loss_delta_reg_weight = float(cfg_get(cfg_get(loss_cfg, "delta_regularization", {}) or {}, "weight", 1.0))
         hsp_cfg = cfg_get(iforward_cfg, "history_safe_projection", {}) or {}
         hsp_damage_cfg = cfg_get(hsp_cfg, "damage_loss", {}) or {}
@@ -761,6 +824,7 @@ class IForwardModel(nn.Module):
             memory_state = IForwardV6MemoryState.empty()
         else:
             memory_state = IForwardMemoryState.empty()
+        parent_temporal = ParentTemporalState.empty() if self.is_stage2_1_parent_temporal else None
         return IForwardState(
             local_gs=local_state,
             memory=memory_state,
@@ -779,6 +843,7 @@ class IForwardModel(nn.Module):
             node_state_distant=node_distant,
             node_state_rigid=node_rigid,
             biggs_state=None,
+            parent_temporal=parent_temporal,
         )
 
     def _adc_lite_aabb(
@@ -942,6 +1007,21 @@ class IForwardModel(nn.Module):
         factor = start_factor + (1.0 - start_factor) * progress
         return float(base * factor)
 
+    def _history_damage_loss_weight_for_step(self, global_step: int) -> float:
+        if not bool(getattr(self, "loss_history_damage_enable", False)):
+            return 0.0
+        base = float(getattr(self, "loss_history_damage_target_weight", 0.0))
+        if base <= 0.0:
+            return 0.0
+        if not bool(getattr(self, "loss_history_damage_warmup_enable", True)):
+            return base
+        start = int(getattr(self, "loss_history_damage_warmup_start_step", 10000))
+        steps = int(getattr(self, "loss_history_damage_warmup_steps", 15000))
+        if steps <= 0:
+            return base if int(global_step) >= start else 0.0
+        progress = min(max(float(int(global_step) - start) / float(steps), 0.0), 1.0)
+        return float(base * progress)
+
     def _render_final_losses(
         self,
         *,
@@ -950,6 +1030,7 @@ class IForwardModel(nn.Module):
         resolved: IForwardResolvedBatch,
         carried_state: Optional[IForwardState],
         ablation: str,
+        in_rollout_history_loss_weight: float,
     ) -> tuple[
         Dict[str, torch.Tensor],
         Dict[str, float],
@@ -975,7 +1056,7 @@ class IForwardModel(nn.Module):
         appended = len(pred_rgbs) - before
         image_refs.extend([tuple(int(x) for x in resolved.target_refs[int(i)]) for i in current_indices[:appended]])
         image_roles.extend(["current_latest"] * int(appended))
-        if self.loss_in_rollout_history_weight > 0.0 and len(resolved.history_rollout_target_indices) > 0:
+        if float(in_rollout_history_loss_weight) > 0.0 and len(resolved.history_rollout_target_indices) > 0:
             history_indices = list(resolved.history_rollout_target_indices)
             before = len(pred_rgbs)
             in_rollout_history_loss, in_rollout_stats = self.bridge.render_loss(
@@ -1320,6 +1401,14 @@ class IForwardModel(nn.Module):
                 adc_apply_stats.update(adc_policy_stats)
                 local_state = state.local_gs
         memory_state = state.memory
+        parent_temporal_state = (
+            getattr(state, "parent_temporal", None)
+            if self.is_stage2_1_parent_temporal
+            else None
+        )
+        if self.is_stage2_1_parent_temporal and not isinstance(parent_temporal_state, ParentTemporalState):
+            parent_temporal_state = ParentTemporalState.empty()
+            state.parent_temporal = parent_temporal_state
         history_ema = state.history_ema
         if self.is_v3_gru_history_gate:
             memory_state, history_ema = self._ensure_v3_state(
@@ -1388,12 +1477,33 @@ class IForwardModel(nn.Module):
             observe_batch["_iforward"] = ifwd_meta
 
         global_step = int(batch.get("global_step", 0))
+        history_damage_weight = self._history_damage_loss_weight_for_step(global_step)
+        history_damage_probe: Optional[HistoryDamageProbe] = None
+        if self.is_stage2_1_parent_temporal and float(history_damage_weight) > 0.0:
+            history_damage_indices = list(resolved.history_rollout_target_indices)
+            if history_damage_indices:
+                with torch.no_grad():
+                    _before_loss, _before_stats, before_per_ref = self.bridge.render_loss(
+                        local_state=local_state,
+                        batch=batch,
+                        target_indices=history_damage_indices,
+                        mask_policy=str(getattr(self.bridge, "current_mask_policy", "non_sky_non_egocar")),
+                        return_per_ref_loss=True,
+                    )
+                history_damage_probe = HistoryDamageProbe(
+                    target_indices=[int(x) for x in history_damage_indices],
+                    before_per_ref=before_per_ref.detach(),
+                )
+            else:
+                history_damage_probe = HistoryDamageProbe.empty(ref=local_state.bg.means)
         biggs_parent_runtime = None
+        stage2_1_parent_block_cache: Dict[str, Any] = {}
         for step_pos, step in enumerate(resolved.steps):
             next_step = resolved.steps[step_pos + 1] if step_pos + 1 < len(resolved.steps) else None
             is_block_enter, is_block_exit = self._resolved_step_block_flags(step, next_step)
             if bool(is_block_enter):
                 block_hsp_cache = {}
+                stage2_1_parent_block_cache = {}
                 if self.is_stage2_0_biggs_parent_lifting:
                     if str(getattr(self, "stage2_0_biggs_parent_exact_refresh_policy", "block_enter")) == "block_enter":
                         biggs_parent_runtime = None
@@ -1425,7 +1535,55 @@ class IForwardModel(nn.Module):
             timings["observe_ms"] += observe_step_ms
             t0 = time.perf_counter()
             with self._nvtx_range("iforward/event"):
-                event = self.bridge.build_event(local_state=local_state, measurement=measurement)
+                if self.is_stage2_1_parent_temporal:
+                    if not isinstance(measurement, dict):
+                        raise RuntimeError("Stage2_1 requires dict measurement from BigGS observation.")
+                    parent_spatial = getattr(self, "parent_spatial_backbone", None)
+                    parent_temporal = getattr(self, "parent_temporal_mamba", None)
+                    if parent_spatial is None or parent_temporal is None:
+                        raise RuntimeError("Stage2_1 parent modules are not initialized.")
+                    parent_inputs = self.bridge.build_stage2_1_parent_inputs(
+                        local_state=local_state,
+                        measurement=measurement,
+                    )
+                    parent_event_spatial, near_layout_cache = parent_spatial(
+                        near_in=parent_inputs["near_in"],
+                        far_in=parent_inputs["far_in"],
+                        route=parent_inputs["route"],
+                        aabb_min=parent_inputs["aabb_min"],
+                        aabb_max=parent_inputs["aabb_max"],
+                        near_batch_offsets=parent_inputs.get("near_batch_offsets"),
+                        far_batch_offsets=parent_inputs.get("far_batch_offsets"),
+                        near_layout_cache=stage2_1_parent_block_cache.get("near_layout_cache"),
+                    )
+                    stage2_1_parent_block_cache["near_layout_cache"] = near_layout_cache
+                    parent_keys = build_parent_temporal_keys(
+                        parent_event=parent_event_spatial,
+                        measurement=measurement,
+                    )
+                    parent_preview = parent_temporal.preview(
+                        event=parent_event_spatial,
+                        state=parent_temporal_state,
+                        keys=parent_keys,
+                    )
+                    if bool(is_block_enter) or "commit_event" not in stage2_1_parent_block_cache:
+                        step_block_id = int(
+                            getattr(
+                                step,
+                                "block_id",
+                                getattr(step, "episode_block_idx", getattr(step, "rollout_block_rank", step.step_idx)),
+                            )
+                        )
+                        stage2_1_parent_block_cache["commit_event"] = parent_event_spatial
+                        stage2_1_parent_block_cache["commit_keys"] = parent_keys
+                        stage2_1_parent_block_cache["commit_block_id"] = step_block_id
+                    event = self.bridge.decode_stage2_1_biggs_child_event(
+                        parent_event=parent_preview.event,
+                        local_state=local_state,
+                        measurement=measurement,
+                    )
+                else:
+                    event = self.bridge.build_event(local_state=local_state, measurement=measurement)
             event_step_ms = (time.perf_counter() - t0) * 1000.0
             timings["event_ms"] += event_step_ms
             is_frame_exit = bool(is_block_exit)
@@ -1472,10 +1630,16 @@ class IForwardModel(nn.Module):
                     short_entries = []
                 elif self.is_stage2_0_biggs_parent_lifting:
                     ctx_memory = None
-                    memory_aux = {
-                        "iforward/stage2_0_memory_bypass": 1.0,
-                        "iforward/biggs/memory_noop": 1.0,
-                    }
+                    if self.is_stage2_1_parent_temporal:
+                        memory_aux = {
+                            "iforward/stage2_1_parent_temporal_memory": 1.0,
+                            "iforward/biggs/memory_noop": 1.0,
+                        }
+                    else:
+                        memory_aux = {
+                            "iforward/stage2_0_memory_bypass": 1.0,
+                            "iforward/biggs/memory_noop": 1.0,
+                        }
                     short_entries = []
                 else:
                     memory_state, ctx_memory, memory_aux, short_entries = self.memory(
@@ -1682,6 +1846,22 @@ class IForwardModel(nn.Module):
                         1.0 if bool(should_update_runtime) else 0.0
                     )
                     timings["parent_runtime_update_ms"] += float(parent_runtime_update_step_ms)
+                if self.is_stage2_1_parent_temporal and bool(is_block_exit):
+                    parent_temporal = getattr(self, "parent_temporal_mamba", None)
+                    commit_event = stage2_1_parent_block_cache.get("commit_event")
+                    commit_keys = stage2_1_parent_block_cache.get("commit_keys")
+                    if parent_temporal is not None and commit_event is not None and commit_keys is not None:
+                        parent_temporal_state, temporal_commit_aux = parent_temporal.commit(
+                            event=commit_event,
+                            state=parent_temporal_state,
+                            keys=commit_keys,
+                            block_id=int(stage2_1_parent_block_cache.get("commit_block_id", step.step_idx)),
+                        )
+                        state.parent_temporal = parent_temporal_state
+                        update_aux.update(
+                            {str(k): float(v) for k, v in temporal_commit_aux.items() if isinstance(v, (int, float))}
+                        )
+                    stage2_1_parent_block_cache = {}
             update_step_ms = (time.perf_counter() - t0) * 1000.0
             timings["update_ms"] += update_step_ms
             t0 = time.perf_counter()
@@ -1724,6 +1904,7 @@ class IForwardModel(nn.Module):
                 resolved=resolved,
                 carried_state=prior_state_for_history,
                 ablation=module_ablation_name,
+                in_rollout_history_loss_weight=float(in_rollout_history_loss_weight),
             )
         timings["final_render_ms"] += (time.perf_counter() - t0) * 1000.0
         if reg_terms:
@@ -1738,9 +1919,26 @@ class IForwardModel(nn.Module):
             hgv2_gate_loss = torch.stack(hgv2_losses).mean()
         else:
             hgv2_gate_loss = local_state.bg.means.new_tensor(0.0)
+        history_damage_loss = local_state.bg.means.new_tensor(0.0)
+        history_damage_num_refs = 0
+        if history_damage_probe is not None and history_damage_probe.valid:
+            _after_loss, _after_stats, after_per_ref = self.bridge.render_loss(
+                local_state=local_state,
+                batch=batch,
+                target_indices=list(history_damage_probe.target_indices),
+                mask_policy=str(getattr(self.bridge, "current_mask_policy", "non_sky_non_egocar")),
+                return_per_ref_loss=True,
+            )
+            history_damage_loss = history_damage_hinge(
+                after_per_ref=after_per_ref,
+                before_per_ref=history_damage_probe.before_per_ref.to(device=after_per_ref.device, dtype=after_per_ref.dtype),
+                margin=float(getattr(self, "loss_history_damage_margin", 0.0)),
+            )
+            history_damage_num_refs = int(after_per_ref.numel())
         final_losses["delta_regularization"] = delta_reg
         final_losses["hsp_damage_loss"] = hsp_damage_loss
         final_losses["hgv2_gate"] = hgv2_gate_loss
+        final_losses["history_damage"] = history_damage_loss
 
         next_history_gradient_bank = None
         if self.is_v3_gru_history_gate and bool(getattr(self, "history_gate_v2_enabled", False)):
@@ -1800,6 +1998,7 @@ class IForwardModel(nn.Module):
             + self.loss_delta_reg_weight * final_losses["delta_regularization"]
             + self.hsp_damage_loss_weight * final_losses["hsp_damage_loss"]
             + float(getattr(self, "loss_hgv2_gate_weight", 0.0)) * final_losses["hgv2_gate"]
+            + float(history_damage_weight) * final_losses["history_damage"]
         )
         if not torch.isfinite(total).all():
             raise RuntimeError("IForward rollout loss became NaN/Inf.")
@@ -1822,11 +2021,14 @@ class IForwardModel(nn.Module):
             adc_bank=next_adc_bank,
             adc_meta=getattr(state, "adc_meta", None),
             biggs_state=getattr(state, "biggs_state", None),
+            parent_temporal=parent_temporal_state,
             node_state_bg=state.node_state_bg,
             node_state_distant=state.node_state_distant,
             node_state_rigid=state.node_state_rigid,
         )
         memory_tokens = memory_state.count_tokens() if hasattr(memory_state, "count_tokens") else {}
+        if self.is_stage2_1_parent_temporal and parent_temporal_state is not None:
+            memory_tokens = {**memory_tokens, **parent_temporal_state.count_tokens()}
         if self.is_v3_gru_history_gate and history_ema is not None:
             memory_tokens = {**memory_tokens, **history_ema.count_tokens()}
         stats: Dict[str, Any] = {
@@ -1868,8 +2070,11 @@ class IForwardModel(nn.Module):
             "loss_weight/delta_regularization": float(self.loss_delta_reg_weight),
             "loss_weight/hsp_damage": float(self.hsp_damage_loss_weight),
             "loss_weight/hgv2_gate": float(getattr(self, "loss_hgv2_gate_weight", 0.0)),
+            "loss_weight/history_damage": float(history_damage_weight),
             "hsp/damage_loss": float(hsp_damage_loss.detach().item()) if hsp_damage_loss.numel() else 0.0,
             "hgv2/loss_gate_aux": float(hgv2_gate_loss.detach().item()) if hgv2_gate_loss.numel() else 0.0,
+            "history_damage/loss": float(history_damage_loss.detach().item()) if history_damage_loss.numel() else 0.0,
+            "history_damage/num_refs": float(history_damage_num_refs),
             "hgv2/enabled": bool(getattr(self, "history_gate_v2_enabled", False)),
             "hgv2/bank_valid": (
                 1.0

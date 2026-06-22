@@ -352,6 +352,7 @@ class IForwardState:
     adc_bank: Optional[IForwardADCBank] = None
     adc_meta: Optional[IForwardADCStateMeta] = None
     biggs_state: Optional[IForwardBigGSState] = None
+    parent_temporal: Optional[Any] = None
     node_state_bg: Optional[NodeStateBackground] = None
     node_state_distant: Optional[NodeStateDistant] = None
     node_state_rigid: Optional[NodeStateRigid] = None
@@ -363,7 +364,7 @@ class IForwardState:
     def detach_for_next_rollout(self) -> "IForwardState":
         return IForwardState(
             local_gs=detach_local_gs_state(self.local_gs),
-            memory=self.memory.detach(),
+            memory=self.memory.detach() if hasattr(self.memory, "detach") else self.memory,
             history=self.history.detach(),
             scene_id=int(self.scene_id),
             segment_id=int(self.segment_id),
@@ -373,6 +374,13 @@ class IForwardState:
             adc_bank=None if self.adc_bank is None else self.adc_bank.detach(),
             adc_meta=None if self.adc_meta is None else self.adc_meta.detach(),
             biggs_state=None if self.biggs_state is None else self.biggs_state.detach(),
+            parent_temporal=(
+                None
+                if self.parent_temporal is None
+                else self.parent_temporal.detach()
+                if hasattr(self.parent_temporal, "detach")
+                else self.parent_temporal
+            ),
             node_state_bg=None,
             node_state_distant=None,
             node_state_rigid=None,

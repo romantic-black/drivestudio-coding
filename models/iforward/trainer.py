@@ -94,7 +94,14 @@ class IForwardTrainer(nn.Module):
             "stage2_0_biggs_compact16_residualonly",
             "stage2_0_biggs_grld_dinov2base_concat48",
             "stage2_0_fwhr_lift_grld_dinov2base",
+            "stage2_1_fwhr_parent_ptv3_temporal_mamba",
         }
+
+    def _is_stage2_1_parent_temporal(self) -> bool:
+        if bool(getattr(self.model, "is_stage2_1_parent_temporal", False)):
+            return True
+        iforward_cfg = cfg_get(cfg_get(self.config, "model", {}) or {}, "iforward", {}) or {}
+        return str(cfg_get(iforward_cfg, "version", "")) == "stage2_1_fwhr_parent_ptv3_temporal_mamba"
 
     def _is_v3_gru_history_gate(self) -> bool:
         if bool(getattr(self.model, "is_v3_gru_history_gate", False)):
@@ -174,6 +181,33 @@ class IForwardTrainer(nn.Module):
                 "stage6_posterior_updater_base": updater_base,
                 "stage6_struct_decoder": self._named_params(struct_decoder, "stage6_struct_event_decoder"),
             }
+        elif self._is_stage2_1_parent_temporal():
+            parent_spatial = getattr(self.model, "parent_spatial_backbone", None)
+            parent_temporal = getattr(self.model, "parent_temporal_mamba", None)
+            parent_token_named: List[Tuple[str, nn.Parameter]] = []
+            parent_ptv3_named: List[Tuple[str, nn.Parameter]] = []
+            if isinstance(parent_spatial, nn.Module):
+                parent_token_named.extend(self._named_params(getattr(parent_spatial, "param_support_codec", None), "parent_spatial_backbone.param_support_codec"))
+                parent_token_named.extend(self._named_params(getattr(parent_spatial, "token_builder", None), "parent_spatial_backbone.token_builder"))
+                parent_token_named.extend(self._named_params(getattr(parent_spatial, "far_mlp", None), "parent_spatial_backbone.far_mlp"))
+                parent_token_named.extend(self._named_params(getattr(parent_spatial, "far_norm", None), "parent_spatial_backbone.far_norm"))
+                parent_ptv3_named.extend(self._named_params(getattr(parent_spatial, "near_ptv3", None), "parent_spatial_backbone.near_ptv3"))
+            temporal_adapter_named: List[Tuple[str, nn.Parameter]] = []
+            temporal_main_named: List[Tuple[str, nn.Parameter]] = []
+            if isinstance(parent_temporal, nn.Module):
+                all_temporal = self._named_params(parent_temporal, "parent_temporal_mamba")
+                temporal_adapter_named = [(n, p) for n, p in all_temporal if ".adapters." in n]
+                adapter_param_ids = {id(p) for _, p in temporal_adapter_named}
+                temporal_main_named = [(n, p) for n, p in all_temporal if id(p) not in adapter_param_ids]
+            groups = {
+                "parent_token_builder": parent_token_named,
+                "parent_ptv3": parent_ptv3_named,
+                "parent_temporal_mamba": temporal_main_named,
+                "parent_temporal_adapter": temporal_adapter_named,
+                "stage6_posterior_updater_base": updater_base,
+            }
+            if adapter_named:
+                groups["vsm_ctx_adapter"] = adapter_named
         elif self._is_stage2_0_biggs_parent_lifting():
             groups = {
                 "stage6_posterior_updater_base": updater_base,
@@ -246,6 +280,10 @@ class IForwardTrainer(nn.Module):
             "stage6_posterior_updater_base": float(cfg_get(lr_cfg, "stage6_posterior_updater_base", 1.0e-5)),
             "stage6_struct_decoder": float(cfg_get(lr_cfg, "stage6_struct_decoder", 0.0)),
             "biggs_child_decoder": float(cfg_get(lr_cfg, "biggs_child_decoder", fallback)),
+            "parent_token_builder": float(cfg_get(lr_cfg, "parent_token_builder", fallback)),
+            "parent_ptv3": float(cfg_get(lr_cfg, "parent_ptv3", fallback)),
+            "parent_temporal_mamba": float(cfg_get(lr_cfg, "parent_temporal_mamba", fallback)),
+            "parent_temporal_adapter": float(cfg_get(lr_cfg, "parent_temporal_adapter", fallback)),
             "stage6_measurement_frontend_residual_unet": float(
                 cfg_get(lr_cfg, "stage6_measurement_frontend_residual_unet", cfg_get(lr_cfg, "measurement_frontend", fallback))
             ),
@@ -302,6 +340,11 @@ class IForwardTrainer(nn.Module):
                 "context_adapter",
                 bool(cfg_get(trainability, "train_context_adapter", True)),
             )
+        elif self._is_stage2_1_parent_temporal():
+            self._set_group_requires_grad("parent_token_builder", bool(cfg_get(trainability, "train_parent_token_builder", True)))
+            self._set_group_requires_grad("parent_ptv3", bool(cfg_get(trainability, "train_parent_ptv3", True)))
+            self._set_group_requires_grad("parent_temporal_mamba", bool(cfg_get(trainability, "train_parent_temporal_mamba", True)))
+            self._set_group_requires_grad("parent_temporal_adapter", bool(cfg_get(trainability, "train_parent_temporal_adapter", True)))
         else:
             self._set_group_requires_grad("memory", bool(cfg_get(trainability, "train_memory", True)))
             self._set_group_requires_grad("memory_fuse", bool(cfg_get(trainability, "train_memory_fuse", True)))

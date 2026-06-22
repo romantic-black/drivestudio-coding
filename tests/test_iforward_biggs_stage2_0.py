@@ -17,6 +17,7 @@ from models.iforward.biggs_relational_decoder import grld_decode_reference
 from models.iforward.biggs_state import BigGSBlockRuntime, BigGSBranchAssignment, BigGSRigidActiveAssignment, IForwardBigGSState
 from models.iforward.cuda_grld_decode import grld_decode, grld_decode_available
 from models.iforward.fwhr_lift import aggregate_fwhr_child_lift
+from models.iforward.parent_spatial_backbone import Stage6ParentParamSupportCodec
 from models.iforward.state import IForwardState
 from models.iforward.trainer import IForwardTrainer
 from models.streetforward.minimal_trainer_stage6_0 import MinimalStreetForwardStage6_0
@@ -1392,6 +1393,25 @@ class _Stage2NoMemoryModel(nn.Module):
         self.phase_a_runtime = _Runtime()
 
 
+class _Stage21Model(nn.Module):
+    is_stage2_0_biggs_parent_lifting = True
+    is_stage2_1_parent_temporal = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.parent_spatial_backbone = nn.Module()
+        self.parent_spatial_backbone.param_support_codec = nn.Linear(2, 2)
+        self.parent_spatial_backbone.token_builder = nn.Linear(2, 2)
+        self.parent_spatial_backbone.far_mlp = nn.Linear(2, 2)
+        self.parent_spatial_backbone.far_norm = nn.LayerNorm(2)
+        self.parent_spatial_backbone.near_ptv3 = nn.Linear(2, 2)
+        self.parent_temporal_mamba = nn.Module()
+        self.parent_temporal_mamba.cells = nn.ModuleDict({"bg": nn.Linear(2, 2)})
+        self.parent_temporal_mamba.adapters = nn.ModuleDict({"bg": nn.Linear(2, 2)})
+        self.parent_temporal_mamba.branch_gate_raw = nn.Parameter(torch.zeros(1))
+        self.phase_a_runtime = _Runtime()
+
+
 def _iforward_trainer_cfg(*, train_biggs: bool = True) -> dict[str, object]:
     return {
         "model": {
@@ -1457,6 +1477,16 @@ def test_stage2_0_cuda_exact_diag_version_uses_biggs_optimizer_groups() -> None:
     names = {str(group.get("name")) for group in trainer.optimizer.param_groups}
     assert "memory" not in names
     assert "memory_fuse" not in names
+    assert "biggs_child_decoder" in names
+
+
+def test_stage2_1_optimizer_groups_exclude_old_struct_decoder() -> None:
+    cfg = _iforward_trainer_cfg(train_biggs=True)
+    cfg["model"]["iforward"]["version"] = "stage2_1_fwhr_parent_ptv3_temporal_mamba"
+    trainer = IForwardTrainer(config=cfg, device=torch.device("cpu"), model=_Stage21Model())
+    names = {str(group.get("name")) for group in trainer.optimizer.param_groups}
+    assert "stage6_struct_decoder" not in names
+    assert {"parent_token_builder", "parent_ptv3", "parent_temporal_mamba", "parent_temporal_adapter"} <= names
     assert "biggs_child_decoder" in names
 
 
@@ -1542,6 +1572,37 @@ def test_fwhr_aggregate_parent_context_and_centered_detail() -> None:
     assert float(feature_sum.grad.abs().sum()) > 0.0
 
 
+def test_fwhr_parent_obs_mode_none_avoids_zero_obs_allocation() -> None:
+    feature_sum = torch.ones(3, 3)
+    out = aggregate_fwhr_child_lift(
+        child_feature_sum=feature_sum,
+        child_weight_sum_feature=torch.ones(3),
+        child_support=torch.ones(3),
+        child_to_parent=torch.tensor([0, 0, 1]),
+        num_parents=2,
+        context_dim=2,
+        detail_dim=1,
+        parent_obs_mode="none",
+    )
+    assert out.parent_obs_code is None
+    assert float(out.aux["parent_obs_none_mode"].item()) == 1.0
+
+
+def test_parent_support_codec_shape_no_obs_code() -> None:
+    codec = Stage6ParentParamSupportCodec(output_dim=5)
+    params = _params_from_branch(_node_bg(4, sh_bases=2))
+    out = codec(
+        params_for_embed=params,
+        support=torch.ones(4),
+        valid_mask=torch.tensor([True, False, True, True]),
+        branch_id=torch.tensor([0, 0, 1, 1]),
+        aabb_min=torch.full((3,), -1.0),
+        aabb_max=torch.full((3,), 1.0),
+    )
+    assert tuple(out.shape) == (4, 5)
+    assert torch.isfinite(out).all()
+
+
 def test_posterior_appearance_detail_changes_only_opacity_and_sh() -> None:
     torch.manual_seed(7)
     updater = Stage6PosteriorUpdater(
@@ -1571,6 +1632,66 @@ def test_posterior_appearance_detail_changes_only_opacity_and_sh() -> None:
     assert not torch.allclose(delta_zero.bg.opacity_logit, delta_detail.bg.opacity_logit)
     assert not torch.allclose(delta_zero.bg.sh, delta_detail.bg.sh)
     assert "posterior/detail_gate_bg" in aux
+
+
+def test_posterior_attribute_detail_affects_configured_attrs() -> None:
+    torch.manual_seed(8)
+    updater = Stage6PosteriorUpdater(
+        event_dim=4,
+        hidden_dim=8,
+        stage_hidden_dim=0,
+        sh_degree=1,
+        output_hidden=False,
+        output_confidence=False,
+        output_noop=True,
+        appearance_detail_enable=True,
+        appearance_detail_dim=2,
+        appearance_detail_attribute_gates={
+            "bg": {"means": 0.5, "scales": 0.0, "quat": 0.0, "opacity": 0.5, "sh": 0.0}
+        },
+        appearance_detail_attribute_gate_max={"means": 1.0, "scales": 1.0e-6, "quat": 1.0e-6, "opacity": 1.0, "sh": 1.0e-6},
+    )
+    event = EventPack(event_bg=torch.randn(4, 4))
+    zeros = AppearanceDetailPack(detail_bg=torch.zeros(4, 2), valid_bg=torch.ones(4, dtype=torch.bool))
+    detail = AppearanceDetailPack(detail_bg=torch.randn(4, 2), valid_bg=torch.ones(4, dtype=torch.bool))
+    delta_zero, _ = updater(event=event, appearance_detail=zeros)
+    delta_detail, aux = updater(event=event, appearance_detail=detail)
+    assert not torch.allclose(delta_zero.bg.means, delta_detail.bg.means)
+    assert torch.allclose(delta_zero.bg.scales_log, delta_detail.bg.scales_log, atol=1e-6)
+    assert torch.allclose(delta_zero.bg.quat_axis_angle, delta_detail.bg.quat_axis_angle, atol=1e-6)
+    assert not torch.allclose(delta_zero.bg.opacity_logit, delta_detail.bg.opacity_logit)
+    assert torch.allclose(delta_zero.bg.sh, delta_detail.bg.sh, atol=1e-6)
+    assert "posterior/detail_gate_bg_means" in aux
+
+
+def test_posterior_hard_zero_masks_invalid_event_rows() -> None:
+    torch.manual_seed(9)
+    updater = Stage6PosteriorUpdater(
+        event_dim=4,
+        hidden_dim=8,
+        stage_hidden_dim=3,
+        sh_degree=1,
+        output_hidden=True,
+        output_confidence=True,
+        output_noop=True,
+        invalid_update_policy="hard_zero",
+    )
+    event = EventPack(
+        event_bg=torch.randn(4, 4),
+        valid_bg=torch.tensor([True, False, True, False]),
+    )
+    delta, aux = updater(event=event, ctx_current=None, ctx_vsm=None)
+    invalid = torch.tensor([False, True, False, True])
+    assert torch.allclose(delta.bg.means[invalid], torch.zeros_like(delta.bg.means[invalid]))
+    assert torch.allclose(delta.bg.scales_log[invalid], torch.zeros_like(delta.bg.scales_log[invalid]))
+    assert torch.allclose(delta.bg.quat_axis_angle[invalid], torch.zeros_like(delta.bg.quat_axis_angle[invalid]))
+    assert torch.allclose(delta.bg.opacity_logit[invalid], torch.zeros_like(delta.bg.opacity_logit[invalid]))
+    assert torch.allclose(delta.bg.sh[invalid], torch.zeros_like(delta.bg.sh[invalid]))
+    assert torch.allclose(delta.bg.hidden[invalid], torch.zeros_like(delta.bg.hidden[invalid]))
+    assert torch.allclose(delta.bg.confidence[invalid], torch.zeros_like(delta.bg.confidence[invalid]))
+    assert torch.allclose(delta.bg.noop[invalid], torch.ones_like(delta.bg.noop[invalid]))
+    assert aux["posterior/invalid_update_policy_hard_zero"] == 1.0
+    assert aux["posterior/valid_bg_ratio"] == 0.5
 
 
 def test_fwhr_config_allows_fine_lifting_flags() -> None:

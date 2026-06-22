@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from datasets.train_scheduler_iforward import (
+    IFORWARD_STAGE2_1_SCHEDULER_VERSION,
     IFORWARD_V4_SCHEDULER_VERSION,
     TrainSchedulerIForward,
     build_ordered_cyclic_start_sequence,
@@ -453,6 +454,90 @@ def _scheduler_v4(ds: _FakeDataset, **kwargs) -> TrainSchedulerIForward:
         fixed_segment_id=0,
         seed=int(kwargs.get("seed", 1)),
         version=IFORWARD_V4_SCHEDULER_VERSION,
+    )
+
+
+def _scheduler_stage2_1(ds: _FakeDataset, **kwargs) -> TrainSchedulerIForward:
+    blocks = int(kwargs.get("blocks_per_rollout", 1))
+    repeats = int(kwargs.get("repeats_per_block", 4))
+    shape_name = str(kwargs.get("shape_name", f"b{blocks}_r{repeats}"))
+    return TrainSchedulerIForward(
+        dataset=ds,
+        episode_cfg={
+            "source_mode": "keyframes",
+            "blocks_per_episode": int(kwargs.get("blocks_per_episode", 4)),
+            "episode_stride": int(kwargs.get("episode_stride", kwargs.get("blocks_per_episode", 4))),
+            "allow_short_last_episode": False,
+            "min_blocks_per_episode": int(kwargs.get("min_blocks_per_episode", kwargs.get("blocks_per_episode", 4))),
+            "target_repeats_per_block": int(kwargs.get("target_repeats_per_block", 8)),
+            "rollouts_per_episode": int(kwargs.get("rollouts_per_episode", 4)),
+            "block_source_frame_policy": "random_within_keyframe_once_per_episode",
+            "reset_scene_state_policy": "episode_begin",
+        },
+        rollout_cfg={
+            "shape_sample_scope": "episode",
+            "block_selection_policy": "ordered_cyclic_start",
+            "start_offset_policy": "fixed",
+            "start_offset": int(kwargs.get("start_offset", 0)),
+            "tail_policy": "circular_fill",
+            "delivery_order_policy": "rollout_order",
+            "detach_graph_after_rollout": True,
+            "max_inner_K": int(kwargs.get("max_inner_K", 8)),
+            "fixed_shape_name": shape_name,
+            "shapes": [
+                {
+                    "name": shape_name,
+                    "blocks_per_rollout": blocks,
+                    "repeats_per_block": repeats,
+                    "prob": 1.0,
+                }
+            ],
+            "shapes_schedule": [
+                {
+                    "start_step": int(kwargs.get("phase1_start_step", 4000)),
+                    "shapes": [
+                        {"name": "r4b2", "blocks_per_rollout": 2, "repeats_per_block": 4, "prob": 1.0}
+                    ],
+                }
+            ],
+        },
+        traversal_cfg={
+            "traversal_mode": str(kwargs.get("traversal_mode", "scene_round_robin_episode")),
+            "scene_order": "ascending",
+            "segment_order": "ascending",
+            "seed": int(kwargs.get("seed", 1)),
+        },
+        evidence_cfg={"camera_policy": "all_cams", "allow_camera_dropout": False},
+        supervision_cfg={
+            "current": {
+                "enable": True,
+                "role_name": "final_current_recon",
+                "frame_policy": "all_rollout_input_frames",
+                "camera_policy": "all_cams",
+            },
+            "nearby": {"enable": False},
+            "history_replay": {
+                "enable": True,
+                "role_name": "final_history_replay",
+                "camera_policy": "all_cams",
+                "start_step": kwargs.get("history_start_step", None),
+                "max_frames_per_rollout": 2,
+            },
+        },
+        memory_cfg={
+            "observation_commit_policy": "first_repeat_only",
+            "optimizer_memory_update_policy": "block_exit_only",
+            "reset_policy": "episode_begin",
+            "carry_policy": "across_rollouts_until_episode_end",
+        },
+        loss_timing_cfg={"policy": "rollout_final_only", "intermediate_step_loss": False},
+        leakage_check_cfg={"enable": True, "forbid_test_refs_in_train": True},
+        preload_cfg={"emit_hints": False},
+        include_test=False,
+        fixed_scene_id=1,
+        fixed_segment_id=0,
+        seed=int(kwargs.get("seed", 1)),
+        version=IFORWARD_STAGE2_1_SCHEDULER_VERSION,
     )
 
 
@@ -1017,6 +1102,70 @@ def test_iforward_v4_r4b2_n10_r8_exact_coverage():
     assert final_meta["block_visit_count_max_after"] == 2
     assert final_meta["coverage_exact"] is True
     assert batches[-1]["is_wraparound_rollout"] is True
+
+
+def test_iforward_stage2_1_phase0_b1_r4_block_exit_memory_update():
+    ds = _FakeDataset(multi_frame_per_keyframe=True, num_keyframes=4, num_cams=2)
+    scheduler = _scheduler_stage2_1(ds, shape_name="b1_r4", blocks_per_rollout=1, repeats_per_block=4)
+    batch = scheduler.next_batch()["_iforward"]
+    assert batch["scheduler_version"] == IFORWARD_STAGE2_1_SCHEDULER_VERSION
+    assert batch["shape_name"] == "b1_r4"
+    assert batch["window_block_ids"] == [0]
+    assert len(batch["steps"]) == 4
+    assert [bool(step["commit_observation_memory"]) for step in batch["steps"]] == [True, False, False, False]
+    assert [bool(step["update_optimizer_memory"]) for step in batch["steps"]] == [False, False, False, True]
+
+
+def test_iforward_stage2_1_phase1_r4b2_and_stable_source_frame_per_episode():
+    ds = _FakeDataset(multi_frame_per_keyframe=True, num_keyframes=4, num_cams=2)
+    scheduler = _scheduler_stage2_1(ds, shape_name="r4b2", blocks_per_rollout=2, repeats_per_block=4)
+    scheduler.global_step = 4000
+    first = scheduler.next_batch()["_iforward"]
+    second = scheduler.next_batch()["_iforward"]
+    assert first["shape_name"] == "r4b2"
+    assert first["window_block_ids"] == [0, 1]
+    assert second["window_block_ids"] == [1, 2]
+    frame_by_block = {}
+    for batch in (first, second):
+        for block_id, frame_idx in zip(batch["window_block_ids"], batch["input_frame_indices"]):
+            if int(block_id) in frame_by_block:
+                assert frame_by_block[int(block_id)] == int(frame_idx)
+            frame_by_block[int(block_id)] = int(frame_idx)
+    assert all(
+        bool(step["update_optimizer_memory"]) == bool(step["is_block_exit"])
+        for step in first["steps"] + second["steps"]
+    )
+
+
+def test_iforward_stage2_1_history_start_step_skips_prior_blocks_until_enabled():
+    ds = _FakeDataset(multi_frame_per_keyframe=True, num_keyframes=4, num_cams=2)
+    scheduler = _scheduler_stage2_1(
+        ds,
+        shape_name="b1_r4",
+        blocks_per_rollout=1,
+        repeats_per_block=4,
+        history_start_step=1000,
+    )
+    _first = scheduler.next_batch()["_iforward"]
+    second = scheduler.next_batch()["_iforward"]
+    assert second["window_block_ids"] == [1]
+    assert bool(second["final_supervision"]["history_skipped"]) is True
+    assert second["final_supervision"]["history_skip_reason"] == "history_start_step_1000"
+    assert not [
+        ref
+        for ref, role in zip(second["target_refs_flat"], second["target_roles_flat"])
+        if str(role) == "final_history_replay"
+    ]
+
+    scheduler.global_step = 1000
+    third = scheduler.next_batch()["_iforward"]
+    history = [
+        ref
+        for ref, role in zip(third["target_refs_flat"], third["target_roles_flat"])
+        if str(role) == "final_history_replay"
+    ]
+    assert bool(third["final_supervision"]["history_skipped"]) is False
+    assert history
 
 
 def test_iforward_v4_r2b4_n10_r8_exact_coverage_wrap_windows():
