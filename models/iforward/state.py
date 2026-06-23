@@ -353,6 +353,7 @@ class IForwardState:
     adc_meta: Optional[IForwardADCStateMeta] = None
     biggs_state: Optional[IForwardBigGSState] = None
     parent_temporal: Optional[Any] = None
+    sequence10_bank: Optional[Any] = None
     node_state_bg: Optional[NodeStateBackground] = None
     node_state_distant: Optional[NodeStateDistant] = None
     node_state_rigid: Optional[NodeStateRigid] = None
@@ -380,6 +381,13 @@ class IForwardState:
                 else self.parent_temporal.detach()
                 if hasattr(self.parent_temporal, "detach")
                 else self.parent_temporal
+            ),
+            sequence10_bank=(
+                None
+                if self.sequence10_bank is None
+                else self.sequence10_bank.detach()
+                if hasattr(self.sequence10_bank, "detach")
+                else self.sequence10_bank
             ),
             node_state_bg=None,
             node_state_distant=None,

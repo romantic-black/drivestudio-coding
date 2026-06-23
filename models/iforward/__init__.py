@@ -7,6 +7,7 @@ from .resolver import (
     IFORWARD_HISTORY_ROLE,
     IFORWARD_NEARBY_ROLE,
     IFORWARD_SCHEDULER_VERSION,
+    IFORWARD_SEQUENCE10_SCHEDULER_VERSION,
     IFORWARD_STAGE2_1_SCHEDULER_VERSION,
     IFORWARD_V3_SCHEDULER_VERSION,
     IFORWARD_V4_SCHEDULER_VERSION,
@@ -22,6 +23,7 @@ from .random_window_batch import (
     IForwardRandomWindowStep,
 )
 from .random_window_resolver import IForwardRandomWindowBatchResolver
+from .sequence10_resolver import IForwardSequence10Resolver
 from .state import (
     BranchMemoryState,
     DenseMambaState,
@@ -157,6 +159,7 @@ __all__ = [
     "IFORWARD_HISTORY_ROLE",
     "IFORWARD_NEARBY_ROLE",
     "IFORWARD_SCHEDULER_VERSION",
+    "IFORWARD_SEQUENCE10_SCHEDULER_VERSION",
     "IFORWARD_STAGE2_1_SCHEDULER_VERSION",
     "IFORWARD_V3_SCHEDULER_VERSION",
     "IFORWARD_V4_SCHEDULER_VERSION",
@@ -166,6 +169,7 @@ __all__ = [
     "IForwardBatchResolver",
     "IForwardBigGSState",
     "IForwardRandomWindowBatchResolver",
+    "IForwardSequence10Resolver",
     "IForwardRandomWindowPlan",
     "IForwardRandomWindowStep",
     "IForwardMemoryState",

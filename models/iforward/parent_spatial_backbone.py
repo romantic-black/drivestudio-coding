@@ -154,6 +154,8 @@ class ParentTokenBuilder(nn.Module):
         token_dim: int = 64,
         support_embed_dim: int = 4,
         branch_embed_dim: int = 4,
+        frame_gap_embed_dim: int = 4,
+        visit_kind_embed_dim: int = 4,
     ) -> None:
         super().__init__()
         self.token_dim = int(token_dim)
@@ -166,6 +168,10 @@ class ParentTokenBuilder(nn.Module):
         )
         self.branch_embed = nn.Embedding(2, int(branch_embed_dim))
         self.branch_proj = nn.Linear(int(branch_embed_dim), int(token_dim))
+        self.frame_gap_embed = nn.Embedding(3, int(frame_gap_embed_dim))
+        self.frame_gap_proj = nn.Linear(int(frame_gap_embed_dim), int(token_dim))
+        self.visit_kind_embed = nn.Embedding(3, int(visit_kind_embed_dim))
+        self.visit_kind_proj = nn.Linear(int(visit_kind_embed_dim), int(token_dim))
         self.norm = nn.LayerNorm(int(token_dim))
 
     def forward(
@@ -176,6 +182,8 @@ class ParentTokenBuilder(nn.Module):
         support: torch.Tensor,
         valid_mask: torch.Tensor,
         branch_id: torch.Tensor,
+        frame_gap: int | torch.Tensor = 0,
+        visit_kind_id: int | torch.Tensor = 1,
     ) -> torch.Tensor:
         n = int(parent_context.shape[0])
         out = self.feat_proj(parent_context)
@@ -192,6 +200,24 @@ class ParentTokenBuilder(nn.Module):
         if int(branch.shape[0]) != n:
             raise ValueError("ParentTokenBuilder branch_id row mismatch")
         out = out + self.branch_proj(self.branch_embed(branch).to(dtype=parent_context.dtype))
+        if torch.is_tensor(frame_gap):
+            gap = frame_gap.to(device=parent_context.device, dtype=torch.long).reshape(-1)
+            if int(gap.numel()) == 1:
+                gap = gap.expand(n)
+        else:
+            gap = torch.full((n,), int(frame_gap), device=parent_context.device, dtype=torch.long)
+        if torch.is_tensor(visit_kind_id):
+            visit = visit_kind_id.to(device=parent_context.device, dtype=torch.long).reshape(-1)
+            if int(visit.numel()) == 1:
+                visit = visit.expand(n)
+        else:
+            visit = torch.full((n,), int(visit_kind_id), device=parent_context.device, dtype=torch.long)
+        if int(gap.numel()) != n or int(visit.numel()) != n:
+            raise ValueError("ParentTokenBuilder frame_gap/visit_kind row mismatch")
+        gap = gap.clamp(0, 2)
+        visit = visit.clamp(0, 2)
+        out = out + self.frame_gap_proj(self.frame_gap_embed(gap).to(dtype=parent_context.dtype))
+        out = out + self.visit_kind_proj(self.visit_kind_embed(visit).to(dtype=parent_context.dtype))
         out = self.norm(out)
         if not torch.isfinite(out).all():
             raise RuntimeError("ParentTokenBuilder output contains NaN/Inf")
@@ -208,6 +234,8 @@ class ParentSpatialBackbone(nn.Module):
         param_support_dim: int = 24,
         support_embed_dim: int = 4,
         branch_embed_dim: int = 4,
+        frame_gap_embed_dim: int = 4,
+        visit_kind_embed_dim: int = 4,
         near_depth: int = 4,
         near_heads: int = 4,
         near_patch_size: int = 64,
@@ -240,6 +268,8 @@ class ParentSpatialBackbone(nn.Module):
             token_dim=int(token_dim),
             support_embed_dim=int(support_embed_dim),
             branch_embed_dim=int(branch_embed_dim),
+            frame_gap_embed_dim=int(frame_gap_embed_dim),
+            visit_kind_embed_dim=int(visit_kind_embed_dim),
         )
         self.near_ptv3 = ParentPTv3Encoder(
             dim=int(token_dim),
@@ -278,6 +308,8 @@ class ParentSpatialBackbone(nn.Module):
         aabb_min: torch.Tensor,
         aabb_max: torch.Tensor,
         valid: torch.Tensor,
+        frame_gap: int | torch.Tensor = 0,
+        visit_kind_id: int | torch.Tensor = 1,
     ) -> torch.Tensor:
         context = x.parent_context
         if self.zero_invalid_context:
@@ -296,7 +328,18 @@ class ParentSpatialBackbone(nn.Module):
             support=x.support,
             valid_mask=valid,
             branch_id=x.branch_id,
+            frame_gap=frame_gap,
+            visit_kind_id=visit_kind_id,
         )
+
+    @staticmethod
+    def _visit_kind_id(visit_kind: str | int | torch.Tensor) -> int | torch.Tensor:
+        if torch.is_tensor(visit_kind):
+            return visit_kind
+        if isinstance(visit_kind, int):
+            return int(visit_kind)
+        mapping = {"bootstrap": 0, "causal_first": 1, "repair": 2}
+        return int(mapping.get(str(visit_kind), 1))
 
     def encode_near(
         self,
@@ -306,6 +349,8 @@ class ParentSpatialBackbone(nn.Module):
         aabb_max: torch.Tensor,
         batch_offsets: Optional[torch.Tensor] = None,
         layout_cache: Optional[Dict[str, ParentSerializedLayout]] = None,
+        frame_gap: int | torch.Tensor = 0,
+        visit_kind: str | int | torch.Tensor = 1,
     ) -> ParentStructOutput:
         n = int(x.coords.shape[0])
         if int(x.split_0 + x.split_1) != n:
@@ -317,7 +362,14 @@ class ParentSpatialBackbone(nn.Module):
                 support=x.support,
             )
         valid = self._valid(x, bg_threshold=self.support_threshold_bg, rigid_threshold=self.support_threshold_rigid)
-        token = self._tokens(x, aabb_min=aabb_min, aabb_max=aabb_max, valid=valid)
+        token = self._tokens(
+            x,
+            aabb_min=aabb_min,
+            aabb_max=aabb_max,
+            valid=valid,
+            frame_gap=frame_gap,
+            visit_kind_id=self._visit_kind_id(visit_kind),
+        )
         event, layouts, aux = self.near_ptv3(
             token,
             coords=x.coords,
@@ -335,6 +387,8 @@ class ParentSpatialBackbone(nn.Module):
         aabb_min: torch.Tensor,
         aabb_max: torch.Tensor,
         batch_offsets: Optional[torch.Tensor] = None,
+        frame_gap: int | torch.Tensor = 0,
+        visit_kind: str | int | torch.Tensor = 1,
     ) -> ParentStructOutput:
         _ = batch_offsets
         n = int(x.coords.shape[0])
@@ -351,7 +405,14 @@ class ParentSpatialBackbone(nn.Module):
             bg_threshold=self.support_threshold_distant,
             rigid_threshold=self.support_threshold_rigid_out,
         )
-        token = self._tokens(x, aabb_min=aabb_min, aabb_max=aabb_max, valid=valid)
+        token = self._tokens(
+            x,
+            aabb_min=aabb_min,
+            aabb_max=aabb_max,
+            valid=valid,
+            frame_gap=frame_gap,
+            visit_kind_id=self._visit_kind_id(visit_kind),
+        )
         event = self.far_norm(self.far_mlp(token))
         if not torch.isfinite(event).all():
             raise RuntimeError("ParentSpatial far event contains NaN/Inf")
@@ -373,6 +434,8 @@ class ParentSpatialBackbone(nn.Module):
         near_batch_offsets: Optional[torch.Tensor] = None,
         far_batch_offsets: Optional[torch.Tensor] = None,
         near_layout_cache: Optional[Dict[str, ParentSerializedLayout]] = None,
+        frame_gap: int | torch.Tensor = 0,
+        visit_kind: str | int | torch.Tensor = 1,
     ) -> tuple[EventPack, Dict[str, ParentSerializedLayout]]:
         near = self.encode_near(
             near_in,
@@ -380,12 +443,16 @@ class ParentSpatialBackbone(nn.Module):
             aabb_max=aabb_max,
             batch_offsets=near_batch_offsets,
             layout_cache=near_layout_cache,
+            frame_gap=frame_gap,
+            visit_kind=visit_kind,
         )
         far = self.encode_far(
             far_in,
             aabb_min=aabb_min,
             aabb_max=aabb_max,
             batch_offsets=far_batch_offsets,
+            frame_gap=frame_gap,
+            visit_kind=visit_kind,
         )
         num_bg = int(near_in.split_0)
         num_rigid_in = int(near_in.split_1)

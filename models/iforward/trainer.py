@@ -803,9 +803,34 @@ class IForwardTrainer(nn.Module):
             "image_refs": [tuple(int(v) for v in ref) for ref in out.image_refs],
             "image_roles": [str(role) for role in out.image_roles],
         }
-        if str(out.resolved.scheduler_version) == "random_window_v1":
-            final["iforward/scheduler_version"] = str(out.resolved.scheduler_version)
-            final["iforward/window_block_ids"] = [int(x) for x in tuple(out.resolved.window_block_ids)]
+        final["iforward/scheduler_version"] = str(out.resolved.scheduler_version)
+        final["iforward/window_block_ids"] = [int(x) for x in tuple(out.resolved.window_block_ids)]
+        if str(out.resolved.scheduler_version) == "iforward_sequence10_v1":
+            meta = dict(getattr(out.resolved, "meta", {}) or {})
+            sequence_positions = [int(x) for x in list(meta.get("sequence_positions", []) or [])]
+            sequence_keyframes = [int(x) for x in list(meta.get("sequence_keyframe_indices", []) or [])]
+            sequence_frames = [int(x) for x in list(meta.get("sequence_source_frame_indices", []) or [])]
+            repair_positions = [int(x) for x in list(meta.get("repair_positions", []) or [])]
+            final["iforward/sequence10/phase"] = str(meta.get("scheduler_phase", ""))
+            final["iforward/sequence10/rollout_phase"] = str(meta.get("rollout_phase", ""))
+            final["iforward/sequence10/stride"] = int(meta.get("sequence_stride", 0) or 0)
+            final["iforward/sequence10/sequence_id"] = int(meta.get("sequence_id", -1) or -1)
+            final["iforward/sequence10/positions"] = sequence_positions
+            final["iforward/sequence10/keyframe_ids"] = sequence_keyframes
+            final["iforward/sequence10/frame_ids"] = sequence_frames
+            final["iforward/sequence10/history_positions"] = [
+                int(x) for x in list(meta.get("history_positions", []) or [])
+            ]
+            final["iforward/sequence10/repair_positions"] = repair_positions
+            final["iforward/sequence10/repair_hash"] = int(meta.get("repair_permutation_hash", -1) or -1)
+            final["iforward/sequence10/repair_flag"] = bool(str(meta.get("scheduler_phase", "")) == "repair")
+            final["iforward/sequence10/temporal_commit_count"] = int(
+                sum(1 for step in out.resolved.steps if bool(getattr(step, "temporal_commit", False)))
+            )
+            final["iforward/sequence10/temporal_read_count"] = int(
+                sum(1 for step in out.resolved.steps if bool(getattr(step, "temporal_read", False)))
+            )
+            final["iforward/sequence10/history_frame_count"] = int(len(list(meta.get("history_positions", []) or [])))
         for name, value in timings.items():
             final[name] = float(value)
         for prefix, values in (

@@ -3,6 +3,10 @@ from __future__ import annotations
 from typing import Any, Optional, Tuple
 
 from datasets.train_scheduler_iforward import IFORWARD_STAGE2_1_SCHEDULER_VERSION, TrainSchedulerIForward
+from datasets.train_scheduler_iforward_sequence10 import (
+    IFORWARD_SEQUENCE10_SCHEDULER_VERSION,
+    TrainSchedulerIForwardSequence10,
+)
 
 
 def _cfg_get(node: Any, key: str, default: Any = None) -> Any:
@@ -36,7 +40,7 @@ def resolve_fixed_scene_segment_iforward(cfg: Any) -> Tuple[Optional[int], Optio
 def build_train_scheduler_iforward_from_cfg(
     cfg: Any,
     dataset: Any,
-) -> TrainSchedulerIForward:
+) -> TrainSchedulerIForward | TrainSchedulerIForwardSequence10:
     sched = cfg.get("scheduler_iforward") if hasattr(cfg, "get") else None
     if sched is None:
         raise ValueError("config must define scheduler_iforward")
@@ -48,11 +52,12 @@ def build_train_scheduler_iforward_from_cfg(
         "iforward_v3_random_window",
         "iforward_v4_coverage_ordered",
         IFORWARD_STAGE2_1_SCHEDULER_VERSION,
+        IFORWARD_SEQUENCE10_SCHEDULER_VERSION,
     }:
         raise ValueError(
             "scheduler_iforward.version must be iforward_v1, "
             "iforward_v3_random_window, iforward_v4_coverage_ordered, "
-            f"or {IFORWARD_STAGE2_1_SCHEDULER_VERSION}"
+            f"{IFORWARD_STAGE2_1_SCHEDULER_VERSION}, or {IFORWARD_SEQUENCE10_SCHEDULER_VERSION}"
         )
 
     fixed_scene_id, fixed_segment_id = resolve_fixed_scene_segment_iforward(cfg)
@@ -73,6 +78,27 @@ def build_train_scheduler_iforward_from_cfg(
     loss_timing_cfg = dict(_cfg_get(sched, "loss_timing", {}) or {})
     leakage_check_cfg = dict(_cfg_get(sched, "leakage_check", {}) or {})
     preload_cfg = dict(_cfg_get(sched, "preload", {}) or {})
+
+    if version == IFORWARD_SEQUENCE10_SCHEDULER_VERSION:
+        if dict(_cfg_get(sched, "episode", {}) or {}) or dict(_cfg_get(sched, "rollout", {}) or {}):
+            raise ValueError("iforward_sequence10_v1 forbids legacy scheduler_iforward.episode/rollout config blocks")
+        return TrainSchedulerIForwardSequence10(
+            dataset=dataset,
+            traversal_cfg=traversal_cfg,
+            bootstrap_cfg=dict(_cfg_get(sched, "bootstrap", {}) or {}),
+            sequence_cfg=dict(_cfg_get(sched, "sequence", {}) or {}),
+            causal_cfg=dict(_cfg_get(sched, "causal", {}) or {}),
+            repair_cfg=dict(_cfg_get(sched, "repair", {}) or {}),
+            supervision_cfg=supervision_cfg,
+            history_loss_cfg=dict(_cfg_get(sched, "history_loss", {}) or {}),
+            damage_loss_cfg=dict(_cfg_get(sched, "damage_loss", {}) or {}),
+            preload_cfg=preload_cfg,
+            include_test=bool(include_test),
+            fixed_scene_id=fixed_scene_id,
+            fixed_segment_id=fixed_segment_id,
+            seed=_cfg_get(traversal_cfg, "seed", None),
+            fail_fast=bool(_cfg_get(sched, "fail_fast", True)),
+        )
 
     return dataset.create_train_scheduler_iforward(
         episode_cfg=episode_cfg,

@@ -20,7 +20,13 @@ from datasets.iforward_coverage_validation import (
     iforward_coverage_validation_cfg,
     write_iforward_coverage_validation_rows,
 )
+from datasets.iforward_sequence10_validation import (
+    SEQUENCE10_VALIDATION_PROTOCOLS,
+    build_sequence10_manifest,
+    write_sequence10_manifest,
+)
 from datasets.train_scheduler_iforward import TrainSchedulerIForward
+from datasets.train_scheduler_iforward_sequence10 import TrainSchedulerIForwardSequence10
 from models.iforward import IForwardTrainer
 from tools.train_minimal_streetforward_stage4_3_iforward_common import (
     build_multi_scene_dataset_v4,
@@ -118,6 +124,53 @@ def _iforward_validation_cfg(cfg: Any) -> Dict[str, Any]:
     }
 
 
+def _iforward_sequence10_validation_cfg(cfg: Any) -> Dict[str, Any]:
+    raw = _cfg_get(cfg, "iforward_sequence10_validation", {}) or {}
+    tb_images_raw = _cfg_get(raw, "tensorboard_images", {}) or {}
+    protocols_raw = _cfg_get(raw, "protocols", SEQUENCE10_VALIDATION_PROTOCOLS)
+    if protocols_raw is None:
+        protocols = list(SEQUENCE10_VALIDATION_PROTOCOLS)
+    elif isinstance(protocols_raw, str):
+        protocols = [str(protocols_raw)]
+    else:
+        protocols = [str(x) for x in list(protocols_raw)]
+    unknown = [p for p in protocols if p not in set(SEQUENCE10_VALIDATION_PROTOCOLS)]
+    if unknown:
+        raise ValueError(f"Unknown iforward_sequence10_validation.protocols entries: {unknown}")
+    modes_raw = _cfg_get(raw, "modes", ["full"])
+    if modes_raw is None:
+        modes = ["full"]
+    elif isinstance(modes_raw, str):
+        modes = [str(modes_raw)]
+    else:
+        modes = [str(x) for x in list(modes_raw)]
+    strides_raw = _cfg_get(raw, "strides", [1, 2])
+    if isinstance(strides_raw, (int, float)):
+        strides = [int(strides_raw)]
+    else:
+        strides = [int(x) for x in list(strides_raw or [1, 2])]
+    return {
+        "enable": bool(_cfg_get(raw, "enable", False)),
+        "run_at_train_start": bool(_cfg_get(raw, "run_at_train_start", True)),
+        "interval_steps": int(_cfg_get(raw, "interval_steps", 5000)),
+        "segments_per_scene": int(_cfg_get(raw, "segments_per_scene", 1)),
+        "max_segments_total": int(_cfg_get(raw, "max_segments_total", 2)),
+        "max_entries": int(_cfg_get(raw, "max_entries", 8)),
+        "seed": int(_cfg_get(raw, "seed", 20260623)),
+        "protocols": protocols,
+        "modes": modes,
+        "strides": strides,
+        "manifest_path": str(_cfg_get(raw, "manifest_path", "")),
+        "tensorboard_images_enable": bool(_cfg_get(tb_images_raw, "enable", True)),
+        "tensorboard_images_max_per_role": int(_cfg_get(tb_images_raw, "max_images_per_role", 2)),
+    }
+
+
+def _is_sequence10_scheduler_cfg(cfg: Any) -> bool:
+    sched = _cfg_get(cfg, "scheduler_iforward", {}) or {}
+    return str(_cfg_get(sched, "version", "")) == "iforward_sequence10_v1"
+
+
 def _max_inner_k_from_shapes(shapes: Sequence[Dict[str, Any]]) -> int:
     max_k = 0
     for shape in list(shapes or []):
@@ -168,6 +221,7 @@ def _write_iforward_validation_tb_images(
     segment_id: int,
     rollout_idx: int,
     max_images_per_role: int,
+    tag_root: str = "iforward_validation/images",
 ) -> None:
     if writer is None or int(max_images_per_role) <= 0:
         return
@@ -198,7 +252,7 @@ def _write_iforward_validation_tb_images(
             if max_err > 0.0:
                 err = err / max_err
             tag = (
-                f"iforward_validation/images/"
+                f"{str(tag_root).strip('/')}/"
                 f"scene_{int(scene_id):03d}_segment_{int(segment_id):03d}/"
                 f"{role}/rollout_{int(rollout_idx)}/view_{count}_f{frame_idx:05d}_c{cam_idx}"
             )
@@ -365,6 +419,543 @@ def _make_validation_scheduler(cfg: Any, dataset: Any, scene_id: int, segment_id
         version=str(scheduler_version),
         fail_fast=True,
     )
+
+
+def _sequence10_protocol_stride(protocol: str) -> Optional[int]:
+    if "D2" in str(protocol):
+        return 2
+    if "D1" in str(protocol):
+        return 1
+    return None
+
+
+def _sequence10_protocol_rollout_count(protocol: str) -> int:
+    if str(protocol) in {"S10-D1-Repair", "S10-D2-Repair"}:
+        return 6
+    if str(protocol) in {"S10-D1-Causal", "S10-D2-Causal"}:
+        return 5
+    return 1
+
+
+def _sequence10_eval_pairs(cfg: Any, dataset: Any, val_cfg: Dict[str, Any]) -> List[Tuple[int, int]]:
+    data_cfg = _cfg_get(cfg, "data", {}) or {}
+    eval_scene_ids = [int(x) for x in list(_cfg_get(data_cfg, "eval_scene_ids", []) or [])]
+    if not eval_scene_ids:
+        eval_scene_ids = [int(x) for x in list(_cfg_get(data_cfg, "train_scene_ids", []) or [])]
+    strides = [int(x) for x in list(val_cfg.get("strides", [1, 2]) or [1, 2])]
+    max_segments_total = max(1, int(val_cfg.get("max_segments_total", 2)))
+    segments_per_scene = max(1, int(val_cfg.get("segments_per_scene", 1)))
+    out: List[Tuple[int, int]] = []
+    for scene_id in eval_scene_ids:
+        scene_count = 0
+        try:
+            segment_ids = sorted(int(x) for x in list(dataset.list_segment_ids(int(scene_id)) or []))
+        except Exception as exc:
+            base.logger.warning("Sequence10 validation could not list segments for scene=%s: %s", int(scene_id), exc)
+            continue
+        for segment_id in segment_ids:
+            try:
+                manifest = build_sequence10_manifest(
+                    dataset=dataset,
+                    scene_segment_pairs=[(int(scene_id), int(segment_id))],
+                    strides=strides,
+                    max_entries=1,
+                )
+            except Exception as exc:
+                base.logger.warning(
+                    "Sequence10 validation skipped scene=%s segment=%s while checking eligibility: %s",
+                    int(scene_id),
+                    int(segment_id),
+                    exc,
+                )
+                continue
+            if not list(manifest.get("entries", []) or []):
+                continue
+            out.append((int(scene_id), int(segment_id)))
+            scene_count += 1
+            if len(out) >= int(max_segments_total) or scene_count >= int(segments_per_scene):
+                break
+        if len(out) >= int(max_segments_total):
+            break
+    return out
+
+
+def _sequence10_validation_entries_for_protocol(
+    *,
+    dataset: Any,
+    pairs: Sequence[Tuple[int, int]],
+    protocol: str,
+    val_cfg: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    stride = _sequence10_protocol_stride(protocol)
+    strides = [int(stride)] if stride is not None else [int(x) for x in list(val_cfg.get("strides", [1, 2]) or [1, 2])]
+    manifest = build_sequence10_manifest(
+        dataset=dataset,
+        scene_segment_pairs=[(int(s), int(g)) for s, g in pairs],
+        strides=strides,
+        max_entries=max(1, int(val_cfg.get("max_entries", 8))),
+    )
+    entries: List[Dict[str, Any]] = []
+    seen: set[Tuple[int, int, int]] = set()
+    for raw in list(manifest.get("entries", []) or []):
+        entry = dict(raw)
+        key = (int(entry.get("scene_id", -1)), int(entry.get("segment_id", -1)), int(entry.get("stride", 1)))
+        if key in seen:
+            continue
+        seen.add(key)
+        entries.append(entry)
+        if len(entries) >= max(1, int(val_cfg.get("max_entries", 8))):
+            break
+    return entries
+
+
+def _make_sequence10_validation_scheduler(
+    *,
+    cfg: Any,
+    dataset: Any,
+    scene_id: int,
+    segment_id: int,
+    stride: int,
+    protocol: str,
+    seed: int,
+) -> TrainSchedulerIForwardSequence10:
+    sched = _cfg_get(cfg, "scheduler_iforward", {}) or {}
+    traversal_cfg = copy.deepcopy(dict(_cfg_get(sched, "traversal", {}) or {}))
+    traversal_cfg.update(
+        {
+            "fixed_scene_id": int(scene_id),
+            "fixed_segment_id": int(segment_id),
+            "scene_order": "ordered",
+            "segment_order": "ordered",
+            "traversal_mode": "scene_round_robin_episode",
+            "forbid_consecutive_same_scene": True,
+            "seed": int(seed),
+        }
+    )
+    sequence_cfg = copy.deepcopy(dict(_cfg_get(sched, "sequence", {}) or {}))
+    sequence_cfg.update(
+        {
+            "length": 10,
+            "block_source": "keyframes",
+            "strides": [int(stride)],
+            "max_inner_K": 10,
+        }
+    )
+    bootstrap_cfg = copy.deepcopy(dict(_cfg_get(sched, "bootstrap", {}) or {}))
+    causal_cfg = copy.deepcopy(dict(_cfg_get(sched, "causal", {}) or {}))
+    repair_cfg = copy.deepcopy(dict(_cfg_get(sched, "repair", {}) or {}))
+    if str(protocol) in {"SingleFrame-K8", "Repeat Stability"}:
+        bootstrap_cfg.update(
+            {
+                "end_step": 1_000_000,
+                "repeat_choices": [{"repeats": 8, "prob": 1.0}],
+                "current_only": True,
+            }
+        )
+        causal_cfg.update(
+            {
+                "start_step": 1_000_000,
+                "rollouts_per_episode": 5,
+                "blocks_per_rollout": 2,
+                "repeats_per_block": 4,
+                "temporal_read": True,
+                "temporal_commit": True,
+                "physical_time_advance": True,
+            }
+        )
+        repair_cfg.update(
+            {
+                "start_step": 1_000_000,
+                "prob": 0.0,
+                "blocks_per_rollout": 10,
+                "repeats_per_block": 1,
+                "non_identity_permutation": True,
+                "temporal_read": True,
+                "temporal_commit": False,
+                "observation_commit": False,
+                "update_optimizer_memory": False,
+                "physical_time_advance": False,
+            }
+        )
+    else:
+        bootstrap_cfg.update({"end_step": 0})
+        causal_cfg.update(
+            {
+                "start_step": 0,
+                "rollouts_per_episode": 5,
+                "blocks_per_rollout": 2,
+                "repeats_per_block": 4,
+                "temporal_read": True,
+                "temporal_commit": True,
+                "physical_time_advance": True,
+            }
+        )
+        repair_cfg.update(
+            {
+                "start_step": 0 if "Repair" in str(protocol) else 1_000_000,
+                "prob": 1.0 if "Repair" in str(protocol) else 0.0,
+                "blocks_per_rollout": 10,
+                "repeats_per_block": 1,
+                "non_identity_permutation": True,
+                "temporal_read": True,
+                "temporal_commit": False,
+                "observation_commit": False,
+                "update_optimizer_memory": False,
+                "physical_time_advance": False,
+            }
+        )
+    supervision_cfg = copy.deepcopy(dict(_cfg_get(sched, "supervision", {}) or {}))
+    history_cfg = copy.deepcopy(dict(_cfg_get(supervision_cfg, "history_replay", {}) or {}))
+    history_cfg.update({"enable": True, "start_step": 0, "max_frames_per_rollout": 10})
+    supervision_cfg["history_replay"] = history_cfg
+    preload_cfg = copy.deepcopy(dict(_cfg_get(sched, "preload", {}) or {}))
+    preload_cfg["emit_hints"] = False
+    return TrainSchedulerIForwardSequence10(
+        dataset=dataset,
+        traversal_cfg=traversal_cfg,
+        bootstrap_cfg=bootstrap_cfg,
+        sequence_cfg=sequence_cfg,
+        causal_cfg=causal_cfg,
+        repair_cfg=repair_cfg,
+        supervision_cfg=supervision_cfg,
+        history_loss_cfg={},
+        damage_loss_cfg={},
+        preload_cfg=preload_cfg,
+        include_test=False,
+        fixed_scene_id=int(scene_id),
+        fixed_segment_id=int(segment_id),
+        seed=int(seed),
+        fail_fast=True,
+    )
+
+
+def _tensor_to_float(value: Any, default: float = float("nan")) -> float:
+    if torch.is_tensor(value):
+        if value.numel() == 0:
+            return float(default)
+        value = value.detach().float().mean().item()
+    return _safe_float(value, default)
+
+
+def _sequence10_row_from_output(
+    *,
+    out: Any,
+    ifwd_meta: Dict[str, Any],
+    protocol: str,
+    mode: str,
+    trigger_step: int,
+    trigger_train_episode_counter: int,
+    rollout_idx: int,
+    repeat_idx: int = 0,
+) -> Dict[str, Any]:
+    stats = dict(getattr(out, "stats", {}) or {})
+    losses = dict(getattr(out, "losses", {}) or {})
+    resolved = getattr(out, "resolved", None)
+    return {
+        "step": int(trigger_step),
+        "split": "iforward_sequence10_validation",
+        "protocol": str(protocol),
+        "mode": str(mode),
+        "trigger_step": int(trigger_step),
+        "trigger_train_episode_counter": int(trigger_train_episode_counter),
+        "scene_id": int(ifwd_meta.get("scene_id", -1)),
+        "segment_id": int(ifwd_meta.get("segment_id", -1)),
+        "rollout_idx": int(rollout_idx),
+        "repeat_idx": int(repeat_idx),
+        "scheduler_phase": str(ifwd_meta.get("scheduler_phase", "")),
+        "rollout_phase": str(ifwd_meta.get("rollout_phase", "")),
+        "rollout_shape": str(ifwd_meta.get("shape_name", "unknown")),
+        "sequence_id": int(ifwd_meta.get("sequence_id", -1) or -1),
+        "sequence_stride": int(ifwd_meta.get("sequence_stride", 0) or 0),
+        "sequence_positions": [int(x) for x in list(ifwd_meta.get("sequence_positions", []) or [])],
+        "sequence_keyframe_indices": [
+            int(x) for x in list(ifwd_meta.get("sequence_keyframe_indices", []) or [])
+        ],
+        "sequence_source_frame_indices": [
+            int(x) for x in list(ifwd_meta.get("sequence_source_frame_indices", []) or [])
+        ],
+        "history_positions": [int(x) for x in list(ifwd_meta.get("history_positions", []) or [])],
+        "repair_positions": [int(x) for x in list(ifwd_meta.get("repair_positions", []) or [])],
+        "repair_flag": bool(str(ifwd_meta.get("scheduler_phase", "")) == "repair"),
+        "repair_permutation_hash": int(ifwd_meta.get("repair_permutation_hash", -1) or -1),
+        "temporal_read_count": int(ifwd_meta.get("temporal_read_count", 0) or 0),
+        "temporal_commit_count": int(ifwd_meta.get("temporal_commit_count", 0) or 0),
+        "observation_commit_count": int(ifwd_meta.get("observation_commit_count", 0) or 0),
+        "optimizer_memory_update_count": int(ifwd_meta.get("optimizer_memory_update_count", 0) or 0),
+        "history_frame_count": int(ifwd_meta.get("history_frame_count", 0) or 0),
+        "history_ref_count": int(ifwd_meta.get("history_ref_count", 0) or 0),
+        "inference_only": True,
+        "loss": _tensor_to_float(getattr(out, "loss", None)),
+        "current_loss": _tensor_to_float(losses.get("current")),
+        "history_rollout_loss": _tensor_to_float(losses.get("in_rollout_history")),
+        "history_damage_loss": _tensor_to_float(losses.get("history_damage")),
+        "current_psnr": _safe_float(stats.get("current_psnr", stats.get("current_latest_psnr"))),
+        "history_rollout_psnr": _safe_float(stats.get("history_psnr", stats.get("history_rollout_psnr"))),
+        "current_valid_ratio": _safe_float(stats.get("current_valid_ratio", stats.get("current_latest_valid_ratio"))),
+        "history_rollout_valid_ratio": _safe_float(
+            stats.get("history_valid_ratio", stats.get("in_rollout_history_valid_ratio"))
+        ),
+        "current_num_refs": _safe_float(stats.get("current_num_refs", stats.get("current_latest_num_refs"))),
+        "history_rollout_num_refs": _safe_float(stats.get("history_num_refs", stats.get("history_rollout_num_refs"))),
+        "sequence10_best_damage_loss": _safe_float(stats.get("sequence10/best_damage_loss", 0.0), 0.0),
+        "sequence10_best_damage_num_pos": _safe_float(stats.get("sequence10/best_damage_num_pos", 0.0), 0.0),
+        "sequence10_bank_valid_count": _safe_float(stats.get("sequence10/bank_valid_count", 0.0), 0.0),
+        "sequence10_bank_update_count": _safe_float(stats.get("sequence10/bank_update_count", 0.0), 0.0),
+        "loss_weight_history": _safe_float(stats.get("loss_weight/in_rollout_history", 0.0), 0.0),
+        "loss_weight_history_damage": _safe_float(stats.get("loss_weight/history_damage", 0.0), 0.0),
+        "carry_scene_state_after_rollout": bool(getattr(resolved, "carry_scene_state_after_rollout", False)),
+        "episode_end_after_rollout": bool(getattr(resolved, "episode_end_after_rollout", False)),
+    }
+
+
+def _reset_iforward_eval_runtime(model: Any) -> None:
+    reset_bridge = getattr(model, "_reset_bridge_runtime_node_state", None)
+    if callable(reset_bridge):
+        reset_bridge()
+    if hasattr(model, "reset_iforward_state_cache"):
+        model.reset_iforward_state_cache()
+
+
+def _sequence10_minimal_from_scheduler_batch(raw_batch: Dict[str, Any], device: torch.device, trigger_step: int) -> Dict[str, Any]:
+    target = raw_batch.get("target") or {}
+    image = target.get("image") if isinstance(target, dict) else None
+    num_targets = int(image.shape[0]) if torch.is_tensor(image) else 0
+    minimal_batch = base.convert_batch_to_minimal_format(
+        raw_batch,
+        device,
+        num_targets=num_targets,
+        include_source_for_2d=True,
+        view_selection=None,
+    )
+    minimal_batch["global_step"] = int(trigger_step)
+    return minimal_batch
+
+
+def _write_iforward_sequence10_validation_rows(
+    *,
+    cfg: Any,
+    dataset: Any,
+    model: Any,
+    device: torch.device,
+    trigger_step: int,
+    trigger_train_episode_counter: int,
+    metrics_fh: Any,
+    writer: Any,
+    **_: Any,
+) -> None:
+    val_cfg = _iforward_sequence10_validation_cfg(cfg)
+    if not bool(val_cfg["enable"]):
+        return
+    pairs = _sequence10_eval_pairs(cfg, dataset, val_cfg)
+    if not pairs:
+        row = {
+            "step": int(trigger_step),
+            "split": "iforward_sequence10_validation_global",
+            "trigger_step": int(trigger_step),
+            "trigger_train_episode_counter": int(trigger_train_episode_counter),
+            "num_rollouts": 0,
+            "status": "no_valid_sequence10_segments",
+        }
+        if metrics_fh is not None:
+            base._write_metrics_history(metrics_fh, row)
+        return
+    manifest = build_sequence10_manifest(
+        dataset=dataset,
+        scene_segment_pairs=[(int(s), int(g)) for s, g in pairs],
+        strides=[int(x) for x in list(val_cfg.get("strides", [1, 2]) or [1, 2])],
+        max_entries=max(1, int(val_cfg.get("max_entries", 8))),
+    )
+    manifest_path = str(val_cfg.get("manifest_path", "") or "")
+    if manifest_path:
+        write_sequence10_manifest(manifest_path, manifest)
+
+    was_training = bool(model.training)
+    saved_cache = dict(getattr(model, "_state_cache", {}) or {})
+    rows: List[Dict[str, Any]] = []
+    model.eval()
+    _reset_iforward_eval_runtime(model)
+    try:
+        with torch.no_grad():
+            for protocol in list(val_cfg["protocols"]):
+                entries = _sequence10_validation_entries_for_protocol(
+                    dataset=dataset,
+                    pairs=pairs,
+                    protocol=str(protocol),
+                    val_cfg=val_cfg,
+                )
+                if not entries:
+                    row = {
+                        "step": int(trigger_step),
+                        "split": "iforward_sequence10_validation_global",
+                        "protocol": str(protocol),
+                        "trigger_step": int(trigger_step),
+                        "trigger_train_episode_counter": int(trigger_train_episode_counter),
+                        "num_rollouts": 0,
+                        "status": "no_valid_protocol_entries",
+                    }
+                    if metrics_fh is not None:
+                        base._write_metrics_history(metrics_fh, row)
+                    continue
+                for entry_idx, entry in enumerate(entries):
+                    scene_id = int(entry["scene_id"])
+                    segment_id = int(entry["segment_id"])
+                    stride = int(entry["stride"])
+                    seed = int(val_cfg["seed"]) + 1009 * int(entry_idx) + 97 * int(stride)
+                    for mode in list(val_cfg["modes"]):
+                        scheduler = _make_sequence10_validation_scheduler(
+                            cfg=cfg,
+                            dataset=dataset,
+                            scene_id=scene_id,
+                            segment_id=segment_id,
+                            stride=stride,
+                            protocol=str(protocol),
+                            seed=int(seed),
+                        )
+                        if str(protocol) == "Repeat Stability":
+                            raw_batch = scheduler.next_batch()
+                            ifwd_meta = dict(raw_batch.get("_iforward", {}) or {})
+                            minimal_batch = _sequence10_minimal_from_scheduler_batch(raw_batch, device, int(trigger_step))
+                            repeat_rows: List[Dict[str, Any]] = []
+                            for repeat_idx in range(2):
+                                _reset_iforward_eval_runtime(model)
+                                out = model.forward_rollout(minimal_batch, carried_state=None, ablation=str(mode))
+                                row = _sequence10_row_from_output(
+                                    out=out,
+                                    ifwd_meta=ifwd_meta,
+                                    protocol=str(protocol),
+                                    mode=str(mode),
+                                    trigger_step=int(trigger_step),
+                                    trigger_train_episode_counter=int(trigger_train_episode_counter),
+                                    rollout_idx=0,
+                                    repeat_idx=int(repeat_idx),
+                                )
+                                rows.append(row)
+                                repeat_rows.append(row)
+                                if metrics_fh is not None:
+                                    base._write_metrics_history(metrics_fh, row)
+                            if len(repeat_rows) == 2:
+                                diff_row = {
+                                    "step": int(trigger_step),
+                                    "split": "iforward_sequence10_validation_global",
+                                    "protocol": str(protocol),
+                                    "mode": str(mode),
+                                    "scene_id": int(scene_id),
+                                    "segment_id": int(segment_id),
+                                    "sequence_stride": int(stride),
+                                    "trigger_step": int(trigger_step),
+                                    "trigger_train_episode_counter": int(trigger_train_episode_counter),
+                                    "num_rollouts": 2,
+                                    "repeat_stability_loss_abs_diff": abs(
+                                        float(repeat_rows[0]["loss"]) - float(repeat_rows[1]["loss"])
+                                    ),
+                                    "repeat_stability_current_psnr_abs_diff": abs(
+                                        float(repeat_rows[0]["current_psnr"]) - float(repeat_rows[1]["current_psnr"])
+                                    ),
+                                }
+                                if metrics_fh is not None:
+                                    base._write_metrics_history(metrics_fh, diff_row)
+                            continue
+
+                        carried_state = None
+                        _reset_iforward_eval_runtime(model)
+                        rollout_count = _sequence10_protocol_rollout_count(str(protocol))
+                        for rollout_idx in range(int(rollout_count)):
+                            raw_batch = scheduler.next_batch()
+                            ifwd_meta = dict(raw_batch.get("_iforward", {}) or {})
+                            minimal_batch = _sequence10_minimal_from_scheduler_batch(raw_batch, device, int(trigger_step))
+                            out = model.forward_rollout(minimal_batch, carried_state=carried_state, ablation=str(mode))
+                            row = _sequence10_row_from_output(
+                                out=out,
+                                ifwd_meta=ifwd_meta,
+                                protocol=str(protocol),
+                                mode=str(mode),
+                                trigger_step=int(trigger_step),
+                                trigger_train_episode_counter=int(trigger_train_episode_counter),
+                                rollout_idx=int(rollout_idx),
+                            )
+                            rows.append(row)
+                            if metrics_fh is not None:
+                                base._write_metrics_history(metrics_fh, row)
+                            if writer is not None:
+                                tag = (
+                                    f"iforward_sequence10_validation/{str(protocol)}/{str(mode)}/"
+                                    f"scene_{scene_id:03d}_segment_{segment_id:03d}"
+                                )
+                                writer.add_scalar(f"{tag}/current_psnr", float(row["current_psnr"]), int(trigger_step))
+                                writer.add_scalar(f"{tag}/history_rollout_psnr", float(row["history_rollout_psnr"]), int(trigger_step))
+                                writer.add_scalar(f"{tag}/sequence10_best_damage_loss", float(row["sequence10_best_damage_loss"]), int(trigger_step))
+                                if bool(val_cfg["tensorboard_images_enable"]) and (
+                                    int(rollout_idx) == int(rollout_count) - 1 or bool(row["repair_flag"])
+                                ):
+                                    _write_iforward_validation_tb_images(
+                                        writer=writer,
+                                        out=out,
+                                        step=int(trigger_step),
+                                        scene_id=int(scene_id),
+                                        segment_id=int(segment_id),
+                                        rollout_idx=int(rollout_idx),
+                                        max_images_per_role=int(val_cfg["tensorboard_images_max_per_role"]),
+                                        tag_root=f"iforward_sequence10_validation/images/{str(protocol)}/{str(mode)}",
+                                    )
+                            resolved = getattr(out, "resolved", None)
+                            carry_after = bool(getattr(resolved, "carry_scene_state_after_rollout", False))
+                            episode_end = bool(getattr(resolved, "episode_end_after_rollout", False))
+                            if bool(carry_after) and not bool(episode_end):
+                                next_state = getattr(out, "next_state", None)
+                                detach = getattr(next_state, "detach_for_next_rollout", None)
+                                carried_state = detach() if callable(detach) else next_state
+                            else:
+                                carried_state = None
+                                _reset_iforward_eval_runtime(model)
+    finally:
+        if hasattr(model, "_state_cache"):
+            model._state_cache = saved_cache
+        _reset_iforward_eval_runtime(model)
+        model.train(was_training)
+
+    if rows:
+        global_rows: List[Dict[str, Any]] = []
+        for protocol in list(val_cfg["protocols"]):
+            for mode in list(val_cfg["modes"]):
+                mode_rows = [r for r in rows if str(r.get("protocol")) == str(protocol) and str(r.get("mode")) == str(mode)]
+                if not mode_rows:
+                    continue
+                global_rows.append(
+                    {
+                        "step": int(trigger_step),
+                        "split": "iforward_sequence10_validation_global",
+                        "protocol": str(protocol),
+                        "mode": str(mode),
+                        "trigger_step": int(trigger_step),
+                        "trigger_train_episode_counter": int(trigger_train_episode_counter),
+                        "num_rollouts": int(len(mode_rows)),
+                        "loss": _mean([float(r["loss"]) for r in mode_rows]),
+                        "current_psnr": _mean([float(r["current_psnr"]) for r in mode_rows]),
+                        "history_rollout_psnr": _mean([float(r["history_rollout_psnr"]) for r in mode_rows]),
+                        "current_valid_ratio": _mean([float(r["current_valid_ratio"]) for r in mode_rows]),
+                        "history_rollout_valid_ratio": _mean([float(r["history_rollout_valid_ratio"]) for r in mode_rows]),
+                        "sequence10_best_damage_loss": _mean(
+                            [float(r["sequence10_best_damage_loss"]) for r in mode_rows]
+                        ),
+                        "sequence10_bank_valid_count": _mean(
+                            [float(r["sequence10_bank_valid_count"]) for r in mode_rows]
+                        ),
+                    }
+                )
+        for global_row in global_rows:
+            if metrics_fh is not None:
+                base._write_metrics_history(metrics_fh, global_row)
+            if writer is not None:
+                protocol = str(global_row.get("protocol", "all"))
+                mode = str(global_row.get("mode", "full"))
+                tag = f"iforward_sequence10_validation/global/{protocol}/{mode}"
+                writer.add_scalar(f"{tag}/current_psnr", float(global_row["current_psnr"]), int(trigger_step))
+                writer.add_scalar(f"{tag}/history_rollout_psnr", float(global_row["history_rollout_psnr"]), int(trigger_step))
+                writer.add_scalar(f"{tag}/sequence10_best_damage_loss", float(global_row["sequence10_best_damage_loss"]), int(trigger_step))
+        if writer is not None:
+            flush = getattr(writer, "flush", None)
+            if callable(flush):
+                flush()
 
 
 def _write_iforward_validation_rows(
@@ -637,6 +1228,11 @@ def _write_iforward_validation_rows(
 
 def _iforward_train_start_hook(**kwargs: Any) -> None:
     cfg = kwargs["cfg"]
+    if _is_sequence10_scheduler_cfg(cfg):
+        val_cfg = _iforward_sequence10_validation_cfg(cfg)
+        if bool(val_cfg["enable"]) and bool(val_cfg["run_at_train_start"]):
+            _write_iforward_sequence10_validation_rows(**kwargs)
+        return
     coverage_cfg = iforward_coverage_validation_cfg(cfg)
     if bool(coverage_cfg["enable"]) and bool(coverage_cfg["run_at_train_start"]):
         call_kwargs = dict(kwargs)
@@ -650,6 +1246,13 @@ def _iforward_train_start_hook(**kwargs: Any) -> None:
 
 def _iforward_step_end_hook(**kwargs: Any) -> None:
     cfg = kwargs["cfg"]
+    if _is_sequence10_scheduler_cfg(cfg):
+        val_cfg = _iforward_sequence10_validation_cfg(cfg)
+        interval = int(val_cfg["interval_steps"])
+        step = int(kwargs.get("trigger_step", 0))
+        if bool(val_cfg["enable"]) and interval > 0 and step >= 0 and (step + 1) % int(interval) == 0:
+            _write_iforward_sequence10_validation_rows(**kwargs)
+        return
     coverage_cfg = iforward_coverage_validation_cfg(cfg)
     coverage_interval = int(coverage_cfg["interval_steps"])
     val_cfg = _iforward_validation_cfg(cfg)

@@ -1110,6 +1110,16 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         self.stage2_0_biggs_parent_state_cfg = self._cfg_get(biggs_cfg, "parent_state", {}) or {}
         self.stage2_0_biggs_observe_cfg = self._cfg_get(biggs_cfg, "observe", {}) or {}
         self.stage2_0_biggs_lifting_cfg = self._cfg_get(biggs_cfg, "lifting", {}) or {}
+        detail_support_cfg = self._cfg_get(self.stage2_0_biggs_lifting_cfg, "detail_support_min", {}) or {}
+        self.stage2_0_fwhr_detail_support_min = {
+            "bg": float(self._cfg_get(detail_support_cfg, "bg", getattr(self, "bg_src_backproject_support_min", 0.0))),
+            "distant": float(
+                self._cfg_get(detail_support_cfg, "distant", getattr(self, "distant_src_backproject_support_min", 0.0))
+            ),
+            "rigid": float(
+                self._cfg_get(detail_support_cfg, "rigid", getattr(self, "rigid_src_backproject_support_min", 0.0))
+            ),
+        }
         parent_state_policy = str(self._cfg_get(self.stage2_0_biggs_parent_state_cfg, "exact_refresh_policy", "block_enter")).lower()
         if parent_state_policy not in {"block_enter", "none"}:
             raise ValueError(
@@ -2401,7 +2411,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             thresholds.append(
                 torch.full(
                     (int(num_bg),),
-                    float(getattr(self, "bg_src_backproject_support_min", 0.0)),
+                    float(getattr(self, "stage2_0_fwhr_detail_support_min", {}).get("bg", getattr(self, "bg_src_backproject_support_min", 0.0))),
                     device=child_feature_sum.device,
                     dtype=child_feature_sum.dtype,
                 )
@@ -2410,7 +2420,12 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             thresholds.append(
                 torch.full(
                     (int(num_distant),),
-                    float(getattr(self, "distant_src_backproject_support_min", 0.0)),
+                    float(
+                        getattr(self, "stage2_0_fwhr_detail_support_min", {}).get(
+                            "distant",
+                            getattr(self, "distant_src_backproject_support_min", 0.0),
+                        )
+                    ),
                     device=child_feature_sum.device,
                     dtype=child_feature_sum.dtype,
                 )
@@ -2419,7 +2434,12 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             thresholds.append(
                 torch.full(
                     (int(num_rigid_s),),
-                    float(getattr(self, "rigid_src_backproject_support_min", 0.0)),
+                    float(
+                        getattr(self, "stage2_0_fwhr_detail_support_min", {}).get(
+                            "rigid",
+                            getattr(self, "rigid_src_backproject_support_min", 0.0),
+                        )
+                    ),
                     device=child_feature_sum.device,
                     dtype=child_feature_sum.dtype,
                 )
@@ -2444,12 +2464,35 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         stats: Dict[str, float] = {
             "iforward/fwhr/context_dim": float(context_dim),
             "iforward/fwhr/detail_dim": float(detail_dim),
+            "iforward/fwhr/detail_support_min_bg": float(
+                getattr(self, "stage2_0_fwhr_detail_support_min", {}).get("bg", 0.0)
+            ),
+            "iforward/fwhr/detail_support_min_distant": float(
+                getattr(self, "stage2_0_fwhr_detail_support_min", {}).get("distant", 0.0)
+            ),
+            "iforward/fwhr/detail_support_min_rigid": float(
+                getattr(self, "stage2_0_fwhr_detail_support_min", {}).get("rigid", 0.0)
+            ),
         }
         for key, value in dict(lift.aux or {}).items():
             if torch.is_tensor(value):
                 stats[f"iforward/fwhr/{key}"] = float(value.item())
             elif isinstance(value, (int, float)):
                 stats[f"iforward/fwhr/{key}"] = float(value)
+        valid_all = lift.child_detail_valid.detach().to(dtype=torch.float32)
+        cursor = 0
+        if int(num_bg) > 0:
+            stats["iforward/fwhr/detail_valid_ratio_bg"] = float(valid_all[cursor : cursor + int(num_bg)].mean().item())
+            cursor += int(num_bg)
+        if int(num_distant) > 0:
+            stats["iforward/fwhr/detail_valid_ratio_distant"] = float(
+                valid_all[cursor : cursor + int(num_distant)].mean().item()
+            )
+            cursor += int(num_distant)
+        if int(num_rigid_s) > 0:
+            stats["iforward/fwhr/detail_valid_ratio_rigid"] = float(
+                valid_all[cursor : cursor + int(num_rigid_s)].mean().item()
+            )
         return lift, stats
 
     def _stage2_0_biggs_projection_stats(
@@ -2856,8 +2899,13 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 raise RuntimeError("FW-HR expected fine_scene to be built")
             context_dim = int(self._cfg_get(lifting_cfg, "context_dim", int(cnn_inputs["features_2d"].shape[-1])))
             detail_dim = int(self._cfg_get(lifting_cfg, "detail_dim", 8))
-            if not bool(self._cfg_get(lifting_cfg, "fused_cuda", True)):
-                raise RuntimeError("FW-HR training path requires biggs.lifting.fused_cuda=true")
+            lifting_backend = str(self._cfg_get(lifting_cfg, "backend", "")).strip().lower()
+            legacy_fused_flag = bool(self._cfg_get(lifting_cfg, "fused_cuda", True))
+            if not bool(legacy_fused_flag) and lifting_backend not in {"child_v4_raw_torch_aggregate"}:
+                raise RuntimeError(
+                    "FW-HR training path requires biggs.lifting.fused_cuda=true or "
+                    "biggs.lifting.backend=child_v4_raw_torch_aggregate"
+                )
             child_to_parent_global = self._stage2_0_fwhr_child_to_parent_global(
                 state=state,
                 active_rigid=active_rigid,

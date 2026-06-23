@@ -350,6 +350,53 @@ def _build_iforward_scheduler_row(
         "window_end": _metric_int(result.get("iforward/window_end", scheduler_info.get("window_end", -1))),
         "window_block_ids": _metric_list_int(result.get("iforward/window_block_ids", scheduler_info.get("window_block_ids"))),
     }
+    if str(row.get("scheduler_version", "")) == "iforward_sequence10_v1":
+        row.update(
+            {
+                "scheduler_phase": str(
+                    result.get("iforward/sequence10/phase", scheduler_info.get("scheduler_phase", ""))
+                ),
+                "rollout_phase": str(
+                    result.get("iforward/sequence10/rollout_phase", scheduler_info.get("rollout_phase", ""))
+                ),
+                "sequence_id": _metric_int(
+                    result.get("iforward/sequence10/sequence_id", scheduler_info.get("sequence_id", -1))
+                ),
+                "sequence_stride": _metric_int(
+                    result.get("iforward/sequence10/stride", scheduler_info.get("sequence_stride", -1))
+                ),
+                "sequence_positions": _metric_list_int(
+                    result.get("iforward/sequence10/positions", scheduler_info.get("sequence_positions"))
+                ),
+                "sequence_keyframe_ids": _metric_list_int(
+                    result.get("iforward/sequence10/keyframe_ids", scheduler_info.get("sequence_keyframe_indices"))
+                ),
+                "sequence_frame_ids": _metric_list_int(
+                    result.get("iforward/sequence10/frame_ids", scheduler_info.get("sequence_source_frame_indices"))
+                ),
+                "history_positions": _metric_list_int(
+                    result.get("iforward/sequence10/history_positions", scheduler_info.get("history_positions"))
+                ),
+                "repair_positions": _metric_list_int(
+                    result.get("iforward/sequence10/repair_positions", scheduler_info.get("repair_positions"))
+                ),
+                "repair_hash": _metric_int(
+                    result.get("iforward/sequence10/repair_hash", scheduler_info.get("repair_permutation_hash", -1))
+                ),
+                "repair_flag": _metric_bool(
+                    result.get("iforward/sequence10/repair_flag", scheduler_info.get("repair_flag", False))
+                ),
+                "temporal_commit_count": _metric_int(
+                    result.get("iforward/sequence10/temporal_commit_count", scheduler_info.get("temporal_commit_count", 0))
+                ),
+                "temporal_read_count": _metric_int(
+                    result.get("iforward/sequence10/temporal_read_count", scheduler_info.get("temporal_read_count", 0))
+                ),
+                "history_frame_count": _metric_int(
+                    result.get("iforward/sequence10/history_frame_count", scheduler_info.get("history_frame_count", 0))
+                ),
+            }
+        )
     return row
 
 
@@ -2422,6 +2469,25 @@ def main() -> None:
     train_step_metrics_interval = int(cfg.logging.get("train_step_metrics_interval", 0))
     if train_step_metrics_interval < 0:
         raise ValueError("logging.train_step_metrics_interval must be >= 0")
+    scheduler_metrics_interval = int(cfg.logging.get("scheduler_metrics_interval", 1))
+    if scheduler_metrics_interval < 0:
+        raise ValueError("logging.scheduler_metrics_interval must be >= 0")
+    sequence10_force_train_step_metrics = str(
+        cfg.logging.get("sequence10_force_train_step_metrics", "all_key_rollouts")
+    ).strip()
+    if sequence10_force_train_step_metrics not in {"all_key_rollouts", "repair_and_episode_end", "episode_end", "none"}:
+        raise ValueError(
+            "logging.sequence10_force_train_step_metrics must be one of "
+            "['all_key_rollouts', 'repair_and_episode_end', 'episode_end', 'none']"
+        )
+    sequence10_force_scheduler_metrics = str(
+        cfg.logging.get("sequence10_force_scheduler_metrics", "all_key_rollouts")
+    ).strip()
+    if sequence10_force_scheduler_metrics not in {"all_key_rollouts", "repair_and_episode_end", "episode_end", "none"}:
+        raise ValueError(
+            "logging.sequence10_force_scheduler_metrics must be one of "
+            "['all_key_rollouts', 'repair_and_episode_end', 'episode_end', 'none']"
+        )
     random_window_diagnostics_interval = int(
         cfg.logging.get("random_window_diagnostics_interval", max(int(train_step_metrics_interval), 100))
     )
@@ -2460,12 +2526,16 @@ def main() -> None:
         save_train_views_psnr_below = None
     logger.info(
         "Train monitor switches: heavy_metrics=%s include_per_view_metrics=%s "
-        "include_extra_result_metrics=%s low_psnr_image_dump=%s train_step_metrics_interval=%s",
+        "include_extra_result_metrics=%s low_psnr_image_dump=%s train_step_metrics_interval=%s "
+        "scheduler_metrics_interval=%s sequence10_force_train_step_metrics=%s sequence10_force_scheduler_metrics=%s",
         bool(train_monitor_enable_heavy_metrics),
         bool(train_monitor_include_per_view_metrics),
         bool(train_monitor_include_extra_result_metrics),
         bool(train_monitor_enable_low_psnr_image_dump),
         int(train_step_metrics_interval),
+        int(scheduler_metrics_interval),
+        str(sequence10_force_train_step_metrics),
+        str(sequence10_force_scheduler_metrics),
     )
     logger.info(
         "Random-window metrics: diagnostics_interval=%s",
@@ -2970,23 +3040,52 @@ def main() -> None:
             sum_num_gaussians_rigid += int(result.get("num_gaussians_rigid", 0))
             sum_num_gaussians_sky += int(result.get("num_gaussians_sky", 0))
             if result.get("iforward/rollout_id_global", None) is not None:
-                scheduler_row = _build_iforward_scheduler_row(
-                    step=int(step),
-                    result=result,
-                    scheduler_info=scheduler_info,
+                is_sequence10_step = (
+                    str(result.get("iforward/scheduler_version", scheduler_info.get("scheduler_version", "")))
+                    == "iforward_sequence10_v1"
                 )
-                _write_metrics_history(metrics_fh, scheduler_row)
-                drift_row = _build_biggs_parent_drift_row(
-                    step=int(step),
-                    result=result,
-                    scheduler_info=scheduler_info,
+                sequence10_rollout_idx = int(
+                    result.get("iforward/rollout_idx_in_episode", scheduler_info.get("rollout_idx_in_episode", -1))
+                    or -1
                 )
-                if drift_row is not None:
-                    _write_metrics_history(metrics_fh, drift_row)
-                    if writer is not None:
-                        drift_max = drift_row.get("iforward/biggs/drift_max", None)
-                        if isinstance(drift_max, (int, float)):
-                            writer.add_scalar("train/biggs_parent_drift/max", float(drift_max), int(step))
+                sequence10_repair = bool(
+                    result.get("iforward/sequence10/repair_flag", scheduler_info.get("repair_flag", False))
+                )
+                sequence10_episode_end = bool(result.get("iforward/episode_end_after_rollout", False))
+                force_sequence10_scheduler_metrics = False
+                if is_sequence10_step:
+                    if sequence10_force_scheduler_metrics == "all_key_rollouts":
+                        force_sequence10_scheduler_metrics = (
+                            sequence10_rollout_idx in {0, 4}
+                            or bool(sequence10_repair)
+                            or bool(sequence10_episode_end)
+                        )
+                    elif sequence10_force_scheduler_metrics == "repair_and_episode_end":
+                        force_sequence10_scheduler_metrics = bool(sequence10_repair) or bool(sequence10_episode_end)
+                    elif sequence10_force_scheduler_metrics == "episode_end":
+                        force_sequence10_scheduler_metrics = bool(sequence10_episode_end)
+                should_write_scheduler_metrics = (
+                    bool(scheduler_metrics_interval > 0 and step % int(scheduler_metrics_interval) == 0)
+                    or bool(force_sequence10_scheduler_metrics)
+                )
+                if should_write_scheduler_metrics:
+                    scheduler_row = _build_iforward_scheduler_row(
+                        step=int(step),
+                        result=result,
+                        scheduler_info=scheduler_info,
+                    )
+                    _write_metrics_history(metrics_fh, scheduler_row)
+                    drift_row = _build_biggs_parent_drift_row(
+                        step=int(step),
+                        result=result,
+                        scheduler_info=scheduler_info,
+                    )
+                    if drift_row is not None:
+                        _write_metrics_history(metrics_fh, drift_row)
+                        if writer is not None:
+                            drift_max = drift_row.get("iforward/biggs/drift_max", None)
+                            if isinstance(drift_max, (int, float)):
+                                writer.add_scalar("train/biggs_parent_drift/max", float(drift_max), int(step))
 
             current_block_idx_global = int(scheduler_info.get("block_idx_global", -1))
             if current_block_idx_global >= 0:
@@ -3032,7 +3131,44 @@ def main() -> None:
                 if step % max(diag_cfg["interval"], 1) == 0:
                     diag_row = _diagnose_step(list(diag_window))
 
-            if train_step_metrics_interval > 0 and step % train_step_metrics_interval == 0:
+            force_sequence10_metrics = (
+                str(result.get("iforward/scheduler_version", scheduler_info.get("scheduler_version", "")))
+                == "iforward_sequence10_v1"
+                and sequence10_force_train_step_metrics != "none"
+                and (
+                    (
+                        sequence10_force_train_step_metrics == "all_key_rollouts"
+                        and (
+                            int(
+                                result.get(
+                                    "iforward/rollout_idx_in_episode",
+                                    scheduler_info.get("rollout_idx_in_episode", -1),
+                                )
+                                or -1
+                            )
+                            in {0, 4}
+                            or bool(result.get("iforward/sequence10/repair_flag", scheduler_info.get("repair_flag", False)))
+                            or bool(result.get("iforward/episode_end_after_rollout", False))
+                        )
+                    )
+                    or (
+                        sequence10_force_train_step_metrics == "repair_and_episode_end"
+                        and (
+                            bool(result.get("iforward/sequence10/repair_flag", scheduler_info.get("repair_flag", False)))
+                            or bool(result.get("iforward/episode_end_after_rollout", False))
+                        )
+                    )
+                    or (
+                        sequence10_force_train_step_metrics == "episode_end"
+                        and bool(result.get("iforward/episode_end_after_rollout", False))
+                    )
+                )
+            )
+            should_write_train_step_metrics = (
+                bool(train_step_metrics_interval > 0 and step % train_step_metrics_interval == 0)
+                or bool(force_sequence10_metrics)
+            )
+            if should_write_train_step_metrics:
                 if _is_iforward_random_window_result(result):
                     train_step_row = _build_iforward_random_window_train_step_row(
                         step=int(step),
@@ -3127,9 +3263,22 @@ def main() -> None:
                             train_step_row[k] = int(v)
                         elif isinstance(v, float):
                             train_step_row[k] = float(v)
-                        elif isinstance(v, str) and k in {"stage6/phase", "shape_name", "iforward/scheduler_version"}:
+                        elif isinstance(v, str) and k in {
+                            "stage6/phase",
+                            "shape_name",
+                            "iforward/scheduler_version",
+                            "iforward/sequence10/phase",
+                            "iforward/sequence10/rollout_phase",
+                        }:
                             train_step_row[k] = str(v)
-                        elif k == "iforward/window_block_ids" and isinstance(v, (list, tuple)):
+                        elif k in {
+                            "iforward/window_block_ids",
+                            "iforward/sequence10/positions",
+                            "iforward/sequence10/keyframe_ids",
+                            "iforward/sequence10/frame_ids",
+                            "iforward/sequence10/history_positions",
+                            "iforward/sequence10/repair_positions",
+                        } and isinstance(v, (list, tuple)):
                             train_step_row[k] = [int(x) for x in v]
                     if diag_row:
                         train_step_row.update(diag_row)

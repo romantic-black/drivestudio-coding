@@ -11,6 +11,7 @@ IFORWARD_SCHEDULER_VERSION = "iforward_v1"
 IFORWARD_V3_SCHEDULER_VERSION = "iforward_v3_random_window"
 IFORWARD_V4_SCHEDULER_VERSION = "iforward_v4_coverage_ordered"
 IFORWARD_STAGE2_1_SCHEDULER_VERSION = "iforward_stage2_1_parent_temporal"
+IFORWARD_SEQUENCE10_SCHEDULER_VERSION = "iforward_sequence10_v1"
 IFORWARD_MODEL_FAMILY = "IForward"
 IFORWARD_CURRENT_ROLE = "final_current_recon"
 IFORWARD_HISTORY_ROLE = "final_history_replay"
@@ -46,6 +47,13 @@ class IForwardResolvedStep:
     window_revisit_count: int = 0
     block_visit_count_before: int = 0
     block_visit_count_after: int = 0
+    sequence_pos: int = -1
+    visit_kind: str = ""
+    frame_gap: int = 0
+    temporal_read: bool = True
+    temporal_commit: bool = False
+    physical_time_advance: bool = False
+    scheduler_phase: str = ""
 
 
 @dataclass(frozen=True)
@@ -321,6 +329,7 @@ class IForwardBatchResolver:
             IFORWARD_V3_SCHEDULER_VERSION,
             IFORWARD_V4_SCHEDULER_VERSION,
             IFORWARD_STAGE2_1_SCHEDULER_VERSION,
+            IFORWARD_SEQUENCE10_SCHEDULER_VERSION,
         }
         if scheduler_version not in allowed_versions:
             raise ValueError(
@@ -329,7 +338,8 @@ class IForwardBatchResolver:
         is_v3 = scheduler_version == IFORWARD_V3_SCHEDULER_VERSION
         is_v4 = scheduler_version == IFORWARD_V4_SCHEDULER_VERSION
         is_stage2_1 = scheduler_version == IFORWARD_STAGE2_1_SCHEDULER_VERSION
-        is_explicit_iforward = bool(is_v3 or is_v4 or is_stage2_1)
+        is_sequence10 = scheduler_version == IFORWARD_SEQUENCE10_SCHEDULER_VERSION
+        is_explicit_iforward = bool(is_v3 or is_v4 or is_stage2_1 or is_sequence10)
         model_family = str(ifwd.get("model_family", request_meta.get("model_family", self.expected_model_family)))
         if model_family != self.expected_model_family:
             raise ValueError(f"IForward requires model_family={self.expected_model_family!r}, got {model_family!r}.")
@@ -382,7 +392,10 @@ class IForwardBatchResolver:
                 raise ValueError("IForward v1 requires rollout-final render loss only.")
             repeat_idx = int(step.get("repeat_idx", 0))
             commit = bool(step.get("commit_observation_memory", repeat_idx == 0))
-            if commit != (repeat_idx == 0):
+            expected_commit = False if bool(is_sequence10) and str(step.get("visit_kind", "")) in {"bootstrap", "repair"} else (
+                int(repeat_idx) == 0
+            )
+            if commit != bool(expected_commit):
                 raise ValueError("IForward commit_observation_memory must be true only on repeat_idx=0.")
             rollout_block_rank = int(step.get("rollout_block_rank", 0))
             next_step = dict(steps_raw[k + 1]) if k + 1 < len(steps_raw) and isinstance(steps_raw[k + 1], Mapping) else None
@@ -395,7 +408,9 @@ class IForwardBatchResolver:
                 rollout_block_rank=int(rollout_block_rank),
                 source_frame_idx=int(source_frame_idx),
             )
-            expected_update = bool(block_clock["is_block_exit"]) if bool(is_stage2_1) else True
+            expected_update = bool(step.get("update_optimizer_memory", False)) if bool(is_sequence10) else (
+                bool(block_clock["is_block_exit"]) if bool(is_stage2_1) else True
+            )
             if bool(step.get("update_optimizer_memory", True)) != bool(expected_update):
                 if bool(is_stage2_1):
                     raise ValueError("IForward Stage2_1 update_optimizer_memory must be true only on block exit.")
@@ -458,6 +473,13 @@ class IForwardBatchResolver:
                     ),
                     block_visit_count_before=int(step.get("block_visit_count_before", 0)),
                     block_visit_count_after=int(step.get("block_visit_count_after", 0)),
+                    sequence_pos=int(step.get("sequence_pos", -1)),
+                    visit_kind=str(step.get("visit_kind", "")),
+                    frame_gap=int(step.get("frame_gap", 0)),
+                    temporal_read=bool(step.get("temporal_read", True)),
+                    temporal_commit=bool(step.get("temporal_commit", False)),
+                    physical_time_advance=bool(step.get("physical_time_advance", False)),
+                    scheduler_phase=str(step.get("scheduler_phase", "")),
                 )
             )
 

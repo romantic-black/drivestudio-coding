@@ -64,6 +64,7 @@ _EGO_MASK_MISSING = object()
 
 _EXPECTED_ASSET_COORDINATE_FRAME = "seg0_camera_opencv"
 _IFORWARD_STAGE2_1_SCHEDULER_VERSION = "iforward_stage2_1_parent_temporal"
+_IFORWARD_SEQUENCE10_SCHEDULER_VERSION = "iforward_sequence10_v1"
 
 
 @dataclass(frozen=True)
@@ -2473,11 +2474,12 @@ class MultiSceneDatasetV4:
             "iforward_v3_random_window",
             "iforward_v4_coverage_ordered",
             _IFORWARD_STAGE2_1_SCHEDULER_VERSION,
+            _IFORWARD_SEQUENCE10_SCHEDULER_VERSION,
         }:
             raise ValueError(
                 "expected IForwardRolloutPlan.scheduler_version == 'iforward_v1' "
                 "or 'iforward_v3_random_window' or 'iforward_v4_coverage_ordered' "
-                f"or '{_IFORWARD_STAGE2_1_SCHEDULER_VERSION}'"
+                f"or '{_IFORWARD_STAGE2_1_SCHEDULER_VERSION}' or '{_IFORWARD_SEQUENCE10_SCHEDULER_VERSION}'"
             )
         if int(scene_id) != int(getattr(plan, "scene_id")) or int(segment_id) != int(getattr(plan, "segment_id")):
             raise ValueError(
@@ -2491,7 +2493,11 @@ class MultiSceneDatasetV4:
         )
         target_refs_raw = [(int(ref[0]), int(ref[1])) for ref in list(getattr(plan, "target_refs_flat", []) or [])]
         target_roles_raw = [str(x) for x in list(getattr(plan, "target_roles_flat", []) or [])]
-        if plan_scheduler_version in {"iforward_v4_coverage_ordered", _IFORWARD_STAGE2_1_SCHEDULER_VERSION}:
+        if plan_scheduler_version in {
+            "iforward_v4_coverage_ordered",
+            _IFORWARD_STAGE2_1_SCHEDULER_VERSION,
+            _IFORWARD_SEQUENCE10_SCHEDULER_VERSION,
+        }:
             # V4 final eval intentionally allows one image ref to appear under
             # both rollout-supervision and eval-only roles on the last rollout.
             target_refs, target_roles = [tuple(x) for x in target_refs_raw], [str(x) for x in target_roles_raw]
@@ -2623,6 +2629,26 @@ class MultiSceneDatasetV4:
             "window_revisit_count": int(getattr(plan, "window_revisit_count", 0)),
             "unique_windows_seen": int(getattr(plan, "unique_windows_seen", 0)),
             "is_repeated_window": bool(getattr(plan, "is_repeated_window", False)),
+            "sequence_id": int(getattr(plan, "sequence_id", -1)),
+            "sequence_length": int(getattr(plan, "sequence_length", 0)),
+            "sequence_stride": int(getattr(plan, "sequence_stride", 0)),
+            "sequence_start_block_pos": int(getattr(plan, "sequence_start_block_pos", -1)),
+            "sequence_block_ids": [int(x) for x in list(getattr(plan, "sequence_block_ids", []) or [])],
+            "sequence_keyframe_indices": [int(x) for x in list(getattr(plan, "sequence_keyframe_indices", []) or [])],
+            "sequence_source_frame_indices": [
+                int(x) for x in list(getattr(plan, "sequence_source_frame_indices", []) or [])
+            ],
+            "sequence_positions": [int(x) for x in list(getattr(plan, "sequence_positions", []) or [])],
+            "history_positions": [int(x) for x in list(getattr(plan, "history_positions", []) or [])],
+            "repair_positions": [int(x) for x in list(getattr(plan, "repair_positions", []) or [])],
+            "scheduler_phase": str(getattr(plan, "scheduler_phase", "")),
+            "rollout_phase": str(getattr(plan, "rollout_phase", "")),
+            "repair_enabled": bool(getattr(plan, "repair_enabled", False)),
+            "repair_permutation_hash": int(getattr(plan, "repair_permutation_hash", -1)),
+            "temporal_read_count": int(getattr(plan, "temporal_read_count", 0)),
+            "temporal_commit_count": int(getattr(plan, "temporal_commit_count", 0)),
+            "observation_commit_count": int(getattr(plan, "observation_commit_count", 0)),
+            "optimizer_memory_update_count": int(getattr(plan, "optimizer_memory_update_count", 0)),
             "evidence_refs_flat": [tuple(x) for x in evidence_refs],
             "target_refs_flat": [tuple(x) for x in target_refs],
             "target_roles_flat": [str(x) for x in target_roles],
