@@ -362,17 +362,22 @@ class AssetPreloadManagerV2:
                 segment_id,
                 meta={"hint_scope": hint_scope},
             )
-        if hint_scope in ("next_block_exact", "v9_role_refs"):
+        if hint_scope in (
+            "next_block_exact",
+            "v9_role_refs",
+            "stage2_2_current_rollout_view_pack",
+            "stage2_2_next_rollout_view_pack",
+        ):
             if self._cfg.warm_next_block_exact:
                 for ref in refs:
                     self.submit_view_meta(PRIORITY_NEXT_BLOCK_EXACT, scene_id, segment_id, ref, meta={})
                     if self._cfg.enable_view_pack_cache:
                         self.submit_view_pack(PRIORITY_NEXT_BLOCK_EXACT, scene_id, segment_id, ref, meta={})
-        elif hint_scope == "episode_source_superset":
+        elif hint_scope in ("episode_source_superset", "stage2_2_remaining_episode_view_meta"):
             if self._cfg.warm_episode_source_superset:
                 for ref in refs:
                     self.submit_view_meta(PRIORITY_EPISODE_SUPERSET, scene_id, segment_id, ref, meta={})
-        elif hint_scope == "episode_chain_exact":
+        elif hint_scope in ("episode_chain_exact", "stage2_2_next_episode_segment_static"):
             if self._cfg.warm_episode_chain_exact:
                 for ref in refs:
                     self.submit_view_meta(PRIORITY_EPISODE_SUPERSET, scene_id, segment_id, ref, meta={})

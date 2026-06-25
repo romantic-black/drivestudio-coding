@@ -7,6 +7,7 @@ from datasets.train_scheduler_iforward_sequence10 import (
     IFORWARD_SEQUENCE10_SCHEDULER_VERSION,
     TrainSchedulerIForwardSequence10,
 )
+from datasets.iforward_stage2_2.scheduler import IFORWARD_STAGE2_2_SCHEDULER_VERSION, Stage22Scheduler
 
 
 def _cfg_get(node: Any, key: str, default: Any = None) -> Any:
@@ -30,6 +31,12 @@ def _null_int(x: Any) -> Optional[int]:
 
 
 def resolve_fixed_scene_segment_iforward(cfg: Any) -> Tuple[Optional[int], Optional[int]]:
+    sched22 = cfg.get("scheduler_stage2_2") if hasattr(cfg, "get") else None
+    if sched22 is not None and bool(_cfg_get(sched22, "enable", False)):
+        traversal22 = _cfg_get(sched22, "traversal", {}) or {}
+        return _null_int(_cfg_get(traversal22, "fixed_scene_id", None)), _null_int(
+            _cfg_get(traversal22, "fixed_segment_id", None)
+        )
     sched = cfg.get("scheduler_iforward") if hasattr(cfg, "get") else None
     traversal = (_cfg_get(sched, "traversal", {}) or {}) if sched is not None else {}
     return _null_int(_cfg_get(traversal, "fixed_scene_id", None)), _null_int(
@@ -40,7 +47,45 @@ def resolve_fixed_scene_segment_iforward(cfg: Any) -> Tuple[Optional[int], Optio
 def build_train_scheduler_iforward_from_cfg(
     cfg: Any,
     dataset: Any,
-) -> TrainSchedulerIForward | TrainSchedulerIForwardSequence10:
+) -> TrainSchedulerIForward | TrainSchedulerIForwardSequence10 | Stage22Scheduler:
+    sched22 = cfg.get("scheduler_stage2_2") if hasattr(cfg, "get") else None
+    if sched22 is not None and bool(_cfg_get(sched22, "enable", False)):
+        legacy = cfg.get("scheduler_iforward") if hasattr(cfg, "get") else None
+        if legacy is not None and bool(_cfg_get(legacy, "enable", False)):
+            raise ValueError("scheduler_stage2_2 forbids enabled legacy scheduler_iforward")
+        version22 = str(_cfg_get(sched22, "version", IFORWARD_STAGE2_2_SCHEDULER_VERSION))
+        if version22 != IFORWARD_STAGE2_2_SCHEDULER_VERSION:
+            raise ValueError(
+                f"scheduler_stage2_2.version must be {IFORWARD_STAGE2_2_SCHEDULER_VERSION}, got {version22!r}"
+            )
+        index_dir = str(_cfg_get(sched22, "index_dir", "") or "")
+        if not index_dir:
+            raise ValueError("scheduler_stage2_2.index_dir is required; build it with tools/build_iforward_stage2_2_index.py")
+        fixed_scene_id, fixed_segment_id = resolve_fixed_scene_segment_iforward(cfg)
+        from tools.train_minimal_streetforward_stage4_3_v7_common import (
+            parse_include_test,
+            validate_train_scene_for_fixed,
+        )
+
+        validate_train_scene_for_fixed(cfg, fixed_scene_id)
+        include_test = parse_include_test(cfg)
+        return Stage22Scheduler(
+            dataset=dataset,
+            cfg=cfg,
+            index_dir=index_dir,
+            traversal_cfg=dict(_cfg_get(sched22, "traversal", {}) or {}),
+            bootstrap_cfg=dict(_cfg_get(sched22, "bootstrap", {}) or {}),
+            protocol_cfg=dict(_cfg_get(sched22, "protocol", {}) or {}),
+            causal_cfg=dict(_cfg_get(sched22, "causal", {}) or {}),
+            repair_cfg=dict(_cfg_get(sched22, "repair", {}) or {}),
+            supervision_cfg=dict(_cfg_get(sched22, "supervision", {}) or {}),
+            preload_cfg=dict(_cfg_get(sched22, "preload", {}) or {}),
+            include_test=bool(include_test),
+            fixed_scene_id=fixed_scene_id,
+            fixed_segment_id=fixed_segment_id,
+            seed=_cfg_get(_cfg_get(sched22, "traversal", {}) or {}, "seed", None),
+            fail_fast=bool(_cfg_get(sched22, "fail_fast", True)),
+        )
     sched = cfg.get("scheduler_iforward") if hasattr(cfg, "get") else None
     if sched is None:
         raise ValueError("config must define scheduler_iforward")

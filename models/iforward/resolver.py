@@ -12,6 +12,7 @@ IFORWARD_V3_SCHEDULER_VERSION = "iforward_v3_random_window"
 IFORWARD_V4_SCHEDULER_VERSION = "iforward_v4_coverage_ordered"
 IFORWARD_STAGE2_1_SCHEDULER_VERSION = "iforward_stage2_1_parent_temporal"
 IFORWARD_SEQUENCE10_SCHEDULER_VERSION = "iforward_sequence10_v1"
+IFORWARD_STAGE2_2_SCHEDULER_VERSION = "iforward_stage2_2_stream10_rawframe"
 IFORWARD_MODEL_FAMILY = "IForward"
 IFORWARD_CURRENT_ROLE = "final_current_recon"
 IFORWARD_HISTORY_ROLE = "final_history_replay"
@@ -54,6 +55,13 @@ class IForwardResolvedStep:
     temporal_commit: bool = False
     physical_time_advance: bool = False
     scheduler_phase: str = ""
+    timestamp_us: int = 0
+    timestamp_sec: float = 0.0
+    delta_t_sec: float = 0.0
+    ego_delta_translation: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    ego_delta_yaw: float = 0.0
+    visit_memory_mask: bool = True
+    repair_no_commit: bool = False
 
 
 @dataclass(frozen=True)
@@ -330,6 +338,7 @@ class IForwardBatchResolver:
             IFORWARD_V4_SCHEDULER_VERSION,
             IFORWARD_STAGE2_1_SCHEDULER_VERSION,
             IFORWARD_SEQUENCE10_SCHEDULER_VERSION,
+            IFORWARD_STAGE2_2_SCHEDULER_VERSION,
         }
         if scheduler_version not in allowed_versions:
             raise ValueError(
@@ -338,8 +347,9 @@ class IForwardBatchResolver:
         is_v3 = scheduler_version == IFORWARD_V3_SCHEDULER_VERSION
         is_v4 = scheduler_version == IFORWARD_V4_SCHEDULER_VERSION
         is_stage2_1 = scheduler_version == IFORWARD_STAGE2_1_SCHEDULER_VERSION
+        is_stage2_2 = scheduler_version == IFORWARD_STAGE2_2_SCHEDULER_VERSION
         is_sequence10 = scheduler_version == IFORWARD_SEQUENCE10_SCHEDULER_VERSION
-        is_explicit_iforward = bool(is_v3 or is_v4 or is_stage2_1 or is_sequence10)
+        is_explicit_iforward = bool(is_v3 or is_v4 or is_stage2_1 or is_stage2_2 or is_sequence10)
         model_family = str(ifwd.get("model_family", request_meta.get("model_family", self.expected_model_family)))
         if model_family != self.expected_model_family:
             raise ValueError(f"IForward requires model_family={self.expected_model_family!r}, got {model_family!r}.")
@@ -392,7 +402,8 @@ class IForwardBatchResolver:
                 raise ValueError("IForward v1 requires rollout-final render loss only.")
             repeat_idx = int(step.get("repeat_idx", 0))
             commit = bool(step.get("commit_observation_memory", repeat_idx == 0))
-            expected_commit = False if bool(is_sequence10) and str(step.get("visit_kind", "")) in {"bootstrap", "repair"} else (
+            no_commit_visit = str(step.get("visit_kind", "")) in {"bootstrap", "repair", "stress"}
+            expected_commit = False if bool(is_sequence10 or is_stage2_2) and bool(no_commit_visit) else (
                 int(repeat_idx) == 0
             )
             if commit != bool(expected_commit):
@@ -408,12 +419,15 @@ class IForwardBatchResolver:
                 rollout_block_rank=int(rollout_block_rank),
                 source_frame_idx=int(source_frame_idx),
             )
-            expected_update = bool(step.get("update_optimizer_memory", False)) if bool(is_sequence10) else (
-                bool(block_clock["is_block_exit"]) if bool(is_stage2_1) else True
-            )
+            if bool(is_sequence10):
+                expected_update = bool(step.get("update_optimizer_memory", False))
+            elif bool(is_stage2_2) and bool(no_commit_visit):
+                expected_update = False
+            else:
+                expected_update = bool(block_clock["is_block_exit"]) if bool(is_stage2_1 or is_stage2_2) else True
             if bool(step.get("update_optimizer_memory", True)) != bool(expected_update):
-                if bool(is_stage2_1):
-                    raise ValueError("IForward Stage2_1 update_optimizer_memory must be true only on block exit.")
+                if bool(is_stage2_1 or is_stage2_2):
+                    raise ValueError("IForward Stage2 update_optimizer_memory must be true only on block exit.")
                 raise ValueError("IForward update_optimizer_memory must be true for every repeat.")
             is_frame_exit = bool(step.get("is_frame_exit", block_clock["is_block_exit"]))
             episode_visit_idx = int(step.get("episode_visit_idx", -1))
@@ -480,6 +494,18 @@ class IForwardBatchResolver:
                     temporal_commit=bool(step.get("temporal_commit", False)),
                     physical_time_advance=bool(step.get("physical_time_advance", False)),
                     scheduler_phase=str(step.get("scheduler_phase", "")),
+                    timestamp_us=int(step.get("timestamp_us", 0)),
+                    timestamp_sec=float(step.get("timestamp_sec", float(step.get("timestamp_us", 0)) / 1.0e6)),
+                    delta_t_sec=float(step.get("delta_t_sec", 0.0)),
+                    ego_delta_translation=tuple(
+                        float(x)
+                        for x in (
+                            list(step.get("ego_delta_translation", (0.0, 0.0, 0.0))) + [0.0, 0.0, 0.0]
+                        )[:3]
+                    ),
+                    ego_delta_yaw=float(step.get("ego_delta_yaw", 0.0)),
+                    visit_memory_mask=bool(step.get("visit_memory_mask", True)),
+                    repair_no_commit=bool(step.get("repair_no_commit", False)),
                 )
             )
 

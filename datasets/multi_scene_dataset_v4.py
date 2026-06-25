@@ -65,6 +65,7 @@ _EGO_MASK_MISSING = object()
 _EXPECTED_ASSET_COORDINATE_FRAME = "seg0_camera_opencv"
 _IFORWARD_STAGE2_1_SCHEDULER_VERSION = "iforward_stage2_1_parent_temporal"
 _IFORWARD_SEQUENCE10_SCHEDULER_VERSION = "iforward_sequence10_v1"
+_IFORWARD_STAGE2_2_SCHEDULER_VERSION = "iforward_stage2_2_stream10_rawframe"
 
 
 @dataclass(frozen=True)
@@ -82,6 +83,7 @@ class SegmentIndexV4:
     segment_first_frame_idx: int
     train_image_refs: Tuple[ImageRef, ...]
     test_image_refs: Tuple[ImageRef, ...]
+    frame_timestamps_us: Dict[int, int] = dataclasses.field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1487,6 +1489,20 @@ class MultiSceneDatasetV4:
             for x in np.asarray(payload["test_image_refs"]).tolist()
             if int(x[1]) in active_cam_ids
         )
+        raw_timestamps = (
+            payload.get("frame_timestamps_us")
+            or payload.get("timestamps_us")
+            or payload.get("frame_timestamps")
+            or payload.get("timestamps")
+            or []
+        )
+        frame_timestamps_us: Dict[int, int] = {}
+        if isinstance(raw_timestamps, dict):
+            frame_timestamps_us = {int(k): int(v) for k, v in raw_timestamps.items()}
+        else:
+            ts_list = [int(x) for x in list(raw_timestamps or [])]
+            if len(ts_list) == len(train_frames):
+                frame_timestamps_us = {int(f): int(ts) for f, ts in zip(train_frames, ts_list)}
         return SegmentIndexV4(
             scene_id=int(payload["scene_id"]),
             segment_id=int(payload["segment_id"]),
@@ -1501,6 +1517,7 @@ class MultiSceneDatasetV4:
             segment_first_frame_idx=int(payload["segment_first_frame_idx"]),
             train_image_refs=train_refs,
             test_image_refs=test_refs,
+            frame_timestamps_us=frame_timestamps_us,
         )
 
     def _cache_segment_index(
@@ -2475,11 +2492,13 @@ class MultiSceneDatasetV4:
             "iforward_v4_coverage_ordered",
             _IFORWARD_STAGE2_1_SCHEDULER_VERSION,
             _IFORWARD_SEQUENCE10_SCHEDULER_VERSION,
+            _IFORWARD_STAGE2_2_SCHEDULER_VERSION,
         }:
             raise ValueError(
                 "expected IForwardRolloutPlan.scheduler_version == 'iforward_v1' "
                 "or 'iforward_v3_random_window' or 'iforward_v4_coverage_ordered' "
-                f"or '{_IFORWARD_STAGE2_1_SCHEDULER_VERSION}' or '{_IFORWARD_SEQUENCE10_SCHEDULER_VERSION}'"
+                f"or '{_IFORWARD_STAGE2_1_SCHEDULER_VERSION}' or '{_IFORWARD_SEQUENCE10_SCHEDULER_VERSION}' "
+                f"or '{_IFORWARD_STAGE2_2_SCHEDULER_VERSION}'"
             )
         if int(scene_id) != int(getattr(plan, "scene_id")) or int(segment_id) != int(getattr(plan, "segment_id")):
             raise ValueError(
@@ -2497,6 +2516,7 @@ class MultiSceneDatasetV4:
             "iforward_v4_coverage_ordered",
             _IFORWARD_STAGE2_1_SCHEDULER_VERSION,
             _IFORWARD_SEQUENCE10_SCHEDULER_VERSION,
+            _IFORWARD_STAGE2_2_SCHEDULER_VERSION,
         }:
             # V4 final eval intentionally allows one image ref to appear under
             # both rollout-supervision and eval-only roles on the last rollout.
@@ -2701,6 +2721,26 @@ class MultiSceneDatasetV4:
             "target_ref_to_index": dict(target_ref_to_index),
         }
         return batch
+
+    def _assemble_segment_batch_from_iforward_stage2_2_request(
+        self,
+        *,
+        scene_id: int,
+        segment_id: int,
+        plan: Any,
+        include_test: bool = False,
+    ) -> Dict[str, Any]:
+        if str(getattr(plan, "scheduler_version", "")) != _IFORWARD_STAGE2_2_SCHEDULER_VERSION:
+            raise ValueError(
+                "expected Stage2_2 plan.scheduler_version == "
+                f"{_IFORWARD_STAGE2_2_SCHEDULER_VERSION!r}"
+            )
+        return self._assemble_segment_batch_from_iforward_request(
+            scene_id=int(scene_id),
+            segment_id=int(segment_id),
+            plan=plan,
+            include_test=bool(include_test),
+        )
 
     def _assemble_segment_batch_from_iforward_random_window_request(
         self,

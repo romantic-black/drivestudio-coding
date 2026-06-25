@@ -397,6 +397,72 @@ def _build_iforward_scheduler_row(
                 ),
             }
         )
+    if str(row.get("scheduler_version", "")) == "iforward_stage2_2_stream10_rawframe":
+        row.update(
+            {
+                "scheduler_phase": str(
+                    result.get("iforward/stage2_2/phase", scheduler_info.get("scheduler_phase", ""))
+                ),
+                "rollout_phase": str(
+                    result.get("iforward/stage2_2/rollout_phase", scheduler_info.get("rollout_phase", ""))
+                ),
+                "stage2_2_protocol": str(
+                    result.get("iforward/stage2_2/protocol", scheduler_info.get("sequence_protocol", ""))
+                ),
+                "sequence_id": _metric_int(
+                    result.get("iforward/stage2_2/sequence_id", scheduler_info.get("sequence_id", -1))
+                ),
+                "sequence_length": _metric_int(scheduler_info.get("sequence_length", 10), 10),
+                "actual_blocks_per_rollout": _metric_int(
+                    scheduler_info.get("actual_blocks_per_rollout", row.get("blocks_per_rollout", -1))
+                ),
+                "sequence_positions": _metric_list_int(
+                    result.get("iforward/stage2_2/positions", scheduler_info.get("sequence_positions"))
+                ),
+                "stage2_2_raw_frame_ids": _metric_list_int(
+                    result.get("iforward/stage2_2/raw_frame_ids", scheduler_info.get("sequence_source_frame_indices"))
+                ),
+                "stage2_2_timestamps_us": _metric_list_int(
+                    result.get("iforward/stage2_2/timestamps_us", scheduler_info.get("sequence_timestamps_us"))
+                ),
+                "stage2_2_frame_gaps": _metric_list_int(
+                    result.get("iforward/stage2_2/frame_gaps", scheduler_info.get("iforward/stage2_2/frame_gaps"))
+                ),
+                "stage2_2_keyframe_ids": _metric_list_int(
+                    result.get("iforward/stage2_2/keyframe_ids", scheduler_info.get("sequence_keyframe_indices"))
+                ),
+                "history_positions": _metric_list_int(
+                    result.get("iforward/stage2_2/history_positions", scheduler_info.get("history_positions"))
+                ),
+                "repair_positions": _metric_list_int(
+                    result.get("iforward/stage2_2/repair_positions", scheduler_info.get("repair_positions"))
+                ),
+                "repair_hash": _metric_int(
+                    result.get("iforward/stage2_2/repair_hash", scheduler_info.get("repair_permutation_hash", -1))
+                ),
+                "repair_flag": _metric_bool(
+                    result.get(
+                        "iforward/stage2_2/repair_flag",
+                        str(scheduler_info.get("scheduler_phase", "")) == "repair",
+                    )
+                ),
+                "temporal_commit_count": _metric_int(
+                    result.get("iforward/stage2_2/temporal_commit_count", scheduler_info.get("temporal_commit_count", 0))
+                ),
+                "temporal_read_count": _metric_int(
+                    result.get("iforward/stage2_2/temporal_read_count", scheduler_info.get("temporal_read_count", 0))
+                ),
+                "history_frame_count": _metric_int(
+                    result.get("iforward/stage2_2/history_frame_count", len(scheduler_info.get("history_positions", []) or []))
+                ),
+                "history_ref_count": _metric_int(
+                    result.get("iforward/stage2_2/history_ref_count", scheduler_info.get("history_ref_count", 0))
+                ),
+                "index_fingerprint": str(
+                    result.get("iforward/stage2_2/index_fingerprint", scheduler_info.get("index_fingerprint", ""))
+                ),
+            }
+        )
     return row
 
 
@@ -2785,6 +2851,12 @@ def main() -> None:
                 scheduler_info = scheduler.get_current_info()
 
             step_events = scheduler.pop_events()
+            for ev in step_events:
+                if str(ev.get("type", "")) == "iforward_stage2_2_eligibility":
+                    row = {k: v for k, v in dict(ev).items() if k != "type"}
+                    row["step"] = int(step)
+                    row["split"] = "iforward_stage2_2_eligibility"
+                    _write_metrics_history(metrics_fh, row)
             validation_due_episode_counters: List[int] = []
             hook_due_episode_counters: List[int] = []
             for ev in step_events:
@@ -3044,6 +3116,10 @@ def main() -> None:
                     str(result.get("iforward/scheduler_version", scheduler_info.get("scheduler_version", "")))
                     == "iforward_sequence10_v1"
                 )
+                is_stage2_2_step = (
+                    str(result.get("iforward/scheduler_version", scheduler_info.get("scheduler_version", "")))
+                    == "iforward_stage2_2_stream10_rawframe"
+                )
                 sequence10_rollout_idx = int(
                     result.get("iforward/rollout_idx_in_episode", scheduler_info.get("rollout_idx_in_episode", -1))
                     or -1
@@ -3064,6 +3140,19 @@ def main() -> None:
                         force_sequence10_scheduler_metrics = bool(sequence10_repair) or bool(sequence10_episode_end)
                     elif sequence10_force_scheduler_metrics == "episode_end":
                         force_sequence10_scheduler_metrics = bool(sequence10_episode_end)
+                if is_stage2_2_step:
+                    stage2_2_phase = str(
+                        result.get("iforward/stage2_2/phase", scheduler_info.get("scheduler_phase", ""))
+                    )
+                    stage2_2_rollout_idx = int(
+                        result.get("iforward/rollout_idx_in_episode", scheduler_info.get("rollout_idx_in_episode", -1))
+                        or -1
+                    )
+                    force_sequence10_scheduler_metrics = bool(
+                        stage2_2_phase == "repair"
+                        or bool(sequence10_episode_end)
+                        or stage2_2_rollout_idx in {0, 4}
+                    )
                 should_write_scheduler_metrics = (
                     bool(scheduler_metrics_interval > 0 and step % int(scheduler_metrics_interval) == 0)
                     or bool(force_sequence10_scheduler_metrics)

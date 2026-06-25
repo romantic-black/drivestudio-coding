@@ -95,13 +95,19 @@ class IForwardTrainer(nn.Module):
             "stage2_0_biggs_grld_dinov2base_concat48",
             "stage2_0_fwhr_lift_grld_dinov2base",
             "stage2_1_fwhr_parent_ptv3_temporal_mamba",
+            "stage2_2_stream10_rawframe_temporal_mamba_v2",
         }
 
     def _is_stage2_1_parent_temporal(self) -> bool:
-        if bool(getattr(self.model, "is_stage2_1_parent_temporal", False)):
+        if bool(getattr(self.model, "is_stage2_1_parent_temporal", False)) or bool(
+            getattr(self.model, "is_stage2_2_parent_temporal", False)
+        ):
             return True
         iforward_cfg = cfg_get(cfg_get(self.config, "model", {}) or {}, "iforward", {}) or {}
-        return str(cfg_get(iforward_cfg, "version", "")) == "stage2_1_fwhr_parent_ptv3_temporal_mamba"
+        return str(cfg_get(iforward_cfg, "version", "")) in {
+            "stage2_1_fwhr_parent_ptv3_temporal_mamba",
+            "stage2_2_stream10_rawframe_temporal_mamba_v2",
+        }
 
     def _is_v3_gru_history_gate(self) -> bool:
         if bool(getattr(self.model, "is_v3_gru_history_gate", False)):
@@ -831,6 +837,51 @@ class IForwardTrainer(nn.Module):
                 sum(1 for step in out.resolved.steps if bool(getattr(step, "temporal_read", False)))
             )
             final["iforward/sequence10/history_frame_count"] = int(len(list(meta.get("history_positions", []) or [])))
+        if str(out.resolved.scheduler_version) == "iforward_stage2_2_stream10_rawframe":
+            meta = dict(getattr(out.resolved, "meta", {}) or {})
+            stage22_request_meta = dict((dict(meta.get("request_meta", {}) or {})).get("iforward_stage2_2", {}) or {})
+            sequence_positions = [int(x) for x in list(meta.get("sequence_positions", []) or [])]
+            sequence_keyframes = [int(x) for x in list(meta.get("sequence_keyframe_indices", []) or [])]
+            sequence_frames = [
+                int(x)
+                for x in list(meta.get("sequence_source_frame_indices", stage22_request_meta.get("raw_frame_ids", [])) or [])
+            ]
+            timestamps = [
+                int(x)
+                for x in list(meta.get("sequence_timestamps_us", stage22_request_meta.get("timestamps_us", [])) or [])
+            ]
+            repair_positions = [int(x) for x in list(meta.get("repair_positions", []) or [])]
+            final["iforward/stage2_2/protocol"] = str(meta.get("sequence_protocol", ""))
+            final["iforward/stage2_2/phase"] = str(meta.get("scheduler_phase", ""))
+            final["iforward/stage2_2/rollout_phase"] = str(meta.get("rollout_phase", ""))
+            final["iforward/stage2_2/sequence_id"] = int(meta.get("sequence_id", -1) or -1)
+            final["iforward/stage2_2/positions"] = sequence_positions
+            final["iforward/stage2_2/keyframe_ids"] = sequence_keyframes
+            final["iforward/stage2_2/raw_frame_ids"] = sequence_frames
+            final["iforward/stage2_2/timestamps_us"] = timestamps
+            final["iforward/stage2_2/frame_gaps"] = [
+                int(getattr(step, "frame_gap", 0)) for step in out.resolved.steps if int(getattr(step, "repeat_idx", 0)) == 0
+            ]
+            final["iforward/stage2_2/history_positions"] = [
+                int(x) for x in list(meta.get("history_positions", []) or [])
+            ]
+            final["iforward/stage2_2/repair_positions"] = repair_positions
+            final["iforward/stage2_2/repair_hash"] = int(meta.get("repair_permutation_hash", -1) or -1)
+            final["iforward/stage2_2/repair_flag"] = bool(str(meta.get("scheduler_phase", "")) == "repair")
+            final["iforward/stage2_2/index_fingerprint"] = str(
+                meta.get("index_fingerprint", stage22_request_meta.get("index_fingerprint", ""))
+            )
+            final["iforward/stage2_2/temporal_commit_count"] = int(
+                sum(1 for step in out.resolved.steps if bool(getattr(step, "temporal_commit", False)))
+            )
+            final["iforward/stage2_2/temporal_read_count"] = int(
+                sum(1 for step in out.resolved.steps if bool(getattr(step, "temporal_read", False)))
+            )
+            final["iforward/stage2_2/history_frame_count"] = int(len(list(meta.get("history_positions", []) or [])))
+            final_supervision = dict(meta.get("final_supervision", {}) or {})
+            final["iforward/stage2_2/history_ref_count"] = int(
+                final_supervision.get("history_ref_count", meta.get("history_ref_count", 0)) or 0
+            )
         for name, value in timings.items():
             final[name] = float(value)
         for prefix, values in (

@@ -372,6 +372,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "stage2_0_biggs_grld_dinov2base_concat48",
             "stage2_0_fwhr_lift_grld_dinov2base",
             "stage2_1_fwhr_parent_ptv3_temporal_mamba",
+            "stage2_2_stream10_rawframe_temporal_mamba_v2",
         }
         if bool(biggs_enabled):
             if bool(self._cfg_get(biggs_cfg, "enable", True)) is not True:
@@ -405,7 +406,10 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             raise ValueError("Stage6_0 Phase A requires base_measurement.type=stage5_4_v4.")
         if bool(self._cfg_get(base_measurement, "require_fused_v4", True)) is not True:
             raise ValueError("Stage6_0 Phase A requires fused V4; fallback is forbidden.")
-        is_stage2_1_parent_temporal = ifwd_version == "stage2_1_fwhr_parent_ptv3_temporal_mamba"
+        is_stage2_1_parent_temporal = ifwd_version in {
+            "stage2_1_fwhr_parent_ptv3_temporal_mamba",
+            "stage2_2_stream10_rawframe_temporal_mamba_v2",
+        }
         if bool(self._cfg_get(base_measurement, "require_obs_code", True)) is not True and not is_stage2_1_parent_temporal:
             raise ValueError("Stage6_0 Phase A requires V4 obs_code.")
         expected_obs_dim = 0 if is_stage2_1_parent_temporal else 2
@@ -898,6 +902,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 "stage2_0_biggs_grld_dinov2base_concat48",
                 "stage2_0_fwhr_lift_grld_dinov2base",
                 "stage2_1_fwhr_parent_ptv3_temporal_mamba",
+                "stage2_2_stream10_rawframe_temporal_mamba_v2",
             }
             and bool(self._cfg_get(biggs_cfg, "enable", True))
         )
@@ -1102,8 +1107,12 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "stage2_0_biggs_grld_dinov2base_concat48",
             "stage2_0_fwhr_lift_grld_dinov2base",
             "stage2_1_fwhr_parent_ptv3_temporal_mamba",
+            "stage2_2_stream10_rawframe_temporal_mamba_v2",
         }
-        self.stage2_1_parent_temporal_enabled = ifwd_version == "stage2_1_fwhr_parent_ptv3_temporal_mamba"
+        self.stage2_1_parent_temporal_enabled = ifwd_version in {
+            "stage2_1_fwhr_parent_ptv3_temporal_mamba",
+            "stage2_2_stream10_rawframe_temporal_mamba_v2",
+        }
         self.stage2_0_biggs_cfg = dict(biggs_cfg or {})
         self.stage2_0_biggs_assignment_cfg = self._cfg_get(biggs_cfg, "assignment", {}) or {}
         self.stage2_0_biggs_projector_cfg = self._cfg_get(biggs_cfg, "parent_projector", {}) or {}

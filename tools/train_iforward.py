@@ -25,6 +25,11 @@ from datasets.iforward_sequence10_validation import (
     build_sequence10_manifest,
     write_sequence10_manifest,
 )
+from datasets.iforward_stage2_2.validation_runner import (
+    run_stage2_2_validation,
+    run_stage2_2_validation_manifest_only,
+    stage2_2_validation_cfg,
+)
 from datasets.train_scheduler_iforward import TrainSchedulerIForward
 from datasets.train_scheduler_iforward_sequence10 import TrainSchedulerIForwardSequence10
 from models.iforward import IForwardTrainer
@@ -74,15 +79,17 @@ def _route_random_window_entrypoint_if_needed(default_config: str) -> bool:
     cfg = OmegaConf.load(config_file)
     random_cfg = _cfg_get(cfg, "scheduler_iforward_random_window", None)
     legacy_cfg = _cfg_get(cfg, "scheduler_iforward", None)
+    stage22_cfg = _cfg_get(cfg, "scheduler_stage2_2", None)
     random_enabled = random_cfg is not None and bool(_cfg_get(random_cfg, "enable", True))
+    stage22_enabled = stage22_cfg is not None and bool(_cfg_get(stage22_cfg, "enable", False))
     if random_enabled and legacy_cfg is None:
         from tools import train_iforward_random_window
 
         train_iforward_random_window.main()
         return True
-    if legacy_cfg is None:
+    if legacy_cfg is None and not stage22_enabled:
         raise ValueError(
-            "tools/train_iforward.py requires legacy scheduler_iforward. "
+            "tools/train_iforward.py requires scheduler_iforward or scheduler_stage2_2. "
             "For scheduler_iforward_random_window configs, use tools/train_iforward_random_window.py."
         )
     return False
@@ -169,6 +176,11 @@ def _iforward_sequence10_validation_cfg(cfg: Any) -> Dict[str, Any]:
 def _is_sequence10_scheduler_cfg(cfg: Any) -> bool:
     sched = _cfg_get(cfg, "scheduler_iforward", {}) or {}
     return str(_cfg_get(sched, "version", "")) == "iforward_sequence10_v1"
+
+
+def _is_stage2_2_scheduler_cfg(cfg: Any) -> bool:
+    sched = _cfg_get(cfg, "scheduler_stage2_2", {}) or {}
+    return bool(_cfg_get(sched, "enable", False))
 
 
 def _max_inner_k_from_shapes(shapes: Sequence[Dict[str, Any]]) -> int:
@@ -1228,6 +1240,38 @@ def _write_iforward_validation_rows(
 
 def _iforward_train_start_hook(**kwargs: Any) -> None:
     cfg = kwargs["cfg"]
+    if _is_stage2_2_scheduler_cfg(cfg):
+        val_cfg = stage2_2_validation_cfg(cfg)
+        if bool(val_cfg["enable"]) and bool(val_cfg["run_at_train_start"]):
+            metrics_fh = kwargs.get("metrics_fh", None)
+            if kwargs.get("model", None) is not None and kwargs.get("dataset", None) is not None:
+                rows = run_stage2_2_validation(
+                    cfg=cfg,
+                    dataset=kwargs["dataset"],
+                    model=kwargs["model"],
+                    device=kwargs.get("device", torch.device("cpu")),
+                    trigger_step=int(kwargs.get("trigger_step", 0)),
+                    modes=list(val_cfg.get("modes", ["full"])),
+                    convert_batch_to_minimal_format=_sequence10_minimal_from_scheduler_batch,
+                )
+                for row in rows:
+                    if metrics_fh is not None:
+                        base._write_metrics_history(metrics_fh, row)
+                entries = rows
+            else:
+                entries = run_stage2_2_validation_manifest_only(cfg=cfg)
+            if metrics_fh is not None:
+                base._write_metrics_history(
+                    metrics_fh,
+                    {
+                        "step": int(kwargs.get("trigger_step", 0)),
+                        "split": "iforward_stage2_2_validation_global",
+                        "num_entries": int(len(entries)),
+                        "protocols": sorted({str(e.get("protocol", "")) for e in entries}),
+                        "status": "completed" if entries else "empty",
+                    },
+                )
+        return
     if _is_sequence10_scheduler_cfg(cfg):
         val_cfg = _iforward_sequence10_validation_cfg(cfg)
         if bool(val_cfg["enable"]) and bool(val_cfg["run_at_train_start"]):
@@ -1246,6 +1290,36 @@ def _iforward_train_start_hook(**kwargs: Any) -> None:
 
 def _iforward_step_end_hook(**kwargs: Any) -> None:
     cfg = kwargs["cfg"]
+    if _is_stage2_2_scheduler_cfg(cfg):
+        val_cfg = stage2_2_validation_cfg(cfg)
+        interval = int(val_cfg["interval_steps"])
+        step = int(kwargs.get("trigger_step", 0))
+        if bool(val_cfg["enable"]) and interval > 0 and step >= 0 and (step + 1) % int(interval) == 0:
+            metrics_fh = kwargs.get("metrics_fh", None)
+            rows = run_stage2_2_validation(
+                cfg=cfg,
+                dataset=kwargs["dataset"],
+                model=kwargs["model"],
+                device=kwargs.get("device", torch.device("cpu")),
+                trigger_step=int(step),
+                modes=list(val_cfg.get("modes", ["full"])),
+                convert_batch_to_minimal_format=_sequence10_minimal_from_scheduler_batch,
+            )
+            for row in rows:
+                if metrics_fh is not None:
+                    base._write_metrics_history(metrics_fh, row)
+            if metrics_fh is not None:
+                base._write_metrics_history(
+                    metrics_fh,
+                    {
+                        "step": int(step),
+                        "split": "iforward_stage2_2_validation_global",
+                        "num_entries": int(len(rows)),
+                        "protocols": sorted({str(e.get("protocol", "")) for e in rows}),
+                        "status": "completed" if rows else "empty",
+                    },
+                )
+        return
     if _is_sequence10_scheduler_cfg(cfg):
         val_cfg = _iforward_sequence10_validation_cfg(cfg)
         interval = int(val_cfg["interval_steps"])
