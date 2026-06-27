@@ -66,6 +66,7 @@ _EXPECTED_ASSET_COORDINATE_FRAME = "seg0_camera_opencv"
 _IFORWARD_STAGE2_1_SCHEDULER_VERSION = "iforward_stage2_1_parent_temporal"
 _IFORWARD_SEQUENCE10_SCHEDULER_VERSION = "iforward_sequence10_v1"
 _IFORWARD_STAGE2_2_SCHEDULER_VERSION = "iforward_stage2_2_stream10_rawframe"
+_IFORWARD_STAGE2_3_SCHEDULER_VERSION = "iforward_2_3_scheduler_v3_optimizer_mamba"
 
 
 @dataclass(frozen=True)
@@ -2493,12 +2494,13 @@ class MultiSceneDatasetV4:
             _IFORWARD_STAGE2_1_SCHEDULER_VERSION,
             _IFORWARD_SEQUENCE10_SCHEDULER_VERSION,
             _IFORWARD_STAGE2_2_SCHEDULER_VERSION,
+            _IFORWARD_STAGE2_3_SCHEDULER_VERSION,
         }:
             raise ValueError(
                 "expected IForwardRolloutPlan.scheduler_version == 'iforward_v1' "
                 "or 'iforward_v3_random_window' or 'iforward_v4_coverage_ordered' "
                 f"or '{_IFORWARD_STAGE2_1_SCHEDULER_VERSION}' or '{_IFORWARD_SEQUENCE10_SCHEDULER_VERSION}' "
-                f"or '{_IFORWARD_STAGE2_2_SCHEDULER_VERSION}'"
+                f"or '{_IFORWARD_STAGE2_2_SCHEDULER_VERSION}' or '{_IFORWARD_STAGE2_3_SCHEDULER_VERSION}'"
             )
         if int(scene_id) != int(getattr(plan, "scene_id")) or int(segment_id) != int(getattr(plan, "segment_id")):
             raise ValueError(
@@ -2517,6 +2519,7 @@ class MultiSceneDatasetV4:
             _IFORWARD_STAGE2_1_SCHEDULER_VERSION,
             _IFORWARD_SEQUENCE10_SCHEDULER_VERSION,
             _IFORWARD_STAGE2_2_SCHEDULER_VERSION,
+            _IFORWARD_STAGE2_3_SCHEDULER_VERSION,
         }:
             # V4 final eval intentionally allows one image ref to appear under
             # both rollout-supervision and eval-only roles on the last rollout.
@@ -2659,14 +2662,23 @@ class MultiSceneDatasetV4:
                 int(x) for x in list(getattr(plan, "sequence_source_frame_indices", []) or [])
             ],
             "sequence_positions": [int(x) for x in list(getattr(plan, "sequence_positions", []) or [])],
+            "episode_positions": [int(x) for x in list(getattr(plan, "episode_positions", []) or [])],
+            "rollout_positions": [int(x) for x in list(getattr(plan, "rollout_positions", []) or [])],
             "history_positions": [int(x) for x in list(getattr(plan, "history_positions", []) or [])],
             "repair_positions": [int(x) for x in list(getattr(plan, "repair_positions", []) or [])],
+            "repeat_budgets": [int(x) for x in list(getattr(plan, "repeat_budgets", []) or [])],
+            "frame_gaps": [int(x) for x in list(getattr(plan, "frame_gaps", []) or [])],
+            "visit_kinds": [str(x) for x in list(getattr(plan, "visit_kinds", []) or [])],
             "scheduler_phase": str(getattr(plan, "scheduler_phase", "")),
             "rollout_phase": str(getattr(plan, "rollout_phase", "")),
             "repair_enabled": bool(getattr(plan, "repair_enabled", False)),
+            "repair_round_idx": int(getattr(plan, "repair_round_idx", -1)),
+            "repair_pattern_name": str(getattr(plan, "repair_pattern_name", "")),
             "repair_permutation_hash": int(getattr(plan, "repair_permutation_hash", -1)),
             "temporal_read_count": int(getattr(plan, "temporal_read_count", 0)),
             "temporal_commit_count": int(getattr(plan, "temporal_commit_count", 0)),
+            "optimizer_memory_read_count": int(getattr(plan, "optimizer_memory_read_count", 0)),
+            "optimizer_memory_write_count": int(getattr(plan, "optimizer_memory_write_count", 0)),
             "observation_commit_count": int(getattr(plan, "observation_commit_count", 0)),
             "optimizer_memory_update_count": int(getattr(plan, "optimizer_memory_update_count", 0)),
             "evidence_refs_flat": [tuple(x) for x in evidence_refs],
@@ -2734,6 +2746,26 @@ class MultiSceneDatasetV4:
             raise ValueError(
                 "expected Stage2_2 plan.scheduler_version == "
                 f"{_IFORWARD_STAGE2_2_SCHEDULER_VERSION!r}"
+            )
+        return self._assemble_segment_batch_from_iforward_request(
+            scene_id=int(scene_id),
+            segment_id=int(segment_id),
+            plan=plan,
+            include_test=bool(include_test),
+        )
+
+    def _assemble_segment_batch_from_iforward_stage2_3_request(
+        self,
+        *,
+        scene_id: int,
+        segment_id: int,
+        plan: Any,
+        include_test: bool = False,
+    ) -> Dict[str, Any]:
+        if str(getattr(plan, "scheduler_version", "")) != _IFORWARD_STAGE2_3_SCHEDULER_VERSION:
+            raise ValueError(
+                "expected Stage2_3 plan.scheduler_version == "
+                f"{_IFORWARD_STAGE2_3_SCHEDULER_VERSION!r}"
             )
         return self._assemble_segment_batch_from_iforward_request(
             scene_id=int(scene_id),

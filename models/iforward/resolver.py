@@ -13,6 +13,7 @@ IFORWARD_V4_SCHEDULER_VERSION = "iforward_v4_coverage_ordered"
 IFORWARD_STAGE2_1_SCHEDULER_VERSION = "iforward_stage2_1_parent_temporal"
 IFORWARD_SEQUENCE10_SCHEDULER_VERSION = "iforward_sequence10_v1"
 IFORWARD_STAGE2_2_SCHEDULER_VERSION = "iforward_stage2_2_stream10_rawframe"
+IFORWARD_STAGE2_3_SCHEDULER_VERSION = "iforward_2_3_scheduler_v3_optimizer_mamba"
 IFORWARD_MODEL_FAMILY = "IForward"
 IFORWARD_CURRENT_ROLE = "final_current_recon"
 IFORWARD_HISTORY_ROLE = "final_history_replay"
@@ -58,10 +59,23 @@ class IForwardResolvedStep:
     timestamp_us: int = 0
     timestamp_sec: float = 0.0
     delta_t_sec: float = 0.0
+    visit_order_gap: int = 0
+    physical_frame_gap_abs: int = 0
+    previous_visit_sequence_pos: int = -1
     ego_delta_translation: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     ego_delta_yaw: float = 0.0
     visit_memory_mask: bool = True
     repair_no_commit: bool = False
+    repeat_budget: int = 1
+    visit_count_for_frame: int = 0
+    is_first_visit_of_frame: bool = False
+    is_last_update_of_episode: bool = False
+    global_update_idx_in_episode: int = -1
+    optimizer_memory_read: bool = True
+    optimizer_memory_write: bool = True
+    time_since_same_frame_visit: float = 0.0
+    source_keyframe_idx: int = -1
+    validation_render_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -339,6 +353,7 @@ class IForwardBatchResolver:
             IFORWARD_STAGE2_1_SCHEDULER_VERSION,
             IFORWARD_SEQUENCE10_SCHEDULER_VERSION,
             IFORWARD_STAGE2_2_SCHEDULER_VERSION,
+            IFORWARD_STAGE2_3_SCHEDULER_VERSION,
         }
         if scheduler_version not in allowed_versions:
             raise ValueError(
@@ -348,8 +363,9 @@ class IForwardBatchResolver:
         is_v4 = scheduler_version == IFORWARD_V4_SCHEDULER_VERSION
         is_stage2_1 = scheduler_version == IFORWARD_STAGE2_1_SCHEDULER_VERSION
         is_stage2_2 = scheduler_version == IFORWARD_STAGE2_2_SCHEDULER_VERSION
+        is_stage2_3 = scheduler_version == IFORWARD_STAGE2_3_SCHEDULER_VERSION
         is_sequence10 = scheduler_version == IFORWARD_SEQUENCE10_SCHEDULER_VERSION
-        is_explicit_iforward = bool(is_v3 or is_v4 or is_stage2_1 or is_stage2_2 or is_sequence10)
+        is_explicit_iforward = bool(is_v3 or is_v4 or is_stage2_1 or is_stage2_2 or is_stage2_3 or is_sequence10)
         model_family = str(ifwd.get("model_family", request_meta.get("model_family", self.expected_model_family)))
         if model_family != self.expected_model_family:
             raise ValueError(f"IForward requires model_family={self.expected_model_family!r}, got {model_family!r}.")
@@ -402,10 +418,14 @@ class IForwardBatchResolver:
                 raise ValueError("IForward v1 requires rollout-final render loss only.")
             repeat_idx = int(step.get("repeat_idx", 0))
             commit = bool(step.get("commit_observation_memory", repeat_idx == 0))
-            no_commit_visit = str(step.get("visit_kind", "")) in {"bootstrap", "repair", "stress"}
-            expected_commit = False if bool(is_sequence10 or is_stage2_2) and bool(no_commit_visit) else (
-                int(repeat_idx) == 0
-            )
+            no_commit_visit = str(step.get("visit_kind", "")) in {"bootstrap", "repair", "stress", "final_all"}
+            stage23_bootstrap_no_commit = bool(is_stage2_3 and str(step.get("visit_kind", "")) == "bootstrap")
+            stage23_final_all_no_commit = bool(is_stage2_3 and bool(step.get("validation_render_only", False)))
+            expected_commit = False if (
+                (bool(is_sequence10 or is_stage2_2) and bool(no_commit_visit))
+                or stage23_bootstrap_no_commit
+                or stage23_final_all_no_commit
+            ) else (int(repeat_idx) == 0)
             if commit != bool(expected_commit):
                 raise ValueError("IForward commit_observation_memory must be true only on repeat_idx=0.")
             rollout_block_rank = int(step.get("rollout_block_rank", 0))
@@ -421,11 +441,15 @@ class IForwardBatchResolver:
             )
             if bool(is_sequence10):
                 expected_update = bool(step.get("update_optimizer_memory", False))
+            elif bool(is_stage2_3):
+                expected_update = bool(step.get("optimizer_memory_write", step.get("update_optimizer_memory", False)))
             elif bool(is_stage2_2) and bool(no_commit_visit):
                 expected_update = False
             else:
                 expected_update = bool(block_clock["is_block_exit"]) if bool(is_stage2_1 or is_stage2_2) else True
             if bool(step.get("update_optimizer_memory", True)) != bool(expected_update):
+                if bool(is_stage2_3):
+                    raise ValueError("IForward Stage2_3 update_optimizer_memory must match optimizer_memory_write.")
                 if bool(is_stage2_1 or is_stage2_2):
                     raise ValueError("IForward Stage2 update_optimizer_memory must be true only on block exit.")
                 raise ValueError("IForward update_optimizer_memory must be true for every repeat.")
@@ -497,6 +521,9 @@ class IForwardBatchResolver:
                     timestamp_us=int(step.get("timestamp_us", 0)),
                     timestamp_sec=float(step.get("timestamp_sec", float(step.get("timestamp_us", 0)) / 1.0e6)),
                     delta_t_sec=float(step.get("delta_t_sec", 0.0)),
+                    visit_order_gap=int(step.get("visit_order_gap", 0)),
+                    physical_frame_gap_abs=int(step.get("physical_frame_gap_abs", abs(int(step.get("frame_gap", 0))))),
+                    previous_visit_sequence_pos=int(step.get("previous_visit_sequence_pos", -1)),
                     ego_delta_translation=tuple(
                         float(x)
                         for x in (
@@ -506,6 +533,20 @@ class IForwardBatchResolver:
                     ego_delta_yaw=float(step.get("ego_delta_yaw", 0.0)),
                     visit_memory_mask=bool(step.get("visit_memory_mask", True)),
                     repair_no_commit=bool(step.get("repair_no_commit", False)),
+                    repeat_budget=int(step.get("repeat_budget", block_clock["repeats_per_block"] or 1)),
+                    visit_count_for_frame=int(step.get("visit_count_for_frame", 0)),
+                    is_first_visit_of_frame=bool(step.get("is_first_visit_of_frame", False)),
+                    is_last_update_of_episode=bool(step.get("is_last_update_of_episode", False)),
+                    global_update_idx_in_episode=int(
+                        step.get("global_update_idx_in_episode", step.get("optimizer_step_idx_in_episode", optimizer_step_idx))
+                    ),
+                    optimizer_memory_read=bool(step.get("optimizer_memory_read", step.get("temporal_read", True))),
+                    optimizer_memory_write=bool(
+                        step.get("optimizer_memory_write", step.get("temporal_commit", step.get("update_optimizer_memory", True)))
+                    ),
+                    time_since_same_frame_visit=float(step.get("time_since_same_frame_visit", 0.0)),
+                    source_keyframe_idx=int(step.get("source_keyframe_idx", source_frame_idx)),
+                    validation_render_only=bool(step.get("validation_render_only", False)),
                 )
             )
 

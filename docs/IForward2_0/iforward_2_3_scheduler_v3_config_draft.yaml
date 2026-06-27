@@ -1,0 +1,112 @@
+model:
+  iforward:
+    version: iforward_2_3_optimizer_mamba
+
+    parent_optimizer_mamba:
+      enable: true
+      ctx_dim: 32
+      state_dim: 8
+      read_every_repeat: true
+      write_every_repeat: true
+      reset_scope: episode
+      detach_scope: rollout_boundary
+      write_mask:
+        support_min: 0.001
+        require_valid: true
+      write_token:
+        include_spatial_event: true
+        include_parent_event: true
+        include_delta_summary: true
+        include_visit_embedding: true
+      visit_embedding:
+        kinds: [bootstrap, assimilation, repair, repeat_stability]
+        repeat_idx_max: 16
+        repeat_budget_max: 16
+      fusion:
+        gate_init:
+          bootstrap: 0.0
+          assimilation: 0.05
+          repair: 0.03
+          repeat_stability: 0.03
+
+scheduler_v3:
+  enable: true
+  version: optimizer_sequence_v1
+
+  traversal:
+    scene_order: shuffled_round_robin
+    segment_order: shuffled_round_robin
+    forbid_consecutive_scene: true
+
+  bootstrap:
+    end_step: 5000
+    frames_per_asset_pack: 4
+    fresh_state_per_frame: true
+    mamba: off
+    repeat_distribution:
+      4: 0.50
+      6: 0.30
+      8: 0.20
+
+  sequence:
+    min_frames: 8
+    max_frames: 10
+    min_unique_keyframes: 3
+    min_frame_span: 8
+    max_frame_span: 30
+    assimilation_order:
+      chronological: 0.80
+      local_shuffle: 0.20
+
+  assimilation:
+    start_step: 5000
+    frames_per_rollout: 2
+    max_inner_k: 12
+    repeat_pairs:
+      "4,4": 0.35
+      "4,6": 0.15
+      "6,4": 0.15
+      "6,6": 0.15
+      "4,8": 0.10
+      "8,4": 0.10
+
+  repair:
+    enable: true
+    start_step: 15000
+    probability_schedule:
+      - [15000, 0.10]
+      - [18000, 0.25]
+      - [22000, 0.50]
+    rounds:
+      1: 0.70
+      2: 0.30
+    rollout_options:
+      B6R1: 0.35
+      B8R1: 0.40
+      B6R2: 0.25
+    random_order: true
+    mamba_read: true
+    mamba_write: true
+    last_update_write: false
+
+  loss:
+    current_weight: 1.0
+    history_weight: 0.5
+    retention_weight: 0.35
+    best_damage_weight: 0.25
+    history_metric: l1_ssim
+    retention_metric: l1
+    best_damage_metric: l1
+
+  producer:
+    queue_depth: 32
+    preload_next_episode: true
+    episode_pinned_cache: true
+
+validation_v3:
+  enable: true
+  protocols:
+    assimilation: true
+    repair_permutations: 3
+    repeat_stability: [4, 8, 16, 32]
+    mamba_ablation: [off, read_only, read_write, shuffled]

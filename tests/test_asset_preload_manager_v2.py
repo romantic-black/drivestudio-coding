@@ -151,3 +151,53 @@ def test_asset_preload_manager_v2_v9_role_refs_warms_view_pack():
     kinds = [x[0] for x in ds.calls]
     assert "view_meta" in kinds
     assert "view_pack" in kinds
+
+
+def test_asset_preload_manager_v2_stage2_3_current_rollout_warms_view_pack():
+    ds = _DummyDataset()
+    mgr = AssetPreloadManagerV2(ds, parse_preload_cfg_v2(_cfg_dict()))
+    mgr.start()
+    mgr.submit_preload_hint(
+        hint={
+            "scene_id": 1,
+            "segment_id": 0,
+            "future_image_refs": [(12, 0)],
+        },
+        hint_scope="stage2_3_current_rollout_view_pack",
+        include_test=False,
+    )
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        kinds = [x[0] for x in ds.calls]
+        if "view_meta" in kinds and "view_pack" in kinds:
+            break
+        time.sleep(0.01)
+    mgr.stop()
+    kinds = [x[0] for x in ds.calls]
+    assert "view_meta" in kinds
+    assert "view_pack" in kinds
+
+
+def test_asset_preload_manager_v2_stage2_3_episode_chain_warms_view_pack():
+    ds = _DummyDataset()
+    mgr = AssetPreloadManagerV2(ds, parse_preload_cfg_v2(_cfg_dict()))
+    mgr.start()
+    mgr.submit_preload_hint(
+        hint={
+            "scene_id": 1,
+            "segment_id": 0,
+            "future_image_refs": [(12, 0), (13, 1)],
+        },
+        hint_scope="stage2_3_episode_chain_exact",
+        include_test=False,
+    )
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        kinds = [x[0] for x in ds.calls]
+        if "view_meta" in kinds and "view_pack" in kinds:
+            break
+        time.sleep(0.01)
+    mgr.stop()
+    kinds = [x[0] for x in ds.calls]
+    assert "view_meta" in kinds
+    assert "view_pack" in kinds

@@ -373,6 +373,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "stage2_0_fwhr_lift_grld_dinov2base",
             "stage2_1_fwhr_parent_ptv3_temporal_mamba",
             "stage2_2_stream10_rawframe_temporal_mamba_v2",
+            "iforward_2_3_optimizer_mamba",
         }
         if bool(biggs_enabled):
             if bool(self._cfg_get(biggs_cfg, "enable", True)) is not True:
@@ -409,6 +410,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         is_stage2_1_parent_temporal = ifwd_version in {
             "stage2_1_fwhr_parent_ptv3_temporal_mamba",
             "stage2_2_stream10_rawframe_temporal_mamba_v2",
+            "iforward_2_3_optimizer_mamba",
         }
         if bool(self._cfg_get(base_measurement, "require_obs_code", True)) is not True and not is_stage2_1_parent_temporal:
             raise ValueError("Stage6_0 Phase A requires V4 obs_code.")
@@ -903,6 +905,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 "stage2_0_fwhr_lift_grld_dinov2base",
                 "stage2_1_fwhr_parent_ptv3_temporal_mamba",
                 "stage2_2_stream10_rawframe_temporal_mamba_v2",
+                "iforward_2_3_optimizer_mamba",
             }
             and bool(self._cfg_get(biggs_cfg, "enable", True))
         )
@@ -1108,10 +1111,12 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "stage2_0_fwhr_lift_grld_dinov2base",
             "stage2_1_fwhr_parent_ptv3_temporal_mamba",
             "stage2_2_stream10_rawframe_temporal_mamba_v2",
+            "iforward_2_3_optimizer_mamba",
         }
         self.stage2_1_parent_temporal_enabled = ifwd_version in {
             "stage2_1_fwhr_parent_ptv3_temporal_mamba",
             "stage2_2_stream10_rawframe_temporal_mamba_v2",
+            "iforward_2_3_optimizer_mamba",
         }
         self.stage2_0_biggs_cfg = dict(biggs_cfg or {})
         self.stage2_0_biggs_assignment_cfg = self._cfg_get(biggs_cfg, "assignment", {}) or {}

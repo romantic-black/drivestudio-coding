@@ -355,6 +355,7 @@ class IForwardState:
     parent_temporal: Optional[Any] = None
     sequence10_bank: Optional[Any] = None
     stage2_2_bank: Optional[Any] = None
+    stage2_3_bank: Optional[Any] = None
     node_state_bg: Optional[NodeStateBackground] = None
     node_state_distant: Optional[NodeStateDistant] = None
     node_state_rigid: Optional[NodeStateRigid] = None
@@ -396,6 +397,13 @@ class IForwardState:
                 else self.stage2_2_bank.detach()
                 if hasattr(self.stage2_2_bank, "detach")
                 else self.stage2_2_bank
+            ),
+            stage2_3_bank=(
+                None
+                if self.stage2_3_bank is None
+                else self.stage2_3_bank.detach()
+                if hasattr(self.stage2_3_bank, "detach")
+                else self.stage2_3_bank
             ),
             node_state_bg=None,
             node_state_distant=None,

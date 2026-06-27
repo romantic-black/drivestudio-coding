@@ -463,6 +463,94 @@ def _build_iforward_scheduler_row(
                 ),
             }
         )
+    if str(row.get("scheduler_version", "")) == "iforward_2_3_scheduler_v3_optimizer_mamba":
+        row.update(
+            {
+                "scheduler_phase": str(
+                    result.get("iforward/stage2_3/phase", scheduler_info.get("scheduler_phase", ""))
+                ),
+                "rollout_phase": str(
+                    result.get("iforward/stage2_3/rollout_phase", scheduler_info.get("rollout_phase", ""))
+                ),
+                "sequence_id": _metric_int(scheduler_info.get("sequence_id", -1)),
+                "sequence_length": _metric_int(
+                    result.get("iforward/stage2_3/sequence_length", scheduler_info.get("sequence_length", 0))
+                ),
+                "actual_blocks_per_rollout": _metric_int(
+                    result.get(
+                        "iforward/stage2_3/actual_blocks_per_rollout",
+                        scheduler_info.get("actual_blocks_per_rollout", row.get("blocks_per_rollout", -1)),
+                    )
+                ),
+                "episode_positions": _metric_list_int(
+                    result.get("iforward/stage2_3/episode_positions", scheduler_info.get("episode_positions"))
+                ),
+                "rollout_positions": _metric_list_int(
+                    result.get("iforward/stage2_3/rollout_positions", scheduler_info.get("rollout_positions"))
+                ),
+                "sequence_positions": _metric_list_int(
+                    result.get("iforward/stage2_3/rollout_positions", scheduler_info.get("sequence_positions"))
+                ),
+                "history_positions": _metric_list_int(
+                    result.get("iforward/stage2_3/history_positions", scheduler_info.get("history_positions"))
+                ),
+                "repair_positions": _metric_list_int(
+                    result.get("iforward/stage2_3/repair_positions", scheduler_info.get("repair_positions"))
+                ),
+                "repeat_budgets": _metric_list_int(
+                    result.get("iforward/stage2_3/repeat_budgets", scheduler_info.get("repeat_budgets"))
+                ),
+                "frame_gaps": _metric_list_int(
+                    result.get("iforward/stage2_3/frame_gaps", scheduler_info.get("frame_gaps"))
+                ),
+                "visit_kinds": [
+                    str(x)
+                    for x in list(
+                        result.get("iforward/stage2_3/visit_kinds", scheduler_info.get("visit_kinds", [])) or []
+                    )
+                ],
+                "repair_round_idx": _metric_int(
+                    result.get("iforward/stage2_3/repair_round_idx", scheduler_info.get("repair_round_idx", -1))
+                ),
+                "repair_pattern_name": str(
+                    result.get("iforward/stage2_3/repair_pattern_name", scheduler_info.get("repair_pattern_name", ""))
+                ),
+                "repair_hash": _metric_int(scheduler_info.get("repair_permutation_hash", -1)),
+                "repair_flag": _metric_bool(str(scheduler_info.get("scheduler_phase", "")) == "repair"),
+                "optimizer_memory_read_count": _metric_int(scheduler_info.get("optimizer_memory_read_count", 0)),
+                "optimizer_memory_write_count": _metric_int(scheduler_info.get("optimizer_memory_write_count", 0)),
+                "observation_commit_count": _metric_int(scheduler_info.get("observation_commit_count", 0)),
+                "producer_enabled": _metric_bool(scheduler_info.get("producer_enabled", False)),
+                "producer_queue_depth": _metric_int(scheduler_info.get("producer_queue_depth", 0), 0),
+                "producer_queue_size": _metric_int(scheduler_info.get("producer_queue_size", 0), 0),
+                "producer_wait_ms": _metric_float(scheduler_info.get("producer_wait_ms"), 0.0),
+                "producer_build_ms": _metric_float(scheduler_info.get("producer_build_ms"), 0.0),
+                "producer_batches_produced": _metric_int(scheduler_info.get("producer_batches_produced", 0), 0),
+                "producer_worker_errors": _metric_int(scheduler_info.get("producer_worker_errors", 0), 0),
+                "preload_hint_count": _metric_int(scheduler_info.get("preload_hint_count", 0), 0),
+                "preload_episode_ref_count": _metric_int(scheduler_info.get("preload_episode_ref_count", 0), 0),
+                "index_fingerprint": str(scheduler_info.get("index_fingerprint", "")),
+            }
+        )
+        row.update(
+            {
+                "iforward/stage2_3/phase": str(row.get("scheduler_phase", "")),
+                "iforward/stage2_3/rollout_phase": str(row.get("rollout_phase", "")),
+                "iforward/stage2_3/sequence_length": _metric_int(row.get("sequence_length", 0)),
+                "iforward/stage2_3/actual_blocks_per_rollout": _metric_int(
+                    row.get("actual_blocks_per_rollout", row.get("blocks_per_rollout", -1))
+                ),
+                "iforward/stage2_3/episode_positions": list(row.get("episode_positions", []) or []),
+                "iforward/stage2_3/rollout_positions": list(row.get("rollout_positions", []) or []),
+                "iforward/stage2_3/history_positions": list(row.get("history_positions", []) or []),
+                "iforward/stage2_3/repair_positions": list(row.get("repair_positions", []) or []),
+                "iforward/stage2_3/repeat_budgets": list(row.get("repeat_budgets", []) or []),
+                "iforward/stage2_3/frame_gaps": list(row.get("frame_gaps", []) or []),
+                "iforward/stage2_3/visit_kinds": list(row.get("visit_kinds", []) or []),
+                "iforward/stage2_3/repair_round_idx": _metric_int(row.get("repair_round_idx", -1)),
+                "iforward/stage2_3/repair_pattern_name": str(row.get("repair_pattern_name", "")),
+            }
+        )
     return row
 
 
@@ -3120,6 +3208,10 @@ def main() -> None:
                     str(result.get("iforward/scheduler_version", scheduler_info.get("scheduler_version", "")))
                     == "iforward_stage2_2_stream10_rawframe"
                 )
+                is_stage2_3_step = (
+                    str(result.get("iforward/scheduler_version", scheduler_info.get("scheduler_version", "")))
+                    == "iforward_2_3_scheduler_v3_optimizer_mamba"
+                )
                 sequence10_rollout_idx = int(
                     result.get("iforward/rollout_idx_in_episode", scheduler_info.get("rollout_idx_in_episode", -1))
                     or -1
@@ -3152,6 +3244,19 @@ def main() -> None:
                         stage2_2_phase == "repair"
                         or bool(sequence10_episode_end)
                         or stage2_2_rollout_idx in {0, 4}
+                    )
+                if is_stage2_3_step:
+                    stage2_3_phase = str(
+                        result.get("iforward/stage2_3/phase", scheduler_info.get("scheduler_phase", ""))
+                    )
+                    stage2_3_rollout_idx = int(
+                        result.get("iforward/rollout_idx_in_episode", scheduler_info.get("rollout_idx_in_episode", -1))
+                        or -1
+                    )
+                    force_sequence10_scheduler_metrics = bool(
+                        stage2_3_phase == "repair"
+                        or bool(sequence10_episode_end)
+                        or stage2_3_rollout_idx in {0, 4}
                     )
                 should_write_scheduler_metrics = (
                     bool(scheduler_metrics_interval > 0 and step % int(scheduler_metrics_interval) == 0)
@@ -3343,6 +3448,89 @@ def main() -> None:
                         "node_state_sync_update": bool(result.get("node_state_sync_update", False)),
                         "node_state_sync_reset": bool(result.get("node_state_sync_reset", False)),
                     }
+                    if (
+                        str(
+                            result.get(
+                                "iforward/scheduler_version",
+                                scheduler_info.get("scheduler_version", ""),
+                            )
+                        )
+                        == "iforward_2_3_scheduler_v3_optimizer_mamba"
+                    ):
+                        train_step_row.update(
+                            {
+                                "iforward/stage2_3/phase": str(
+                                    result.get(
+                                        "iforward/stage2_3/phase",
+                                        scheduler_info.get("scheduler_phase", ""),
+                                    )
+                                ),
+                                "iforward/stage2_3/rollout_phase": str(
+                                    result.get(
+                                        "iforward/stage2_3/rollout_phase",
+                                        scheduler_info.get("rollout_phase", ""),
+                                    )
+                                ),
+                                "iforward/stage2_3/episode_positions": _metric_list_int(
+                                    result.get(
+                                        "iforward/stage2_3/episode_positions",
+                                        scheduler_info.get("episode_positions"),
+                                    )
+                                ),
+                                "iforward/stage2_3/rollout_positions": _metric_list_int(
+                                    result.get(
+                                        "iforward/stage2_3/rollout_positions",
+                                        scheduler_info.get("rollout_positions"),
+                                    )
+                                ),
+                                "iforward/stage2_3/history_positions": _metric_list_int(
+                                    result.get(
+                                        "iforward/stage2_3/history_positions",
+                                        scheduler_info.get("history_positions"),
+                                    )
+                                ),
+                                "iforward/stage2_3/repair_positions": _metric_list_int(
+                                    result.get(
+                                        "iforward/stage2_3/repair_positions",
+                                        scheduler_info.get("repair_positions"),
+                                    )
+                                ),
+                                "iforward/stage2_3/repeat_budgets": _metric_list_int(
+                                    result.get(
+                                        "iforward/stage2_3/repeat_budgets",
+                                        scheduler_info.get("repeat_budgets"),
+                                    )
+                                ),
+                                "iforward/stage2_3/frame_gaps": _metric_list_int(
+                                    result.get(
+                                        "iforward/stage2_3/frame_gaps",
+                                        scheduler_info.get("frame_gaps"),
+                                    )
+                                ),
+                                "iforward/stage2_3/visit_kinds": [
+                                    str(x)
+                                    for x in list(
+                                        result.get(
+                                            "iforward/stage2_3/visit_kinds",
+                                            scheduler_info.get("visit_kinds", []),
+                                        )
+                                        or []
+                                    )
+                                ],
+                                "iforward/stage2_3/repair_round_idx": _metric_int(
+                                    result.get(
+                                        "iforward/stage2_3/repair_round_idx",
+                                        scheduler_info.get("repair_round_idx", -1),
+                                    )
+                                ),
+                                "iforward/stage2_3/repair_pattern_name": str(
+                                    result.get(
+                                        "iforward/stage2_3/repair_pattern_name",
+                                        scheduler_info.get("repair_pattern_name", ""),
+                                    )
+                                ),
+                            }
+                        )
                     for k, v in result.items():
                         if k.startswith("_") or k in train_step_row or k in {"pred_rgbs", "gt_images", "image_refs", "image_roles"}:
                             continue
@@ -3358,6 +3546,9 @@ def main() -> None:
                             "iforward/scheduler_version",
                             "iforward/sequence10/phase",
                             "iforward/sequence10/rollout_phase",
+                            "iforward/stage2_3/phase",
+                            "iforward/stage2_3/rollout_phase",
+                            "iforward/stage2_3/repair_pattern_name",
                         }:
                             train_step_row[k] = str(v)
                         elif k in {
@@ -3367,8 +3558,16 @@ def main() -> None:
                             "iforward/sequence10/frame_ids",
                             "iforward/sequence10/history_positions",
                             "iforward/sequence10/repair_positions",
+                            "iforward/stage2_3/episode_positions",
+                            "iforward/stage2_3/rollout_positions",
+                            "iforward/stage2_3/history_positions",
+                            "iforward/stage2_3/repair_positions",
+                            "iforward/stage2_3/repeat_budgets",
+                            "iforward/stage2_3/frame_gaps",
                         } and isinstance(v, (list, tuple)):
                             train_step_row[k] = [int(x) for x in v]
+                        elif k in {"iforward/stage2_3/visit_kinds"} and isinstance(v, (list, tuple)):
+                            train_step_row[k] = [str(x) for x in v]
                     if diag_row:
                         train_step_row.update(diag_row)
                     if perf_cfg["enable"] and perf_cfg["cuda_memory"] and torch.cuda.is_available():
@@ -4153,6 +4352,8 @@ def main() -> None:
                 writer.close()
             except OSError as exc:
                 logger.warning("TensorBoard writer close/flush failed (log_dir may have been removed): %s", exc)
+        if "scheduler" in locals() and hasattr(scheduler, "shutdown"):
+            scheduler.shutdown()
         if hasattr(dataset, "shutdown_preload"):
             dataset.shutdown_preload()
 

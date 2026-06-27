@@ -48,11 +48,23 @@ from .stage2_2 import (
     build_parent_temporal_keys_v2,
     history_damage_hinge_v2,
 )
+from .stage2_3 import (
+    DenseOptimizerState,
+    EpisodeHistoryBankV3,
+    KeyedOptimizerState,
+    OptimizerBranchState,
+    ParentOptimizerMamba,
+    ParentOptimizerMambaState,
+    VisitMeta,
+    build_parent_delta_summary,
+    history_damage_hinge_v3,
+)
 from .point_mamba_memory import IForwardPointMambaMemory
 from .resolver import (
     IFORWARD_SEQUENCE10_SCHEDULER_VERSION,
     IFORWARD_STAGE2_1_SCHEDULER_VERSION,
     IFORWARD_STAGE2_2_SCHEDULER_VERSION,
+    IFORWARD_STAGE2_3_SCHEDULER_VERSION,
     IFORWARD_V3_SCHEDULER_VERSION,
     IFORWARD_V4_SCHEDULER_VERSION,
     IForwardBatchResolver,
@@ -425,12 +437,14 @@ class IForwardModel(nn.Module):
             IFORWARD_STAGE2_1_SCHEDULER_VERSION,
             IFORWARD_SEQUENCE10_SCHEDULER_VERSION,
             IFORWARD_STAGE2_2_SCHEDULER_VERSION,
+            IFORWARD_STAGE2_3_SCHEDULER_VERSION,
         }:
             return
         raise ValueError(
             "IForward v3/v4/stage2_1 requires scheduler_iforward.version=iforward_v3_random_window, "
             "iforward_v4_coverage_ordered, iforward_stage2_1_parent_temporal, "
-            "iforward_sequence10_v1, or iforward_stage2_2_stream10_rawframe "
+            "iforward_sequence10_v1, iforward_stage2_2_stream10_rawframe, "
+            "or iforward_2_3_scheduler_v3_optimizer_mamba "
             f"when scheduler_iforward is enabled, got {version!r}."
         )
 
@@ -455,9 +469,17 @@ class IForwardModel(nn.Module):
 
                 self.resolver = IForwardRandomWindowBatchResolver()
             else:
+                scheduler23_cfg = cfg_get(config, "scheduler_v3", {}) or {}
                 scheduler22_cfg = cfg_get(config, "scheduler_stage2_2", {}) or {}
                 scheduler_cfg = cfg_get(config, "scheduler_iforward", {}) or {}
-                if bool(cfg_get(scheduler22_cfg, "enable", False)):
+                if bool(cfg_get(scheduler23_cfg, "enable", False)) and str(
+                    cfg_get(scheduler23_cfg, "version", "")
+                ) == "optimizer_sequence_v1":
+                    from datasets.iforward_stage2_3.resolver import Stage23BatchResolver
+
+                    self.resolver = Stage23BatchResolver()
+                    scheduler_version = IFORWARD_STAGE2_3_SCHEDULER_VERSION
+                elif bool(cfg_get(scheduler22_cfg, "enable", False)):
                     from datasets.iforward_stage2_2.resolver import Stage22BatchResolver
 
                     self.resolver = Stage22BatchResolver()
@@ -471,10 +493,11 @@ class IForwardModel(nn.Module):
                     IFORWARD_V4_SCHEDULER_VERSION,
                     IFORWARD_STAGE2_1_SCHEDULER_VERSION,
                     IFORWARD_STAGE2_2_SCHEDULER_VERSION,
+                    IFORWARD_STAGE2_3_SCHEDULER_VERSION,
                 }:
-                    if scheduler_version != IFORWARD_STAGE2_2_SCHEDULER_VERSION:
+                    if scheduler_version not in {IFORWARD_STAGE2_2_SCHEDULER_VERSION, IFORWARD_STAGE2_3_SCHEDULER_VERSION}:
                         self.resolver = IForwardBatchResolver(expected_scheduler_version=scheduler_version)
-                elif scheduler_version != IFORWARD_STAGE2_2_SCHEDULER_VERSION:
+                elif scheduler_version not in {IFORWARD_STAGE2_2_SCHEDULER_VERSION, IFORWARD_STAGE2_3_SCHEDULER_VERSION}:
                     self.resolver = IForwardBatchResolver()
 
         if bridge is None:
@@ -497,6 +520,7 @@ class IForwardModel(nn.Module):
         self.is_v6_point_mamba_xcpe = self.iforward_version == "v6_point_mamba_xcpe"
         self.is_stage2_1_parent_temporal = self.iforward_version == "stage2_1_fwhr_parent_ptv3_temporal_mamba"
         self.is_stage2_2_parent_temporal = self.iforward_version == "stage2_2_stream10_rawframe_temporal_mamba_v2"
+        self.is_stage2_3_optimizer_mamba = self.iforward_version == "iforward_2_3_optimizer_mamba"
         self.is_stage2_0_biggs_parent_lifting = self.iforward_version in {
             "stage2_0_biggs_parent_lifting",
             "stage2_0_biggs_cuda_exact_diagonal_projector",
@@ -506,6 +530,7 @@ class IForwardModel(nn.Module):
             "stage2_0_fwhr_lift_grld_dinov2base",
             "stage2_1_fwhr_parent_ptv3_temporal_mamba",
             "stage2_2_stream10_rawframe_temporal_mamba_v2",
+            "iforward_2_3_optimizer_mamba",
         }
         self.history_safe_projection = None
         self.adc_lite_cfg = cfg_get(iforward_cfg, "adc_lite", {}) or {}
@@ -674,7 +699,7 @@ class IForwardModel(nn.Module):
             self.history_gate_v2_enabled = False
             self.memory = None
             self.history_safe_projection = None
-            if self.is_stage2_1_parent_temporal or self.is_stage2_2_parent_temporal:
+            if self.is_stage2_1_parent_temporal or self.is_stage2_2_parent_temporal or self.is_stage2_3_optimizer_mamba:
                 parent_spatial_cfg = cfg_get(iforward_cfg, "parent_spatial", {}) or {}
                 parent_ptv3_cfg = cfg_get(parent_spatial_cfg, "ptv3", {}) or {}
                 parent_support_cfg = cfg_get(parent_spatial_cfg, "support_threshold", {}) or {}
@@ -698,7 +723,38 @@ class IForwardModel(nn.Module):
                     use_xcpe=bool(cfg_get(parent_ptv3_cfg, "use_xcpe", True)),
                     zero_invalid_context=bool(cfg_get(parent_spatial_cfg, "zero_invalid_context", True)),
                 )
-                if self.is_stage2_2_parent_temporal:
+                if self.is_stage2_3_optimizer_mamba:
+                    parent_optimizer_cfg = (
+                        cfg_get(iforward_cfg, "parent_optimizer_mamba", None)
+                        or cfg_get(iforward_cfg, "parent_temporal_mamba_v2", None)
+                        or cfg_get(iforward_cfg, "parent_temporal_mamba", {})
+                        or {}
+                    )
+                    write_mask_cfg = cfg_get(parent_optimizer_cfg, "write_mask", {}) or {}
+                    write_token_cfg = cfg_get(parent_optimizer_cfg, "write_token", {}) or {}
+                    fusion_cfg = cfg_get(parent_optimizer_cfg, "fusion", {}) or {}
+                    self.stage2_3_include_delta_summary = bool(cfg_get(write_token_cfg, "include_delta_summary", True))
+                    self.stage2_3_delta_summary_fail_fast = bool(
+                        cfg_get(
+                            write_token_cfg,
+                            "fail_fast",
+                            cfg_get(parent_optimizer_cfg, "fail_fast", cfg_get(iforward_cfg, "fail_fast", True)),
+                        )
+                    )
+                    self.parent_temporal_mamba = ParentOptimizerMamba(
+                        event_dim=int(cfg_get(parent_optimizer_cfg, "event_dim", cfg_get(parent_spatial_cfg, "event_dim", 64))),
+                        ctx_dim=int(cfg_get(parent_optimizer_cfg, "ctx_dim", 32)),
+                        model_dim=int(cfg_get(parent_optimizer_cfg, "model_dim", 32)),
+                        state_dim=int(cfg_get(parent_optimizer_cfg, "state_dim", 8)),
+                        conv_kernel=int(cfg_get(parent_optimizer_cfg, "conv_kernel", 2)),
+                        adapter_hidden_dim=int(cfg_get(parent_optimizer_cfg, "adapter_hidden_dim", 64)),
+                        visit_dim=int(cfg_get(cfg_get(parent_optimizer_cfg, "visit_embedding", {}) or {}, "output_dim", 32)),
+                        support_min=float(cfg_get(write_mask_cfg, "support_min", 0.001)),
+                        dense_bg=bool(cfg_get(parent_optimizer_cfg, "dense_bg", True)),
+                        dense_distant=bool(cfg_get(parent_optimizer_cfg, "dense_distant", True)),
+                        gate_init=dict(cfg_get(fusion_cfg, "gate_init", {}) or {}),
+                    )
+                elif self.is_stage2_2_parent_temporal:
                     parent_temporal_cfg = (
                         cfg_get(iforward_cfg, "parent_temporal_mamba_v2", None)
                         or cfg_get(iforward_cfg, "parent_temporal_mamba", {})
@@ -836,6 +892,15 @@ class IForwardModel(nn.Module):
                 "freeze_write",
                 "shuffle_context",
             }
+        elif self.is_stage2_3_optimizer_mamba:
+            self.allowed_ablations = {
+                "full",
+                "mamba_off",
+                "mamba_read_only",
+                "mamba_read_write",
+                "mamba_shuffle_state",
+                "mamba_freeze_write",
+            }
         else:
             self.allowed_ablations = {
                 "full",
@@ -888,7 +953,9 @@ class IForwardModel(nn.Module):
             memory_state = IForwardV6MemoryState.empty()
         else:
             memory_state = IForwardMemoryState.empty()
-        if self.is_stage2_2_parent_temporal:
+        if self.is_stage2_3_optimizer_mamba:
+            parent_temporal = ParentOptimizerMambaState.empty()
+        elif self.is_stage2_2_parent_temporal:
             parent_temporal = ParentTemporalStateV2.empty()
         elif self.is_stage2_1_parent_temporal:
             parent_temporal = ParentTemporalState.empty()
@@ -902,6 +969,11 @@ class IForwardModel(nn.Module):
         stage2_2_bank = (
             EpisodeHistoryBankV2.empty(device=self.device)
             if str(getattr(resolved, "scheduler_version", "")) == IFORWARD_STAGE2_2_SCHEDULER_VERSION
+            else None
+        )
+        stage2_3_bank = (
+            EpisodeHistoryBankV3.empty(device=self.device)
+            if str(getattr(resolved, "scheduler_version", "")) == IFORWARD_STAGE2_3_SCHEDULER_VERSION
             else None
         )
         return IForwardState(
@@ -925,6 +997,7 @@ class IForwardModel(nn.Module):
             parent_temporal=parent_temporal,
             sequence10_bank=sequence10_bank,
             stage2_2_bank=stage2_2_bank,
+            stage2_3_bank=stage2_3_bank,
         )
 
     def _adc_lite_aabb(
@@ -1133,7 +1206,7 @@ class IForwardModel(nn.Module):
         after_by_pos = []
         valid_by_pos = []
         zero = per_ref.new_tensor(0.0)
-        for pos in range(10):
+        for pos in range(int(expected_positions)):
             value = per_pos_loss.get(int(pos))
             if value is None:
                 after_by_pos.append(zero)
@@ -1187,6 +1260,33 @@ class IForwardModel(nn.Module):
             expected_positions=10,
         )
 
+    def _stage2_3_per_pos_loss(
+        self,
+        *,
+        resolved: IForwardResolvedBatch,
+        final_pack: IForwardFinalRenderPack,
+        ref: torch.Tensor,
+    ) -> Tuple[Dict[int, torch.Tensor], torch.Tensor, torch.Tensor]:
+        if str(getattr(resolved, "scheduler_version", "")) != IFORWARD_STAGE2_3_SCHEDULER_VERSION:
+            return {}, ref.new_zeros((0,)), torch.zeros((0,), device=ref.device, dtype=torch.bool)
+        meta = dict(getattr(resolved, "meta", {}) or {})
+        source_frames = [int(x) for x in list(meta.get("sequence_source_frame_indices", []) or [])]
+        if not source_frames:
+            request_meta = dict(meta.get("request_meta", {}) or {})
+            source_frames = [
+                int(x)
+                for x in list(dict(request_meta.get("iforward_stage2_3", {}) or {}).get("raw_frame_ids", []) or [])
+            ]
+        if not source_frames:
+            return {}, ref.new_zeros((0,)), torch.zeros((0,), device=ref.device, dtype=torch.bool)
+        return self._per_pos_loss_from_final_roles(
+            resolved=resolved,
+            source_frames=source_frames,
+            roles=(final_pack.current, final_pack.history),
+            ref=ref,
+            expected_positions=len(source_frames),
+        )
+
     def _render_final_losses(
         self,
         *,
@@ -1230,7 +1330,8 @@ class IForwardModel(nn.Module):
         appended = len(pred_rgbs) - before
         image_refs.extend([tuple(int(x) for x in resolved.target_refs[int(i)]) for i in current_indices[:appended]])
         image_roles.extend(["current_latest"] * int(appended))
-        if float(in_rollout_history_loss_weight) > 0.0 and len(resolved.history_rollout_target_indices) > 0:
+        force_history_render = bool((getattr(resolved, "meta", {}) or {}).get("validation_force_history_render", False))
+        if (float(in_rollout_history_loss_weight) > 0.0 or bool(force_history_render)) and len(resolved.history_rollout_target_indices) > 0:
             history_indices = list(resolved.history_rollout_target_indices)
             before = len(pred_rgbs)
             in_rollout_history_loss, in_rollout_stats, history_per_ref = self.bridge.render_loss(
@@ -1492,6 +1593,67 @@ class IForwardModel(nn.Module):
         )
         return bool(is_block_enter), bool(is_block_exit)
 
+    def _normalize_ablation_name(self, ablation: Optional[str]) -> str:
+        name = str(ablation or "full")
+        if not bool(getattr(self, "is_stage2_3_optimizer_mamba", False)):
+            return name
+        aliases = {
+            "off": "mamba_off",
+            "read_only": "mamba_read_only",
+            "read_write": "mamba_read_write",
+            "shuffled": "mamba_shuffle_state",
+            "shuffle_memory": "mamba_shuffle_state",
+            "bypass_memory": "mamba_off",
+            "freeze_write": "mamba_freeze_write",
+        }
+        return str(aliases.get(name, name))
+
+    @staticmethod
+    def _shuffle_stage2_3_optimizer_state(
+        state: Optional[ParentOptimizerMambaState],
+    ) -> Optional[ParentOptimizerMambaState]:
+        if state is None:
+            return None
+
+        def _shuffle_dense(dense: Optional[DenseOptimizerState]) -> Optional[DenseOptimizerState]:
+            if dense is None or int(dense.seen.numel()) <= 1:
+                return dense
+            order = torch.randperm(int(dense.seen.numel()), device=dense.seen.device)
+            return DenseOptimizerState(
+                conv_state=dense.conv_state.index_select(0, order.to(device=dense.conv_state.device)),
+                ssm_state=dense.ssm_state.index_select(0, order.to(device=dense.ssm_state.device)),
+                seen=dense.seen.index_select(0, order),
+                update_count=dense.update_count.index_select(0, order.to(device=dense.update_count.device)),
+                last_visit_step=dense.last_visit_step.index_select(0, order.to(device=dense.last_visit_step.device)),
+                last_frame_id=dense.last_frame_id.index_select(0, order.to(device=dense.last_frame_id.device)),
+                last_visit_kind=dense.last_visit_kind.index_select(0, order.to(device=dense.last_visit_kind.device)),
+            )
+
+        def _shuffle_keyed(keyed: Optional[KeyedOptimizerState]) -> Optional[KeyedOptimizerState]:
+            if keyed is None or int(keyed.keys.numel()) <= 1:
+                return keyed
+            order = torch.randperm(int(keyed.keys.numel()), device=keyed.keys.device)
+            return KeyedOptimizerState(
+                keys=keyed.keys,
+                conv_state=keyed.conv_state.index_select(0, order.to(device=keyed.conv_state.device)),
+                ssm_state=keyed.ssm_state.index_select(0, order.to(device=keyed.ssm_state.device)),
+                seen=keyed.seen.index_select(0, order.to(device=keyed.seen.device)),
+                update_count=keyed.update_count.index_select(0, order.to(device=keyed.update_count.device)),
+                last_visit_step=keyed.last_visit_step.index_select(0, order.to(device=keyed.last_visit_step.device)),
+                last_frame_id=keyed.last_frame_id.index_select(0, order.to(device=keyed.last_frame_id.device)),
+                last_visit_kind=keyed.last_visit_kind.index_select(0, order.to(device=keyed.last_visit_kind.device)),
+            )
+
+        def _shuffle_branch(branch: OptimizerBranchState) -> OptimizerBranchState:
+            return OptimizerBranchState(dense=_shuffle_dense(branch.dense), keyed=_shuffle_keyed(branch.keyed))
+
+        return ParentOptimizerMambaState(
+            bg=_shuffle_branch(state.bg),
+            distant=_shuffle_branch(state.distant),
+            rigid=_shuffle_branch(state.rigid),
+            global_update_step=int(state.global_update_step),
+        )
+
     def forward_rollout(
         self,
         batch: Dict[str, Any],
@@ -1499,10 +1661,19 @@ class IForwardModel(nn.Module):
         carried_state: Optional[IForwardState] = None,
         ablation: Optional[str] = None,
     ) -> IForwardRolloutOutput:
-        ablation_name = str(ablation or "full")
+        ablation_name = self._normalize_ablation_name(ablation)
         if ablation_name not in self.allowed_ablations:
             raise ValueError(f"unsupported IForward ablation={ablation_name!r}")
         module_ablation_name = "full" if ablation_name in {"full_adc", "no_adc"} else ablation_name
+        if self.is_stage2_3_optimizer_mamba:
+            module_ablation_name = "full"
+        stage2_3_mamba_off = bool(self.is_stage2_3_optimizer_mamba and ablation_name == "mamba_off")
+        stage2_3_mamba_freeze_write = bool(
+            self.is_stage2_3_optimizer_mamba and ablation_name in {"mamba_read_only", "mamba_freeze_write"}
+        )
+        stage2_3_mamba_shuffle_state = bool(
+            self.is_stage2_3_optimizer_mamba and ablation_name == "mamba_shuffle_state"
+        )
         adc_disabled_by_ablation = ablation_name == "no_adc"
         resolved = self.resolver.resolve(batch)
         global_step = int(batch.get("global_step", 0) or 0)
@@ -1598,7 +1769,7 @@ class IForwardModel(nn.Module):
         memory_state = state.memory
         parent_temporal_state = (
             getattr(state, "parent_temporal", None)
-            if (self.is_stage2_1_parent_temporal or self.is_stage2_2_parent_temporal)
+            if (self.is_stage2_1_parent_temporal or self.is_stage2_2_parent_temporal or self.is_stage2_3_optimizer_mamba)
             else None
         )
         if self.is_stage2_1_parent_temporal and not isinstance(parent_temporal_state, ParentTemporalState):
@@ -1606,6 +1777,9 @@ class IForwardModel(nn.Module):
             state.parent_temporal = parent_temporal_state
         if self.is_stage2_2_parent_temporal and not isinstance(parent_temporal_state, ParentTemporalStateV2):
             parent_temporal_state = ParentTemporalStateV2.empty()
+            state.parent_temporal = parent_temporal_state
+        if self.is_stage2_3_optimizer_mamba and not isinstance(parent_temporal_state, ParentOptimizerMambaState):
+            parent_temporal_state = ParentOptimizerMambaState.empty()
             state.parent_temporal = parent_temporal_state
         history_ema = state.history_ema
         if self.is_v3_gru_history_gate:
@@ -1733,7 +1907,7 @@ class IForwardModel(nn.Module):
             timings["observe_ms"] += observe_step_ms
             t0 = time.perf_counter()
             with self._nvtx_range("iforward/event"):
-                if self.is_stage2_1_parent_temporal or self.is_stage2_2_parent_temporal:
+                if self.is_stage2_1_parent_temporal or self.is_stage2_2_parent_temporal or self.is_stage2_3_optimizer_mamba:
                     if not isinstance(measurement, dict):
                         raise RuntimeError("Stage2 parent temporal requires dict measurement from BigGS observation.")
                     parent_spatial = getattr(self, "parent_spatial_backbone", None)
@@ -1757,7 +1931,7 @@ class IForwardModel(nn.Module):
                         visit_kind=str(getattr(step, "visit_kind", "causal_first") or "causal_first"),
                     )
                     stage2_1_parent_block_cache["near_layout_cache"] = near_layout_cache
-                    if self.is_stage2_2_parent_temporal:
+                    if self.is_stage2_2_parent_temporal or self.is_stage2_3_optimizer_mamba:
                         parent_keys = build_parent_temporal_keys_v2(
                             parent_event=parent_event_spatial,
                             measurement=measurement,
@@ -1769,13 +1943,31 @@ class IForwardModel(nn.Module):
                         )
                     is_sequence10_scheduler = str(getattr(resolved, "scheduler_version", "")) == IFORWARD_SEQUENCE10_SCHEDULER_VERSION
                     is_stage2_2_scheduler = str(getattr(resolved, "scheduler_version", "")) == IFORWARD_STAGE2_2_SCHEDULER_VERSION
+                    is_stage2_3_scheduler = str(getattr(resolved, "scheduler_version", "")) == IFORWARD_STAGE2_3_SCHEDULER_VERSION
                     temporal_read_enabled = (
+                        bool(getattr(step, "optimizer_memory_read", True))
+                        if bool(is_stage2_3_scheduler)
+                        else
                         bool(getattr(step, "temporal_read", True))
                         if (is_sequence10_scheduler or is_stage2_2_scheduler)
                         else True
                     )
+                    if bool(self.is_stage2_3_optimizer_mamba and stage2_3_mamba_off):
+                        temporal_read_enabled = False
                     if bool(temporal_read_enabled):
-                        if self.is_stage2_2_parent_temporal:
+                        if self.is_stage2_3_optimizer_mamba:
+                            preview_state = (
+                                self._shuffle_stage2_3_optimizer_state(parent_temporal_state)
+                                if bool(stage2_3_mamba_shuffle_state)
+                                else parent_temporal_state
+                            )
+                            parent_preview = parent_temporal.preview(
+                                event=parent_event_spatial,
+                                state=preview_state,
+                                keys=parent_keys,
+                                visit_meta=VisitMeta.from_step(step),
+                            )
+                        elif self.is_stage2_2_parent_temporal:
                             parent_preview = parent_temporal.preview(
                                 event=parent_event_spatial,
                                 state=parent_temporal_state,
@@ -1803,14 +1995,22 @@ class IForwardModel(nn.Module):
                     else:
                         parent_event_for_decode = parent_event_spatial
                         aux = dict(parent_event_for_decode.aux or {})
-                        aux["iforward/parent_temporal/read_skipped"] = 1.0
+                        aux[
+                            "iforward/parent_optimizer_mamba/read_skipped"
+                            if self.is_stage2_3_optimizer_mamba
+                            else "iforward/parent_temporal/read_skipped"
+                        ] = 1.0
                         parent_event_for_decode.aux = aux
+                    if self.is_stage2_3_optimizer_mamba:
+                        stage2_1_parent_block_cache["optimizer_spatial_event"] = parent_event_spatial
+                        stage2_1_parent_block_cache["optimizer_fused_event"] = parent_event_for_decode
+                        stage2_1_parent_block_cache["optimizer_keys"] = parent_keys
                     block_can_temporal_commit = (
                         str(getattr(step, "visit_kind", "")) not in {"repair", "stress"}
                         if bool(is_sequence10_scheduler or is_stage2_2_scheduler)
                         else True
                     )
-                    if bool(block_can_temporal_commit) and (
+                    if (not self.is_stage2_3_optimizer_mamba) and bool(block_can_temporal_commit) and (
                         bool(is_block_enter) or "commit_event" not in stage2_1_parent_block_cache
                     ):
                         step_block_id = int(
@@ -1891,7 +2091,12 @@ class IForwardModel(nn.Module):
                     short_entries = []
                 elif self.is_stage2_0_biggs_parent_lifting:
                     ctx_memory = None
-                    if self.is_stage2_2_parent_temporal:
+                    if self.is_stage2_3_optimizer_mamba:
+                        memory_aux = {
+                            "iforward/stage2_3_parent_optimizer_mamba": 1.0,
+                            "iforward/biggs/memory_noop": 1.0,
+                        }
+                    elif self.is_stage2_2_parent_temporal:
                         memory_aux = {
                             "iforward/stage2_2_parent_temporal_memory_v2": 1.0,
                             "iforward/biggs/memory_noop": 1.0,
@@ -1925,9 +2130,16 @@ class IForwardModel(nn.Module):
                 detach=bool(getattr(self.memory, "short_entry_detach", True)) if self.memory is not None else True,
             )
             old_local_state_before_update = local_state
+            validation_render_only = bool(getattr(step, "validation_render_only", False))
             t0 = time.perf_counter()
             with self._nvtx_range("iforward/update"):
-                if self.is_v3_gru_history_gate:
+                delta = None
+                if bool(validation_render_only):
+                    update_aux = {
+                        "iforward/stage2_3/validation_render_only": 1.0,
+                        "iforward/stage2_3/update_skipped_for_final_all": 1.0,
+                    }
+                elif self.is_v3_gru_history_gate:
                     if history_ema is None:
                         raise RuntimeError("IForward-v3 history EMA is not initialized.")
                     history_gate = getattr(self, "history_gate", None)
@@ -2091,7 +2303,7 @@ class IForwardModel(nn.Module):
                     current_runtime = measurement.get("biggs_parent_runtime", biggs_parent_runtime)
                     skip_exit = bool(getattr(self, "stage2_0_biggs_skip_update_on_block_exit", True))
                     update_nonfinal = bool(getattr(self, "stage2_0_biggs_update_after_each_nonfinal_repeat", True))
-                    should_update_runtime = current_runtime is not None and (
+                    should_update_runtime = (not bool(validation_render_only)) and current_runtime is not None and (
                         (not bool(is_block_exit) and bool(update_nonfinal))
                         or (bool(is_block_exit) and not bool(skip_exit))
                     )
@@ -2112,6 +2324,50 @@ class IForwardModel(nn.Module):
                         1.0 if bool(should_update_runtime) else 0.0
                     )
                     timings["parent_runtime_update_ms"] += float(parent_runtime_update_step_ms)
+                if self.is_stage2_3_optimizer_mamba:
+                    parent_temporal = getattr(self, "parent_temporal_mamba", None)
+                    spatial_event = stage2_1_parent_block_cache.get("optimizer_spatial_event")
+                    fused_event = stage2_1_parent_block_cache.get("optimizer_fused_event")
+                    optimizer_keys = stage2_1_parent_block_cache.get("optimizer_keys")
+                    optimizer_write_requested = bool(
+                        getattr(step, "optimizer_memory_write", getattr(step, "update_optimizer_memory", False))
+                    )
+                    if bool(validation_render_only or stage2_3_mamba_off or stage2_3_mamba_freeze_write):
+                        optimizer_write_requested = False
+                    if (
+                        bool(optimizer_write_requested)
+                        and parent_temporal is not None
+                        and spatial_event is not None
+                        and optimizer_keys is not None
+                    ):
+                        delta_for_optimizer_write = None
+                        if bool(getattr(self, "stage2_3_include_delta_summary", True)):
+                            runtime_for_delta = biggs_parent_runtime
+                            if isinstance(measurement, dict):
+                                runtime_for_delta = runtime_for_delta or measurement.get("biggs_parent_runtime", None)
+                            delta_for_optimizer_write, delta_summary_aux = build_parent_delta_summary(
+                                delta=delta,
+                                runtime=runtime_for_delta,
+                                spatial_event=spatial_event,
+                                fail_fast=bool(getattr(self, "stage2_3_delta_summary_fail_fast", True)),
+                            )
+                            update_aux.update(
+                                {str(k): float(v) for k, v in delta_summary_aux.items() if isinstance(v, (int, float))}
+                            )
+                        parent_temporal_state, optimizer_write_aux = parent_temporal.write(
+                            spatial_event=spatial_event,
+                            fused_event=fused_event,
+                            state=parent_temporal_state,
+                            keys=optimizer_keys,
+                            visit_meta=VisitMeta.from_step(step),
+                            delta=delta_for_optimizer_write,
+                        )
+                        state.parent_temporal = parent_temporal_state
+                        update_aux.update(
+                            {str(k): float(v) for k, v in optimizer_write_aux.items() if isinstance(v, (int, float))}
+                        )
+                    else:
+                        update_aux["iforward/parent_optimizer_mamba/write_skipped"] = 1.0
                 if (self.is_stage2_1_parent_temporal or self.is_stage2_2_parent_temporal) and bool(is_block_exit):
                     parent_temporal = getattr(self, "parent_temporal_mamba", None)
                     commit_event = stage2_1_parent_block_cache.get("commit_event")
@@ -2162,7 +2418,11 @@ class IForwardModel(nn.Module):
             update_step_ms = (time.perf_counter() - t0) * 1000.0
             timings["update_ms"] += update_step_ms
             t0 = time.perf_counter()
-            reg_loss, reg_stats = self.bridge.delta_regularization(delta, local_state=local_state)
+            if delta is None:
+                reg_loss = local_state.bg.means.new_tensor(0.0)
+                reg_stats = {}
+            else:
+                reg_loss, reg_stats = self.bridge.delta_regularization(delta, local_state=local_state)
             delta_reg_step_ms = (time.perf_counter() - t0) * 1000.0
             timings["delta_reg_ms"] += delta_reg_step_ms
             reg_terms.append(reg_loss)
@@ -2183,6 +2443,7 @@ class IForwardModel(nn.Module):
                 "frame_gap": float(int(getattr(step, "frame_gap", 0))),
                 "temporal_read": float(1.0 if bool(getattr(step, "temporal_read", True)) else 0.0),
                 "temporal_commit": float(1.0 if bool(getattr(step, "temporal_commit", False)) else 0.0),
+                "validation_render_only": float(1.0 if bool(getattr(step, "validation_render_only", False)) else 0.0),
                 "physical_time_advance": float(
                     1.0 if bool(getattr(step, "physical_time_advance", False)) else 0.0
                 ),
@@ -2222,6 +2483,7 @@ class IForwardModel(nn.Module):
         timings["final_render_ms"] += (time.perf_counter() - t0) * 1000.0
         is_sequence10_scheduler = str(getattr(resolved, "scheduler_version", "")) == IFORWARD_SEQUENCE10_SCHEDULER_VERSION
         is_stage2_2_scheduler = str(getattr(resolved, "scheduler_version", "")) == IFORWARD_STAGE2_2_SCHEDULER_VERSION
+        is_stage2_3_scheduler = str(getattr(resolved, "scheduler_version", "")) == IFORWARD_STAGE2_3_SCHEDULER_VERSION
         sequence10_bank = getattr(state, "sequence10_bank", None)
         if bool(is_sequence10_scheduler):
             if not isinstance(sequence10_bank, Sequence10HistoryBank):
@@ -2243,6 +2505,16 @@ class IForwardModel(nn.Module):
         stage2_2_bank_damage_loss = local_state.bg.means.new_tensor(0.0)
         stage2_2_bank_damage_num_pos = 0.0
         stage2_2_damage_stats: Dict[str, float] = {}
+        stage2_3_bank = getattr(state, "stage2_3_bank", None)
+        if bool(is_stage2_3_scheduler):
+            if not isinstance(stage2_3_bank, EpisodeHistoryBankV3):
+                stage2_3_bank = EpisodeHistoryBankV3.empty(device=self.device)
+        stage2_3_per_pos_loss: Dict[int, torch.Tensor] = {}
+        stage2_3_after_by_pos = local_state.bg.means.new_zeros((0,))
+        stage2_3_after_valid = torch.zeros((0,), device=local_state.bg.means.device, dtype=torch.bool)
+        stage2_3_bank_damage_loss = local_state.bg.means.new_tensor(0.0)
+        stage2_3_bank_damage_num_pos = 0.0
+        stage2_3_damage_stats: Dict[str, float] = {}
         if bool(is_sequence10_scheduler):
             sequence10_per_pos_loss, sequence10_after_by_pos, sequence10_after_valid = (
                 self._sequence10_current_per_pos_loss_from_final_pack(
@@ -2253,6 +2525,12 @@ class IForwardModel(nn.Module):
             )
         if bool(is_stage2_2_scheduler):
             stage2_2_per_pos_loss, stage2_2_after_by_pos, stage2_2_after_valid = self._stage2_2_per_pos_loss(
+                resolved=resolved,
+                final_pack=final_render_pack,
+                ref=local_state.bg.means,
+            )
+        if bool(is_stage2_3_scheduler):
+            stage2_3_per_pos_loss, stage2_3_after_by_pos, stage2_3_after_valid = self._stage2_3_per_pos_loss(
                 resolved=resolved,
                 final_pack=final_render_pack,
                 ref=local_state.bg.means,
@@ -2350,6 +2628,22 @@ class IForwardModel(nn.Module):
             )
             stage2_2_bank_damage_num_pos = float(stage2_2_damage_stats.get("stage2_2/best_damage_num_pos", 0.0))
             history_damage_loss = history_damage_loss + stage2_2_bank_damage_loss
+        stage2_3_phase = str((getattr(resolved, "meta", {}) or {}).get("scheduler_phase", ""))
+        if (
+            bool(is_stage2_3_scheduler)
+            and stage2_3_phase == "repair"
+            and isinstance(stage2_3_bank, EpisodeHistoryBankV3)
+            and float(history_damage_weight) > 0.0
+        ):
+            stage2_3_bank_damage_loss, stage2_3_damage_stats = history_damage_hinge_v3(
+                repair_losses=stage2_3_after_by_pos,
+                bank=stage2_3_bank,
+                positions=range(int(stage2_3_after_by_pos.numel())),
+                valid=stage2_3_after_valid,
+                margin=float(getattr(self, "loss_history_damage_margin", 0.0)),
+            )
+            stage2_3_bank_damage_num_pos = float(stage2_3_damage_stats.get("stage2_3/best_damage_num_pos", 0.0))
+            history_damage_loss = history_damage_loss + stage2_3_bank_damage_loss
         final_losses["delta_regularization"] = delta_reg
         final_losses["hsp_damage_loss"] = hsp_damage_loss
         final_losses["hgv2_gate"] = hgv2_gate_loss
@@ -2373,6 +2667,17 @@ class IForwardModel(nn.Module):
                     rollout_id=int(getattr(resolved, "rollout_id_global", -1)),
                 )
             next_stage2_2_bank = next_stage2_2_bank.detach()
+        next_stage2_3_bank = stage2_3_bank
+        if bool(is_stage2_3_scheduler) and isinstance(next_stage2_3_bank, EpisodeHistoryBankV3):
+            for pos, loss_value in stage2_3_per_pos_loss.items():
+                psnr = -10.0 * torch.log10(loss_value.detach().clamp_min(1.0e-8))
+                next_stage2_3_bank = next_stage2_3_bank.update(
+                    sequence_pos=int(pos),
+                    loss=loss_value,
+                    psnr=psnr,
+                    rollout_id=int(getattr(resolved, "rollout_id_global", -1)),
+                )
+            next_stage2_3_bank = next_stage2_3_bank.detach()
 
         next_history_gradient_bank = None
         if self.is_v3_gru_history_gate and bool(getattr(self, "history_gate_v2_enabled", False)):
@@ -2458,17 +2763,66 @@ class IForwardModel(nn.Module):
             parent_temporal=parent_temporal_state,
             sequence10_bank=next_sequence10_bank,
             stage2_2_bank=next_stage2_2_bank,
+            stage2_3_bank=next_stage2_3_bank,
             node_state_bg=state.node_state_bg,
             node_state_distant=state.node_state_distant,
             node_state_rigid=state.node_state_rigid,
         )
         memory_tokens = memory_state.count_tokens() if hasattr(memory_state, "count_tokens") else {}
-        if (self.is_stage2_1_parent_temporal or self.is_stage2_2_parent_temporal) and parent_temporal_state is not None:
+        if (
+            self.is_stage2_1_parent_temporal
+            or self.is_stage2_2_parent_temporal
+            or self.is_stage2_3_optimizer_mamba
+        ) and parent_temporal_state is not None:
             memory_tokens = {**memory_tokens, **parent_temporal_state.count_tokens()}
         if self.is_v3_gru_history_gate and history_ema is not None:
             memory_tokens = {**memory_tokens, **history_ema.count_tokens()}
         if isinstance(next_stage2_2_bank, EpisodeHistoryBankV2):
             memory_tokens = {**memory_tokens, **next_stage2_2_bank.count_tokens()}
+        if isinstance(next_stage2_3_bank, EpisodeHistoryBankV3):
+            memory_tokens = {**memory_tokens, **next_stage2_3_bank.count_tokens()}
+        resolved_meta = dict(getattr(resolved, "meta", {}) or {})
+        repeat0_steps = [step for step in list(resolved.steps or []) if int(getattr(step, "repeat_idx", 0)) == 0]
+        actual_blocks_per_rollout = int(
+            resolved_meta.get(
+                "actual_blocks_per_rollout",
+                len(repeat0_steps) if repeat0_steps else (len(resolved.window_block_ids) if resolved.window_block_ids else 0),
+            )
+        )
+        stage2_3_rollout_positions = [
+            int(x)
+            for x in list(
+                resolved_meta.get(
+                    "rollout_positions",
+                    resolved_meta.get("sequence_positions", [int(getattr(step, "sequence_pos", -1)) for step in repeat0_steps]),
+                )
+                or []
+            )
+        ]
+        stage2_3_repeat_budgets = [
+            int(x)
+            for x in list(
+                resolved_meta.get("repeat_budgets", [int(getattr(step, "repeat_budget", 1)) for step in repeat0_steps])
+                or []
+            )
+        ]
+        stage2_3_frame_gaps = [
+            int(x)
+            for x in list(
+                resolved_meta.get("frame_gaps", [int(getattr(step, "frame_gap", 0)) for step in list(resolved.steps or [])])
+                or []
+            )
+        ]
+        stage2_3_visit_kind_to_id = {"bootstrap": 0, "assimilate": 1, "assimilation": 1, "repair": 2, "repeat_stability": 3}
+        stage2_3_visit_kind_ids = [
+            int(stage2_3_visit_kind_to_id.get(str(getattr(step, "visit_kind", "")), -1))
+            for step in list(resolved.steps or [])
+        ]
+        stage2_3_visit_kind_id_mean = (
+            float(sum(stage2_3_visit_kind_ids)) / float(len(stage2_3_visit_kind_ids))
+            if stage2_3_visit_kind_ids
+            else 0.0
+        )
         stats: Dict[str, Any] = {
             **final_stats,
             "inner_K": int(resolved.inner_K),
@@ -2481,7 +2835,7 @@ class IForwardModel(nn.Module):
             "window_revisit_count": int(resolved.window_revisit_count),
             "unique_windows_seen": int(resolved.unique_windows_seen),
             "is_repeated_window": bool(resolved.is_repeated_window),
-            "blocks_per_rollout": int(len(resolved.window_block_ids)) if resolved.window_block_ids else 0,
+            "blocks_per_rollout": int(actual_blocks_per_rollout),
             "repeats_per_block": int(resolved.steps[0].repeats_per_block) if resolved.steps else 0,
             "num_source_views": int(len(resolved.source_refs)),
             "num_targets": int(len(resolved.target_refs)),
@@ -2585,6 +2939,71 @@ class IForwardModel(nn.Module):
                 float((final_losses["current"] + float(self.loss_in_rollout_history_weight) * final_losses["in_rollout_history"]).detach().item())
                 if bool(is_stage2_2_scheduler)
                 else 0.0
+            ),
+            "stage2_3/best_damage_loss": (
+                float(stage2_3_bank_damage_loss.detach().item())
+                if bool(is_stage2_3_scheduler) and stage2_3_phase == "repair" and stage2_3_bank_damage_loss.numel()
+                else 0.0
+            ),
+            "stage2_3/best_damage_num_pos": (
+                float(stage2_3_bank_damage_num_pos) if str(stage2_3_phase) == "repair" else 0.0
+            ),
+            "stage2_3/best_damage_p90": float(stage2_3_damage_stats.get("stage2_3/best_damage_p90", 0.0)),
+            "stage2_3/best_damage_max": float(stage2_3_damage_stats.get("stage2_3/best_damage_max", 0.0)),
+            "stage2_3/bank_valid_count": (
+                float(sum(1 for item in getattr(next_stage2_3_bank, "entries", {}).values() if bool(getattr(item, "seen", False))))
+                if isinstance(next_stage2_3_bank, EpisodeHistoryBankV3)
+                else 0.0
+            ),
+            "stage2_3/bank_update_count": float(len(stage2_3_per_pos_loss)),
+            "stage2_3/current_raw": (
+                float(final_losses["current"].detach().item()) if bool(is_stage2_3_scheduler) else 0.0
+            ),
+            "stage2_3/history_raw": (
+                float(final_losses["in_rollout_history"].detach().item()) if bool(is_stage2_3_scheduler) else 0.0
+            ),
+            "stage2_3/monitor_fixed_objective": (
+                float((final_losses["current"] + float(self.loss_in_rollout_history_weight) * final_losses["in_rollout_history"]).detach().item())
+                if bool(is_stage2_3_scheduler)
+                else 0.0
+            ),
+            "iforward/stage2_3/phase": stage2_3_phase if bool(is_stage2_3_scheduler) else "",
+            "iforward/stage2_3/rollout_phase": str(resolved_meta.get("rollout_phase", "")) if bool(is_stage2_3_scheduler) else "",
+            "iforward/stage2_3/rollout_positions": stage2_3_rollout_positions if bool(is_stage2_3_scheduler) else [],
+            "iforward/stage2_3/episode_positions": (
+                [int(x) for x in list(resolved_meta.get("episode_positions", resolved.window_block_ids or []) or [])]
+                if bool(is_stage2_3_scheduler)
+                else []
+            ),
+            "iforward/stage2_3/history_positions": (
+                [int(x) for x in list(resolved_meta.get("history_positions", []) or [])] if bool(is_stage2_3_scheduler) else []
+            ),
+            "iforward/stage2_3/repair_positions": (
+                [int(x) for x in list(resolved_meta.get("repair_positions", []) or [])] if bool(is_stage2_3_scheduler) else []
+            ),
+            "iforward/stage2_3/repeat_budgets": stage2_3_repeat_budgets if bool(is_stage2_3_scheduler) else [],
+            "iforward/stage2_3/frame_gaps": stage2_3_frame_gaps if bool(is_stage2_3_scheduler) else [],
+            "iforward/stage2_3/visit_kinds": (
+                [str(x) for x in list(resolved_meta.get("visit_kinds", [str(getattr(step, "visit_kind", "")) for step in list(resolved.steps or [])]) or [])]
+                if bool(is_stage2_3_scheduler)
+                else []
+            ),
+            "iforward/stage2_3/visit_kind_id_mean": (
+                float(stage2_3_visit_kind_id_mean) if bool(is_stage2_3_scheduler) else 0.0
+            ),
+            "iforward/stage2_3/repair_round_idx": (
+                int(resolved_meta.get("repair_round_idx", -1)) if bool(is_stage2_3_scheduler) else -1
+            ),
+            "iforward/stage2_3/repair_pattern_name": (
+                str(resolved_meta.get("repair_pattern_name", "")) if bool(is_stage2_3_scheduler) else ""
+            ),
+            "iforward/stage2_3/actual_blocks_per_rollout": (
+                int(actual_blocks_per_rollout) if bool(is_stage2_3_scheduler) else 0
+            ),
+            "iforward/stage2_3/sequence_length": (
+                int(resolved_meta.get("sequence_length", getattr(resolved, "episode_num_blocks", 0)))
+                if bool(is_stage2_3_scheduler)
+                else 0
             ),
             "hgv2/enabled": bool(getattr(self, "history_gate_v2_enabled", False)),
             "hgv2/bank_valid": (

@@ -367,6 +367,7 @@ class AssetPreloadManagerV2:
             "v9_role_refs",
             "stage2_2_current_rollout_view_pack",
             "stage2_2_next_rollout_view_pack",
+            "stage2_3_current_rollout_view_pack",
         ):
             if self._cfg.warm_next_block_exact:
                 for ref in refs:
@@ -377,7 +378,7 @@ class AssetPreloadManagerV2:
             if self._cfg.warm_episode_source_superset:
                 for ref in refs:
                     self.submit_view_meta(PRIORITY_EPISODE_SUPERSET, scene_id, segment_id, ref, meta={})
-        elif hint_scope in ("episode_chain_exact", "stage2_2_next_episode_segment_static"):
+        elif hint_scope in ("episode_chain_exact", "stage2_2_next_episode_segment_static", "stage2_3_episode_chain_exact"):
             if self._cfg.warm_episode_chain_exact:
                 for ref in refs:
                     self.submit_view_meta(PRIORITY_EPISODE_SUPERSET, scene_id, segment_id, ref, meta={})

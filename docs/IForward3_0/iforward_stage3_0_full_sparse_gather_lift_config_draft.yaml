@@ -1,0 +1,68 @@
+model:
+  iforward:
+    version: stage3_0_full_sparse_gather_lift
+
+    lifting:
+      type: full_sparse_gather
+      disable_fwhr_feature_backproject: true
+      scalar_anchor_backend: cuda_scalar_anchor
+      context_dim: 48
+      detail_dim: 8
+
+      parent_gather:
+        num_taps: 5
+        offset_scale: 0.5
+        max_offset_px: 8.0
+        query_dim: 96
+        use_optimizer_prior: true
+        use_geometry_pe: true
+        chunk_size: 32768
+        offset_init: zero
+        center_tap_bias: 2.0
+
+      child_gather:
+        num_taps: 5
+        offset_scale: 0.75
+        max_offset_px: 8.0
+        query_dim: 128
+        use_parent_event: true
+        use_geometry_pe: true
+        center_by_parent: true
+        chunk_size: 65536
+        offset_init: zero
+        center_tap_bias: 2.0
+
+      scalar_anchor:
+        return_child_view_support: true
+        return_parent_view_support: true
+        support_threshold:
+          parent: 1.0e-4
+          child: 1.0e-4
+        detach_geometry: true
+
+      regularization:
+        offset_l2: 1.0e-4
+        out_of_bounds: 1.0e-3
+        view_entropy_min_weight: 0.0
+        tap_entropy_min_weight: 0.0
+
+      training_schedule:
+        fixed_center_steps: 1000
+        train_weights_steps: 3000
+        offset_warmup_steps: 5000
+        offset_scale_start: 0.1
+
+      debug:
+        shadow_fwhr: false
+        log_gather_stats: true
+
+validation:
+  stage3_0:
+    enable: true
+    compare_to_fwhr_baseline: true
+    log_offset_histograms: true
+    protocols:
+      - current_b1r4
+      - sequence10_causal
+      - repair
+      - repeat_stability

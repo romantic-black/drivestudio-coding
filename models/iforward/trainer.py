@@ -96,6 +96,7 @@ class IForwardTrainer(nn.Module):
             "stage2_0_fwhr_lift_grld_dinov2base",
             "stage2_1_fwhr_parent_ptv3_temporal_mamba",
             "stage2_2_stream10_rawframe_temporal_mamba_v2",
+            "iforward_2_3_optimizer_mamba",
         }
 
     def _is_stage2_1_parent_temporal(self) -> bool:
@@ -107,6 +108,7 @@ class IForwardTrainer(nn.Module):
         return str(cfg_get(iforward_cfg, "version", "")) in {
             "stage2_1_fwhr_parent_ptv3_temporal_mamba",
             "stage2_2_stream10_rawframe_temporal_mamba_v2",
+            "iforward_2_3_optimizer_mamba",
         }
 
     def _is_v3_gru_history_gate(self) -> bool:

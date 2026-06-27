@@ -8,6 +8,7 @@ from datasets.train_scheduler_iforward_sequence10 import (
     TrainSchedulerIForwardSequence10,
 )
 from datasets.iforward_stage2_2.scheduler import IFORWARD_STAGE2_2_SCHEDULER_VERSION, Stage22Scheduler
+from datasets.iforward_stage2_3.scheduler import IFORWARD_STAGE2_3_SCHEDULER_VERSION, Stage23Scheduler
 
 
 def _cfg_get(node: Any, key: str, default: Any = None) -> Any:
@@ -32,6 +33,16 @@ def _null_int(x: Any) -> Optional[int]:
 
 def resolve_fixed_scene_segment_iforward(cfg: Any) -> Tuple[Optional[int], Optional[int]]:
     sched22 = cfg.get("scheduler_stage2_2") if hasattr(cfg, "get") else None
+    sched23 = cfg.get("scheduler_v3") if hasattr(cfg, "get") else None
+    if (
+        sched23 is not None
+        and bool(_cfg_get(sched23, "enable", False))
+        and str(_cfg_get(sched23, "version", "")) == "optimizer_sequence_v1"
+    ):
+        traversal23 = _cfg_get(sched23, "traversal", {}) or {}
+        return _null_int(_cfg_get(traversal23, "fixed_scene_id", None)), _null_int(
+            _cfg_get(traversal23, "fixed_segment_id", None)
+        )
     if sched22 is not None and bool(_cfg_get(sched22, "enable", False)):
         traversal22 = _cfg_get(sched22, "traversal", {}) or {}
         return _null_int(_cfg_get(traversal22, "fixed_scene_id", None)), _null_int(
@@ -47,7 +58,47 @@ def resolve_fixed_scene_segment_iforward(cfg: Any) -> Tuple[Optional[int], Optio
 def build_train_scheduler_iforward_from_cfg(
     cfg: Any,
     dataset: Any,
-) -> TrainSchedulerIForward | TrainSchedulerIForwardSequence10 | Stage22Scheduler:
+) -> TrainSchedulerIForward | TrainSchedulerIForwardSequence10 | Stage22Scheduler | Stage23Scheduler:
+    sched23 = cfg.get("scheduler_v3") if hasattr(cfg, "get") else None
+    if (
+        sched23 is not None
+        and bool(_cfg_get(sched23, "enable", False))
+        and str(_cfg_get(sched23, "version", "")) == "optimizer_sequence_v1"
+    ):
+        legacy = cfg.get("scheduler_iforward") if hasattr(cfg, "get") else None
+        sched22_legacy = cfg.get("scheduler_stage2_2") if hasattr(cfg, "get") else None
+        if legacy is not None and bool(_cfg_get(legacy, "enable", False)):
+            raise ValueError("scheduler_v3 optimizer_sequence_v1 forbids enabled legacy scheduler_iforward")
+        if sched22_legacy is not None and bool(_cfg_get(sched22_legacy, "enable", False)):
+            raise ValueError("scheduler_v3 optimizer_sequence_v1 forbids enabled scheduler_stage2_2")
+        index_dir = str(_cfg_get(sched23, "index_dir", "") or "")
+        if not index_dir:
+            raise ValueError("scheduler_v3.index_dir is required; build it with tools/build_iforward_stage2_3_index.py")
+        fixed_scene_id, fixed_segment_id = resolve_fixed_scene_segment_iforward(cfg)
+        from tools.train_minimal_streetforward_stage4_3_v7_common import (
+            parse_include_test,
+            validate_train_scene_for_fixed,
+        )
+
+        validate_train_scene_for_fixed(cfg, fixed_scene_id)
+        include_test = parse_include_test(cfg)
+        return Stage23Scheduler(
+            dataset=dataset,
+            cfg=cfg,
+            index_dir=index_dir,
+            traversal_cfg=dict(_cfg_get(sched23, "traversal", {}) or {}),
+            bootstrap_cfg=dict(_cfg_get(sched23, "bootstrap", {}) or {}),
+            sequence_cfg=dict(_cfg_get(sched23, "sequence", {}) or {}),
+            assimilation_cfg=dict(_cfg_get(sched23, "assimilation", {}) or {}),
+            repair_cfg=dict(_cfg_get(sched23, "repair", {}) or {}),
+            loss_cfg=dict(_cfg_get(sched23, "loss", {}) or {}),
+            producer_cfg=dict(_cfg_get(sched23, "producer", {}) or {}),
+            include_test=bool(include_test),
+            fixed_scene_id=fixed_scene_id,
+            fixed_segment_id=fixed_segment_id,
+            seed=_cfg_get(_cfg_get(sched23, "traversal", {}) or {}, "seed", None),
+            fail_fast=bool(_cfg_get(sched23, "fail_fast", True)),
+        )
     sched22 = cfg.get("scheduler_stage2_2") if hasattr(cfg, "get") else None
     if sched22 is not None and bool(_cfg_get(sched22, "enable", False)):
         legacy = cfg.get("scheduler_iforward") if hasattr(cfg, "get") else None
