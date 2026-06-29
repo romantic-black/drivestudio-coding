@@ -329,6 +329,42 @@ def test_fusion_extractor_cached_backbone_intermediates_keep_adapter_grad(fake_t
     assert backbone_grad == 0.0
 
 
+def test_dino_backbone_cache_can_adapt_native_token_grid_16d(fake_timm):
+    _ = fake_timm
+    extractor = DINOv2ResidualConcatExtractor(
+        dino_model_name="vit_base_patch14_reg4_dinov2",
+        dino_pretrained=False,
+        dino_out_channels=16,
+        residual_feat_channels=8,
+        residual_base_channels=8,
+        normalize_dino="fixed_layernorm",
+    )
+    x = torch.randn(2, 6, 28, 42)
+    feats = extractor.extract_dino_backbone_intermediates(x[:, :3])
+    native_hw = (int(feats[-1].shape[-2]), int(feats[-1].shape[-1]))
+    assert native_hw == (2, 3)
+    cache = DINOFeatureCache(dtype="float16", cpu_pinned=False, cpu_max_items=1, gpu_max_items=1)
+    cached, stats_miss = cache.get_or_compute(
+        key=("native", 0),
+        device=torch.device("cpu"),
+        compute=lambda: feats,
+        trainable=False,
+    )
+    cached_again, stats_hit = cache.get_or_compute(
+        key=("native", 0),
+        device=torch.device("cpu"),
+        compute=lambda: feats,
+        trainable=False,
+    )
+    assert stats_miss.miss == 1.0
+    assert stats_hit.hit_l1 == 1.0
+    assert isinstance(cached, tuple)
+    assert isinstance(cached_again, tuple)
+    native = extractor.adapt_dino_backbone_intermediates(cached_again, target_hw=native_hw)
+    assert tuple(native.shape) == (2, 2, 3, 16)
+    assert native.requires_grad is False
+
+
 def test_dino_feature_cache_lru_and_trainable_guard() -> None:
     cache = DINOFeatureCache(dtype="float16", cpu_pinned=False, cpu_max_items=1, gpu_max_items=1)
     calls = {"n": 0}

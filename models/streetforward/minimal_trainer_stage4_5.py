@@ -230,6 +230,7 @@ class MinimalStreetForwardStage4_5(MinimalStreetForwardStage4_2):
         cache = getattr(self, "dino_feature_cache", None)
         extractor = self.image_feature_extractor
         fwhr_detail_2d = None
+        stage3_dino_native_2d = None
         fwhr_aux_stats: Dict[str, float] = {}
         if (
             dino_cache_key is not None
@@ -269,6 +270,19 @@ class MinimalStreetForwardStage4_5(MinimalStreetForwardStage4_2):
                 )
                 if not isinstance(cached_dino, tuple):
                     raise RuntimeError("DINO backbone_intermediate cache expected a tuple of intermediate tensors")
+                if bool(getattr(self, "stage3_dino_native_enabled", False)):
+                    native_hw = (int(cached_dino[-1].shape[-2]), int(cached_dino[-1].shape[-1]))
+                    stage3_dino_native_2d = extractor.adapt_dino_backbone_intermediates(
+                        cached_dino,
+                        target_hw=native_hw,
+                    )
+                    expected_c = int(getattr(self, "stage3_dino_native_dim", int(stage3_dino_native_2d.shape[-1])))
+                    if int(stage3_dino_native_2d.shape[-1]) != expected_c:
+                        raise ValueError(
+                            "Stage3 DINO native channel mismatch: "
+                            f"got {int(stage3_dino_native_2d.shape[-1])}, expected {expected_c}"
+                        )
+                    fwhr_aux_stats["iforward/cnn/stage3_dino_native_feat_mb"] = _tensor_mb(stage3_dino_native_2d)
                 dino_feat = extractor.adapt_dino_backbone_intermediates(cached_dino, target_hw=target_hw)
             else:
                 dino_feat, stats = cache.get_or_compute(
@@ -327,6 +341,7 @@ class MinimalStreetForwardStage4_5(MinimalStreetForwardStage4_2):
         return {
             "features_2d": features_2d,
             "fwhr_detail_2d": fwhr_detail_2d,
+            "stage3_dino_native_2d": stage3_dino_native_2d,
             "source_pair_valid_mask": source_pair_valid_mask,
             "dino_cache_stats": dino_cache_stats,
             "cnn_perf_stats": {**cnn_perf_stats, **fwhr_aux_stats},

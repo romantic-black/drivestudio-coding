@@ -225,11 +225,16 @@ class AlphaTWeightExtractorV3(AlphaTWeightExtractorV2):
         means2d = meta["means2d"]
         conics = meta["conics"]
         opacities = meta["opacities"]
+        camera_ids = meta.get("camera_ids", None)
+        depths = meta.get("depths", None)
+        radii = meta.get("radii", None)
         packed_global_ids = meta.get("gaussian_ids", None)
         if packed_global_ids is None:
             raise ValueError("Packed render meta missing gaussian_ids for multi-camera path.")
         if packed_global_ids.dtype != torch.int64:
             packed_global_ids = packed_global_ids.to(torch.int64)
+        if camera_ids is not None and camera_ids.dtype != torch.int64:
+            camera_ids = camera_ids.to(torch.int64)
 
         flatten_ids = meta["flatten_ids"]
         tile_offsets = meta["isect_offsets"]
@@ -250,6 +255,9 @@ class AlphaTWeightExtractorV3(AlphaTWeightExtractorV2):
             "means2d": means2d,
             "conics": conics,
             "opacities": opacities,
+            "camera_ids": camera_ids,
+            "depths": depths,
+            "radii": radii,
             "packed_global_gaussian_ids": packed_global_ids,
             "flatten_ids": flatten_ids,
             "isect_offsets": tile_offsets,

@@ -34,6 +34,18 @@ from models.iforward.biggs_state import BigGSBlockRuntime, IForwardBigGSState
 from models.iforward.dino_feature_cache import DINOFeatureCache
 from models.iforward.fwhr_lift import aggregate_fwhr_child_lift
 from models.iforward.parent_spatial_backbone import ParentStructInput, empty_parent_struct_input
+from models.iforward.stage3_0 import (
+    GatherConfig,
+    ParentContextFusion,
+    ParentQueryBuilder,
+    SparseGatherLift,
+    build_cuda_scalar_anchor_stats,
+    build_projected_meta_anchor_stats,
+    center_child_detail_by_parent,
+    support_center_sparse_gather,
+)
+from models.iforward.stage3_0.losses import merge_stage3_reg_terms
+from models.iforward.stage3_0.sparse_grid_sample import prepare_value_nchw
 from models.streetforward.minimal_trainer_stage4_0 import spatial_hw_from_image_tensor
 from models.streetforward.minimal_trainer_stage5_4 import MinimalStreetForwardStage5_4
 from models.streetforward.node_states import NodeStateBackground, NodeStateDistant, NodeStateRigid
@@ -73,6 +85,7 @@ from models.streetforward.stage6_0.vsm import Stage6QueryPred, masked_smooth_l1
 
 
 logger = logging.getLogger(__name__)
+IFORWARD_STAGE3_0_VERSION = "stage3_0_full_sparse_gather_lift"
 
 
 def _to_plain_dict(node: Any) -> Dict[str, Any]:
@@ -152,6 +165,30 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         peak = float(torch.cuda.max_memory_allocated() / (1024.0 ** 3))
         extras = " ".join(f"{k}={v}" for k, v in extra.items())
         logger.info("STAGE6_MEM %s alloc_gb=%.3f reserved_gb=%.3f peak_gb=%.3f %s", label, alloc, reserved, peak, extras)
+
+    def _stage3_0_memory_aux_enabled(self) -> bool:
+        if not bool(getattr(self, "stage3_0_enabled", False)) or not torch.cuda.is_available():
+            return False
+        lifting_cfg = getattr(self, "stage3_0_lifting_cfg", {}) or {}
+        default_interval = int(self._cfg_get(lifting_cfg, "gather_aux_interval", 100))
+        interval = int(self._cfg_get(lifting_cfg, "memory_aux_interval", default_interval))
+        if interval <= 0:
+            return False
+        global_step = int(getattr(self, "stage3_0_global_step", 0))
+        return bool(global_step % int(interval) == 0)
+
+    def _stage3_0_memory_aux(self, label: str, *, include_step_max: bool = False) -> Dict[str, float]:
+        if not self._stage3_0_memory_aux_enabled():
+            return {}
+        prefix = f"iforward/stage3/mem_{label}"
+        out = {
+            f"{prefix}_allocated_mb": float(torch.cuda.memory_allocated() / (1024.0 ** 2)),
+            f"{prefix}_reserved_mb": float(torch.cuda.memory_reserved() / (1024.0 ** 2)),
+            f"{prefix}_max_allocated_mb": float(torch.cuda.max_memory_allocated() / (1024.0 ** 2)),
+        }
+        if bool(include_step_max):
+            out["iforward/stage3/mem_step_max_allocated_mb"] = out[f"{prefix}_max_allocated_mb"]
+        return out
 
     def _compat_stage5_4_config(self, config: Any) -> Any:
         cfg = copy.deepcopy(config)
@@ -374,6 +411,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "stage2_1_fwhr_parent_ptv3_temporal_mamba",
             "stage2_2_stream10_rawframe_temporal_mamba_v2",
             "iforward_2_3_optimizer_mamba",
+            IFORWARD_STAGE3_0_VERSION,
         }
         if bool(biggs_enabled):
             if bool(self._cfg_get(biggs_cfg, "enable", True)) is not True:
@@ -386,8 +424,43 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 raise ValueError("stage2_0_biggs_parent_lifting requires adc_lite.enable=false")
             observe_cfg = self._cfg_get(biggs_cfg, "observe", {}) or {}
             lifting_cfg = self._cfg_get(biggs_cfg, "lifting", {}) or {}
+            stage3_enabled = ifwd_version == IFORWARD_STAGE3_0_VERSION
+            if bool(stage3_enabled):
+                stage3_lifting = self._cfg_get(iforward_cfg, "lifting", None)
+                if stage3_lifting is None:
+                    raise ValueError("Stage3_0 requires model.iforward.lifting.")
+                if str(self._cfg_get(stage3_lifting, "type", "")).lower() != "full_sparse_gather":
+                    raise ValueError("Stage3_0 requires model.iforward.lifting.type=full_sparse_gather.")
+                if str(self._cfg_get(lifting_cfg, "type", "")).lower() == "fwhr":
+                    raise ValueError("Stage3_0 forbids legacy model.iforward.biggs.lifting.type=fwhr.")
+                backend = str(self._cfg_get(stage3_lifting, "scalar_anchor_backend", "cuda_scalar_anchor")).lower()
+                if backend not in {"projected_meta", "cuda_scalar_anchor"}:
+                    raise ValueError(f"unsupported Stage3_0 scalar_anchor_backend={backend!r}")
+                parent_lift_cfg = self._cfg_get(stage3_lifting, "parent", {}) or {}
+                parent_lift_type = str(self._cfg_get(parent_lift_cfg, "type", "legacy_direct_lift")).lower()
+                if parent_lift_type not in {"legacy_direct_lift", "sparse_gather"}:
+                    raise ValueError(f"unsupported Stage3_0 parent.type={parent_lift_type!r}")
+                dino_native_cfg = self._cfg_get(stage3_lifting, "dino_native", {}) or {}
+                if parent_lift_type == "legacy_direct_lift" and bool(self._cfg_get(dino_native_cfg, "enable", False)):
+                    raise ValueError("Stage3_0 parent.type=legacy_direct_lift forbids dino_native.enable=true.")
+                if bool(self._cfg_get(dino_native_cfg, "enable", False)):
+                    dino_cache_cfg = (
+                        self._cfg_get(
+                            self._cfg_get(self._cfg_get(model_cfg, "feature_extractor", {}) or {}, "dino", {}) or {},
+                            "cache",
+                            {},
+                        )
+                        or {}
+                    )
+                    if not bool(self._cfg_get(dino_cache_cfg, "enable", False)):
+                        raise ValueError("Stage3_0 dino_native.enable=true requires feature_extractor.dino.cache.enable=true.")
+                    if str(self._cfg_get(dino_cache_cfg, "level", "")).lower() != "backbone_intermediate":
+                        raise ValueError(
+                            "Stage3_0 dino_native.enable=true requires "
+                            "feature_extractor.dino.cache.level=backbone_intermediate."
+                        )
             is_fwhr = str(self._cfg_get(lifting_cfg, "type", "")).lower() == "fwhr"
-            if not bool(is_fwhr) and bool(self._cfg_get(observe_cfg, "parent_scene_for_lifting", True)) is not True:
+            if not bool(stage3_enabled) and not bool(is_fwhr) and bool(self._cfg_get(observe_cfg, "parent_scene_for_lifting", True)) is not True:
                 raise ValueError("stage2_0_biggs_parent_lifting requires parent_scene_for_lifting=true")
             skip_cfg = self._cfg_get(biggs_cfg, "child_observation_skip", {}) or {}
             if bool(self._cfg_get(skip_cfg, "enable", False)) and (
@@ -411,6 +484,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "stage2_1_fwhr_parent_ptv3_temporal_mamba",
             "stage2_2_stream10_rawframe_temporal_mamba_v2",
             "iforward_2_3_optimizer_mamba",
+            IFORWARD_STAGE3_0_VERSION,
         }
         if bool(self._cfg_get(base_measurement, "require_obs_code", True)) is not True and not is_stage2_1_parent_temporal:
             raise ValueError("Stage6_0 Phase A requires V4 obs_code.")
@@ -906,6 +980,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 "stage2_1_fwhr_parent_ptv3_temporal_mamba",
                 "stage2_2_stream10_rawframe_temporal_mamba_v2",
                 "iforward_2_3_optimizer_mamba",
+                IFORWARD_STAGE3_0_VERSION,
             }
             and bool(self._cfg_get(biggs_cfg, "enable", True))
         )
@@ -1112,11 +1187,13 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "stage2_1_fwhr_parent_ptv3_temporal_mamba",
             "stage2_2_stream10_rawframe_temporal_mamba_v2",
             "iforward_2_3_optimizer_mamba",
+            IFORWARD_STAGE3_0_VERSION,
         }
         self.stage2_1_parent_temporal_enabled = ifwd_version in {
             "stage2_1_fwhr_parent_ptv3_temporal_mamba",
             "stage2_2_stream10_rawframe_temporal_mamba_v2",
             "iforward_2_3_optimizer_mamba",
+            IFORWARD_STAGE3_0_VERSION,
         }
         self.stage2_0_biggs_cfg = dict(biggs_cfg or {})
         self.stage2_0_biggs_assignment_cfg = self._cfg_get(biggs_cfg, "assignment", {}) or {}
@@ -1124,6 +1201,11 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         self.stage2_0_biggs_parent_state_cfg = self._cfg_get(biggs_cfg, "parent_state", {}) or {}
         self.stage2_0_biggs_observe_cfg = self._cfg_get(biggs_cfg, "observe", {}) or {}
         self.stage2_0_biggs_lifting_cfg = self._cfg_get(biggs_cfg, "lifting", {}) or {}
+        self.stage3_0_enabled = ifwd_version == IFORWARD_STAGE3_0_VERSION
+        self.stage3_0_lifting_cfg = self._cfg_get(iforward_cfg, "lifting", {}) or {}
+        self.stage3_0_gather_reg_terms: Dict[str, torch.Tensor] = {}
+        self.stage3_0_last_aux: Dict[str, float] = {}
+        self.stage3_0_global_step = 0
         detail_support_cfg = self._cfg_get(self.stage2_0_biggs_lifting_cfg, "detail_support_min", {}) or {}
         self.stage2_0_fwhr_detail_support_min = {
             "bg": float(self._cfg_get(detail_support_cfg, "bg", getattr(self, "bg_src_backproject_support_min", 0.0))),
@@ -1199,6 +1281,110 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 child_cfg,
                 event_dim=int(self.stage6_event_dim),
             ).to(self.device)
+        self.stage3_parent_query: Optional[ParentQueryBuilder] = None
+        self.stage3_parent_query_obs2d: Optional[nn.Module] = None
+        self.stage3_parent_context_fusion: Optional[ParentContextFusion] = None
+        self.stage3_child_query: Optional[nn.Module] = None
+        self.stage3_parent_gather: Optional[SparseGatherLift] = None
+        self.stage3_child_gather: Optional[SparseGatherLift] = None
+        self.stage3_parent_query_use_obs2d_lift = False
+        self.stage3_parent_query_use_dino_native_lift = False
+        self.stage3_parent_context_use_dino_native_fusion = False
+        self.stage3_dino_native_enabled = False
+        self.stage3_dino_native_dim = 0
+        self.stage3_parent_lifting_type = "legacy_direct_lift"
+        if bool(self.stage3_0_enabled):
+            if str(self._cfg_get(self.stage3_0_lifting_cfg, "type", "")).lower() != "full_sparse_gather":
+                raise ValueError("Stage3_0 requires model.iforward.lifting.type=full_sparse_gather")
+            scalar_anchor_backend = str(
+                self._cfg_get(self.stage3_0_lifting_cfg, "scalar_anchor_backend", "cuda_scalar_anchor")
+            ).lower()
+            if scalar_anchor_backend not in {"projected_meta", "cuda_scalar_anchor"}:
+                raise ValueError(f"unsupported Stage3_0 scalar_anchor_backend={scalar_anchor_backend!r}")
+            context_dim = int(self._cfg_get(self.stage3_0_lifting_cfg, "context_dim", self.stage6_feat_2d_dim))
+            detail_dim = int(self._cfg_get(self.stage3_0_lifting_cfg, "detail_dim", 8))
+            if int(context_dim) != int(self.stage6_feat_2d_dim):
+                raise ValueError(
+                    f"Stage3_0 context_dim must match Stage6 feat_2d_dim={int(self.stage6_feat_2d_dim)}, got {context_dim}"
+                )
+            schedule_cfg = _to_plain_dict(self._cfg_get(self.stage3_0_lifting_cfg, "training_schedule", {}) or {})
+
+            def _gather_cfg(name: str) -> Dict[str, Any]:
+                base = _to_plain_dict(self._cfg_get(self.stage3_0_lifting_cfg, name, {}) or {})
+                for key, value in schedule_cfg.items():
+                    base.setdefault(str(key), value)
+                return base
+
+            parent_cfg = _gather_cfg("parent_gather")
+            child_cfg = _gather_cfg("child_gather")
+            parent_lift_cfg = self._cfg_get(self.stage3_0_lifting_cfg, "parent", {}) or {}
+            self.stage3_parent_lifting_type = str(
+                self._cfg_get(parent_lift_cfg, "type", "legacy_direct_lift")
+            ).lower()
+            if self.stage3_parent_lifting_type not in {"legacy_direct_lift", "sparse_gather"}:
+                raise ValueError(f"unsupported Stage3_0 parent.type={self.stage3_parent_lifting_type!r}")
+            parent_query_dim = int(self._cfg_get(parent_cfg, "query_dim", 96))
+            parent_query_cfg = self._cfg_get(self.stage3_0_lifting_cfg, "parent_query", {}) or {}
+            parent_context_cfg = self._cfg_get(self.stage3_0_lifting_cfg, "parent_context", {}) or {}
+            dino_native_cfg = self._cfg_get(self.stage3_0_lifting_cfg, "dino_native", {}) or {}
+            if self.stage3_parent_lifting_type == "legacy_direct_lift" and bool(
+                self._cfg_get(dino_native_cfg, "enable", False)
+            ):
+                raise ValueError("Stage3_0 parent.type=legacy_direct_lift forbids dino_native.enable=true")
+            obs2d_dim = int(self._cfg_get(parent_query_cfg, "obs2d_lift_dim", 0) or 0)
+            self.stage3_parent_query_use_obs2d_lift = bool(
+                self._cfg_get(parent_query_cfg, "use_obs2d_lift", False)
+            ) and obs2d_dim > 0 and self.stage3_parent_lifting_type == "sparse_gather"
+            self.stage3_parent_query_use_dino_native_lift = bool(
+                self._cfg_get(parent_query_cfg, "use_dino_native_lift", False)
+            ) and self.stage3_parent_lifting_type == "sparse_gather"
+            self.stage3_parent_context_use_dino_native_fusion = bool(
+                self._cfg_get(parent_context_cfg, "use_dino_native_fusion", False)
+            ) and self.stage3_parent_lifting_type == "sparse_gather"
+            self.stage3_dino_native_enabled = bool(self._cfg_get(dino_native_cfg, "enable", False)) and (
+                self.stage3_parent_lifting_type == "sparse_gather"
+            )
+            self.stage3_dino_native_dim = int(self._cfg_get(dino_native_cfg, "out_channels", 16))
+            if bool(self.stage3_dino_native_enabled):
+                expected_level = str(self._cfg_get(dino_native_cfg, "cache_level", "backbone_intermediate")).lower()
+                if expected_level != "backbone_intermediate":
+                    raise ValueError("Stage3 dino_native.cache_level must be backbone_intermediate")
+                if getattr(self, "dino_feature_cache", None) is None:
+                    raise ValueError("Stage3 dino_native.enable=true requires model.feature_extractor.dino.cache.enable=true")
+                if str(getattr(self, "dino_feature_cache_level", "adapter_output")).lower() != "backbone_intermediate":
+                    raise ValueError("Stage3 dino_native requires model.feature_extractor.dino.cache.level=backbone_intermediate")
+            if bool(self.stage3_parent_query_use_dino_native_lift) and not bool(self.stage3_dino_native_enabled):
+                raise ValueError("parent_query.use_dino_native_lift=true requires dino_native.enable=true")
+            if bool(self.stage3_parent_context_use_dino_native_fusion) and not bool(self.stage3_dino_native_enabled):
+                raise ValueError("parent_context.use_dino_native_fusion=true requires dino_native.enable=true")
+            extra_query_dim = 0
+            if bool(self.stage3_parent_query_use_obs2d_lift):
+                extra_query_dim += int(obs2d_dim)
+                self.stage3_parent_query_obs2d = nn.Sequential(
+                    nn.LayerNorm(int(context_dim)),
+                    nn.Linear(int(context_dim), int(obs2d_dim)),
+                ).to(self.device)
+            if bool(self.stage3_parent_query_use_dino_native_lift):
+                extra_query_dim += int(self.stage3_dino_native_dim)
+            if self.stage3_parent_lifting_type == "sparse_gather":
+                self.stage3_parent_query = ParentQueryBuilder(
+                    query_dim=parent_query_dim,
+                    extra_input_dim=int(extra_query_dim),
+                ).to(self.device)
+                if bool(self.stage3_parent_context_use_dino_native_fusion):
+                    self.stage3_parent_context_fusion = ParentContextFusion(
+                        context_dim=int(context_dim),
+                        dino_dim=int(self.stage3_dino_native_dim),
+                    ).to(self.device)
+                self.stage3_parent_gather = SparseGatherLift(
+                    value_dim=int(context_dim),
+                    config=GatherConfig.from_config(parent_cfg, defaults=GatherConfig(query_dim=parent_query_dim)),
+                ).to(self.device)
+            child_type = str(self._cfg_get(child_cfg, "type", "support_center")).lower()
+            if child_type != "support_center":
+                raise ValueError("Stage3_0 child_gather.type must be support_center")
+            self.stage3_child_query = None
+            self.stage3_child_gather = None
         vsm_cfg = self._cfg_get(stage6, "vsm", {}) or {}
         query_cfg = self._cfg_get(stage6, "query_decoder", {}) or {}
         self.stage6_vsm: Optional[Stage6ViewSetMemory] = None
@@ -2376,6 +2562,648 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             raise RuntimeError(f"FW-HR child_to_parent row mismatch: {int(out.numel())} vs {expected}")
         return out
 
+    @staticmethod
+    def _stage3_0_branch_params(branch: Any) -> Dict[str, torch.Tensor]:
+        return {
+            "means": branch.means,
+            "scales_log": branch.scales_log,
+            "quats": branch.quats,
+            "opacity_logit": branch.opacity_logit,
+            "sh_dc": branch.sh_dc,
+            "sh_rest": branch.sh_rest,
+        }
+
+    def _stage3_0_optimizer_prior(
+        self,
+        *,
+        parent_optimizer_state: Optional[Any],
+        branch: str,
+        rows: int,
+        ref: torch.Tensor,
+    ) -> torch.Tensor:
+        out = ref.new_zeros((int(rows), 4))
+        if parent_optimizer_state is None or int(rows) == 0:
+            return out
+        branch_state = getattr(parent_optimizer_state, str(branch), None)
+        dense = getattr(branch_state, "dense", None) if branch_state is not None else None
+        if dense is None:
+            return out
+        seen = getattr(dense, "seen", None)
+        update_count = getattr(dense, "update_count", None)
+        last_visit_step = getattr(dense, "last_visit_step", None)
+        last_visit_kind = getattr(dense, "last_visit_kind", None)
+        if not torch.is_tensor(seen) or int(seen.numel()) == 0:
+            return out
+        n = min(int(rows), int(seen.numel()))
+        out[:n, 0] = seen[:n].to(device=ref.device, dtype=ref.dtype).reshape(-1)
+        if torch.is_tensor(update_count) and int(update_count.numel()) >= n:
+            out[:n, 1] = torch.log1p(update_count[:n].to(device=ref.device, dtype=ref.dtype).clamp_min(0.0))
+        if torch.is_tensor(last_visit_step) and int(last_visit_step.numel()) >= n:
+            out[:n, 2] = last_visit_step[:n].to(device=ref.device, dtype=ref.dtype).clamp_min(0.0) / 1000.0
+        if torch.is_tensor(last_visit_kind) and int(last_visit_kind.numel()) >= n:
+            out[:n, 3] = last_visit_kind[:n].to(device=ref.device, dtype=ref.dtype).clamp_min(0.0) / 10.0
+        return out
+
+    def _stage3_0_build_anchor_stats(
+        self,
+        *,
+        fine_scene: Dict[str, torch.Tensor],
+        source_views: List[Any],
+        source_pair_valid_mask: Optional[torch.Tensor],
+        child_to_parent_global: torch.Tensor,
+        num_children: int,
+        num_parents: int,
+        height: int,
+        width: int,
+    ) -> Tuple[Any, Dict[str, float]]:
+        extractor = getattr(self, "alpha_t_extractor_v4", None) or getattr(self, "alpha_t_extractor_v3", None)
+        builder = getattr(extractor, "_build_multi_camera_meta_from_views", None)
+        if not callable(builder):
+            raise RuntimeError("Stage3_0 requires alpha_t_extractor_v3/v4 meta builder.")
+        t0 = time.perf_counter()
+        meta, meta_stats = builder(
+            gaussians=fine_scene,
+            cameras=source_views,
+            height=int(height),
+            width=int(width),
+        )
+        anchor_cfg = self._cfg_get(getattr(self, "stage3_0_lifting_cfg", {}) or {}, "scalar_anchor", {}) or {}
+        threshold_cfg = self._cfg_get(anchor_cfg, "support_threshold", {}) or {}
+        threshold_values = [
+            float(value)
+            for key, value in dict(threshold_cfg or {}).items()
+            if str(key) not in {"child", "parent"} and isinstance(value, (int, float))
+        ]
+        default_threshold = min(threshold_values) if threshold_values else 1.0e-4
+        child_threshold = float(self._cfg_get(threshold_cfg, "child", default_threshold))
+        parent_threshold = float(self._cfg_get(threshold_cfg, "parent", child_threshold))
+        detach_geometry = bool(
+            self._cfg_get(
+                anchor_cfg,
+                "detach_geometry",
+                self._cfg_get(getattr(self, "stage3_0_lifting_cfg", {}) or {}, "detach_geometry", True),
+            )
+        )
+        backend = str(
+            self._cfg_get(getattr(self, "stage3_0_lifting_cfg", {}) or {}, "scalar_anchor_backend", "cuda_scalar_anchor")
+        ).lower()
+        anchor_aux: Dict[str, float] = {}
+        if backend == "cuda_scalar_anchor":
+            anchor_weight_threshold = float(self._cfg_get(anchor_cfg, "weight_threshold", 0.0))
+            global_step = int(getattr(self, "stage3_0_global_step", 0))
+            heavy_aux_interval = int(self._cfg_get(anchor_cfg, "heavy_aux_interval", 100))
+            emit_heavy_aux = bool(heavy_aux_interval > 0 and global_step % int(heavy_aux_interval) == 0)
+            cuda_event_timing = bool(self._cfg_get(anchor_cfg, "cuda_event_timing", False))
+            count_pairs = bool(self._cfg_get(anchor_cfg, "count_pairs", False))
+            requested_anchor_mode = str(self._cfg_get(anchor_cfg, "anchor_mode", "auto")).lower()
+            if requested_anchor_mode not in {"auto", "full", "fast_uv_support"}:
+                raise ValueError(f"unsupported Stage3_0 scalar_anchor.anchor_mode={requested_anchor_mode!r}")
+            parent_lifting_type = str(getattr(self, "stage3_parent_lifting_type", "legacy_direct_lift")).lower()
+            parent_legacy_direct = parent_lifting_type == "legacy_direct_lift"
+            parent_gather = getattr(self, "stage3_parent_gather", None)
+            fast_anchor_allowed = (
+                bool(parent_legacy_direct)
+                or (
+                    parent_gather is not None
+                    and bool(parent_gather.use_fixed_center_fast_path(global_step))
+                    and not bool(parent_gather.config.fixed_center_use_geometry_pe)
+                )
+            )
+            if requested_anchor_mode == "auto":
+                anchor_mode = "fast_uv_support" if bool(fast_anchor_allowed) else "full"
+            elif requested_anchor_mode == "fast_uv_support":
+                if not bool(fast_anchor_allowed):
+                    raise RuntimeError(
+                        "Stage3 fast_uv_support scalar anchor is only valid while parent gather is fixed-center "
+                        "with fixed_center_use_geometry_pe=false. Child gather is always support_center."
+                    )
+                anchor_mode = "fast_uv_support"
+            else:
+                if bool(parent_legacy_direct):
+                    raise RuntimeError("Stage3 legacy_direct_lift parent requires scalar_anchor.anchor_mode=auto or fast_uv_support.")
+                anchor_mode = "full"
+            anchor, anchor_aux = build_cuda_scalar_anchor_stats(
+                meta=meta,
+                child_to_parent=child_to_parent_global,
+                num_children=int(num_children),
+                num_parents=int(num_parents),
+                num_views=int(len(source_views)),
+                image_height=int(height),
+                image_width=int(width),
+                source_pair_valid_mask=source_pair_valid_mask,
+                child_support_threshold=child_threshold,
+                parent_support_threshold=parent_threshold,
+                weight_threshold=anchor_weight_threshold,
+                anchor_mode=anchor_mode,
+                count_pairs=count_pairs,
+                child_only=bool(parent_legacy_direct),
+                detach_geometry=detach_geometry,
+                emit_heavy_aux=emit_heavy_aux,
+                use_cuda_event_timing=cuda_event_timing,
+                return_aux=True,
+            )
+        elif backend == "projected_meta":
+            anchor = build_projected_meta_anchor_stats(
+                meta=meta,
+                child_to_parent=child_to_parent_global,
+                num_children=int(num_children),
+                num_parents=int(num_parents),
+                num_views=int(len(source_views)),
+                image_height=int(height),
+                image_width=int(width),
+                source_pair_valid_mask=source_pair_valid_mask,
+                child_support_threshold=child_threshold,
+                parent_support_threshold=parent_threshold,
+                detach_geometry=detach_geometry,
+            )
+            anchor_aux = {
+                "iforward/stage3/anchor_backend_id": 0.0,
+                "iforward/stage3/anchor_mode_id": 0.0,
+                "iforward/stage3/anchor_fast_uv_support_enabled": 0.0,
+                "iforward/stage3/anchor_parent_aggregate_backend_id": 0.0,
+                "iforward/stage3/anchor_parent_aggregate_cuda_enabled": 0.0,
+                "iforward/stage3/anchor_heavy_aux_enabled": 0.0,
+                "iforward/stage3/anchor_pair_count_enabled": 0.0,
+                "iforward/stage3/anchor_cuda_ms": 0.0,
+                "iforward/stage3/anchor_cuda_event_ms": 0.0,
+                "iforward/stage3/anchor_normalize_ms": 0.0,
+                "iforward/stage3/anchor_pair_count_total": 0.0,
+                "iforward/stage3/anchor_pair_count_threshold": 0.0,
+            }
+        else:
+            raise ValueError(f"unsupported Stage3_0 scalar_anchor_backend={backend!r}")
+        stats = {
+            "iforward/stage3/scalar_anchor_ms": float((time.perf_counter() - t0) * 1000.0),
+            "iforward/stage3/anchor_nnz": float(int(meta.get("means2d", torch.zeros((0, 2))).shape[0])),
+            **anchor_aux,
+            "iforward/stage3/child_support_valid_ratio": (
+                float(anchor.child_valid.detach().float().any(dim=1).float().mean().item())
+                if int(anchor.child_valid.numel()) > 0
+                else 0.0
+            ),
+            "iforward/stage3/parent_support_valid_ratio": (
+                float(anchor.parent_valid.detach().float().any(dim=1).float().mean().item())
+                if int(anchor.parent_valid.numel()) > 0
+                else 0.0
+            ),
+        }
+        for key, value in dict(meta_stats or {}).items():
+            if isinstance(value, (int, float)):
+                stats[f"iforward/stage3/meta_{key}"] = float(value)
+        return anchor, stats
+
+    def _stage3_0_parent_sparse_gather(
+        self,
+        *,
+        cnn_inputs: Dict[str, Any],
+        anchor_stats: Any,
+        bg_proj: BigGSParentProjection,
+        distant_proj: Optional[BigGSParentProjection],
+        rigid_proj_active: Optional[BigGSParentProjection],
+        parent_optimizer_state: Optional[Any],
+        height: int,
+        width: int,
+        num_parent_bg: int,
+        num_parent_distant: int,
+        num_parent_rigid: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float], Dict[str, torch.Tensor]]:
+        parent_query = getattr(self, "stage3_parent_query", None)
+        parent_gather = getattr(self, "stage3_parent_gather", None)
+        if parent_query is None or parent_gather is None:
+            raise RuntimeError("Stage3_0 parent gather modules are not initialized.")
+        context_2d = cnn_inputs["features_2d"]
+        if context_2d.dim() != 4:
+            raise ValueError(f"Stage3_0 context_2d must be [V,H,W,C], got {tuple(context_2d.shape)}")
+        obs2d_map = None
+        obs2d_module = getattr(self, "stage3_parent_query_obs2d", None)
+        if bool(getattr(self, "stage3_parent_query_use_obs2d_lift", False)):
+            if obs2d_module is None:
+                raise RuntimeError("Stage3_0 parent query obs2d lift module is not initialized.")
+            obs2d_map = obs2d_module(context_2d)
+        dino_native_2d = None
+        needs_dino_native = bool(getattr(self, "stage3_parent_query_use_dino_native_lift", False)) or bool(
+            getattr(self, "stage3_parent_context_use_dino_native_fusion", False)
+        )
+        if bool(needs_dino_native):
+            dino_native_2d = cnn_inputs.get("stage3_dino_native_2d")
+            if not torch.is_tensor(dino_native_2d):
+                raise RuntimeError("Stage3_0 parent DINO native lift requires cnn_inputs['stage3_dino_native_2d'].")
+            if dino_native_2d.dim() != 4 or int(dino_native_2d.shape[0]) != int(context_2d.shape[0]):
+                raise ValueError(f"stage3_dino_native_2d must be [V,Hd,Wd,C], got {tuple(dino_native_2d.shape)}")
+            dino_native_2d = dino_native_2d.to(device=context_2d.device, dtype=context_2d.dtype).detach()
+            if int(dino_native_2d.shape[-1]) != int(getattr(self, "stage3_dino_native_dim", int(dino_native_2d.shape[-1]))):
+                raise ValueError("Stage3_0 DINO native feature channel mismatch.")
+        gather_cfg = self._cfg_get(getattr(self, "stage3_0_lifting_cfg", {}) or {}, "parent_gather", {}) or {}
+        prepared_context = prepare_value_nchw(context_2d) if parent_gather._should_prepare_value(context_2d) else None
+        gather_aux_interval = int(
+            self._cfg_get(getattr(self, "stage3_0_lifting_cfg", {}) or {}, "gather_aux_interval", 100)
+        )
+        scalar_cfg = self._cfg_get(getattr(self, "stage3_0_lifting_cfg", {}) or {}, "scalar_anchor", {}) or {}
+        threshold_cfg = self._cfg_get(scalar_cfg, "support_threshold", {}) or {}
+        valid_row_filter = bool(self._cfg_get(gather_cfg, "valid_row_filter", True))
+        query_chunked = bool(self._cfg_get(gather_cfg, "query_chunked", True))
+        parent_threshold = float(
+            self._cfg_get(
+                threshold_cfg,
+                "parent",
+                min(
+                    [
+                        float(v)
+                        for k, v in dict(threshold_cfg or {}).items()
+                        if str(k) not in {"child"} and isinstance(v, (int, float))
+                    ]
+                    or [1.0e-4]
+                ),
+            )
+        )
+        global_step = int(getattr(self, "stage3_0_global_step", 0))
+        emit_gather_heavy_aux = bool(gather_aux_interval > 0 and global_step % int(gather_aux_interval) == 0)
+        queries = []
+        start = 0
+        stats: Dict[str, float] = {}
+        regs: Dict[str, torch.Tensor] = {}
+
+        def _run_branch(name: str, branch_id: int, params: Dict[str, torch.Tensor], rows: int) -> Tuple[torch.Tensor, torch.Tensor]:
+            nonlocal start, stats, regs
+            end = start + int(rows)
+            feat = context_2d.new_zeros((int(rows), int(context_2d.shape[-1])))
+            conf = context_2d.new_zeros((int(rows),))
+            if int(rows) == 0:
+                start = end
+                return feat, conf
+            prior = self._stage3_0_optimizer_prior(
+                parent_optimizer_state=parent_optimizer_state,
+                branch=name,
+                rows=int(rows),
+                ref=context_2d,
+            )
+            support_total = anchor_stats.parent_support_total[start:end]
+            row_valid = anchor_stats.parent_valid[start:end].any(dim=1)
+            if bool(valid_row_filter):
+                row_valid = row_valid & (support_total.to(device=row_valid.device) >= float(parent_threshold))
+            row_idx = torch.nonzero(row_valid, as_tuple=False).reshape(-1).to(device=context_2d.device, dtype=torch.long)
+            stats[f"iforward/stage3/parent_{name}_rows_total"] = float(int(rows))
+            stats[f"iforward/stage3/parent_{name}_rows_valid"] = float(int(row_idx.numel()))
+            stats[f"iforward/stage3/parent_{name}_rows_valid_ratio"] = float(int(row_idx.numel())) / float(max(int(rows), 1))
+            chunk_limit = parent_gather.effective_chunk_size(global_step, rows=int(row_idx.numel()))
+            if not bool(query_chunked):
+                chunk_limit = max(int(row_idx.numel()), 1)
+            stats[f"iforward/stage3/parent_{name}_chunk_size"] = float(chunk_limit)
+            stats[f"iforward/stage3/parent_{name}_num_chunks"] = float(
+                math.ceil(float(int(row_idx.numel())) / float(chunk_limit)) if int(row_idx.numel()) > 0 else 0
+            )
+            aux_sum: Dict[str, float] = {}
+            aux_rows = 0
+            reg_chunks = []
+
+            def _slice_params(row_ids: torch.Tensor) -> Dict[str, torch.Tensor]:
+                out_params: Dict[str, torch.Tensor] = {}
+                for key, value in params.items():
+                    if torch.is_tensor(value) and value.dim() > 0 and int(value.shape[0]) == int(rows):
+                        out_params[str(key)] = value.index_select(0, row_ids.to(device=value.device, dtype=torch.long))
+                    else:
+                        out_params[str(key)] = value
+                return out_params
+
+            def _merge_aux(weight: int, aux_items: Dict[str, float]) -> None:
+                for key, value in aux_items.items():
+                    aux_sum[str(key)] = aux_sum.get(str(key), 0.0) + float(value) * float(weight)
+
+            for cstart in range(0, int(row_idx.numel()), chunk_limit):
+                cidx = row_idx[cstart : cstart + chunk_limit]
+                if int(cidx.numel()) == 0:
+                    continue
+                anchor_uv_c = anchor_stats.parent_uv[start:end].index_select(
+                    0, cidx.to(device=anchor_stats.parent_uv.device, dtype=torch.long)
+                )
+                support_c = anchor_stats.parent_support[start:end].index_select(
+                    0, cidx.to(device=anchor_stats.parent_support.device, dtype=torch.long)
+                )
+                valid_c = anchor_stats.parent_valid[start:end].index_select(
+                    0, cidx.to(device=anchor_stats.parent_valid.device, dtype=torch.long)
+                )
+                rows_c = int(cidx.numel())
+                obs2d_lift_c = None
+                dino_lift_c = None
+                if obs2d_map is not None and not parent_gather.use_fixed_center_fast_path(global_step):
+                    obs2d_lift_c, _obs_conf, obs_aux = support_center_sparse_gather(
+                        value_map=obs2d_map,
+                        anchor_uv=anchor_uv_c,
+                        support=support_c,
+                        valid=valid_c,
+                        image_height=int(height),
+                        image_width=int(width),
+                        backend=str(parent_gather.config.backend).lower(),
+                        chunk_size=int(chunk_limit),
+                        emit_heavy_aux=emit_gather_heavy_aux,
+                        prefix=f"stage3/parent_{name}_obs2d_query_lift",
+                    )
+                    _merge_aux(rows_c, obs_aux)
+                if dino_native_2d is not None:
+                    dino_lift_c, _dino_conf, dino_aux = support_center_sparse_gather(
+                        value_map=dino_native_2d,
+                        anchor_uv=anchor_uv_c,
+                        support=support_c,
+                        valid=valid_c,
+                        image_height=int(height),
+                        image_width=int(width),
+                        backend=str(parent_gather.config.backend).lower(),
+                        chunk_size=int(chunk_limit),
+                        emit_heavy_aux=emit_gather_heavy_aux,
+                        prefix=f"stage3/parent_{name}_dino_native_lift",
+                    )
+                    _merge_aux(rows_c, dino_aux)
+                if parent_gather.use_fixed_center_fast_path(global_step):
+                    q = None
+                else:
+                    q = parent_query(
+                        params=_slice_params(cidx),
+                        support_total=support_total.index_select(0, cidx.to(device=support_total.device, dtype=torch.long)),
+                        branch_id=int(branch_id),
+                        optimizer_prior=prior.index_select(0, cidx.to(device=prior.device, dtype=torch.long)),
+                        obs2d_lift=obs2d_lift_c,
+                        dino_lift=dino_lift_c if bool(getattr(self, "stage3_parent_query_use_dino_native_lift", False)) else None,
+                    )
+                out_c, conf_c, aux_c, reg_c = parent_gather(
+                    value_map=context_2d,
+                    anchor_uv=anchor_uv_c,
+                    support=support_c,
+                    valid=valid_c,
+                    depth=anchor_stats.parent_depth[start:end].index_select(
+                        0, cidx.to(device=anchor_stats.parent_depth.device, dtype=torch.long)
+                    ),
+                    radius=anchor_stats.parent_radius[start:end].index_select(
+                        0, cidx.to(device=anchor_stats.parent_radius.device, dtype=torch.long)
+                    ),
+                    image_height=int(height),
+                    image_width=int(width),
+                    query=q,
+                    prepared_value_nchw=prepared_context,
+                    global_step=global_step,
+                    emit_heavy_aux=emit_gather_heavy_aux,
+                    prefix=f"stage3/parent_{name}",
+                )
+                if bool(getattr(self, "stage3_parent_context_use_dino_native_fusion", False)):
+                    fusion = getattr(self, "stage3_parent_context_fusion", None)
+                    if fusion is None or dino_lift_c is None:
+                        raise RuntimeError("Stage3_0 parent context DINO fusion is not initialized.")
+                    out_c = fusion(out_c, dino_lift_c)
+                feat.index_copy_(0, cidx, out_c)
+                conf.index_copy_(0, cidx, conf_c)
+                aux_rows += rows_c
+                _merge_aux(rows_c, aux_c)
+                reg_chunks.append(reg_c)
+            if aux_rows > 0:
+                stats.update({key: float(value) / float(aux_rows) for key, value in aux_sum.items()})
+            regs = merge_stage3_reg_terms(regs, merge_stage3_reg_terms(*reg_chunks))
+            start = end
+            return feat, conf
+
+        feat_bg, conf_bg = _run_branch("bg", 0, bg_proj.params, int(num_parent_bg))
+        queries.append((feat_bg, conf_bg))
+        if int(num_parent_distant) > 0:
+            if distant_proj is None:
+                raise RuntimeError("Stage3_0 distant parent gather expected distant projection")
+            queries.append(_run_branch("distant", 1, distant_proj.params, int(num_parent_distant)))
+        if int(num_parent_rigid) > 0:
+            if rigid_proj_active is None:
+                raise RuntimeError("Stage3_0 rigid parent gather expected active rigid projection")
+            queries.append(_run_branch("rigid", 2, rigid_proj_active.params, int(num_parent_rigid)))
+        feat_all = torch.cat([x[0] for x in queries], dim=0) if queries else context_2d.new_zeros((0, int(context_2d.shape[-1])))
+        conf_all = torch.cat([x[1] for x in queries], dim=0) if queries else context_2d.new_zeros((0,))
+        if bool(emit_gather_heavy_aux):
+            stats["iforward/stage3/parent_context_rms"] = (
+                float(feat_all.detach().float().square().mean().sqrt().item()) if int(feat_all.numel()) else 0.0
+            )
+            stats["iforward/stage3/parent_confidence_mean"] = (
+                float(conf_all.detach().float().mean().item()) if int(conf_all.numel()) else 0.0
+            )
+        return feat_all, anchor_stats.parent_support_total.to(device=feat_all.device, dtype=feat_all.dtype), stats, regs
+
+    def _stage3_0_gather_child_detail(
+        self,
+        *,
+        local_state: LocalGSState,
+        measurement: Dict[str, Any],
+    ) -> None:
+        if not bool(getattr(self, "stage3_0_enabled", False)):
+            return
+        anchor = measurement.get("stage3_anchor_stats")
+        detail_2d = measurement.get("stage3_detail_2d")
+        if anchor is None or not torch.is_tensor(detail_2d):
+            raise RuntimeError("Stage3_0 child gather requires anchor stats and detail_2d in measurement.")
+        height = int(measurement["stage3_image_height"])
+        width = int(measurement["stage3_image_width"])
+        gather_aux_interval = int(
+            self._cfg_get(getattr(self, "stage3_0_lifting_cfg", {}) or {}, "gather_aux_interval", 100)
+        )
+        child_to_parent_global = measurement["stage3_child_to_parent_global"].to(device=detail_2d.device, dtype=torch.long)
+        num_bg = int(measurement.get("num_bg", 0))
+        num_distant = int(measurement.get("num_distant", 0))
+        num_rigid = int(measurement.get("num_rigid_S", 0))
+        aux: Dict[str, float] = {}
+        reg_items = [measurement.get("stage3_gather_reg_terms", {})]
+        child_gather_cfg = self._cfg_get(getattr(self, "stage3_0_lifting_cfg", {}) or {}, "child_gather", {}) or {}
+        child_type = str(self._cfg_get(child_gather_cfg, "type", "support_center")).lower()
+        if child_type != "support_center":
+            raise ValueError("Stage3_0 child gather only supports type=support_center")
+        center_by_parent = bool(self._cfg_get(child_gather_cfg, "center_by_parent", True))
+        valid_row_filter = bool(self._cfg_get(child_gather_cfg, "valid_row_filter", True))
+        backend = str(self._cfg_get(child_gather_cfg, "backend", "auto")).lower()
+        chunk_limit_cfg = int(self._cfg_get(child_gather_cfg, "fixed_center_chunk_size", self._cfg_get(child_gather_cfg, "chunk_size", 65536)))
+        if chunk_limit_cfg <= 0:
+            chunk_limit_cfg = 2**30
+        child_threshold = float(
+            self._cfg_get(
+                self._cfg_get(self._cfg_get(getattr(self, "stage3_0_lifting_cfg", {}) or {}, "scalar_anchor", {}) or {}, "support_threshold", {}) or {},
+                "child",
+                1.0e-4,
+            )
+        )
+        global_step = int(getattr(self, "stage3_0_global_step", 0))
+        emit_gather_heavy_aux = bool(gather_aux_interval > 0 and global_step % int(gather_aux_interval) == 0)
+        detach_child_detail_cfg = bool(self._cfg_get(child_gather_cfg, "detach_child_detail", False))
+        train_child_detail_every_n = max(int(self._cfg_get(child_gather_cfg, "train_child_detail_every_n", 1)), 1)
+        child_detail_train_enabled = (not bool(detach_child_detail_cfg)) and (
+            int(train_child_detail_every_n) <= 1 or int(global_step) % int(train_child_detail_every_n) == 0
+        )
+        prepared_detail = (
+            prepare_value_nchw(detail_2d)
+            if backend == "pytorch" or (backend == "auto" and not torch.is_tensor(detail_2d))
+            else None
+        )
+        aux["iforward/stage3/child_support_center_enabled"] = 1.0
+        aux["iforward/stage3/child_event_dependency_removed"] = 1.0
+        aux["iforward/stage3/child_learned_path_enabled"] = 0.0
+        aux["iforward/stage3/child_detail_detached"] = 0.0 if bool(child_detail_train_enabled) else 1.0
+        aux["iforward/stage3/child_detail_train_every_n"] = float(train_child_detail_every_n)
+        ignored_child_keys = {
+            "query_dim",
+            "offset_scale",
+            "max_offset_px",
+            "train_weights_steps",
+            "offset_warmup_steps",
+            "use_geometry_pe",
+        }
+        aux["iforward/stage3/child_ignored_learned_config"] = (
+            1.0 if any(str(key) in child_gather_cfg for key in ignored_child_keys) else 0.0
+        )
+
+        def _run(
+            *,
+            name: str,
+            start: int,
+            rows: int,
+            parent_id_local: torch.Tensor,
+            num_parents: int,
+        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            nonlocal aux, reg_items
+            ref = detail_2d
+            if int(rows) == 0:
+                return (
+                    ref.new_zeros((0, int(detail_2d.shape[-1]))),
+                    torch.zeros((0,), device=ref.device, dtype=torch.bool),
+                    ref.new_zeros((0,)),
+                )
+            end = int(start) + int(rows)
+            support_total = anchor.child_support_total[start:end]
+            detail = ref.new_zeros((int(rows), int(detail_2d.shape[-1])))
+            confidence = ref.new_zeros((int(rows),))
+            row_valid = anchor.child_valid[start:end].any(dim=1)
+            if bool(valid_row_filter):
+                row_valid = row_valid & (support_total.to(device=row_valid.device) >= float(child_threshold))
+            row_idx = torch.nonzero(row_valid, as_tuple=False).reshape(-1).to(device=detail_2d.device, dtype=torch.long)
+            aux[f"iforward/stage3/child_{name}_rows_total"] = float(int(rows))
+            aux[f"iforward/stage3/child_{name}_rows_valid"] = float(int(row_idx.numel()))
+            aux[f"iforward/stage3/child_{name}_rows_valid_ratio"] = float(int(row_idx.numel())) / float(max(int(rows), 1))
+            chunk_limit = min(int(chunk_limit_cfg), max(int(row_idx.numel()), 1))
+            aux[f"iforward/stage3/child_{name}_chunk_size"] = float(chunk_limit)
+            aux[f"iforward/stage3/child_{name}_num_chunks"] = float(
+                math.ceil(float(int(row_idx.numel())) / float(chunk_limit)) if int(row_idx.numel()) > 0 else 0
+            )
+            aux_sum: Dict[str, float] = {}
+            aux_rows = 0
+
+            for cstart in range(0, int(row_idx.numel()), chunk_limit):
+                cidx = row_idx[cstart : cstart + chunk_limit]
+                if int(cidx.numel()) == 0:
+                    continue
+                detail_c, confidence_c, gather_aux = support_center_sparse_gather(
+                    value_map=detail_2d,
+                    anchor_uv=anchor.child_uv[start:end].index_select(0, cidx.to(device=anchor.child_uv.device, dtype=torch.long)),
+                    support=anchor.child_support[start:end].index_select(0, cidx.to(device=anchor.child_support.device, dtype=torch.long)),
+                    valid=anchor.child_valid[start:end].index_select(0, cidx.to(device=anchor.child_valid.device, dtype=torch.long)),
+                    image_height=int(height),
+                    image_width=int(width),
+                    backend=backend,
+                    prepared_value_nchw=prepared_detail,
+                    chunk_size=int(chunk_limit),
+                    emit_heavy_aux=emit_gather_heavy_aux,
+                    prefix=f"stage3/child_{name}",
+                )
+                detail.index_copy_(0, cidx, detail_c)
+                confidence.index_copy_(0, cidx, confidence_c)
+                rows_c = int(cidx.numel())
+                aux_rows += rows_c
+                for key, value in gather_aux.items():
+                    aux_sum[str(key)] = aux_sum.get(str(key), 0.0) + float(value) * float(rows_c)
+            if aux_rows > 0:
+                aux.update({key: float(value) / float(aux_rows) for key, value in aux_sum.items()})
+            valid = (support_total.to(device=detail.device, dtype=detail.dtype) >= float(child_threshold)) & (confidence > 0.0)
+            valid_idx = torch.nonzero(valid, as_tuple=False).reshape(-1) if bool(center_by_parent) else None
+            if valid_idx is not None and int(valid_idx.numel()) > 0:
+                centered_valid, center_err = center_child_detail_by_parent(
+                    detail.index_select(0, valid_idx),
+                    child_to_parent=parent_id_local.to(device=detail.device, dtype=torch.long).index_select(
+                        0, valid_idx.to(device=parent_id_local.device)
+                    ),
+                    weights=confidence.index_select(0, valid_idx),
+                    num_parents=int(num_parents),
+                )
+                detail.index_copy_(0, valid_idx, centered_valid)
+                aux[f"iforward/stage3/child_{name}_centering_error"] = (
+                    float(center_err.item()) if bool(emit_gather_heavy_aux) else 0.0
+                )
+            elif bool(center_by_parent):
+                aux[f"iforward/stage3/child_{name}_centering_error"] = 0.0
+            detail = torch.where(valid.unsqueeze(-1), detail, torch.zeros_like(detail))
+            if bool(emit_gather_heavy_aux):
+                aux[f"iforward/stage3/child_{name}_detail_rms"] = (
+                    float(detail.detach().float().square().mean().sqrt().item()) if detail.numel() else 0.0
+                )
+                aux[f"iforward/stage3/child_{name}_valid_ratio"] = (
+                    float(valid.detach().float().mean().item()) if valid.numel() else 0.0
+                )
+            return detail, valid, confidence
+
+        cursor = 0
+        detail_bg, valid_bg, support_bg = _run(
+            name="bg",
+            start=cursor,
+            rows=num_bg,
+            parent_id_local=measurement["assign_bg"].child_to_parent,
+            num_parents=int(measurement["assign_bg"].num_parents),
+        )
+        cursor += num_bg
+        detail_d = valid_d = support_d = None
+        if num_distant > 0 and local_state.distant is not None:
+            detail_d, valid_d, support_d = _run(
+                name="distant",
+                start=cursor,
+                rows=num_distant,
+                parent_id_local=measurement["assign_distant"].child_to_parent,
+                num_parents=int(measurement["assign_distant"].num_parents),
+            )
+        cursor += num_distant
+        detail_r = valid_r = support_r = None
+        active = measurement.get("assign_rigid_active")
+        if num_rigid > 0 and local_state.rigid is not None and active is not None:
+            detail_r, valid_r, support_r = _run(
+                name="rigid",
+                start=cursor,
+                rows=num_rigid,
+                parent_id_local=active.child_to_active_parent_S,
+                num_parents=int(active.active_parent_count.numel()),
+            )
+        if not bool(child_detail_train_enabled):
+            detail_bg = detail_bg.detach()
+            if torch.is_tensor(detail_d):
+                detail_d = detail_d.detach()
+            if torch.is_tensor(detail_r):
+                detail_r = detail_r.detach()
+        measurement.update(
+            {
+                "child_detail_bg": detail_bg,
+                "child_detail_distant": detail_d,
+                "child_detail_rigid_S": detail_r,
+                "child_detail_valid_bg": valid_bg,
+                "child_detail_valid_distant": valid_d,
+                "child_detail_valid_rigid_S": valid_r,
+                "child_detail_support_bg": support_bg,
+                "child_detail_support_distant": support_d,
+                "child_detail_support_rigid_S": support_r,
+                "stage3_gather_reg_terms": merge_stage3_reg_terms(*reg_items),
+            }
+        )
+        if bool(emit_gather_heavy_aux):
+            aux["iforward/stage3/child_detail_rms"] = float(
+                torch.cat(
+                    [
+                        x.reshape(-1)
+                        for x in (detail_bg, detail_d, detail_r)
+                        if torch.is_tensor(x) and int(x.numel()) > 0
+                    ],
+                    dim=0,
+                )
+                .detach()
+                .float()
+                .square()
+                .mean()
+                .sqrt()
+                .item()
+            ) if any(torch.is_tensor(x) and int(x.numel()) > 0 for x in (detail_bg, detail_d, detail_r)) else 0.0
+        measurement.update(aux)
+
     def _stage2_0_fwhr_lift_from_fine_scene(
         self,
         *,
@@ -2589,9 +3417,13 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         biggs_scene_id: Optional[int] = None,
         biggs_segment_id: Optional[int] = None,
         biggs_episode_id: Optional[int] = None,
+        parent_optimizer_state: Optional[Any] = None,
+        visit_meta: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         observe_total_t0 = time.perf_counter()
         biggs_observe_perf: Dict[str, float] = {}
+        if isinstance(visit_meta, dict) and "global_step" in visit_meta:
+            self.stage3_0_global_step = int(visit_meta.get("global_step", 0) or 0)
 
         def _record_observe_time(name: str, start: float) -> None:
             biggs_observe_perf[f"iforward/biggs/time_observe_{name}_ms"] = float((time.perf_counter() - start) * 1000.0)
@@ -2855,13 +3687,17 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         source_views, source_images, source_sky_masks, source_egocar_masks = self._source_subset(batch, source_indices)
         height, width = spatial_hw_from_image_tensor(source_images[0])
         lifting_cfg = getattr(self, "stage2_0_biggs_lifting_cfg", {}) or {}
+        stage3_enabled = bool(getattr(self, "stage3_0_enabled", False))
         fwhr_enabled = str(self._cfg_get(lifting_cfg, "type", "")).lower() == "fwhr"
         parent_scene_for_cnn = bool(self._cfg_get(getattr(self, "stage2_0_biggs_observe_cfg", {}) or {}, "parent_scene_for_cnn", True))
         cnn_scene = parent_scene
         fine_scene = None
-        if bool(fwhr_enabled) or not bool(parent_scene_for_cnn):
+        if bool(stage3_enabled):
+            fwhr_enabled = False
+            parent_scene_for_cnn = False
+        if bool(fwhr_enabled) or bool(stage3_enabled) or not bool(parent_scene_for_cnn):
             fine_scene = self._stage2_0_fine_scene_from_state(bg=bg_m, distant=distant_m, rigid=rigid_m, route=route)
-        if bool(fwhr_enabled):
+        if bool(fwhr_enabled) or bool(stage3_enabled):
             cnn_scene = fine_scene
         elif not bool(parent_scene_for_cnn):
             cnn_scene = fine_scene
@@ -2908,6 +3744,12 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         child_detail_support_bg = None
         child_detail_support_d = None
         child_detail_support_r = None
+        stage3_anchor_stats = None
+        stage3_context_2d = None
+        stage3_detail_2d = None
+        stage3_dino_native_2d = None
+        stage3_child_to_parent_global = None
+        stage3_parent_reg_terms: Dict[str, torch.Tensor] = {}
         if bool(fwhr_enabled):
             if fine_scene is None:
                 raise RuntimeError("FW-HR expected fine_scene to be built")
@@ -2963,6 +3805,126 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 child_detail_r = fwhr_lift.child_detail[cstart : cstart + num_r_f]
                 child_detail_valid_r = fwhr_lift.child_detail_valid[cstart : cstart + num_r_f]
                 child_detail_support_r = fwhr_lift.child_detail_support[cstart : cstart + num_r_f]
+        elif bool(stage3_enabled):
+            if fine_scene is None:
+                raise RuntimeError("Stage3_0 expected fine_scene to be built")
+            context_dim = int(self._cfg_get(getattr(self, "stage3_0_lifting_cfg", {}) or {}, "context_dim", int(cnn_inputs["features_2d"].shape[-1])))
+            detail_dim = int(self._cfg_get(getattr(self, "stage3_0_lifting_cfg", {}) or {}, "detail_dim", 8))
+            detail_2d = cnn_inputs.get("fwhr_detail_2d")
+            context_2d = cnn_inputs["features_2d"]
+            if detail_2d is None or not torch.is_tensor(detail_2d):
+                raise RuntimeError("Stage3_0 requires image_feature_extractor.forward_fwhr/detail output")
+            if int(context_2d.shape[-1]) != int(context_dim):
+                raise ValueError(f"Stage3_0 context dim mismatch: got {int(context_2d.shape[-1])}, expected {context_dim}")
+            if int(detail_2d.shape[-1]) != int(detail_dim):
+                raise ValueError(f"Stage3_0 detail dim mismatch: got {int(detail_2d.shape[-1])}, expected {detail_dim}")
+            if self._stage3_0_memory_aux_enabled() and torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+            child_to_parent_global = self._stage2_0_fwhr_child_to_parent_global(
+                state=state,
+                active_rigid=active_rigid,
+                num_bg=int(bg_m.means.shape[0]),
+                num_distant=int(distant_m.means.shape[0]) if distant_m is not None else 0,
+                num_rigid_s=int(route.S.numel()),
+                num_parent_bg=int(m_bg),
+                num_parent_distant=int(m_d),
+            )
+            anchor_stats, anchor_aux = self._stage3_0_build_anchor_stats(
+                fine_scene=fine_scene,
+                source_views=source_views,
+                source_pair_valid_mask=cnn_inputs["source_pair_valid_mask"],
+                child_to_parent_global=child_to_parent_global,
+                num_children=int(child_to_parent_global.numel()),
+                num_parents=int(num_parent),
+                height=int(height),
+                width=int(width),
+            )
+            anchor_aux.update(self._stage3_0_memory_aux("after_anchor"))
+            stage3_anchor_stats = anchor_stats
+            stage3_context_2d = context_2d
+            stage3_detail_2d = detail_2d
+            stage3_dino_native_2d = None
+            stage3_child_to_parent_global = child_to_parent_global
+            parent_lifting_type = str(getattr(self, "stage3_parent_lifting_type", "legacy_direct_lift")).lower()
+            parent_reg: Dict[str, torch.Tensor] = {}
+            if parent_lifting_type == "legacy_direct_lift":
+                feat_all, acc_all = self._backproject_scene_features_multi_camera(
+                    gaussians_scene=parent_scene,
+                    source_views=source_views,
+                    features_2d=context_2d,
+                    source_pair_valid_mask=cnn_inputs["source_pair_valid_mask"],
+                    height=height,
+                    width=width,
+                    return_debug_stats=bool(getattr(self, "stage2_0_biggs_return_debug_stats", True)),
+                )
+                parent_aux = {
+                    "iforward/stage3/parent_legacy_direct_lift_enabled": 1.0,
+                    "iforward/stage3/parent_sparse_gather_enabled": 0.0,
+                    "iforward/stage3/parent_dino_native_stage3_enabled": 0.0,
+                }
+            elif parent_lifting_type == "sparse_gather":
+                stage3_dino_native_2d = cnn_inputs.get("stage3_dino_native_2d")
+                feat_all, acc_all, parent_aux, parent_reg = self._stage3_0_parent_sparse_gather(
+                    cnn_inputs=cnn_inputs,
+                    anchor_stats=anchor_stats,
+                    bg_proj=bg_proj,
+                    distant_proj=distant_proj,
+                    rigid_proj_active=rigid_proj_active,
+                    parent_optimizer_state=parent_optimizer_state,
+                    height=int(height),
+                    width=int(width),
+                    num_parent_bg=int(m_bg),
+                    num_parent_distant=int(m_d),
+                    num_parent_rigid=int(m_r),
+                )
+                parent_aux = {
+                    **parent_aux,
+                    "iforward/stage3/parent_legacy_direct_lift_enabled": 0.0,
+                    "iforward/stage3/parent_sparse_gather_enabled": 1.0,
+                }
+            else:
+                raise ValueError(f"unsupported Stage3_0 parent lifting type={parent_lifting_type!r}")
+            parent_aux.update(self._stage3_0_memory_aux("after_parent_lift"))
+            stage3_parent_reg_terms = parent_reg
+            obs_all = None
+            fwhr_stats = {
+                **anchor_aux,
+                **parent_aux,
+                "iforward/stage3/enabled": 1.0,
+                "iforward/stage3/context_dim": float(context_dim),
+                "iforward/stage3/detail_dim": float(detail_dim),
+                "iforward/stage3/optimizer_prior_present": 1.0 if parent_optimizer_state is not None else 0.0,
+            }
+            child_measurement = {
+                "stage3_anchor_stats": stage3_anchor_stats,
+                "stage3_detail_2d": stage3_detail_2d,
+                "stage3_child_to_parent_global": stage3_child_to_parent_global,
+                "stage3_gather_reg_terms": stage3_parent_reg_terms,
+                "stage3_image_height": int(height),
+                "stage3_image_width": int(width),
+                "num_bg": int(bg_m.means.shape[0]),
+                "num_distant": int(distant_m.means.shape[0]) if distant_m is not None else 0,
+                "num_rigid_S": int(route.S.numel()),
+                "assign_bg": state.bg,
+                "assign_distant": state.distant,
+                "assign_rigid_active": active_rigid,
+                "route": route,
+            }
+            self._stage3_0_gather_child_detail(local_state=local_state, measurement=child_measurement)
+            child_measurement.update(self._stage3_0_memory_aux("after_child_gather"))
+            stage3_parent_reg_terms = child_measurement.get("stage3_gather_reg_terms", stage3_parent_reg_terms)
+            child_detail_bg = child_measurement.get("child_detail_bg")
+            child_detail_d = child_measurement.get("child_detail_distant")
+            child_detail_r = child_measurement.get("child_detail_rigid_S")
+            child_detail_valid_bg = child_measurement.get("child_detail_valid_bg")
+            child_detail_valid_d = child_measurement.get("child_detail_valid_distant")
+            child_detail_valid_r = child_measurement.get("child_detail_valid_rigid_S")
+            child_detail_support_bg = child_measurement.get("child_detail_support_bg")
+            child_detail_support_d = child_measurement.get("child_detail_support_distant")
+            child_detail_support_r = child_measurement.get("child_detail_support_rigid_S")
+            for key, value in child_measurement.items():
+                if str(key).startswith("iforward/stage3/") and isinstance(value, (int, float)):
+                    fwhr_stats[str(key)] = float(value)
         else:
             feat_all, acc_all = self._backproject_scene_features_multi_camera(
                 gaussians_scene=parent_scene,
@@ -2988,7 +3950,14 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         if feat_all is None or acc_all is None:
             raise RuntimeError("BigGS parent lifting returned empty features")
         t_slice_stats = time.perf_counter()
-        parent_obs_mode = str(self._cfg_get(getattr(self, "stage2_0_biggs_lifting_cfg", {}) or {}, "parent_obs_mode", "zero")).lower()
+        parent_obs_mode_default = "none" if bool(stage3_enabled) else "zero"
+        parent_obs_mode = str(
+            self._cfg_get(
+                getattr(self, "stage2_0_biggs_lifting_cfg", {}) or {},
+                "parent_obs_mode",
+                parent_obs_mode_default,
+            )
+        ).lower()
         if obs_all is None and parent_obs_mode != "none":
             raise RuntimeError("BigGS parent lifting expected V4 obs_code")
         if obs_all is not None:
@@ -3031,9 +4000,15 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         }
         _record_observe_time("slice_stats", t_slice_stats)
         _record_observe_time("total", observe_total_t0)
-        return {
+        result = {
             "biggs_enabled": True,
-            "biggs_mode": "fwhr_lift_event_decode" if bool(fwhr_enabled) else "parent_lifting_event_decode",
+            "biggs_mode": (
+                "stage3_sparse_gather_event_decode"
+                if bool(stage3_enabled)
+                else "fwhr_lift_event_decode"
+                if bool(fwhr_enabled)
+                else "parent_lifting_event_decode"
+            ),
             "biggs_state": state_cpu.detach(),
             "biggs_parent_runtime": next_parent_runtime,
             "route": route,
@@ -3069,6 +4044,8 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "child_detail_support_bg": child_detail_support_bg,
             "child_detail_support_distant": child_detail_support_d,
             "child_detail_support_rigid_S": child_detail_support_r,
+            "stage3_gather_reg_terms": stage3_parent_reg_terms,
+            "stage3_visit_meta": dict(visit_meta or {}),
             "num_bg": int(bg_m.means.shape[0]),
             "num_distant": int(distant_m.means.shape[0]) if distant_m is not None else 0,
             "num_rigid_S": int(route.S.numel()),
@@ -3080,6 +4057,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "iforward/biggs/compression_total_active": float(num_fine) / float(max(num_parent, 1)),
             "iforward/biggs/parent_scene_for_cnn": 1.0 if bool(parent_scene_for_cnn) else 0.0,
             "iforward/fwhr/enabled": 1.0 if bool(fwhr_enabled) else 0.0,
+            "iforward/stage3/enabled": 1.0 if bool(stage3_enabled) else 0.0,
             "iforward/biggs/time_assignment_ms": float(time_assignment_ms),
             "iforward/biggs/time_parent_project_ms": float(time_parent_project_ms),
             "iforward/biggs/time_parent_render_cnn_ms": float(time_parent_render_cnn_ms),
@@ -3096,6 +4074,21 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             **dict(cnn_inputs.get("cnn_perf_stats", {}) or {}),
             "src_backproject_pass_count": 1,
         }
+        if bool(stage3_enabled) and bool(
+            self._cfg_get(getattr(self, "stage3_0_lifting_cfg", {}) or {}, "return_stage3_debug_tensors", False)
+        ):
+            result.update(
+                {
+                    "stage3_anchor_stats": stage3_anchor_stats,
+                    "stage3_context_2d": stage3_context_2d,
+                    "stage3_detail_2d": stage3_detail_2d,
+                    "stage3_dino_native_2d": stage3_dino_native_2d,
+                    "stage3_child_to_parent_global": stage3_child_to_parent_global,
+                    "stage3_image_height": int(height),
+                    "stage3_image_width": int(width),
+                }
+            )
+        return result
 
     def _observe_v4_measurement(
         self,
@@ -3109,6 +4102,8 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         biggs_scene_id: Optional[int] = None,
         biggs_segment_id: Optional[int] = None,
         biggs_episode_id: Optional[int] = None,
+        parent_optimizer_state: Optional[Any] = None,
+        visit_meta: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         grad_enabled = str(getattr(self, "stage6_source_evidence_grad_mode", "no_grad_v4")) != "no_grad_v4"
         ctx_mgr = torch.enable_grad() if grad_enabled else torch.no_grad()
@@ -3124,6 +4119,8 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                     biggs_scene_id=biggs_scene_id,
                     biggs_segment_id=biggs_segment_id,
                     biggs_episode_id=biggs_episode_id,
+                    parent_optimizer_state=parent_optimizer_state,
+                    visit_meta=visit_meta,
                 )
         with ctx_mgr:
             self._mem_debug("observe/begin", grad_enabled=int(grad_enabled), source_frame_idx=int(source_frame_idx))
@@ -4265,11 +5262,14 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             if not (
                 str(key).startswith("iforward/biggs/")
                 or str(key).startswith("iforward/fwhr/")
+                or str(key).startswith("iforward/stage3/")
                 or str(key).startswith("num_parent_")
             ):
                 continue
             if isinstance(value, (int, float)):
                 aux[str(key)] = float(value)
+        if bool(float(measurement.get("iforward/stage3/enabled", 0.0) or 0.0) > 0.0):
+            aux.update(self._stage3_0_memory_aux("after_event_decode", include_step_max=True))
         fine_event.aux = aux
         return self._event_with_default_view_code(fine_event)
 
@@ -4326,6 +5326,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             if not (
                 str(key).startswith("iforward/biggs/")
                 or str(key).startswith("iforward/fwhr/")
+                or str(key).startswith("iforward/stage3/")
                 or str(key).startswith("num_parent_")
             ):
                 continue
@@ -4338,6 +5339,8 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         aux["iforward/biggs/parent_event_rows_rigid"] = (
             float(int(parent_event.event_rigid.shape[0])) if parent_event.event_rigid is not None else 0.0
         )
+        if bool(float(measurement.get("iforward/stage3/enabled", 0.0) or 0.0) > 0.0):
+            aux.update(self._stage3_0_memory_aux("after_event_decode", include_step_max=True))
         fine_event.aux = aux
         self._mem_debug("encode/biggs_after_child_decode")
         return self._event_with_default_view_code(fine_event)

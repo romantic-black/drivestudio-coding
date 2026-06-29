@@ -59,6 +59,7 @@ from .stage2_3 import (
     build_parent_delta_summary,
     history_damage_hinge_v3,
 )
+from .stage3_0.losses import stage3_gather_regularization
 from .point_mamba_memory import IForwardPointMambaMemory
 from .resolver import (
     IFORWARD_SEQUENCE10_SCHEDULER_VERSION,
@@ -516,11 +517,15 @@ class IForwardModel(nn.Module):
         event_dim = int(getattr(self.bridge, "event_dim", 48))
         iforward_cfg = cfg_get(cfg_get(config, "model", {}) or {}, "iforward", {}) or {}
         self.iforward_version = str(cfg_get(iforward_cfg, "version", "v1"))
+        self.is_stage3_0_full_sparse_gather_lift = self.iforward_version == "stage3_0_full_sparse_gather_lift"
         self.is_v3_gru_history_gate = self.iforward_version == "v3_gru_history_gate"
         self.is_v6_point_mamba_xcpe = self.iforward_version == "v6_point_mamba_xcpe"
         self.is_stage2_1_parent_temporal = self.iforward_version == "stage2_1_fwhr_parent_ptv3_temporal_mamba"
         self.is_stage2_2_parent_temporal = self.iforward_version == "stage2_2_stream10_rawframe_temporal_mamba_v2"
-        self.is_stage2_3_optimizer_mamba = self.iforward_version == "iforward_2_3_optimizer_mamba"
+        self.is_stage2_3_optimizer_mamba = self.iforward_version in {
+            "iforward_2_3_optimizer_mamba",
+            "stage3_0_full_sparse_gather_lift",
+        }
         self.is_stage2_0_biggs_parent_lifting = self.iforward_version in {
             "stage2_0_biggs_parent_lifting",
             "stage2_0_biggs_cuda_exact_diagonal_projector",
@@ -531,6 +536,7 @@ class IForwardModel(nn.Module):
             "stage2_1_fwhr_parent_ptv3_temporal_mamba",
             "stage2_2_stream10_rawframe_temporal_mamba_v2",
             "iforward_2_3_optimizer_mamba",
+            "stage3_0_full_sparse_gather_lift",
         }
         self.history_safe_projection = None
         self.adc_lite_cfg = cfg_get(iforward_cfg, "adc_lite", {}) or {}
@@ -554,8 +560,31 @@ class IForwardModel(nn.Module):
                 raise ValueError("stage2_0_biggs_parent_lifting requires adc_lite.enable=false")
             observe_cfg = cfg_get(biggs_cfg, "observe", {}) or {}
             lifting_cfg = cfg_get(biggs_cfg, "lifting", {}) or {}
+            if self.is_stage3_0_full_sparse_gather_lift:
+                stage3_lifting_cfg = cfg_get(iforward_cfg, "lifting", None)
+                if stage3_lifting_cfg is None:
+                    raise ValueError("Stage3_0 requires model.iforward.lifting.")
+                if str(cfg_get(stage3_lifting_cfg, "type", "")).lower() != "full_sparse_gather":
+                    raise ValueError("Stage3_0 requires model.iforward.lifting.type=full_sparse_gather.")
+                if str(cfg_get(lifting_cfg, "type", "")).lower() == "fwhr":
+                    raise ValueError("Stage3_0 forbids legacy model.iforward.biggs.lifting.type=fwhr.")
+                scalar_anchor_backend = str(cfg_get(stage3_lifting_cfg, "scalar_anchor_backend", "cuda_scalar_anchor")).lower()
+                if scalar_anchor_backend not in {"projected_meta", "cuda_scalar_anchor"}:
+                    raise ValueError(f"Stage3_0 unsupported scalar_anchor_backend={scalar_anchor_backend!r}.")
+                parent_lift_cfg = cfg_get(stage3_lifting_cfg, "parent", {}) or {}
+                parent_lift_type = str(cfg_get(parent_lift_cfg, "type", "legacy_direct_lift")).lower()
+                if parent_lift_type not in {"legacy_direct_lift", "sparse_gather"}:
+                    raise ValueError(f"Stage3_0 unsupported parent.type={parent_lift_type!r}.")
+                if parent_lift_type == "legacy_direct_lift" and bool(
+                    cfg_get(cfg_get(stage3_lifting_cfg, "dino_native", {}) or {}, "enable", False)
+                ):
+                    raise ValueError("Stage3_0 parent.type=legacy_direct_lift forbids dino_native.enable=true.")
             is_fwhr = str(cfg_get(lifting_cfg, "type", "")).lower() == "fwhr"
-            if not bool(is_fwhr) and bool(cfg_get(observe_cfg, "parent_scene_for_lifting", True)) is not True:
+            if (
+                not bool(self.is_stage3_0_full_sparse_gather_lift)
+                and not bool(is_fwhr)
+                and bool(cfg_get(observe_cfg, "parent_scene_for_lifting", True)) is not True
+            ):
                 raise ValueError("stage2_0_biggs_parent_lifting requires parent_scene_for_lifting=true")
             skip_cfg = cfg_get(biggs_cfg, "child_observation_skip", {}) or {}
             if bool(cfg_get(skip_cfg, "enable", False)) and (
@@ -849,6 +878,10 @@ class IForwardModel(nn.Module):
         self.loss_history_damage_warmup_start_step = int(cfg_get(history_damage_warmup_cfg, "start_step", 10000))
         self.loss_history_damage_warmup_steps = int(cfg_get(history_damage_warmup_cfg, "steps", 15000))
         self.loss_delta_reg_weight = float(cfg_get(cfg_get(loss_cfg, "delta_regularization", {}) or {}, "weight", 1.0))
+        stage3_lifting_cfg = cfg_get(iforward_cfg, "lifting", {}) or {}
+        stage3_reg_cfg = cfg_get(stage3_lifting_cfg, "regularization", {}) or {}
+        self.stage3_offset_l2_weight = float(cfg_get(stage3_reg_cfg, "offset_l2", 0.0))
+        self.stage3_out_of_bounds_weight = float(cfg_get(stage3_reg_cfg, "out_of_bounds", 0.0))
         hsp_cfg = cfg_get(iforward_cfg, "history_safe_projection", {}) or {}
         hsp_damage_cfg = cfg_get(hsp_cfg, "damage_loss", {}) or {}
         self.hsp_damage_loss_weight = (
@@ -1799,6 +1832,8 @@ class IForwardModel(nn.Module):
         per_step: List[Dict[str, float]] = []
         reg_terms: List[torch.Tensor] = []
         reg_stats_sum: Dict[str, float] = {}
+        stage3_reg_terms: List[torch.Tensor] = []
+        stage3_reg_stats_sum: Dict[str, float] = {}
         hsp_losses: List[torch.Tensor] = []
         hsp_stats_sum: Dict[str, float] = {}
         hsp_stats_count = 0
@@ -1893,6 +1928,15 @@ class IForwardModel(nn.Module):
                     observe_kwargs["biggs_scene_id"] = int(resolved.scene_id)
                     observe_kwargs["biggs_segment_id"] = int(resolved.segment_id)
                     observe_kwargs["biggs_episode_id"] = int(resolved.episode_id)
+                    observe_kwargs["visit_meta"] = {
+                        "global_step": int(global_step),
+                        "step_idx": int(getattr(step, "step_idx", 0)),
+                        "repeat_idx": int(getattr(step, "repeat_idx", 0)),
+                        "repeat_budget": int(getattr(step, "repeat_budget", 0)),
+                        "visit_kind": str(getattr(step, "visit_kind", "")),
+                    }
+                    if self.iforward_version == "stage3_0_full_sparse_gather_lift":
+                        observe_kwargs["parent_optimizer_state"] = parent_temporal_state
                 measurement = self.bridge.observe(**observe_kwargs)
                 if (
                     self.is_stage2_0_biggs_parent_lifting
@@ -2045,6 +2089,18 @@ class IForwardModel(nn.Module):
                     )
                 else:
                     event = self.bridge.build_event(local_state=local_state, measurement=measurement)
+                if self.is_stage3_0_full_sparse_gather_lift and isinstance(measurement, dict):
+                    raw_terms = measurement.get("stage3_gather_reg_terms", {})
+                    if isinstance(raw_terms, dict) and any(torch.is_tensor(v) for v in raw_terms.values()):
+                        stage3_reg_loss, stage3_reg_stats = stage3_gather_regularization(
+                            raw_terms,
+                            offset_l2_weight=float(getattr(self, "stage3_offset_l2_weight", 0.0)),
+                            out_of_bounds_weight=float(getattr(self, "stage3_out_of_bounds_weight", 0.0)),
+                        )
+                        stage3_reg_terms.append(stage3_reg_loss)
+                        for key, value in stage3_reg_stats.items():
+                            if isinstance(value, (int, float)):
+                                stage3_reg_stats_sum[key] = stage3_reg_stats_sum.get(key, 0.0) + float(value)
             event_step_ms = (time.perf_counter() - t0) * 1000.0
             timings["event_ms"] += event_step_ms
             is_frame_exit = bool(is_block_exit)
@@ -2539,6 +2595,10 @@ class IForwardModel(nn.Module):
             delta_reg = torch.stack(reg_terms).mean()
         else:
             delta_reg = local_state.bg.means.new_tensor(0.0)
+        if stage3_reg_terms:
+            stage3_gather_reg = torch.stack([x.to(device=local_state.bg.means.device) for x in stage3_reg_terms]).mean()
+        else:
+            stage3_gather_reg = local_state.bg.means.new_tensor(0.0)
         if hsp_losses:
             hsp_damage_loss = torch.stack(hsp_losses).mean()
         else:
@@ -2645,6 +2705,7 @@ class IForwardModel(nn.Module):
             stage2_3_bank_damage_num_pos = float(stage2_3_damage_stats.get("stage2_3/best_damage_num_pos", 0.0))
             history_damage_loss = history_damage_loss + stage2_3_bank_damage_loss
         final_losses["delta_regularization"] = delta_reg
+        final_losses["stage3_gather_regularization"] = stage3_gather_reg
         final_losses["hsp_damage_loss"] = hsp_damage_loss
         final_losses["hgv2_gate"] = hgv2_gate_loss
         final_losses["history_damage"] = history_damage_loss
@@ -2735,6 +2796,7 @@ class IForwardModel(nn.Module):
             + float(in_rollout_history_loss_weight) * final_losses["in_rollout_history"]
             + self.loss_short_window_history_weight * final_losses["short_window_history"]
             + self.loss_delta_reg_weight * final_losses["delta_regularization"]
+            + final_losses["stage3_gather_regularization"]
             + self.hsp_damage_loss_weight * final_losses["hsp_damage_loss"]
             + float(getattr(self, "loss_hgv2_gate_weight", 0.0)) * final_losses["hgv2_gate"]
             + float(history_damage_weight) * final_losses["history_damage"]
@@ -2860,9 +2922,14 @@ class IForwardModel(nn.Module):
             ),
             "loss_weight/short_window_history": float(self.loss_short_window_history_weight),
             "loss_weight/delta_regularization": float(self.loss_delta_reg_weight),
+            "loss_weight/stage3_offset_l2": float(getattr(self, "stage3_offset_l2_weight", 0.0)),
+            "loss_weight/stage3_out_of_bounds": float(getattr(self, "stage3_out_of_bounds_weight", 0.0)),
             "loss_weight/hsp_damage": float(self.hsp_damage_loss_weight),
             "loss_weight/hgv2_gate": float(getattr(self, "loss_hgv2_gate_weight", 0.0)),
             "loss_weight/history_damage": float(history_damage_weight),
+            "iforward/stage3/loss_gather_regularization": float(stage3_gather_reg.detach().item())
+            if bool(getattr(self, "is_stage3_0_full_sparse_gather_lift", False))
+            else 0.0,
             "hsp/damage_loss": float(hsp_damage_loss.detach().item()) if hsp_damage_loss.numel() else 0.0,
             "hgv2/loss_gate_aux": float(hgv2_gate_loss.detach().item()) if hgv2_gate_loss.numel() else 0.0,
             "history_damage/loss": float(history_damage_loss.detach().item()) if history_damage_loss.numel() else 0.0,
@@ -3078,6 +3145,8 @@ class IForwardModel(nn.Module):
             stats[f"{key}_mean"] = float(sum(values) / float(len(values)))
         for key, value in reg_stats_sum.items():
             stats[f"delta_reg/{key}_mean"] = float(value) / float(max(len(reg_terms), 1))
+        for key, value in stage3_reg_stats_sum.items():
+            stats[str(key)] = float(value) / float(max(len(stage3_reg_terms), 1))
         for key, value in hsp_stats_sum.items():
             stats[str(key)] = float(value) / float(max(int(hsp_stats_count), 1))
         for key, value in hgv2_stats_sum.items():

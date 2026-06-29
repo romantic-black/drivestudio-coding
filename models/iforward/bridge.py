@@ -96,6 +96,8 @@ class IForwardStage6Bridge:
         biggs_scene_id: Optional[int] = None,
         biggs_segment_id: Optional[int] = None,
         biggs_episode_id: Optional[int] = None,
+        parent_optimizer_state: Optional[Any] = None,
+        visit_meta: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         return self.runtime._observe_v4_measurement(
             local_state=local_state,
@@ -107,6 +109,8 @@ class IForwardStage6Bridge:
             biggs_scene_id=biggs_scene_id,
             biggs_segment_id=biggs_segment_id,
             biggs_episode_id=biggs_episode_id,
+            parent_optimizer_state=parent_optimizer_state,
+            visit_meta=visit_meta,
         )
 
     def update_biggs_parent_runtime(

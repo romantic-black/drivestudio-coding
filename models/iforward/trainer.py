@@ -77,6 +77,24 @@ class IForwardTrainer(nn.Module):
         decoder = getattr(runtime, "biggs_child_decoder", None) if runtime is not None else None
         return decoder if isinstance(decoder, nn.Module) else None
 
+    def _stage3_sparse_gather_modules(self) -> List[Tuple[str, nn.Module]]:
+        runtime = self._phase_a_runtime()
+        if runtime is None:
+            return []
+        out: List[Tuple[str, nn.Module]] = []
+        for name in (
+            "stage3_parent_query",
+            "stage3_parent_query_obs2d",
+            "stage3_parent_context_fusion",
+            "stage3_child_query",
+            "stage3_parent_gather",
+            "stage3_child_gather",
+        ):
+            module = getattr(runtime, name, None)
+            if isinstance(module, nn.Module):
+                out.append((name, module))
+        return out
+
     def _is_v6_point_mamba_xcpe(self) -> bool:
         if bool(getattr(self.model, "is_v6_point_mamba_xcpe", False)):
             return True
@@ -97,11 +115,15 @@ class IForwardTrainer(nn.Module):
             "stage2_1_fwhr_parent_ptv3_temporal_mamba",
             "stage2_2_stream10_rawframe_temporal_mamba_v2",
             "iforward_2_3_optimizer_mamba",
+            "stage3_0_full_sparse_gather_lift",
         }
 
     def _is_stage2_1_parent_temporal(self) -> bool:
-        if bool(getattr(self.model, "is_stage2_1_parent_temporal", False)) or bool(
-            getattr(self.model, "is_stage2_2_parent_temporal", False)
+        if (
+            bool(getattr(self.model, "is_stage2_1_parent_temporal", False))
+            or bool(getattr(self.model, "is_stage2_2_parent_temporal", False))
+            or bool(getattr(self.model, "is_stage2_3_optimizer_mamba", False))
+            or bool(getattr(self.model, "is_stage3_0_full_sparse_gather_lift", False))
         ):
             return True
         iforward_cfg = cfg_get(cfg_get(self.config, "model", {}) or {}, "iforward", {}) or {}
@@ -109,6 +131,7 @@ class IForwardTrainer(nn.Module):
             "stage2_1_fwhr_parent_ptv3_temporal_mamba",
             "stage2_2_stream10_rawframe_temporal_mamba_v2",
             "iforward_2_3_optimizer_mamba",
+            "stage3_0_full_sparse_gather_lift",
         }
 
     def _is_v3_gru_history_gate(self) -> bool:
@@ -243,6 +266,11 @@ class IForwardTrainer(nn.Module):
         biggs_named = self._named_params(self._biggs_child_decoder(), "biggs_child_decoder")
         if biggs_named:
             groups["biggs_child_decoder"] = biggs_named
+        stage3_named: List[Tuple[str, nn.Parameter]] = []
+        for module_name, module in self._stage3_sparse_gather_modules():
+            stage3_named.extend(self._named_params(module, module_name))
+        if stage3_named:
+            groups["stage3_sparse_gather"] = stage3_named
         measurement_groups = self._measurement_frontend_params()
         iforward_cfg = cfg_get(cfg_get(self.config, "model", {}) or {}, "iforward", {}) or {}
         trainability = cfg_get(iforward_cfg, "trainability", {}) or {}
@@ -288,6 +316,7 @@ class IForwardTrainer(nn.Module):
             "stage6_posterior_updater_base": float(cfg_get(lr_cfg, "stage6_posterior_updater_base", 1.0e-5)),
             "stage6_struct_decoder": float(cfg_get(lr_cfg, "stage6_struct_decoder", 0.0)),
             "biggs_child_decoder": float(cfg_get(lr_cfg, "biggs_child_decoder", fallback)),
+            "stage3_sparse_gather": float(cfg_get(lr_cfg, "stage3_sparse_gather", fallback)),
             "parent_token_builder": float(cfg_get(lr_cfg, "parent_token_builder", fallback)),
             "parent_ptv3": float(cfg_get(lr_cfg, "parent_ptv3", fallback)),
             "parent_temporal_mamba": float(cfg_get(lr_cfg, "parent_temporal_mamba", fallback)),
@@ -324,6 +353,7 @@ class IForwardTrainer(nn.Module):
         unfreeze_struct_step = int(cfg_get(trainability, "unfreeze_struct_decoder_after_step", 10**12))
         train_measurement = bool(cfg_get(trainability, "train_measurement_frontend", False))
         train_biggs_child_decoder = bool(cfg_get(trainability, "train_biggs_child_decoder", True))
+        train_stage3_sparse_gather = bool(cfg_get(trainability, "train_stage3_sparse_gather", True))
 
         self._set_all_model_requires_grad(False)
         if self._is_v3_gru_history_gate():
@@ -362,6 +392,7 @@ class IForwardTrainer(nn.Module):
         struct_train = bool(train_struct and int(global_step) >= int(unfreeze_struct_step))
         self._set_group_requires_grad("stage6_struct_decoder", struct_train)
         self._set_group_requires_grad("biggs_child_decoder", train_biggs_child_decoder)
+        self._set_group_requires_grad("stage3_sparse_gather", train_stage3_sparse_gather)
         for group_name in (
             "stage6_measurement_frontend_residual_unet",
             "stage6_measurement_frontend_fusion_neck",
@@ -378,6 +409,8 @@ class IForwardTrainer(nn.Module):
             if name == "stage6_struct_decoder" and not struct_train:
                 lr = 0.0
             if name == "biggs_child_decoder" and not train_biggs_child_decoder:
+                lr = 0.0
+            if name == "stage3_sparse_gather" and not train_stage3_sparse_gather:
                 lr = 0.0
             if name.startswith("stage6_measurement_frontend") and not train_measurement:
                 lr = 0.0
