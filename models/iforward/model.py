@@ -62,10 +62,12 @@ from .stage2_3 import (
 from .stage3_0.losses import stage3_gather_regularization
 from .point_mamba_memory import IForwardPointMambaMemory
 from .resolver import (
+    IFORWARD_OPTIMIZER_SEQUENCE_SCHEDULER_VERSIONS,
     IFORWARD_SEQUENCE10_SCHEDULER_VERSION,
     IFORWARD_STAGE2_1_SCHEDULER_VERSION,
     IFORWARD_STAGE2_2_SCHEDULER_VERSION,
     IFORWARD_STAGE2_3_SCHEDULER_VERSION,
+    IFORWARD_STAGE3_0_SCHEDULER_VERSION,
     IFORWARD_V3_SCHEDULER_VERSION,
     IFORWARD_V4_SCHEDULER_VERSION,
     IForwardBatchResolver,
@@ -75,6 +77,7 @@ from .sequence10_history_bank import Sequence10HistoryBank, sequence10_damage_hi
 from .sequence10_resolver import IForwardSequence10Resolver
 from .state import IForwardMemoryState, IForwardShortWindowHistory, IForwardState
 from .utils import cfg_ensure_child, cfg_get, cfg_set, clone_config
+from .versions import is_stage3_0_iforward_version
 
 
 def _cfg_set_missing(node: Any, key: str, value: Any) -> None:
@@ -470,16 +473,25 @@ class IForwardModel(nn.Module):
 
                 self.resolver = IForwardRandomWindowBatchResolver()
             else:
-                scheduler23_cfg = cfg_get(config, "scheduler_v3", {}) or {}
+                scheduler30_cfg = cfg_get(config, "scheduler_stage3_0", None)
+                scheduler23_cfg = (
+                    scheduler30_cfg
+                    if scheduler30_cfg is not None and bool(cfg_get(scheduler30_cfg, "enable", False))
+                    else (cfg_get(config, "scheduler_v3", {}) or {})
+                )
                 scheduler22_cfg = cfg_get(config, "scheduler_stage2_2", {}) or {}
                 scheduler_cfg = cfg_get(config, "scheduler_iforward", {}) or {}
                 if bool(cfg_get(scheduler23_cfg, "enable", False)) and str(
                     cfg_get(scheduler23_cfg, "version", "")
-                ) == "optimizer_sequence_v1":
+                ) in {"optimizer_sequence_v1", IFORWARD_STAGE3_0_SCHEDULER_VERSION}:
                     from datasets.iforward_stage2_3.resolver import Stage23BatchResolver
 
                     self.resolver = Stage23BatchResolver()
-                    scheduler_version = IFORWARD_STAGE2_3_SCHEDULER_VERSION
+                    scheduler_version = (
+                        IFORWARD_STAGE3_0_SCHEDULER_VERSION
+                        if scheduler23_cfg is scheduler30_cfg
+                        else IFORWARD_STAGE2_3_SCHEDULER_VERSION
+                    )
                 elif bool(cfg_get(scheduler22_cfg, "enable", False)):
                     from datasets.iforward_stage2_2.resolver import Stage22BatchResolver
 
@@ -495,10 +507,11 @@ class IForwardModel(nn.Module):
                     IFORWARD_STAGE2_1_SCHEDULER_VERSION,
                     IFORWARD_STAGE2_2_SCHEDULER_VERSION,
                     IFORWARD_STAGE2_3_SCHEDULER_VERSION,
+                    IFORWARD_STAGE3_0_SCHEDULER_VERSION,
                 }:
-                    if scheduler_version not in {IFORWARD_STAGE2_2_SCHEDULER_VERSION, IFORWARD_STAGE2_3_SCHEDULER_VERSION}:
+                    if scheduler_version not in {IFORWARD_STAGE2_2_SCHEDULER_VERSION, *IFORWARD_OPTIMIZER_SEQUENCE_SCHEDULER_VERSIONS}:
                         self.resolver = IForwardBatchResolver(expected_scheduler_version=scheduler_version)
-                elif scheduler_version not in {IFORWARD_STAGE2_2_SCHEDULER_VERSION, IFORWARD_STAGE2_3_SCHEDULER_VERSION}:
+                elif scheduler_version not in {IFORWARD_STAGE2_2_SCHEDULER_VERSION, *IFORWARD_OPTIMIZER_SEQUENCE_SCHEDULER_VERSIONS}:
                     self.resolver = IForwardBatchResolver()
 
         if bridge is None:
@@ -517,15 +530,14 @@ class IForwardModel(nn.Module):
         event_dim = int(getattr(self.bridge, "event_dim", 48))
         iforward_cfg = cfg_get(cfg_get(config, "model", {}) or {}, "iforward", {}) or {}
         self.iforward_version = str(cfg_get(iforward_cfg, "version", "v1"))
-        self.is_stage3_0_full_sparse_gather_lift = self.iforward_version == "stage3_0_full_sparse_gather_lift"
+        self.is_stage3_0_full_sparse_gather_lift = is_stage3_0_iforward_version(self.iforward_version)
         self.is_v3_gru_history_gate = self.iforward_version == "v3_gru_history_gate"
         self.is_v6_point_mamba_xcpe = self.iforward_version == "v6_point_mamba_xcpe"
         self.is_stage2_1_parent_temporal = self.iforward_version == "stage2_1_fwhr_parent_ptv3_temporal_mamba"
         self.is_stage2_2_parent_temporal = self.iforward_version == "stage2_2_stream10_rawframe_temporal_mamba_v2"
         self.is_stage2_3_optimizer_mamba = self.iforward_version in {
             "iforward_2_3_optimizer_mamba",
-            "stage3_0_full_sparse_gather_lift",
-        }
+        } or bool(self.is_stage3_0_full_sparse_gather_lift)
         self.is_stage2_0_biggs_parent_lifting = self.iforward_version in {
             "stage2_0_biggs_parent_lifting",
             "stage2_0_biggs_cuda_exact_diagonal_projector",
@@ -536,8 +548,7 @@ class IForwardModel(nn.Module):
             "stage2_1_fwhr_parent_ptv3_temporal_mamba",
             "stage2_2_stream10_rawframe_temporal_mamba_v2",
             "iforward_2_3_optimizer_mamba",
-            "stage3_0_full_sparse_gather_lift",
-        }
+        } or bool(self.is_stage3_0_full_sparse_gather_lift)
         self.history_safe_projection = None
         self.adc_lite_cfg = cfg_get(iforward_cfg, "adc_lite", {}) or {}
         self.adc_lite_enabled = bool(cfg_get(self.adc_lite_cfg, "enable", False))
@@ -1006,7 +1017,7 @@ class IForwardModel(nn.Module):
         )
         stage2_3_bank = (
             EpisodeHistoryBankV3.empty(device=self.device)
-            if str(getattr(resolved, "scheduler_version", "")) == IFORWARD_STAGE2_3_SCHEDULER_VERSION
+            if str(getattr(resolved, "scheduler_version", "")) in IFORWARD_OPTIMIZER_SEQUENCE_SCHEDULER_VERSIONS
             else None
         )
         return IForwardState(
@@ -1300,7 +1311,7 @@ class IForwardModel(nn.Module):
         final_pack: IForwardFinalRenderPack,
         ref: torch.Tensor,
     ) -> Tuple[Dict[int, torch.Tensor], torch.Tensor, torch.Tensor]:
-        if str(getattr(resolved, "scheduler_version", "")) != IFORWARD_STAGE2_3_SCHEDULER_VERSION:
+        if str(getattr(resolved, "scheduler_version", "")) not in IFORWARD_OPTIMIZER_SEQUENCE_SCHEDULER_VERSIONS:
             return {}, ref.new_zeros((0,)), torch.zeros((0,), device=ref.device, dtype=torch.bool)
         meta = dict(getattr(resolved, "meta", {}) or {})
         source_frames = [int(x) for x in list(meta.get("sequence_source_frame_indices", []) or [])]
@@ -1850,6 +1861,64 @@ class IForwardModel(nn.Module):
             "delta_reg_ms": 0.0,
             "final_render_ms": 0.0,
         }
+        model_cfg = cfg_get(self.config, "model", {}) or {}
+        iforward_cfg_for_mem = cfg_get(model_cfg, "iforward", {}) or {}
+        debug_cfg_for_mem = cfg_get(iforward_cfg_for_mem, "debug", {}) or {}
+        lifting_cfg_for_mem = cfg_get(iforward_cfg_for_mem, "lifting", {}) or {}
+        default_mem_interval = int(cfg_get(lifting_cfg_for_mem, "memory_aux_interval", 0))
+        forward_mem_interval = int(
+            cfg_get(debug_cfg_for_mem, "forward_memory_aux_interval", default_mem_interval)
+        )
+        emit_forward_mem_aux = bool(
+            torch.cuda.is_available()
+            and int(forward_mem_interval) > 0
+            and int(global_step) % int(forward_mem_interval) == 0
+        )
+        rollout_mem_aux: Dict[str, float] = {
+            "iforward/forward_mem/interval": float(max(int(forward_mem_interval), 0)),
+            "iforward/forward_mem/sampled": 1.0 if bool(emit_forward_mem_aux) else 0.0,
+        }
+
+        def _cuda_mem_snapshot() -> Optional[Dict[str, float]]:
+            if not bool(emit_forward_mem_aux):
+                return None
+            try:
+                device = local_state.bg.means.device
+                if torch.device(device).type != "cuda":
+                    device = torch.cuda.current_device()
+                allocated = float(torch.cuda.memory_allocated(device) / (1024.0 * 1024.0))
+                reserved = float(torch.cuda.memory_reserved(device) / (1024.0 * 1024.0))
+                max_allocated = float(torch.cuda.max_memory_allocated(device) / (1024.0 * 1024.0))
+            except Exception:
+                return None
+            return {
+                "allocated_mb": allocated,
+                "reserved_mb": reserved,
+                "max_allocated_mb": max_allocated,
+            }
+
+        def _record_stage_mem(
+            stage: str,
+            *,
+            out: Dict[str, float],
+            prev: Optional[Dict[str, float]] = None,
+            prefix: str = "iforward/forward_mem",
+        ) -> Optional[Dict[str, float]]:
+            snap = _cuda_mem_snapshot()
+            if snap is None:
+                return prev
+            for name, value in snap.items():
+                out[f"{prefix}/{stage}_{name}"] = float(value)
+            if prev is not None:
+                out[f"{prefix}/{stage}_allocated_delta_mb"] = float(
+                    snap["allocated_mb"] - prev.get("allocated_mb", snap["allocated_mb"])
+                )
+                out[f"{prefix}/{stage}_reserved_delta_mb"] = float(
+                    snap["reserved_mb"] - prev.get("reserved_mb", snap["reserved_mb"])
+                )
+            return snap
+
+        rollout_mem_prev = _record_stage_mem("rollout_start", out=rollout_mem_aux)
         adc_suppression_accumulator = None
         if (
             bool(getattr(self, "adc_lite_enabled", False))
@@ -1906,6 +1975,8 @@ class IForwardModel(nn.Module):
         biggs_parent_runtime = None
         stage2_1_parent_block_cache: Dict[str, Any] = {}
         for step_pos, step in enumerate(resolved.steps):
+            step_mem_aux: Dict[str, float] = {}
+            step_mem_prev = _record_stage_mem("before_observe", out=step_mem_aux)
             next_step = resolved.steps[step_pos + 1] if step_pos + 1 < len(resolved.steps) else None
             is_block_enter, is_block_exit = self._resolved_step_block_flags(step, next_step)
             if bool(is_block_enter):
@@ -1935,7 +2006,7 @@ class IForwardModel(nn.Module):
                         "repeat_budget": int(getattr(step, "repeat_budget", 0)),
                         "visit_kind": str(getattr(step, "visit_kind", "")),
                     }
-                    if self.iforward_version == "stage3_0_full_sparse_gather_lift":
+                    if bool(self.is_stage3_0_full_sparse_gather_lift):
                         observe_kwargs["parent_optimizer_state"] = parent_temporal_state
                 measurement = self.bridge.observe(**observe_kwargs)
                 if (
@@ -1947,6 +2018,7 @@ class IForwardModel(nn.Module):
                     detach_biggs = getattr(next_biggs_state, "detach", None)
                     state.biggs_state = detach_biggs() if callable(detach_biggs) else next_biggs_state
                     biggs_parent_runtime = measurement.get("biggs_parent_runtime", biggs_parent_runtime)
+            step_mem_prev = _record_stage_mem("after_observe", out=step_mem_aux, prev=step_mem_prev)
             observe_step_ms = (time.perf_counter() - t0) * 1000.0
             timings["observe_ms"] += observe_step_ms
             t0 = time.perf_counter()
@@ -1987,7 +2059,7 @@ class IForwardModel(nn.Module):
                         )
                     is_sequence10_scheduler = str(getattr(resolved, "scheduler_version", "")) == IFORWARD_SEQUENCE10_SCHEDULER_VERSION
                     is_stage2_2_scheduler = str(getattr(resolved, "scheduler_version", "")) == IFORWARD_STAGE2_2_SCHEDULER_VERSION
-                    is_stage2_3_scheduler = str(getattr(resolved, "scheduler_version", "")) == IFORWARD_STAGE2_3_SCHEDULER_VERSION
+                    is_stage2_3_scheduler = str(getattr(resolved, "scheduler_version", "")) in IFORWARD_OPTIMIZER_SEQUENCE_SCHEDULER_VERSIONS
                     temporal_read_enabled = (
                         bool(getattr(step, "optimizer_memory_read", True))
                         if bool(is_stage2_3_scheduler)
@@ -2101,6 +2173,7 @@ class IForwardModel(nn.Module):
                         for key, value in stage3_reg_stats.items():
                             if isinstance(value, (int, float)):
                                 stage3_reg_stats_sum[key] = stage3_reg_stats_sum.get(key, 0.0) + float(value)
+            step_mem_prev = _record_stage_mem("after_event", out=step_mem_aux, prev=step_mem_prev)
             event_step_ms = (time.perf_counter() - t0) * 1000.0
             timings["event_ms"] += event_step_ms
             is_frame_exit = bool(is_block_exit)
@@ -2179,6 +2252,7 @@ class IForwardModel(nn.Module):
                         update_optimizer_memory=bool(step.update_optimizer_memory),
                         ablation=module_ablation_name,
                     )
+            step_mem_prev = _record_stage_mem("after_memory", out=step_mem_aux, prev=step_mem_prev)
             memory_step_ms = (time.perf_counter() - t0) * 1000.0
             timings["memory_ms"] += memory_step_ms
             working_history = working_history.commit_memory_entries(
@@ -2471,6 +2545,7 @@ class IForwardModel(nn.Module):
                     elif bool(is_sequence10_scheduler or is_stage2_2_scheduler):
                         update_aux["iforward/parent_temporal/block_commit_skipped"] = 1.0
                     stage2_1_parent_block_cache = {}
+            step_mem_prev = _record_stage_mem("after_update", out=step_mem_aux, prev=step_mem_prev)
             update_step_ms = (time.perf_counter() - t0) * 1000.0
             timings["update_ms"] += update_step_ms
             t0 = time.perf_counter()
@@ -2485,6 +2560,7 @@ class IForwardModel(nn.Module):
             for key, value in reg_stats.items():
                 if isinstance(value, (int, float)):
                     reg_stats_sum[key] = reg_stats_sum.get(key, 0.0) + float(value)
+            _record_stage_mem("after_delta_reg", out=step_mem_aux, prev=step_mem_prev)
             item: Dict[str, float] = {
                 "k": float(step.step_idx),
                 "source_frame_idx": float(step.source_frame_idx),
@@ -2516,8 +2592,10 @@ class IForwardModel(nn.Module):
                 item.update({str(k): float(v) for k, v in measurement.items() if isinstance(v, (int, float))})
             item.update({str(k): float(v) for k, v in memory_aux.items() if isinstance(v, (int, float))})
             item.update({str(k): float(v) for k, v in update_aux.items() if isinstance(v, (int, float))})
+            item.update(step_mem_aux)
             per_step.append(item)
 
+        rollout_mem_prev = _record_stage_mem("after_rollout_loop", out=rollout_mem_aux, prev=rollout_mem_prev)
         t0 = time.perf_counter()
         with self._nvtx_range("iforward/final_render"):
             (
@@ -2537,9 +2615,10 @@ class IForwardModel(nn.Module):
                 in_rollout_history_loss_weight=float(in_rollout_history_loss_weight),
             )
         timings["final_render_ms"] += (time.perf_counter() - t0) * 1000.0
+        rollout_mem_prev = _record_stage_mem("after_final_render", out=rollout_mem_aux, prev=rollout_mem_prev)
         is_sequence10_scheduler = str(getattr(resolved, "scheduler_version", "")) == IFORWARD_SEQUENCE10_SCHEDULER_VERSION
         is_stage2_2_scheduler = str(getattr(resolved, "scheduler_version", "")) == IFORWARD_STAGE2_2_SCHEDULER_VERSION
-        is_stage2_3_scheduler = str(getattr(resolved, "scheduler_version", "")) == IFORWARD_STAGE2_3_SCHEDULER_VERSION
+        is_stage2_3_scheduler = str(getattr(resolved, "scheduler_version", "")) in IFORWARD_OPTIMIZER_SEQUENCE_SCHEDULER_VERSIONS
         sequence10_bank = getattr(state, "sequence10_bank", None)
         if bool(is_sequence10_scheduler):
             if not isinstance(sequence10_bank, Sequence10HistoryBank):
@@ -2709,6 +2788,7 @@ class IForwardModel(nn.Module):
         final_losses["hsp_damage_loss"] = hsp_damage_loss
         final_losses["hgv2_gate"] = hgv2_gate_loss
         final_losses["history_damage"] = history_damage_loss
+        rollout_mem_prev = _record_stage_mem("after_loss_terms", out=rollout_mem_aux, prev=rollout_mem_prev)
         next_sequence10_bank = sequence10_bank
         if bool(is_sequence10_scheduler) and isinstance(next_sequence10_bank, Sequence10HistoryBank):
             next_sequence10_bank.update(sequence10_per_pos_loss)
@@ -2803,6 +2883,7 @@ class IForwardModel(nn.Module):
         )
         if not torch.isfinite(total).all():
             raise RuntimeError("IForward rollout loss became NaN/Inf.")
+        rollout_mem_prev = _record_stage_mem("after_total_loss", out=rollout_mem_aux, prev=rollout_mem_prev)
 
         history_indices = tuple(()) if self.is_v3_gru_history_gate else tuple(
             resolved.history_commit_target_indices or resolved.current_target_indices
@@ -3119,6 +3200,7 @@ class IForwardModel(nn.Module):
         if current_psnr is not None and short_psnr is not None:
             stats["psnr_gap/current_minus_short_history"] = float(current_psnr) - float(short_psnr)
         stats.update({key: float(value) for key, value in timings.items()})
+        stats.update(rollout_mem_aux)
         per_step_metric_keys = sorted(
             {
                 str(key)
@@ -3143,6 +3225,31 @@ class IForwardModel(nn.Module):
             stats[str(key)] = float(values[-1])
             stats[f"{key}_last"] = float(values[-1])
             stats[f"{key}_mean"] = float(sum(values) / float(len(values)))
+            if str(key).startswith("iforward/forward_mem/"):
+                stats[f"{key}_max"] = float(max(values))
+        if bool(emit_forward_mem_aux):
+            for item in per_step:
+                raw_k = item.get("k", None)
+                if raw_k is None:
+                    continue
+                try:
+                    k = int(raw_k)
+                except Exception:
+                    continue
+                for key, value in item.items():
+                    if not (
+                        isinstance(value, (int, float))
+                        and math.isfinite(float(value))
+                        and str(key).startswith("iforward/forward_mem/")
+                        and (
+                            str(key).endswith("_allocated_mb")
+                            or str(key).endswith("_allocated_delta_mb")
+                            or str(key).endswith("_max_allocated_mb")
+                        )
+                    ):
+                        continue
+                    short_key = str(key)[len("iforward/forward_mem/") :]
+                    stats[f"iforward/forward_mem/k{k}/{short_key}"] = float(value)
         for key, value in reg_stats_sum.items():
             stats[f"delta_reg/{key}_mean"] = float(value) / float(max(len(reg_terms), 1))
         for key, value in stage3_reg_stats_sum.items():

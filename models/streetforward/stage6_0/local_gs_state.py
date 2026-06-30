@@ -152,15 +152,23 @@ class LocalGSState:
         sh_rest_delta = sh_delta[:, 1:, :] if int(sh_delta.shape[1]) > 1 else state.sh_rest.new_zeros(state.sh_rest.shape)
         if tuple(sh_rest_delta.shape) != tuple(state.sh_rest.shape):
             raise ValueError(f"delta sh_rest shape {tuple(sh_rest_delta.shape)} != state {tuple(state.sh_rest.shape)}")
-        quat_delta = _axis_angle_to_quat(delta.quat_axis_angle)
+        quat_delta = _axis_angle_to_quat(delta.quat_axis_angle) if delta.is_active("quat_axis_angle") else None
         return LocalBranchState(
-            means=state.means + delta.means,
-            scales_log=state.scales_log + delta.scales_log,
-            quats=_normalize_quat(_quat_multiply(state.quats, quat_delta)),
-            opacity_logit=state.opacity_logit + delta.opacity_logit,
-            sh_dc=state.sh_dc + sh_dc_delta,
-            sh_rest=state.sh_rest + sh_rest_delta,
-            hidden=state.hidden + delta.hidden,
+            means=state.means + delta.means if delta.is_active("means") else state.means,
+            scales_log=state.scales_log + delta.scales_log if delta.is_active("scales_log") else state.scales_log,
+            quats=(
+                _normalize_quat(_quat_multiply(state.quats, quat_delta))
+                if quat_delta is not None
+                else state.quats
+            ),
+            opacity_logit=(
+                state.opacity_logit + delta.opacity_logit
+                if delta.is_active("opacity_logit")
+                else state.opacity_logit
+            ),
+            sh_dc=state.sh_dc + sh_dc_delta if delta.is_active("sh") else state.sh_dc,
+            sh_rest=state.sh_rest + sh_rest_delta if delta.is_active("sh") else state.sh_rest,
+            hidden=state.hidden + delta.hidden if delta.is_active("hidden") else state.hidden,
         )
 
     def apply_delta(self, delta: DeltaPack) -> "LocalGSState":

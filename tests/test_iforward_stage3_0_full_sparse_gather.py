@@ -49,12 +49,17 @@ def _node_bg(n: int, *, device: torch.device = torch.device("cpu"), sh_bases: in
 def test_stage3_config_reads_top_level_lifting_and_forbids_legacy_fwhr() -> None:
     cfg = OmegaConf.load("configs/iforward/iforward_stage3_0_full_sparse_gather_lift.yaml")
     assert cfg.model.iforward.version == "stage3_0_full_sparse_gather_lift"
+    assert cfg.model.iforward.repair_training.enable is True
+    assert list(cfg.model.iforward.repair_training.kinds) == ["repair"]
+    assert cfg.model.iforward.repair_training.freeze_2d_frontend is True
+    assert cfg.model.iforward.repair_training.no_grad_2d_forward is True
     assert cfg.model.iforward.lifting.type == "full_sparse_gather"
     assert cfg.model.iforward.lifting.scalar_anchor_backend == "cuda_scalar_anchor"
     assert cfg.model.iforward.lifting.scalar_anchor.anchor_mode == "auto"
     assert cfg.model.iforward.lifting.scalar_anchor.count_pairs is False
     assert cfg.model.iforward.lifting.gather_aux_interval == 100
     assert cfg.model.iforward.lifting.memory_aux_interval == 100
+    assert cfg.model.iforward.debug.forward_memory_aux_interval == 100
     assert cfg.model.iforward.lifting.return_stage3_debug_tensors is False
     assert cfg.model.feature_extractor.dino.cache.level == "backbone_intermediate"
     assert cfg.model.iforward.lifting.parent.type == "legacy_direct_lift"
@@ -71,6 +76,9 @@ def test_stage3_config_reads_top_level_lifting_and_forbids_legacy_fwhr() -> None
     assert cfg.model.iforward.lifting.child_gather.fixed_center_chunk_size == 65536
     assert cfg.model.iforward.lifting.child_gather.detach_child_detail is False
     assert cfg.model.iforward.lifting.child_gather.train_child_detail_every_n == 1
+    assert cfg.scheduler_v3.assimilation.max_inner_k == 8
+    assert dict(cfg.scheduler_v3.assimilation.repeat_pairs) == {"4,4": 1.0}
+    assert cfg.scheduler_v3.repair.max_inner_k == 16
     assert "lifting" not in cfg.model.iforward.biggs
 
     runtime = MinimalStreetForwardStage6_0.__new__(MinimalStreetForwardStage6_0)
@@ -92,6 +100,82 @@ def test_stage3_config_reads_top_level_lifting_and_forbids_legacy_fwhr() -> None
     bad_backend.model.iforward.lifting.scalar_anchor_backend = "bad_backend"
     with pytest.raises(ValueError, match="unsupported"):
         runtime._validate_stage6_0_phase_a_config(bad_backend)
+
+
+def test_stage3_full_train_config_uses_30k_assimilation_30k_repair_schedule() -> None:
+    cfg = OmegaConf.load("configs/iforward/iforward_stage3_0_full_train_30k_assim_30k_repair.yaml")
+    assert cfg.output_name == "iforward_stage3_0_full_train_30k_assim_30k_repair"
+    for legacy_key in [
+        "scheduler_v3",
+        "scheduler_stage2_2",
+        "scheduler_v9",
+        "validation_v8",
+        "validation_v9",
+        "iforward_validation",
+        "iforward_coverage_validation",
+        "iforward_sequence10_validation",
+        "iforward_stage2_2_validation",
+        "validation_v3",
+    ]:
+        assert legacy_key not in cfg
+    assert cfg.scheduler_stage3_0.version == "stage3_0_optimizer_sequence_v1"
+    assert cfg.scheduler_stage3_0.bootstrap.end_step == 0
+    assert cfg.scheduler_stage3_0.assimilation.start_step == 0
+    assert "frames_per_rollout" not in cfg.scheduler_stage3_0.assimilation
+    assert cfg.scheduler_stage3_0.assimilation.max_inner_k == 8
+    assert dict(cfg.scheduler_stage3_0.assimilation.rollout_options) == {
+        "B1R8": 0.1,
+        "B1R6": 0.1,
+        "B1R4": 0.1,
+        "B1R2": 0.1,
+        "B2R4": 0.2,
+    }
+    assert dict(cfg.scheduler_stage3_0.assimilation.repeat_pairs) == {"2,6": 0.1, "6,2": 0.1, "3,5": 0.1, "5,3": 0.1}
+    assert cfg.scheduler_stage3_0.repair.start_step == 30000
+    assert cfg.scheduler_stage3_0.repair.max_inner_k == 16
+    assert "rounds" not in cfg.scheduler_stage3_0.repair
+    assert dict(cfg.scheduler_stage3_0.repair.round_distribution) == {2: 0.25, 4: 0.25, 6: 0.25, 8: 0.25}
+    assert dict(cfg.scheduler_stage3_0.repair.rollout_options) == {
+        "B6R1": 0.15,
+        "B4R2": 0.15,
+        "B8R1": 0.15,
+        "B4R3": 0.15,
+        "B6R2": 0.1,
+        "B12R1": 0.1,
+        "B8R2": 0.1,
+        "B16R1": 0.1,
+    }
+    schedule = list(cfg.scheduler_stage3_0.sequence.frame_count_schedule)
+    assert len(schedule) == 2
+    assert dict(schedule[0]) == {"start_step": 0, "target_frames": 10, "min_frames": 10, "allow_short": False}
+    assert dict(schedule[1]) == {"start_step": 30000, "target_frames": 24, "min_frames": 8, "allow_short": True}
+    assert cfg.scheduler_stage3_0_validation.enable is True
+    assert cfg.model.iforward.version == "stage3_0_scalar_anchor_child_support_parent_legacy"
+    assert cfg.model.iforward.repair_training.start_step == 30000
+    assert list(cfg.model.iforward.repair_training.kinds) == ["repair"]
+    assert cfg.model.stage6_0.local_rollout.source == "scheduler_stage3_0"
+    assert cfg.model.iforward.lifting.parent.type == "legacy_direct_lift"
+    assert cfg.model.iforward.lifting.child_gather.type == "support_center"
+    assert "parent_query" not in cfg.model.iforward.lifting
+    assert "parent_context" not in cfg.model.iforward.lifting
+    assert "dino_native" not in cfg.model.iforward.lifting
+    assert "parent_gather" not in cfg.model.iforward.lifting
+    assert "regularization" not in cfg.model.iforward.lifting
+
+
+def test_stage3_repair_training_start_step_and_kind_gate() -> None:
+    runtime = MinimalStreetForwardStage6_0.__new__(MinimalStreetForwardStage6_0)
+    nn.Module.__init__(runtime)
+    runtime.iforward_repair_training_cfg = {
+        "enable": True,
+        "start_step": 30000,
+        "kinds": ["assimilate", "repair"],
+        "freeze_2d_frontend": True,
+    }
+    assert runtime._repair_training_enabled_for_visit({"global_step": 29999, "visit_kind": "assimilate"}) is False
+    assert runtime._repair_training_enabled_for_visit({"global_step": 30000, "visit_kind": "assimilate"}) is True
+    assert runtime._repair_training_enabled_for_visit({"global_step": 30000, "visit_kind": "repair"}) is True
+    assert runtime._repair_training_enabled_for_visit({"global_step": 30000, "visit_kind": "bootstrap"}) is False
 
 
 def test_projected_meta_anchor_filters_masks_aggregates_and_detaches() -> None:
@@ -614,7 +698,14 @@ def test_stage3_child_detail_detach_ablation_and_train_interval() -> None:
     assert not measurement["child_detail_bg"].requires_grad
 
 
-def _run_stage3_observe_smoke(device: torch.device, *, return_debug_tensors: bool = False) -> None:
+def _run_stage3_observe_smoke(
+    device: torch.device,
+    *,
+    return_debug_tensors: bool = False,
+    visit_meta: dict[str, object] | None = None,
+    repair_training_cfg: dict[str, object] | None = None,
+    source_features_require_grad: bool = False,
+) -> tuple[dict[str, object], list[dict[str, object]]]:
     runtime = MinimalStreetForwardStage6_0.__new__(MinimalStreetForwardStage6_0)
     nn.Module.__init__(runtime)
     runtime.device = device
@@ -630,6 +721,7 @@ def _run_stage3_observe_smoke(device: torch.device, *, return_debug_tensors: boo
     runtime.stage2_0_biggs_observe_cfg = {"parent_scene_for_cnn": False}
     runtime.stage2_0_biggs_lifting_cfg = {}
     runtime.stage2_0_biggs_return_debug_stats = False
+    runtime.iforward_repair_training_cfg = repair_training_cfg or {}
     runtime.stage3_0_enabled = True
     runtime.stage3_0_global_step = 0
     runtime.stage3_0_lifting_cfg = {
@@ -654,11 +746,19 @@ def _run_stage3_observe_smoke(device: torch.device, *, return_debug_tensors: boo
         [torch.zeros((1, 4, 4), dtype=torch.bool, device=device)],
         [torch.zeros((1, 4, 4), dtype=torch.bool, device=device)],
     )
-    runtime._render_source_scene_only_for_cnn = lambda **kwargs: {
-        "features_2d": torch.arange(4 * 4 * 4, dtype=torch.float32, device=device).reshape(1, 4, 4, 4),
-        "fwhr_detail_2d": torch.ones((1, 4, 4, 2), dtype=torch.float32, device=device),
-        "source_pair_valid_mask": torch.ones((1, 4, 4), dtype=torch.bool, device=device),
-    }
+    def _render_source_scene_only_for_cnn(**_kwargs):
+        features = torch.arange(4 * 4 * 4, dtype=torch.float32, device=device).reshape(1, 4, 4, 4)
+        detail = torch.ones((1, 4, 4, 2), dtype=torch.float32, device=device)
+        if bool(source_features_require_grad):
+            features = features.detach().clone().requires_grad_(True) * 1.0
+            detail = detail.detach().clone().requires_grad_(True) * 1.0
+        return {
+            "features_2d": features,
+            "fwhr_detail_2d": detail,
+            "source_pair_valid_mask": torch.ones((1, 4, 4), dtype=torch.bool, device=device),
+        }
+
+    runtime._render_source_scene_only_for_cnn = _render_source_scene_only_for_cnn
 
     def _meta_builder(**kwargs):
         n = int(kwargs["gaussians"]["means"].shape[0])
@@ -691,7 +791,7 @@ def _run_stage3_observe_smoke(device: torch.device, *, return_debug_tensors: boo
         source_indices=[0],
         source_frame_idx=0,
         biggs_state=None,
-        visit_meta={"global_step": 0},
+        visit_meta=visit_meta or {"global_step": 0},
     )
     assert measurement["biggs_mode"] == "stage3_sparse_gather_event_decode"
     assert measurement["iforward/fwhr/enabled"] == 0.0
@@ -718,6 +818,7 @@ def _run_stage3_observe_smoke(device: torch.device, *, return_debug_tensors: boo
     assert measurement["child_detail_bg"] is not None
     assert measurement["child_detail_valid_bg"] is not None
     assert measurement["iforward/stage3/child_event_dependency_removed"] == 1.0
+    return measurement, backproject_calls
 
 
 def test_stage3_observe_uses_legacy_parent_backproject() -> None:
@@ -726,6 +827,42 @@ def test_stage3_observe_uses_legacy_parent_backproject() -> None:
 
 def test_stage3_observe_can_return_debug_tensors_when_enabled() -> None:
     _run_stage3_observe_smoke(torch.device("cpu"), return_debug_tensors=True)
+
+
+def test_stage3_repair_training_detaches_2d_observe_features() -> None:
+    normal, normal_calls = _run_stage3_observe_smoke(
+        torch.device("cpu"),
+        visit_meta={"global_step": 0, "visit_kind": "bootstrap"},
+        repair_training_cfg={
+            "enable": True,
+            "kinds": ["repair"],
+            "freeze_2d_frontend": True,
+            "no_grad_2d_forward": True,
+        },
+        source_features_require_grad=True,
+    )
+    assert normal["iforward/repair_training/enabled"] == 0.0
+    assert bool(normal_calls[0]["features_2d"].requires_grad)
+
+    repair, repair_calls = _run_stage3_observe_smoke(
+        torch.device("cpu"),
+        visit_meta={"global_step": 0, "visit_kind": "repair"},
+        repair_training_cfg={
+            "enable": True,
+            "kinds": ["repair"],
+            "freeze_2d_frontend": True,
+            "no_grad_2d_forward": True,
+        },
+        source_features_require_grad=True,
+    )
+    assert repair["iforward/repair_training/enabled"] == 1.0
+    assert repair["iforward/repair_training/freeze_2d_frontend"] == 1.0
+    assert repair["iforward/repair_training/no_grad_2d_forward"] == 1.0
+    assert repair["iforward/repair_training/features_2d_requires_grad"] == 0.0
+    assert repair["iforward/repair_training/detail_2d_requires_grad"] == 0.0
+    assert not bool(repair_calls[0]["features_2d"].requires_grad)
+    assert repair["parent_feat_2d_bg"].requires_grad is False
+    assert repair["child_detail_bg"].requires_grad is False
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")

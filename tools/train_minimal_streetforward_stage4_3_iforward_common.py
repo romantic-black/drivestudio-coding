@@ -8,7 +8,11 @@ from datasets.train_scheduler_iforward_sequence10 import (
     TrainSchedulerIForwardSequence10,
 )
 from datasets.iforward_stage2_2.scheduler import IFORWARD_STAGE2_2_SCHEDULER_VERSION, Stage22Scheduler
-from datasets.iforward_stage2_3.scheduler import IFORWARD_STAGE2_3_SCHEDULER_VERSION, Stage23Scheduler
+from datasets.iforward_stage2_3.scheduler import (
+    IFORWARD_STAGE2_3_SCHEDULER_VERSION,
+    IFORWARD_STAGE3_0_SCHEDULER_VERSION,
+    Stage23Scheduler,
+)
 
 
 def _cfg_get(node: Any, key: str, default: Any = None) -> Any:
@@ -33,11 +37,16 @@ def _null_int(x: Any) -> Optional[int]:
 
 def resolve_fixed_scene_segment_iforward(cfg: Any) -> Tuple[Optional[int], Optional[int]]:
     sched22 = cfg.get("scheduler_stage2_2") if hasattr(cfg, "get") else None
-    sched23 = cfg.get("scheduler_v3") if hasattr(cfg, "get") else None
+    sched30 = cfg.get("scheduler_stage3_0") if hasattr(cfg, "get") else None
+    sched23 = (
+        sched30
+        if sched30 is not None and bool(_cfg_get(sched30, "enable", False))
+        else (cfg.get("scheduler_v3") if hasattr(cfg, "get") else None)
+    )
     if (
         sched23 is not None
         and bool(_cfg_get(sched23, "enable", False))
-        and str(_cfg_get(sched23, "version", "")) == "optimizer_sequence_v1"
+        and str(_cfg_get(sched23, "version", "")) in {"optimizer_sequence_v1", IFORWARD_STAGE3_0_SCHEDULER_VERSION}
     ):
         traversal23 = _cfg_get(sched23, "traversal", {}) or {}
         return _null_int(_cfg_get(traversal23, "fixed_scene_id", None)), _null_int(
@@ -59,21 +68,30 @@ def build_train_scheduler_iforward_from_cfg(
     cfg: Any,
     dataset: Any,
 ) -> TrainSchedulerIForward | TrainSchedulerIForwardSequence10 | Stage22Scheduler | Stage23Scheduler:
-    sched23 = cfg.get("scheduler_v3") if hasattr(cfg, "get") else None
+    sched30 = cfg.get("scheduler_stage3_0") if hasattr(cfg, "get") else None
+    sched23 = (
+        sched30
+        if sched30 is not None and bool(_cfg_get(sched30, "enable", False))
+        else (cfg.get("scheduler_v3") if hasattr(cfg, "get") else None)
+    )
+    sched23_key = "scheduler_stage3_0" if sched23 is sched30 else "scheduler_v3"
     if (
         sched23 is not None
         and bool(_cfg_get(sched23, "enable", False))
-        and str(_cfg_get(sched23, "version", "")) == "optimizer_sequence_v1"
+        and str(_cfg_get(sched23, "version", "")) in {"optimizer_sequence_v1", IFORWARD_STAGE3_0_SCHEDULER_VERSION}
     ):
         legacy = cfg.get("scheduler_iforward") if hasattr(cfg, "get") else None
         sched22_legacy = cfg.get("scheduler_stage2_2") if hasattr(cfg, "get") else None
+        sched23_legacy = cfg.get("scheduler_v3") if hasattr(cfg, "get") else None
         if legacy is not None and bool(_cfg_get(legacy, "enable", False)):
-            raise ValueError("scheduler_v3 optimizer_sequence_v1 forbids enabled legacy scheduler_iforward")
+            raise ValueError(f"{sched23_key} optimizer-sequence forbids enabled legacy scheduler_iforward")
         if sched22_legacy is not None and bool(_cfg_get(sched22_legacy, "enable", False)):
-            raise ValueError("scheduler_v3 optimizer_sequence_v1 forbids enabled scheduler_stage2_2")
+            raise ValueError(f"{sched23_key} optimizer-sequence forbids enabled scheduler_stage2_2")
+        if sched23 is sched30 and sched23_legacy is not None and bool(_cfg_get(sched23_legacy, "enable", False)):
+            raise ValueError("scheduler_stage3_0 forbids enabled legacy scheduler_v3")
         index_dir = str(_cfg_get(sched23, "index_dir", "") or "")
         if not index_dir:
-            raise ValueError("scheduler_v3.index_dir is required; build it with tools/build_iforward_stage2_3_index.py")
+            raise ValueError(f"{sched23_key}.index_dir is required; build it with tools/build_iforward_stage2_3_index.py")
         fixed_scene_id, fixed_segment_id = resolve_fixed_scene_segment_iforward(cfg)
         from tools.train_minimal_streetforward_stage4_3_v7_common import (
             parse_include_test,

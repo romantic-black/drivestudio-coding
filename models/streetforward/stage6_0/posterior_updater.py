@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from models.streetforward.math_utils import _num_sh_bases
 from models.streetforward.stage6_0.event_encoder import EventPack
@@ -39,6 +40,12 @@ class BranchDelta:
     hidden: torch.Tensor
     confidence: torch.Tensor
     noop: torch.Tensor
+    active_attrs: Optional[Dict[str, bool]] = None
+
+    def is_active(self, attr: str) -> bool:
+        if self.active_attrs is None:
+            return True
+        return bool(self.active_attrs.get(str(attr), True))
 
 
 @dataclass
@@ -91,6 +98,15 @@ class CurrentContextAdapter(nn.Module):
 
 
 class Stage6PosteriorUpdater(nn.Module):
+    _SCOPE_KEYS = {
+        "means": "update_means",
+        "scales_log": "update_scales",
+        "quat_axis_angle": "update_quat",
+        "opacity_logit": "update_opacity",
+        "sh": "update_sh",
+        "hidden": "update_hidden",
+    }
+
     def __init__(
         self,
         *,
@@ -237,6 +253,26 @@ class Stage6PosteriorUpdater(nn.Module):
         else:
             self.vsm_ctx_adapter = None
 
+    @staticmethod
+    def _linear_with_detail_gate(
+        head: nn.Linear,
+        h: torch.Tensor,
+        detail_delta: torch.Tensor,
+        gate: torch.Tensor,
+    ) -> torch.Tensor:
+        # For a linear head, head(h + g * d) == head(h) + g * linear(d, W).
+        # This keeps per-attribute gates exact without materializing five [N,H] h forks.
+        gate_t = gate.to(device=h.device, dtype=h.dtype)
+        return head(h) + gate_t * F.linear(detail_delta, head.weight, None)
+
+    @classmethod
+    def _active_attrs_from_scope(cls, scope: Optional[Dict[str, Any]]) -> Dict[str, bool]:
+        raw = dict(scope or {})
+        return {
+            attr: bool(raw.get(scope_key, True))
+            for attr, scope_key in cls._SCOPE_KEYS.items()
+        }
+
     def _branch_forward(
         self,
         *,
@@ -246,9 +282,15 @@ class Stage6PosteriorUpdater(nn.Module):
         ctx_vsm: Optional[torch.Tensor],
         appearance_detail: Optional[torch.Tensor] = None,
         appearance_valid: Optional[torch.Tensor] = None,
+        branch_scope: Optional[Dict[str, Any]] = None,
     ) -> Optional[BranchDelta]:
         if event is None:
             return None
+        if branch_scope is not None and not bool(dict(branch_scope).get("enable", True)):
+            return None
+        active_attrs = self._active_attrs_from_scope(branch_scope)
+        if self.head_hidden is None:
+            active_attrs["hidden"] = False
         if event.dim() != 2 or int(event.shape[-1]) != int(self.event_dim):
             raise ValueError(f"event must be [N,{self.event_dim}], got {tuple(event.shape)}")
         if ctx_current is not None:
@@ -273,6 +315,7 @@ class Stage6PosteriorUpdater(nn.Module):
                 hidden=event.new_zeros((n, self.stage_hidden_dim if self.output_hidden else 0)),
                 confidence=z1 if self.output_confidence else event.new_zeros((n, 0)),
                 noop=z1,
+                active_attrs=active_attrs,
             )
         ctx_in = event if ctx_current is None else ctx_current
         if ctx_vsm is not None:
@@ -283,6 +326,8 @@ class Stage6PosteriorUpdater(nn.Module):
         h_means = h_scales = h_quat = h_opacity = h_sh = h
         h_app = h
         detail_gate = event.new_tensor(0.0)
+        attr_detail_delta: Optional[torch.Tensor] = None
+        attr_detail_gates: Optional[torch.Tensor] = None
         if self.appearance_detail_enable and appearance_detail is not None:
             if self.detail_adapter is None:
                 raise RuntimeError("appearance detail is enabled but adapter/gate are missing")
@@ -309,11 +354,8 @@ class Stage6PosteriorUpdater(nn.Module):
                     raise RuntimeError("appearance attribute detail gates are enabled but missing")
                 max_attr = getattr(self, "detail_gate_attr_max").to(device=h.device, dtype=h.dtype)
                 gates = torch.sigmoid(self.detail_gate_raw_attr[branch_idx]).to(device=h.device, dtype=h.dtype) * max_attr
-                h_means = h + gates[0] * detail_delta
-                h_scales = h + gates[1] * detail_delta
-                h_quat = h + gates[2] * detail_delta
-                h_opacity = h + gates[3] * detail_delta
-                h_sh = h + gates[4] * detail_delta
+                attr_detail_delta = detail_delta
+                attr_detail_gates = gates
                 detail_gate = gates.detach().mean()
             else:
                 if self.detail_gate_raw is None:
@@ -325,28 +367,45 @@ class Stage6PosteriorUpdater(nn.Module):
         noop = torch.sigmoid(self.head_noop(h)) if self.head_noop is not None else event.new_zeros((int(event.shape[0]), 1))
         gate = 1.0 - noop
         clamps = self.branch_clamps.get(str(branch_name), self.branch_clamps["bg"])
-        hidden = (
-            gate * float(clamps["hidden_max_step"]) * torch.tanh(self.head_hidden(h))
-            if self.head_hidden is not None
-            else event.new_zeros((int(event.shape[0]), 0))
-        )
+        n_rows = int(event.shape[0])
+        hidden = event.new_zeros((n_rows, self.stage_hidden_dim if self.output_hidden else 0))
+        if self.head_hidden is not None and bool(active_attrs["hidden"]):
+            hidden = gate * float(clamps["hidden_max_step"]) * torch.tanh(self.head_hidden(h))
         confidence = (
             torch.sigmoid(self.head_confidence(h))
             if self.head_confidence is not None
             else event.new_zeros((int(event.shape[0]), 0))
         )
+        def _raw_attr(attr: str, head: nn.Linear, h_attr: torch.Tensor, gate_idx: int, cols: int) -> torch.Tensor:
+            if not bool(active_attrs[attr]):
+                return event.new_zeros((n_rows, int(cols)))
+            if attr_detail_delta is not None and attr_detail_gates is not None:
+                return self._linear_with_detail_gate(head, h, attr_detail_delta, attr_detail_gates[gate_idx])
+            return head(h_attr)
+
+        raw_means = _raw_attr("means", self.head_means, h_means, 0, 3)
+        raw_scales = _raw_attr("scales_log", self.head_scales, h_scales, 1, 3)
+        raw_quat = _raw_attr("quat_axis_angle", self.head_quat, h_quat, 2, 3)
+        raw_opacity = _raw_attr("opacity_logit", self.head_opacity, h_opacity, 3, 1)
+        raw_sh = _raw_attr("sh", self.head_sh, h_sh, 4, self.sh_dim)
+        def _scaled_delta(attr: str, raw: torch.Tensor, max_step: float) -> torch.Tensor:
+            if not bool(active_attrs[attr]):
+                return torch.zeros_like(raw)
+            return gate * float(max_step) * torch.tanh(raw)
+
         delta = BranchDelta(
-            means=gate * float(clamps["means_max_step_m"]) * torch.tanh(self.head_means(h_means)),
-            scales_log=gate * float(clamps["scales_log_max_step"]) * torch.tanh(self.head_scales(h_scales)),
-            quat_axis_angle=gate * float(clamps["quat_axis_angle_max_step_rad"]) * torch.tanh(self.head_quat(h_quat)),
-            opacity_logit=gate * float(clamps["opacity_logit_max_step"]) * torch.tanh(self.head_opacity(h_opacity)),
-            sh=gate * float(clamps["sh_max_step"]) * torch.tanh(self.head_sh(h_sh)),
+            means=_scaled_delta("means", raw_means, float(clamps["means_max_step_m"])),
+            scales_log=_scaled_delta("scales_log", raw_scales, float(clamps["scales_log_max_step"])),
+            quat_axis_angle=_scaled_delta("quat_axis_angle", raw_quat, float(clamps["quat_axis_angle_max_step_rad"])),
+            opacity_logit=_scaled_delta("opacity_logit", raw_opacity, float(clamps["opacity_logit_max_step"])),
+            sh=_scaled_delta("sh", raw_sh, float(clamps["sh_max_step"])),
             hidden=hidden,
             confidence=confidence,
             noop=noop,
+            active_attrs=active_attrs,
         )
         for name, value in delta.__dict__.items():
-            if not torch.isfinite(value).all():
+            if torch.is_tensor(value) and not torch.isfinite(value).all():
                 raise RuntimeError(f"Stage6PosteriorUpdater delta {name} contains NaN/Inf")
         return delta
 
@@ -394,6 +453,7 @@ class Stage6PosteriorUpdater(nn.Module):
             hidden=delta.hidden * valid_f if delta.hidden.numel() else delta.hidden,
             confidence=delta.confidence * valid_f if delta.confidence.numel() else delta.confidence,
             noop=torch.where(mask.unsqueeze(-1), delta.noop, torch.ones_like(delta.noop)),
+            active_attrs=delta.active_attrs,
         )
 
     def forward(
@@ -403,6 +463,7 @@ class Stage6PosteriorUpdater(nn.Module):
         ctx_current: Optional[ContextPack] = None,
         ctx_vsm: Optional[ContextPack] = None,
         appearance_detail: Optional[AppearanceDetailPack] = None,
+        branch_scope: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> tuple[DeltaPack, Dict[str, Any]]:
         bg = self._branch_forward(
             branch_name="bg",
@@ -411,6 +472,7 @@ class Stage6PosteriorUpdater(nn.Module):
             ctx_vsm=None if ctx_vsm is None else ctx_vsm.ctx_bg,
             appearance_detail=None if appearance_detail is None else appearance_detail.detail_bg,
             appearance_valid=None if appearance_detail is None else appearance_detail.valid_bg,
+            branch_scope=None if branch_scope is None else branch_scope.get("bg"),
         )
         if bg is None:
             raise RuntimeError("EventPack.event_bg is required")
@@ -421,6 +483,7 @@ class Stage6PosteriorUpdater(nn.Module):
             ctx_vsm=None if ctx_vsm is None else ctx_vsm.ctx_distant,
             appearance_detail=None if appearance_detail is None else appearance_detail.detail_distant,
             appearance_valid=None if appearance_detail is None else appearance_detail.valid_distant,
+            branch_scope=None if branch_scope is None else branch_scope.get("distant"),
         )
         rigid = self._branch_forward(
             branch_name="rigid",
@@ -429,6 +492,7 @@ class Stage6PosteriorUpdater(nn.Module):
             ctx_vsm=None if ctx_vsm is None else ctx_vsm.ctx_rigid,
             appearance_detail=None if appearance_detail is None else appearance_detail.detail_rigid,
             appearance_valid=None if appearance_detail is None else appearance_detail.valid_rigid,
+            branch_scope=None if branch_scope is None else branch_scope.get("rigid"),
         )
         bg = self._apply_invalid_update_policy(bg, event.valid_bg, branch_name="bg")
         if bg is None:

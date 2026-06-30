@@ -67,6 +67,11 @@ _IFORWARD_STAGE2_1_SCHEDULER_VERSION = "iforward_stage2_1_parent_temporal"
 _IFORWARD_SEQUENCE10_SCHEDULER_VERSION = "iforward_sequence10_v1"
 _IFORWARD_STAGE2_2_SCHEDULER_VERSION = "iforward_stage2_2_stream10_rawframe"
 _IFORWARD_STAGE2_3_SCHEDULER_VERSION = "iforward_2_3_scheduler_v3_optimizer_mamba"
+_IFORWARD_STAGE3_0_SCHEDULER_VERSION = "stage3_0_optimizer_sequence_v1"
+_IFORWARD_OPTIMIZER_SEQUENCE_SCHEDULER_VERSIONS = {
+    _IFORWARD_STAGE2_3_SCHEDULER_VERSION,
+    _IFORWARD_STAGE3_0_SCHEDULER_VERSION,
+}
 
 
 @dataclass(frozen=True)
@@ -2495,12 +2500,14 @@ class MultiSceneDatasetV4:
             _IFORWARD_SEQUENCE10_SCHEDULER_VERSION,
             _IFORWARD_STAGE2_2_SCHEDULER_VERSION,
             _IFORWARD_STAGE2_3_SCHEDULER_VERSION,
+            _IFORWARD_STAGE3_0_SCHEDULER_VERSION,
         }:
             raise ValueError(
                 "expected IForwardRolloutPlan.scheduler_version == 'iforward_v1' "
                 "or 'iforward_v3_random_window' or 'iforward_v4_coverage_ordered' "
                 f"or '{_IFORWARD_STAGE2_1_SCHEDULER_VERSION}' or '{_IFORWARD_SEQUENCE10_SCHEDULER_VERSION}' "
-                f"or '{_IFORWARD_STAGE2_2_SCHEDULER_VERSION}' or '{_IFORWARD_STAGE2_3_SCHEDULER_VERSION}'"
+                f"or '{_IFORWARD_STAGE2_2_SCHEDULER_VERSION}' or '{_IFORWARD_STAGE2_3_SCHEDULER_VERSION}' "
+                f"or '{_IFORWARD_STAGE3_0_SCHEDULER_VERSION}'"
             )
         if int(scene_id) != int(getattr(plan, "scene_id")) or int(segment_id) != int(getattr(plan, "segment_id")):
             raise ValueError(
@@ -2520,6 +2527,7 @@ class MultiSceneDatasetV4:
             _IFORWARD_SEQUENCE10_SCHEDULER_VERSION,
             _IFORWARD_STAGE2_2_SCHEDULER_VERSION,
             _IFORWARD_STAGE2_3_SCHEDULER_VERSION,
+            _IFORWARD_STAGE3_0_SCHEDULER_VERSION,
         }:
             # V4 final eval intentionally allows one image ref to appear under
             # both rollout-supervision and eval-only roles on the last rollout.
@@ -2636,6 +2644,13 @@ class MultiSceneDatasetV4:
             "repeats_per_block": int(getattr(plan, "repeats_per_block")),
             "requested_inner_K": int(getattr(plan, "requested_inner_K")),
             "actual_inner_K": int(getattr(plan, "actual_inner_K")),
+            "phase_max_inner_k": int(
+                getattr(
+                    plan,
+                    "phase_max_inner_k",
+                    getattr(plan, "actual_inner_K", getattr(plan, "inner_K", 0)),
+                )
+            ),
             "short_rollout": bool(getattr(plan, "short_rollout")),
             "short_rollout_reason": str(getattr(plan, "short_rollout_reason")),
             "input_frame_indices": [int(x) for x in list(getattr(plan, "input_frame_indices", []) or [])],
@@ -2654,6 +2669,9 @@ class MultiSceneDatasetV4:
             "is_repeated_window": bool(getattr(plan, "is_repeated_window", False)),
             "sequence_id": int(getattr(plan, "sequence_id", -1)),
             "sequence_length": int(getattr(plan, "sequence_length", 0)),
+            "sequence_target_frames": int(getattr(plan, "sequence_target_frames", getattr(plan, "sequence_length", 0))),
+            "sequence_min_frames": int(getattr(plan, "sequence_min_frames", getattr(plan, "sequence_length", 0))),
+            "sequence_allow_short": bool(getattr(plan, "sequence_allow_short", False)),
             "sequence_stride": int(getattr(plan, "sequence_stride", 0)),
             "sequence_start_block_pos": int(getattr(plan, "sequence_start_block_pos", -1)),
             "sequence_block_ids": [int(x) for x in list(getattr(plan, "sequence_block_ids", []) or [])],
@@ -2713,6 +2731,7 @@ class MultiSceneDatasetV4:
         request_meta["rollout_id_global"] = int(getattr(plan, "rollout_id_global"))
         request_meta["rollout_idx_in_episode"] = int(getattr(plan, "rollout_idx_in_episode"))
         request_meta["inner_K"] = int(getattr(plan, "inner_K"))
+        request_meta["phase_max_inner_k"] = int(iforward_meta["phase_max_inner_k"])
         request_meta["source_image_refs"] = [tuple(x) for x in evidence_refs]
         request_meta["source_image_ref"] = tuple(evidence_refs[0])
         request_meta["target_image_refs"] = [tuple(x) for x in target_refs]
@@ -2762,10 +2781,10 @@ class MultiSceneDatasetV4:
         plan: Any,
         include_test: bool = False,
     ) -> Dict[str, Any]:
-        if str(getattr(plan, "scheduler_version", "")) != _IFORWARD_STAGE2_3_SCHEDULER_VERSION:
+        if str(getattr(plan, "scheduler_version", "")) not in _IFORWARD_OPTIMIZER_SEQUENCE_SCHEDULER_VERSIONS:
             raise ValueError(
-                "expected Stage2_3 plan.scheduler_version == "
-                f"{_IFORWARD_STAGE2_3_SCHEDULER_VERSION!r}"
+                "expected Stage2_3 optimizer-sequence plan.scheduler_version in "
+                f"{sorted(_IFORWARD_OPTIMIZER_SEQUENCE_SCHEDULER_VERSIONS)!r}"
             )
         return self._assemble_segment_batch_from_iforward_request(
             scene_id=int(scene_id),

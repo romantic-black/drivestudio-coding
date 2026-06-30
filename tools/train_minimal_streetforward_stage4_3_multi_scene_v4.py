@@ -90,6 +90,7 @@ DEFAULT_CONFIG_FILE = "configs/minimal_streetforward_stage4_3_multi_scene_v4.yam
 ALLOW_ONE_SEGMENT = False
 ALLOW_OPTIONAL_ONE_SEGMENT = False
 EPISODE_END_HOOK = None
+RUN_START_HOOK = None
 TRAIN_START_HOOK = None
 STEP_END_HOOK = None
 
@@ -344,6 +345,15 @@ def _build_iforward_scheduler_row(
         "blocks_per_rollout": _metric_int(result.get("iforward/blocks_per_rollout", scheduler_info.get("T_steps", -1))),
         "repeats_per_block": _metric_int(result.get("iforward/repeats_per_block", scheduler_info.get("R_steps", -1))),
         "inner_K": _metric_int(result.get("iforward/inner_K", scheduler_info.get("inner_K", -1))),
+        "requested_inner_K": _metric_int(
+            result.get("iforward/requested_inner_K", scheduler_info.get("requested_inner_K", -1))
+        ),
+        "actual_inner_K": _metric_int(
+            result.get("iforward/actual_inner_K", scheduler_info.get("actual_inner_K", -1))
+        ),
+        "phase_max_inner_k": _metric_int(
+            result.get("iforward/phase_max_inner_k", scheduler_info.get("phase_max_inner_k", -1))
+        ),
         "episode_end": _metric_bool(result.get("iforward/episode_end_after_rollout", False)),
         "carry_after_rollout": _metric_bool(result.get("iforward/carry_scene_state_after_rollout", False)),
         "window_start": _metric_int(result.get("iforward/window_start", scheduler_info.get("window_start", -1))),
@@ -463,7 +473,10 @@ def _build_iforward_scheduler_row(
                 ),
             }
         )
-    if str(row.get("scheduler_version", "")) == "iforward_2_3_scheduler_v3_optimizer_mamba":
+    if str(row.get("scheduler_version", "")) in {
+        "iforward_2_3_scheduler_v3_optimizer_mamba",
+        "stage3_0_optimizer_sequence_v1",
+    }:
         row.update(
             {
                 "scheduler_phase": str(
@@ -475,6 +488,42 @@ def _build_iforward_scheduler_row(
                 "sequence_id": _metric_int(scheduler_info.get("sequence_id", -1)),
                 "sequence_length": _metric_int(
                     result.get("iforward/stage2_3/sequence_length", scheduler_info.get("sequence_length", 0))
+                ),
+                "sequence_target_frames": _metric_int(
+                    result.get(
+                        "iforward/stage2_3/sequence_target_frames",
+                        scheduler_info.get("sequence_target_frames", 0),
+                    )
+                ),
+                "sequence_min_frames": _metric_int(
+                    result.get(
+                        "iforward/stage2_3/sequence_min_frames",
+                        scheduler_info.get("sequence_min_frames", 0),
+                    )
+                ),
+                "sequence_allow_short": _metric_bool(
+                    result.get(
+                        "iforward/stage2_3/sequence_allow_short",
+                        scheduler_info.get("sequence_allow_short", False),
+                    )
+                ),
+                "requested_inner_K": _metric_int(
+                    result.get(
+                        "iforward/stage2_3/requested_inner_K",
+                        result.get("iforward/requested_inner_K", scheduler_info.get("requested_inner_K", -1)),
+                    )
+                ),
+                "actual_inner_K": _metric_int(
+                    result.get(
+                        "iforward/stage2_3/actual_inner_K",
+                        result.get("iforward/actual_inner_K", scheduler_info.get("actual_inner_K", -1)),
+                    )
+                ),
+                "phase_max_inner_k": _metric_int(
+                    result.get(
+                        "iforward/stage2_3/phase_max_inner_k",
+                        result.get("iforward/phase_max_inner_k", scheduler_info.get("phase_max_inner_k", -1)),
+                    )
                 ),
                 "actual_blocks_per_rollout": _metric_int(
                     result.get(
@@ -537,6 +586,12 @@ def _build_iforward_scheduler_row(
                 "iforward/stage2_3/phase": str(row.get("scheduler_phase", "")),
                 "iforward/stage2_3/rollout_phase": str(row.get("rollout_phase", "")),
                 "iforward/stage2_3/sequence_length": _metric_int(row.get("sequence_length", 0)),
+                "iforward/stage2_3/sequence_target_frames": _metric_int(row.get("sequence_target_frames", 0)),
+                "iforward/stage2_3/sequence_min_frames": _metric_int(row.get("sequence_min_frames", 0)),
+                "iforward/stage2_3/sequence_allow_short": _metric_bool(row.get("sequence_allow_short", False)),
+                "iforward/stage2_3/requested_inner_K": _metric_int(row.get("requested_inner_K", -1)),
+                "iforward/stage2_3/actual_inner_K": _metric_int(row.get("actual_inner_K", -1)),
+                "iforward/stage2_3/phase_max_inner_k": _metric_int(row.get("phase_max_inner_k", -1)),
                 "iforward/stage2_3/actual_blocks_per_rollout": _metric_int(
                     row.get("actual_blocks_per_rollout", row.get("blocks_per_rollout", -1))
                 ),
@@ -2882,6 +2937,7 @@ def main() -> None:
         str(history_cfg.get("record_on", "")) == "block_exit"
     )
     episode_end_hook = globals().get("EPISODE_END_HOOK")
+    run_start_hook = globals().get("RUN_START_HOOK")
     train_start_hook = globals().get("TRAIN_START_HOOK")
     step_end_hook = globals().get("STEP_END_HOOK")
 
@@ -2897,6 +2953,22 @@ def main() -> None:
             writer = SummaryWriter(log_dir=tb_dir)
         elif use_tensorboard and SummaryWriter is None:
             logger.warning("logging.use_tensorboard=true but torch.utils.tensorboard is unavailable; TensorBoard disabled.")
+        if callable(run_start_hook):
+            run_start_hook(
+                cfg=cfg,
+                args=args,
+                dataset=dataset,
+                scheduler=scheduler,
+                model=model,
+                device=device,
+                trigger_train_episode_counter=0,
+                trigger_step=int(start_step) - 1,
+                metrics_fh=metrics_fh,
+                writer=writer,
+                resume_checkpoint=resume_checkpoint,
+                init_checkpoint=init_checkpoint,
+                checkpoint_prefix=_checkpoint_prefix_for_cfg(cfg),
+            )
         if bool(validation_v7_cfg.eval_enable and validation_v7_cfg.run_at_train_start):
             _run_validation_v7_round(
                 cfg=cfg,
@@ -3210,7 +3282,7 @@ def main() -> None:
                 )
                 is_stage2_3_step = (
                     str(result.get("iforward/scheduler_version", scheduler_info.get("scheduler_version", "")))
-                    == "iforward_2_3_scheduler_v3_optimizer_mamba"
+                    in {"iforward_2_3_scheduler_v3_optimizer_mamba", "stage3_0_optimizer_sequence_v1"}
                 )
                 sequence10_rollout_idx = int(
                     result.get("iforward/rollout_idx_in_episode", scheduler_info.get("rollout_idx_in_episode", -1))
@@ -3455,7 +3527,7 @@ def main() -> None:
                                 scheduler_info.get("scheduler_version", ""),
                             )
                         )
-                        == "iforward_2_3_scheduler_v3_optimizer_mamba"
+                        in {"iforward_2_3_scheduler_v3_optimizer_mamba", "stage3_0_optimizer_sequence_v1"}
                     ):
                         train_step_row.update(
                             {
@@ -3469,6 +3541,51 @@ def main() -> None:
                                     result.get(
                                         "iforward/stage2_3/rollout_phase",
                                         scheduler_info.get("rollout_phase", ""),
+                                    )
+                                ),
+                                "iforward/stage2_3/sequence_target_frames": _metric_int(
+                                    result.get(
+                                        "iforward/stage2_3/sequence_target_frames",
+                                        scheduler_info.get("sequence_target_frames", 0),
+                                    )
+                                ),
+                                "iforward/stage2_3/sequence_min_frames": _metric_int(
+                                    result.get(
+                                        "iforward/stage2_3/sequence_min_frames",
+                                        scheduler_info.get("sequence_min_frames", 0),
+                                    )
+                                ),
+                                "iforward/stage2_3/sequence_allow_short": _metric_bool(
+                                    result.get(
+                                        "iforward/stage2_3/sequence_allow_short",
+                                        scheduler_info.get("sequence_allow_short", False),
+                                    )
+                                ),
+                                "iforward/stage2_3/requested_inner_K": _metric_int(
+                                    result.get(
+                                        "iforward/stage2_3/requested_inner_K",
+                                        result.get(
+                                            "iforward/requested_inner_K",
+                                            scheduler_info.get("requested_inner_K", -1),
+                                        ),
+                                    )
+                                ),
+                                "iforward/stage2_3/actual_inner_K": _metric_int(
+                                    result.get(
+                                        "iforward/stage2_3/actual_inner_K",
+                                        result.get(
+                                            "iforward/actual_inner_K",
+                                            scheduler_info.get("actual_inner_K", -1),
+                                        ),
+                                    )
+                                ),
+                                "iforward/stage2_3/phase_max_inner_k": _metric_int(
+                                    result.get(
+                                        "iforward/stage2_3/phase_max_inner_k",
+                                        result.get(
+                                            "iforward/phase_max_inner_k",
+                                            scheduler_info.get("phase_max_inner_k", -1),
+                                        ),
                                     )
                                 ),
                                 "iforward/stage2_3/episode_positions": _metric_list_int(
@@ -4191,10 +4308,38 @@ def main() -> None:
             _drop_result_tensor_payloads(result)
             pred_rgbs = []
             gt_images = []
-            if "pred_rgbs_eval" in locals():
-                pred_rgbs_eval = []
-            if "gt_images_eval" in locals():
-                gt_images_eval = []
+            pred_rgbs_eval = []
+            gt_images_eval = []
+            psnr_light_list = []
+            psnr_full_light = []
+            psnr_primary_list = []
+            psnr_full_list = []
+            psnr_non_sky_list = []
+            ssim_primary_list = []
+            ssim_full_list = []
+            ssim_non_sky_list = []
+            lpips_primary_list = []
+            lpips_full_list = []
+            lpips_non_sky_list = []
+            mse_primary_vals = []
+            mse_full_vals = []
+            mse_non_sky_vals = []
+            # Python loop locals persist across iterations. Drop large tensor aliases
+            # before cleanup metrics so 24-frame target/source image batches do not
+            # stay live until the next rollout overwrites these names.
+            tgt = {}
+            tgt_meta = {}
+            tgt_view = {}
+            sky_mask = None
+            sm = None
+            non_sky_mask = None
+            pred_c = None
+            gt_c = None
+            w3 = None
+            fi_t = None
+            ci_t = None
+            train_step_kwargs = {}
+            block_exit_events = []
             if "train_step_row" in locals():
                 train_step_row = {}
             if "row" in locals():
@@ -4203,8 +4348,8 @@ def main() -> None:
                 metric_vals = {}
             if "diag_row" in locals():
                 diag_row = {}
-            raw_batch = {}
-            minimal_batch = {}
+            raw_batch = None
+            minimal_batch = None
             result = None
             did_empty_cache = False
             if (

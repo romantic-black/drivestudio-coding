@@ -23,7 +23,9 @@ def _cfg_get(node: Any, key: str, default: Any = None) -> Any:
 
 
 def _stage22_compatible_cfg(cfg: Any) -> dict:
-    sched_v3 = _cfg_get(cfg, "scheduler_v3", {}) or {}
+    sched_v3 = _cfg_get(cfg, "scheduler_stage3_0", None)
+    if sched_v3 is None:
+        sched_v3 = _cfg_get(cfg, "scheduler_v3", {}) or {}
     time_v3 = _cfg_get(sched_v3, "time", {}) or {}
     sched22 = {
         "time": {

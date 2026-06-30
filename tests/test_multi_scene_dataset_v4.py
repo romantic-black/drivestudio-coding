@@ -382,12 +382,14 @@ def test_v4_iforward_request_materializer_writes_mapping_meta(tmp_path):
     assert meta["scheduler_version"] == "iforward_v1"
     assert meta["model_family"] == "IForward"
     assert meta["assembly_mode"] == "image_ref_iforward_v1"
+    assert meta["phase_max_inner_k"] == 2
     assert meta["source_image_refs"] == [(0, 0), (1, 0)]
     assert meta["target_image_refs"] == [(0, 0), (1, 0)]
     assert meta["target_image_roles"] == ["final_current_recon", "final_current_recon"]
 
     ifwd = meta["iforward"]
     assert batch["_iforward"] == ifwd
+    assert ifwd["phase_max_inner_k"] == 2
     assert ifwd["source_ref_to_index_keyed"]["0:0"] == 0
     assert ifwd["source_ref_to_index_keyed"]["1:0"] == 1
     assert ifwd["target_ref_to_index_keyed"]["0:0"] == 0

@@ -24,6 +24,7 @@ from models.streetforward.minimal_trainer_stage6_0 import MinimalStreetForwardSt
 from models.streetforward.node_states import NodeStateBackground, NodeStateDistant, NodeStateRigid
 from models.streetforward.stage6_0 import AppearanceDetailPack, LocalGSState, Stage6PosteriorUpdater, Stage6StructInput
 from models.streetforward.stage6_0.event_encoder import EventPack
+from models.streetforward.stage6_0.posterior_updater import BranchDelta, DeltaPack
 
 
 def _quat(n: int, *, device: torch.device = torch.device("cpu")) -> torch.Tensor:
@@ -1662,6 +1663,132 @@ def test_posterior_attribute_detail_affects_configured_attrs() -> None:
     assert not torch.allclose(delta_zero.bg.opacity_logit, delta_detail.bg.opacity_logit)
     assert torch.allclose(delta_zero.bg.sh, delta_detail.bg.sh, atol=1e-6)
     assert "posterior/detail_gate_bg_means" in aux
+
+
+def test_posterior_attribute_detail_linearized_heads_match_materialized_forks() -> None:
+    torch.manual_seed(18)
+    updater = Stage6PosteriorUpdater(
+        event_dim=4,
+        hidden_dim=8,
+        stage_hidden_dim=0,
+        sh_degree=1,
+        output_hidden=False,
+        output_confidence=False,
+        output_noop=True,
+        appearance_detail_enable=True,
+        appearance_detail_dim=2,
+        appearance_detail_attribute_gates={
+            "bg": {"means": 0.25, "scales": 0.15, "quat": 0.05, "opacity": 0.35, "sh": 0.45}
+        },
+        appearance_detail_attribute_gate_max={
+            "means": 1.0,
+            "scales": 1.0,
+            "quat": 1.0,
+            "opacity": 1.0,
+            "sh": 1.0,
+        },
+    )
+    event = torch.randn(6, 4)
+    detail = torch.randn(6, 2)
+    h = updater.trunk(event)
+    assert updater.detail_adapter is not None
+    detail_delta = updater.detail_adapter(detail)
+    assert updater.detail_gate_raw_attr is not None
+    max_attr = updater.detail_gate_attr_max.to(device=h.device, dtype=h.dtype)
+    gates = torch.sigmoid(updater.detail_gate_raw_attr[0]).to(device=h.device, dtype=h.dtype) * max_attr
+    for gate, head in zip(
+        gates,
+        (updater.head_means, updater.head_scales, updater.head_quat, updater.head_opacity, updater.head_sh),
+    ):
+        materialized = head(h + gate * detail_delta)
+        linearized = updater._linear_with_detail_gate(head, h, detail_delta, gate)
+        assert torch.allclose(linearized, materialized, atol=1e-6, rtol=1e-6)
+
+
+def test_posterior_branch_scope_skips_disabled_attribute_heads(monkeypatch: pytest.MonkeyPatch) -> None:
+    torch.manual_seed(19)
+    updater = Stage6PosteriorUpdater(
+        event_dim=4,
+        hidden_dim=8,
+        stage_hidden_dim=0,
+        sh_degree=1,
+        output_hidden=False,
+        output_confidence=False,
+        output_noop=True,
+        appearance_detail_enable=True,
+        appearance_detail_dim=2,
+        appearance_detail_attribute_gates={
+            "distant": {"means": 0.25, "scales": 0.15, "quat": 0.05, "opacity": 0.35, "sh": 0.45}
+        },
+    )
+
+    def _raise(*_args, **_kwargs):
+        raise AssertionError("disabled attribute head was called")
+
+    monkeypatch.setattr(updater.head_means, "forward", _raise)
+    monkeypatch.setattr(updater.head_scales, "forward", _raise)
+    monkeypatch.setattr(updater.head_quat, "forward", _raise)
+    event = torch.randn(5, 4)
+    detail = torch.randn(5, 2)
+    delta = updater._branch_forward(
+        branch_name="distant",
+        event=event,
+        ctx_current=None,
+        ctx_vsm=None,
+        appearance_detail=detail,
+        branch_scope={
+            "enable": True,
+            "update_means": False,
+            "update_scales": False,
+            "update_quat": False,
+            "update_opacity": True,
+            "update_sh": True,
+            "update_hidden": False,
+        },
+    )
+    assert delta is not None
+    assert delta.is_active("means") is False
+    assert delta.is_active("scales_log") is False
+    assert delta.is_active("quat_axis_angle") is False
+    assert delta.is_active("opacity_logit") is True
+    assert delta.is_active("sh") is True
+    assert torch.allclose(delta.means, torch.zeros_like(delta.means))
+    assert torch.allclose(delta.scales_log, torch.zeros_like(delta.scales_log))
+    assert torch.allclose(delta.quat_axis_angle, torch.zeros_like(delta.quat_axis_angle))
+    assert not torch.allclose(delta.opacity_logit, torch.zeros_like(delta.opacity_logit))
+    assert not torch.allclose(delta.sh, torch.zeros_like(delta.sh))
+
+
+def test_apply_delta_reuses_inactive_branch_attrs() -> None:
+    bg = _node_bg(3)
+    local = LocalGSState.from_node_states(bg=bg, distant=None, rigid=None, hidden_dim=0)
+    delta = BranchDelta(
+        means=torch.ones(3, 3),
+        scales_log=torch.ones(3, 3),
+        quat_axis_angle=torch.ones(3, 3),
+        opacity_logit=torch.ones(3, 1) * 0.25,
+        sh=torch.ones(3, 9) * 0.5,
+        hidden=torch.zeros(3, 0),
+        confidence=torch.zeros(3, 0),
+        noop=torch.zeros(3, 1),
+        active_attrs={
+            "means": False,
+            "scales_log": False,
+            "quat_axis_angle": False,
+            "opacity_logit": True,
+            "sh": True,
+            "hidden": False,
+        },
+    )
+    next_state = local.apply_delta(DeltaPack(bg=delta))
+    assert next_state.bg.means is local.bg.means
+    assert next_state.bg.scales_log is local.bg.scales_log
+    assert next_state.bg.quats is local.bg.quats
+    assert next_state.bg.hidden is local.bg.hidden
+    assert next_state.bg.opacity_logit is not local.bg.opacity_logit
+    assert next_state.bg.sh_dc is not local.bg.sh_dc
+    assert next_state.bg.sh_rest is not local.bg.sh_rest
+    assert torch.allclose(next_state.bg.opacity_logit, local.bg.opacity_logit + 0.25)
 
 
 def test_posterior_hard_zero_masks_invalid_event_rows() -> None:

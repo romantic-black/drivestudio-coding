@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, Iterable, Tuple
 
 from models.iforward.resolver import (
+    IFORWARD_OPTIMIZER_SEQUENCE_SCHEDULER_VERSIONS,
     IFORWARD_STAGE2_3_SCHEDULER_VERSION,
     IForwardBatchResolver,
     IForwardResolvedBatch,
@@ -25,15 +26,27 @@ def _unique_preserve(values: Iterable[int]) -> Tuple[int, ...]:
     return tuple(out)
 
 
+def _phase_max_inner_k(resolved: IForwardResolvedBatch, *, default: int) -> int:
+    meta = dict(resolved.meta or {})
+    raw = meta.get("phase_max_inner_k", None)
+    if raw is None:
+        request_meta = dict(meta.get("request_meta", {}) or {})
+        raw = dict(request_meta.get("iforward_stage2_3", {}) or {}).get("phase_max_inner_k", None)
+    if raw is None:
+        return int(default)
+    return int(raw)
+
+
 class Stage23BatchResolver(IForwardBatchResolver):
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(expected_scheduler_version=IFORWARD_STAGE2_3_SCHEDULER_VERSION, **kwargs)
 
     def resolve(self, batch: Dict[str, Any]) -> IForwardResolvedBatch:
         resolved = super().resolve(batch)
-        if str(resolved.scheduler_version) != IFORWARD_STAGE2_3_SCHEDULER_VERSION:
+        if str(resolved.scheduler_version) not in IFORWARD_OPTIMIZER_SEQUENCE_SCHEDULER_VERSIONS:
             raise ValueError(
-                f"Stage2_3 resolver requires scheduler_version={IFORWARD_STAGE2_3_SCHEDULER_VERSION!r}, "
+                f"Stage2_3 resolver requires optimizer-sequence scheduler_version in "
+                f"{sorted(IFORWARD_OPTIMIZER_SEQUENCE_SCHEDULER_VERSIONS)!r}, "
                 f"got {resolved.scheduler_version!r}"
             )
         self._validate_stage2_3(resolved)
@@ -129,8 +142,9 @@ class Stage23BatchResolver(IForwardBatchResolver):
         positions = _unique_preserve(step.sequence_pos for step in _repeat0_steps(resolved))
         if len(positions) < 1 or len(positions) > 2:
             raise ValueError("Stage2_3 assimilation rollout must be B1 or B2")
-        if int(resolved.inner_K) > 12:
-            raise ValueError("Stage2_3 assimilation inner_K must be <= 12")
+        max_inner_k = _phase_max_inner_k(resolved, default=12)
+        if int(resolved.inner_K) > int(max_inner_k):
+            raise ValueError(f"Stage2_3 assimilation inner_K must be <= phase_max_inner_k ({max_inner_k})")
         for step in resolved.steps:
             if str(step.visit_kind) not in {"assimilate", "assimilation"}:
                 raise ValueError("Stage2_3 assimilation requires assimilate visit_kind")
@@ -143,8 +157,9 @@ class Stage23BatchResolver(IForwardBatchResolver):
         positions = _unique_preserve(step.sequence_pos for step in _repeat0_steps(resolved))
         if len(positions) < 1:
             raise ValueError("Stage2_3 repair must visit at least one frame")
-        if int(resolved.inner_K) > 12:
-            raise ValueError("Stage2_3 repair inner_K must be <= 12")
+        max_inner_k = _phase_max_inner_k(resolved, default=12)
+        if int(resolved.inner_K) > int(max_inner_k):
+            raise ValueError(f"Stage2_3 repair inner_K must be <= phase_max_inner_k ({max_inner_k})")
         write_values = [bool(step.optimizer_memory_write) for step in resolved.steps]
         if not any(write_values):
             raise ValueError("Stage2_3 repair must write optimizer memory on at least one repeat")

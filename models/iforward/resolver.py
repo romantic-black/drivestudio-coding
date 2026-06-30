@@ -14,6 +14,11 @@ IFORWARD_STAGE2_1_SCHEDULER_VERSION = "iforward_stage2_1_parent_temporal"
 IFORWARD_SEQUENCE10_SCHEDULER_VERSION = "iforward_sequence10_v1"
 IFORWARD_STAGE2_2_SCHEDULER_VERSION = "iforward_stage2_2_stream10_rawframe"
 IFORWARD_STAGE2_3_SCHEDULER_VERSION = "iforward_2_3_scheduler_v3_optimizer_mamba"
+IFORWARD_STAGE3_0_SCHEDULER_VERSION = "stage3_0_optimizer_sequence_v1"
+IFORWARD_OPTIMIZER_SEQUENCE_SCHEDULER_VERSIONS = {
+    IFORWARD_STAGE2_3_SCHEDULER_VERSION,
+    IFORWARD_STAGE3_0_SCHEDULER_VERSION,
+}
 IFORWARD_MODEL_FAMILY = "IForward"
 IFORWARD_CURRENT_ROLE = "final_current_recon"
 IFORWARD_HISTORY_ROLE = "final_history_replay"
@@ -354,6 +359,7 @@ class IForwardBatchResolver:
             IFORWARD_SEQUENCE10_SCHEDULER_VERSION,
             IFORWARD_STAGE2_2_SCHEDULER_VERSION,
             IFORWARD_STAGE2_3_SCHEDULER_VERSION,
+            IFORWARD_STAGE3_0_SCHEDULER_VERSION,
         }
         if scheduler_version not in allowed_versions:
             raise ValueError(
@@ -363,7 +369,7 @@ class IForwardBatchResolver:
         is_v4 = scheduler_version == IFORWARD_V4_SCHEDULER_VERSION
         is_stage2_1 = scheduler_version == IFORWARD_STAGE2_1_SCHEDULER_VERSION
         is_stage2_2 = scheduler_version == IFORWARD_STAGE2_2_SCHEDULER_VERSION
-        is_stage2_3 = scheduler_version == IFORWARD_STAGE2_3_SCHEDULER_VERSION
+        is_stage2_3 = scheduler_version in IFORWARD_OPTIMIZER_SEQUENCE_SCHEDULER_VERSIONS
         is_sequence10 = scheduler_version == IFORWARD_SEQUENCE10_SCHEDULER_VERSION
         is_explicit_iforward = bool(is_v3 or is_v4 or is_stage2_1 or is_stage2_2 or is_stage2_3 or is_sequence10)
         model_family = str(ifwd.get("model_family", request_meta.get("model_family", self.expected_model_family)))

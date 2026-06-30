@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from datasets.iforward_stage2_3.resolver import Stage23BatchResolver
@@ -139,13 +140,51 @@ def test_stage2_3_validation_mamba_ablation_modes_are_stage2_3_names():
     assert "Assimilation-Causal-FinalAll" in val2["protocols"]
 
 
+def test_stage2_3_validation_accepts_scheduler_stage3_0_validation_key():
+    val = stage2_3_validation_cfg(
+        {
+            "scheduler_stage3_0_validation": {
+                "enable": True,
+                "protocols": {"assimilation": True, "repeat_stability": [4, 8]},
+            }
+        }
+    )
+    assert val["enable"] is True
+    assert "Assimilation-Causal-FinalAll" in val["protocols"]
+    assert "Repeat Stability" in val["protocols"]
+    assert val["repeat_stability_repeats"] == [4, 8]
+
+
+def test_stage2_3_validation_rejects_enabled_new_and_legacy_keys():
+    with pytest.raises(ValueError, match="scheduler_stage3_0_validation.*validation_v3"):
+        stage2_3_validation_cfg(
+            {
+                "scheduler_stage3_0_validation": {"enable": True},
+                "validation_v3": {"enable": True},
+            }
+        )
+
+
 def test_stage2_3_validation_runner_calls_fake_model_and_protocols():
     model = _FakeModel()
     writer = _FakeWriter()
-    rows = run_stage2_3_validation(cfg=_cfg(), dataset=_Dataset(), model=model, device="cpu", trigger_step=7, writer=writer)
+    status_rows = []
+    rows = run_stage2_3_validation(
+        cfg=_cfg(),
+        dataset=_Dataset(),
+        model=model,
+        device="cpu",
+        trigger_step=7,
+        writer=writer,
+        status_writer=lambda row: status_rows.append(dict(row)),
+    )
     assert rows
     assert rows[0]["split"] == "iforward_stage2_3_validation"
     assert rows[0]["trigger_step"] == 7
+    statuses = [str(row.get("status", "")) for row in status_rows]
+    assert "manifest_built" in statuses
+    assert "protocol_start" in statuses
+    assert "protocol_done" in statuses
     assert model.calls
     protocols = {str(row.get("protocol", "")) for row in rows}
     assert {

@@ -11,7 +11,7 @@ from datasets.train_scheduler_iforward import (
     ImageRef,
 )
 
-from .index_format import IFORWARD_STAGE2_3_SCHEDULER_VERSION
+from .index_format import IFORWARD_STAGE2_3_SCHEDULER_VERSION, IFORWARD_STAGE3_0_SCHEDULER_VERSION
 
 
 STAGE23_CURRENT_ROLE = "final_current_recon"
@@ -50,6 +50,10 @@ class Stage23StepPlan(IForwardStepPlan):
 
 @dataclass(frozen=True)
 class RolloutPlanV3(IForwardRolloutPlan):
+    phase_max_inner_k: int = 0
+    sequence_target_frames: int = 0
+    sequence_min_frames: int = 0
+    sequence_allow_short: bool = False
     sequence_id: int = -1
     sequence_length: int = 0
     sequence_protocol: str = "optimizer_sequence_v1"
@@ -129,6 +133,7 @@ __all__ = [
     "EpisodePlanV3",
     "IFORWARD_MODEL_FAMILY",
     "IFORWARD_STAGE2_3_SCHEDULER_VERSION",
+    "IFORWARD_STAGE3_0_SCHEDULER_VERSION",
     "RolloutPlanV3",
     "STAGE23_CURRENT_ROLE",
     "STAGE23_HISTORY_ROLE",

@@ -46,6 +46,10 @@ from models.iforward.stage3_0 import (
 )
 from models.iforward.stage3_0.losses import merge_stage3_reg_terms
 from models.iforward.stage3_0.sparse_grid_sample import prepare_value_nchw
+from models.iforward.versions import (
+    STAGE3_0_SCALAR_ANCHOR_CHILD_SUPPORT_PARENT_LEGACY_VERSION,
+    is_stage3_0_iforward_version,
+)
 from models.streetforward.minimal_trainer_stage4_0 import spatial_hw_from_image_tensor
 from models.streetforward.minimal_trainer_stage5_4 import MinimalStreetForwardStage5_4
 from models.streetforward.node_states import NodeStateBackground, NodeStateDistant, NodeStateRigid
@@ -85,7 +89,7 @@ from models.streetforward.stage6_0.vsm import Stage6QueryPred, masked_smooth_l1
 
 
 logger = logging.getLogger(__name__)
-IFORWARD_STAGE3_0_VERSION = "stage3_0_full_sparse_gather_lift"
+IFORWARD_STAGE3_0_VERSION = STAGE3_0_SCALAR_ANCHOR_CHILD_SUPPORT_PARENT_LEGACY_VERSION
 
 
 def _to_plain_dict(node: Any) -> Dict[str, Any]:
@@ -188,6 +192,41 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         }
         if bool(include_step_max):
             out["iforward/stage3/mem_step_max_allocated_mb"] = out[f"{prefix}_max_allocated_mb"]
+        return out
+
+    def _repair_training_cfg(self) -> Any:
+        return getattr(self, "iforward_repair_training_cfg", {}) or {}
+
+    def _repair_training_visit_kind(self, visit_meta: Optional[Dict[str, Any]]) -> str:
+        if isinstance(visit_meta, dict):
+            return str(visit_meta.get("visit_kind", "") or "")
+        return ""
+
+    def _repair_training_enabled_for_visit(self, visit_meta: Optional[Dict[str, Any]]) -> bool:
+        cfg = self._repair_training_cfg()
+        if not bool(self._cfg_get(cfg, "enable", False)):
+            return False
+        start_step = int(self._cfg_get(cfg, "start_step", 0) or 0)
+        global_step = int(visit_meta.get("global_step", 0) or 0) if isinstance(visit_meta, dict) else 0
+        if int(global_step) < int(start_step):
+            return False
+        kinds = self._cfg_get(cfg, "kinds", ["repair"]) or ["repair"]
+        kind_set = {str(kind) for kind in list(kinds)}
+        return self._repair_training_visit_kind(visit_meta) in kind_set
+
+    def _repair_training_freeze_2d_for_visit(self, visit_meta: Optional[Dict[str, Any]]) -> bool:
+        cfg = self._repair_training_cfg()
+        return bool(
+            self._repair_training_enabled_for_visit(visit_meta)
+            and bool(self._cfg_get(cfg, "freeze_2d_frontend", True))
+        )
+
+    def _detach_cnn_inputs_for_repair_training(self, cnn_inputs: Dict[str, Any]) -> Dict[str, Any]:
+        out = dict(cnn_inputs)
+        for key in ("features_2d", "fwhr_detail_2d", "stage3_dino_native_2d"):
+            value = out.get(key)
+            if torch.is_tensor(value):
+                out[key] = value.detach()
         return out
 
     def _compat_stage5_4_config(self, config: Any) -> Any:
@@ -411,8 +450,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "stage2_1_fwhr_parent_ptv3_temporal_mamba",
             "stage2_2_stream10_rawframe_temporal_mamba_v2",
             "iforward_2_3_optimizer_mamba",
-            IFORWARD_STAGE3_0_VERSION,
-        }
+        } or is_stage3_0_iforward_version(ifwd_version)
         if bool(biggs_enabled):
             if bool(self._cfg_get(biggs_cfg, "enable", True)) is not True:
                 raise ValueError(f"{ifwd_version} requires model.iforward.biggs.enable=true")
@@ -424,7 +462,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 raise ValueError("stage2_0_biggs_parent_lifting requires adc_lite.enable=false")
             observe_cfg = self._cfg_get(biggs_cfg, "observe", {}) or {}
             lifting_cfg = self._cfg_get(biggs_cfg, "lifting", {}) or {}
-            stage3_enabled = ifwd_version == IFORWARD_STAGE3_0_VERSION
+            stage3_enabled = is_stage3_0_iforward_version(ifwd_version)
             if bool(stage3_enabled):
                 stage3_lifting = self._cfg_get(iforward_cfg, "lifting", None)
                 if stage3_lifting is None:
@@ -484,8 +522,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "stage2_1_fwhr_parent_ptv3_temporal_mamba",
             "stage2_2_stream10_rawframe_temporal_mamba_v2",
             "iforward_2_3_optimizer_mamba",
-            IFORWARD_STAGE3_0_VERSION,
-        }
+        } or is_stage3_0_iforward_version(ifwd_version)
         if bool(self._cfg_get(base_measurement, "require_obs_code", True)) is not True and not is_stage2_1_parent_temporal:
             raise ValueError("Stage6_0 Phase A requires V4 obs_code.")
         expected_obs_dim = 0 if is_stage2_1_parent_temporal else 2
@@ -968,22 +1005,19 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         model_cfg = self._require_key(config, "model", "config")
         iforward_cfg = self._cfg_get(model_cfg, "iforward", {}) or {}
         biggs_cfg = self._cfg_get(iforward_cfg, "biggs", {}) or {}
-        is_stage2_biggs = (
-            str(self._cfg_get(iforward_cfg, "version", ""))
-            in {
-                "stage2_0_biggs_parent_lifting",
-                "stage2_0_biggs_cuda_exact_diagonal_projector",
-                "stage2_0_biggs_incremental_whdd",
-                "stage2_0_biggs_compact16_residualonly",
+        ifwd_version = str(self._cfg_get(iforward_cfg, "version", ""))
+        is_stage2_biggs_version = ifwd_version in {
+            "stage2_0_biggs_parent_lifting",
+            "stage2_0_biggs_cuda_exact_diagonal_projector",
+            "stage2_0_biggs_incremental_whdd",
+            "stage2_0_biggs_compact16_residualonly",
                 "stage2_0_biggs_grld_dinov2base_concat48",
                 "stage2_0_fwhr_lift_grld_dinov2base",
-                "stage2_1_fwhr_parent_ptv3_temporal_mamba",
-                "stage2_2_stream10_rawframe_temporal_mamba_v2",
-                "iforward_2_3_optimizer_mamba",
-                IFORWARD_STAGE3_0_VERSION,
-            }
-            and bool(self._cfg_get(biggs_cfg, "enable", True))
-        )
+            "stage2_1_fwhr_parent_ptv3_temporal_mamba",
+            "stage2_2_stream10_rawframe_temporal_mamba_v2",
+            "iforward_2_3_optimizer_mamba",
+        } or is_stage3_0_iforward_version(ifwd_version)
+        is_stage2_biggs = bool(is_stage2_biggs_version) and bool(self._cfg_get(biggs_cfg, "enable", True))
         self.stage6_phase = str(self._cfg_get(model_cfg, "phase", "phase_A_block_local_unroll"))
         stage6 = self._require_key(model_cfg, "stage6_0", "model")
         base_measurement = self._require_key(stage6, "base_measurement", "model.stage6_0")
@@ -997,6 +1031,12 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         self.stage6_detach_source_render_for_cnn = bool(
             self._cfg_get(base_measurement, "detach_source_render_for_cnn", True)
         )
+        self.stage6_cnn_view_chunk_size = int(self._cfg_get(base_measurement, "cnn_view_chunk_size", 0) or 0)
+        if int(self.stage6_cnn_view_chunk_size) < 0:
+            raise ValueError(
+                "model.stage6_0.base_measurement.cnn_view_chunk_size must be >= 0, "
+                f"got {int(self.stage6_cnn_view_chunk_size)}"
+            )
         self.stage6_train_v4_lift = bool(self._cfg_get(base_measurement, "train_v4_lift", False))
         self.stage6_measurement_trainable_param_names: set[str] = set()
 
@@ -1187,22 +1227,21 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "stage2_1_fwhr_parent_ptv3_temporal_mamba",
             "stage2_2_stream10_rawframe_temporal_mamba_v2",
             "iforward_2_3_optimizer_mamba",
-            IFORWARD_STAGE3_0_VERSION,
-        }
+        } or is_stage3_0_iforward_version(ifwd_version)
         self.stage2_1_parent_temporal_enabled = ifwd_version in {
             "stage2_1_fwhr_parent_ptv3_temporal_mamba",
             "stage2_2_stream10_rawframe_temporal_mamba_v2",
             "iforward_2_3_optimizer_mamba",
-            IFORWARD_STAGE3_0_VERSION,
-        }
+        } or is_stage3_0_iforward_version(ifwd_version)
         self.stage2_0_biggs_cfg = dict(biggs_cfg or {})
         self.stage2_0_biggs_assignment_cfg = self._cfg_get(biggs_cfg, "assignment", {}) or {}
         self.stage2_0_biggs_projector_cfg = self._cfg_get(biggs_cfg, "parent_projector", {}) or {}
         self.stage2_0_biggs_parent_state_cfg = self._cfg_get(biggs_cfg, "parent_state", {}) or {}
         self.stage2_0_biggs_observe_cfg = self._cfg_get(biggs_cfg, "observe", {}) or {}
         self.stage2_0_biggs_lifting_cfg = self._cfg_get(biggs_cfg, "lifting", {}) or {}
-        self.stage3_0_enabled = ifwd_version == IFORWARD_STAGE3_0_VERSION
+        self.stage3_0_enabled = is_stage3_0_iforward_version(ifwd_version)
         self.stage3_0_lifting_cfg = self._cfg_get(iforward_cfg, "lifting", {}) or {}
+        self.iforward_repair_training_cfg = self._cfg_get(iforward_cfg, "repair_training", {}) or {}
         self.stage3_0_gather_reg_terms: Dict[str, torch.Tensor] = {}
         self.stage3_0_last_aux: Dict[str, float] = {}
         self.stage3_0_global_step = 0
@@ -3702,6 +3741,17 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         elif not bool(parent_scene_for_cnn):
             cnn_scene = fine_scene
         _record_observe_time("parent_scene_source", t_scene_source)
+        repair_training_active = bool(self._repair_training_enabled_for_visit(visit_meta))
+        repair_freeze_2d = bool(self._repair_training_freeze_2d_for_visit(visit_meta))
+        repair_no_grad_2d = bool(
+            repair_freeze_2d
+            and bool(self._cfg_get(self._repair_training_cfg(), "no_grad_2d_forward", True))
+        )
+        repair_training_aux: Dict[str, float] = {
+            "iforward/repair_training/enabled": 1.0 if bool(repair_training_active) else 0.0,
+            "iforward/repair_training/freeze_2d_frontend": 1.0 if bool(repair_freeze_2d) else 0.0,
+            "iforward/repair_training/no_grad_2d_forward": 1.0 if bool(repair_no_grad_2d) else 0.0,
+        }
         t0 = time.perf_counter()
         dino_cache_key = self._stage2_0_dino_cache_key(
             batch=batch,
@@ -3712,15 +3762,25 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             height=height,
             width=width,
         )
-        cnn_inputs = self._render_source_scene_only_for_cnn(
-            gaussians_scene=cnn_scene,
-            source_views=source_views,
-            source_images=source_images,
-            source_sky_masks=source_sky_masks,
-            source_egocar_masks=source_egocar_masks,
-            height=height,
-            width=width,
-            dino_cache_key=dino_cache_key,
+        cnn_ctx = torch.no_grad() if bool(repair_no_grad_2d) else nullcontext()
+        with cnn_ctx:
+            cnn_inputs = self._render_source_scene_only_for_cnn(
+                gaussians_scene=cnn_scene,
+                source_views=source_views,
+                source_images=source_images,
+                source_sky_masks=source_sky_masks,
+                source_egocar_masks=source_egocar_masks,
+                height=height,
+                width=width,
+                dino_cache_key=dino_cache_key,
+            )
+        if bool(repair_freeze_2d):
+            cnn_inputs = self._detach_cnn_inputs_for_repair_training(cnn_inputs)
+        repair_training_aux["iforward/repair_training/features_2d_requires_grad"] = float(
+            1.0 if torch.is_tensor(cnn_inputs.get("features_2d")) and bool(cnn_inputs["features_2d"].requires_grad) else 0.0
+        )
+        repair_training_aux["iforward/repair_training/detail_2d_requires_grad"] = float(
+            1.0 if torch.is_tensor(cnn_inputs.get("fwhr_detail_2d")) and bool(cnn_inputs["fwhr_detail_2d"].requires_grad) else 0.0
         )
         time_parent_render_cnn_ms = (time.perf_counter() - t0) * 1000.0
         self._mem_debug("biggs/after_parent_render_cnn")
@@ -4072,6 +4132,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             **drift_stats,
             **dict(cnn_inputs.get("dino_cache_stats", {}) or {}),
             **dict(cnn_inputs.get("cnn_perf_stats", {}) or {}),
+            **repair_training_aux,
             "src_backproject_pass_count": 1,
         }
         if bool(stage3_enabled) and bool(
@@ -4633,23 +4694,32 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
 
     @staticmethod
     def _mask_branch_delta(delta: BranchDelta, scope: Dict[str, bool]) -> BranchDelta:
+        active_attrs = {
+            "means": bool(scope["update_means"]) and delta.is_active("means"),
+            "scales_log": bool(scope["update_scales"]) and delta.is_active("scales_log"),
+            "quat_axis_angle": bool(scope["update_quat"]) and delta.is_active("quat_axis_angle"),
+            "opacity_logit": bool(scope["update_opacity"]) and delta.is_active("opacity_logit"),
+            "sh": bool(scope["update_sh"]) and delta.is_active("sh"),
+            "hidden": bool(scope.get("update_hidden", True)) and delta.is_active("hidden"),
+        }
         return BranchDelta(
-            means=delta.means if bool(scope["update_means"]) else torch.zeros_like(delta.means),
-            scales_log=delta.scales_log if bool(scope["update_scales"]) else torch.zeros_like(delta.scales_log),
+            means=delta.means if bool(active_attrs["means"]) else torch.zeros_like(delta.means),
+            scales_log=delta.scales_log if bool(active_attrs["scales_log"]) else torch.zeros_like(delta.scales_log),
             quat_axis_angle=(
                 delta.quat_axis_angle
-                if bool(scope["update_quat"])
+                if bool(active_attrs["quat_axis_angle"])
                 else torch.zeros_like(delta.quat_axis_angle)
             ),
             opacity_logit=(
                 delta.opacity_logit
-                if bool(scope["update_opacity"])
+                if bool(active_attrs["opacity_logit"])
                 else torch.zeros_like(delta.opacity_logit)
             ),
-            sh=delta.sh if bool(scope["update_sh"]) else torch.zeros_like(delta.sh),
-            hidden=delta.hidden if bool(scope.get("update_hidden", True)) else torch.zeros_like(delta.hidden),
+            sh=delta.sh if bool(active_attrs["sh"]) else torch.zeros_like(delta.sh),
+            hidden=delta.hidden if bool(active_attrs["hidden"]) else torch.zeros_like(delta.hidden),
             confidence=delta.confidence,
             noop=delta.noop,
+            active_attrs=active_attrs,
         )
 
     def _apply_branch_scope(self, delta: DeltaPack) -> DeltaPack:
@@ -4694,6 +4764,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             hidden=fill(delta.hidden),
             confidence=fill(delta.confidence),
             noop=fill(delta.noop),
+            active_attrs=delta.active_attrs,
         )
 
     def _stage6_aabb(self, ref: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -5418,6 +5489,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             ctx_current=None,
             ctx_vsm=ctx_vsm,
             appearance_detail=getattr(event, "appearance_detail", None),
+            branch_scope=getattr(self, "stage6_branch_scope", None),
         )
         self._mem_debug("encode/after_posterior")
         route = event.route

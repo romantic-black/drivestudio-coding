@@ -13,7 +13,11 @@ import numpy as np
 from datasets.train_scheduler_iforward import IFORWARD_MODEL_FAMILY, ImageRef, _dedupe_refs_keep_order
 
 from .index_builder import build_stage2_3_index_from_dataset
-from .index_format import IFORWARD_STAGE2_3_SCHEDULER_VERSION, stable_uint64
+from .index_format import (
+    IFORWARD_STAGE2_3_SCHEDULER_VERSION,
+    IFORWARD_STAGE3_0_SCHEDULER_VERSION,
+    stable_uint64,
+)
 from .index_loader import Stage23Index, load_stage2_3_index
 from .schema import (
     STAGE23_CURRENT_ROLE,
@@ -48,6 +52,14 @@ def _cfg_items(node: Any) -> List[Tuple[Any, Any]]:
         except Exception:
             return []
     return []
+
+
+def _scheduler_cfg_and_version(cfg: Any) -> Tuple[Any, str]:
+    stage3_cfg = _cfg_get(cfg, "scheduler_stage3_0", None)
+    if stage3_cfg is not None and bool(_cfg_get(stage3_cfg, "enable", False)):
+        return stage3_cfg, IFORWARD_STAGE3_0_SCHEDULER_VERSION
+    stage23_cfg = _cfg_get(cfg, "scheduler_v3", {}) or {}
+    return stage23_cfg, IFORWARD_STAGE2_3_SCHEDULER_VERSION
 
 
 def _rng_token(rng: random.Random) -> int:
@@ -87,26 +99,7 @@ def _sample_weighted_map(rng: random.Random, raw: Any, *, default: int) -> int:
 
 
 def _sample_weighted_pairs(rng: random.Random, raw: Any) -> Tuple[int, int]:
-    items: List[Tuple[Tuple[int, int], float]] = []
-    mapped = _cfg_items(raw)
-    if mapped:
-        for key, value in mapped:
-            text = str(key)
-            if "," not in text:
-                continue
-            a, b = text.split(",", 1)
-            pair = (int(a.strip()), int(b.strip()))
-            prob = float(value)
-            if min(pair) > 0 and prob > 0:
-                items.append((pair, prob))
-    else:
-        for item in list(raw or []):
-            reps = list(_cfg_get(item, "repeats", []) or [])
-            prob = float(_cfg_get(item, "prob", 0.0))
-            if len(reps) == 2 and prob > 0.0:
-                items.append(((int(reps[0]), int(reps[1])), prob))
-    if not items:
-        items = [((4, 4), 1.0)]
+    items = [(pair, prob) for _, pair, prob in _iter_assimilation_repeat_pairs(raw)]
     total = sum(float(p) for _, p in items)
     draw = rng.random() * total
     acc = 0.0
@@ -115,6 +108,84 @@ def _sample_weighted_pairs(rng: random.Random, raw: Any) -> Tuple[int, int]:
         if draw <= acc:
             return int(pair[0]), int(pair[1])
     return items[-1][0]
+
+
+def _parse_rollout_option_name(name: Any) -> Tuple[int, int]:
+    text = str(name).upper()
+    if not text.startswith("B") or "R" not in text:
+        raise ValueError(f"invalid rollout option {name!r}; expected BxRy")
+    frames_text, repeats_text = text.split("R", 1)
+    frames = int(frames_text.replace("B", ""))
+    repeats = int(repeats_text)
+    if frames <= 0 or repeats <= 0:
+        raise ValueError(f"invalid rollout option {name!r}; B and R must be positive")
+    return frames, repeats
+
+
+def _iter_assimilation_repeat_pairs(raw: Any) -> List[Tuple[str, Tuple[int, int], float]]:
+    items: List[Tuple[str, Tuple[int, int], float]] = []
+    mapped = _cfg_items(raw)
+    if mapped:
+        for key, value in mapped:
+            try:
+                text = str(key)
+                if "," not in text:
+                    continue
+                a, b = text.split(",", 1)
+                pair = (int(a.strip()), int(b.strip()))
+                prob = float(value)
+            except Exception:
+                continue
+            if min(pair) > 0 and prob > 0.0:
+                items.append((text, pair, prob))
+    else:
+        for idx, item in enumerate(list(raw or [])):
+            try:
+                reps = list(_cfg_get(item, "repeats", []) or [])
+                prob = float(_cfg_get(item, "prob", 0.0))
+            except Exception:
+                continue
+            if len(reps) == 2 and prob > 0.0:
+                pair = (int(reps[0]), int(reps[1]))
+                if min(pair) > 0:
+                    items.append((f"repeat_pairs[{idx}]", pair, prob))
+    if not items:
+        items = [("4,4", (4, 4), 1.0)]
+    return items
+
+
+def _parse_repair_option_name(name: Any) -> Tuple[int, int]:
+    try:
+        return _parse_rollout_option_name(name)
+    except ValueError as exc:
+        raise ValueError(f"invalid repair rollout option {name!r}; expected BxRy") from exc
+
+
+def _iter_assimilation_candidates(assimilation_cfg: Any) -> List[Tuple[str, Tuple[int, ...], float, str]]:
+    items: List[Tuple[str, Tuple[int, ...], float, str]] = []
+    rollout_options = _cfg_get(assimilation_cfg, "rollout_options", None)
+    for name, prob in _cfg_items(rollout_options):
+        try:
+            p = float(prob)
+            frames, repeats = _parse_rollout_option_name(name)
+        except Exception:
+            continue
+        if p > 0.0:
+            items.append((str(name), tuple(int(repeats) for _ in range(int(frames))), p, "rollout_options"))
+
+    repeat_pairs = _cfg_get(
+        assimilation_cfg,
+        "repeat_pairs",
+        _cfg_get(assimilation_cfg, "repeat_pair_table", None),
+    )
+    if repeat_pairs is not None:
+        for name, pair, prob in _iter_assimilation_repeat_pairs(repeat_pairs):
+            if float(prob) > 0.0:
+                items.append((str(name), (int(pair[0]), int(pair[1])), float(prob), "repeat_pairs"))
+
+    if not items:
+        items = [("4,4", (4, 4), 1.0, "repeat_pairs")]
+    return items
 
 
 def _repair_prob(schedule: Any, *, step: int, default: float = 0.0) -> float:
@@ -126,6 +197,27 @@ def _repair_prob(schedule: Any, *, step: int, default: float = 0.0) -> float:
         if int(step) >= int(vals[0]):
             out = float(vals[1])
     return float(max(0.0, min(1.0, out)))
+
+
+def _sequence_frame_rule_from_item(item: Any, *, fallback_start: int = 0) -> Dict[str, Any]:
+    target = int(_cfg_get(item, "target_frames", _cfg_get(item, "frames", 0)) or 0)
+    if target <= 0:
+        raise ValueError("Stage2_3 scheduler_v3.sequence.frame_count_schedule target_frames must be > 0")
+    min_frames = int(_cfg_get(item, "min_frames", target) or target)
+    if min_frames <= 0:
+        raise ValueError("Stage2_3 scheduler_v3.sequence.frame_count_schedule min_frames must be > 0")
+    if min_frames > target:
+        raise ValueError(
+            "Stage2_3 scheduler_v3.sequence.frame_count_schedule min_frames must be <= target_frames: "
+            f"min_frames={min_frames}, target_frames={target}"
+        )
+    return {
+        "start_step": int(_cfg_get(item, "start_step", fallback_start) or 0),
+        "target_frames": int(target),
+        "min_frames": int(min_frames),
+        "allow_short": bool(_cfg_get(item, "allow_short", False)),
+        "scheduled": True,
+    }
 
 
 @dataclass
@@ -160,7 +252,9 @@ class Stage23Scheduler:
     ) -> None:
         self.dataset = dataset
         self.cfg = cfg or {}
-        sched_cfg = _cfg_get(self.cfg, "scheduler_v3", {}) or {}
+        sched_cfg, scheduler_version = _scheduler_cfg_and_version(self.cfg)
+        sched_cfg = sched_cfg or {}
+        self.scheduler_version = str(scheduler_version)
         self.traversal_cfg = dict(traversal_cfg or _cfg_get(sched_cfg, "traversal", {}) or {})
         self.bootstrap_cfg = dict(bootstrap_cfg or _cfg_get(sched_cfg, "bootstrap", {}) or {})
         self.sequence_cfg = dict(sequence_cfg or _cfg_get(sched_cfg, "sequence", {}) or {})
@@ -203,7 +297,7 @@ class Stage23Scheduler:
         self._episode_plan_cursor = 0
         self._pending_events: List[Dict[str, Any]] = []
         self._last_info: Dict[str, Any] = {
-            "scheduler_version": IFORWARD_STAGE2_3_SCHEDULER_VERSION,
+            "scheduler_version": self.scheduler_version,
             "global_step": 0,
             "index_fingerprint": self.index.fingerprint,
         }
@@ -216,12 +310,25 @@ class Stage23Scheduler:
         self._emit_eligibility_summary()
 
     def _init_producer_runtime(self, *, force_disabled: bool = False) -> None:
-        depth = int(_cfg_get(self.producer_cfg, "queue_depth", 0) or 0)
+        depth_configured = int(_cfg_get(self.producer_cfg, "queue_depth", 0) or 0)
+        depth = int(depth_configured)
+        cuda_depth_cap = _cfg_get(self.producer_cfg, "cuda_queue_depth_cap", None)
+        dataset_device = getattr(self.dataset, "device", None)
+        dataset_device_type = str(getattr(dataset_device, "type", dataset_device))
+        if cuda_depth_cap is not None and dataset_device_type == "cuda":
+            cap = int(cuda_depth_cap)
+            if cap < 0:
+                raise ValueError(
+                    f"Stage2_3 scheduler_v3.producer.cuda_queue_depth_cap must be >= 0, got {cap}"
+                )
+            depth = min(int(depth), int(cap))
         enabled_raw = _cfg_get(self.producer_cfg, "enable", None)
         enabled = bool(depth > 0) if enabled_raw is None else bool(enabled_raw)
         if force_disabled or depth <= 0:
             enabled = False
         self._producer_enabled = bool(enabled)
+        self._producer_queue_depth_configured = int(max(0, depth_configured))
+        self._producer_cuda_queue_depth_cap = None if cuda_depth_cap is None else int(cuda_depth_cap)
         self._producer_queue_depth = int(max(0, depth))
         self._producer_queue: Optional[queue.Queue[_ProducedBatch]] = (
             queue.Queue(maxsize=max(1, int(depth))) if self._producer_enabled else None
@@ -246,7 +353,7 @@ class Stage23Scheduler:
         if "rng_state" in state:
             self.rng.setstate(state["rng_state"])
         self._last_info = {
-            "scheduler_version": IFORWARD_STAGE2_3_SCHEDULER_VERSION,
+            "scheduler_version": self.scheduler_version,
             "global_step": int(self.global_step),
             "index_fingerprint": self.index.fingerprint,
         }
@@ -268,6 +375,7 @@ class Stage23Scheduler:
             "fixed_scene_id",
             "fixed_segment_id",
             "index",
+            "scheduler_version",
         ):
             setattr(clone, name, getattr(self, name))
         clone.rng = random.Random()
@@ -296,6 +404,22 @@ class Stage23Scheduler:
                     "Stage2_3 scheduler_v3.assimilation.start_step must be omitted or equal "
                     f"to bootstrap.end_step ({bootstrap_end}); got {assimilation_start}"
                 )
+        frame_schedule = list(_cfg_get(self.sequence_cfg, "frame_count_schedule", []) or [])
+        prev_start: Optional[int] = None
+        for idx, item in enumerate(frame_schedule):
+            rule = _sequence_frame_rule_from_item(item)
+            start = int(rule["start_step"])
+            if start < 0:
+                raise ValueError(
+                    "Stage2_3 scheduler_v3.sequence.frame_count_schedule start_step must be >= 0: "
+                    f"index={idx}, start_step={start}"
+                )
+            if prev_start is not None and start <= prev_start:
+                raise ValueError(
+                    "Stage2_3 scheduler_v3.sequence.frame_count_schedule start_step values must be strictly increasing: "
+                    f"index={idx}, start_step={start}, previous={prev_start}"
+                )
+            prev_start = int(start)
         repair_schedule = list(_cfg_get(self.repair_cfg, "probability_schedule", []) or [])
         if repair_schedule and "prob" in self.repair_cfg and self.repair_cfg.get("prob") is not None:
             raise ValueError(
@@ -320,6 +444,55 @@ class Stage23Scheduler:
                 if step <= prev:
                     raise ValueError("Stage2_3 repair.probability_schedule steps must be strictly increasing")
                 prev = step
+        assimilation_max_k = int(_cfg_get(self.assimilation_cfg, "max_inner_k", 12))
+        for name, repeats, _prob, source_path in _iter_assimilation_candidates(self.assimilation_cfg):
+            candidate_k = int(sum(int(x) for x in repeats))
+            if candidate_k > assimilation_max_k:
+                raise ValueError(
+                    "Stage2_3 scheduler_v3.assimilation candidate exceeds max_inner_k: "
+                    f"path=scheduler_v3.assimilation.{source_path}, candidate={name}, "
+                    f"candidate_K={candidate_k}, max_inner_k={assimilation_max_k}"
+                )
+
+        repair_max_k = int(_cfg_get(self.repair_cfg, "max_inner_k", 12))
+        rollout_options = _cfg_items(_cfg_get(self.repair_cfg, "rollout_options", None))
+        if rollout_options:
+            for name, prob in rollout_options:
+                try:
+                    p = float(prob)
+                except Exception:
+                    continue
+                if p <= 0.0:
+                    continue
+                frames, repeats = _parse_repair_option_name(name)
+                candidate_k = int(frames) * int(repeats)
+                if candidate_k > repair_max_k:
+                    raise ValueError(
+                        "Stage2_3 scheduler_v3.repair.rollout_options candidate exceeds max_inner_k: "
+                        f"path=scheduler_v3.repair.rollout_options, candidate={name}, "
+                        f"candidate_K={candidate_k}, max_inner_k={repair_max_k}"
+                    )
+        elif int(6 * 1) > repair_max_k:
+            raise ValueError(
+                "Stage2_3 scheduler_v3.repair.rollout_options default candidate exceeds max_inner_k: "
+                f"path=scheduler_v3.repair.rollout_options, candidate=B6R1, candidate_K=6, max_inner_k={repair_max_k}"
+            )
+        for idx, item in enumerate(list(_cfg_get(self.repair_cfg, "patterns", []) or [])):
+            try:
+                p = float(_cfg_get(item, "prob", 0.0))
+            except Exception:
+                continue
+            if p <= 0.0:
+                continue
+            frames = int(_cfg_get(item, "frames", 6))
+            repeats = int(_cfg_get(item, "repeats", 1))
+            candidate_k = int(frames) * int(repeats)
+            if candidate_k > repair_max_k:
+                raise ValueError(
+                    "Stage2_3 scheduler_v3.repair.patterns candidate exceeds max_inner_k: "
+                    f"path=scheduler_v3.repair.patterns[{idx}], candidate={_cfg_get(item, 'name', idx)}, "
+                    f"candidate_K={candidate_k}, max_inner_k={repair_max_k}"
+                )
 
     def _eligible_segment_rows(self) -> List[int]:
         rows = []
@@ -353,7 +526,7 @@ class Stage23Scheduler:
         self._pending_events.append(
             {
                 "type": "iforward_stage2_3_eligibility",
-                "scheduler_version": IFORWARD_STAGE2_3_SCHEDULER_VERSION,
+                "scheduler_version": self.scheduler_version,
                 "eligible_scene_count": int(len(indexed_scenes)),
                 "eligible_segment_count": int(len(self._segment_rows)),
                 "timestamp_source": str(self.index.timestamp_source),
@@ -558,6 +731,12 @@ class Stage23Scheduler:
         last_visit_context: Optional[Dict[str, Any]] = None,
         repair_round_idx: int = -1,
         repair_pattern_name: str = "",
+        phase_max_inner_k: Optional[int] = None,
+        requested_inner_k: Optional[int] = None,
+        requested_blocks_per_rollout: Optional[int] = None,
+        sequence_target_frames: Optional[int] = None,
+        sequence_min_frames: Optional[int] = None,
+        sequence_allow_short: Optional[bool] = None,
     ) -> RolloutPlanV3:
         if last_visit_context is None:
             last_visit_context = {}
@@ -599,8 +778,26 @@ class Stage23Scheduler:
         window_hash = int(stable_uint64((scene_id, segment_id, sequence_id, *frame_indices)) & 0x7FFFFFFFFFFFFFFF)
         steps = [type(step)(**{**step.__dict__, "window_hash": int(window_hash)}) for step in steps]
         repeat_label = "x".join(str(int(x)) for x in repeat_budgets)
+        actual_inner_k = int(len(steps))
+        requested_inner_k_value = int(requested_inner_k) if requested_inner_k is not None else int(actual_inner_k)
+        requested_blocks_value = (
+            int(requested_blocks_per_rollout)
+            if requested_blocks_per_rollout is not None
+            else int(len(positions))
+        )
+        default_phase_cfg = self.repair_cfg if str(phase) == "repair" else self.assimilation_cfg
+        default_phase_max = (
+            int(_cfg_get(default_phase_cfg, "max_inner_k", actual_inner_k))
+            if str(phase) in {"assimilation", "repair"}
+            else int(actual_inner_k)
+        )
+        phase_max_inner_k_value = (
+            int(phase_max_inner_k)
+            if phase_max_inner_k is not None
+            else int(default_phase_max)
+        )
         request_meta = {
-            "scheduler_version": IFORWARD_STAGE2_3_SCHEDULER_VERSION,
+            "scheduler_version": self.scheduler_version,
             "model_family": IFORWARD_MODEL_FAMILY,
             "iforward_stage2_3": {
                 "index_fingerprint": self.index.fingerprint,
@@ -618,10 +815,16 @@ class Stage23Scheduler:
                 "visit_kinds": [str(s.visit_kind) for s in steps],
                 "repair_round_idx": int(repair_round_idx),
                 "repair_pattern_name": str(repair_pattern_name),
+                "phase_max_inner_k": int(phase_max_inner_k_value),
+                "requested_inner_K": int(requested_inner_k_value),
+                "actual_inner_K": int(actual_inner_k),
+                "sequence_target_frames": int(sequence_target_frames or rows.shape[0]),
+                "sequence_min_frames": int(sequence_min_frames or rows.shape[0]),
+                "sequence_allow_short": bool(sequence_allow_short),
             },
         }
         return RolloutPlanV3(
-            scheduler_version=IFORWARD_STAGE2_3_SCHEDULER_VERSION,
+            scheduler_version=self.scheduler_version,
             scene_id=int(scene_id),
             segment_id=int(segment_id),
             episode_id=int(self._episode_id_next),
@@ -634,10 +837,13 @@ class Stage23Scheduler:
             shape_name=f"{str(phase)}_b{len(positions)}r{repeat_label}",
             blocks_per_rollout=int(len(positions)),
             repeats_per_block=int(max(repeat_budgets) if repeat_budgets else 0),
-            requested_blocks_per_rollout=int(len(positions)),
+            requested_blocks_per_rollout=int(requested_blocks_value),
             actual_blocks_per_rollout=int(len(positions)),
-            requested_inner_K=int(len(steps)),
-            actual_inner_K=int(len(steps)),
+            requested_inner_K=int(requested_inner_k_value),
+            actual_inner_K=int(actual_inner_k),
+            sequence_target_frames=int(sequence_target_frames or rows.shape[0]),
+            sequence_min_frames=int(sequence_min_frames or rows.shape[0]),
+            sequence_allow_short=bool(sequence_allow_short),
             short_rollout=False,
             short_rollout_reason="",
             episode_block_indices=[int(x) for x in positions],
@@ -645,7 +851,7 @@ class Stage23Scheduler:
             input_frame_indices=current_frames,
             delivery_frame_indices=current_frames,
             delivery_order_policy="iforward_stage2_3_optimizer_sequence",
-            inner_K=int(len(steps)),
+            inner_K=int(actual_inner_k),
             steps=list(steps),
             final_supervision=final,
             reset_scene_state_before_rollout=bool(int(rollout_idx) == 0),
@@ -695,6 +901,7 @@ class Stage23Scheduler:
             optimizer_memory_read_count=sum(1 for s in steps if bool(s.optimizer_memory_read)),
             optimizer_memory_write_count=sum(1 for s in steps if bool(s.optimizer_memory_write)),
             observation_commit_count=sum(1 for s in steps if bool(s.commit_observation_memory)),
+            phase_max_inner_k=int(phase_max_inner_k_value),
         )
 
     def _build_bootstrap_rollout(self) -> RolloutPlanV3:
@@ -731,31 +938,68 @@ class Stage23Scheduler:
             last_visit_context={},
         )
 
-    def _sample_sequence_rows(self) -> Tuple[int, np.ndarray, Tuple[int, ...]]:
+    def _active_sequence_frame_rule(self) -> Dict[str, Any]:
+        schedule = list(_cfg_get(self.sequence_cfg, "frame_count_schedule", []) or [])
+        if schedule:
+            active = _sequence_frame_rule_from_item(schedule[0])
+            for item in schedule:
+                rule = _sequence_frame_rule_from_item(item)
+                if int(self.global_step) >= int(rule["start_step"]):
+                    active = rule
+                else:
+                    break
+            return active
         min_frames = int(_cfg_get(self.sequence_cfg, "min_frames", 8))
         max_frames = int(_cfg_get(self.sequence_cfg, "max_frames", 10))
+        if min_frames <= 0 or max_frames < min_frames:
+            raise ValueError(
+                "Stage2_3 scheduler_v3.sequence requires 0 < min_frames <= max_frames: "
+                f"min_frames={min_frames}, max_frames={max_frames}"
+            )
+        return {
+            "start_step": 0,
+            "target_frames": int(max_frames),
+            "min_frames": int(min_frames),
+            "allow_short": False,
+            "scheduled": False,
+        }
+
+    def _select_sequence_count(self, *, available: int, rule: Dict[str, Any]) -> Optional[int]:
+        available = int(available)
+        min_frames = int(rule["min_frames"])
+        target = int(rule["target_frames"])
+        if available < min_frames:
+            return None
+        if bool(rule.get("scheduled", False)):
+            if available < target and not bool(rule.get("allow_short", False)):
+                return None
+            return int(min(target, available))
+        return int(self.rng.randint(min_frames, min(target, available)))
+
+    def _sample_sequence_rows(self) -> Tuple[int, np.ndarray, Tuple[int, ...], Dict[str, Any]]:
+        frame_rule = self._active_sequence_frame_rule()
         min_keyframes = int(_cfg_get(self.sequence_cfg, "min_unique_keyframes", 3))
         min_span = int(_cfg_get(self.sequence_cfg, "min_frame_span", 8))
         max_span = int(_cfg_get(self.sequence_cfg, "max_frame_span", 30))
         for _seg_try in range(max(8, len(self._segment_rows) * 2)):
             segment_row = self._next_segment_row()
             frames = self.index.frames_for_segment_row(segment_row)
-            if int(frames.shape[0]) < int(min_frames):
+            n = self._select_sequence_count(available=int(frames.shape[0]), rule=frame_rule)
+            if n is None:
                 continue
-            n = self.rng.randint(min_frames, min(max_frames, int(frames.shape[0])))
             for _ in range(64):
                 local = sorted(self.rng.sample(range(int(frames.shape[0])), int(n)))
                 selected = frames[local]
                 span = int(selected[-1]["frame_idx"]) - int(selected[0]["frame_idx"])
                 keyframes = {int(row["keyframe_idx"]) for row in selected}
                 if span >= min_span and span <= max_span and len(keyframes) >= min_keyframes:
-                    return int(segment_row), selected, tuple(int(x) for x in local)
-            for start in range(0, int(frames.shape[0]) - min_frames + 1):
-                selected = frames[start : start + min_frames]
+                    return int(segment_row), selected, tuple(int(x) for x in local), dict(frame_rule)
+            for start in range(0, int(frames.shape[0]) - int(n) + 1):
+                selected = frames[start : start + int(n)]
                 span = int(selected[-1]["frame_idx"]) - int(selected[0]["frame_idx"])
                 keyframes = {int(row["keyframe_idx"]) for row in selected}
                 if span >= min_span and span <= max_span and len(keyframes) >= min_keyframes:
-                    return int(segment_row), selected, tuple(range(start, start + min_frames))
+                    return int(segment_row), selected, tuple(range(start, start + int(n))), dict(frame_rule)
         raise ValueError("Stage2_3 could not sample a valid optimizer sequence")
 
     def _assimilation_order(self, n: int) -> List[int]:
@@ -782,7 +1026,15 @@ class Stage23Scheduler:
         return bool(self.rng.random() < float(prob))
 
     def _repair_rounds(self) -> int:
-        raw = _cfg_get(self.repair_cfg, "rounds", _cfg_get(self.repair_cfg, "rounds_distribution", {1: 1.0}))
+        raw = _cfg_get(
+            self.repair_cfg,
+            "round_distribution",
+            _cfg_get(
+                self.repair_cfg,
+                "rounds_per_episode_distribution",
+                _cfg_get(self.repair_cfg, "rounds", _cfg_get(self.repair_cfg, "rounds_distribution", {1: 1.0})),
+            ),
+        )
         return _sample_weighted_map(self.rng, raw, default=1)
 
     def _repair_pattern(self) -> Tuple[int, int, str]:
@@ -809,9 +1061,7 @@ class Stage23Scheduler:
             for name, prob in valid_items:
                 acc += float(prob)
                 if draw <= acc:
-                    text = str(name).upper()
-                    frames = int(text.split("R", 1)[0].replace("B", ""))
-                    repeats = int(text.split("R", 1)[1])
+                    frames, repeats = _parse_repair_option_name(name)
                     return frames, repeats, str(name)
         patterns = list(_cfg_get(self.repair_cfg, "patterns", []) or [])
         if patterns:
@@ -824,14 +1074,43 @@ class Stage23Scheduler:
                     return int(_cfg_get(item, "frames", 6)), int(_cfg_get(item, "repeats", 1)), str(_cfg_get(item, "name", "repair"))
         return 6, 1, "B6R1"
 
+    def _assimilation_candidate(self, *, remaining: int) -> Tuple[Tuple[int, ...], str]:
+        max_k = int(_cfg_get(self.assimilation_cfg, "max_inner_k", 12))
+        candidates = []
+        total = 0.0
+        for name, repeats, prob, _source_path in _iter_assimilation_candidates(self.assimilation_cfg):
+            if len(repeats) > int(remaining):
+                continue
+            if int(sum(int(x) for x in repeats)) > int(max_k):
+                continue
+            p = float(prob)
+            if p <= 0.0:
+                continue
+            candidates.append((str(name), tuple(int(x) for x in repeats), p))
+            total += p
+        if candidates:
+            draw = self.rng.random() * total
+            acc = 0.0
+            for name, repeats, prob in candidates:
+                acc += float(prob)
+                if draw <= acc:
+                    return tuple(int(x) for x in repeats), str(name)
+            name, repeats, _prob = candidates[-1]
+            return tuple(int(x) for x in repeats), str(name)
+
+        single_raw = _cfg_get(self.assimilation_cfg, "single_repeat_distribution", {4: 0.5, 6: 0.3, 8: 0.2})
+        repeat = _sample_weighted_map(self.rng, single_raw, default=min(4, max(1, int(max_k))))
+        repeat = min(int(repeat), int(max_k))
+        return (int(repeat),), f"B1R{int(repeat)}"
+
     def _build_episode(self) -> EpisodePlanV3:
-        segment_row, rows, _ = self._sample_sequence_rows()
+        segment_row, rows, _, sequence_frame_rule = self._sample_sequence_rows()
         scene_id, segment_id = self._segment_ids(segment_row)
         sequence_id = int(stable_uint64((scene_id, segment_id, tuple(int(x["frame_idx"]) for x in rows), _rng_token(self.rng))) & 0x7FFFFFFFFFFFFFFF)
         order = self._assimilation_order(int(rows.shape[0]))
         repair_enabled = self._repair_enabled()
         repair_rounds = self._repair_rounds() if repair_enabled else 0
-        repair_plans: List[Tuple[List[int], int, str, int]] = []
+        repair_plans: List[Tuple[List[int], int, str, int, int]] = []
         repair_positions_flat: List[int] = []
         covered: set[int] = set()
         for _round in range(int(repair_rounds)):
@@ -845,24 +1124,31 @@ class Stage23Scheduler:
                 self.rng.shuffle(selected)
             covered.update(selected)
             repair_positions_flat.extend(int(x) for x in selected)
-            repair_plans.append(([int(x) for x in selected], int(repeats), str(pattern_name), int(_round)))
+            repair_plans.append(([int(x) for x in selected], int(repeats), str(pattern_name), int(_round), int(frames)))
         repair_hash = int(stable_uint64((scene_id, segment_id, sequence_id, *repair_positions_flat, _rng_token(self.rng))) & 0x7FFFFFFFFFFFFFFF) if repair_enabled else -1
         rollouts: List[RolloutPlanV3] = []
         step_offset = 0
         visit_counts: Dict[int, int] = {}
         last_visit_step_by_pos: Dict[int, int] = {}
         last_visit_context: Dict[str, Any] = {}
-        assimilation_chunks = [order[i : i + 2] for i in range(0, len(order), 2)]
-        total_rollouts = len(assimilation_chunks) + len(repair_plans)
-        for ridx, chunk in enumerate(assimilation_chunks):
-            if len(chunk) == 2:
-                pair = _sample_weighted_pairs(self.rng, _cfg_get(self.assimilation_cfg, "repeat_pairs", _cfg_get(self.assimilation_cfg, "repeat_pair_table", {})))
-                repeats = [int(pair[0]), int(pair[1])]
-            else:
-                repeats = [_sample_weighted_map(self.rng, {4: 0.5, 6: 0.3, 8: 0.2}, default=4)]
+        assimilation_plans: List[Tuple[List[int], List[int], str]] = []
+        cursor = 0
+        while int(cursor) < len(order):
+            repeats_tuple, candidate_name = self._assimilation_candidate(remaining=len(order) - int(cursor))
+            chunk = [int(x) for x in order[int(cursor) : int(cursor) + len(repeats_tuple)]]
+            if not chunk:
+                break
+            assimilation_plans.append((chunk, [int(x) for x in repeats_tuple[: len(chunk)]], str(candidate_name)))
+            cursor += len(chunk)
+        total_rollouts = len(assimilation_plans) + len(repair_plans)
+        for ridx, (chunk, repeats, _candidate_name) in enumerate(assimilation_plans):
             max_k = int(_cfg_get(self.assimilation_cfg, "max_inner_k", 12))
-            if sum(repeats) > max_k:
-                repeats = [max(1, min(r, max_k // max(len(repeats), 1))) for r in repeats]
+            requested_inner_k = int(sum(repeats))
+            if requested_inner_k > max_k:
+                raise ValueError(
+                    "Stage2_3 scheduler_v3.assimilation sampled repeat pair exceeds max_inner_k; "
+                    f"requested_inner_K={requested_inner_k}, max_inner_k={max_k}, repeats={repeats}"
+                )
             history = [p for p in range(int(rows.shape[0])) if int(visit_counts.get(int(p), 0)) > 0 and int(p) not in set(chunk)]
             plan = self._rollout_from_positions(
                 rows=rows,
@@ -884,19 +1170,25 @@ class Stage23Scheduler:
                 last_visit_step_by_pos=last_visit_step_by_pos,
                 is_last_rollout=bool(ridx == total_rollouts - 1),
                 last_visit_context=last_visit_context,
+                phase_max_inner_k=int(max_k),
+                requested_inner_k=int(requested_inner_k),
+                requested_blocks_per_rollout=int(len(chunk)),
+                sequence_target_frames=int(sequence_frame_rule["target_frames"]),
+                sequence_min_frames=int(sequence_frame_rule["min_frames"]),
+                sequence_allow_short=bool(sequence_frame_rule["allow_short"]),
             )
             rollouts.append(plan)
             step_offset += int(len(plan.steps))
-        for repair_idx, (positions, repeats_per_frame, repair_pattern_name, repair_round_idx) in enumerate(repair_plans):
+        for repair_idx, (positions, repeats_per_frame, repair_pattern_name, repair_round_idx, requested_frames) in enumerate(repair_plans):
             rollout_idx = len(rollouts)
             max_k = int(_cfg_get(self.repair_cfg, "max_inner_k", 12))
             repeats = [int(repeats_per_frame) for _ in positions]
-            while sum(repeats) > max_k and any(r > 1 for r in repeats):
-                for idx in range(len(repeats)):
-                    if sum(repeats) <= max_k:
-                        break
-                    if repeats[idx] > 1:
-                        repeats[idx] -= 1
+            requested_inner_k = int(requested_frames) * int(repeats_per_frame)
+            if requested_inner_k > max_k:
+                raise ValueError(
+                    "Stage2_3 scheduler_v3.repair sampled pattern exceeds max_inner_k; "
+                    f"candidate={repair_pattern_name}, requested_inner_K={requested_inner_k}, max_inner_k={max_k}"
+                )
             history = [p for p in range(int(rows.shape[0])) if int(p) not in set(positions)]
             plan = self._rollout_from_positions(
                 rows=rows,
@@ -920,6 +1212,12 @@ class Stage23Scheduler:
                 last_visit_context=last_visit_context,
                 repair_round_idx=int(repair_round_idx),
                 repair_pattern_name=str(repair_pattern_name),
+                phase_max_inner_k=int(max_k),
+                requested_inner_k=int(requested_inner_k),
+                requested_blocks_per_rollout=int(requested_frames),
+                sequence_target_frames=int(sequence_frame_rule["target_frames"]),
+                sequence_min_frames=int(sequence_frame_rule["min_frames"]),
+                sequence_allow_short=bool(sequence_frame_rule["allow_short"]),
             )
             rollouts.append(plan)
             step_offset += int(len(plan.steps))
@@ -946,7 +1244,7 @@ class Stage23Scheduler:
 
     def _update_last_info(self, plan: RolloutPlanV3) -> None:
         self._last_info = {
-            "scheduler_version": IFORWARD_STAGE2_3_SCHEDULER_VERSION,
+            "scheduler_version": self.scheduler_version,
             "model_family": IFORWARD_MODEL_FAMILY,
             "global_step": int(self.global_step),
             "scene_id": int(plan.scene_id),
@@ -958,6 +1256,9 @@ class Stage23Scheduler:
             "rollout_phase": str(plan.rollout_phase),
             "shape_name": str(plan.shape_name),
             "sequence_length": int(plan.sequence_length),
+            "sequence_target_frames": int(plan.sequence_target_frames),
+            "sequence_min_frames": int(plan.sequence_min_frames),
+            "sequence_allow_short": bool(plan.sequence_allow_short),
             "sequence_id": int(plan.sequence_id),
             "sequence_positions": [int(x) for x in plan.sequence_positions],
             "episode_positions": [int(x) for x in plan.episode_positions],
@@ -978,6 +1279,9 @@ class Stage23Scheduler:
             "actual_blocks_per_rollout": int(plan.actual_blocks_per_rollout),
             "requested_blocks_per_rollout": int(plan.requested_blocks_per_rollout),
             "inner_K": int(plan.inner_K),
+            "requested_inner_K": int(plan.requested_inner_K),
+            "actual_inner_K": int(plan.actual_inner_K),
+            "phase_max_inner_k": int(plan.phase_max_inner_k),
             "optimizer_memory_read_count": int(plan.optimizer_memory_read_count),
             "optimizer_memory_write_count": int(plan.optimizer_memory_write_count),
             "observation_commit_count": int(plan.observation_commit_count),
@@ -1058,6 +1362,8 @@ class Stage23Scheduler:
         return {
             "producer_enabled": bool(self._producer_enabled),
             "producer_queue_depth": int(self._producer_queue_depth),
+            "producer_queue_depth_configured": int(getattr(self, "_producer_queue_depth_configured", self._producer_queue_depth)),
+            "producer_cuda_queue_depth_cap": int(getattr(self, "_producer_cuda_queue_depth_cap", -1) or -1),
             "producer_queue_size": int(qsize),
             "producer_wait_ms": float(wait_ms),
             "producer_build_ms": float(build_ms),
@@ -1214,7 +1520,7 @@ class Stage23Scheduler:
 
     def state_dict(self) -> Dict[str, Any]:
         return {
-            "scheduler_version": IFORWARD_STAGE2_3_SCHEDULER_VERSION,
+            "scheduler_version": self.scheduler_version,
             "global_step": int(self.global_step),
             "epoch_idx": int(self.epoch_idx),
             "episode_id_next": int(self._episode_id_next),
@@ -1240,6 +1546,7 @@ class Stage23Scheduler:
             thread.join(timeout=5.0)
             if not thread.is_alive():
                 self._producer_thread = None
+        self._clear_producer_queue()
         clear_scope = getattr(self.dataset, "clear_preload_scheduler_scope", None)
         if callable(clear_scope):
             clear_scope()
@@ -1251,4 +1558,4 @@ class Stage23Scheduler:
             pass
 
 
-__all__ = ["IFORWARD_STAGE2_3_SCHEDULER_VERSION", "Stage23Scheduler"]
+__all__ = ["IFORWARD_STAGE2_3_SCHEDULER_VERSION", "IFORWARD_STAGE3_0_SCHEDULER_VERSION", "Stage23Scheduler"]

@@ -66,8 +66,32 @@ def _cfg_get(node: Any, key: str, default: Any = None) -> Any:
     return default
 
 
+def _emit_status(status_writer: Optional[Callable[[Dict[str, Any]], None]], row: Dict[str, Any]) -> None:
+    if callable(status_writer):
+        status_writer(dict(row))
+
+
+def _scheduler_key_version(cfg: Any) -> Tuple[str, str]:
+    sched_cfg = _cfg_get(cfg, "scheduler_stage3_0", None)
+    if sched_cfg is not None and bool(_cfg_get(sched_cfg, "enable", False)):
+        return "scheduler_stage3_0", str(_cfg_get(sched_cfg, "version", ""))
+    sched_cfg = _cfg_get(cfg, "scheduler_v3", {}) or {}
+    return "scheduler_v3", str(_cfg_get(sched_cfg, "version", ""))
+
+
 def stage2_3_validation_cfg(cfg: Any) -> Dict[str, Any]:
-    raw = _cfg_get(cfg, "validation_v3", {}) or {}
+    stage3_raw = _cfg_get(cfg, "scheduler_stage3_0_validation", None)
+    legacy_raw = _cfg_get(cfg, "validation_v3", None)
+    if stage3_raw is not None and legacy_raw is not None:
+        if bool(_cfg_get(stage3_raw, "enable", False)) and bool(_cfg_get(legacy_raw, "enable", False)):
+            raise ValueError(
+                "scheduler_stage3_0_validation and validation_v3 must not both be enabled"
+            )
+    raw = (
+        stage3_raw
+        if stage3_raw is not None and bool(_cfg_get(stage3_raw, "enable", False))
+        else (legacy_raw or stage3_raw or {})
+    )
     protocols_raw = _cfg_get(raw, "protocols", DEFAULT_STAGE23_VALIDATION_PROTOCOLS)
     protocols_is_map = hasattr(protocols_raw, "items")
     if isinstance(protocols_raw, str):
@@ -153,7 +177,9 @@ def build_stage2_3_validation_manifest(*, scheduler: Stage23Scheduler, max_entri
 
 
 def run_stage2_3_validation_manifest_only(*, cfg: Any, dataset: Any, max_entries: Optional[int] = None) -> List[Dict[str, Any]]:
-    sched_cfg = _cfg_get(cfg, "scheduler_v3", {}) or {}
+    sched_cfg = _cfg_get(cfg, "scheduler_stage3_0", None)
+    if sched_cfg is None or not bool(_cfg_get(sched_cfg, "enable", False)):
+        sched_cfg = _cfg_get(cfg, "scheduler_v3", {}) or {}
     producer_cfg = dict(_cfg_get(sched_cfg, "producer", {}) or {})
     producer_cfg["enable"] = False
     scheduler = Stage23Scheduler(dataset=dataset, cfg=cfg, producer_cfg=producer_cfg, fail_fast=False)
@@ -602,7 +628,9 @@ def _maybe_write_tb_images(
 
 
 def _make_scheduler(cfg: Any, dataset: Any, *, seed: int) -> Stage23Scheduler:
-    sched_cfg = _cfg_get(cfg, "scheduler_v3", {}) or {}
+    sched_cfg = _cfg_get(cfg, "scheduler_stage3_0", None)
+    if sched_cfg is None or not bool(_cfg_get(sched_cfg, "enable", False)):
+        sched_cfg = _cfg_get(cfg, "scheduler_v3", {}) or {}
     repair_cfg = dict(_cfg_get(sched_cfg, "repair", {}) or {})
     repair_cfg["enable"] = False
     producer_cfg = dict(_cfg_get(sched_cfg, "producer", {}) or {})
@@ -629,10 +657,31 @@ def run_stage2_3_validation(
     modes: Optional[List[str]] = None,
     convert_batch_to_minimal_format: Optional[Callable[[Dict[str, Any], torch.device, int], Dict[str, Any]]] = None,
     writer: Optional[Any] = None,
+    status_writer: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> List[Dict[str, Any]]:
     val = stage2_3_validation_cfg(cfg)
     protocols = list(val.get("protocols", DEFAULT_STAGE23_VALIDATION_PROTOCOLS))
     base_modes = list(modes or val.get("modes", ["full"]) or ["full"])
+    scheduler_key, scheduler_version = _scheduler_key_version(cfg)
+    planned_protocol_count = 0
+    for protocol in protocols:
+        planned_protocol_count += len(
+            list(val.get("mamba_ablation_modes", DEFAULT_STAGE23_MAMBA_ABLATION_MODES))
+            if str(protocol) == "Mamba Ablation"
+            else base_modes
+        )
+    _emit_status(
+        status_writer,
+        {
+            "status": "manifest_built",
+            "max_entries": int(val.get("max_entries", 4)),
+            "scheduler_key": str(scheduler_key),
+            "scheduler_version": str(scheduler_version),
+            "planned_protocol_count": int(planned_protocol_count),
+            "protocols": [str(x) for x in protocols],
+            "modes": [str(x) for x in base_modes],
+        },
+    )
     device_obj = torch.device(device)
     was_training = bool(getattr(model, "training", False))
     rows: List[Dict[str, Any]] = []
@@ -647,6 +696,16 @@ def run_stage2_3_validation(
                     if str(protocol) == "Mamba Ablation":
                         protocol_modes = list(val.get("mamba_ablation_modes", DEFAULT_STAGE23_MAMBA_ABLATION_MODES))
                     for mode in protocol_modes:
+                        protocol_rows_before = int(len(rows))
+                        _emit_status(
+                            status_writer,
+                            {
+                                "status": "protocol_start",
+                                "entry_idx": int(entry_idx),
+                                "protocol": str(protocol),
+                                "mode": str(mode),
+                            },
+                        )
                         scheduler = _make_scheduler(cfg, dataset, seed=int(val.get("seed", 0)) + int(entry_idx))
                         episode = scheduler._build_episode()
                         frame_rows = _rows_for_episode(scheduler, episode)
@@ -669,6 +728,16 @@ def run_stage2_3_validation(
                             rows.extend(causal_rows)
                             _append_summary(rows, protocol=str(protocol), mode=str(mode), trigger_step=int(trigger_step), kind="causal_summary", source_rows=causal_rows)
                             _append_retention_curve(rows, protocol=str(protocol), mode=str(mode), trigger_step=int(trigger_step), source_rows=causal_rows)
+                            _emit_status(
+                                status_writer,
+                                {
+                                    "status": "protocol_done",
+                                    "entry_idx": int(entry_idx),
+                                    "protocol": str(protocol),
+                                    "mode": str(mode),
+                                    "rows_emitted": int(len(rows) - protocol_rows_before),
+                                },
+                            )
                             continue
 
                         if str(protocol) == "Assimilation-Causal-FinalAll":
@@ -752,6 +821,16 @@ def run_stage2_3_validation(
                                 mode=str(mode),
                                 trigger_step=int(trigger_step),
                                 source_rows=[*causal_rows, row],
+                            )
+                            _emit_status(
+                                status_writer,
+                                {
+                                    "status": "protocol_done",
+                                    "entry_idx": int(entry_idx),
+                                    "protocol": str(protocol),
+                                    "mode": str(mode),
+                                    "rows_emitted": int(len(rows) - protocol_rows_before),
+                                },
                             )
                             continue
 
@@ -840,6 +919,16 @@ def run_stage2_3_validation(
                                 trigger_step=int(trigger_step),
                                 source_rows=repair_rows,
                             )
+                            _emit_status(
+                                status_writer,
+                                {
+                                    "status": "protocol_done",
+                                    "entry_idx": int(entry_idx),
+                                    "protocol": str(protocol),
+                                    "mode": str(mode),
+                                    "rows_emitted": int(len(rows) - protocol_rows_before),
+                                },
+                            )
                             continue
 
                         if str(protocol) == "Repeat Stability":
@@ -891,6 +980,16 @@ def run_stage2_3_validation(
                                 rows.append(row)
                                 repeat_rows.append(row)
                             _append_summary(rows, protocol=str(protocol), mode=str(mode), trigger_step=int(trigger_step), kind="repeat_stability_summary", source_rows=repeat_rows)
+                            _emit_status(
+                                status_writer,
+                                {
+                                    "status": "protocol_done",
+                                    "entry_idx": int(entry_idx),
+                                    "protocol": str(protocol),
+                                    "mode": str(mode),
+                                    "rows_emitted": int(len(rows) - protocol_rows_before),
+                                },
+                            )
                             continue
 
                         if str(protocol) == "Order Robustness":
@@ -944,6 +1043,16 @@ def run_stage2_3_validation(
                                 rows.append(row)
                                 perm_rows.append(row)
                             _append_summary(rows, protocol=str(protocol), mode=str(mode), trigger_step=int(trigger_step), kind="order_robustness_summary", source_rows=perm_rows)
+                        _emit_status(
+                            status_writer,
+                            {
+                                "status": "protocol_done",
+                                "entry_idx": int(entry_idx),
+                                "protocol": str(protocol),
+                                "mode": str(mode),
+                                "rows_emitted": int(len(rows) - protocol_rows_before),
+                            },
+                        )
     finally:
         if hasattr(model, "train"):
             model.train(was_training)

@@ -14,15 +14,25 @@ def _mul_attr(value: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
 def gate_branch_delta(delta: BranchDelta, gate: Any) -> BranchDelta:
     """Apply an attribute gate to one Stage6 branch delta."""
 
+    active_attrs = dict(delta.active_attrs or {})
+
+    def maybe_mul(attr: str, value: torch.Tensor, gate_value: torch.Tensor) -> torch.Tensor:
+        if not delta.is_active(attr):
+            active_attrs[attr] = False
+            return value
+        active_attrs[attr] = True
+        return _mul_attr(value, gate_value)
+
     return BranchDelta(
-        means=_mul_attr(delta.means, gate.means),
-        scales_log=_mul_attr(delta.scales_log, gate.scales),
-        quat_axis_angle=_mul_attr(delta.quat_axis_angle, gate.quat),
-        opacity_logit=_mul_attr(delta.opacity_logit, gate.opacity),
-        sh=_mul_attr(delta.sh, gate.sh),
-        hidden=_mul_attr(delta.hidden, gate.hidden),
+        means=maybe_mul("means", delta.means, gate.means),
+        scales_log=maybe_mul("scales_log", delta.scales_log, gate.scales),
+        quat_axis_angle=maybe_mul("quat_axis_angle", delta.quat_axis_angle, gate.quat),
+        opacity_logit=maybe_mul("opacity_logit", delta.opacity_logit, gate.opacity),
+        sh=maybe_mul("sh", delta.sh, gate.sh),
+        hidden=maybe_mul("hidden", delta.hidden, gate.hidden),
         confidence=delta.confidence,
         noop=delta.noop,
+        active_attrs=active_attrs,
     )
 
 

@@ -9,7 +9,11 @@ import pytest
 from omegaconf import OmegaConf
 
 from datasets.iforward_stage2_3.index_builder import build_stage2_3_index_from_dataset
-from datasets.iforward_stage2_3.scheduler import IFORWARD_STAGE2_3_SCHEDULER_VERSION, Stage23Scheduler
+from datasets.iforward_stage2_3.scheduler import (
+    IFORWARD_STAGE2_3_SCHEDULER_VERSION,
+    IFORWARD_STAGE3_0_SCHEDULER_VERSION,
+    Stage23Scheduler,
+)
 
 
 class _Dataset:
@@ -130,6 +134,29 @@ def _omegaconf_scheduler(scheduler_v3, *, seed=3):
     return Stage23Scheduler(dataset=ds, cfg=cfg, index=index, seed=int(seed))
 
 
+def test_stage2_3_scheduler_stage3_0_config_key_emits_stage3_version():
+    ds = _Dataset()
+    cfg = OmegaConf.create(
+        {
+            "scheduler_stage3_0": {
+                "enable": True,
+                "version": "stage3_0_optimizer_sequence_v1",
+                "time": {"allow_synthetic_timestamp": True},
+                "bootstrap": {"end_step": 0, "frames_per_asset_pack": 4},
+                "sequence": {"min_frames": 8, "max_frames": 10, "min_unique_keyframes": 3, "min_frame_span": 8, "max_frame_span": 30},
+                "assimilation": {"max_inner_k": 8, "rollout_options": {"B2R4": 1.0}},
+                "repair": {"enable": False},
+            }
+        }
+    )
+    index = build_stage2_3_index_from_dataset(dataset=ds, cfg=cfg)
+    sched = Stage23Scheduler(dataset=ds, cfg=cfg, index=index, seed=31)
+    meta = sched.next_batch()["_iforward"]
+    assert meta["scheduler_version"] == IFORWARD_STAGE3_0_SCHEDULER_VERSION
+    assert meta["requested_inner_K"] == 8
+    assert meta["phase_max_inner_k"] == 8
+
+
 def test_stage2_3_scheduler_assimilation_inner_k_and_every_repeat_write():
     sched = _scheduler(seed=4)
     meta = sched.next_batch()["_iforward"]
@@ -205,6 +232,136 @@ def test_stage2_3_scheduler_omegaconf_repeat_pairs_are_not_defaulted():
     assert meta["inner_K"] == 10
 
 
+def test_stage2_3_scheduler_assimilation_rollout_option_b1r6():
+    sched = _omegaconf_scheduler(
+        {
+            "time": {"allow_synthetic_timestamp": True},
+            "bootstrap": {"end_step": 0, "frames_per_asset_pack": 4},
+            "sequence": {"min_frames": 8, "max_frames": 10, "min_unique_keyframes": 3, "min_frame_span": 8, "max_frame_span": 30},
+            "assimilation": {"max_inner_k": 8, "rollout_options": {"B1R6": 1.0}},
+            "repair": {"enable": False},
+        },
+        seed=43,
+    )
+    meta = sched.next_batch()["_iforward"]
+    assert meta["scheduler_phase"] == "assimilation"
+    assert meta["repeat_budgets"] == [6]
+    assert meta["actual_blocks_per_rollout"] == 1
+    assert meta["requested_inner_K"] == 6
+    assert meta["actual_inner_K"] == 6
+    assert meta["phase_max_inner_k"] == 8
+
+
+def test_stage2_3_scheduler_assimilation_rollout_option_b2r4():
+    sched = _omegaconf_scheduler(
+        {
+            "time": {"allow_synthetic_timestamp": True},
+            "bootstrap": {"end_step": 0, "frames_per_asset_pack": 4},
+            "sequence": {"min_frames": 8, "max_frames": 10, "min_unique_keyframes": 3, "min_frame_span": 8, "max_frame_span": 30},
+            "assimilation": {"max_inner_k": 8, "rollout_options": {"B2R4": 1.0}},
+            "repair": {"enable": False},
+        },
+        seed=44,
+    )
+    meta = sched.next_batch()["_iforward"]
+    assert meta["scheduler_phase"] == "assimilation"
+    assert meta["repeat_budgets"] == [4, 4]
+    assert meta["actual_blocks_per_rollout"] == 2
+    assert meta["requested_inner_K"] == 8
+    assert meta["actual_inner_K"] == 8
+    assert meta["phase_max_inner_k"] == 8
+
+
+def test_stage2_3_scheduler_assimilation_repeat_pairs_over_cap_fail_fast():
+    ds = _Dataset()
+    cfg = OmegaConf.create(
+        {
+            "scheduler_v3": {
+                "time": {"allow_synthetic_timestamp": True},
+                "bootstrap": {"end_step": 0, "frames_per_asset_pack": 4},
+                "sequence": {"min_frames": 8, "max_frames": 10, "min_unique_keyframes": 3, "min_frame_span": 8, "max_frame_span": 30},
+                "assimilation": {"max_inner_k": 8, "repeat_pairs": {"4,8": 1.0}},
+                "repair": {"enable": False},
+            }
+        }
+    )
+    index = build_stage2_3_index_from_dataset(dataset=ds, cfg=cfg)
+    with pytest.raises(ValueError, match=r"assimilation\.repeat_pairs.*candidate=4,8.*candidate_K=12.*max_inner_k=8"):
+        Stage23Scheduler(dataset=ds, cfg=cfg, index=index)
+
+
+def test_stage2_3_scheduler_repair_rollout_option_over_cap_fail_fast():
+    ds = _Dataset()
+    cfg = OmegaConf.create(
+        {
+            "scheduler_v3": {
+                "time": {"allow_synthetic_timestamp": True},
+                "bootstrap": {"end_step": 0, "frames_per_asset_pack": 4},
+                "sequence": {"min_frames": 8, "max_frames": 10, "min_unique_keyframes": 3, "min_frame_span": 8, "max_frame_span": 30},
+                "assimilation": {"max_inner_k": 8, "repeat_pairs": {"4,4": 1.0}},
+                "repair": {
+                    "enable": True,
+                    "start_step": 0,
+                    "probability_schedule": [[0, 1.0]],
+                    "rollout_options": {"B6R2": 1.0},
+                    "max_inner_k": 8,
+                },
+            }
+        }
+    )
+    index = build_stage2_3_index_from_dataset(dataset=ds, cfg=cfg)
+    with pytest.raises(ValueError, match=r"repair\.rollout_options.*candidate=B6R2.*candidate_K=12.*max_inner_k=8"):
+        Stage23Scheduler(dataset=ds, cfg=cfg, index=index)
+
+
+def test_stage2_3_scheduler_repair_pattern_over_cap_fail_fast():
+    ds = _Dataset()
+    cfg = OmegaConf.create(
+        {
+            "scheduler_v3": {
+                "time": {"allow_synthetic_timestamp": True},
+                "bootstrap": {"end_step": 0, "frames_per_asset_pack": 4},
+                "sequence": {"min_frames": 8, "max_frames": 10, "min_unique_keyframes": 3, "min_frame_span": 8, "max_frame_span": 30},
+                "assimilation": {"max_inner_k": 8, "repeat_pairs": {"4,4": 1.0}},
+                "repair": {
+                    "enable": True,
+                    "start_step": 0,
+                    "probability_schedule": [[0, 1.0]],
+                    "rollout_options": {},
+                    "patterns": [{"name": "B5R2", "frames": 5, "repeats": 2, "prob": 1.0}],
+                    "max_inner_k": 8,
+                },
+            }
+        }
+    )
+    index = build_stage2_3_index_from_dataset(dataset=ds, cfg=cfg)
+    with pytest.raises(ValueError, match=r"repair\.patterns\[0\].*candidate=B5R2.*candidate_K=10.*max_inner_k=8"):
+        Stage23Scheduler(dataset=ds, cfg=cfg, index=index)
+
+
+def test_stage2_3_scheduler_assimilation_a8_metadata():
+    sched = _omegaconf_scheduler(
+        {
+            "time": {"allow_synthetic_timestamp": True},
+            "bootstrap": {"end_step": 0, "frames_per_asset_pack": 4},
+            "sequence": {"min_frames": 8, "max_frames": 10, "min_unique_keyframes": 3, "min_frame_span": 8, "max_frame_span": 30},
+            "assimilation": {"max_inner_k": 8, "repeat_pairs": {"4,4": 1.0}},
+            "repair": {"enable": False},
+        },
+        seed=45,
+    )
+    meta = sched.next_batch()["_iforward"]
+    assert meta["scheduler_phase"] == "assimilation"
+    assert meta["repeat_budgets"] == [4, 4]
+    assert meta["inner_K"] == 8
+    assert meta["requested_inner_K"] == 8
+    assert meta["actual_inner_K"] == 8
+    assert meta["phase_max_inner_k"] == 8
+    assert meta["request_meta"]["iforward_stage2_3"]["requested_inner_K"] == 8
+    assert meta["request_meta"]["iforward_stage2_3"]["actual_inner_K"] == 8
+    assert meta["request_meta"]["iforward_stage2_3"]["phase_max_inner_k"] == 8
+
+
 def test_stage2_3_scheduler_omegaconf_repair_options_and_two_rounds():
     sched = _omegaconf_scheduler(
         {
@@ -269,6 +426,218 @@ def test_stage2_3_scheduler_omegaconf_repair_b6r2_pattern():
     assert len(repair["rollout_positions"]) == 6
     assert repair["repeat_budgets"] == [2] * 6
     assert repair["inner_K"] == 12
+
+
+def test_stage2_3_scheduler_repair_b4r4_uses_repair_cap_16():
+    sched = _omegaconf_scheduler(
+        {
+            "time": {"allow_synthetic_timestamp": True},
+            "bootstrap": {"end_step": 0, "frames_per_asset_pack": 4},
+            "sequence": {"min_frames": 8, "max_frames": 8, "min_unique_keyframes": 3, "min_frame_span": 8, "max_frame_span": 30},
+            "assimilation": {"max_inner_k": 8, "repeat_pairs": {"4,4": 1.0}},
+            "repair": {
+                "enable": True,
+                "start_step": 0,
+                "probability_schedule": [[0, 1.0]],
+                "rounds": {"1": 1.0},
+                "rollout_options": {"B4R4": 1.0},
+                "last_update_write": False,
+                "max_inner_k": 16,
+            },
+        },
+        seed=46,
+    )
+    repair = None
+    while True:
+        meta = sched.next_batch()["_iforward"]
+        if meta["scheduler_phase"] == "repair":
+            repair = meta
+        if meta["episode_end_after_rollout"]:
+            break
+    assert repair is not None
+    assert repair["repair_pattern_name"] == "B4R4"
+    assert len(repair["rollout_positions"]) == 4
+    assert repair["repeat_budgets"] == [4] * 4
+    assert repair["requested_inner_K"] == 16
+    assert repair["actual_inner_K"] == 16
+    assert repair["inner_K"] == 16
+    assert repair["phase_max_inner_k"] == 16
+
+
+def test_stage2_3_scheduler_repair_requested_k_preserves_short_sequence():
+    sched = _omegaconf_scheduler(
+        {
+            "time": {"allow_synthetic_timestamp": True},
+            "bootstrap": {"end_step": 0, "frames_per_asset_pack": 4},
+            "sequence": {"min_frames": 4, "max_frames": 4, "min_unique_keyframes": 3, "min_frame_span": 4, "max_frame_span": 30},
+            "assimilation": {"max_inner_k": 8, "repeat_pairs": {"4,4": 1.0}},
+            "repair": {
+                "enable": True,
+                "start_step": 0,
+                "probability_schedule": [[0, 1.0]],
+                "rounds": {"1": 1.0},
+                "rollout_options": {"B6R2": 1.0},
+                "last_update_write": False,
+                "max_inner_k": 12,
+            },
+        },
+        seed=47,
+    )
+    repair = None
+    while True:
+        meta = sched.next_batch()["_iforward"]
+        if meta["scheduler_phase"] == "repair":
+            repair = meta
+        if meta["episode_end_after_rollout"]:
+            break
+    assert repair is not None
+    assert len(repair["rollout_positions"]) == 4
+    assert repair["requested_inner_K"] == 12
+    assert repair["actual_inner_K"] == 8
+    assert repair["inner_K"] == 8
+
+
+def test_stage2_3_scheduler_sequence_schedule_assimilation_uses_10_frames_and_k10_cap():
+    sched = _omegaconf_scheduler(
+        {
+            "time": {"allow_synthetic_timestamp": True},
+            "bootstrap": {"end_step": 0, "frames_per_asset_pack": 4},
+            "sequence": {
+                "min_frames": 8,
+                "max_frames": 24,
+                "min_unique_keyframes": 3,
+                "min_frame_span": 8,
+                "max_frame_span": 30,
+                "frame_count_schedule": [
+                    {"start_step": 0, "target_frames": 10, "min_frames": 10, "allow_short": False},
+                    {"start_step": 30000, "target_frames": 24, "min_frames": 8, "allow_short": True},
+                ],
+            },
+            "assimilation": {"start_step": 0, "max_inner_k": 10, "repeat_pairs": {"4,4": 0.4, "4,6": 0.3, "6,4": 0.3}},
+            "repair": {"enable": True, "start_step": 30000, "probability_schedule": [[30000, 1.0]], "max_inner_k": 24},
+        },
+        seed=48,
+    )
+    meta = sched.next_batch()["_iforward"]
+    assert meta["scheduler_phase"] == "assimilation"
+    assert meta["sequence_length"] == 10
+    assert meta["sequence_target_frames"] == 10
+    assert meta["sequence_min_frames"] == 10
+    assert meta["sequence_allow_short"] is False
+    assert meta["repair_enabled"] is False
+    assert meta["requested_inner_K"] <= 10
+    assert meta["phase_max_inner_k"] == 10
+
+
+def test_stage2_3_scheduler_sequence_schedule_repair_phase_allows_short_24_frame_target():
+    ds = _Dataset(frames=range(12))
+    cfg = OmegaConf.create(
+        {
+            "scheduler_v3": {
+                "time": {"allow_synthetic_timestamp": True},
+                "bootstrap": {"end_step": 0, "frames_per_asset_pack": 4},
+                "sequence": {
+                    "min_frames": 8,
+                    "max_frames": 24,
+                    "min_unique_keyframes": 3,
+                    "min_frame_span": 8,
+                    "max_frame_span": 30,
+                    "frame_count_schedule": [
+                        {"start_step": 0, "target_frames": 10, "min_frames": 10, "allow_short": False},
+                        {"start_step": 30000, "target_frames": 24, "min_frames": 8, "allow_short": True},
+                    ],
+                },
+                "assimilation": {"start_step": 0, "max_inner_k": 10, "repeat_pairs": {"4,4": 1.0}},
+                "repair": {"enable": False, "max_inner_k": 24},
+            }
+        }
+    )
+    index = build_stage2_3_index_from_dataset(dataset=ds, cfg=cfg)
+    sched = Stage23Scheduler(dataset=ds, cfg=cfg, index=index, seed=49)
+    sched.global_step = 30000
+    meta = sched.next_batch()["_iforward"]
+    assert meta["scheduler_phase"] == "assimilation"
+    assert meta["sequence_length"] == 12
+    assert meta["sequence_target_frames"] == 24
+    assert meta["sequence_min_frames"] == 8
+    assert meta["sequence_allow_short"] is True
+
+
+def test_stage2_3_scheduler_repair_rollout_option_over_cap_24_fail_fast():
+    ds = _Dataset()
+    cfg = OmegaConf.create(
+        {
+            "scheduler_v3": {
+                "time": {"allow_synthetic_timestamp": True},
+                "bootstrap": {"end_step": 0, "frames_per_asset_pack": 4},
+                "sequence": {
+                    "min_frames": 8,
+                    "max_frames": 24,
+                    "min_unique_keyframes": 3,
+                    "min_frame_span": 8,
+                    "max_frame_span": 30,
+                    "frame_count_schedule": [
+                        {"start_step": 0, "target_frames": 10, "min_frames": 10, "allow_short": False},
+                        {"start_step": 30000, "target_frames": 24, "min_frames": 8, "allow_short": True},
+                    ],
+                },
+                "assimilation": {"start_step": 0, "max_inner_k": 10, "repeat_pairs": {"4,4": 1.0}},
+                "repair": {
+                    "enable": True,
+                    "start_step": 30000,
+                    "probability_schedule": [[30000, 1.0]],
+                    "rollout_options": {"B7R4": 1.0},
+                    "max_inner_k": 24,
+                },
+            }
+        }
+    )
+    index = build_stage2_3_index_from_dataset(dataset=ds, cfg=cfg)
+    with pytest.raises(ValueError, match=r"repair\.rollout_options.*candidate=B7R4.*candidate_K=28.*max_inner_k=24"):
+        Stage23Scheduler(dataset=ds, cfg=cfg, index=index)
+
+
+def test_stage2_3_scheduler_repair_smoke_override_start0_uses_cap24():
+    sched = _omegaconf_scheduler(
+        {
+            "time": {"allow_synthetic_timestamp": True},
+            "bootstrap": {"end_step": 0, "frames_per_asset_pack": 4},
+            "sequence": {
+                "min_frames": 8,
+                "max_frames": 24,
+                "min_unique_keyframes": 3,
+                "min_frame_span": 8,
+                "max_frame_span": 30,
+                "frame_count_schedule": [
+                    {"start_step": 0, "target_frames": 24, "min_frames": 8, "allow_short": True},
+                ],
+            },
+            "assimilation": {"start_step": 0, "max_inner_k": 10, "repeat_pairs": {"4,4": 1.0}},
+            "repair": {
+                "enable": True,
+                "start_step": 0,
+                "probability_schedule": [[0, 1.0]],
+                "rounds": {"1": 1.0},
+                "rollout_options": {"B24R1": 1.0},
+                "last_update_write": False,
+                "max_inner_k": 24,
+            },
+        },
+        seed=50,
+    )
+    repair = None
+    while True:
+        meta = sched.next_batch()["_iforward"]
+        if meta["scheduler_phase"] == "repair":
+            repair = meta
+        if meta["episode_end_after_rollout"]:
+            break
+    assert repair is not None
+    assert repair["sequence_length"] == 24
+    assert repair["repair_pattern_name"] == "B24R1"
+    assert repair["requested_inner_K"] == 24
+    assert repair["actual_inner_K"] == 24
+    assert repair["phase_max_inner_k"] == 24
 
 
 def test_stage2_3_scheduler_resume_determinism():
@@ -339,6 +708,25 @@ def test_stage2_3_producer_matches_sync_metadata():
             assert int(info["producer_batches_produced"]) >= 1
     finally:
         sync.shutdown()
+        prod.shutdown()
+
+
+def test_stage2_3_producer_cuda_queue_depth_cap_is_effective():
+    ds = _Dataset()
+    ds.device = "cuda"
+    prod = _scheduler(
+        dataset=ds,
+        seed=210,
+        producer={"enable": True, "queue_depth": 32, "cuda_queue_depth_cap": 1, "preload_next_episode": False},
+    )
+    try:
+        _ = prod.next_batch()
+        info = prod.get_current_info()
+        assert info["producer_enabled"] is True
+        assert int(info["producer_queue_depth_configured"]) == 32
+        assert int(info["producer_cuda_queue_depth_cap"]) == 1
+        assert int(info["producer_queue_depth"]) == 1
+    finally:
         prod.shutdown()
 
 

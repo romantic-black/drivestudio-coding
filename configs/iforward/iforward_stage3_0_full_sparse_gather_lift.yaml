@@ -235,14 +235,9 @@ scheduler_v3:
   assimilation:
     start_step: 5000
     frames_per_rollout: 2
-    max_inner_k: 12
+    max_inner_k: 8
     repeat_pairs:
-      "4,4": 0.35
-      "4,6": 0.15
-      "6,4": 0.15
-      "6,6": 0.15
-      "4,8": 0.10
-      "8,4": 0.10
+      "4,4": 1.0
   repair:
     enable: true
     start_step: 15000
@@ -261,10 +256,11 @@ scheduler_v3:
     mamba_read: true
     mamba_write: true
     last_update_write: false
-    max_inner_k: 12
+    max_inner_k: 16
   producer:
     enable: true
-    queue_depth: 32
+    queue_depth: 1
+    cuda_queue_depth_cap: 1
     preload_next_episode: true
     episode_pinned_cache: true
 
@@ -338,10 +334,16 @@ model:
       enable_memory_aux_stats: false
       log_per_k_metrics: false
       log_per_k_aux_interval: 10000
+      forward_memory_aux_interval: 100
       nvtx_ranges: false
     short_window_history:
       max_entries: 24
       max_memory_entries: 0
+    repair_training:
+      enable: true
+      kinds: [repair]
+      freeze_2d_frontend: true
+      no_grad_2d_forward: true
     lifting:
       type: full_sparse_gather
       context_dim: 48
@@ -415,7 +417,7 @@ model:
       event_dim: 64
       ctx_dim: 32
       model_dim: 32
-      state_dim: 8
+      state_dim: 16
       conv_kernel: 2
       read_every_repeat: true
       write_every_repeat: true
@@ -508,7 +510,7 @@ model:
         mode: gaussian_relational
         rank: 4
         parent_event_dim: 64
-        fine_event_dim: 16
+        fine_event_dim: 32
         relation_dim: 12
         hidden_dim: 64
         num_layers: 2
@@ -553,7 +555,7 @@ model:
       event_dim: 64
       ctx_dim: 32
       model_dim: 32
-      state_dim: 8
+      state_dim: 16
       conv_kernel: 2
       adapter_hidden_dim: 64
       motion_embed_dim: 16
@@ -609,6 +611,7 @@ model:
       train_dinov2: false
       detach_v4_outputs: false
       detach_source_render_for_cnn: true
+      cnn_view_chunk_size: 12
     local_rollout:
       source: scheduler_stage2_2
       use_scheduler_inner_K: true
@@ -658,8 +661,8 @@ model:
       input_event: true
       input_current_ctx: false
       input_vsm_ctx: false
-      hidden_dim: 32
-      event_dim: 16
+      hidden_dim: 48
+      event_dim: 32
       stage_hidden_dim: 0
       output_hidden: false
       output_confidence: false

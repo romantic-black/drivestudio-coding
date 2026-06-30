@@ -191,6 +191,17 @@ class MinimalStreetForwardStage4_5(MinimalStreetForwardStage4_2):
             cnn_perf_stats[f"iforward/cnn/{label}_allocated_mb"] = float(allocated / scale)
             cnn_perf_stats[f"iforward/cnn/{label}_reserved_mb"] = float(reserved / scale)
 
+        def _merge_dino_stats(dst: Dict[str, float], src: Dict[str, float]) -> None:
+            for key, value in dict(src or {}).items():
+                try:
+                    v = float(value)
+                except Exception:
+                    continue
+                if key.endswith(("cache_cpu_mb", "cache_gpu_mb", "feature_dtype_id")):
+                    dst[key] = v
+                else:
+                    dst[key] = float(dst.get(key, 0.0)) + v
+
         _mark_cuda("start")
         t0 = time.perf_counter()
         scene_render_out = self.alpha_t_extractor.render_rgb_only(
@@ -243,73 +254,190 @@ class MinimalStreetForwardStage4_5(MinimalStreetForwardStage4_2):
             t0 = time.perf_counter()
             x6 = extractor._to_nchw_6(multi)  # type: ignore[attr-defined]
             _elapsed("to_nchw6", t0)
-            t0 = time.perf_counter()
-            residual_feat = extractor.extract_residual_feature(x6)
-            _elapsed("residual_unet", t0)
-            _mark_cuda("after_residual_unet")
-            cnn_perf_stats["iforward/cnn/residual_feat_mb"] = _tensor_mb(residual_feat)
-            target_hw = (int(residual_feat.shape[1]), int(residual_feat.shape[2]))
-            rgb = x6[:, :3, :, :]
             trainable = bool(
                 extractor.dino_adapter_has_trainable_params()  # type: ignore[attr-defined]
                 if hasattr(extractor, "dino_adapter_has_trainable_params")
                 else False
             )
-            t0 = time.perf_counter()
-            if cache_level == "backbone_intermediate":
-                if not hasattr(extractor, "extract_dino_backbone_intermediates") or not hasattr(
-                    extractor,
-                    "adapt_dino_backbone_intermediates",
-                ):
-                    raise RuntimeError("DINO backbone_intermediate cache requires extractor split DINO adapter APIs")
-                cached_dino, stats = cache.get_or_compute(
-                    key=dino_cache_key,
-                    device=rgb.device,
-                    trainable=False,
-                    compute=lambda: extractor.extract_dino_backbone_intermediates(rgb),
+            stage3_lifting_cfg = getattr(self, "stage3_0_lifting_cfg", {}) or {}
+            detach_detail_input = bool(
+                getattr(self, "stage3_0_enabled", False)
+                and (
+                    stage3_lifting_cfg.get("detail_head_detach_residual", False)
+                    if hasattr(stage3_lifting_cfg, "get")
+                    else False
                 )
-                if not isinstance(cached_dino, tuple):
-                    raise RuntimeError("DINO backbone_intermediate cache expected a tuple of intermediate tensors")
-                if bool(getattr(self, "stage3_dino_native_enabled", False)):
-                    native_hw = (int(cached_dino[-1].shape[-2]), int(cached_dino[-1].shape[-1]))
-                    stage3_dino_native_2d = extractor.adapt_dino_backbone_intermediates(
-                        cached_dino,
-                        target_hw=native_hw,
-                    )
-                    expected_c = int(getattr(self, "stage3_dino_native_dim", int(stage3_dino_native_2d.shape[-1])))
-                    if int(stage3_dino_native_2d.shape[-1]) != expected_c:
-                        raise ValueError(
-                            "Stage3 DINO native channel mismatch: "
-                            f"got {int(stage3_dino_native_2d.shape[-1])}, expected {expected_c}"
-                        )
-                    fwhr_aux_stats["iforward/cnn/stage3_dino_native_feat_mb"] = _tensor_mb(stage3_dino_native_2d)
-                dino_feat = extractor.adapt_dino_backbone_intermediates(cached_dino, target_hw=target_hw)
-            else:
-                dino_feat, stats = cache.get_or_compute(
-                    key=dino_cache_key,
-                    device=rgb.device,
-                    trainable=trainable,
-                    compute=lambda: extractor.extract_dino_feature(rgb, target_hw=target_hw),
-                )
-                if not torch.is_tensor(dino_feat):
-                    raise RuntimeError("DINO adapter_output cache expected a tensor")
-            _elapsed("dino_cache_or_compute", t0)
-            _mark_cuda("after_dino")
-            dino_cache_stats = stats.as_dict()
-            cnn_perf_stats["iforward/cnn/dino_feat_mb"] = _tensor_mb(dino_feat)
-            t0 = time.perf_counter()
-            features_2d = extractor.fuse_features(
-                dino_feat.to(device=residual_feat.device, dtype=residual_feat.dtype),
-                residual_feat,
             )
+            view_chunk_size = int(getattr(self, "stage6_cnn_view_chunk_size", 0) or 0)
+            use_view_chunks = bool(view_chunk_size > 0 and int(x6.shape[0]) > int(view_chunk_size))
+            cnn_perf_stats["iforward/cnn/view_chunk_size"] = float(view_chunk_size)
+            cnn_perf_stats["iforward/cnn/view_chunked_enabled"] = float(use_view_chunks)
+
+            if use_view_chunks:
+                feature_chunks: List[torch.Tensor] = []
+                detail_chunks: List[torch.Tensor] = []
+                dino_native_chunks: List[torch.Tensor] = []
+                residual_mb = 0.0
+                dino_mb = 0.0
+                detail_mb = 0.0
+                dino_native_mb = 0.0
+                chunk_count = 0
+                residual_ms = 0.0
+                dino_ms = 0.0
+                fusion_ms = 0.0
+                for start in range(0, int(x6.shape[0]), int(view_chunk_size)):
+                    end = min(int(start) + int(view_chunk_size), int(x6.shape[0]))
+                    x6_chunk = x6[start:end]
+                    t_chunk = time.perf_counter()
+                    residual_chunk = extractor.extract_residual_feature(x6_chunk)
+                    residual_ms += float((time.perf_counter() - t_chunk) * 1000.0)
+                    residual_mb += _tensor_mb(residual_chunk)
+                    target_hw = (int(residual_chunk.shape[1]), int(residual_chunk.shape[2]))
+                    rgb_chunk = x6_chunk[:, :3, :, :]
+
+                    t_chunk = time.perf_counter()
+                    if cache_level == "backbone_intermediate":
+                        if not hasattr(extractor, "extract_dino_backbone_intermediates") or not hasattr(
+                            extractor,
+                            "adapt_dino_backbone_intermediates",
+                        ):
+                            raise RuntimeError("DINO backbone_intermediate cache requires extractor split DINO adapter APIs")
+                        chunk_key = (dino_cache_key, "view_chunk", int(start), int(end), int(x6.shape[0]))
+                        cached_dino, stats = cache.get_or_compute(
+                            key=chunk_key,
+                            device=rgb_chunk.device,
+                            trainable=False,
+                            compute=lambda rgb_in=rgb_chunk: extractor.extract_dino_backbone_intermediates(rgb_in),
+                        )
+                        if not isinstance(cached_dino, tuple):
+                            raise RuntimeError("DINO backbone_intermediate cache expected a tuple of intermediate tensors")
+                        if bool(getattr(self, "stage3_dino_native_enabled", False)):
+                            native_hw = (int(cached_dino[-1].shape[-2]), int(cached_dino[-1].shape[-1]))
+                            native_chunk = extractor.adapt_dino_backbone_intermediates(
+                                cached_dino,
+                                target_hw=native_hw,
+                            )
+                            expected_c = int(getattr(self, "stage3_dino_native_dim", int(native_chunk.shape[-1])))
+                            if int(native_chunk.shape[-1]) != expected_c:
+                                raise ValueError(
+                                    "Stage3 DINO native channel mismatch: "
+                                    f"got {int(native_chunk.shape[-1])}, expected {expected_c}"
+                                )
+                            dino_native_mb += _tensor_mb(native_chunk)
+                            dino_native_chunks.append(native_chunk)
+                        dino_chunk = extractor.adapt_dino_backbone_intermediates(cached_dino, target_hw=target_hw)
+                    else:
+                        chunk_key = (dino_cache_key, "view_chunk", int(start), int(end), int(x6.shape[0]))
+                        dino_chunk, stats = cache.get_or_compute(
+                            key=chunk_key,
+                            device=rgb_chunk.device,
+                            trainable=trainable,
+                            compute=lambda rgb_in=rgb_chunk, hw=target_hw: extractor.extract_dino_feature(rgb_in, target_hw=hw),
+                        )
+                        if not torch.is_tensor(dino_chunk):
+                            raise RuntimeError("DINO adapter_output cache expected a tensor")
+                    dino_ms += float((time.perf_counter() - t_chunk) * 1000.0)
+                    dino_mb += _tensor_mb(dino_chunk)
+                    _merge_dino_stats(dino_cache_stats, stats.as_dict())
+
+                    t_chunk = time.perf_counter()
+                    feature_chunks.append(
+                        extractor.fuse_features(
+                            dino_chunk.to(device=residual_chunk.device, dtype=residual_chunk.dtype),
+                            residual_chunk,
+                        )
+                    )
+                    if hasattr(extractor, "detail_head"):
+                        detail_input = residual_chunk.detach() if detach_detail_input else residual_chunk
+                        detail_chunk = extractor.detail_head(detail_input)  # type: ignore[attr-defined]
+                        detail_mb += _tensor_mb(detail_chunk)
+                        detail_chunks.append(detail_chunk)
+                    fusion_ms += float((time.perf_counter() - t_chunk) * 1000.0)
+                    chunk_count += 1
+                features_2d = torch.cat(feature_chunks, dim=0).contiguous()
+                feature_chunks = []
+                if detail_chunks:
+                    fwhr_detail_2d = torch.cat(detail_chunks, dim=0).contiguous()
+                    detail_chunks = []
+                if dino_native_chunks:
+                    stage3_dino_native_2d = torch.cat(dino_native_chunks, dim=0).contiguous()
+                    dino_native_chunks = []
+                cnn_perf_stats["iforward/cnn/view_chunk_count"] = float(chunk_count)
+                cnn_perf_stats["iforward/cnn/residual_unet_ms"] = float(residual_ms)
+                cnn_perf_stats["iforward/cnn/dino_cache_or_compute_ms"] = float(dino_ms)
+                cnn_perf_stats["iforward/cnn/fusion_ms"] = float(fusion_ms)
+                cnn_perf_stats["iforward/cnn/residual_feat_mb"] = float(residual_mb)
+                cnn_perf_stats["iforward/cnn/dino_feat_mb"] = float(dino_mb)
+                _mark_cuda("after_feature_chunks")
+            else:
+                t0 = time.perf_counter()
+                residual_feat = extractor.extract_residual_feature(x6)
+                _elapsed("residual_unet", t0)
+                _mark_cuda("after_residual_unet")
+                cnn_perf_stats["iforward/cnn/residual_feat_mb"] = _tensor_mb(residual_feat)
+                target_hw = (int(residual_feat.shape[1]), int(residual_feat.shape[2]))
+                rgb = x6[:, :3, :, :]
+                t0 = time.perf_counter()
+                if cache_level == "backbone_intermediate":
+                    if not hasattr(extractor, "extract_dino_backbone_intermediates") or not hasattr(
+                        extractor,
+                        "adapt_dino_backbone_intermediates",
+                    ):
+                        raise RuntimeError("DINO backbone_intermediate cache requires extractor split DINO adapter APIs")
+                    cached_dino, stats = cache.get_or_compute(
+                        key=dino_cache_key,
+                        device=rgb.device,
+                        trainable=False,
+                        compute=lambda: extractor.extract_dino_backbone_intermediates(rgb),
+                    )
+                    if not isinstance(cached_dino, tuple):
+                        raise RuntimeError("DINO backbone_intermediate cache expected a tuple of intermediate tensors")
+                    if bool(getattr(self, "stage3_dino_native_enabled", False)):
+                        native_hw = (int(cached_dino[-1].shape[-2]), int(cached_dino[-1].shape[-1]))
+                        stage3_dino_native_2d = extractor.adapt_dino_backbone_intermediates(
+                            cached_dino,
+                            target_hw=native_hw,
+                        )
+                        expected_c = int(getattr(self, "stage3_dino_native_dim", int(stage3_dino_native_2d.shape[-1])))
+                        if int(stage3_dino_native_2d.shape[-1]) != expected_c:
+                            raise ValueError(
+                                "Stage3 DINO native channel mismatch: "
+                                f"got {int(stage3_dino_native_2d.shape[-1])}, expected {expected_c}"
+                            )
+                        fwhr_aux_stats["iforward/cnn/stage3_dino_native_feat_mb"] = _tensor_mb(stage3_dino_native_2d)
+                    dino_feat = extractor.adapt_dino_backbone_intermediates(cached_dino, target_hw=target_hw)
+                else:
+                    dino_feat, stats = cache.get_or_compute(
+                        key=dino_cache_key,
+                        device=rgb.device,
+                        trainable=trainable,
+                        compute=lambda: extractor.extract_dino_feature(rgb, target_hw=target_hw),
+                    )
+                    if not torch.is_tensor(dino_feat):
+                        raise RuntimeError("DINO adapter_output cache expected a tensor")
+                _elapsed("dino_cache_or_compute", t0)
+                _mark_cuda("after_dino")
+                dino_cache_stats = stats.as_dict()
+                cnn_perf_stats["iforward/cnn/dino_feat_mb"] = _tensor_mb(dino_feat)
+                t0 = time.perf_counter()
+                features_2d = extractor.fuse_features(
+                    dino_feat.to(device=residual_feat.device, dtype=residual_feat.dtype),
+                    residual_feat,
+                )
+                if hasattr(extractor, "detail_head"):
+                    detail_input = residual_feat.detach() if detach_detail_input else residual_feat
+                    fwhr_detail_2d = extractor.detail_head(detail_input)  # type: ignore[attr-defined]
+                    fwhr_aux_stats["iforward/cnn/fwhr_detail_feat_mb"] = _tensor_mb(fwhr_detail_2d)
+                _elapsed("fusion", t0)
+            _mark_cuda("after_fusion")
             if hasattr(extractor, "detail_head"):
-                fwhr_detail_2d = extractor.detail_head(residual_feat)  # type: ignore[attr-defined]
+                fwhr_aux_stats["iforward/cnn/detail_head_detach_residual"] = float(detach_detail_input)
                 fwhr_aux_stats["iforward/cnn/fwhr_detail_feat_mb"] = _tensor_mb(fwhr_detail_2d)
                 fwhr_aux_stats["iforward/cnn/fwhr_detail_feature_rms"] = float(
                     fwhr_detail_2d.detach().float().square().mean().sqrt().item()
-                ) if int(fwhr_detail_2d.numel()) > 0 else 0.0
-            _elapsed("fusion", t0)
-            _mark_cuda("after_fusion")
+                ) if fwhr_detail_2d is not None and int(fwhr_detail_2d.numel()) > 0 else 0.0
+            if stage3_dino_native_2d is not None:
+                fwhr_aux_stats["iforward/cnn/stage3_dino_native_feat_mb"] = _tensor_mb(stage3_dino_native_2d)
         elif hasattr(extractor, "forward_fwhr"):
             t0 = time.perf_counter()
             fwhr_features = extractor.forward_fwhr(multi)  # type: ignore[attr-defined]

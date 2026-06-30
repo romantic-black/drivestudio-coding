@@ -274,6 +274,7 @@ class IForwardStage6Bridge:
             ctx_current=None,
             ctx_vsm=ctx_memory,
             appearance_detail=getattr(event, "appearance_detail", None),
+            branch_scope=getattr(self.runtime, "stage6_branch_scope", None),
         )
         out = {**dict(getattr(event, "aux", {}) or {}), **dict(aux or {})}
         out.update(self._ctx_adapter_stats(event=event, ctx_memory=ctx_memory))

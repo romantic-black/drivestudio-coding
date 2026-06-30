@@ -10,6 +10,7 @@ import torch.nn as nn
 from .model import IForwardModel, IForwardRolloutOutput
 from .state import IForwardState
 from .utils import cfg_get
+from .versions import is_stage3_0_iforward_version
 
 
 class IForwardTrainer(nn.Module):
@@ -115,8 +116,7 @@ class IForwardTrainer(nn.Module):
             "stage2_1_fwhr_parent_ptv3_temporal_mamba",
             "stage2_2_stream10_rawframe_temporal_mamba_v2",
             "iforward_2_3_optimizer_mamba",
-            "stage3_0_full_sparse_gather_lift",
-        }
+        } or is_stage3_0_iforward_version(cfg_get(iforward_cfg, "version", ""))
 
     def _is_stage2_1_parent_temporal(self) -> bool:
         if (
@@ -131,8 +131,7 @@ class IForwardTrainer(nn.Module):
             "stage2_1_fwhr_parent_ptv3_temporal_mamba",
             "stage2_2_stream10_rawframe_temporal_mamba_v2",
             "iforward_2_3_optimizer_mamba",
-            "stage3_0_full_sparse_gather_lift",
-        }
+        } or is_stage3_0_iforward_version(cfg_get(iforward_cfg, "version", ""))
 
     def _is_v3_gru_history_gate(self) -> bool:
         if bool(getattr(self.model, "is_v3_gru_history_gate", False)):
@@ -804,6 +803,30 @@ class IForwardTrainer(nn.Module):
 
         t0 = time.perf_counter()
         losses = {name: float(value.detach().item()) for name, value in out.losses.items()}
+        resolved_meta = dict(getattr(out.resolved, "meta", {}) or {})
+        request_meta = dict(resolved_meta.get("request_meta", {}) or {})
+        stage23_request_meta = dict(request_meta.get("iforward_stage2_3", {}) or {})
+        requested_inner_k = int(
+            resolved_meta.get(
+                "requested_inner_K",
+                stage23_request_meta.get("requested_inner_K", int(out.resolved.inner_K)),
+            )
+            or int(out.resolved.inner_K)
+        )
+        actual_inner_k = int(
+            resolved_meta.get(
+                "actual_inner_K",
+                stage23_request_meta.get("actual_inner_K", int(out.resolved.inner_K)),
+            )
+            or int(out.resolved.inner_K)
+        )
+        phase_max_inner_k = int(
+            resolved_meta.get(
+                "phase_max_inner_k",
+                stage23_request_meta.get("phase_max_inner_k", int(actual_inner_k)),
+            )
+            or int(actual_inner_k)
+        )
         final = {
             "loss": float(loss.detach().item()),
             "iforward/loss_total": float(loss.detach().item()),
@@ -811,6 +834,9 @@ class IForwardTrainer(nn.Module):
             "iforward/segment_id": int(out.resolved.segment_id),
             "iforward/episode_id": int(out.resolved.episode_id),
             "iforward/inner_K": float(out.resolved.inner_K),
+            "iforward/requested_inner_K": float(requested_inner_k),
+            "iforward/actual_inner_K": float(actual_inner_k),
+            "iforward/phase_max_inner_k": float(phase_max_inner_k),
             "iforward/rollout_id_global": float(out.resolved.rollout_id_global),
             "iforward/rollout_idx_in_episode": float(out.resolved.rollout_idx_in_episode),
             "iforward/rollouts_per_episode": int(out.resolved.rollouts_per_episode),
@@ -846,6 +872,22 @@ class IForwardTrainer(nn.Module):
         }
         final["iforward/scheduler_version"] = str(out.resolved.scheduler_version)
         final["iforward/window_block_ids"] = [int(x) for x in tuple(out.resolved.window_block_ids)]
+        if str(out.resolved.scheduler_version) in {
+            "iforward_2_3_scheduler_v3_optimizer_mamba",
+            "stage3_0_optimizer_sequence_v1",
+        }:
+            final["iforward/stage2_3/requested_inner_K"] = float(requested_inner_k)
+            final["iforward/stage2_3/actual_inner_K"] = float(actual_inner_k)
+            final["iforward/stage2_3/phase_max_inner_k"] = float(phase_max_inner_k)
+            final["iforward/stage2_3/sequence_target_frames"] = float(
+                int(resolved_meta.get("sequence_target_frames", stage23_request_meta.get("sequence_target_frames", 0)) or 0)
+            )
+            final["iforward/stage2_3/sequence_min_frames"] = float(
+                int(resolved_meta.get("sequence_min_frames", stage23_request_meta.get("sequence_min_frames", 0)) or 0)
+            )
+            final["iforward/stage2_3/sequence_allow_short"] = bool(
+                resolved_meta.get("sequence_allow_short", stage23_request_meta.get("sequence_allow_short", False))
+            )
         if str(out.resolved.scheduler_version) == "iforward_sequence10_v1":
             meta = dict(getattr(out.resolved, "meta", {}) or {})
             sequence_positions = [int(x) for x in list(meta.get("sequence_positions", []) or [])]

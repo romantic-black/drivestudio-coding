@@ -1,6 +1,5 @@
-output_name: iforward_2_3_scheduler_v3_optimizer_mamba
-# IForward Stage 2_2: raw-frame stream10 scheduler, Temporal Mamba V2,
-# episode history bank, and Stage2_2 validation.
+output_name: iforward_stage3_0_full_train_30k_assim_30k_repair
+# IForward Stage 3_0 full training: 30k assimilation-only, then repair-enabled.
 
 initialization:
   phase_b_from_phase_a:
@@ -93,117 +92,13 @@ dataset:
       enable: true
       traj_length_thresh_m: 0.5
 
-scheduler_stage2_2:
-  enable: false
-  version: iforward_stage2_2_stream10_rawframe
-  fail_fast: true
-  index_dir: /root/autodl-tmp/outputs/iforward_stage2_2_stream10_rawframe/index
-  # Fill this with metadata.json:fingerprint after rebuilding the Stage2_2
-  # index. This config intentionally uses frame_idx * 100ms synthetic timestamp.
-  index_fingerprint: "a44f3080ddaa260a028fcce845493b88d891243b3ae00e4c8e1281ce0969bfd2"
-  time:
-    frame_period_us: 100000
-    timestamp_source: frame_idx_times_frame_period_us
-    allow_synthetic_timestamp: true
-  traversal:
-    fixed_scene_id: null
-    fixed_segment_id: null
-    seed: null
-    scene_order: shuffle_per_epoch
-    segment_order: shuffle_per_epoch
-    traversal_mode: scene_round_robin_episode
-    forbid_consecutive_same_scene: true
-  bootstrap:
-    end_step: 5000
-    repeat_choices:
-      - {repeats: 4, prob: 0.60}
-      - {repeats: 6, prob: 0.30}
-      - {repeats: 8, prob: 0.10}
-    current_only: true
-  protocol:
-    weights: {D1: 1.0, D2: 1.0, I123: 1.0}
-    producer_queue_size: 2
-  causal:
-    start_step: 5000
-    rollouts_per_episode: 5
-    blocks_per_rollout: 2
-    repeats_per_block: 4
-    temporal_read: true
-    temporal_commit: true
-    physical_time_advance: true
-  repair:
-    start_step: 15000
-    prob: 0.5
-    blocks_per_rollout: 8
-    repeats_per_block: 1
-    non_identity_permutation: true
-    temporal_read: true
-    temporal_commit: false
-    observation_commit: false
-    update_optimizer_memory: false
-    physical_time_advance: false
-  evidence:
-    camera_policy: all_cams
-    cams_per_input: null
-    fixed_cam_ids: null
-    allow_camera_dropout: false
-    mask_policy: non_sky_non_egocar
-  memory:
-    observation_commit_policy: first_repeat_only
-    optimizer_memory_update_policy: block_exit_only
-    reset_policy: episode_begin
-    carry_policy: across_rollouts_until_episode_end
-  loss_timing:
-    policy: rollout_final_only
-    intermediate_step_loss: false
-  supervision:
-    current:
-      enable: true
-      role_name: final_current_recon
-      frame_policy: all_rollout_input_frames
-      camera_policy: all_cams
-      required: true
-    nearby:
-      enable: false
-      role_name: final_nearby_rollout
-      scope: rollout_keyframe_span
-      policy: random_non_input_frames
-      frames_per_rollout: 1
-      insufficient_policy: use_available_or_skip_if_none
-      camera_policy: all_cams
-      max_refs_per_rollout: 24
-      add_to_evidence: false
-      mask_policy: non_sky_non_egocar
-    history_replay:
-      enable: true
-      start_step: 5000
-      sampling_policy: sequence10_seen_excluding_current
-      exclude_current_blocks: true
-      max_frames_per_rollout: 10
-      camera_policy: all_cams
-      max_refs_per_rollout: 30
-  leakage_check:
-    enable: true
-    same_scene_segment_required: true
-    forbid_test_refs_in_train: true
-    target_role_count_match_required: true
-    nearby_not_in_evidence: true
-    nearby_not_input_frame: true
-    current_supervision_must_cover_all_inputs: true
-  preload:
-    emit_hints: true
-    warm_current_rollout_refs: true
-    warm_next_rollout_refs: true
-    warm_episode_chain: true
-    hint_scope_for_exact_refs: stage2_2_current_rollout_view_pack
-
-scheduler_v3:
+scheduler_stage3_0:
   enable: true
-  version: optimizer_sequence_v1
+  version: stage3_0_optimizer_sequence_v1
   fail_fast: true
-  index_dir: /root/autodl-tmp/outputs/iforward_2_3_scheduler_v3_optimizer_mamba/index
+  index_dir: /root/autodl-tmp/outputs/iforward_stage3_0_full_train_30k_assim_30k_repair/index
   # Fill with metadata.json:fingerprint after running tools/build_iforward_stage2_3_index.py.
-  index_fingerprint: ""
+  index_fingerprint: "a44f3080ddaa260a028fcce845493b88d891243b3ae00e4c8e1281ce0969bfd2"
   allow_missing_index_fingerprint: true
   time:
     frame_period_us: 100000
@@ -216,7 +111,7 @@ scheduler_v3:
     fixed_scene_id: null
     fixed_segment_id: null
   bootstrap:
-    end_step: 5000
+    end_step: 0
     frames_per_asset_pack: 4
     fresh_state_per_frame: true
     mamba: off
@@ -226,55 +121,60 @@ scheduler_v3:
       8: 0.20
   sequence:
     min_frames: 8
-    max_frames: 10
+    max_frames: 24
     min_unique_keyframes: 3
     min_frame_span: 8
     max_frame_span: 30
+    frame_count_schedule:
+      - {start_step: 0, target_frames: 10, min_frames: 10, allow_short: false}
+      - {start_step: 30000, target_frames: 24, min_frames: 8, allow_short: true}
     assimilation_order:
       chronological: 0.80
       local_shuffle: 0.20
   assimilation:
-    start_step: 5000
-    frames_per_rollout: 2
-    max_inner_k: 12
+    start_step: 0
+    max_inner_k: 8
+    rollout_options:
+      B1R8: 0.1
+      B1R6: 0.1
+      B1R4: 0.1
+      B1R2: 0.1
+      B2R4: 0.20
     repeat_pairs:
-      "4,4": 0.35
-      "4,6": 0.15
-      "6,4": 0.15
-      "6,6": 0.15
-      "4,8": 0.10
-      "8,4": 0.10
+      "2,6": 0.1
+      "6,2": 0.1
+      "3,5": 0.1
+      "5,3": 0.1
   repair:
     enable: true
-    start_step: 15000
+    start_step: 30000
     probability_schedule:
-      - [15000, 0.10]
-      - [18000, 0.25]
-      - [22000, 0.50]
-    rounds:
-      1: 0.70
-      2: 0.30
+      - [30000, 1]
+    round_distribution:
+      2: 0.25
+      4: 0.25
+      6: 0.25
+      8: 0.25
     rollout_options:
-      B6R1: 0.35
-      B8R1: 0.40
-      B6R2: 0.25
+      B6R1: 0.15
+      B4R2: 0.15
+      B8R1: 0.15
+      B4R3: 0.15
+      B6R2: 0.10
+      B12R1: 0.10
+      B8R2: 0.10
+      B16R1: 0.10
     random_order: true
     mamba_read: true
     mamba_write: true
     last_update_write: false
-    max_inner_k: 12
+    max_inner_k: 16
   producer:
     enable: true
-    queue_depth: 32
+    queue_depth: 1
+    cuda_queue_depth_cap: 1
     preload_next_episode: true
     episode_pinned_cache: true
-
-scheduler_v9:
-  enable: false
-  phase: phase_A_block_local_unroll
-  phase_A:
-    nearby_supervision:
-      enable: false
 
 model:
   stage: "6_0"
@@ -307,7 +207,7 @@ model:
       pad_to_patch_multiple: 14
       cache:
         enable: true
-        level: adapter_output
+        level: backbone_intermediate
         dtype: float16
         cpu_pinned: true
         cpu_max_items: 0
@@ -334,7 +234,7 @@ model:
       enable: true
       k: 8
   iforward:
-    version: iforward_2_3_optimizer_mamba
+    version: stage3_0_scalar_anchor_child_support_parent_legacy
     debug:
       enable_memory_aux_stats: false
       log_per_k_metrics: false
@@ -344,12 +244,51 @@ model:
     short_window_history:
       max_entries: 24
       max_memory_entries: 0
+    repair_training:
+      enable: true
+      start_step: 30000
+      kinds: [repair]
+      freeze_2d_frontend: true
+      no_grad_2d_forward: true
+    lifting:
+      type: full_sparse_gather
+      context_dim: 48
+      detail_dim: 8
+      scalar_anchor_backend: cuda_scalar_anchor
+      detach_geometry: true
+      return_stage3_debug_tensors: false
+      memory_aux_interval: 100
+      scalar_anchor:
+        support_mode: projected_opacity
+        anchor_mode: auto
+        count_pairs: false
+        heavy_aux_interval: 100
+        cuda_event_timing: false
+        support_threshold:
+          bg: 1.0e-3
+          distant: 1.0e-3
+          rigid: 1.0e-3
+        eps: 1.0e-6
+      gather_aux_interval: 100
+      parent:
+        type: legacy_direct_lift
+        feature_source: features_2d
+      child_gather:
+        type: support_center
+        num_taps: 1
+        chunk_size: 65536
+        fixed_center_chunk_size: 65536
+        center_by_parent: true
+        valid_row_filter: true
+        detach_child_detail: false
+        train_child_detail_every_n: 1
+        backend: cuda
     parent_optimizer_mamba:
       enable: true
       event_dim: 64
       ctx_dim: 32
       model_dim: 32
-      state_dim: 8
+      state_dim: 16
       conv_kernel: 2
       read_every_repeat: true
       write_every_repeat: true
@@ -380,20 +319,6 @@ model:
         parent_scene_for_lifting: false
         parent_scene_for_cnn: false
         return_debug_stats: false
-      lifting:
-        type: fwhr
-        context_dim: 48
-        detail_dim: 8
-        backend: child_v4_raw_torch_aggregate
-        fused_cuda: false
-        hierarchical_fused_cuda: false
-        geometry_grad: false
-        parent_obs_mode: none
-        detail_support_min:
-          bg: 1.0e-3
-          distant: 1.0e-3
-          rigid: 1.0e-3
-        eps: 1.0e-6
       assignment:
         method: branch_aware_voxel_cap
         cache_scope: scene_segment_topology
@@ -456,7 +381,7 @@ model:
         mode: gaussian_relational
         rank: 4
         parent_event_dim: 64
-        fine_event_dim: 16
+        fine_event_dim: 32
         relation_dim: 12
         hidden_dim: 64
         num_layers: 2
@@ -501,7 +426,7 @@ model:
       event_dim: 64
       ctx_dim: 32
       model_dim: 32
-      state_dim: 8
+      state_dim: 16
       conv_kernel: 2
       adapter_hidden_dim: 64
       motion_embed_dim: 16
@@ -557,8 +482,9 @@ model:
       train_dinov2: false
       detach_v4_outputs: false
       detach_source_render_for_cnn: true
+      cnn_view_chunk_size: 12
     local_rollout:
-      source: scheduler_stage2_2
+      source: scheduler_stage3_0
       use_scheduler_inner_K: true
       local_G_no_detach_between_steps: true
       detach_persistent_state_at_block_start: true
@@ -606,8 +532,8 @@ model:
       input_event: true
       input_current_ctx: false
       input_vsm_ctx: false
-      hidden_dim: 32
-      event_dim: 16
+      hidden_dim: 48
+      event_dim: 32
       stage_hidden_dim: 0
       output_hidden: false
       output_confidence: false
@@ -696,7 +622,7 @@ optimizer:
   weight_decay: 1.0e-4
 
 training:
-  max_iterations: 3000010
+  max_iterations: 60010
   start_step: 0
   resume_checkpoint: ""
   iforward:
@@ -710,103 +636,7 @@ training:
     enable: true
     max_norm: 1.0
 
-validation_v8:
-  eval_enable: false
-
-validation_v9:
-  enable: false
-
-iforward_validation:
-  enable: false
-  modes: [full]
-  run_at_train_start: true
-  interval_steps: 5000
-  segments_per_scene: 1
-  rollouts_per_segment: 1
-  shape_eval_mode: independent_all
-  use_train_rollout_shapes: false
-  rollout_shapes:
-    - {name: b1_r4, blocks_per_rollout: 1, repeats_per_block: 4, prob: 1.0}
-    - {name: b1_r8, blocks_per_rollout: 1, repeats_per_block: 8, prob: 1.0}
-
-iforward_coverage_validation:
-  enable: false
-  run_at_train_start: true
-  interval_steps: 5000
-  seed: 20260620
-  segments_per_scene: 1
-  max_segments_total: 4
-  episode:
-    blocks_per_episode: 4
-    episode_stride: 4
-    allow_short_last_episode: false
-    min_blocks_per_episode: 4
-    reset_state_at_begin: true
-    carry_state_across_rollouts: true
-    block_source_frame_policy: random_within_keyframe_once_per_episode
-  rollout:
-    block_selection_policy: ordered_cyclic_start
-    tail_policy: circular_fill
-    start_offset: 0
-    detach_graph_after_rollout: true
-    max_inner_K: 8
-  shapes:
-    - {name: r8b1, blocks_per_rollout: 1, repeats_per_block: 8}
-    - {name: r4b2, blocks_per_rollout: 2, repeats_per_block: 4}
-    - {name: r2b4, blocks_per_rollout: 4, repeats_per_block: 2}
-  target_repeats_per_block: [8]
-  supervision:
-    current:
-      enable: true
-      role_name: final_current_recon
-      frame_policy: all_rollout_input_frames
-      camera_policy: all_cams
-    history_replay:
-      enable: true
-      role_name: final_history_replay
-      max_frames_per_rollout: 8
-      sampling_policy: previous_visited_blocks
-      exclude_current_blocks: true
-      camera_policy: all_cams
-    nearby:
-      enable: false
-  final_eval:
-    enable: true
-    attach_to_last_rollout: true
-    recon_all_blocks: true
-    nearby_nvs_all_blocks: false
-    roles_zero_loss: true
-    require_per_ref_psnr: true
-  tensorboard_images:
-    enable: true
-    max_images_per_role: 4
-
-iforward_sequence10_validation:
-  enable: false
-
-iforward_stage2_2_validation:
-  enable: false
-  run_at_train_start: true
-  interval_steps: 20000
-  seed: 20260623
-  segments_per_scene: 1
-  max_segments_total: 2
-  max_entries: 1
-  manifest_path: /root/autodl-tmp/outputs/iforward_stage2_2_stream10_rawframe/stage2_2_manifest_v2.json
-  modes: [full]
-  protocols:
-    - S10-D1-Causal
-    - S10-D2-Causal
-    - S10-I123-Causal
-    - S10-D1-Repair
-    - S10-D2-Repair
-    - Repeat Stability
-    - Order Robustness
-  tensorboard_images:
-    enable: true
-    max_images_per_role: 2
-
-validation_v3:
+scheduler_stage3_0_validation:
   enable: true
   run_at_train_start: true
   interval_steps: 20000
@@ -823,13 +653,13 @@ validation_v3:
 
 logging:
   output_root: /root/autodl-tmp/outputs
-  project: iforward_2_3_scheduler_v3_optimizer_mamba
+  project: iforward_stage3_0_full_train_30k_assim_30k_repair
   log_dir: null
   image_interval_blocks: 1000
   image_interval: 1000
   image_trigger:
     mode: raw_step_interval
-    interval_blocks_equiv: 20000
+    interval_blocks_equiv: 1000
   enable_jsonl_metrics: true
   metrics_history_append: true
   train_step_metrics_interval: 1009
