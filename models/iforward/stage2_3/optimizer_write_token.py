@@ -353,12 +353,20 @@ class OptimizerWriteTokenBuilder(nn.Module):
         token_dim: int,
         delta_summary_dim: int = 7,
         hidden_dim: int = 96,
+        include_spatial_event: bool = True,
+        include_parent_event: bool = True,
+        include_delta_summary: bool = True,
+        include_visit_embedding: bool = True,
     ) -> None:
         super().__init__()
         self.event_dim = int(event_dim)
         self.visit_dim = int(visit_dim)
         self.delta_summary_dim = int(delta_summary_dim)
         self.token_dim = int(token_dim)
+        self.include_spatial_event = bool(include_spatial_event)
+        self.include_parent_event = bool(include_parent_event)
+        self.include_delta_summary = bool(include_delta_summary)
+        self.include_visit_embedding = bool(include_visit_embedding)
         in_dim = int(event_dim) * 2 + int(visit_dim) + int(delta_summary_dim) + 2
         self.net = nn.Sequential(
             nn.Linear(in_dim, int(hidden_dim)),
@@ -391,16 +399,23 @@ class OptimizerWriteTokenBuilder(nn.Module):
         if spatial is None:
             return None
         rows = int(spatial.shape[0])
+        spatial_v = spatial if self.include_spatial_event else torch.zeros_like(spatial)
         fused_v = fused if fused is not None else spatial
+        if not self.include_parent_event:
+            fused_v = torch.zeros_like(spatial)
         if visit is None:
             visit_v = spatial.new_zeros((rows, self.visit_dim))
         elif int(visit.shape[0]) == 1:
             visit_v = visit.to(device=spatial.device, dtype=spatial.dtype).expand(rows, -1)
         else:
             visit_v = visit.to(device=spatial.device, dtype=spatial.dtype)
+        if not self.include_visit_embedding:
+            visit_v = torch.zeros_like(visit_v)
         support_v, valid_v = self._support_valid(support, valid, rows, spatial)
         delta_v = _branch_delta_summary(delta_branch, rows, ref=spatial)
-        return self.net(torch.cat([spatial, fused_v, visit_v, delta_v, support_v, valid_v], dim=-1))
+        if not self.include_delta_summary:
+            delta_v = torch.zeros_like(delta_v)
+        return self.net(torch.cat([spatial_v, fused_v, visit_v, delta_v, support_v, valid_v], dim=-1))
 
     def forward(
         self,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
@@ -8,30 +9,216 @@ import torch.nn as nn
 
 from models.streetforward.stage6_0.event_encoder import EventPack
 
-from models.iforward.mamba import StreamingMambaCell, StreamingMambaCellState
 from models.iforward.stage2_2.parent_temporal_keys_v2 import ParentTemporalKeysV2
 
 from .optimizer_memory_schema import (
-    DenseOptimizerState,
-    KeyedOptimizerState,
-    OptimizerBranchState,
-    ParentOptimizerMambaState,
+    DeltaKVOptimizerBranchState,
+    DenseDeltaKVOptimizerState,
+    KeyedDeltaKVOptimizerState,
+    ParentOptimizerDeltaKVState,
 )
 from .optimizer_visit_embedding import OptimizerVisitEmbedding, VISIT_KIND_TO_ID, VisitMeta
 from .optimizer_write_token import OptimizerWriteTokenBuilder
+from .parent_optimizer_mamba import ParentOptimizerPreview
+
+
+def rms(x: torch.Tensor, dim=-1, keepdim: bool = True, eps: float = 1.0e-6) -> torch.Tensor:
+    if int(x.numel()) == 0:
+        return torch.sqrt(torch.mean(x.float() * x.float(), dim=dim, keepdim=keepdim) + eps).to(dtype=x.dtype)
+    return torch.sqrt(torch.mean(x.float() * x.float(), dim=dim, keepdim=keepdim) + eps).to(dtype=x.dtype)
+
+
+def rms_unit(x: torch.Tensor, dim=-1, eps: float = 1.0e-6) -> torch.Tensor:
+    return x / rms(x, dim=dim, keepdim=True, eps=eps)
+
+
+def rms_clamp(x: torch.Tensor, max_rms: float, dims=(-1,), eps: float = 1.0e-6) -> torch.Tensor:
+    if float(max_rms) <= 0.0 or int(x.numel()) == 0:
+        return x
+    r = torch.sqrt(torch.mean(x.float() * x.float(), dim=dims, keepdim=True) + eps).to(dtype=x.dtype)
+    scale = torch.clamp(float(max_rms) / r.clamp_min(eps), max=1.0)
+    return x * scale
+
+
+def _rms_rows(x: torch.Tensor, dims=(-1,)) -> torch.Tensor:
+    if int(x.numel()) == 0:
+        return x.new_zeros((0,))
+    return torch.sqrt(torch.mean(x.float() * x.float(), dim=dims) + 1.0e-6).to(device=x.device)
+
+
+def _stats(prefix: str, values: torch.Tensor) -> Dict[str, float]:
+    if int(values.numel()) == 0:
+        return {f"{prefix}_mean": 0.0, f"{prefix}_max": 0.0}
+    detached = values.detach().float()
+    return {
+        f"{prefix}_mean": float(detached.mean().item()),
+        f"{prefix}_max": float(detached.max().item()),
+    }
 
 
 @dataclass
-class ParentOptimizerPreview:
-    event: EventPack
-    aux: Dict[str, Any]
+class DeltaKVCellState:
+    kv_state: torch.Tensor
+    seen: torch.Tensor
 
 
-def _empty_dense(cell: StreamingMambaCell, *, rows: int, device: torch.device, dtype: torch.dtype) -> DenseOptimizerState:
+class LowRankGatedDeltaKVCell(nn.Module):
+    def __init__(
+        self,
+        *,
+        event_dim: int,
+        token_dim: int,
+        key_dim: int = 16,
+        value_dim: int = 32,
+        hidden_dim: int = 64,
+        value_rms_max: float = 2.0,
+        ctx_rms_max: float = 4.0,
+        state_rms_max: float = 4.0,
+        erase_gate_max: float = 1.0,
+        write_gate_max: float = 1.0,
+        erase_bias: float = 0.0,
+        write_bias: float = 0.0,
+        decay_bias: float = 0.0,
+        decay_min: Optional[Dict[str, float] | float] = None,
+        query_rms_unit: bool = True,
+        key_rms_unit: bool = True,
+    ) -> None:
+        super().__init__()
+        self.event_dim = int(event_dim)
+        self.token_dim = int(token_dim)
+        self.key_dim = int(key_dim)
+        self.value_dim = int(value_dim)
+        self.value_rms_max = float(value_rms_max)
+        self.ctx_rms_max = float(ctx_rms_max)
+        self.state_rms_max = float(state_rms_max)
+        self.erase_gate_max = float(erase_gate_max)
+        self.write_gate_max = float(write_gate_max)
+        self.erase_bias = float(erase_bias)
+        self.write_bias = float(write_bias)
+        self.decay_bias = float(decay_bias)
+        self.query_rms_unit = bool(query_rms_unit)
+        self.key_rms_unit = bool(key_rms_unit)
+        if hasattr(decay_min, "items"):
+            self.decay_min_by_kind = {str(k): float(v) for k, v in dict(decay_min).items()}
+        elif decay_min is None:
+            self.decay_min_by_kind = {
+                "bootstrap": 1.0,
+                "assimilate": 0.98,
+                "assimilation": 0.98,
+                "repair": 1.0,
+                "repeat_stability": 1.0,
+                "stress": 1.0,
+            }
+        else:
+            self.decay_min_by_kind = {"default": float(decay_min)}
+
+        self.q_proj = nn.Linear(int(event_dim), self.key_dim)
+        self.key_proj = nn.Linear(int(token_dim), self.key_dim)
+        self.value_proj = nn.Linear(int(token_dim), self.value_dim)
+        self.erase_proj = nn.Linear(int(token_dim), self.key_dim)
+        self.write_proj = nn.Linear(int(token_dim), self.value_dim)
+        self.decay_proj = nn.Linear(int(token_dim), self.key_dim)
+
+        for module in (self.q_proj, self.key_proj, self.value_proj, self.erase_proj, self.write_proj, self.decay_proj):
+            nn.init.xavier_uniform_(module.weight)
+            nn.init.zeros_(module.bias)
+
+    def init_state(self, rows: int, *, device: torch.device, dtype: torch.dtype) -> DeltaKVCellState:
+        return DeltaKVCellState(
+            kv_state=torch.zeros((int(rows), self.key_dim, self.value_dim), device=device, dtype=dtype),
+            seen=torch.zeros((int(rows),), device=device, dtype=torch.bool),
+        )
+
+    def read(self, event: torch.Tensor, state: DeltaKVCellState) -> Tuple[torch.Tensor, Dict[str, float]]:
+        q_raw = self.q_proj(event)
+        q = (rms_unit(q_raw, dim=-1) if self.query_rms_unit else q_raw) / math.sqrt(float(self.key_dim))
+        ctx = torch.einsum("nkv,nk->nv", state.kv_state.to(device=event.device, dtype=event.dtype), q)
+        ctx = rms_clamp(ctx, self.ctx_rms_max, dims=(-1,))
+        seen = state.seen.to(device=event.device, dtype=torch.bool)
+        ctx = torch.where(seen[:, None], ctx, torch.zeros_like(ctx))
+        if not torch.isfinite(ctx).all():
+            raise RuntimeError("LowRankGatedDeltaKVCell read produced NaN/Inf")
+        aux = {}
+        aux.update(_stats("ctx_rms", _rms_rows(ctx, dims=(-1,))))
+        aux.update(_stats("query_rms", _rms_rows(q, dims=(-1,))))
+        return ctx, aux
+
+    @staticmethod
+    def _kind(visit_meta: Optional[VisitMeta | Dict[str, object] | object]) -> str:
+        if isinstance(visit_meta, VisitMeta):
+            return str(visit_meta.visit_kind)
+        if isinstance(visit_meta, dict):
+            return str(VisitMeta.from_mapping(visit_meta).visit_kind)
+        if visit_meta is not None:
+            return str(VisitMeta.from_step(visit_meta).visit_kind)
+        return "bootstrap"
+
+    def _decay_min(self, visit_meta: Optional[VisitMeta | Dict[str, object] | object]) -> float:
+        kind = self._kind(visit_meta)
+        return float(self.decay_min_by_kind.get(kind, self.decay_min_by_kind.get("default", 0.98)))
+
+    def write(
+        self,
+        token: torch.Tensor,
+        state: DeltaKVCellState,
+        write_mask: torch.Tensor,
+        *,
+        visit_meta: Optional[VisitMeta | Dict[str, object] | object] = None,
+    ) -> Tuple[DeltaKVCellState, Dict[str, float]]:
+        if int(token.shape[0]) == 0:
+            return state, {
+                "state_rms_mean": 0.0,
+                "state_rms_max": 0.0,
+                "key_rms_mean": 0.0,
+                "key_rms_max": 0.0,
+                "value_rms_mean": 0.0,
+                "value_rms_max": 0.0,
+                "erase_gate_mean": 0.0,
+                "erase_gate_max": 0.0,
+                "write_gate_mean": 0.0,
+                "write_gate_max": 0.0,
+                "decay_mean": 0.0,
+                "decay_max": 0.0,
+            }
+        s_old = state.kv_state.to(device=token.device, dtype=token.dtype)
+        seen_old = state.seen.to(device=token.device, dtype=torch.bool)
+        k_raw = self.key_proj(token)
+        k = (rms_unit(k_raw, dim=-1) if self.key_rms_unit else k_raw) / math.sqrt(float(self.key_dim))
+        v = rms_clamp(self.value_proj(token), self.value_rms_max, dims=(-1,))
+        erase = torch.sigmoid(self.erase_proj(token) + self.erase_bias) * float(self.erase_gate_max)
+        write = torch.sigmoid(self.write_proj(token) + self.write_bias) * float(self.write_gate_max)
+        decay_min = self._decay_min(visit_meta)
+        decay = float(decay_min) + (1.0 - float(decay_min)) * torch.sigmoid(self.decay_proj(token) + self.decay_bias)
+        s_decay = s_old * decay[:, :, None]
+        old = torch.einsum("nkv,nk->nv", s_decay, erase * k)
+        s_erased = s_decay - torch.einsum("nk,nv->nkv", k, old)
+        s_write = s_erased + torch.einsum("nk,nv->nkv", k, write * v)
+        s_new = rms_clamp(s_write, self.state_rms_max, dims=(-2, -1))
+        mask = write_mask.to(device=token.device, dtype=torch.bool)
+        kv_state = torch.where(mask[:, None, None], s_new, s_old)
+        seen = seen_old | mask
+        if not torch.isfinite(kv_state).all():
+            raise RuntimeError("LowRankGatedDeltaKVCell write produced NaN/Inf")
+        aux = {}
+        aux.update(_stats("state_rms", _rms_rows(kv_state, dims=(-2, -1))))
+        aux.update(_stats("key_rms", _rms_rows(k, dims=(-1,))))
+        aux.update(_stats("value_rms", _rms_rows(v, dims=(-1,))))
+        aux.update(_stats("erase_gate", erase.detach().float().mean(dim=-1)))
+        aux.update(_stats("write_gate", write.detach().float().mean(dim=-1)))
+        aux.update(_stats("decay", decay.detach().float().mean(dim=-1)))
+        return DeltaKVCellState(kv_state=kv_state, seen=seen), aux
+
+
+def _empty_delta_dense(
+    cell: LowRankGatedDeltaKVCell,
+    *,
+    rows: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> DenseDeltaKVOptimizerState:
     init = cell.init_state(int(rows), device=device, dtype=dtype)
-    return DenseOptimizerState(
-        conv_state=init.conv_state,
-        ssm_state=init.ssm_state,
+    return DenseDeltaKVOptimizerState(
+        kv_state=init.kv_state,
         seen=init.seen,
         update_count=torch.zeros((int(rows),), device=device, dtype=torch.long),
         last_visit_step=torch.full((int(rows),), -1, device=device, dtype=torch.long),
@@ -40,23 +227,22 @@ def _empty_dense(cell: StreamingMambaCell, *, rows: int, device: torch.device, d
     )
 
 
-def _ensure_dense(
-    cell: StreamingMambaCell,
-    state: Optional[DenseOptimizerState],
+def _ensure_delta_dense(
+    cell: LowRankGatedDeltaKVCell,
+    state: Optional[DenseDeltaKVOptimizerState],
     *,
     rows: int,
     device: torch.device,
     dtype: torch.dtype,
-) -> DenseOptimizerState:
+) -> DenseDeltaKVOptimizerState:
     if state is None:
-        return _empty_dense(cell, rows=int(rows), device=device, dtype=dtype)
+        return _empty_delta_dense(cell, rows=int(rows), device=device, dtype=dtype)
     base = state.to(device=device, dtype=dtype)
     if int(base.seen.numel()) >= int(rows):
         return base
-    extra = _empty_dense(cell, rows=int(rows) - int(base.seen.numel()), device=device, dtype=dtype)
-    return DenseOptimizerState(
-        conv_state=torch.cat([base.conv_state, extra.conv_state], dim=0),
-        ssm_state=torch.cat([base.ssm_state, extra.ssm_state], dim=0),
+    extra = _empty_delta_dense(cell, rows=int(rows) - int(base.seen.numel()), device=device, dtype=dtype)
+    return DenseDeltaKVOptimizerState(
+        kv_state=torch.cat([base.kv_state, extra.kv_state], dim=0),
         seen=torch.cat([base.seen, extra.seen], dim=0),
         update_count=torch.cat([base.update_count, extra.update_count], dim=0),
         last_visit_step=torch.cat([base.last_visit_step, extra.last_visit_step], dim=0),
@@ -65,12 +251,16 @@ def _ensure_dense(
     )
 
 
-def _empty_keyed(cell: StreamingMambaCell, *, device: torch.device, dtype: torch.dtype) -> KeyedOptimizerState:
+def _empty_delta_keyed(
+    cell: LowRankGatedDeltaKVCell,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> KeyedDeltaKVOptimizerState:
     init = cell.init_state(0, device=device, dtype=dtype)
-    return KeyedOptimizerState(
+    return KeyedDeltaKVOptimizerState(
         keys=torch.zeros((0,), device=device, dtype=torch.long),
-        conv_state=init.conv_state,
-        ssm_state=init.ssm_state,
+        kv_state=init.kv_state,
         seen=init.seen,
         update_count=torch.zeros((0,), device=device, dtype=torch.long),
         last_visit_step=torch.zeros((0,), device=device, dtype=torch.long),
@@ -79,14 +269,13 @@ def _empty_keyed(cell: StreamingMambaCell, *, device: torch.device, dtype: torch
     )
 
 
-def _sort_keyed(state: KeyedOptimizerState) -> KeyedOptimizerState:
+def _sort_delta_keyed(state: KeyedDeltaKVOptimizerState) -> KeyedDeltaKVOptimizerState:
     if int(state.keys.numel()) <= 1:
         return state
     keys, order = torch.sort(state.keys.to(dtype=torch.long))
-    return KeyedOptimizerState(
+    return KeyedDeltaKVOptimizerState(
         keys=keys,
-        conv_state=state.conv_state[order],
-        ssm_state=state.ssm_state[order],
+        kv_state=state.kv_state[order],
         seen=state.seen[order],
         update_count=state.update_count[order],
         last_visit_step=state.last_visit_step[order],
@@ -95,14 +284,14 @@ def _sort_keyed(state: KeyedOptimizerState) -> KeyedOptimizerState:
     )
 
 
-def _gather_keyed(
-    cell: StreamingMambaCell,
-    state: Optional[KeyedOptimizerState],
+def _gather_delta_keyed(
+    cell: LowRankGatedDeltaKVCell,
+    state: Optional[KeyedDeltaKVOptimizerState],
     keys: torch.Tensor,
     *,
     device: torch.device,
     dtype: torch.dtype,
-) -> Tuple[StreamingMambaCellState, Dict[str, torch.Tensor]]:
+) -> Tuple[DeltaKVCellState, Dict[str, torch.Tensor]]:
     gathered = cell.init_state(int(keys.numel()), device=device, dtype=dtype)
     meta = {
         "update_count": torch.zeros((int(keys.numel()),), device=device, dtype=torch.long),
@@ -122,8 +311,7 @@ def _gather_keyed(
     if int(dst.numel()) == 0:
         return gathered, meta
     src = safe[dst]
-    gathered.conv_state[dst] = base.conv_state[src]
-    gathered.ssm_state[dst] = base.ssm_state[src]
+    gathered.kv_state[dst] = base.kv_state[src]
     gathered.seen[dst] = base.seen[src]
     meta["update_count"][dst] = base.update_count[src]
     meta["last_visit_step"][dst] = base.last_visit_step[src]
@@ -132,21 +320,21 @@ def _gather_keyed(
     return gathered, meta
 
 
-def _scatter_keyed(
-    cell: StreamingMambaCell,
-    state: Optional[KeyedOptimizerState],
+def _scatter_delta_keyed(
+    cell: LowRankGatedDeltaKVCell,
+    state: Optional[KeyedDeltaKVOptimizerState],
     keys: torch.Tensor,
-    updated: StreamingMambaCellState,
+    updated: DeltaKVCellState,
     meta: Dict[str, torch.Tensor],
     *,
     write_mask: torch.Tensor,
     device: torch.device,
     dtype: torch.dtype,
-) -> Optional[KeyedOptimizerState]:
+) -> Optional[KeyedDeltaKVOptimizerState]:
     rows_mask = torch.nonzero(write_mask.to(device=device, dtype=torch.bool), as_tuple=False).squeeze(1)
     if int(rows_mask.numel()) == 0:
         return state
-    base = state.to(device=device, dtype=dtype) if state is not None else _empty_keyed(cell, device=device, dtype=dtype)
+    base = state.to(device=device, dtype=dtype) if state is not None else _empty_delta_keyed(cell, device=device, dtype=dtype)
     write_keys = keys.to(device=device, dtype=torch.long)[rows_mask]
     missing = write_keys
     if int(base.keys.numel()) > 0:
@@ -157,11 +345,10 @@ def _scatter_keyed(
         missing = write_keys[~hit0]
     if int(missing.numel()) > 0:
         init = cell.init_state(int(missing.numel()), device=device, dtype=dtype)
-        base = _sort_keyed(
-            KeyedOptimizerState(
+        base = _sort_delta_keyed(
+            KeyedDeltaKVOptimizerState(
                 keys=torch.cat([base.keys, missing], dim=0),
-                conv_state=torch.cat([base.conv_state, init.conv_state], dim=0),
-                ssm_state=torch.cat([base.ssm_state, init.ssm_state], dim=0),
+                kv_state=torch.cat([base.kv_state, init.kv_state], dim=0),
                 seen=torch.cat([base.seen, init.seen], dim=0),
                 update_count=torch.cat([base.update_count, torch.zeros((int(missing.numel()),), device=device, dtype=torch.long)], dim=0),
                 last_visit_step=torch.cat([base.last_visit_step, torch.full((int(missing.numel()),), -1, device=device, dtype=torch.long)], dim=0),
@@ -170,24 +357,21 @@ def _scatter_keyed(
             )
         )
     rows = torch.searchsorted(base.keys, write_keys)
-    conv = base.conv_state.clone()
-    ssm = base.ssm_state.clone()
+    kv_state = base.kv_state.clone()
     seen = base.seen.clone()
     update_count = base.update_count.clone()
     last_visit_step = base.last_visit_step.clone()
     last_frame_id = base.last_frame_id.clone()
     last_visit_kind = base.last_visit_kind.clone()
-    conv[rows] = updated.conv_state[rows_mask]
-    ssm[rows] = updated.ssm_state[rows_mask]
+    kv_state[rows] = updated.kv_state[rows_mask]
     seen[rows] = updated.seen[rows_mask]
     update_count[rows] = meta["update_count"][rows_mask]
     last_visit_step[rows] = meta["last_visit_step"][rows_mask]
     last_frame_id[rows] = meta["last_frame_id"][rows_mask]
     last_visit_kind[rows] = meta["last_visit_kind"][rows_mask]
-    return KeyedOptimizerState(
+    return KeyedDeltaKVOptimizerState(
         keys=base.keys,
-        conv_state=conv,
-        ssm_state=ssm,
+        kv_state=kv_state,
         seen=seen,
         update_count=update_count,
         last_visit_step=last_visit_step,
@@ -229,23 +413,34 @@ class _OptimizerAdapter(nn.Module):
         return self.net(x)
 
 
-class ParentOptimizerMamba(nn.Module):
-    state_cls = ParentOptimizerMambaState
+class ParentOptimizerGatedDeltaKV(nn.Module):
+    state_cls = ParentOptimizerDeltaKVState
 
     def __init__(
         self,
         *,
         event_dim: int = 64,
         ctx_dim: int = 32,
-        model_dim: int = 32,
-        state_dim: int = 8,
-        conv_kernel: int = 2,
+        token_dim: int = 64,
+        key_dim: int = 16,
+        value_dim: int = 32,
         adapter_hidden_dim: int = 64,
         visit_dim: int = 32,
         support_min: float = 0.001,
         dense_bg: bool = True,
         dense_distant: bool = True,
         gate_init: Optional[Dict[str, float]] = None,
+        value_rms_max: float = 2.0,
+        ctx_rms_max: float = 4.0,
+        state_rms_max: float = 4.0,
+        erase_gate_max: float = 1.0,
+        write_gate_max: float = 1.0,
+        erase_bias: float = 0.0,
+        write_bias: float = 0.0,
+        decay_bias: float = 0.0,
+        decay_min: Optional[Dict[str, float] | float] = None,
+        query_rms_unit: bool = True,
+        key_rms_unit: bool = True,
         include_spatial_event: bool = True,
         include_parent_event: bool = True,
         include_delta_summary: bool = True,
@@ -258,16 +453,26 @@ class ParentOptimizerMamba(nn.Module):
         self.support_min = float(support_min)
         self.dense_bg = bool(dense_bg)
         self.dense_distant = bool(dense_distant)
-        input_dim = int(event_dim) + int(visit_dim)
         self.visit_embedding = OptimizerVisitEmbedding(output_dim=int(visit_dim))
         self.cells = nn.ModuleDict(
             {
-                branch: StreamingMambaCell(
-                    input_dim=input_dim,
-                    model_dim=int(model_dim),
-                    state_dim=int(state_dim),
-                    conv_kernel=int(conv_kernel),
-                    output_dim=int(ctx_dim),
+                branch: LowRankGatedDeltaKVCell(
+                    event_dim=int(event_dim),
+                    token_dim=int(token_dim),
+                    key_dim=int(key_dim),
+                    value_dim=int(value_dim),
+                    hidden_dim=int(adapter_hidden_dim),
+                    value_rms_max=float(value_rms_max),
+                    ctx_rms_max=float(ctx_rms_max),
+                    state_rms_max=float(state_rms_max),
+                    erase_gate_max=float(erase_gate_max),
+                    write_gate_max=float(write_gate_max),
+                    erase_bias=float(erase_bias),
+                    write_bias=float(write_bias),
+                    decay_bias=float(decay_bias),
+                    decay_min=decay_min,
+                    query_rms_unit=bool(query_rms_unit),
+                    key_rms_unit=bool(key_rms_unit),
                 )
                 for branch in ("bg", "distant", "rigid")
             }
@@ -281,7 +486,7 @@ class ParentOptimizerMamba(nn.Module):
         self.write_builder = OptimizerWriteTokenBuilder(
             event_dim=int(event_dim),
             visit_dim=int(visit_dim),
-            token_dim=int(event_dim),
+            token_dim=int(token_dim),
             hidden_dim=int(adapter_hidden_dim),
             include_spatial_event=bool(include_spatial_event),
             include_parent_event=bool(include_parent_event),
@@ -298,35 +503,30 @@ class ParentOptimizerMamba(nn.Module):
                     self.visit_gate_raw[int(VISIT_KIND_TO_ID[str(kind)])] = torch.logit(torch.tensor(p))
 
     @staticmethod
-    def empty_state() -> ParentOptimizerMambaState:
-        return ParentOptimizerMambaState.empty()
+    def empty_state() -> ParentOptimizerDeltaKVState:
+        return ParentOptimizerDeltaKVState.empty()
 
     def _visit(self, meta: Optional[VisitMeta | Dict[str, object] | object], *, ref: torch.Tensor, rows: int) -> torch.Tensor:
         return self.visit_embedding(meta, ref=ref, rows=int(rows))
-
-    def _token(self, x: torch.Tensor, visit: torch.Tensor) -> torch.Tensor:
-        return torch.cat([x, visit.to(device=x.device, dtype=x.dtype)], dim=-1)
 
     def _preview_dense(
         self,
         *,
         branch: str,
         x: torch.Tensor,
-        state: Optional[OptimizerBranchState],
+        state: Optional[DeltaKVOptimizerBranchState],
         visit_meta: Optional[VisitMeta | Dict[str, object] | object],
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, float]]:
         cell = self.cells[str(branch)]
-        base = _ensure_dense(cell, None if state is None else state.dense, rows=int(x.shape[0]), device=x.device, dtype=x.dtype)
+        base = _ensure_delta_dense(cell, None if state is None else state.dense, rows=int(x.shape[0]), device=x.device, dtype=x.dtype)
         seen = base.seen[: int(x.shape[0])].to(device=x.device, dtype=torch.bool)
         visit = self._visit(visit_meta, ref=x, rows=int(x.shape[0]))
-        cell_state = StreamingMambaCellState(
-            conv_state=base.conv_state[: int(x.shape[0])],
-            ssm_state=base.ssm_state[: int(x.shape[0])],
+        cell_state = DeltaKVCellState(
+            kv_state=base.kv_state[: int(x.shape[0])],
             seen=seen,
         )
-        out, _ = cell(self._token(x, visit), cell_state, write_mask=torch.zeros((int(x.shape[0]),), device=x.device, dtype=torch.bool))
-        out = torch.where(seen[:, None], out, torch.zeros_like(out))
-        return out, seen, visit
+        out, aux = cell.read(x, cell_state)
+        return out, seen, visit, aux
 
     def _preview_keyed(
         self,
@@ -334,20 +534,24 @@ class ParentOptimizerMamba(nn.Module):
         branch: str,
         x: torch.Tensor,
         keys: torch.Tensor,
-        state: Optional[OptimizerBranchState],
+        state: Optional[DeltaKVOptimizerBranchState],
         support: Optional[torch.Tensor],
         visit_meta: Optional[VisitMeta | Dict[str, object] | object],
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, float]]:
         if int(x.shape[0]) == 0:
-            return x.new_zeros((0, self.ctx_dim)), x.new_zeros((0,), dtype=torch.bool), x.new_zeros((0, self.visit_dim))
+            return (
+                x.new_zeros((0, self.ctx_dim)),
+                x.new_zeros((0,), dtype=torch.bool),
+                x.new_zeros((0, self.visit_dim)),
+                {"ctx_rms_mean": 0.0, "ctx_rms_max": 0.0, "query_rms_mean": 0.0, "query_rms_max": 0.0},
+            )
         cell = self.cells[str(branch)]
         keys_u, inverse, x_u = _weighted_aggregate(x, keys.to(device=x.device, dtype=torch.long), support=support)
-        cell_state, _ = _gather_keyed(cell, None if state is None else state.keyed, keys_u, device=x.device, dtype=x.dtype)
+        cell_state, _ = _gather_delta_keyed(cell, None if state is None else state.keyed, keys_u, device=x.device, dtype=x.dtype)
         seen_u = cell_state.seen.to(device=x.device, dtype=torch.bool)
         visit_u = self._visit(visit_meta, ref=x_u, rows=int(keys_u.numel()))
-        out_u, _ = cell(self._token(x_u, visit_u), cell_state, write_mask=torch.zeros((int(keys_u.numel()),), device=x.device, dtype=torch.bool))
-        out_u = torch.where(seen_u[:, None], out_u, torch.zeros_like(out_u))
-        return out_u.index_select(0, inverse), seen_u.index_select(0, inverse), visit_u.index_select(0, inverse)
+        out_u, aux = cell.read(x_u, cell_state)
+        return out_u.index_select(0, inverse), seen_u.index_select(0, inverse), visit_u.index_select(0, inverse), aux
 
     def _branch_preview(
         self,
@@ -355,17 +559,17 @@ class ParentOptimizerMamba(nn.Module):
         branch: str,
         x: Optional[torch.Tensor],
         keys: Optional[torch.Tensor],
-        branch_state: Optional[OptimizerBranchState],
+        branch_state: Optional[DeltaKVOptimizerBranchState],
         dense: bool,
         support: Optional[torch.Tensor],
         visit_meta: Optional[VisitMeta | Dict[str, object] | object],
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Dict[str, float]]:
         if x is None:
-            return None, None, None
+            return None, None, None, {}
         if dense:
             return self._preview_dense(branch=branch, x=x, state=branch_state, visit_meta=visit_meta)
         if keys is None:
-            raise ValueError(f"ParentOptimizerMamba {branch} preview requires keys")
+            raise ValueError(f"ParentOptimizerGatedDeltaKV {branch} preview requires keys")
         return self._preview_keyed(
             branch=branch,
             x=x,
@@ -407,20 +611,20 @@ class ParentOptimizerMamba(nn.Module):
         contribution = torch.where(seen.to(device=event.device, dtype=torch.bool)[:, None], contribution, torch.zeros_like(contribution))
         out = event + contribution
         if not torch.isfinite(out).all():
-            raise RuntimeError(f"ParentOptimizerMamba fused {branch} event contains NaN/Inf")
+            raise RuntimeError(f"ParentOptimizerGatedDeltaKV fused {branch} event contains NaN/Inf")
         return out
 
     def preview(
         self,
         *,
         event: EventPack,
-        state: Optional[ParentOptimizerMambaState],
+        state: Optional[ParentOptimizerDeltaKVState],
         keys: ParentTemporalKeysV2,
         visit_meta: Optional[VisitMeta | Dict[str, object] | object] = None,
         **_: Any,
     ) -> ParentOptimizerPreview:
-        state = state if state is not None else ParentOptimizerMambaState.empty()
-        ctx_bg, seen_bg, visit_bg = self._branch_preview(
+        state = state if state is not None else ParentOptimizerDeltaKVState.empty()
+        ctx_bg, seen_bg, visit_bg, aux_bg = self._branch_preview(
             branch="bg",
             x=event.event_bg,
             keys=keys.bg,
@@ -429,7 +633,7 @@ class ParentOptimizerMamba(nn.Module):
             support=event.support_bg,
             visit_meta=visit_meta,
         )
-        ctx_distant, seen_distant, visit_distant = self._branch_preview(
+        ctx_distant, seen_distant, visit_distant, aux_distant = self._branch_preview(
             branch="distant",
             x=event.event_distant,
             keys=keys.distant,
@@ -438,7 +642,7 @@ class ParentOptimizerMamba(nn.Module):
             support=event.support_distant,
             visit_meta=visit_meta,
         )
-        ctx_rigid, seen_rigid, visit_rigid = self._branch_preview(
+        ctx_rigid, seen_rigid, visit_rigid, aux_rigid = self._branch_preview(
             branch="rigid",
             x=event.event_rigid,
             keys=keys.rigid,
@@ -447,6 +651,7 @@ class ParentOptimizerMamba(nn.Module):
             support=event.support_rigid,
             visit_meta=visit_meta,
         )
+        _ = (visit_bg, visit_distant, visit_rigid)
         fused = EventPack(
             event_bg=self._fuse(branch="bg", event=event.event_bg, ctx=ctx_bg, seen=seen_bg, support=event.support_bg, visit_meta=visit_meta),
             event_distant=self._fuse(
@@ -483,13 +688,20 @@ class ParentOptimizerMamba(nn.Module):
         aux = dict(event.aux or {})
         for name, seen in (("bg", seen_bg), ("distant", seen_distant), ("rigid", seen_rigid)):
             if seen is not None:
+                aux[f"iforward/parent_optimizer_gdkv/{name}_preview_seen_ratio"] = (
+                    float(seen.detach().float().mean().item()) if int(seen.numel()) else 0.0
+                )
                 aux[f"iforward/parent_optimizer_mamba/{name}_preview_seen_ratio"] = (
                     float(seen.detach().float().mean().item()) if int(seen.numel()) else 0.0
                 )
+        for branch, branch_aux in (("bg", aux_bg), ("distant", aux_distant), ("rigid", aux_rigid)):
+            for key, value in branch_aux.items():
+                aux[f"iforward/parent_optimizer_gdkv/{branch}_{key}"] = float(value)
+        aux["iforward/parent_optimizer_gdkv/read"] = 1.0
         aux["iforward/parent_optimizer_mamba/read"] = 1.0
-        aux["iforward/parent_optimizer_memory/type_id"] = 0.0
-        aux["iforward/parent_optimizer_memory/is_gdkv"] = 0.0
-        aux["iforward/parent_optimizer_memory/legacy_mamba_alias"] = 0.0
+        aux["iforward/parent_optimizer_memory/type_id"] = 1.0
+        aux["iforward/parent_optimizer_memory/is_gdkv"] = 1.0
+        aux["iforward/parent_optimizer_memory/legacy_mamba_alias"] = 1.0
         fused.aux = aux
         return ParentOptimizerPreview(event=fused, aux=aux)
 
@@ -508,6 +720,7 @@ class ParentOptimizerMamba(nn.Module):
 
     @staticmethod
     def _meta_values(visit_meta: Optional[VisitMeta | Dict[str, object] | object], *, device: torch.device) -> Dict[str, int]:
+        _ = device
         if isinstance(visit_meta, VisitMeta):
             meta = visit_meta
         elif isinstance(visit_meta, dict):
@@ -522,58 +735,66 @@ class ParentOptimizerMamba(nn.Module):
             "kind": int(VISIT_KIND_TO_ID.get(str(meta.visit_kind), 0)),
         }
 
+    @staticmethod
+    def _written_aux(prefix: str, branch: str, count: float, cell_aux: Optional[Dict[str, float]] = None) -> Dict[str, float]:
+        out = {
+            f"iforward/parent_optimizer_gdkv/{branch}_written": float(count),
+            f"iforward/parent_optimizer_mamba/{branch}_written": float(count),
+        }
+        for key, value in dict(cell_aux or {}).items():
+            out[f"iforward/parent_optimizer_gdkv/{branch}_{key}"] = float(value)
+        return out
+
     def _write_dense(
         self,
         *,
         branch: str,
         x: Optional[torch.Tensor],
-        branch_state: OptimizerBranchState,
+        branch_state: DeltaKVOptimizerBranchState,
         valid: Optional[torch.Tensor],
         support: Optional[torch.Tensor],
         visit_meta: Optional[VisitMeta | Dict[str, object] | object],
-    ) -> Tuple[OptimizerBranchState, Dict[str, float]]:
+    ) -> Tuple[DeltaKVOptimizerBranchState, Dict[str, float]]:
         if x is None:
-            return branch_state, {f"iforward/parent_optimizer_mamba/{branch}_written": 0.0}
+            return branch_state, self._written_aux("gdkv", branch, 0.0)
         write = self._valid_write_mask(x, valid, support)
         assert write is not None
         cell = self.cells[str(branch)]
-        base = _ensure_dense(cell, branch_state.dense, rows=int(x.shape[0]), device=x.device, dtype=x.dtype)
+        base = _ensure_delta_dense(cell, branch_state.dense, rows=int(x.shape[0]), device=x.device, dtype=x.dtype)
         old_seen = base.seen[: int(x.shape[0])].to(device=x.device, dtype=torch.bool)
-        visit = self._visit(visit_meta, ref=x, rows=int(x.shape[0]))
-        cell_state = StreamingMambaCellState(
-            conv_state=base.conv_state[: int(x.shape[0])],
-            ssm_state=base.ssm_state[: int(x.shape[0])],
+        cell_state = DeltaKVCellState(
+            kv_state=base.kv_state[: int(x.shape[0])],
             seen=old_seen,
         )
-        _, updated = cell(self._token(x, visit), cell_state, write_mask=write)
+        updated, cell_aux = cell.write(x, cell_state, write_mask=write, visit_meta=visit_meta)
         n = int(x.shape[0])
-        conv = base.conv_state.clone()
-        ssm = base.ssm_state.clone()
+        kv_state = base.kv_state.clone()
         seen = base.seen.clone()
         update_count = base.update_count.clone()
         last_visit_step = base.last_visit_step.clone()
         last_frame_id = base.last_frame_id.clone()
         last_visit_kind = base.last_visit_kind.clone()
-        conv[:n] = updated.conv_state
-        ssm[:n] = updated.ssm_state
+        kv_state[:n] = updated.kv_state
         seen[:n] = updated.seen
         meta = self._meta_values(visit_meta, device=x.device)
         update_count[:n] = torch.where(write, update_count[:n] + 1, update_count[:n])
         last_visit_step[:n] = torch.where(write, torch.full((n,), int(meta["visit_step"]), device=x.device, dtype=torch.long), last_visit_step[:n])
         last_frame_id[:n] = torch.where(write, torch.full((n,), int(meta["frame_id"]), device=x.device, dtype=torch.long), last_frame_id[:n])
         last_visit_kind[:n] = torch.where(write, torch.full((n,), int(meta["kind"]), device=x.device, dtype=torch.long), last_visit_kind[:n])
-        dense = DenseOptimizerState(
-            conv_state=conv,
-            ssm_state=ssm,
+        dense = DenseDeltaKVOptimizerState(
+            kv_state=kv_state,
             seen=seen,
             update_count=update_count,
             last_visit_step=last_visit_step,
             last_frame_id=last_frame_id,
             last_visit_kind=last_visit_kind,
         )
-        return OptimizerBranchState(dense=dense, keyed=branch_state.keyed), {
-            f"iforward/parent_optimizer_mamba/{branch}_written": float(write.detach().float().sum().item())
-        }
+        return DeltaKVOptimizerBranchState(dense=dense, keyed=branch_state.keyed), self._written_aux(
+            "gdkv",
+            branch,
+            float(write.detach().float().sum().item()),
+            cell_aux,
+        )
 
     def _write_keyed(
         self,
@@ -581,15 +802,15 @@ class ParentOptimizerMamba(nn.Module):
         branch: str,
         x: Optional[torch.Tensor],
         keys: Optional[torch.Tensor],
-        branch_state: OptimizerBranchState,
+        branch_state: DeltaKVOptimizerBranchState,
         valid: Optional[torch.Tensor],
         support: Optional[torch.Tensor],
         visit_meta: Optional[VisitMeta | Dict[str, object] | object],
-    ) -> Tuple[OptimizerBranchState, Dict[str, float]]:
+    ) -> Tuple[DeltaKVOptimizerBranchState, Dict[str, float]]:
         if x is None:
-            return branch_state, {f"iforward/parent_optimizer_mamba/{branch}_written": 0.0}
+            return branch_state, self._written_aux("gdkv", branch, 0.0)
         if keys is None:
-            raise ValueError(f"ParentOptimizerMamba {branch} write requires keys")
+            raise ValueError(f"ParentOptimizerGatedDeltaKV {branch} write requires keys")
         write = self._valid_write_mask(x, valid, support)
         assert write is not None
         keys_u, inverse, x_u = _weighted_aggregate(x, keys.to(device=x.device, dtype=torch.long), support=support)
@@ -597,9 +818,8 @@ class ParentOptimizerMamba(nn.Module):
         write_counts.index_add_(0, inverse, write.to(dtype=x.dtype))
         write_u = write_counts > 0
         cell = self.cells[str(branch)]
-        cell_state, meta_state = _gather_keyed(cell, branch_state.keyed, keys_u, device=x.device, dtype=x.dtype)
-        visit_u = self._visit(visit_meta, ref=x_u, rows=int(keys_u.numel()))
-        _, updated = cell(self._token(x_u, visit_u), cell_state, write_mask=write_u)
+        cell_state, meta_state = _gather_delta_keyed(cell, branch_state.keyed, keys_u, device=x.device, dtype=x.dtype)
+        updated, cell_aux = cell.write(x_u, cell_state, write_mask=write_u, visit_meta=visit_meta)
         meta_vals = self._meta_values(visit_meta, device=x.device)
         meta_state = {str(k): v.clone() for k, v in meta_state.items()}
         meta_state["update_count"] = torch.where(write_u, meta_state["update_count"] + 1, meta_state["update_count"])
@@ -618,7 +838,7 @@ class ParentOptimizerMamba(nn.Module):
             torch.full((int(keys_u.numel()),), int(meta_vals["kind"]), device=x.device, dtype=torch.long),
             meta_state["last_visit_kind"],
         )
-        keyed = _scatter_keyed(
+        keyed = _scatter_delta_keyed(
             cell,
             branch_state.keyed,
             keys_u,
@@ -628,9 +848,12 @@ class ParentOptimizerMamba(nn.Module):
             device=x.device,
             dtype=x.dtype,
         )
-        return OptimizerBranchState(dense=branch_state.dense, keyed=keyed), {
-            f"iforward/parent_optimizer_mamba/{branch}_written": float(write.detach().float().sum().item())
-        }
+        return DeltaKVOptimizerBranchState(dense=branch_state.dense, keyed=keyed), self._written_aux(
+            "gdkv",
+            branch,
+            float(write.detach().float().sum().item()),
+            cell_aux,
+        )
 
     def write(
         self,
@@ -638,13 +861,13 @@ class ParentOptimizerMamba(nn.Module):
         spatial_event: EventPack,
         fused_event: Optional[EventPack] = None,
         write_event: Optional[EventPack] = None,
-        state: Optional[ParentOptimizerMambaState],
+        state: Optional[ParentOptimizerDeltaKVState],
         keys: ParentTemporalKeysV2,
         visit_meta: Optional[VisitMeta | Dict[str, object] | object] = None,
         delta: Optional[object] = None,
         **_: Any,
-    ) -> Tuple[ParentOptimizerMambaState, Dict[str, float]]:
-        state = state if state is not None else ParentOptimizerMambaState.empty()
+    ) -> Tuple[ParentOptimizerDeltaKVState, Dict[str, float]]:
+        state = state if state is not None else ParentOptimizerDeltaKVState.empty()
         fused = fused_event if fused_event is not None else spatial_event
         if write_event is None:
             write_event = self.write_builder(
@@ -712,7 +935,7 @@ class ParentOptimizerMamba(nn.Module):
             support=write_event.support_rigid,
             visit_meta=visit_meta,
         )
-        next_state = ParentOptimizerMambaState(
+        next_state = ParentOptimizerDeltaKVState(
             bg=bg,
             distant=distant,
             rigid=rigid,
@@ -722,13 +945,22 @@ class ParentOptimizerMamba(nn.Module):
             **aux_bg,
             **aux_distant,
             **aux_rigid,
+            "iforward/parent_optimizer_gdkv/write": 1.0,
+            "iforward/parent_optimizer_gdkv/global_update_step": float(next_state.global_update_step),
             "iforward/parent_optimizer_mamba/write": 1.0,
             "iforward/parent_optimizer_mamba/global_update_step": float(next_state.global_update_step),
-            "iforward/parent_optimizer_memory/type_id": 0.0,
-            "iforward/parent_optimizer_memory/is_gdkv": 0.0,
-            "iforward/parent_optimizer_memory/legacy_mamba_alias": 0.0,
+            "iforward/parent_optimizer_memory/type_id": 1.0,
+            "iforward/parent_optimizer_memory/is_gdkv": 1.0,
+            "iforward/parent_optimizer_memory/legacy_mamba_alias": 1.0,
         }
         return next_state, aux
 
 
-__all__ = ["ParentOptimizerMamba", "ParentOptimizerPreview"]
+__all__ = [
+    "DeltaKVCellState",
+    "LowRankGatedDeltaKVCell",
+    "ParentOptimizerGatedDeltaKV",
+    "rms",
+    "rms_clamp",
+    "rms_unit",
+]

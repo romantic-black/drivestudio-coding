@@ -48,7 +48,7 @@ from models.iforward.stage3_0.losses import merge_stage3_reg_terms
 from models.iforward.stage3_0.sparse_grid_sample import prepare_value_nchw
 from models.iforward.versions import (
     STAGE3_0_SCALAR_ANCHOR_CHILD_SUPPORT_PARENT_LEGACY_VERSION,
-    is_stage3_0_iforward_version,
+    is_stage3_optimizer_memory_iforward_version,
 )
 from models.streetforward.minimal_trainer_stage4_0 import spatial_hw_from_image_tensor
 from models.streetforward.minimal_trainer_stage5_4 import MinimalStreetForwardStage5_4
@@ -450,7 +450,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "stage2_1_fwhr_parent_ptv3_temporal_mamba",
             "stage2_2_stream10_rawframe_temporal_mamba_v2",
             "iforward_2_3_optimizer_mamba",
-        } or is_stage3_0_iforward_version(ifwd_version)
+        } or is_stage3_optimizer_memory_iforward_version(ifwd_version)
         if bool(biggs_enabled):
             if bool(self._cfg_get(biggs_cfg, "enable", True)) is not True:
                 raise ValueError(f"{ifwd_version} requires model.iforward.biggs.enable=true")
@@ -462,7 +462,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 raise ValueError("stage2_0_biggs_parent_lifting requires adc_lite.enable=false")
             observe_cfg = self._cfg_get(biggs_cfg, "observe", {}) or {}
             lifting_cfg = self._cfg_get(biggs_cfg, "lifting", {}) or {}
-            stage3_enabled = is_stage3_0_iforward_version(ifwd_version)
+            stage3_enabled = is_stage3_optimizer_memory_iforward_version(ifwd_version)
             if bool(stage3_enabled):
                 stage3_lifting = self._cfg_get(iforward_cfg, "lifting", None)
                 if stage3_lifting is None:
@@ -522,7 +522,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "stage2_1_fwhr_parent_ptv3_temporal_mamba",
             "stage2_2_stream10_rawframe_temporal_mamba_v2",
             "iforward_2_3_optimizer_mamba",
-        } or is_stage3_0_iforward_version(ifwd_version)
+        } or is_stage3_optimizer_memory_iforward_version(ifwd_version)
         if bool(self._cfg_get(base_measurement, "require_obs_code", True)) is not True and not is_stage2_1_parent_temporal:
             raise ValueError("Stage6_0 Phase A requires V4 obs_code.")
         expected_obs_dim = 0 if is_stage2_1_parent_temporal else 2
@@ -639,12 +639,8 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             raise ValueError("Stage6_0 Phase A requires posterior_updater.input_current_ctx=false.")
         branch_scope = self._cfg_get(updater_cfg, "branch_scope", {}) or {}
         distant_scope = self._cfg_get(branch_scope, "distant", {}) or {}
-        if bool(self._cfg_get(distant_scope, "update_means", False)):
-            raise ValueError("Stage6_0 Phase A P0 requires distant update_means=false.")
-        if bool(self._cfg_get(distant_scope, "update_scales", False)):
-            raise ValueError("Stage6_0 Phase A P0 requires distant update_scales=false.")
         if bool(self._cfg_get(distant_scope, "update_quat", False)):
-            raise ValueError("Stage6_0 Phase A P0 requires distant update_quat=false.")
+            raise ValueError("Stage6_0 Phase A requires distant update_quat=false.")
 
     def _validate_stage6_0_phase_b_config(self, config) -> None:
         model_cfg = self._require_key(config, "model", "config")
@@ -1016,7 +1012,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "stage2_1_fwhr_parent_ptv3_temporal_mamba",
             "stage2_2_stream10_rawframe_temporal_mamba_v2",
             "iforward_2_3_optimizer_mamba",
-        } or is_stage3_0_iforward_version(ifwd_version)
+        } or is_stage3_optimizer_memory_iforward_version(ifwd_version)
         is_stage2_biggs = bool(is_stage2_biggs_version) and bool(self._cfg_get(biggs_cfg, "enable", True))
         self.stage6_phase = str(self._cfg_get(model_cfg, "phase", "phase_A_block_local_unroll"))
         stage6 = self._require_key(model_cfg, "stage6_0", "model")
@@ -1227,19 +1223,19 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "stage2_1_fwhr_parent_ptv3_temporal_mamba",
             "stage2_2_stream10_rawframe_temporal_mamba_v2",
             "iforward_2_3_optimizer_mamba",
-        } or is_stage3_0_iforward_version(ifwd_version)
+        } or is_stage3_optimizer_memory_iforward_version(ifwd_version)
         self.stage2_1_parent_temporal_enabled = ifwd_version in {
             "stage2_1_fwhr_parent_ptv3_temporal_mamba",
             "stage2_2_stream10_rawframe_temporal_mamba_v2",
             "iforward_2_3_optimizer_mamba",
-        } or is_stage3_0_iforward_version(ifwd_version)
+        } or is_stage3_optimizer_memory_iforward_version(ifwd_version)
         self.stage2_0_biggs_cfg = dict(biggs_cfg or {})
         self.stage2_0_biggs_assignment_cfg = self._cfg_get(biggs_cfg, "assignment", {}) or {}
         self.stage2_0_biggs_projector_cfg = self._cfg_get(biggs_cfg, "parent_projector", {}) or {}
         self.stage2_0_biggs_parent_state_cfg = self._cfg_get(biggs_cfg, "parent_state", {}) or {}
         self.stage2_0_biggs_observe_cfg = self._cfg_get(biggs_cfg, "observe", {}) or {}
         self.stage2_0_biggs_lifting_cfg = self._cfg_get(biggs_cfg, "lifting", {}) or {}
-        self.stage3_0_enabled = is_stage3_0_iforward_version(ifwd_version)
+        self.stage3_0_enabled = is_stage3_optimizer_memory_iforward_version(ifwd_version)
         self.stage3_0_lifting_cfg = self._cfg_get(iforward_cfg, "lifting", {}) or {}
         self.iforward_repair_training_cfg = self._cfg_get(iforward_cfg, "repair_training", {}) or {}
         self.stage3_0_gather_reg_terms: Dict[str, torch.Tensor] = {}

@@ -156,6 +156,17 @@ def test_stage3_full_train_config_uses_30k_assimilation_30k_repair_schedule() ->
     assert cfg.model.stage6_0.local_rollout.source == "scheduler_stage3_0"
     assert cfg.model.iforward.lifting.parent.type == "legacy_direct_lift"
     assert cfg.model.iforward.lifting.child_gather.type == "support_center"
+    distant_scope = cfg.model.stage6_0.posterior_updater.branch_scope.distant
+    assert distant_scope.update_means is True
+    assert distant_scope.update_scales is True
+    assert distant_scope.update_quat is False
+    distant_detail_gates = cfg.model.stage6_0.posterior_updater.appearance_detail.attribute_gates.distant
+    assert distant_detail_gates.means > 0.0
+    assert distant_detail_gates.scales > 0.0
+    distant_clamps = cfg.model.stage6_0.posterior_updater.branch_clamps.distant
+    assert distant_clamps.means_max_step_m > 0.0
+    assert distant_clamps.scales_log_max_step > 0.0
+    assert distant_clamps.quat_axis_angle_max_step_rad == 0.0
     assert "parent_query" not in cfg.model.iforward.lifting
     assert "parent_context" not in cfg.model.iforward.lifting
     assert "dino_native" not in cfg.model.iforward.lifting

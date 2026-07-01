@@ -49,10 +49,15 @@ from .stage2_2 import (
     history_damage_hinge_v2,
 )
 from .stage2_3 import (
+    DeltaKVOptimizerBranchState,
     DenseOptimizerState,
+    DenseDeltaKVOptimizerState,
     EpisodeHistoryBankV3,
     KeyedOptimizerState,
+    KeyedDeltaKVOptimizerState,
     OptimizerBranchState,
+    ParentOptimizerDeltaKVState,
+    ParentOptimizerGatedDeltaKV,
     ParentOptimizerMamba,
     ParentOptimizerMambaState,
     VisitMeta,
@@ -77,7 +82,7 @@ from .sequence10_history_bank import Sequence10HistoryBank, sequence10_damage_hi
 from .sequence10_resolver import IForwardSequence10Resolver
 from .state import IForwardMemoryState, IForwardShortWindowHistory, IForwardState
 from .utils import cfg_ensure_child, cfg_get, cfg_set, clone_config
-from .versions import is_stage3_0_iforward_version
+from .versions import is_stage3_1_iforward_version, is_stage3_optimizer_memory_iforward_version
 
 
 def _cfg_set_missing(node: Any, key: str, value: Any) -> None:
@@ -530,14 +535,15 @@ class IForwardModel(nn.Module):
         event_dim = int(getattr(self.bridge, "event_dim", 48))
         iforward_cfg = cfg_get(cfg_get(config, "model", {}) or {}, "iforward", {}) or {}
         self.iforward_version = str(cfg_get(iforward_cfg, "version", "v1"))
-        self.is_stage3_0_full_sparse_gather_lift = is_stage3_0_iforward_version(self.iforward_version)
+        self.is_stage3_1_lowrank_gdkv = is_stage3_1_iforward_version(self.iforward_version)
+        self.is_stage3_0_full_sparse_gather_lift = is_stage3_optimizer_memory_iforward_version(self.iforward_version)
         self.is_v3_gru_history_gate = self.iforward_version == "v3_gru_history_gate"
         self.is_v6_point_mamba_xcpe = self.iforward_version == "v6_point_mamba_xcpe"
         self.is_stage2_1_parent_temporal = self.iforward_version == "stage2_1_fwhr_parent_ptv3_temporal_mamba"
         self.is_stage2_2_parent_temporal = self.iforward_version == "stage2_2_stream10_rawframe_temporal_mamba_v2"
         self.is_stage2_3_optimizer_mamba = self.iforward_version in {
             "iforward_2_3_optimizer_mamba",
-        } or bool(self.is_stage3_0_full_sparse_gather_lift)
+        } or bool(is_stage3_optimizer_memory_iforward_version(self.iforward_version))
         self.is_stage2_0_biggs_parent_lifting = self.iforward_version in {
             "stage2_0_biggs_parent_lifting",
             "stage2_0_biggs_cuda_exact_diagonal_projector",
@@ -548,7 +554,7 @@ class IForwardModel(nn.Module):
             "stage2_1_fwhr_parent_ptv3_temporal_mamba",
             "stage2_2_stream10_rawframe_temporal_mamba_v2",
             "iforward_2_3_optimizer_mamba",
-        } or bool(self.is_stage3_0_full_sparse_gather_lift)
+        } or bool(is_stage3_optimizer_memory_iforward_version(self.iforward_version))
         self.history_safe_projection = None
         self.adc_lite_cfg = cfg_get(iforward_cfg, "adc_lite", {}) or {}
         self.adc_lite_enabled = bool(cfg_get(self.adc_lite_cfg, "enable", False))
@@ -765,7 +771,8 @@ class IForwardModel(nn.Module):
                 )
                 if self.is_stage2_3_optimizer_mamba:
                     parent_optimizer_cfg = (
-                        cfg_get(iforward_cfg, "parent_optimizer_mamba", None)
+                        cfg_get(iforward_cfg, "parent_optimizer_memory", None)
+                        or cfg_get(iforward_cfg, "parent_optimizer_mamba", None)
                         or cfg_get(iforward_cfg, "parent_temporal_mamba_v2", None)
                         or cfg_get(iforward_cfg, "parent_temporal_mamba", {})
                         or {}
@@ -773,7 +780,18 @@ class IForwardModel(nn.Module):
                     write_mask_cfg = cfg_get(parent_optimizer_cfg, "write_mask", {}) or {}
                     write_token_cfg = cfg_get(parent_optimizer_cfg, "write_token", {}) or {}
                     fusion_cfg = cfg_get(parent_optimizer_cfg, "fusion", {}) or {}
+                    memory_type = str(
+                        cfg_get(
+                            parent_optimizer_cfg,
+                            "type",
+                            "lowrank_gated_delta_kv" if bool(self.is_stage3_1_lowrank_gdkv) else "mamba",
+                        )
+                    ).lower()
                     self.stage2_3_include_delta_summary = bool(cfg_get(write_token_cfg, "include_delta_summary", True))
+                    include_spatial_event = bool(cfg_get(write_token_cfg, "include_spatial_event", True))
+                    include_parent_event = bool(cfg_get(write_token_cfg, "include_parent_event", True))
+                    include_delta_summary = bool(cfg_get(write_token_cfg, "include_delta_summary", True))
+                    include_visit_embedding = bool(cfg_get(write_token_cfg, "include_visit_embedding", True))
                     self.stage2_3_delta_summary_fail_fast = bool(
                         cfg_get(
                             write_token_cfg,
@@ -781,19 +799,54 @@ class IForwardModel(nn.Module):
                             cfg_get(parent_optimizer_cfg, "fail_fast", cfg_get(iforward_cfg, "fail_fast", True)),
                         )
                     )
-                    self.parent_temporal_mamba = ParentOptimizerMamba(
-                        event_dim=int(cfg_get(parent_optimizer_cfg, "event_dim", cfg_get(parent_spatial_cfg, "event_dim", 64))),
-                        ctx_dim=int(cfg_get(parent_optimizer_cfg, "ctx_dim", 32)),
-                        model_dim=int(cfg_get(parent_optimizer_cfg, "model_dim", 32)),
-                        state_dim=int(cfg_get(parent_optimizer_cfg, "state_dim", 8)),
-                        conv_kernel=int(cfg_get(parent_optimizer_cfg, "conv_kernel", 2)),
-                        adapter_hidden_dim=int(cfg_get(parent_optimizer_cfg, "adapter_hidden_dim", 64)),
-                        visit_dim=int(cfg_get(cfg_get(parent_optimizer_cfg, "visit_embedding", {}) or {}, "output_dim", 32)),
-                        support_min=float(cfg_get(write_mask_cfg, "support_min", 0.001)),
-                        dense_bg=bool(cfg_get(parent_optimizer_cfg, "dense_bg", True)),
-                        dense_distant=bool(cfg_get(parent_optimizer_cfg, "dense_distant", True)),
-                        gate_init=dict(cfg_get(fusion_cfg, "gate_init", {}) or {}),
-                    )
+                    if memory_type in {"lowrank_gated_delta_kv", "gated_delta_kv", "gdkv"}:
+                        gdkv_cfg = cfg_get(parent_optimizer_cfg, "gated_delta_kv", {}) or {}
+                        self.parent_temporal_mamba = ParentOptimizerGatedDeltaKV(
+                            event_dim=int(cfg_get(parent_optimizer_cfg, "event_dim", cfg_get(parent_spatial_cfg, "event_dim", 64))),
+                            ctx_dim=int(cfg_get(parent_optimizer_cfg, "ctx_dim", cfg_get(gdkv_cfg, "V", 32))),
+                            token_dim=int(cfg_get(parent_optimizer_cfg, "token_dim", cfg_get(parent_optimizer_cfg, "event_dim", 64))),
+                            key_dim=int(cfg_get(parent_optimizer_cfg, "key_dim", cfg_get(gdkv_cfg, "K", 16))),
+                            value_dim=int(cfg_get(parent_optimizer_cfg, "value_dim", cfg_get(gdkv_cfg, "V", 32))),
+                            adapter_hidden_dim=int(cfg_get(parent_optimizer_cfg, "adapter_hidden_dim", 64)),
+                            visit_dim=int(cfg_get(cfg_get(parent_optimizer_cfg, "visit_embedding", {}) or {}, "output_dim", 32)),
+                            support_min=float(cfg_get(write_mask_cfg, "support_min", 0.001)),
+                            dense_bg=bool(cfg_get(parent_optimizer_cfg, "dense_bg", True)),
+                            dense_distant=bool(cfg_get(parent_optimizer_cfg, "dense_distant", True)),
+                            gate_init=dict(cfg_get(fusion_cfg, "gate_init", {}) or {}),
+                            value_rms_max=float(cfg_get(gdkv_cfg, "value_rms_max", 2.0)),
+                            ctx_rms_max=float(cfg_get(gdkv_cfg, "ctx_rms_max", 4.0)),
+                            state_rms_max=float(cfg_get(gdkv_cfg, "state_rms_max", 4.0)),
+                            erase_gate_max=float(cfg_get(gdkv_cfg, "erase_gate_max", 1.0)),
+                            write_gate_max=float(cfg_get(gdkv_cfg, "write_gate_max", 1.0)),
+                            erase_bias=float(cfg_get(gdkv_cfg, "erase_bias", 0.0)),
+                            write_bias=float(cfg_get(gdkv_cfg, "write_bias", 0.0)),
+                            decay_bias=float(cfg_get(gdkv_cfg, "decay_bias", 0.0)),
+                            decay_min=cfg_get(gdkv_cfg, "decay_min", None),
+                            query_rms_unit=bool(cfg_get(gdkv_cfg, "query_rms_unit", True)),
+                            key_rms_unit=bool(cfg_get(gdkv_cfg, "key_rms_unit", True)),
+                            include_spatial_event=include_spatial_event,
+                            include_parent_event=include_parent_event,
+                            include_delta_summary=include_delta_summary,
+                            include_visit_embedding=include_visit_embedding,
+                        )
+                    else:
+                        self.parent_temporal_mamba = ParentOptimizerMamba(
+                            event_dim=int(cfg_get(parent_optimizer_cfg, "event_dim", cfg_get(parent_spatial_cfg, "event_dim", 64))),
+                            ctx_dim=int(cfg_get(parent_optimizer_cfg, "ctx_dim", 32)),
+                            model_dim=int(cfg_get(parent_optimizer_cfg, "model_dim", 32)),
+                            state_dim=int(cfg_get(parent_optimizer_cfg, "state_dim", 8)),
+                            conv_kernel=int(cfg_get(parent_optimizer_cfg, "conv_kernel", 2)),
+                            adapter_hidden_dim=int(cfg_get(parent_optimizer_cfg, "adapter_hidden_dim", 64)),
+                            visit_dim=int(cfg_get(cfg_get(parent_optimizer_cfg, "visit_embedding", {}) or {}, "output_dim", 32)),
+                            support_min=float(cfg_get(write_mask_cfg, "support_min", 0.001)),
+                            dense_bg=bool(cfg_get(parent_optimizer_cfg, "dense_bg", True)),
+                            dense_distant=bool(cfg_get(parent_optimizer_cfg, "dense_distant", True)),
+                            gate_init=dict(cfg_get(fusion_cfg, "gate_init", {}) or {}),
+                            include_spatial_event=include_spatial_event,
+                            include_parent_event=include_parent_event,
+                            include_delta_summary=include_delta_summary,
+                            include_visit_embedding=include_visit_embedding,
+                        )
                 elif self.is_stage2_2_parent_temporal:
                     parent_temporal_cfg = (
                         cfg_get(iforward_cfg, "parent_temporal_mamba_v2", None)
@@ -974,7 +1027,29 @@ class IForwardModel(nn.Module):
     ) -> bool:
         _ = (weights_only, path)
         if str(ckpt.get("export_type", "")) != "stage6_0_phase_a_for_phase_b":
-            return False
+            init_cfg = cfg_get(self.config, "initialization", {}) or {}
+            skip_keys = [str(x) for x in list(cfg_get(init_cfg, "skip_keys", []) or []) if str(x)]
+            sd = ckpt.get("model_state_dict")
+            if not skip_keys or not isinstance(sd, dict):
+                return False
+            filtered = {
+                str(k): v
+                for k, v in dict(sd).items()
+                if not any(str(k).startswith(prefix) or f".{prefix}" in str(k) for prefix in skip_keys)
+            }
+            missing, unexpected = self.load_state_dict(filtered, strict=False)
+
+            def _allowed(name: str) -> bool:
+                return any(str(name).startswith(prefix) or f".{prefix}" in str(name) for prefix in skip_keys)
+
+            bad_missing = [str(k) for k in missing if not _allowed(str(k))]
+            bad_unexpected = [str(k) for k in unexpected if not _allowed(str(k))]
+            if bad_missing or bad_unexpected:
+                raise ValueError(
+                    "IForward init_checkpoint skip_keys load failed: "
+                    f"missing={bad_missing[:20]} unexpected={bad_unexpected[:20]}"
+                )
+            return True
         runtime = getattr(self, "phase_a_runtime", None)
         loader = getattr(runtime, "_load_phase_b_export_payload", None)
         if not callable(loader):
@@ -998,7 +1073,9 @@ class IForwardModel(nn.Module):
         else:
             memory_state = IForwardMemoryState.empty()
         if self.is_stage2_3_optimizer_mamba:
-            parent_temporal = ParentOptimizerMambaState.empty()
+            parent_memory = getattr(self, "parent_temporal_mamba", None)
+            empty_state = getattr(parent_memory, "empty_state", None)
+            parent_temporal = empty_state() if callable(empty_state) else ParentOptimizerMambaState.empty()
         elif self.is_stage2_2_parent_temporal:
             parent_temporal = ParentTemporalStateV2.empty()
         elif self.is_stage2_1_parent_temporal:
@@ -1654,12 +1731,12 @@ class IForwardModel(nn.Module):
 
     @staticmethod
     def _shuffle_stage2_3_optimizer_state(
-        state: Optional[ParentOptimizerMambaState],
-    ) -> Optional[ParentOptimizerMambaState]:
+        state: Optional[ParentOptimizerMambaState | ParentOptimizerDeltaKVState],
+    ) -> Optional[ParentOptimizerMambaState | ParentOptimizerDeltaKVState]:
         if state is None:
             return None
 
-        def _shuffle_dense(dense: Optional[DenseOptimizerState]) -> Optional[DenseOptimizerState]:
+        def _shuffle_mamba_dense(dense: Optional[DenseOptimizerState]) -> Optional[DenseOptimizerState]:
             if dense is None or int(dense.seen.numel()) <= 1:
                 return dense
             order = torch.randperm(int(dense.seen.numel()), device=dense.seen.device)
@@ -1673,7 +1750,7 @@ class IForwardModel(nn.Module):
                 last_visit_kind=dense.last_visit_kind.index_select(0, order.to(device=dense.last_visit_kind.device)),
             )
 
-        def _shuffle_keyed(keyed: Optional[KeyedOptimizerState]) -> Optional[KeyedOptimizerState]:
+        def _shuffle_mamba_keyed(keyed: Optional[KeyedOptimizerState]) -> Optional[KeyedOptimizerState]:
             if keyed is None or int(keyed.keys.numel()) <= 1:
                 return keyed
             order = torch.randperm(int(keyed.keys.numel()), device=keyed.keys.device)
@@ -1688,13 +1765,51 @@ class IForwardModel(nn.Module):
                 last_visit_kind=keyed.last_visit_kind.index_select(0, order.to(device=keyed.last_visit_kind.device)),
             )
 
-        def _shuffle_branch(branch: OptimizerBranchState) -> OptimizerBranchState:
-            return OptimizerBranchState(dense=_shuffle_dense(branch.dense), keyed=_shuffle_keyed(branch.keyed))
+        def _shuffle_delta_dense(dense: Optional[DenseDeltaKVOptimizerState]) -> Optional[DenseDeltaKVOptimizerState]:
+            if dense is None or int(dense.seen.numel()) <= 1:
+                return dense
+            order = torch.randperm(int(dense.seen.numel()), device=dense.seen.device)
+            return DenseDeltaKVOptimizerState(
+                kv_state=dense.kv_state.index_select(0, order.to(device=dense.kv_state.device)),
+                seen=dense.seen.index_select(0, order),
+                update_count=dense.update_count.index_select(0, order.to(device=dense.update_count.device)),
+                last_visit_step=dense.last_visit_step.index_select(0, order.to(device=dense.last_visit_step.device)),
+                last_frame_id=dense.last_frame_id.index_select(0, order.to(device=dense.last_frame_id.device)),
+                last_visit_kind=dense.last_visit_kind.index_select(0, order.to(device=dense.last_visit_kind.device)),
+            )
+
+        def _shuffle_delta_keyed(keyed: Optional[KeyedDeltaKVOptimizerState]) -> Optional[KeyedDeltaKVOptimizerState]:
+            if keyed is None or int(keyed.keys.numel()) <= 1:
+                return keyed
+            order = torch.randperm(int(keyed.keys.numel()), device=keyed.keys.device)
+            return KeyedDeltaKVOptimizerState(
+                keys=keyed.keys,
+                kv_state=keyed.kv_state.index_select(0, order.to(device=keyed.kv_state.device)),
+                seen=keyed.seen.index_select(0, order.to(device=keyed.seen.device)),
+                update_count=keyed.update_count.index_select(0, order.to(device=keyed.update_count.device)),
+                last_visit_step=keyed.last_visit_step.index_select(0, order.to(device=keyed.last_visit_step.device)),
+                last_frame_id=keyed.last_frame_id.index_select(0, order.to(device=keyed.last_frame_id.device)),
+                last_visit_kind=keyed.last_visit_kind.index_select(0, order.to(device=keyed.last_visit_kind.device)),
+            )
+
+        if isinstance(state, ParentOptimizerDeltaKVState):
+            def _shuffle_delta_branch(branch: DeltaKVOptimizerBranchState) -> DeltaKVOptimizerBranchState:
+                return DeltaKVOptimizerBranchState(dense=_shuffle_delta_dense(branch.dense), keyed=_shuffle_delta_keyed(branch.keyed))
+
+            return ParentOptimizerDeltaKVState(
+                bg=_shuffle_delta_branch(state.bg),
+                distant=_shuffle_delta_branch(state.distant),
+                rigid=_shuffle_delta_branch(state.rigid),
+                global_update_step=int(state.global_update_step),
+            )
+
+        def _shuffle_mamba_branch(branch: OptimizerBranchState) -> OptimizerBranchState:
+            return OptimizerBranchState(dense=_shuffle_mamba_dense(branch.dense), keyed=_shuffle_mamba_keyed(branch.keyed))
 
         return ParentOptimizerMambaState(
-            bg=_shuffle_branch(state.bg),
-            distant=_shuffle_branch(state.distant),
-            rigid=_shuffle_branch(state.rigid),
+            bg=_shuffle_mamba_branch(state.bg),
+            distant=_shuffle_mamba_branch(state.distant),
+            rigid=_shuffle_mamba_branch(state.rigid),
             global_update_step=int(state.global_update_step),
         )
 
@@ -1822,9 +1937,13 @@ class IForwardModel(nn.Module):
         if self.is_stage2_2_parent_temporal and not isinstance(parent_temporal_state, ParentTemporalStateV2):
             parent_temporal_state = ParentTemporalStateV2.empty()
             state.parent_temporal = parent_temporal_state
-        if self.is_stage2_3_optimizer_mamba and not isinstance(parent_temporal_state, ParentOptimizerMambaState):
-            parent_temporal_state = ParentOptimizerMambaState.empty()
-            state.parent_temporal = parent_temporal_state
+        if self.is_stage2_3_optimizer_mamba:
+            parent_memory = getattr(self, "parent_temporal_mamba", None)
+            expected_cls = getattr(parent_memory, "state_cls", ParentOptimizerMambaState)
+            if not isinstance(parent_temporal_state, expected_cls):
+                empty_state = getattr(parent_memory, "empty_state", None)
+                parent_temporal_state = empty_state() if callable(empty_state) else ParentOptimizerMambaState.empty()
+                state.parent_temporal = parent_temporal_state
         history_ema = state.history_ema
         if self.is_v3_gru_history_gate:
             memory_state, history_ema = self._ensure_v3_state(
@@ -2116,6 +2235,15 @@ class IForwardModel(nn.Module):
                             if self.is_stage2_3_optimizer_mamba
                             else "iforward/parent_temporal/read_skipped"
                         ] = 1.0
+                        if bool(getattr(self, "is_stage3_1_lowrank_gdkv", False)):
+                            aux["iforward/parent_optimizer_gdkv/read_skipped"] = 1.0
+                            aux["iforward/parent_optimizer_memory/type_id"] = 1.0
+                            aux["iforward/parent_optimizer_memory/is_gdkv"] = 1.0
+                            aux["iforward/parent_optimizer_memory/legacy_mamba_alias"] = 1.0
+                        elif self.is_stage2_3_optimizer_mamba:
+                            aux["iforward/parent_optimizer_memory/type_id"] = 0.0
+                            aux["iforward/parent_optimizer_memory/is_gdkv"] = 0.0
+                            aux["iforward/parent_optimizer_memory/legacy_mamba_alias"] = 0.0
                         parent_event_for_decode.aux = aux
                     if self.is_stage2_3_optimizer_mamba:
                         stage2_1_parent_block_cache["optimizer_spatial_event"] = parent_event_spatial
@@ -2224,7 +2352,15 @@ class IForwardModel(nn.Module):
                         memory_aux = {
                             "iforward/stage2_3_parent_optimizer_mamba": 1.0,
                             "iforward/biggs/memory_noop": 1.0,
+                            "iforward/parent_optimizer_memory/type_id": 0.0,
+                            "iforward/parent_optimizer_memory/is_gdkv": 0.0,
+                            "iforward/parent_optimizer_memory/legacy_mamba_alias": 0.0,
                         }
+                        if bool(getattr(self, "is_stage3_1_lowrank_gdkv", False)):
+                            memory_aux["iforward/stage3_1_parent_optimizer_gdkv"] = 1.0
+                            memory_aux["iforward/parent_optimizer_memory/type_id"] = 1.0
+                            memory_aux["iforward/parent_optimizer_memory/is_gdkv"] = 1.0
+                            memory_aux["iforward/parent_optimizer_memory/legacy_mamba_alias"] = 1.0
                     elif self.is_stage2_2_parent_temporal:
                         memory_aux = {
                             "iforward/stage2_2_parent_temporal_memory_v2": 1.0,
@@ -2498,6 +2634,15 @@ class IForwardModel(nn.Module):
                         )
                     else:
                         update_aux["iforward/parent_optimizer_mamba/write_skipped"] = 1.0
+                        if bool(getattr(self, "is_stage3_1_lowrank_gdkv", False)):
+                            update_aux["iforward/parent_optimizer_gdkv/write_skipped"] = 1.0
+                            update_aux["iforward/parent_optimizer_memory/type_id"] = 1.0
+                            update_aux["iforward/parent_optimizer_memory/is_gdkv"] = 1.0
+                            update_aux["iforward/parent_optimizer_memory/legacy_mamba_alias"] = 1.0
+                        else:
+                            update_aux["iforward/parent_optimizer_memory/type_id"] = 0.0
+                            update_aux["iforward/parent_optimizer_memory/is_gdkv"] = 0.0
+                            update_aux["iforward/parent_optimizer_memory/legacy_mamba_alias"] = 0.0
                 if (self.is_stage2_1_parent_temporal or self.is_stage2_2_parent_temporal) and bool(is_block_exit):
                     parent_temporal = getattr(self, "parent_temporal_mamba", None)
                     commit_event = stage2_1_parent_block_cache.get("commit_event")

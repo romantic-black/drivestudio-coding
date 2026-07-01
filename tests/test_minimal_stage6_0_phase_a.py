@@ -510,8 +510,8 @@ def test_stage6_encode_update_clamps_bg_means_to_segment_aabb():
     model = _stage6_encode_update_test_model(detach_v4_outputs=True)
 
     class FixedUpdater(nn.Module):
-        def forward(self, *, event, ctx_current=None, ctx_vsm=None):
-            _ = ctx_current, ctx_vsm
+        def forward(self, *, event, ctx_current=None, ctx_vsm=None, appearance_detail=None, branch_scope=None):
+            _ = ctx_current, ctx_vsm, appearance_detail, branch_scope
             n = int(event.event_bg.shape[0])
             zeros3 = event.event_bg.new_zeros((n, 3))
             delta = BranchDelta(
@@ -843,7 +843,7 @@ def _validate_with_parent_noop(cfg, monkeypatch):
         (("model", "history_memory", "enable"), True),
         (("model", "update_gate", "enable"), True),
         (("model", "view_transient", "enable"), True),
-        (("model", "stage6_0", "posterior_updater", "branch_scope", "distant", "update_means"), True),
+        (("model", "stage6_0", "posterior_updater", "branch_scope", "distant", "update_quat"), True),
     ],
 )
 def test_stage6_config_validation_rejects_forbidden_phase_a_values(path, value, monkeypatch):
@@ -854,6 +854,15 @@ def test_stage6_config_validation_rejects_forbidden_phase_a_values(path, value, 
     node[path[-1]] = value
     with pytest.raises(ValueError):
         _validate_with_parent_noop(cfg, monkeypatch)
+
+
+def test_stage6_config_validation_accepts_distant_means_and_scales(monkeypatch):
+    cfg = _valid_stage6_config()
+    distant_scope = cfg["model"]["stage6_0"]["posterior_updater"]["branch_scope"]["distant"]
+    distant_scope["update_means"] = True
+    distant_scope["update_scales"] = True
+    distant_scope["update_quat"] = False
+    _validate_with_parent_noop(cfg, monkeypatch)
 
 
 def test_stage6_config_validation_rejects_scheduler_v8_runtime(monkeypatch):
@@ -981,6 +990,41 @@ def test_stage6_distant_branch_scope_freezes_geometry():
     assert masked.distant is not None
     assert torch.count_nonzero(masked.distant.means) == 0
     assert torch.count_nonzero(masked.distant.scales_log) == 0
+    assert torch.count_nonzero(masked.distant.quat_axis_angle) == 0
+    assert torch.count_nonzero(masked.distant.opacity_logit) > 0
+    assert torch.count_nonzero(masked.distant.sh) > 0
+
+
+def test_stage6_distant_branch_scope_allows_means_and_scales_when_enabled():
+    model = MinimalStreetForwardStage6_0.__new__(MinimalStreetForwardStage6_0)
+    model.stage6_branch_scope = {
+        "bg": {
+            "update_means": True,
+            "update_scales": True,
+            "update_quat": True,
+            "update_opacity": True,
+            "update_sh": True,
+        },
+        "distant": {
+            "update_means": True,
+            "update_scales": True,
+            "update_quat": False,
+            "update_opacity": True,
+            "update_sh": True,
+        },
+        "rigid": {
+            "update_means": True,
+            "update_scales": True,
+            "update_quat": True,
+            "update_opacity": True,
+            "update_sh": True,
+        },
+    }
+    delta = DeltaPack(bg=_branch_delta(), distant=_branch_delta(), rigid=_branch_delta())
+    masked = MinimalStreetForwardStage6_0._apply_branch_scope(model, delta)
+    assert masked.distant is not None
+    assert torch.count_nonzero(masked.distant.means) > 0
+    assert torch.count_nonzero(masked.distant.scales_log) > 0
     assert torch.count_nonzero(masked.distant.quat_axis_angle) == 0
     assert torch.count_nonzero(masked.distant.opacity_logit) > 0
     assert torch.count_nonzero(masked.distant.sh) > 0

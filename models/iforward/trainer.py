@@ -10,7 +10,7 @@ import torch.nn as nn
 from .model import IForwardModel, IForwardRolloutOutput
 from .state import IForwardState
 from .utils import cfg_get
-from .versions import is_stage3_0_iforward_version
+from .versions import is_stage3_optimizer_memory_iforward_version
 
 
 class IForwardTrainer(nn.Module):
@@ -116,7 +116,7 @@ class IForwardTrainer(nn.Module):
             "stage2_1_fwhr_parent_ptv3_temporal_mamba",
             "stage2_2_stream10_rawframe_temporal_mamba_v2",
             "iforward_2_3_optimizer_mamba",
-        } or is_stage3_0_iforward_version(cfg_get(iforward_cfg, "version", ""))
+        } or is_stage3_optimizer_memory_iforward_version(cfg_get(iforward_cfg, "version", ""))
 
     def _is_stage2_1_parent_temporal(self) -> bool:
         if (
@@ -131,7 +131,7 @@ class IForwardTrainer(nn.Module):
             "stage2_1_fwhr_parent_ptv3_temporal_mamba",
             "stage2_2_stream10_rawframe_temporal_mamba_v2",
             "iforward_2_3_optimizer_mamba",
-        } or is_stage3_0_iforward_version(cfg_get(iforward_cfg, "version", ""))
+        } or is_stage3_optimizer_memory_iforward_version(cfg_get(iforward_cfg, "version", ""))
 
     def _is_v3_gru_history_gate(self) -> bool:
         if bool(getattr(self.model, "is_v3_gru_history_gate", False)):
@@ -488,6 +488,17 @@ class IForwardTrainer(nn.Module):
             metrics[f"iforward/optimizer/{name}/param_count"] = float(self._param_count(params))
             metrics[f"iforward/optimizer/{name}/trainable_param_count"] = float(self._trainable_param_count(params))
             metrics[f"iforward/grad/{name}"] = float(grad_norm.detach().item())
+            if bool(getattr(self.model, "is_stage3_1_lowrank_gdkv", False)):
+                alias = None
+                if name == "parent_temporal_mamba":
+                    alias = "parent_optimizer_gdkv_core"
+                elif name == "parent_temporal_adapter":
+                    alias = "parent_optimizer_gdkv_adapter"
+                if alias is not None:
+                    metrics[f"iforward/optimizer/{alias}/lr"] = float(group.get("lr", 0.0))
+                    metrics[f"iforward/optimizer/{alias}/param_count"] = float(self._param_count(params))
+                    metrics[f"iforward/optimizer/{alias}/trainable_param_count"] = float(self._trainable_param_count(params))
+                    metrics[f"iforward/grad/{alias}"] = float(grad_norm.detach().item())
         return metrics
 
     def _adapter_metrics(self) -> Dict[str, float]:

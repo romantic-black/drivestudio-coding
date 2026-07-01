@@ -43,7 +43,7 @@ from datasets.iforward_stage2_3.validation_runner import (
 from datasets.train_scheduler_iforward import TrainSchedulerIForward
 from datasets.train_scheduler_iforward_sequence10 import TrainSchedulerIForwardSequence10
 from models.iforward import IForwardTrainer
-from models.iforward.versions import is_stage3_0_iforward_version
+from models.iforward.versions import is_stage3_optimizer_memory_iforward_version
 from tools.train_minimal_streetforward_stage4_3_iforward_common import (
     build_multi_scene_dataset_v4,
     build_train_scheduler_iforward_from_cfg,
@@ -366,7 +366,7 @@ def _is_stage2_3_scheduler_cfg(cfg: Any) -> bool:
         and str(_cfg_get(sched, "version", "")) in {"optimizer_sequence_v1", "stage3_0_optimizer_sequence_v1"}
         and (
             str(_cfg_get(iforward_cfg, "version", "")) == "iforward_2_3_optimizer_mamba"
-            or is_stage3_0_iforward_version(_cfg_get(iforward_cfg, "version", ""))
+            or is_stage3_optimizer_memory_iforward_version(_cfg_get(iforward_cfg, "version", ""))
         )
     )
 
