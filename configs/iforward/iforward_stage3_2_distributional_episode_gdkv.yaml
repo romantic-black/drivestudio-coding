@@ -1,7 +1,11 @@
-output_name: iforward_stage3_0_full_train_30k_assim_30k_repair
-# IForward Stage 3_0 full training: 30k assimilation-only, then repair-enabled.
+output_name: iforward_stage3_2_distributional_episode_gdkv
+# IForward Stage 3_2: distributional episode scheduler for low-rank Gated Delta KV.
 
 initialization:
+  skip_keys:
+    - parent_temporal_mamba
+    - parent_optimizer_mamba
+    - parent_optimizer_memory
   phase_b_from_phase_a:
     enable: false
     checkpoint: ""
@@ -156,19 +160,16 @@ scheduler_stage3_0:
       6: 0.25
       8: 0.25
     rollout_options:
-      B6R1: 0.15
-      B4R2: 0.15
-      B8R1: 0.15
-      B4R3: 0.15
-      B6R2: 0.10
-      B12R1: 0.10
-      B8R2: 0.10
-      B16R1: 0.10
+      B6R1: 0.2
+      B4R2: 0.2
+      B8R1: 0.2
+      B4R3: 0.2
+      B6R2: 0.2
     random_order: true
     mamba_read: true
     mamba_write: true
     last_update_write: false
-    max_inner_k: 16
+    max_inner_k: 12
   producer:
     enable: true
     queue_depth: 1
@@ -176,21 +177,148 @@ scheduler_stage3_0:
     preload_next_episode: true
     episode_pinned_cache: true
 
+scheduler_stage3_2:
+  enable: true
+  version: stage3_2_distributional_episode_v1
+  inherit_from: scheduler_stage3_0
+  fail_fast: true
+  distributions:
+    repeat_refine:
+      enable: true
+      b_choices:
+        1: 0.55
+        2: 0.45
+      k_budget:
+        2: 0.10
+        4: 0.30
+        6: 0.30
+        8: 0.20
+        10: 0.10
+      order:
+        local: 0.70
+        chronological: 0.30
+      phase: assimilation
+      visit_kind: assimilation
+    shuffled_coverage:
+      enable: true
+      b_choices:
+        3: 0.20
+        4: 0.35
+        6: 0.30
+        8: 0.15
+      r_choices:
+        1: 0.70
+        2: 0.30
+      order:
+        local_shuffle: 0.35
+        stratified_shuffle: 0.50
+        global_shuffle: 0.15
+      phase: assimilation
+      visit_kind: assimilation
+    high_block_repair:
+      enable: true
+      b_choices:
+        6: 0.25
+        8: 0.35
+        10: 0.25
+        12: 0.15
+      r_choices:
+        1: 0.75
+        2: 0.25
+        3: 0.00
+      candidate_policy: visited_preferred
+      phase: repair
+      visit_kind: repair
+      last_update_write: false
+  curriculum:
+    - name: warmup
+      start_step: 0
+      end_step: 5000
+      sequence_target_frames: 10
+      min_frames: 10
+      allow_short: false
+      weights:
+        repeat_refine: 0.35
+        shuffled_coverage: 0.55
+        high_block_repair: 0.10
+      max_k:
+        train_2d:
+          repeat_refine: 8
+          shuffled_coverage: 8
+          high_block_repair: 8
+        frozen_2d:
+          repeat_refine: 12
+          shuffled_coverage: 12
+          high_block_repair: 12
+    - name: main
+      start_step: 5000
+      end_step: 30000
+      sequence_target_frames: 16
+      min_frames: 10
+      allow_short: true
+      weights:
+        repeat_refine: 0.20
+        shuffled_coverage: 0.55
+        high_block_repair: 0.25
+      max_k:
+        train_2d:
+          repeat_refine: 8
+          shuffled_coverage: 10
+          high_block_repair: 12
+        frozen_2d:
+          repeat_refine: 12
+          shuffled_coverage: 16
+          high_block_repair: 16
+    - name: hardening
+      start_step: 30000
+      end_step: 60010
+      sequence_target_frames: 24
+      min_frames: 8
+      allow_short: true
+      weights:
+        repeat_refine: 0.10
+        shuffled_coverage: 0.40
+        high_block_repair: 0.50
+      max_k:
+        train_2d:
+          repeat_refine: 8
+          shuffled_coverage: 10
+          high_block_repair: 12
+        frozen_2d:
+          repeat_refine: 12
+          shuffled_coverage: 16
+          high_block_repair: 20
+  episode_recipe:
+    prelude:
+      order_policy: mixed_random
+      min_rollouts: 2
+      max_rollouts: 8
+      cover_target_ratio: 0.65
+    repair_tail:
+      min_rollouts: 0
+      max_rollouts: 4
+      candidate_policy: visited_preferred
+    train_2d_policy:
+      repeat_refine: trainable
+      shuffled_coverage: trainable
+      high_block_repair: frozen_no_grad
+
 model:
   stage: "6_0"
   phase: "phase_A_block_local_unroll"
   backprojector_version: "v4"
+  allow_missing_legacy_sparse_conv: true
   scale_init_value: 0.1
   sh_degree: 1
   voxel_size: 0.2
   sparseConv_outdim: 64
-  feat_2d_channels: 48
+  feat_2d_channels: 32
   feat_2d_downscale: 1
   feature_extractor:
     type: fwhr_dinov2_residual
     residual_unet:
       in_channels: 6
-      feat_channels: 32
+      feat_channels: 16
       base_channels: 48
       feature_downscale: 1
       depth: 4
@@ -227,14 +355,14 @@ model:
   fused_cuda_backproject_v4_force_fallback: false
   struct_decoder:
     type: routed_near_far
-    feat_2d_channels: 48
+    feat_2d_channels: 32
     far:
       hidden_dim: 64
     knn_attention:
       enable: true
       k: 8
   iforward:
-    version: stage3_0_scalar_anchor_child_support_parent_legacy
+    version: stage3_1_lowrank_gated_delta_kv_lift
     debug:
       enable_memory_aux_stats: false
       log_per_k_metrics: false
@@ -252,7 +380,7 @@ model:
       no_grad_2d_forward: true
     lifting:
       type: full_sparse_gather
-      context_dim: 48
+      context_dim: 32
       detail_dim: 8
       scalar_anchor_backend: cuda_scalar_anchor
       detach_geometry: true
@@ -284,12 +412,15 @@ model:
         train_child_detail_every_n: 1
         backend: cuda
     parent_optimizer_mamba:
+      enable: false
+    parent_optimizer_memory:
       enable: true
+      type: lowrank_gated_delta_kv
       event_dim: 64
       ctx_dim: 32
-      model_dim: 32
-      state_dim: 16
-      conv_kernel: 2
+      key_dim: 16
+      value_dim: 32
+      token_dim: 64
       read_every_repeat: true
       write_every_repeat: true
       reset_scope: episode
@@ -313,6 +444,22 @@ model:
           assimilate: 0.05
           repair: 0.03
           repeat_stability: 0.03
+      gated_delta_kv:
+        K: 16
+        V: 32
+        query_rms_unit: true
+        key_rms_unit: true
+        value_rms_max: 2.0
+        ctx_rms_max: 4.0
+        state_rms_max: 4.0
+        erase_gate_max: 1.0
+        write_gate_max: 1.0
+        decay_min:
+          bootstrap: 1.0
+          assimilate: 0.98
+          assimilation: 0.98
+          repair: 1.0
+          repeat_stability: 1.0
     biggs:
       enable: true
       observe:
@@ -402,7 +549,7 @@ model:
         detach_child_params: true
         detach_parent_params: true
     parent_spatial:
-      context_dim: 48
+      context_dim: 32
       event_dim: 64
       token_dim: 64
       param_support_dim: 24
@@ -484,7 +631,7 @@ model:
       detach_source_render_for_cnn: true
       cnn_view_chunk_size: 12
     local_rollout:
-      source: scheduler_stage3_0
+      source: scheduler_stage3_2
       use_scheduler_inner_K: true
       local_G_no_detach_between_steps: true
       detach_persistent_state_at_block_start: true
@@ -495,7 +642,7 @@ model:
     struct_event_decoder:
       enable: true
       event_dim: 64
-      feat_2d_dim: 48
+      feat_2d_dim: 32
       support_embed_dim: 4
       branch_embed_dim: 4
       token:
@@ -544,7 +691,7 @@ model:
         gate_max: 1.0
         attribute_gates:
           bg: {means: 0.02, scales: 0.01, quat: 0.0, opacity: 0.10, sh: 0.10}
-          distant: {means: 0.02, scales: 0.01, quat: 0.0, opacity: 0.10, sh: 0.10}
+          distant: {means: 0.0, scales: 0.003, quat: 0.0, opacity: 0.10, sh: 0.10}
           rigid: {means: 0.03, scales: 0.015, quat: 0.005, opacity: 0.08, sh: 0.08}
       phase_b_hooks:
         accept_vsm_ctx: false
@@ -552,7 +699,7 @@ model:
         vsm_ctx_adapter_init: zero_last
       branch_scope:
         bg: {enable: true, update_means: true, update_scales: true, update_quat: true, update_opacity: true, update_sh: true}
-        distant: {enable: true, update_means: true, update_scales: true, update_quat: false, update_opacity: true, update_sh: true}
+        distant: {enable: true, update_means: false, update_scales: true, update_quat: false, update_opacity: true, update_sh: true}
         rigid: {enable: true, update_means: true, update_scales: true, update_quat: true, update_opacity: true, update_sh: true}
       clamps:
         means_max_step_m: 0.25
@@ -643,14 +790,14 @@ training:
 
 scheduler_stage3_0_validation:
   enable: true
-  run_at_train_start: true
-  interval_steps: 20000
-  max_entries: 4
+  run_at_train_start: false
+  interval_steps: 5000
+  max_entries: 1
   modes: [full]
   protocols:
     assimilation: true
-    repair_permutations: 3
-    repeat_stability: [4, 8, 16, 32]
+    repair_permutations: 1
+    repeat_stability: [8, 16]
     mamba_ablation: [full, mamba_off, mamba_read_only, mamba_read_write, mamba_shuffle_state, mamba_freeze_write]
   tensorboard_images:
     enable: true
@@ -713,8 +860,8 @@ iforward_demo:
 
 logging:
   output_root: /root/autodl-tmp/outputs
-  project: iforward_stage3_0_full_train_30k_assim_30k_repair
-  log_dir: null
+  project: iforward_stage3_2_distributional_episode_gdkv
+  log_dir: /root/autodl-tmp/outputs/iforward_stage3_2_distributional_episode_gdkv
   image_interval_blocks: 1000
   image_interval: 1000
   image_trigger:

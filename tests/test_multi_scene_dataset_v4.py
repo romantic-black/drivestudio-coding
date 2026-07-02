@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import sys
 import types
 
@@ -397,6 +398,23 @@ def test_v4_iforward_request_materializer_writes_mapping_meta(tmp_path):
     assert ifwd["steps"][0]["source_indices"] == [0]
     assert ifwd["steps"][1]["source_indices"] == [1]
     assert ifwd["final_supervision"]["target_indices_by_role"]["final_current_recon"] == [0, 1]
+
+    stage3_2_plan = dataclasses.replace(
+        plan,
+        scheduler_version="stage3_2_distributional_episode_v1",
+        request_meta={
+            "scheduler_version": "stage3_2_distributional_episode_v1",
+            "iforward_stage3_2": {"distribution_type": "shuffled_coverage"},
+        },
+    )
+    stage3_2_batch = ds._assemble_segment_batch_from_iforward_stage2_3_request(
+        scene_id=1,
+        segment_id=0,
+        plan=stage3_2_plan,
+        include_test=False,
+    )
+    assert stage3_2_batch["_iforward"]["scheduler_version"] == "stage3_2_distributional_episode_v1"
+    assert stage3_2_batch["request_meta"]["iforward_stage3_2"]["distribution_type"] == "shuffled_coverage"
 
 
 def test_v4_iforward_requires_stable_dynamic_row_space(tmp_path):

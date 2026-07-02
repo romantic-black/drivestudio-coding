@@ -817,6 +817,7 @@ class IForwardTrainer(nn.Module):
         resolved_meta = dict(getattr(out.resolved, "meta", {}) or {})
         request_meta = dict(resolved_meta.get("request_meta", {}) or {})
         stage23_request_meta = dict(request_meta.get("iforward_stage2_3", {}) or {})
+        stage32_request_meta = dict(request_meta.get("iforward_stage3_2", {}) or {})
         requested_inner_k = int(
             resolved_meta.get(
                 "requested_inner_K",
@@ -886,6 +887,7 @@ class IForwardTrainer(nn.Module):
         if str(out.resolved.scheduler_version) in {
             "iforward_2_3_scheduler_v3_optimizer_mamba",
             "stage3_0_optimizer_sequence_v1",
+            "stage3_2_distributional_episode_v1",
         }:
             final["iforward/stage2_3/requested_inner_K"] = float(requested_inner_k)
             final["iforward/stage2_3/actual_inner_K"] = float(actual_inner_k)
@@ -899,6 +901,28 @@ class IForwardTrainer(nn.Module):
             final["iforward/stage2_3/sequence_allow_short"] = bool(
                 resolved_meta.get("sequence_allow_short", stage23_request_meta.get("sequence_allow_short", False))
             )
+            if stage32_request_meta:
+                final["iforward/stage3_2/enabled"] = bool(stage32_request_meta.get("enabled", True))
+                final["iforward/stage3_2/distribution_type"] = str(stage32_request_meta.get("distribution_type", ""))
+                final["iforward/stage3_2/distribution_type_id"] = int(stage32_request_meta.get("distribution_type_id", 0) or 0)
+                final["iforward/stage3_2/episode_stage"] = str(stage32_request_meta.get("episode_stage", ""))
+                final["iforward/stage3_2/episode_stage_id"] = int(stage32_request_meta.get("episode_stage_id", 0) or 0)
+                final["iforward/stage3_2/order_type"] = str(stage32_request_meta.get("order_type", ""))
+                final["iforward/stage3_2/order_type_id"] = int(stage32_request_meta.get("order_type_id", 0) or 0)
+                final["iforward/stage3_2/train_2d_mode"] = str(stage32_request_meta.get("train_2d_mode", ""))
+                final["iforward/stage3_2/train_2d_mode_id"] = int(stage32_request_meta.get("train_2d_mode_id", 0) or 0)
+                final["iforward/stage3_2/B"] = int(stage32_request_meta.get("B", 0) or 0)
+                final["iforward/stage3_2/R_mean"] = float(stage32_request_meta.get("R_mean", 0.0) or 0.0)
+                final["iforward/stage3_2/K"] = int(stage32_request_meta.get("K", 0) or 0)
+                final["iforward/stage3_2/maxK"] = int(stage32_request_meta.get("maxK", 0) or 0)
+                final["iforward/stage3_2/visited_ratio_before"] = float(stage32_request_meta.get("visited_ratio_before", 0.0) or 0.0)
+                final["iforward/stage3_2/visited_ratio_after"] = float(stage32_request_meta.get("visited_ratio_after", 0.0) or 0.0)
+                final["iforward/stage3_2/repair_visited_ratio"] = float(stage32_request_meta.get("repair_visited_ratio", 0.0) or 0.0)
+                final["iforward/stage3_2/curriculum_phase_name"] = str(stage32_request_meta.get("curriculum_phase_name", ""))
+                final["iforward/stage3_2/curriculum_phase_id"] = int(stage32_request_meta.get("curriculum_phase_id", 0) or 0)
+                final["iforward/stage3_2/prelude_repeat_count"] = int(stage32_request_meta.get("prelude_repeat_count", 0) or 0)
+                final["iforward/stage3_2/prelude_shuffle_count"] = int(stage32_request_meta.get("prelude_shuffle_count", 0) or 0)
+                final["iforward/stage3_2/repair_tail_count"] = int(stage32_request_meta.get("repair_tail_count", 0) or 0)
         if str(out.resolved.scheduler_version) == "iforward_sequence10_v1":
             meta = dict(getattr(out.resolved, "meta", {}) or {})
             sequence_positions = [int(x) for x in list(meta.get("sequence_positions", []) or [])]

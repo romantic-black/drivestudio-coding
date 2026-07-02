@@ -34,11 +34,17 @@ def _std(values: Iterable[Any]) -> float:
 def summarize_event_traces(events: Iterable[Any]) -> dict[str, Any]:
     rows = []
     for event in events:
+        metadata = dict(getattr(event, "metadata", {}) or {})
+        stage32 = dict(metadata.get("iforward_stage3_2", {}) or {})
         row = {
             "protocol": str(getattr(event, "protocol", "")),
             "mode": str(getattr(event, "memory_mode", "")),
             "validation_rollout_kind": str(getattr(event, "event_kind", "")),
             "scheduler_phase": str(getattr(event, "scheduler_phase", "")),
+            "distribution_type": str(stage32.get("distribution_type", metadata.get("distribution_type", ""))),
+            "episode_stage": str(stage32.get("episode_stage", metadata.get("episode_stage", ""))),
+            "order_type": str(stage32.get("order_type", metadata.get("order_type", ""))),
+            "train_2d_mode": str(stage32.get("train_2d_mode", metadata.get("train_2d_mode", ""))),
             "current_psnr": _finite_float(getattr(event, "metrics", {}).get("current_psnr", 0.0)),
             "history_rollout_psnr": _finite_float(getattr(event, "metrics", {}).get("history_rollout_psnr", 0.0)),
             "current_loss": _finite_float(getattr(event, "metrics", {}).get("current", getattr(event, "metrics", {}).get("current_loss", 0.0))),

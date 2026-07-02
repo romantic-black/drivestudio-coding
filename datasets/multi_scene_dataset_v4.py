@@ -68,9 +68,11 @@ _IFORWARD_SEQUENCE10_SCHEDULER_VERSION = "iforward_sequence10_v1"
 _IFORWARD_STAGE2_2_SCHEDULER_VERSION = "iforward_stage2_2_stream10_rawframe"
 _IFORWARD_STAGE2_3_SCHEDULER_VERSION = "iforward_2_3_scheduler_v3_optimizer_mamba"
 _IFORWARD_STAGE3_0_SCHEDULER_VERSION = "stage3_0_optimizer_sequence_v1"
+_IFORWARD_STAGE3_2_SCHEDULER_VERSION = "stage3_2_distributional_episode_v1"
 _IFORWARD_OPTIMIZER_SEQUENCE_SCHEDULER_VERSIONS = {
     _IFORWARD_STAGE2_3_SCHEDULER_VERSION,
     _IFORWARD_STAGE3_0_SCHEDULER_VERSION,
+    _IFORWARD_STAGE3_2_SCHEDULER_VERSION,
 }
 
 
@@ -2501,13 +2503,14 @@ class MultiSceneDatasetV4:
             _IFORWARD_STAGE2_2_SCHEDULER_VERSION,
             _IFORWARD_STAGE2_3_SCHEDULER_VERSION,
             _IFORWARD_STAGE3_0_SCHEDULER_VERSION,
+            _IFORWARD_STAGE3_2_SCHEDULER_VERSION,
         }:
             raise ValueError(
                 "expected IForwardRolloutPlan.scheduler_version == 'iforward_v1' "
                 "or 'iforward_v3_random_window' or 'iforward_v4_coverage_ordered' "
                 f"or '{_IFORWARD_STAGE2_1_SCHEDULER_VERSION}' or '{_IFORWARD_SEQUENCE10_SCHEDULER_VERSION}' "
                 f"or '{_IFORWARD_STAGE2_2_SCHEDULER_VERSION}' or '{_IFORWARD_STAGE2_3_SCHEDULER_VERSION}' "
-                f"or '{_IFORWARD_STAGE3_0_SCHEDULER_VERSION}'"
+                f"or '{_IFORWARD_STAGE3_0_SCHEDULER_VERSION}' or '{_IFORWARD_STAGE3_2_SCHEDULER_VERSION}'"
             )
         if int(scene_id) != int(getattr(plan, "scene_id")) or int(segment_id) != int(getattr(plan, "segment_id")):
             raise ValueError(

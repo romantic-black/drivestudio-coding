@@ -57,10 +57,15 @@ def iforward_validation_v4_cfg(cfg: Any) -> dict[str, Any]:
     if not protocols_raw:
         protocols_raw = {
             "assimilation_timeline": True,
+            "distribution_assimilation_timeline": False,
             "repair_before_after": True,
+            "repair_tail_before_after": False,
             "order_robustness": True,
+            "shuffle_order_robustness": False,
             "repeat_stability": True,
+            "repeat_refine_stability": False,
             "memory_ablation": True,
+            "memory_ablation_by_distribution": False,
             "state_health": True,
         }
     frame_sets_raw = _cfg_get(raw, "frame_sets", ["seq10", "seq24"]) or ["seq10", "seq24"]
@@ -104,56 +109,61 @@ def build_validation_v4_plans(
         for entry_idx in range(max_entries_i):
             scheduler = _make_scheduler_for_frame_set(cfg, dataset, fs=fs, seed=int(val["seed"]) + int(entry_idx))
             scheduler.global_step = max(int(scheduler.global_step), int(_cfg_get(scheduler.bootstrap_cfg, "end_step", 0)))
-            episode = scheduler._build_episode()
+            required_distributions: set[str] = set()
+            if bool(protocols.get("distribution_assimilation_timeline", False)):
+                required_distributions.update({"repeat_refine", "shuffled_coverage"})
+            if bool(protocols.get("repair_tail_before_after", False)):
+                required_distributions.add("high_block_repair")
+            episode = _build_episode_matching(scheduler, required_distributions)
             adapter = Stage3SchedulerAdapter(scheduler)
-            if bool(protocols.get("assimilation_timeline", True)):
+            if bool(protocols.get("assimilation_timeline", True)) or bool(protocols.get("distribution_assimilation_timeline", False)):
                 plans.append(
                     adapter.plan_from_episode_v3(
                         episode,
-                        f"assimilation_timeline/{fs.name}/entry{entry_idx}",
+                        f"{'distribution_assimilation_timeline' if bool(protocols.get('distribution_assimilation_timeline', False)) else 'assimilation_timeline'}/{fs.name}/entry{entry_idx}",
                         memory_mode="full",
                         metadata={"frame_set": fs.name, "entry_idx": int(entry_idx)},
                     )
                 )
-            if bool(protocols.get("memory_ablation", True)):
+            if bool(protocols.get("memory_ablation", True)) or bool(protocols.get("memory_ablation_by_distribution", False)):
                 for mode in memory_modes:
                     plans.append(
                         adapter.plan_from_episode_v3(
                             episode,
-                            f"memory_ablation/{fs.name}/{mode}/entry{entry_idx}",
+                            f"{'memory_ablation_by_distribution' if bool(protocols.get('memory_ablation_by_distribution', False)) else 'memory_ablation'}/{fs.name}/{mode}/entry{entry_idx}",
                             memory_mode=mode,
                             metadata={"frame_set": fs.name, "entry_idx": int(entry_idx), "memory_mode": mode},
                         )
                     )
-            if bool(protocols.get("repair_before_after", True)):
+            if bool(protocols.get("repair_before_after", True)) or bool(protocols.get("repair_tail_before_after", False)):
                 plans.append(
                     _repair_plan(
                         adapter=adapter,
                         scheduler=scheduler,
                         episode=episode,
-                        protocol_name=f"repair_before_after/{fs.name}/entry{entry_idx}",
+                        protocol_name=f"{'repair_tail_before_after' if bool(protocols.get('repair_tail_before_after', False)) else 'repair_before_after'}/{fs.name}/entry{entry_idx}",
                         repair_permutations=1,
                         pattern_name="B6R1",
                     )
                 )
-            if bool(protocols.get("order_robustness", True)):
+            if bool(protocols.get("order_robustness", True)) or bool(protocols.get("shuffle_order_robustness", False)):
                 plans.append(
                     _repair_plan(
                         adapter=adapter,
                         scheduler=scheduler,
                         episode=episode,
-                        protocol_name=f"order_robustness/{fs.name}/entry{entry_idx}",
+                        protocol_name=f"{'shuffle_order_robustness' if bool(protocols.get('shuffle_order_robustness', False)) else 'order_robustness'}/{fs.name}/entry{entry_idx}",
                         repair_permutations=repair_perms,
                         pattern_name="order_perm",
                     )
                 )
-            if bool(protocols.get("repeat_stability", True)):
+            if bool(protocols.get("repeat_stability", True)) or bool(protocols.get("repeat_refine_stability", False)):
                 plans.append(
                     _repeat_stability_plan(
                         adapter=adapter,
                         scheduler=scheduler,
                         episode=episode,
-                        protocol_name=f"repeat_stability/{fs.name}/entry{entry_idx}",
+                        protocol_name=f"{'repeat_refine_stability' if bool(protocols.get('repeat_refine_stability', False)) else 'repeat_stability'}/{fs.name}/entry{entry_idx}",
                         repeats=val["repeat_stability"],
                     )
                 )
@@ -187,7 +197,12 @@ def _select_frame_sets(frame_sets: list[FrameSetSpec], selected: Sequence[str] |
 
 def _make_scheduler_for_frame_set(cfg: Any, dataset: Any, *, fs: FrameSetSpec, seed: int) -> Stage23Scheduler:
     cfg_plain = _to_plain_cfg(cfg)
-    sched_key = "scheduler_stage3_0" if bool(_cfg_get(_cfg_get(cfg_plain, "scheduler_stage3_0", {}), "enable", False)) else "scheduler_v3"
+    if bool(_cfg_get(_cfg_get(cfg_plain, "scheduler_stage3_2", {}), "enable", False)):
+        sched_key = "scheduler_stage3_2"
+    elif bool(_cfg_get(_cfg_get(cfg_plain, "scheduler_stage3_0", {}), "enable", False)):
+        sched_key = "scheduler_stage3_0"
+    else:
+        sched_key = "scheduler_v3"
     sched = dict(_cfg_get(cfg_plain, sched_key, {}) or {})
     sequence = dict(_cfg_get(sched, "sequence", {}) or {})
     sequence.update(
@@ -213,6 +228,33 @@ def _make_scheduler_for_frame_set(cfg: Any, dataset: Any, *, fs: FrameSetSpec, s
     sched["producer"] = producer
     cfg_plain[sched_key] = sched
     return Stage23Scheduler(dataset=dataset, cfg=cfg_plain, producer_cfg=producer, seed=int(seed), fail_fast=False)
+
+
+def _is_stage3_2_scheduler(scheduler: Stage23Scheduler) -> bool:
+    return str(getattr(scheduler, "scheduler_version", "")) == "stage3_2_distributional_episode_v1"
+
+
+def _episode_distribution_types(episode: Any) -> set[str]:
+    out: set[str] = set()
+    for rollout in tuple(getattr(episode, "rollouts", ()) or ()):
+        request_meta = dict(getattr(rollout, "request_meta", {}) or {})
+        stage32 = dict(request_meta.get("iforward_stage3_2", {}) or {})
+        name = str(stage32.get("distribution_type", ""))
+        if name:
+            out.add(name)
+    return out
+
+
+def _build_episode_matching(scheduler: Stage23Scheduler, required: set[str]) -> Any:
+    if not required or not _is_stage3_2_scheduler(scheduler):
+        return scheduler._build_episode()
+    last = None
+    for _ in range(32):
+        episode = scheduler._build_episode()
+        last = episode
+        if required.issubset(_episode_distribution_types(episode)):
+            return episode
+    return last if last is not None else scheduler._build_episode()
 
 
 def _repair_plan(

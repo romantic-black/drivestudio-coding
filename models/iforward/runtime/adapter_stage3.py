@@ -129,8 +129,6 @@ class Stage3SchedulerAdapter:
             optimizer_memory_read_count=0,
             optimizer_memory_write_count=0,
             observation_commit_count=0,
-            scheduler_phase="render_probe",
-            rollout_phase="render_probe",
         )
 
     def _event_from_rollout_plan(
@@ -161,7 +159,9 @@ class Stage3SchedulerAdapter:
 
     @staticmethod
     def _metadata_from_rollout(rollout_plan: RolloutPlanV3) -> dict[str, Any]:
-        return {
+        request_meta = dict(getattr(rollout_plan, "request_meta", {}) or {})
+        stage3_2_meta = dict(request_meta.get("iforward_stage3_2", {}) or {})
+        out = {
             "scene_id": int(getattr(rollout_plan, "scene_id", -1)),
             "segment_id": int(getattr(rollout_plan, "segment_id", -1)),
             "sequence_id": int(getattr(rollout_plan, "sequence_id", -1)),
@@ -176,6 +176,34 @@ class Stage3SchedulerAdapter:
             "optimizer_memory_write_count": int(getattr(rollout_plan, "optimizer_memory_write_count", 0)),
             "observation_commit_count": int(getattr(rollout_plan, "observation_commit_count", 0)),
         }
+        if stage3_2_meta:
+            out.update(
+                {
+                    "stage3_2_enabled": bool(stage3_2_meta.get("enabled", True)),
+                    "distribution_type": str(stage3_2_meta.get("distribution_type", "")),
+                    "distribution_type_id": int(stage3_2_meta.get("distribution_type_id", 0) or 0),
+                    "episode_stage": str(stage3_2_meta.get("episode_stage", "")),
+                    "episode_stage_id": int(stage3_2_meta.get("episode_stage_id", 0) or 0),
+                    "order_type": str(stage3_2_meta.get("order_type", "")),
+                    "order_type_id": int(stage3_2_meta.get("order_type_id", 0) or 0),
+                    "train_2d_mode": str(stage3_2_meta.get("train_2d_mode", "")),
+                    "train_2d_mode_id": int(stage3_2_meta.get("train_2d_mode_id", 0) or 0),
+                    "B": int(stage3_2_meta.get("B", 0) or 0),
+                    "R_mean": float(stage3_2_meta.get("R_mean", 0.0) or 0.0),
+                    "K": int(stage3_2_meta.get("K", 0) or 0),
+                    "maxK": int(stage3_2_meta.get("maxK", 0) or 0),
+                    "visited_ratio_before": float(stage3_2_meta.get("visited_ratio_before", 0.0) or 0.0),
+                    "visited_ratio_after": float(stage3_2_meta.get("visited_ratio_after", 0.0) or 0.0),
+                    "repair_visited_ratio": float(stage3_2_meta.get("repair_visited_ratio", 0.0) or 0.0),
+                    "curriculum_phase_name": str(stage3_2_meta.get("curriculum_phase_name", "")),
+                    "curriculum_phase_id": int(stage3_2_meta.get("curriculum_phase_id", 0) or 0),
+                    "prelude_repeat_count": int(stage3_2_meta.get("prelude_repeat_count", 0) or 0),
+                    "prelude_shuffle_count": int(stage3_2_meta.get("prelude_shuffle_count", 0) or 0),
+                    "repair_tail_count": int(stage3_2_meta.get("repair_tail_count", 0) or 0),
+                    "iforward_stage3_2": stage3_2_meta,
+                }
+            )
+        return out
 
     @staticmethod
     def _rollout_from_meta(meta: dict[str, Any]) -> RolloutPlanV3 | None:

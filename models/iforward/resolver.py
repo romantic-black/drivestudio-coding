@@ -15,9 +15,11 @@ IFORWARD_SEQUENCE10_SCHEDULER_VERSION = "iforward_sequence10_v1"
 IFORWARD_STAGE2_2_SCHEDULER_VERSION = "iforward_stage2_2_stream10_rawframe"
 IFORWARD_STAGE2_3_SCHEDULER_VERSION = "iforward_2_3_scheduler_v3_optimizer_mamba"
 IFORWARD_STAGE3_0_SCHEDULER_VERSION = "stage3_0_optimizer_sequence_v1"
+IFORWARD_STAGE3_2_SCHEDULER_VERSION = "stage3_2_distributional_episode_v1"
 IFORWARD_OPTIMIZER_SEQUENCE_SCHEDULER_VERSIONS = {
     IFORWARD_STAGE2_3_SCHEDULER_VERSION,
     IFORWARD_STAGE3_0_SCHEDULER_VERSION,
+    IFORWARD_STAGE3_2_SCHEDULER_VERSION,
 }
 IFORWARD_MODEL_FAMILY = "IForward"
 IFORWARD_CURRENT_ROLE = "final_current_recon"
@@ -360,6 +362,7 @@ class IForwardBatchResolver:
             IFORWARD_STAGE2_2_SCHEDULER_VERSION,
             IFORWARD_STAGE2_3_SCHEDULER_VERSION,
             IFORWARD_STAGE3_0_SCHEDULER_VERSION,
+            IFORWARD_STAGE3_2_SCHEDULER_VERSION,
         }
         if scheduler_version not in allowed_versions:
             raise ValueError(

@@ -116,7 +116,10 @@ class Stage23BatchResolver(IForwardBatchResolver):
         if phase == "bootstrap":
             self._validate_bootstrap(resolved)
         elif phase == "assimilation":
-            self._validate_assimilation(resolved)
+            if str(resolved.scheduler_version) == "stage3_2_distributional_episode_v1":
+                self._validate_stage3_2_assimilation(resolved)
+            else:
+                self._validate_assimilation(resolved)
         elif phase == "repair":
             self._validate_repair(resolved)
         elif phase == "repeat_stability":
@@ -152,6 +155,32 @@ class Stage23BatchResolver(IForwardBatchResolver):
                 raise ValueError("Stage2_3 assimilation reads/writes optimizer memory every repeat")
             if bool(step.update_optimizer_memory) != bool(step.optimizer_memory_write):
                 raise ValueError("Stage2_3 update_optimizer_memory must mirror optimizer_memory_write")
+
+    def _validate_stage3_2_assimilation(self, resolved: IForwardResolvedBatch) -> None:
+        positions = _unique_preserve(step.sequence_pos for step in _repeat0_steps(resolved))
+        if len(positions) < 1:
+            raise ValueError("Stage3_2 assimilation rollout must visit at least one frame")
+        meta = dict(resolved.meta or {})
+        request_meta = dict(meta.get("request_meta", {}) or {})
+        if not request_meta:
+            request_meta = dict(dict(resolved.raw or {}).get("request_meta", {}) or {})
+        stage32 = dict(request_meta.get("iforward_stage3_2", {}) or {})
+        distribution_type = str(stage32.get("distribution_type", ""))
+        if distribution_type == "repeat_refine" and len(positions) > 2:
+            raise ValueError("Stage3_2 repeat_refine rollout must be B1 or B2")
+        if distribution_type not in {"repeat_refine", "shuffled_coverage", ""}:
+            raise ValueError(f"Stage3_2 invalid assimilation distribution_type={distribution_type!r}")
+        max_inner_k = _phase_max_inner_k(resolved, default=int(stage32.get("maxK", 12) or 12))
+        if int(resolved.inner_K) > int(max_inner_k):
+            raise ValueError(f"Stage3_2 assimilation inner_K must be <= phase_max_inner_k ({max_inner_k})")
+        allowed_visit_kinds = {"assimilate", "assimilation"}
+        for step in resolved.steps:
+            if str(step.visit_kind) not in allowed_visit_kinds:
+                raise ValueError("Stage3_2 assimilation requires assimilate/assimilation visit_kind")
+            if not bool(step.optimizer_memory_read) or not bool(step.optimizer_memory_write):
+                raise ValueError("Stage3_2 assimilation reads/writes optimizer memory every repeat")
+            if bool(step.update_optimizer_memory) != bool(step.optimizer_memory_write):
+                raise ValueError("Stage3_2 update_optimizer_memory must mirror optimizer_memory_write")
 
     def _validate_repair(self, resolved: IForwardResolvedBatch) -> None:
         positions = _unique_preserve(step.sequence_pos for step in _repeat0_steps(resolved))

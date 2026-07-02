@@ -43,6 +43,7 @@ from datasets.iforward_stage2_3.validation_runner import (
 from datasets.train_scheduler_iforward import TrainSchedulerIForward
 from datasets.train_scheduler_iforward_sequence10 import TrainSchedulerIForwardSequence10
 from models.iforward import IForwardTrainer
+from models.iforward.resolver import IFORWARD_STAGE3_2_SCHEDULER_VERSION
 from models.iforward.versions import is_stage3_optimizer_memory_iforward_version
 from tools.train_minimal_streetforward_stage4_3_iforward_common import (
     build_multi_scene_dataset_v4,
@@ -107,18 +108,28 @@ def _git_manifest_fields() -> Dict[str, Any]:
 
 
 def _active_scheduler_manifest_fields(cfg: Any) -> Dict[str, Any]:
-    sched30 = _cfg_get(cfg, "scheduler_stage3_0", None)
-    if sched30 is not None and bool(_cfg_get(sched30, "enable", False)):
-        scheduler_key = "scheduler_stage3_0"
-        scheduler_cfg = sched30
+    inherited_scheduler_cfg: Any = {}
+    sched32 = _cfg_get(cfg, "scheduler_stage3_2", None)
+    if sched32 is not None and bool(_cfg_get(sched32, "enable", False)):
+        scheduler_key = "scheduler_stage3_2"
+        scheduler_cfg = sched32
+        if str(_cfg_get(sched32, "inherit_from", "scheduler_stage3_0") or "") == "scheduler_stage3_0":
+            inherited_scheduler_cfg = _cfg_get(cfg, "scheduler_stage3_0", {}) or {}
     else:
-        scheduler_key = "scheduler_v3"
-        scheduler_cfg = _cfg_get(cfg, "scheduler_v3", {}) or {}
+        sched30 = _cfg_get(cfg, "scheduler_stage3_0", None)
+        if sched30 is not None and bool(_cfg_get(sched30, "enable", False)):
+            scheduler_key = "scheduler_stage3_0"
+            scheduler_cfg = sched30
+        else:
+            scheduler_key = "scheduler_v3"
+            scheduler_cfg = _cfg_get(cfg, "scheduler_v3", {}) or {}
     return {
         "scheduler_key": str(scheduler_key),
         "scheduler_version": str(_cfg_get(scheduler_cfg, "version", "")),
-        "index_dir": str(_cfg_get(scheduler_cfg, "index_dir", "") or ""),
-        "index_fingerprint": str(_cfg_get(scheduler_cfg, "index_fingerprint", "") or ""),
+        "index_dir": str(_cfg_get(scheduler_cfg, "index_dir", _cfg_get(inherited_scheduler_cfg, "index_dir", "")) or ""),
+        "index_fingerprint": str(
+            _cfg_get(scheduler_cfg, "index_fingerprint", _cfg_get(inherited_scheduler_cfg, "index_fingerprint", "")) or ""
+        ),
     }
 
 
@@ -237,18 +248,24 @@ def _route_random_window_entrypoint_if_needed(default_config: str) -> bool:
     random_cfg = _cfg_get(cfg, "scheduler_iforward_random_window", None)
     legacy_cfg = _cfg_get(cfg, "scheduler_iforward", None)
     stage22_cfg = _cfg_get(cfg, "scheduler_stage2_2", None)
+    stage32_cfg = _cfg_get(cfg, "scheduler_stage3_2", None)
     stage30_cfg = _cfg_get(cfg, "scheduler_stage3_0", None)
     stage23_cfg = (
-        stage30_cfg
-        if stage30_cfg is not None and bool(_cfg_get(stage30_cfg, "enable", False))
-        else _cfg_get(cfg, "scheduler_v3", None)
+        stage32_cfg
+        if stage32_cfg is not None and bool(_cfg_get(stage32_cfg, "enable", False))
+        else (
+            stage30_cfg
+            if stage30_cfg is not None and bool(_cfg_get(stage30_cfg, "enable", False))
+            else _cfg_get(cfg, "scheduler_v3", None)
+        )
     )
     random_enabled = random_cfg is not None and bool(_cfg_get(random_cfg, "enable", True))
     stage22_enabled = stage22_cfg is not None and bool(_cfg_get(stage22_cfg, "enable", False))
     stage23_enabled = (
         stage23_cfg is not None
         and bool(_cfg_get(stage23_cfg, "enable", False))
-        and str(_cfg_get(stage23_cfg, "version", "")) in {"optimizer_sequence_v1", "stage3_0_optimizer_sequence_v1"}
+        and str(_cfg_get(stage23_cfg, "version", ""))
+        in {"optimizer_sequence_v1", "stage3_0_optimizer_sequence_v1", IFORWARD_STAGE3_2_SCHEDULER_VERSION, "distributional_episode_v1"}
     )
     if random_enabled and legacy_cfg is None:
         from tools import train_iforward_random_window
@@ -353,17 +370,23 @@ def _is_stage2_2_scheduler_cfg(cfg: Any) -> bool:
 
 
 def _is_stage2_3_scheduler_cfg(cfg: Any) -> bool:
+    sched32 = _cfg_get(cfg, "scheduler_stage3_2", None)
     sched30 = _cfg_get(cfg, "scheduler_stage3_0", None)
     sched = (
-        sched30
-        if sched30 is not None and bool(_cfg_get(sched30, "enable", False))
-        else (_cfg_get(cfg, "scheduler_v3", {}) or {})
+        sched32
+        if sched32 is not None and bool(_cfg_get(sched32, "enable", False))
+        else (
+            sched30
+            if sched30 is not None and bool(_cfg_get(sched30, "enable", False))
+            else (_cfg_get(cfg, "scheduler_v3", {}) or {})
+        )
     )
     model_cfg = _cfg_get(cfg, "model", {}) or {}
     iforward_cfg = _cfg_get(model_cfg, "iforward", {}) or {}
     return (
         bool(_cfg_get(sched, "enable", False))
-        and str(_cfg_get(sched, "version", "")) in {"optimizer_sequence_v1", "stage3_0_optimizer_sequence_v1"}
+        and str(_cfg_get(sched, "version", ""))
+        in {"optimizer_sequence_v1", "stage3_0_optimizer_sequence_v1", IFORWARD_STAGE3_2_SCHEDULER_VERSION, "distributional_episode_v1"}
         and (
             str(_cfg_get(iforward_cfg, "version", "")) == "iforward_2_3_optimizer_mamba"
             or is_stage3_optimizer_memory_iforward_version(_cfg_get(iforward_cfg, "version", ""))
@@ -372,6 +395,9 @@ def _is_stage2_3_scheduler_cfg(cfg: Any) -> bool:
 
 
 def _stage2_3_scheduler_key(cfg: Any) -> str:
+    sched32 = _cfg_get(cfg, "scheduler_stage3_2", None)
+    if sched32 is not None and bool(_cfg_get(sched32, "enable", False)):
+        return "scheduler_stage3_2"
     sched30 = _cfg_get(cfg, "scheduler_stage3_0", None)
     if sched30 is not None and bool(_cfg_get(sched30, "enable", False)):
         return "scheduler_stage3_0"

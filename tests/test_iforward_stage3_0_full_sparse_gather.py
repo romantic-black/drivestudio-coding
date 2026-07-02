@@ -187,6 +187,18 @@ def test_stage3_repair_training_start_step_and_kind_gate() -> None:
     assert runtime._repair_training_enabled_for_visit({"global_step": 30000, "visit_kind": "assimilate"}) is True
     assert runtime._repair_training_enabled_for_visit({"global_step": 30000, "visit_kind": "repair"}) is True
     assert runtime._repair_training_enabled_for_visit({"global_step": 30000, "visit_kind": "bootstrap"}) is False
+    assert (
+        runtime._repair_training_enabled_for_visit(
+            {"global_step": 0, "visit_kind": "repair", "train_2d_mode": "frozen_no_grad"}
+        )
+        is True
+    )
+    assert (
+        runtime._repair_training_enabled_for_visit(
+            {"global_step": 0, "visit_kind": "repair", "train_2d_mode": "trainable"}
+        )
+        is False
+    )
 
 
 def test_projected_meta_anchor_filters_masks_aggregates_and_detaches() -> None:
@@ -874,6 +886,28 @@ def test_stage3_repair_training_detaches_2d_observe_features() -> None:
     assert not bool(repair_calls[0]["features_2d"].requires_grad)
     assert repair["parent_feat_2d_bg"].requires_grad is False
     assert repair["child_detail_bg"].requires_grad is False
+
+
+def test_stage3_2_train_2d_mode_detaches_before_repair_start_step() -> None:
+    repair, repair_calls = _run_stage3_observe_smoke(
+        torch.device("cpu"),
+        visit_meta={"global_step": 0, "visit_kind": "repair", "train_2d_mode": "frozen_no_grad"},
+        repair_training_cfg={
+            "enable": True,
+            "start_step": 30000,
+            "kinds": ["repair"],
+            "freeze_2d_frontend": True,
+            "no_grad_2d_forward": True,
+        },
+        source_features_require_grad=True,
+    )
+    assert repair["iforward/repair_training/enabled"] == 1.0
+    assert repair["iforward/repair_training/freeze_2d_frontend"] == 1.0
+    assert repair["iforward/repair_training/no_grad_2d_forward"] == 1.0
+    assert repair["iforward/repair_training/train_2d_mode_id"] == 2.0
+    assert repair["iforward/repair_training/stage3_2_policy_override"] == 1.0
+    assert repair["iforward/repair_training/features_2d_requires_grad"] == 0.0
+    assert not bool(repair_calls[0]["features_2d"].requires_grad)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")

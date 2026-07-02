@@ -249,3 +249,17 @@ def test_stage3_1_config_and_legacy_ablation_alias() -> None:
     model.is_stage2_3_optimizer_mamba = True
     assert IForwardModel._normalize_ablation_name(model, "shuffle_memory") == "mamba_shuffle_state"
     assert IForwardModel._normalize_ablation_name(model, "read_only") == "mamba_read_only"
+
+
+def test_stage3_2_distributional_config_keeps_gdkv_model_and_enables_scheduler() -> None:
+    cfg = OmegaConf.load("configs/iforward/iforward_stage3_2_distributional_episode_gdkv.yaml")
+    assert cfg.output_name == "iforward_stage3_2_distributional_episode_gdkv"
+    assert cfg.scheduler_stage3_2.enable is True
+    assert cfg.scheduler_stage3_2.version == "stage3_2_distributional_episode_v1"
+    assert cfg.scheduler_stage3_2.inherit_from == "scheduler_stage3_0"
+    assert cfg.scheduler_stage3_0.version == "stage3_0_optimizer_sequence_v1"
+    assert cfg.model.stage6_0.local_rollout.source == "scheduler_stage3_2"
+    assert cfg.model.iforward.version == "stage3_1_lowrank_gated_delta_kv_lift"
+    assert cfg.model.iforward.parent_optimizer_memory.type == "lowrank_gated_delta_kv"
+    assert list(cfg.model.iforward.repair_training.kinds) == ["repair"]
+    assert cfg.scheduler_stage3_2.episode_recipe.train_2d_policy.high_block_repair == "frozen_no_grad"

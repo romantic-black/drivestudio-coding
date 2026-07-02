@@ -242,7 +242,8 @@ def _row_from_output(*, out: Any, protocol: str, rollout_idx: int, mode: str, tr
     meta = dict(getattr(resolved, "meta", {}) or {}) if resolved is not None else {}
     request_meta = dict(meta.get("request_meta", {}) or {})
     stage23_meta = dict(request_meta.get("iforward_stage2_3", {}) or {})
-    return {
+    stage32_meta = dict(request_meta.get("iforward_stage3_2", {}) or {})
+    row = {
         "step": int(trigger_step),
         "trigger_step": int(trigger_step),
         "split": "iforward_stage2_3_validation",
@@ -276,6 +277,29 @@ def _row_from_output(*, out: Any, protocol: str, rollout_idx: int, mode: str, tr
         "stage2_3_bank_valid_count": float(stats.get("stage2_3/bank_valid_count", 0.0)),
         "stage2_3_bank_update_count": float(stats.get("stage2_3/bank_update_count", 0.0)),
     }
+    if stage32_meta:
+        row.update(
+            {
+                "distribution_type": str(stage32_meta.get("distribution_type", "")),
+                "distribution_type_id": int(stage32_meta.get("distribution_type_id", 0) or 0),
+                "episode_stage": str(stage32_meta.get("episode_stage", "")),
+                "episode_stage_id": int(stage32_meta.get("episode_stage_id", 0) or 0),
+                "order_type": str(stage32_meta.get("order_type", "")),
+                "order_type_id": int(stage32_meta.get("order_type_id", 0) or 0),
+                "train_2d_mode": str(stage32_meta.get("train_2d_mode", "")),
+                "train_2d_mode_id": int(stage32_meta.get("train_2d_mode_id", 0) or 0),
+                "stage3_2_B": int(stage32_meta.get("B", 0) or 0),
+                "stage3_2_K": int(stage32_meta.get("K", 0) or 0),
+                "stage3_2_maxK": int(stage32_meta.get("maxK", 0) or 0),
+                "stage3_2_R_mean": float(stage32_meta.get("R_mean", 0.0) or 0.0),
+                "visited_ratio_before": float(stage32_meta.get("visited_ratio_before", 0.0) or 0.0),
+                "visited_ratio_after": float(stage32_meta.get("visited_ratio_after", 0.0) or 0.0),
+                "repair_visited_ratio": float(stage32_meta.get("repair_visited_ratio", 0.0) or 0.0),
+                "curriculum_phase_name": str(stage32_meta.get("curriculum_phase_name", "")),
+                "curriculum_phase_id": int(stage32_meta.get("curriculum_phase_id", 0) or 0),
+            }
+        )
+    return row
 
 
 def _rows_for_episode(scheduler: Stage23Scheduler, episode: Any) -> np.ndarray:

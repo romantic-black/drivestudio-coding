@@ -24,6 +24,19 @@ def export_html_report(trace: Any, output_dir: str | Path, *, title: str = "IFor
                 "validation_rollout_kind": row.get("event_kind", ""),
             }
         )
+        metadata = dict(row.get("metadata", {}) or {})
+        stage32 = dict(metadata.get("iforward_stage3_2", {}) or {})
+        if stage32:
+            row.update(
+                {
+                    "distribution_type": str(stage32.get("distribution_type", "")),
+                    "episode_stage": str(stage32.get("episode_stage", "")),
+                    "order_type": str(stage32.get("order_type", "")),
+                    "train_2d_mode": str(stage32.get("train_2d_mode", "")),
+                    "stage3_2_K": stage32.get("K", 0),
+                    "repair_visited_ratio": stage32.get("repair_visited_ratio", 0.0),
+                }
+            )
         rows.append(row)
     summary = summarize_legacy_rows(rows)
     _write_json(output / "html_summary.json", summary)

@@ -73,6 +73,7 @@ from .resolver import (
     IFORWARD_STAGE2_2_SCHEDULER_VERSION,
     IFORWARD_STAGE2_3_SCHEDULER_VERSION,
     IFORWARD_STAGE3_0_SCHEDULER_VERSION,
+    IFORWARD_STAGE3_2_SCHEDULER_VERSION,
     IFORWARD_V3_SCHEDULER_VERSION,
     IFORWARD_V4_SCHEDULER_VERSION,
     IForwardBatchResolver,
@@ -447,13 +448,15 @@ class IForwardModel(nn.Module):
             IFORWARD_SEQUENCE10_SCHEDULER_VERSION,
             IFORWARD_STAGE2_2_SCHEDULER_VERSION,
             IFORWARD_STAGE2_3_SCHEDULER_VERSION,
+            IFORWARD_STAGE3_0_SCHEDULER_VERSION,
+            IFORWARD_STAGE3_2_SCHEDULER_VERSION,
         }:
             return
         raise ValueError(
             "IForward v3/v4/stage2_1 requires scheduler_iforward.version=iforward_v3_random_window, "
             "iforward_v4_coverage_ordered, iforward_stage2_1_parent_temporal, "
             "iforward_sequence10_v1, iforward_stage2_2_stream10_rawframe, "
-            "or iforward_2_3_scheduler_v3_optimizer_mamba "
+            "stage3_0_optimizer_sequence_v1, or stage3_2_distributional_episode_v1 "
             f"when scheduler_iforward is enabled, got {version!r}."
         )
 
@@ -478,25 +481,31 @@ class IForwardModel(nn.Module):
 
                 self.resolver = IForwardRandomWindowBatchResolver()
             else:
+                scheduler32_cfg = cfg_get(config, "scheduler_stage3_2", None)
                 scheduler30_cfg = cfg_get(config, "scheduler_stage3_0", None)
                 scheduler23_cfg = (
-                    scheduler30_cfg
-                    if scheduler30_cfg is not None and bool(cfg_get(scheduler30_cfg, "enable", False))
-                    else (cfg_get(config, "scheduler_v3", {}) or {})
+                    scheduler32_cfg
+                    if scheduler32_cfg is not None and bool(cfg_get(scheduler32_cfg, "enable", False))
+                    else (
+                        scheduler30_cfg
+                        if scheduler30_cfg is not None and bool(cfg_get(scheduler30_cfg, "enable", False))
+                        else (cfg_get(config, "scheduler_v3", {}) or {})
+                    )
                 )
                 scheduler22_cfg = cfg_get(config, "scheduler_stage2_2", {}) or {}
                 scheduler_cfg = cfg_get(config, "scheduler_iforward", {}) or {}
                 if bool(cfg_get(scheduler23_cfg, "enable", False)) and str(
                     cfg_get(scheduler23_cfg, "version", "")
-                ) in {"optimizer_sequence_v1", IFORWARD_STAGE3_0_SCHEDULER_VERSION}:
+                ) in {"optimizer_sequence_v1", IFORWARD_STAGE3_0_SCHEDULER_VERSION, IFORWARD_STAGE3_2_SCHEDULER_VERSION}:
                     from datasets.iforward_stage2_3.resolver import Stage23BatchResolver
 
                     self.resolver = Stage23BatchResolver()
-                    scheduler_version = (
-                        IFORWARD_STAGE3_0_SCHEDULER_VERSION
-                        if scheduler23_cfg is scheduler30_cfg
-                        else IFORWARD_STAGE2_3_SCHEDULER_VERSION
-                    )
+                    if scheduler23_cfg is scheduler32_cfg:
+                        scheduler_version = IFORWARD_STAGE3_2_SCHEDULER_VERSION
+                    elif scheduler23_cfg is scheduler30_cfg:
+                        scheduler_version = IFORWARD_STAGE3_0_SCHEDULER_VERSION
+                    else:
+                        scheduler_version = IFORWARD_STAGE2_3_SCHEDULER_VERSION
                 elif bool(cfg_get(scheduler22_cfg, "enable", False)):
                     from datasets.iforward_stage2_2.resolver import Stage22BatchResolver
 
@@ -513,6 +522,7 @@ class IForwardModel(nn.Module):
                     IFORWARD_STAGE2_2_SCHEDULER_VERSION,
                     IFORWARD_STAGE2_3_SCHEDULER_VERSION,
                     IFORWARD_STAGE3_0_SCHEDULER_VERSION,
+                    IFORWARD_STAGE3_2_SCHEDULER_VERSION,
                 }:
                     if scheduler_version not in {IFORWARD_STAGE2_2_SCHEDULER_VERSION, *IFORWARD_OPTIMIZER_SEQUENCE_SCHEDULER_VERSIONS}:
                         self.resolver = IForwardBatchResolver(expected_scheduler_version=scheduler_version)
@@ -2118,13 +2128,29 @@ class IForwardModel(nn.Module):
                     observe_kwargs["biggs_scene_id"] = int(resolved.scene_id)
                     observe_kwargs["biggs_segment_id"] = int(resolved.segment_id)
                     observe_kwargs["biggs_episode_id"] = int(resolved.episode_id)
-                    observe_kwargs["visit_meta"] = {
+                    stage3_2_visit_meta = dict(
+                        dict(observe_batch.get("request_meta") or {}).get("iforward_stage3_2", {}) or {}
+                    )
+                    visit_meta = {
                         "global_step": int(global_step),
                         "step_idx": int(getattr(step, "step_idx", 0)),
                         "repeat_idx": int(getattr(step, "repeat_idx", 0)),
                         "repeat_budget": int(getattr(step, "repeat_budget", 0)),
                         "visit_kind": str(getattr(step, "visit_kind", "")),
                     }
+                    if stage3_2_visit_meta:
+                        for meta_key in (
+                            "distribution_type",
+                            "distribution_type_id",
+                            "episode_stage",
+                            "episode_stage_id",
+                            "train_2d_mode",
+                            "train_2d_mode_id",
+                        ):
+                            if meta_key in stage3_2_visit_meta:
+                                visit_meta[str(meta_key)] = stage3_2_visit_meta[meta_key]
+                        visit_meta["iforward_stage3_2"] = stage3_2_visit_meta
+                    observe_kwargs["visit_meta"] = visit_meta
                     if bool(self.is_stage3_0_full_sparse_gather_lift):
                         observe_kwargs["parent_optimizer_state"] = parent_temporal_state
                 measurement = self.bridge.observe(**observe_kwargs)

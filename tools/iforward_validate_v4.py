@@ -68,7 +68,9 @@ def build_iforward_runtime_from_cfg(cfg: Any, *, checkpoint: str = "", device: s
 
 
 def _make_scheduler(cfg: Any, dataset: Any) -> Stage23Scheduler:
-    sched_cfg = cfg.get("scheduler_stage3_0", None) if hasattr(cfg, "get") else None
+    sched_cfg = cfg.get("scheduler_stage3_2", None) if hasattr(cfg, "get") else None
+    if sched_cfg is None or not bool(sched_cfg.get("enable", False)):
+        sched_cfg = cfg.get("scheduler_stage3_0", None) if hasattr(cfg, "get") else None
     if sched_cfg is None or not bool(sched_cfg.get("enable", False)):
         sched_cfg = cfg.get("scheduler_v3", {}) if hasattr(cfg, "get") else {}
     producer_cfg = dict((sched_cfg or {}).get("producer", {}) or {})

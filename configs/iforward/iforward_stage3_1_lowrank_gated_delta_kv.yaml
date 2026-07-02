@@ -720,6 +720,18 @@ iforward_validation_v4:
     images: true
     videos: false
 
+iforward_demo:
+  enable: false
+  default_recipe: repair_showcase_24
+  output_dir: ""
+  seed: 20260701
+  memory_ablation:
+    - full
+    - memory_off
+    - memory_read_write
+    - memory_freeze_write
+    - memory_shuffle_state
+
 logging:
   output_root: /root/autodl-tmp/outputs
   project: iforward_stage3_1_lowrank_gated_delta_kv

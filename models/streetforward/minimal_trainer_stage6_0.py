@@ -202,10 +202,30 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             return str(visit_meta.get("visit_kind", "") or "")
         return ""
 
+    def _repair_training_train_2d_mode(self, visit_meta: Optional[Dict[str, Any]]) -> str:
+        if not isinstance(visit_meta, dict):
+            return ""
+        mode = str(visit_meta.get("train_2d_mode", "") or "")
+        if mode:
+            return mode
+        stage32 = visit_meta.get("iforward_stage3_2")
+        if isinstance(stage32, dict):
+            return str(stage32.get("train_2d_mode", "") or "")
+        return ""
+
+    def _repair_training_stage3_2_frozen_no_grad(self, visit_meta: Optional[Dict[str, Any]]) -> bool:
+        cfg = self._repair_training_cfg()
+        return bool(
+            bool(self._cfg_get(cfg, "enable", False))
+            and self._repair_training_train_2d_mode(visit_meta) == "frozen_no_grad"
+        )
+
     def _repair_training_enabled_for_visit(self, visit_meta: Optional[Dict[str, Any]]) -> bool:
         cfg = self._repair_training_cfg()
         if not bool(self._cfg_get(cfg, "enable", False)):
             return False
+        if self._repair_training_stage3_2_frozen_no_grad(visit_meta):
+            return True
         start_step = int(self._cfg_get(cfg, "start_step", 0) or 0)
         global_step = int(visit_meta.get("global_step", 0) or 0) if isinstance(visit_meta, dict) else 0
         if int(global_step) < int(start_step):
@@ -216,9 +236,20 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
 
     def _repair_training_freeze_2d_for_visit(self, visit_meta: Optional[Dict[str, Any]]) -> bool:
         cfg = self._repair_training_cfg()
+        if self._repair_training_stage3_2_frozen_no_grad(visit_meta):
+            return True
         return bool(
             self._repair_training_enabled_for_visit(visit_meta)
             and bool(self._cfg_get(cfg, "freeze_2d_frontend", True))
+        )
+
+    def _repair_training_no_grad_2d_for_visit(self, visit_meta: Optional[Dict[str, Any]]) -> bool:
+        cfg = self._repair_training_cfg()
+        if self._repair_training_stage3_2_frozen_no_grad(visit_meta):
+            return True
+        return bool(
+            self._repair_training_freeze_2d_for_visit(visit_meta)
+            and bool(self._cfg_get(cfg, "no_grad_2d_forward", True))
         )
 
     def _detach_cnn_inputs_for_repair_training(self, cnn_inputs: Dict[str, Any]) -> Dict[str, Any]:
@@ -3739,14 +3770,17 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         _record_observe_time("parent_scene_source", t_scene_source)
         repair_training_active = bool(self._repair_training_enabled_for_visit(visit_meta))
         repair_freeze_2d = bool(self._repair_training_freeze_2d_for_visit(visit_meta))
-        repair_no_grad_2d = bool(
-            repair_freeze_2d
-            and bool(self._cfg_get(self._repair_training_cfg(), "no_grad_2d_forward", True))
-        )
+        repair_no_grad_2d = bool(self._repair_training_no_grad_2d_for_visit(visit_meta))
+        repair_train_2d_mode = self._repair_training_train_2d_mode(visit_meta)
+        repair_train_2d_mode_id = {"trainable": 1, "frozen_no_grad": 2, "auto": 3}.get(str(repair_train_2d_mode), 0)
         repair_training_aux: Dict[str, float] = {
             "iforward/repair_training/enabled": 1.0 if bool(repair_training_active) else 0.0,
             "iforward/repair_training/freeze_2d_frontend": 1.0 if bool(repair_freeze_2d) else 0.0,
             "iforward/repair_training/no_grad_2d_forward": 1.0 if bool(repair_no_grad_2d) else 0.0,
+            "iforward/repair_training/train_2d_mode_id": float(repair_train_2d_mode_id),
+            "iforward/repair_training/stage3_2_policy_override": (
+                1.0 if bool(self._repair_training_stage3_2_frozen_no_grad(visit_meta)) else 0.0
+            ),
         }
         t0 = time.perf_counter()
         dino_cache_key = self._stage2_0_dino_cache_key(

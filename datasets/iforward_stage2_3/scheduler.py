@@ -16,6 +16,7 @@ from .index_builder import build_stage2_3_index_from_dataset
 from .index_format import (
     IFORWARD_STAGE2_3_SCHEDULER_VERSION,
     IFORWARD_STAGE3_0_SCHEDULER_VERSION,
+    IFORWARD_STAGE3_2_SCHEDULER_VERSION,
     stable_uint64,
 )
 from .index_loader import Stage23Index, load_stage2_3_index
@@ -54,7 +55,50 @@ def _cfg_items(node: Any) -> List[Tuple[Any, Any]]:
     return []
 
 
+def _cfg_to_plain(node: Any) -> Any:
+    try:
+        from omegaconf import OmegaConf
+
+        if OmegaConf.is_config(node):
+            return OmegaConf.to_container(node, resolve=False)
+    except Exception:
+        pass
+    if isinstance(node, dict):
+        return {k: _cfg_to_plain(v) for k, v in node.items()}
+    if isinstance(node, (list, tuple)):
+        return [_cfg_to_plain(x) for x in list(node)]
+    return copy.deepcopy(node)
+
+
+def _deep_merge_dicts(base: Any, override: Any) -> Dict[str, Any]:
+    out = dict(_cfg_to_plain(base) or {})
+    over = dict(_cfg_to_plain(override) or {})
+    for key, value in over.items():
+        if isinstance(out.get(key), dict) and isinstance(value, dict):
+            out[key] = _deep_merge_dicts(out[key], value)
+        else:
+            out[key] = copy.deepcopy(value)
+    return out
+
+
+def _stage3_2_scheduler_cfg(cfg: Any, stage3_2_cfg: Any) -> Dict[str, Any]:
+    inherit_from = str(_cfg_get(stage3_2_cfg, "inherit_from", "scheduler_stage3_0") or "")
+    base: Any = {}
+    if inherit_from == "scheduler_stage3_0":
+        base = _cfg_get(cfg, "scheduler_stage3_0", {}) or {}
+    elif inherit_from == "scheduler_v3":
+        base = _cfg_get(cfg, "scheduler_v3", {}) or {}
+    elif inherit_from:
+        raise ValueError(f"unsupported scheduler_stage3_2.inherit_from={inherit_from!r}")
+    merged = _deep_merge_dicts(base, stage3_2_cfg)
+    merged["enable"] = True
+    return merged
+
+
 def _scheduler_cfg_and_version(cfg: Any) -> Tuple[Any, str]:
+    stage32_cfg = _cfg_get(cfg, "scheduler_stage3_2", None)
+    if stage32_cfg is not None and bool(_cfg_get(stage32_cfg, "enable", False)):
+        return _stage3_2_scheduler_cfg(cfg, stage32_cfg), IFORWARD_STAGE3_2_SCHEDULER_VERSION
     stage3_cfg = _cfg_get(cfg, "scheduler_stage3_0", None)
     if stage3_cfg is not None and bool(_cfg_get(stage3_cfg, "enable", False)):
         return stage3_cfg, IFORWARD_STAGE3_0_SCHEDULER_VERSION
@@ -262,6 +306,12 @@ class Stage23Scheduler:
         self.repair_cfg = dict(repair_cfg or _cfg_get(sched_cfg, "repair", {}) or {})
         self.loss_cfg = dict(loss_cfg or _cfg_get(sched_cfg, "loss", {}) or {})
         self.producer_cfg = dict(producer_cfg or _cfg_get(sched_cfg, "producer", {}) or {})
+        self.stage3_2_cfg = dict(sched_cfg or {}) if str(scheduler_version) == IFORWARD_STAGE3_2_SCHEDULER_VERSION else {}
+        if self.stage3_2_cfg:
+            high_repair_cfg = _cfg_get(_cfg_get(self.stage3_2_cfg, "distributions", {}) or {}, "high_block_repair", {}) or {}
+            if _cfg_get(high_repair_cfg, "last_update_write", None) is not None:
+                self.repair_cfg["last_update_write"] = bool(_cfg_get(high_repair_cfg, "last_update_write", True))
+        self._distributional_compiler = None
         self.include_test = bool(include_test)
         self.fail_fast = bool(fail_fast)
         self._validate_config()
@@ -306,8 +356,17 @@ class Stage23Scheduler:
             raise ValueError("Stage2_3 found no eligible segments")
         self._segment_cursor = 0
         self._bootstrap_pack: List[Tuple[int, int]] = []
+        self._init_distributional_compiler()
         self._init_producer_runtime()
         self._emit_eligibility_summary()
+
+    def _init_distributional_compiler(self) -> None:
+        self._distributional_compiler = None
+        if str(getattr(self, "scheduler_version", "")) != IFORWARD_STAGE3_2_SCHEDULER_VERSION:
+            return
+        from .distributional_episode import DistributionalEpisodeCompiler
+
+        self._distributional_compiler = DistributionalEpisodeCompiler(self, self.stage3_2_cfg)
 
     def _init_producer_runtime(self, *, force_disabled: bool = False) -> None:
         depth_configured = int(_cfg_get(self.producer_cfg, "queue_depth", 0) or 0)
@@ -376,8 +435,10 @@ class Stage23Scheduler:
             "fixed_segment_id",
             "index",
             "scheduler_version",
+            "stage3_2_cfg",
         ):
             setattr(clone, name, getattr(self, name))
+        clone._distributional_compiler = None
         clone.rng = random.Random()
         clone.global_step = 0
         clone.epoch_idx = 0
@@ -392,6 +453,7 @@ class Stage23Scheduler:
         clone._bootstrap_pack = []
         clone._init_producer_runtime(force_disabled=True)
         clone._apply_state_dict(copy.deepcopy(state))
+        clone._init_distributional_compiler()
         clone._pending_events.clear()
         return clone
 
@@ -1103,7 +1165,7 @@ class Stage23Scheduler:
         repeat = min(int(repeat), int(max_k))
         return (int(repeat),), f"B1R{int(repeat)}"
 
-    def _build_episode(self) -> EpisodePlanV3:
+    def _build_legacy_episode(self) -> EpisodePlanV3:
         segment_row, rows, _, sequence_frame_rule = self._sample_sequence_rows()
         scene_id, segment_id = self._segment_ids(segment_row)
         sequence_id = int(stable_uint64((scene_id, segment_id, tuple(int(x["frame_idx"]) for x in rows), _rng_token(self.rng))) & 0x7FFFFFFFFFFFFFFF)
@@ -1234,6 +1296,11 @@ class Stage23Scheduler:
             metadata={"segment_row": int(segment_row)},
         )
 
+    def _build_episode(self) -> EpisodePlanV3:
+        if self._distributional_compiler is not None:
+            return self._distributional_compiler.build_episode(step=int(self.global_step))
+        return self._build_legacy_episode()
+
     def _batch_from_plan(self, plan: RolloutPlanV3) -> Dict[str, Any]:
         assembler = getattr(self.dataset, "_assemble_segment_batch_from_iforward_stage2_3_request", None)
         if not callable(assembler):
@@ -1243,6 +1310,8 @@ class Stage23Scheduler:
         return assembler(scene_id=int(plan.scene_id), segment_id=int(plan.segment_id), plan=plan, include_test=bool(self.include_test))
 
     def _update_last_info(self, plan: RolloutPlanV3) -> None:
+        request_meta = dict(getattr(plan, "request_meta", {}) or {})
+        stage3_2_meta = dict(request_meta.get("iforward_stage3_2", {}) or {})
         self._last_info = {
             "scheduler_version": self.scheduler_version,
             "model_family": IFORWARD_MODEL_FAMILY,
@@ -1287,6 +1356,36 @@ class Stage23Scheduler:
             "observation_commit_count": int(plan.observation_commit_count),
             "index_fingerprint": self.index.fingerprint,
         }
+        if stage3_2_meta:
+            self._last_info.update(
+                {
+                    "stage3_2_enabled": bool(stage3_2_meta.get("enabled", True)),
+                    "distribution_type": str(stage3_2_meta.get("distribution_type", "")),
+                    "distribution_type_id": int(stage3_2_meta.get("distribution_type_id", 0) or 0),
+                    "episode_stage": str(stage3_2_meta.get("episode_stage", "")),
+                    "episode_stage_id": int(stage3_2_meta.get("episode_stage_id", 0) or 0),
+                    "order_type": str(stage3_2_meta.get("order_type", "")),
+                    "order_type_id": int(stage3_2_meta.get("order_type_id", 0) or 0),
+                    "train_2d_mode": str(stage3_2_meta.get("train_2d_mode", "")),
+                    "train_2d_mode_id": int(stage3_2_meta.get("train_2d_mode_id", 0) or 0),
+                    "stage3_2_B": int(stage3_2_meta.get("B", 0) or 0),
+                    "stage3_2_R_mean": float(stage3_2_meta.get("R_mean", 0.0) or 0.0),
+                    "stage3_2_K": int(stage3_2_meta.get("K", 0) or 0),
+                    "stage3_2_maxK": int(stage3_2_meta.get("maxK", 0) or 0),
+                    "visited_ratio_before": float(stage3_2_meta.get("visited_ratio_before", 0.0) or 0.0),
+                    "visited_ratio_after": float(stage3_2_meta.get("visited_ratio_after", 0.0) or 0.0),
+                    "repair_visited_ratio": float(stage3_2_meta.get("repair_visited_ratio", 0.0) or 0.0),
+                    "candidate_pool": str(stage3_2_meta.get("candidate_pool", "")),
+                    "curriculum_phase_name": str(stage3_2_meta.get("curriculum_phase_name", "")),
+                    "curriculum_phase_id": int(stage3_2_meta.get("curriculum_phase_id", 0) or 0),
+                    "prelude_rollout_idx": int(stage3_2_meta.get("prelude_rollout_idx", -1) or -1),
+                    "repair_tail_idx": int(stage3_2_meta.get("repair_tail_idx", -1) or -1),
+                    "prelude_repeat_count": int(stage3_2_meta.get("prelude_repeat_count", 0) or 0),
+                    "prelude_shuffle_count": int(stage3_2_meta.get("prelude_shuffle_count", 0) or 0),
+                    "repair_tail_count": int(stage3_2_meta.get("repair_tail_count", 0) or 0),
+                    "iforward_stage3_2": dict(stage3_2_meta),
+                }
+            )
 
     def _episode_chain_refs_for_preload(self, plan: RolloutPlanV3) -> List[ImageRef]:
         if self._episode_plan is None:
@@ -1558,4 +1657,9 @@ class Stage23Scheduler:
             pass
 
 
-__all__ = ["IFORWARD_STAGE2_3_SCHEDULER_VERSION", "IFORWARD_STAGE3_0_SCHEDULER_VERSION", "Stage23Scheduler"]
+__all__ = [
+    "IFORWARD_STAGE2_3_SCHEDULER_VERSION",
+    "IFORWARD_STAGE3_0_SCHEDULER_VERSION",
+    "IFORWARD_STAGE3_2_SCHEDULER_VERSION",
+    "Stage23Scheduler",
+]
