@@ -657,7 +657,45 @@ training:
   save_checkpoint_freq: 5000
   seed: 41
   amp:
-    enable: false
+    enable: true
+    dtype: auto
+    autocast_device: cuda
+    grad_scaler: auto
+    init_scale: 65536.0
+    growth_factor: 2.0
+    backoff_factor: 0.5
+    growth_interval: 2000
+    cache_enabled: true
+    fp32_islands:
+      geometry: true
+      render: true
+      scalar_anchor: true
+      sparse_gather_cuda: true
+      parent_state_stats: true
+      loss: true
+      grad_clip: true
+    stage3:
+      parent_lift_amp: true
+      parent_lift_dtype: amp
+      child_gather_amp: false
+      child_detail_output_dtype: bf16
+      scalar_anchor_force_fp32: true
+      cuda_sparse_gather_force_fp32_kernel: true
+    storage:
+      features_2d_cache_dtype: bf16
+      parent_context_cache_dtype: bf16
+    memory:
+      gdkv_compute_amp: true
+      gdkv_state_dtype: bf16
+      gdkv_aux_stats_fp32: true
+    render:
+      force_fp32: true
+      loss_force_fp32: true
+    debug:
+      log_dtype_summary: true
+      log_scaler: true
+      log_amp_memory: true
+      finite_check_interval: 1000
   grad_clip:
     enable: true
     max_norm: 1.0

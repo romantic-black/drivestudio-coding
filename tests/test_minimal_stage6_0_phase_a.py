@@ -1030,6 +1030,34 @@ def test_stage6_distant_branch_scope_allows_means_and_scales_when_enabled():
     assert torch.count_nonzero(masked.distant.sh) > 0
 
 
+def test_stage6_delta_pack_to_float32_preserves_structure():
+    base = _branch_delta()
+    delta = DeltaPack(
+        bg=BranchDelta(
+            means=base.means.half(),
+            scales_log=base.scales_log.half(),
+            quat_axis_angle=base.quat_axis_angle.half(),
+            opacity_logit=base.opacity_logit.half(),
+            sh=base.sh.half(),
+            hidden=base.hidden.half(),
+            confidence=base.confidence.half(),
+            noop=base.noop.half(),
+            active_attrs={"means": True},
+        ),
+        distant=_branch_delta(2.0),
+        rigid=None,
+        aux={"keep": "value"},
+    )
+    converted = MinimalStreetForwardStage6_0._delta_pack_to_float32(delta)
+    assert converted.bg.means.dtype is torch.float32
+    assert converted.bg.hidden.dtype is torch.float32
+    assert converted.distant is not None
+    assert converted.distant.means.dtype is torch.float32
+    assert converted.rigid is None
+    assert converted.aux == {"keep": "value"}
+    assert converted.bg.active_attrs == {"means": True}
+
+
 def test_phase_a_target_valid_mask_combines_valid_sky_egocar_and_dynamic():
     target = {
         "valid_mask": torch.tensor([[1.0, 0.0], [1.0, 1.0]]),
@@ -1072,6 +1100,38 @@ def test_phase_a_zero_valid_mask_skips_rgb_loss():
     )
     assert loss.item() == 0.0
     assert stats["skipped_no_valid_pixels"] == 1.0
+
+
+def test_stage3_storage_amp_dtype_helpers_keep_gather_fp32() -> None:
+    model = MinimalStreetForwardStage6_0.__new__(MinimalStreetForwardStage6_0)
+    model.config = {
+        "training": {
+            "amp": {
+                "storage": {
+                    "features_2d_cache_dtype": "bf16",
+                    "parent_context_cache_dtype": "bf16",
+                },
+                "stage3": {
+                    "child_gather_amp": False,
+                    "child_detail_output_dtype": "bf16",
+                },
+            }
+        }
+    }
+    model.iforward_amp_policy = SimpleNamespace(
+        dtype=torch.bfloat16,
+        enabled=True,
+        features_2d_cache_dtype="bf16",
+        parent_context_cache_dtype="bf16",
+        child_gather_amp=False,
+    )
+    features = torch.randn(1, 2, 3, 4)
+    cast = MinimalStreetForwardStage6_0._stage3_cast_feature_cache(model, {"features_2d": features, "unchanged": 1})
+    assert cast["features_2d"].dtype is torch.bfloat16
+    assert cast["unchanged"] == 1
+    assert MinimalStreetForwardStage6_0._stage3_parent_context_cache_dtype(model, features) is torch.bfloat16
+    assert MinimalStreetForwardStage6_0._stage3_child_detail_dtype(model, features) is torch.float32
+    assert MinimalStreetForwardStage6_0._stage3_child_detail_output_dtype(model, features) is torch.bfloat16
 
 
 def test_phase_a_render_loss_zero_valid_mask_omits_psnr_metric():

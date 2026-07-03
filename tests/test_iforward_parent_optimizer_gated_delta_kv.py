@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from omegaconf import OmegaConf
 
@@ -104,6 +105,52 @@ def test_gated_delta_kv_cell_shape_mask_and_state_clamp() -> None:
     assert aux["state_rms_max"] <= 0.7501
 
 
+def test_gated_delta_kv_cell_keeps_state_fp32_from_half_state() -> None:
+    torch.manual_seed(40)
+    cell = LowRankGatedDeltaKVCell(event_dim=8, token_dim=8, key_dim=4, value_dim=5)
+    state = cell.init_state(6, device=torch.device("cpu"), dtype=torch.float16)
+    event = torch.randn(6, 8)
+    token = torch.randn(6, 8)
+    mask = torch.ones(6, dtype=torch.bool)
+    ctx, read_aux = cell.read(event, state)
+    next_state, write_aux = cell.write(token, state, mask, visit_meta=_visit("assimilate"))
+    assert ctx.dtype is torch.float32
+    assert next_state.kv_state.dtype is torch.float32
+    assert read_aux["state_dtype_id"] == 0.0
+    assert write_aux["state_dtype_id"] == 0.0
+
+
+def test_gated_delta_kv_cell_stores_bf16_state_with_fp32_compute() -> None:
+    torch.manual_seed(42)
+    cell = LowRankGatedDeltaKVCell(event_dim=8, token_dim=8, key_dim=4, value_dim=5, state_dtype="bf16")
+    state = cell.init_state(6, device=torch.device("cpu"), dtype=torch.bfloat16)
+    event = torch.randn(6, 8)
+    token = torch.randn(6, 8)
+    mask = torch.ones(6, dtype=torch.bool)
+    ctx, read_aux = cell.read(event, state)
+    next_state, write_aux = cell.write(token, state, mask, visit_meta=_visit("assimilate"))
+    assert ctx.dtype is torch.float32
+    assert next_state.kv_state.dtype is torch.bfloat16
+    assert torch.isfinite(next_state.kv_state.float()).all()
+    assert read_aux["state_dtype_id"] == 2.0
+    assert write_aux["state_dtype_id"] == 2.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA autocast is required")
+def test_gated_delta_kv_cell_keeps_state_fp32_under_cuda_autocast() -> None:
+    torch.manual_seed(41)
+    cell = LowRankGatedDeltaKVCell(event_dim=8, token_dim=8, key_dim=4, value_dim=5).cuda()
+    state = cell.init_state(6, device=torch.device("cuda"), dtype=torch.float32)
+    event = torch.randn(6, 8, device="cuda")
+    token = torch.randn(6, 8, device="cuda")
+    mask = torch.ones(6, device="cuda", dtype=torch.bool)
+    with torch.amp.autocast(device_type="cuda", dtype=torch.float16, enabled=True):
+        ctx, _ = cell.read(event, state)
+        next_state, _ = cell.write(token, state, mask, visit_meta=_visit("assimilate"))
+    assert ctx.dtype is torch.float32
+    assert next_state.kv_state.dtype is torch.float32
+
+
 def test_gated_delta_kv_query_key_rms_flags_are_honored() -> None:
     torch.manual_seed(14)
     event = torch.randn(16, 8)
@@ -184,9 +231,44 @@ def test_gated_delta_kv_preview_unseen_zero_and_repair_writes() -> None:
         assert aux["iforward/parent_optimizer_mamba/write"] == 1.0
     assert state.global_update_step == 2
     assert state.bg.dense is not None
+    assert state.bg.dense.kv_state.dtype is torch.float32
     assert int(state.bg.dense.update_count.sum().item()) == 6
     assert state.rigid.keyed is not None
+    assert state.rigid.keyed.kv_state.dtype is torch.float32
     assert state.rigid.keyed.keys.detach().cpu().tolist() == [200, 201]
+
+
+def test_gated_delta_kv_parent_optimizer_stores_bf16_state() -> None:
+    mem = ParentOptimizerGatedDeltaKV(
+        event_dim=4,
+        ctx_dim=3,
+        token_dim=4,
+        key_dim=2,
+        value_dim=3,
+        adapter_hidden_dim=8,
+        visit_dim=4,
+        state_dtype="bf16",
+    )
+    event = _event()
+    state, write_aux = mem.write(
+        spatial_event=event,
+        state=ParentOptimizerDeltaKVState.empty(),
+        keys=_keys(),
+        visit_meta=_visit("assimilate"),
+    )
+    assert write_aux["iforward/parent_optimizer_gdkv/state_dtype_id"] == 2.0
+    assert state.bg.dense is not None
+    assert state.bg.dense.kv_state.dtype is torch.bfloat16
+    assert state.distant.dense is not None
+    assert state.distant.dense.kv_state.dtype is torch.bfloat16
+    assert state.rigid.keyed is not None
+    assert state.rigid.keyed.kv_state.dtype is torch.bfloat16
+    assert state.rigid.keyed.keys.dtype is torch.long
+    assert state.rigid.keyed.update_count.dtype is torch.long
+    preview = mem.preview(event=event, state=state, keys=_keys(), visit_meta=_visit("repair"))
+    assert preview.aux["iforward/parent_optimizer_gdkv/state_dtype_id"] == 2.0
+    assert preview.aux["iforward/parent_optimizer_gdkv/bg_state_dtype_id"] == 2.0
+    assert preview.event.event_bg.dtype is torch.float32
 
 
 def test_gated_delta_kv_keyed_gather_scatter_repeated_keys() -> None:
@@ -235,6 +317,10 @@ def test_stage3_1_config_and_legacy_ablation_alias() -> None:
     assert cfg.model.iforward.parent_optimizer_memory.type == "lowrank_gated_delta_kv"
     assert cfg.model.iforward.parent_optimizer_memory.gated_delta_kv.K == 16
     assert cfg.model.iforward.parent_optimizer_memory.gated_delta_kv.V == 32
+    assert cfg.training.amp.storage.features_2d_cache_dtype == "bf16"
+    assert cfg.training.amp.storage.parent_context_cache_dtype == "bf16"
+    assert cfg.training.amp.memory.gdkv_state_dtype == "bf16"
+    assert cfg.training.amp.stage3.child_detail_output_dtype == "bf16"
     ParentOptimizerGatedDeltaKV(
         event_dim=4,
         ctx_dim=3,
@@ -261,5 +347,9 @@ def test_stage3_2_distributional_config_keeps_gdkv_model_and_enables_scheduler()
     assert cfg.model.stage6_0.local_rollout.source == "scheduler_stage3_2"
     assert cfg.model.iforward.version == "stage3_1_lowrank_gated_delta_kv_lift"
     assert cfg.model.iforward.parent_optimizer_memory.type == "lowrank_gated_delta_kv"
+    assert cfg.training.amp.storage.features_2d_cache_dtype == "bf16"
+    assert cfg.training.amp.storage.parent_context_cache_dtype == "bf16"
+    assert cfg.training.amp.memory.gdkv_state_dtype == "bf16"
+    assert cfg.training.amp.stage3.child_detail_output_dtype == "bf16"
     assert list(cfg.model.iforward.repair_training.kinds) == ["repair"]
     assert cfg.scheduler_stage3_2.episode_recipe.train_2d_policy.high_block_repair == "frozen_no_grad"

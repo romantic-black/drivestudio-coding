@@ -33,6 +33,7 @@ from models.iforward.biggs_parent_stats import (
 from models.iforward.biggs_state import BigGSBlockRuntime, IForwardBigGSState
 from models.iforward.dino_feature_cache import DINOFeatureCache
 from models.iforward.fwhr_lift import aggregate_fwhr_child_lift
+from models.iforward.amp_policy import amp_dtype_id, build_amp_policy, storage_dtype_from_name
 from models.iforward.parent_spatial_backbone import ParentStructInput, empty_parent_struct_input
 from models.iforward.stage3_0 import (
     GatherConfig,
@@ -1268,6 +1269,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         self.stage2_0_biggs_lifting_cfg = self._cfg_get(biggs_cfg, "lifting", {}) or {}
         self.stage3_0_enabled = is_stage3_optimizer_memory_iforward_version(ifwd_version)
         self.stage3_0_lifting_cfg = self._cfg_get(iforward_cfg, "lifting", {}) or {}
+        self.iforward_amp_policy = build_amp_policy(config, inference_only=True)
         self.iforward_repair_training_cfg = self._cfg_get(iforward_cfg, "repair_training", {}) or {}
         self.stage3_0_gather_reg_terms: Dict[str, torch.Tensor] = {}
         self.stage3_0_last_aux: Dict[str, float] = {}
@@ -2476,12 +2478,25 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         projector_cfg = dict(getattr(self, "stage2_0_biggs_projector_cfg", {}) or {})
         max_scale = self._stage2_0_biggs_max_scale(str(branch_name))
         projector_cfg["tau_parent_scale"] = self._stage2_0_biggs_tau_parent_scale(str(branch_name))
-        return project_biggs_parents(
-            branch=branch,
-            assignment=assignment,
-            cfg=projector_cfg,
-            max_scale=max_scale,
-        )
+        with self._iforward_amp_fp32():
+            return project_biggs_parents(
+                branch=branch,
+                assignment=assignment,
+                cfg=projector_cfg,
+                max_scale=max_scale,
+            )
+
+    def _stage2_0_project_active_rigid_parents(self, **kwargs: Any) -> BigGSParentProjection:
+        with self._iforward_amp_fp32():
+            return project_biggs_active_rigid_parents(**kwargs)
+
+    def _stage2_0_init_parent_branch_runtime(self, **kwargs: Any) -> Any:
+        with self._iforward_amp_fp32():
+            return init_parent_branch_runtime(**kwargs)
+
+    def _stage2_0_update_parent_branch_runtime(self, **kwargs: Any) -> Any:
+        with self._iforward_amp_fp32():
+            return update_parent_branch_runtime(**kwargs)
 
     def _stage2_0_biggs_max_scale(self, branch_name: str) -> float:
         projector_cfg = getattr(self, "stage2_0_biggs_projector_cfg", {}) or {}
@@ -2818,6 +2833,117 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 stats[f"iforward/stage3/meta_{key}"] = float(value)
         return anchor, stats
 
+    def _iforward_amp_autocast(self) -> Any:
+        policy = getattr(self, "iforward_amp_policy", None)
+        return policy.autocast() if policy is not None else nullcontext()
+
+    def _iforward_amp_fp32(self) -> Any:
+        policy = getattr(self, "iforward_amp_policy", None)
+        return policy.fp32() if policy is not None else nullcontext()
+
+    def _stage3_amp_cfg(self) -> Any:
+        training_cfg = self._cfg_get(getattr(self, "config", {}) or {}, "training", {}) or {}
+        amp_cfg = self._cfg_get(training_cfg, "amp", {}) or {}
+        return self._cfg_get(amp_cfg, "stage3", {}) or {}
+
+    def _stage3_storage_cfg(self) -> Any:
+        training_cfg = self._cfg_get(getattr(self, "config", {}) or {}, "training", {}) or {}
+        amp_cfg = self._cfg_get(training_cfg, "amp", {}) or {}
+        return self._cfg_get(amp_cfg, "storage", {}) or {}
+
+    @staticmethod
+    def _dtype_from_name(name: Any, *, default: torch.dtype) -> torch.dtype:
+        label = str(name).strip().lower()
+        if label in {"bf16", "bfloat16"}:
+            return torch.bfloat16
+        if label in {"fp16", "float16", "half", "16"}:
+            return torch.float16
+        if label in {"fp32", "float32", "32", "none", "off", "false"}:
+            return torch.float32
+        if label == "amp":
+            return default
+        return default
+
+    def _storage_dtype_from_name(self, name: Any, ref: torch.Tensor) -> torch.dtype:
+        policy = getattr(self, "iforward_amp_policy", None)
+        return storage_dtype_from_name(
+            name,
+            amp_dtype=getattr(policy, "dtype", None),
+            default=ref.dtype,
+        )
+
+    def _stage3_features_2d_cache_dtype(self, ref: torch.Tensor) -> torch.dtype:
+        policy = getattr(self, "iforward_amp_policy", None)
+        name = self._cfg_get(
+            self._stage3_storage_cfg(),
+            "features_2d_cache_dtype",
+            getattr(policy, "features_2d_cache_dtype", "fp32"),
+        )
+        return self._storage_dtype_from_name(name, ref)
+
+    def _stage3_parent_context_cache_dtype(self, ref: torch.Tensor) -> torch.dtype:
+        policy = getattr(self, "iforward_amp_policy", None)
+        name = self._cfg_get(
+            self._stage3_storage_cfg(),
+            "parent_context_cache_dtype",
+            getattr(policy, "parent_context_cache_dtype", "fp32"),
+        )
+        return self._storage_dtype_from_name(name, ref)
+
+    def _stage3_cast_feature_cache(self, cnn_inputs: Dict[str, Any]) -> Dict[str, Any]:
+        features = cnn_inputs.get("features_2d")
+        if not torch.is_tensor(features):
+            return cnn_inputs
+        dtype = self._stage3_features_2d_cache_dtype(features)
+        if features.dtype == dtype:
+            return cnn_inputs
+        out = dict(cnn_inputs)
+        out["features_2d"] = features.to(dtype=dtype)
+        return out
+
+    def _stage3_parent_lift_amp_enabled(self) -> bool:
+        policy = getattr(self, "iforward_amp_policy", None)
+        return bool(
+            policy is not None
+            and bool(getattr(policy, "enabled", False))
+            and getattr(policy, "dtype", None) is not None
+            and bool(getattr(policy, "parent_lift_amp", False))
+        )
+
+    def _stage3_child_gather_amp_enabled(self) -> bool:
+        policy = getattr(self, "iforward_amp_policy", None)
+        return bool(
+            policy is not None
+            and bool(getattr(policy, "enabled", False))
+            and getattr(policy, "dtype", None) is not None
+            and bool(getattr(policy, "child_gather_amp", False))
+        )
+
+    def _stage3_parent_lift_dtype(self, ref: torch.Tensor) -> torch.dtype:
+        policy = getattr(self, "iforward_amp_policy", None)
+        if not self._stage3_parent_lift_amp_enabled() or policy is None:
+            return torch.float32
+        default = getattr(policy, "dtype", None) or ref.dtype
+        name = self._cfg_get(self._stage3_amp_cfg(), "parent_lift_dtype", "amp")
+        return self._dtype_from_name(name, default=default)
+
+    def _stage3_child_detail_dtype(self, ref: torch.Tensor) -> torch.dtype:
+        policy = getattr(self, "iforward_amp_policy", None)
+        cfg = self._stage3_amp_cfg()
+        name = self._cfg_get(cfg, "child_detail_output_dtype", getattr(policy, "child_detail_output_dtype", "fp32"))
+        if str(name).strip().lower() in {"fp32", "float32", "32", "none", "off", "false"}:
+            return torch.float32
+        if not self._stage3_child_gather_amp_enabled() or policy is None:
+            return torch.float32
+        default = getattr(policy, "dtype", None) or ref.dtype
+        return self._dtype_from_name(name, default=default)
+
+    def _stage3_child_detail_output_dtype(self, ref: torch.Tensor) -> torch.dtype:
+        policy = getattr(self, "iforward_amp_policy", None)
+        cfg = self._stage3_amp_cfg()
+        name = self._cfg_get(cfg, "child_detail_output_dtype", getattr(policy, "child_detail_output_dtype", "fp32"))
+        return self._storage_dtype_from_name(name, ref)
+
     def _stage3_0_parent_sparse_gather(
         self,
         *,
@@ -2840,6 +2966,10 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         context_2d = cnn_inputs["features_2d"]
         if context_2d.dim() != 4:
             raise ValueError(f"Stage3_0 context_2d must be [V,H,W,C], got {tuple(context_2d.shape)}")
+        stats: Dict[str, float] = {
+            "iforward/stage3/parent_lift_amp_enabled": 1.0 if self._stage3_parent_lift_amp_enabled() else 0.0,
+            "iforward/stage3/parent_lift_dtype_id": float(amp_dtype_id(context_2d.dtype)),
+        }
         obs2d_map = None
         obs2d_module = getattr(self, "stage3_parent_query_obs2d", None)
         if bool(getattr(self, "stage3_parent_query_use_obs2d_lift", False)):
@@ -2886,7 +3016,6 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         emit_gather_heavy_aux = bool(gather_aux_interval > 0 and global_step % int(gather_aux_interval) == 0)
         queries = []
         start = 0
-        stats: Dict[str, float] = {}
         regs: Dict[str, torch.Tensor] = {}
 
         def _run_branch(name: str, branch_id: int, params: Dict[str, torch.Tensor], rows: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -3014,6 +3143,8 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                     if fusion is None or dino_lift_c is None:
                         raise RuntimeError("Stage3_0 parent context DINO fusion is not initialized.")
                     out_c = fusion(out_c, dino_lift_c)
+                out_c = out_c.to(device=feat.device, dtype=feat.dtype)
+                conf_c = conf_c.to(device=conf.device, dtype=conf.dtype)
                 feat.index_copy_(0, cidx, out_c)
                 conf.index_copy_(0, cidx, conf_c)
                 aux_rows += rows_c
@@ -3058,6 +3189,9 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         detail_2d = measurement.get("stage3_detail_2d")
         if anchor is None or not torch.is_tensor(detail_2d):
             raise RuntimeError("Stage3_0 child gather requires anchor stats and detail_2d in measurement.")
+        child_detail_dtype = self._stage3_child_detail_dtype(detail_2d)
+        detail_2d = detail_2d.to(dtype=child_detail_dtype)
+        measurement["stage3_detail_2d"] = detail_2d
         height = int(measurement["stage3_image_height"])
         width = int(measurement["stage3_image_width"])
         gather_aux_interval = int(
@@ -3093,6 +3227,8 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         child_detail_train_enabled = (not bool(detach_child_detail_cfg)) and (
             int(train_child_detail_every_n) <= 1 or int(global_step) % int(train_child_detail_every_n) == 0
         )
+        child_amp_enabled = self._stage3_child_gather_amp_enabled()
+        child_detail_output_dtype = self._stage3_child_detail_output_dtype(detail_2d)
         prepared_detail = (
             prepare_value_nchw(detail_2d)
             if backend == "pytorch" or (backend == "auto" and not torch.is_tensor(detail_2d))
@@ -3101,6 +3237,10 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         aux["iforward/stage3/child_support_center_enabled"] = 1.0
         aux["iforward/stage3/child_event_dependency_removed"] = 1.0
         aux["iforward/stage3/child_learned_path_enabled"] = 0.0
+        aux["iforward/stage3/child_gather_amp_enabled"] = 1.0 if bool(child_amp_enabled) else 0.0
+        aux["iforward/stage3/child_detail_gather_dtype_id"] = float(amp_dtype_id(detail_2d.dtype))
+        aux["iforward/stage3/child_detail_output_dtype_id"] = float(amp_dtype_id(child_detail_output_dtype))
+        aux["amp/dtype/child_detail"] = float(amp_dtype_id(child_detail_output_dtype))
         aux["iforward/stage3/child_detail_detached"] = 0.0 if bool(child_detail_train_enabled) else 1.0
         aux["iforward/stage3/child_detail_train_every_n"] = float(train_child_detail_every_n)
         ignored_child_keys = {
@@ -3154,19 +3294,23 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 cidx = row_idx[cstart : cstart + chunk_limit]
                 if int(cidx.numel()) == 0:
                     continue
-                detail_c, confidence_c, gather_aux = support_center_sparse_gather(
-                    value_map=detail_2d,
-                    anchor_uv=anchor.child_uv[start:end].index_select(0, cidx.to(device=anchor.child_uv.device, dtype=torch.long)),
-                    support=anchor.child_support[start:end].index_select(0, cidx.to(device=anchor.child_support.device, dtype=torch.long)),
-                    valid=anchor.child_valid[start:end].index_select(0, cidx.to(device=anchor.child_valid.device, dtype=torch.long)),
-                    image_height=int(height),
-                    image_width=int(width),
-                    backend=backend,
-                    prepared_value_nchw=prepared_detail,
-                    chunk_size=int(chunk_limit),
-                    emit_heavy_aux=emit_gather_heavy_aux,
-                    prefix=f"stage3/child_{name}",
-                )
+                amp_ctx = self._iforward_amp_autocast() if bool(child_amp_enabled) else self._iforward_amp_fp32()
+                with amp_ctx:
+                    detail_c, confidence_c, gather_aux = support_center_sparse_gather(
+                        value_map=detail_2d,
+                        anchor_uv=anchor.child_uv[start:end].index_select(0, cidx.to(device=anchor.child_uv.device, dtype=torch.long)),
+                        support=anchor.child_support[start:end].index_select(0, cidx.to(device=anchor.child_support.device, dtype=torch.long)),
+                        valid=anchor.child_valid[start:end].index_select(0, cidx.to(device=anchor.child_valid.device, dtype=torch.long)),
+                        image_height=int(height),
+                        image_width=int(width),
+                        backend=backend,
+                        prepared_value_nchw=prepared_detail,
+                        chunk_size=int(chunk_limit),
+                        emit_heavy_aux=emit_gather_heavy_aux,
+                        prefix=f"stage3/child_{name}",
+                    )
+                detail_c = detail_c.to(device=detail.device, dtype=detail.dtype)
+                confidence_c = confidence_c.to(device=confidence.device, dtype=confidence.dtype)
                 detail.index_copy_(0, cidx, detail_c)
                 confidence.index_copy_(0, cidx, confidence_c)
                 rows_c = int(cidx.numel())
@@ -3231,6 +3375,11 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 parent_id_local=active.child_to_active_parent_S,
                 num_parents=int(active.active_parent_count.numel()),
             )
+        detail_bg = detail_bg.to(dtype=child_detail_output_dtype)
+        if torch.is_tensor(detail_d):
+            detail_d = detail_d.to(dtype=child_detail_output_dtype)
+        if torch.is_tensor(detail_r):
+            detail_r = detail_r.to(dtype=child_detail_output_dtype)
         if not bool(child_detail_train_enabled):
             detail_bg = detail_bg.detach()
             if torch.is_tensor(detail_d):
@@ -3588,7 +3737,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             t_bg_distant = time.perf_counter()
             if bool(parent_runtime_enabled):
                 projector_cfg_runtime = self._stage2_0_parent_runtime_cfg_for_branch("bg")
-                bg_runtime = init_parent_branch_runtime(
+                bg_runtime = self._stage2_0_init_parent_branch_runtime(
                     params={
                         "means": bg_m.means,
                         "scales_log": bg_m.scales_log,
@@ -3611,7 +3760,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 distant_proj = None
                 if distant_m is not None and state.distant is not None:
                     projector_cfg_runtime = self._stage2_0_parent_runtime_cfg_for_branch("distant")
-                    distant_runtime = init_parent_branch_runtime(
+                    distant_runtime = self._stage2_0_init_parent_branch_runtime(
                         params={
                             "means": distant_m.means,
                             "scales_log": distant_m.scales_log,
@@ -3675,7 +3824,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                     "sh_rest": rigid_m.sh_rest.index_select(0, s),
                 }
                 if bool(parent_runtime_enabled):
-                    rigid_runtime = init_parent_branch_runtime(
+                    rigid_runtime = self._stage2_0_init_parent_branch_runtime(
                         params=rigid_params,
                         child_to_parent=active_rigid.child_to_active_parent_S,
                         parent_count=active_rigid.active_parent_count,
@@ -3691,7 +3840,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                         next_parent_runtime.rigid_active = rigid_runtime
                         next_parent_runtime.rigid_active_assignment = active_rigid
                 else:
-                    rigid_proj_active = project_biggs_active_rigid_parents(
+                    rigid_proj_active = self._stage2_0_project_active_rigid_parents(
                         means_world_S=route.means_world_S,
                         quats_world_S=route.quats_world_S,
                         scales_log_S=rigid_m.scales_log.index_select(0, s),
@@ -3806,6 +3955,8 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             )
         if bool(repair_freeze_2d):
             cnn_inputs = self._detach_cnn_inputs_for_repair_training(cnn_inputs)
+        if bool(stage3_enabled):
+            cnn_inputs = self._stage3_cast_feature_cache(cnn_inputs)
         repair_training_aux["iforward/repair_training/features_2d_requires_grad"] = float(
             1.0 if torch.is_tensor(cnn_inputs.get("features_2d")) and bool(cnn_inputs["features_2d"].requires_grad) else 0.0
         )
@@ -3908,6 +4059,12 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 raise ValueError(f"Stage3_0 context dim mismatch: got {int(context_2d.shape[-1])}, expected {context_dim}")
             if int(detail_2d.shape[-1]) != int(detail_dim):
                 raise ValueError(f"Stage3_0 detail dim mismatch: got {int(detail_2d.shape[-1])}, expected {detail_dim}")
+            parent_lift_dtype = self._stage3_parent_lift_dtype(context_2d)
+            child_detail_dtype = self._stage3_child_detail_dtype(detail_2d)
+            parent_context_cache_dtype = self._stage3_parent_context_cache_dtype(context_2d)
+            child_detail_output_dtype = self._stage3_child_detail_output_dtype(detail_2d)
+            parent_context_2d = context_2d.to(dtype=parent_lift_dtype)
+            child_detail_2d = detail_2d.to(dtype=child_detail_dtype)
             if self._stage3_0_memory_aux_enabled() and torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats()
             child_to_parent_global = self._stage2_0_fwhr_child_to_parent_global(
@@ -3931,22 +4088,26 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             )
             anchor_aux.update(self._stage3_0_memory_aux("after_anchor"))
             stage3_anchor_stats = anchor_stats
-            stage3_context_2d = context_2d
-            stage3_detail_2d = detail_2d
+            stage3_context_2d = parent_context_2d
+            stage3_detail_2d = child_detail_2d
             stage3_dino_native_2d = None
             stage3_child_to_parent_global = child_to_parent_global
             parent_lifting_type = str(getattr(self, "stage3_parent_lifting_type", "legacy_direct_lift")).lower()
             parent_reg: Dict[str, torch.Tensor] = {}
             if parent_lifting_type == "legacy_direct_lift":
-                feat_all, acc_all = self._backproject_scene_features_multi_camera(
-                    gaussians_scene=parent_scene,
-                    source_views=source_views,
-                    features_2d=context_2d,
-                    source_pair_valid_mask=cnn_inputs["source_pair_valid_mask"],
-                    height=height,
-                    width=width,
-                    return_debug_stats=bool(getattr(self, "stage2_0_biggs_return_debug_stats", True)),
-                )
+                amp_ctx = self._iforward_amp_autocast() if self._stage3_parent_lift_amp_enabled() else self._iforward_amp_fp32()
+                with amp_ctx:
+                    feat_all, acc_all = self._backproject_scene_features_multi_camera(
+                        gaussians_scene=parent_scene,
+                        source_views=source_views,
+                        features_2d=parent_context_2d,
+                        source_pair_valid_mask=cnn_inputs["source_pair_valid_mask"],
+                        height=height,
+                        width=width,
+                        return_debug_stats=bool(getattr(self, "stage2_0_biggs_return_debug_stats", True)),
+                    )
+                feat_all = feat_all.to(dtype=parent_context_cache_dtype)
+                acc_all = acc_all.to(device=feat_all.device, dtype=torch.float32)
                 parent_aux = {
                     "iforward/stage3/parent_legacy_direct_lift_enabled": 1.0,
                     "iforward/stage3/parent_sparse_gather_enabled": 0.0,
@@ -3954,24 +4115,30 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 }
             elif parent_lifting_type == "sparse_gather":
                 stage3_dino_native_2d = cnn_inputs.get("stage3_dino_native_2d")
-                feat_all, acc_all, parent_aux, parent_reg = self._stage3_0_parent_sparse_gather(
-                    cnn_inputs=cnn_inputs,
-                    anchor_stats=anchor_stats,
-                    bg_proj=bg_proj,
-                    distant_proj=distant_proj,
-                    rigid_proj_active=rigid_proj_active,
-                    parent_optimizer_state=parent_optimizer_state,
-                    height=int(height),
-                    width=int(width),
-                    num_parent_bg=int(m_bg),
-                    num_parent_distant=int(m_d),
-                    num_parent_rigid=int(m_r),
-                )
+                cnn_inputs_parent = dict(cnn_inputs)
+                cnn_inputs_parent["features_2d"] = parent_context_2d
+                amp_ctx = self._iforward_amp_autocast() if self._stage3_parent_lift_amp_enabled() else self._iforward_amp_fp32()
+                with amp_ctx:
+                    feat_all, acc_all, parent_aux, parent_reg = self._stage3_0_parent_sparse_gather(
+                        cnn_inputs=cnn_inputs_parent,
+                        anchor_stats=anchor_stats,
+                        bg_proj=bg_proj,
+                        distant_proj=distant_proj,
+                        rigid_proj_active=rigid_proj_active,
+                        parent_optimizer_state=parent_optimizer_state,
+                        height=int(height),
+                        width=int(width),
+                        num_parent_bg=int(m_bg),
+                        num_parent_distant=int(m_d),
+                        num_parent_rigid=int(m_r),
+                    )
                 parent_aux = {
                     **parent_aux,
                     "iforward/stage3/parent_legacy_direct_lift_enabled": 0.0,
                     "iforward/stage3/parent_sparse_gather_enabled": 1.0,
                 }
+                feat_all = feat_all.to(dtype=parent_context_cache_dtype)
+                acc_all = acc_all.to(device=feat_all.device, dtype=torch.float32)
             else:
                 raise ValueError(f"unsupported Stage3_0 parent lifting type={parent_lifting_type!r}")
             parent_aux.update(self._stage3_0_memory_aux("after_parent_lift"))
@@ -3984,6 +4151,15 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 "iforward/stage3/context_dim": float(context_dim),
                 "iforward/stage3/detail_dim": float(detail_dim),
                 "iforward/stage3/optimizer_prior_present": 1.0 if parent_optimizer_state is not None else 0.0,
+                "amp/dtype/features_2d_cache": float(amp_dtype_id(context_2d.dtype)),
+                "amp/dtype/parent_context_cache": float(amp_dtype_id(feat_all.dtype)),
+                "amp/dtype/child_detail": float(amp_dtype_id(child_detail_output_dtype)),
+                "iforward/stage3/parent_lift_amp_enabled": 1.0 if self._stage3_parent_lift_amp_enabled() else 0.0,
+                "iforward/stage3/parent_lift_dtype_id": float(amp_dtype_id(parent_context_2d.dtype)),
+                "iforward/stage3/parent_context_cache_dtype_id": float(amp_dtype_id(feat_all.dtype)),
+                "iforward/stage3/child_gather_amp_enabled": 1.0 if self._stage3_child_gather_amp_enabled() else 0.0,
+                "iforward/stage3/child_detail_gather_dtype_id": float(amp_dtype_id(child_detail_2d.dtype)),
+                "iforward/stage3/child_detail_output_dtype_id": float(amp_dtype_id(child_detail_output_dtype)),
             }
             child_measurement = {
                 "stage3_anchor_stats": stage3_anchor_stats,
@@ -4352,7 +4528,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         parent_start: Optional[torch.Tensor] = None,
     ) -> Dict[str, float]:
         cfg = self._stage2_0_parent_runtime_cfg_for_branch(str(branch_name))
-        exact = init_parent_branch_runtime(
+        exact = self._stage2_0_init_parent_branch_runtime(
             params=params,
             child_to_parent=child_to_parent,
             parent_count=parent_count,
@@ -4545,7 +4721,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             bg_runtime = None
             if runtime.bg_assignment is not None:
                 bg_cfg = self._stage2_0_parent_runtime_cfg_for_branch("bg")
-                bg_runtime = init_parent_branch_runtime(
+                bg_runtime = self._stage2_0_init_parent_branch_runtime(
                     params=self._stage2_0_params_from_node_state(new_bg),
                     child_to_parent=runtime.bg_assignment.child_to_parent,
                     parent_count=runtime.bg_assignment.parent_count,
@@ -4559,7 +4735,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             distant_runtime = None
             if runtime.distant_assignment is not None and new_distant is not None:
                 distant_cfg = self._stage2_0_parent_runtime_cfg_for_branch("distant")
-                distant_runtime = init_parent_branch_runtime(
+                distant_runtime = self._stage2_0_init_parent_branch_runtime(
                     params=self._stage2_0_params_from_node_state(new_distant),
                     child_to_parent=runtime.distant_assignment.child_to_parent,
                     parent_count=runtime.distant_assignment.parent_count,
@@ -4576,7 +4752,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 s = active.fine_S.long().to(device=self.device)
                 route_new = self._route_rigid_source_points(new_rigid, int(runtime.source_frame_idx), s)
                 rigid_cfg = self._stage2_0_parent_runtime_cfg_for_branch("rigid")
-                rigid_runtime = init_parent_branch_runtime(
+                rigid_runtime = self._stage2_0_init_parent_branch_runtime(
                     params={
                         "means": route_new.means_world_S,
                         "quats": route_new.quats_world_S,
@@ -4635,7 +4811,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         bg_runtime = runtime.bg
         if bg_runtime is not None and runtime.bg_assignment is not None:
             bg_cfg = self._stage2_0_parent_runtime_cfg_for_branch("bg")
-            bg_runtime = update_parent_branch_runtime(
+            bg_runtime = self._stage2_0_update_parent_branch_runtime(
                 runtime=bg_runtime,
                 old_params=self._stage2_0_params_from_node_state(old_bg),
                 new_params=self._stage2_0_params_from_node_state(new_bg),
@@ -4656,7 +4832,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             and new_distant is not None
         ):
             distant_cfg = self._stage2_0_parent_runtime_cfg_for_branch("distant")
-            distant_runtime = update_parent_branch_runtime(
+            distant_runtime = self._stage2_0_update_parent_branch_runtime(
                 runtime=distant_runtime,
                 old_params=self._stage2_0_params_from_node_state(old_distant),
                 new_params=self._stage2_0_params_from_node_state(new_distant),
@@ -4682,7 +4858,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             route_old = self._route_rigid_source_points(old_rigid, int(runtime.source_frame_idx), s)
             route_new = self._route_rigid_source_points(new_rigid, int(runtime.source_frame_idx), s)
             rigid_cfg = self._stage2_0_parent_runtime_cfg_for_branch("rigid")
-            rigid_runtime = update_parent_branch_runtime(
+            rigid_runtime = self._stage2_0_update_parent_branch_runtime(
                 runtime=rigid_runtime,
                 old_params={
                     "means": route_old.means_world_S,
@@ -4765,6 +4941,35 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 if delta.rigid is not None and bool(self.stage6_branch_scope["rigid"].get("enable", True))
                 else None
             ),
+            aux=delta.aux,
+        )
+
+    @staticmethod
+    def _branch_delta_to_float32(delta: Optional[BranchDelta]) -> Optional[BranchDelta]:
+        if delta is None:
+            return None
+
+        def cast(value: torch.Tensor) -> torch.Tensor:
+            return value.float() if torch.is_tensor(value) and torch.is_floating_point(value) else value
+
+        return BranchDelta(
+            means=cast(delta.means),
+            scales_log=cast(delta.scales_log),
+            quat_axis_angle=cast(delta.quat_axis_angle),
+            opacity_logit=cast(delta.opacity_logit),
+            sh=cast(delta.sh),
+            hidden=cast(delta.hidden),
+            confidence=cast(delta.confidence),
+            noop=cast(delta.noop),
+            active_attrs=delta.active_attrs,
+        )
+
+    @classmethod
+    def _delta_pack_to_float32(cls, delta: DeltaPack) -> DeltaPack:
+        return DeltaPack(
+            bg=cls._branch_delta_to_float32(delta.bg),
+            distant=cls._branch_delta_to_float32(delta.distant),
+            rigid=cls._branch_delta_to_float32(delta.rigid),
             aux=delta.aux,
         )
 
@@ -5340,11 +5545,13 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         decoder = getattr(self, "biggs_child_decoder", None)
         if decoder is None:
             raise RuntimeError("Stage2_1 requires runtime.biggs_child_decoder")
-        fine_event = decoder(
-            parent_event_pack=parent_event,
-            local_state=local_state,
-            measurement=measurement,
-        )
+        # GRLD fused decode currently supports FP32 only.
+        with self._iforward_amp_fp32():
+            fine_event = decoder(
+                parent_event_pack=parent_event,
+                local_state=local_state,
+                measurement=measurement,
+            )
         fine_event.obs_code_bg = None
         fine_event.obs_code_distant = None
         fine_event.obs_code_rigid = None
@@ -5408,11 +5615,13 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             near_batch_offsets=self._build_struct_batch_offsets(stage6_to_struct_decoder_input(near_in), device=self.device),
             far_batch_offsets=self._build_struct_batch_offsets(stage6_to_struct_decoder_input(far_in), device=self.device),
         )
-        fine_event = decoder(
-            parent_event_pack=parent_event,
-            local_state=local_state,
-            measurement=measurement,
-        )
+        # GRLD fused decode currently supports FP32 only.
+        with self._iforward_amp_fp32():
+            fine_event = decoder(
+                parent_event_pack=parent_event,
+                local_state=local_state,
+                measurement=measurement,
+            )
         if torch.is_tensor(measurement.get("child_detail_bg")):
             fine_event.appearance_detail = AppearanceDetailPack(
                 detail_bg=measurement["child_detail_bg"],
@@ -5514,13 +5723,16 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         event: Any,
         ctx_vsm: Optional[ContextPack] = None,
     ) -> tuple[LocalGSState, DeltaPack, Dict[str, Any]]:
-        delta, aux = self.stage6_posterior_updater(
-            event=event,
-            ctx_current=None,
-            ctx_vsm=ctx_vsm,
-            appearance_detail=getattr(event, "appearance_detail", None),
-            branch_scope=getattr(self, "stage6_branch_scope", None),
-        )
+        with self._iforward_amp_autocast():
+            delta, aux = self.stage6_posterior_updater(
+                event=event,
+                ctx_current=None,
+                ctx_vsm=ctx_vsm,
+                appearance_detail=getattr(event, "appearance_detail", None),
+                branch_scope=getattr(self, "stage6_branch_scope", None),
+            )
+        delta = self._delta_pack_to_float32(delta)
+        local_state = local_state.to(device=local_state.bg.means.device, dtype=torch.float32)
         self._mem_debug("encode/after_posterior")
         route = event.route
         if delta.rigid is not None and local_state.rigid is not None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 import time
 from typing import Any, Dict, Optional, Tuple, Union
@@ -51,6 +52,12 @@ def _meta_tensor(meta: Dict[str, Any], *names: str) -> Optional[torch.Tensor]:
         if torch.is_tensor(value):
             return value
     return None
+
+
+def _cuda_fp32_context() -> Any:
+    if torch.cuda.is_available():
+        return torch.amp.autocast(device_type="cuda", enabled=False)
+    return nullcontext()
 
 
 def cuda_scalar_anchor_available() -> bool:
@@ -290,6 +297,10 @@ def build_cuda_scalar_anchor_stats(
     packed_ids = _require_meta_tensor(meta, "packed_global_gaussian_ids")
     if not means2d.is_cuda:
         raise RuntimeError("Stage3 cuda_scalar_anchor requires CUDA tensors.")
+    means2d = means2d.to(dtype=torch.float32)
+    conics = conics.to(device=means2d.device, dtype=torch.float32)
+    opacities = opacities.to(device=means2d.device, dtype=torch.float32)
+    depths = depths.to(device=means2d.device, dtype=torch.float32)
     for name, tensor in {
         "means2d": means2d,
         "conics": conics,
@@ -323,29 +334,30 @@ def build_cuda_scalar_anchor_stats(
         event_end = torch.cuda.Event(enable_timing=True)
         event_start.record()
     t_cuda = time.perf_counter()
-    raw = rasterize_scalar_anchor_multi_camera_in_range(
-        range_start=0,
-        range_end=int(1e9),
-        means2d=means2d,
-        conics=conics,
-        opacities=opacities,
-        depths=depths,
-        radii=radii,
-        image_width=int(image_width),
-        image_height=int(image_height),
-        tile_size=int(meta.get("tile_size", 16)),
-        isect_offsets=isect_offsets.to(device=means2d.device, dtype=torch.int32),
-        flatten_ids=flatten_ids.to(device=means2d.device, dtype=torch.int32),
-        packed_global_gaussian_ids=packed_ids.to(device=means2d.device, dtype=torch.long),
-        child_to_parent=ctp,
-        num_children=int(num_children),
-        num_parents=int(num_parents),
-        pair_valid_mask=mask,
-        weight_threshold=float(weight_threshold),
-        anchor_mode=anchor_mode,
-        count_pairs=bool(count_pairs),
-        child_only=bool(child_only),
-    )
+    with _cuda_fp32_context():
+        raw = rasterize_scalar_anchor_multi_camera_in_range(
+            range_start=0,
+            range_end=int(1e9),
+            means2d=means2d,
+            conics=conics,
+            opacities=opacities,
+            depths=depths,
+            radii=radii,
+            image_width=int(image_width),
+            image_height=int(image_height),
+            tile_size=int(meta.get("tile_size", 16)),
+            isect_offsets=isect_offsets.to(device=means2d.device, dtype=torch.int32),
+            flatten_ids=flatten_ids.to(device=means2d.device, dtype=torch.int32),
+            packed_global_gaussian_ids=packed_ids.to(device=means2d.device, dtype=torch.long),
+            child_to_parent=ctp,
+            num_children=int(num_children),
+            num_parents=int(num_parents),
+            pair_valid_mask=mask,
+            weight_threshold=float(weight_threshold),
+            anchor_mode=anchor_mode,
+            count_pairs=bool(count_pairs),
+            child_only=bool(child_only),
+        )
     if event_end is not None:
         event_end.record()
         event_end.synchronize()

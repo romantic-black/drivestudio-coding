@@ -102,17 +102,31 @@ class FakeIForwardBridge(nn.Module):
         delta = _branch_delta(local_state, means)
         return local_state.apply_delta(delta), delta, {"fake_update": 1.0}
 
-    def render_loss(self, *, local_state, batch, target_indices, mask_policy, pred_rgbs_out=None, gt_images_out=None):
+    def render_loss(
+        self,
+        *,
+        local_state,
+        batch,
+        target_indices,
+        mask_policy,
+        pred_rgbs_out=None,
+        gt_images_out=None,
+        return_per_ref_loss=False,
+    ):
         _ = batch, mask_policy
         self.render_calls.append(tuple(int(x) for x in target_indices))
         if not target_indices:
-            return local_state.bg.means.new_tensor(0.0), {"num_refs": 0.0, "valid_ratio": 0.0}
+            loss = local_state.bg.means.new_tensor(0.0)
+            stats = {"num_refs": 0.0, "valid_ratio": 0.0}
+            if return_per_ref_loss:
+                return loss, stats, local_state.bg.means.new_zeros((0,))
+            return loss, stats
         loss = local_state.bg.means.pow(2).mean()
         if pred_rgbs_out is not None:
             pred_rgbs_out.append(local_state.bg.means.new_zeros(1, 1, 3))
         if gt_images_out is not None:
             gt_images_out.append(local_state.bg.means.new_zeros(1, 1, 3))
-        return loss, {
+        stats = {
             "num_refs": float(len(target_indices)),
             "num_metric_refs": float(len(target_indices)),
             "metric_valid": 1.0,
@@ -121,6 +135,9 @@ class FakeIForwardBridge(nn.Module):
             "l1": float(loss.detach().item()),
             "ssim": 0.0,
         }
+        if return_per_ref_loss:
+            return loss, stats, loss.detach().reshape(1).repeat(len(target_indices)).to(dtype=loss.dtype)
+        return loss, stats
 
     def render_loss_for_targets(self, *, local_state, ref_batch, targets, mask_policy, pred_rgbs_out=None, gt_images_out=None):
         _ = ref_batch, mask_policy
@@ -516,6 +533,72 @@ def test_iforward_trainer_applies_grad_clip():
     assert logs["iforward/grad_clip_applied"] is True
     assert logs["iforward/grad_norm_after_clip"] <= 1.1e-4
     assert logs["iforward/grad_norm_unclipped"] >= logs["iforward/grad_norm_after_clip"]
+
+
+class _ScaledLoss:
+    def __init__(self, loss: torch.Tensor, calls: List[str]) -> None:
+        self.loss = loss
+        self.calls = calls
+
+    def backward(self) -> None:
+        self.calls.append("backward")
+        self.loss.backward()
+
+
+class _SkippingScaler:
+    def __init__(self, calls: List[str]) -> None:
+        self.calls = calls
+        self.scale_value = 2.0
+
+    def is_enabled(self) -> bool:
+        return True
+
+    def scale(self, loss: torch.Tensor) -> _ScaledLoss:
+        self.calls.append("scale")
+        return _ScaledLoss(loss, self.calls)
+
+    def unscale_(self, optimizer: torch.optim.Optimizer) -> None:
+        _ = optimizer
+        self.calls.append("unscale")
+
+    def step(self, optimizer: torch.optim.Optimizer) -> None:
+        _ = optimizer
+        self.calls.append("step")
+
+    def update(self) -> None:
+        self.calls.append("update")
+        self.scale_value = 1.0
+
+    def get_scale(self) -> float:
+        return float(self.scale_value)
+
+
+def test_iforward_trainer_amp_skip_keeps_cache_and_unscales_before_clip(monkeypatch):
+    bridge = FakeIForwardBridge()
+    model = IForwardModel(config=None, device=torch.device("cpu"), bridge=bridge, resolver=IForwardBatchResolver())
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    trainer = IForwardTrainer(
+        config={"training": {"grad_clip": {"enable": True, "max_norm": 1.0e-4}}},
+        device=torch.device("cpu"),
+        model=model,
+        optimizer=optimizer,
+    )
+    logs0 = trainer.train_step(_batch(rollout_idx=0), step=0)
+    assert logs0["iforward/state_cache_size"] == 1
+
+    calls: List[str] = []
+    original_clip = torch.nn.utils.clip_grad_norm_
+
+    def _clip(*args, **kwargs):
+        calls.append("clip")
+        return original_clip(*args, **kwargs)
+
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", _clip)
+    trainer.grad_scaler = _SkippingScaler(calls)
+    logs1 = trainer.train_step(_batch(rollout_idx=1, episode_end=True), step=1)
+    assert logs1["amp/optimizer_step_skipped"] == 1.0
+    assert logs1["iforward/state_cache_size"] == 1
+    assert calls.index("unscale") < calls.index("clip") < calls.index("step")
 
 
 def test_drop_short_window_drops_read_but_keeps_short_history_loss():

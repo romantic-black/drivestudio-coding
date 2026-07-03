@@ -56,6 +56,32 @@ def _stats(prefix: str, values: torch.Tensor) -> Dict[str, float]:
     }
 
 
+GDKV_COMPUTE_DTYPE = torch.float32
+
+
+def _resolve_state_dtype(value: torch.dtype | str) -> torch.dtype:
+    if isinstance(value, torch.dtype):
+        if value in {torch.float32, torch.float16, torch.bfloat16}:
+            return value
+        raise ValueError(f"unsupported GDKV state dtype={value!r}")
+    name = str(value).strip().lower()
+    if name in {"fp32", "float32", "32", "none", "off", "false"}:
+        return torch.float32
+    if name in {"fp16", "float16", "half", "16"}:
+        return torch.float16
+    if name in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    raise ValueError(f"unsupported GDKV state dtype={name!r}")
+
+
+def _dtype_id(dtype: torch.dtype) -> float:
+    if dtype is torch.float16:
+        return 1.0
+    if dtype is torch.bfloat16:
+        return 2.0
+    return 0.0
+
+
 @dataclass
 class DeltaKVCellState:
     kv_state: torch.Tensor
@@ -82,6 +108,7 @@ class LowRankGatedDeltaKVCell(nn.Module):
         decay_min: Optional[Dict[str, float] | float] = None,
         query_rms_unit: bool = True,
         key_rms_unit: bool = True,
+        state_dtype: torch.dtype | str = torch.float32,
     ) -> None:
         super().__init__()
         self.event_dim = int(event_dim)
@@ -98,6 +125,8 @@ class LowRankGatedDeltaKVCell(nn.Module):
         self.decay_bias = float(decay_bias)
         self.query_rms_unit = bool(query_rms_unit)
         self.key_rms_unit = bool(key_rms_unit)
+        self.state_dtype = _resolve_state_dtype(state_dtype)
+        self.state_dtype_id = _dtype_id(self.state_dtype)
         if hasattr(decay_min, "items"):
             self.decay_min_by_kind = {str(k): float(v) for k, v in dict(decay_min).items()}
         elif decay_min is None:
@@ -130,15 +159,16 @@ class LowRankGatedDeltaKVCell(nn.Module):
         )
 
     def read(self, event: torch.Tensor, state: DeltaKVCellState) -> Tuple[torch.Tensor, Dict[str, float]]:
-        q_raw = self.q_proj(event)
+        q_raw = self.q_proj(event).float()
         q = (rms_unit(q_raw, dim=-1) if self.query_rms_unit else q_raw) / math.sqrt(float(self.key_dim))
-        ctx = torch.einsum("nkv,nk->nv", state.kv_state.to(device=event.device, dtype=event.dtype), q)
-        ctx = rms_clamp(ctx, self.ctx_rms_max, dims=(-1,))
+        kv_state = state.kv_state.to(device=event.device, dtype=GDKV_COMPUTE_DTYPE)
+        ctx = torch.einsum("nkv,nk->nv", kv_state, q)
+        ctx = rms_clamp(ctx, self.ctx_rms_max, dims=(-1,)).float()
         seen = state.seen.to(device=event.device, dtype=torch.bool)
         ctx = torch.where(seen[:, None], ctx, torch.zeros_like(ctx))
         if not torch.isfinite(ctx).all():
             raise RuntimeError("LowRankGatedDeltaKVCell read produced NaN/Inf")
-        aux = {}
+        aux = {"state_dtype_id": float(self.state_dtype_id)}
         aux.update(_stats("ctx_rms", _rms_rows(ctx, dims=(-1,))))
         aux.update(_stats("query_rms", _rms_rows(q, dims=(-1,))))
         return ctx, aux
@@ -166,9 +196,13 @@ class LowRankGatedDeltaKVCell(nn.Module):
         visit_meta: Optional[VisitMeta | Dict[str, object] | object] = None,
     ) -> Tuple[DeltaKVCellState, Dict[str, float]]:
         if int(token.shape[0]) == 0:
-            return state, {
+            return DeltaKVCellState(
+                kv_state=state.kv_state.to(device=token.device, dtype=self.state_dtype),
+                seen=state.seen.to(device=token.device, dtype=torch.bool),
+            ), {
                 "state_rms_mean": 0.0,
                 "state_rms_max": 0.0,
+                "state_dtype_id": float(self.state_dtype_id),
                 "key_rms_mean": 0.0,
                 "key_rms_max": 0.0,
                 "value_rms_mean": 0.0,
@@ -180,33 +214,35 @@ class LowRankGatedDeltaKVCell(nn.Module):
                 "decay_mean": 0.0,
                 "decay_max": 0.0,
             }
-        s_old = state.kv_state.to(device=token.device, dtype=token.dtype)
+        s_old = state.kv_state.to(device=token.device, dtype=GDKV_COMPUTE_DTYPE)
         seen_old = state.seen.to(device=token.device, dtype=torch.bool)
-        k_raw = self.key_proj(token)
+        k_raw = self.key_proj(token).float()
         k = (rms_unit(k_raw, dim=-1) if self.key_rms_unit else k_raw) / math.sqrt(float(self.key_dim))
-        v = rms_clamp(self.value_proj(token), self.value_rms_max, dims=(-1,))
-        erase = torch.sigmoid(self.erase_proj(token) + self.erase_bias) * float(self.erase_gate_max)
-        write = torch.sigmoid(self.write_proj(token) + self.write_bias) * float(self.write_gate_max)
+        v = rms_clamp(self.value_proj(token).float(), self.value_rms_max, dims=(-1,)).float()
+        erase = torch.sigmoid(self.erase_proj(token).float() + float(self.erase_bias)) * float(self.erase_gate_max)
+        write = torch.sigmoid(self.write_proj(token).float() + float(self.write_bias)) * float(self.write_gate_max)
         decay_min = self._decay_min(visit_meta)
-        decay = float(decay_min) + (1.0 - float(decay_min)) * torch.sigmoid(self.decay_proj(token) + self.decay_bias)
+        decay = float(decay_min) + (1.0 - float(decay_min)) * torch.sigmoid(
+            self.decay_proj(token).float() + float(self.decay_bias)
+        )
         s_decay = s_old * decay[:, :, None]
         old = torch.einsum("nkv,nk->nv", s_decay, erase * k)
         s_erased = s_decay - torch.einsum("nk,nv->nkv", k, old)
         s_write = s_erased + torch.einsum("nk,nv->nkv", k, write * v)
-        s_new = rms_clamp(s_write, self.state_rms_max, dims=(-2, -1))
+        s_new = rms_clamp(s_write, self.state_rms_max, dims=(-2, -1)).float()
         mask = write_mask.to(device=token.device, dtype=torch.bool)
         kv_state = torch.where(mask[:, None, None], s_new, s_old)
         seen = seen_old | mask
         if not torch.isfinite(kv_state).all():
             raise RuntimeError("LowRankGatedDeltaKVCell write produced NaN/Inf")
-        aux = {}
+        aux = {"state_dtype_id": float(self.state_dtype_id)}
         aux.update(_stats("state_rms", _rms_rows(kv_state, dims=(-2, -1))))
         aux.update(_stats("key_rms", _rms_rows(k, dims=(-1,))))
         aux.update(_stats("value_rms", _rms_rows(v, dims=(-1,))))
         aux.update(_stats("erase_gate", erase.detach().float().mean(dim=-1)))
         aux.update(_stats("write_gate", write.detach().float().mean(dim=-1)))
         aux.update(_stats("decay", decay.detach().float().mean(dim=-1)))
-        return DeltaKVCellState(kv_state=kv_state, seen=seen), aux
+        return DeltaKVCellState(kv_state=kv_state.to(dtype=self.state_dtype), seen=seen), aux
 
 
 def _empty_delta_dense(
@@ -445,6 +481,7 @@ class ParentOptimizerGatedDeltaKV(nn.Module):
         include_parent_event: bool = True,
         include_delta_summary: bool = True,
         include_visit_embedding: bool = True,
+        state_dtype: torch.dtype | str = torch.float32,
     ) -> None:
         super().__init__()
         self.event_dim = int(event_dim)
@@ -453,6 +490,8 @@ class ParentOptimizerGatedDeltaKV(nn.Module):
         self.support_min = float(support_min)
         self.dense_bg = bool(dense_bg)
         self.dense_distant = bool(dense_distant)
+        self.state_dtype = _resolve_state_dtype(state_dtype)
+        self.state_dtype_id = _dtype_id(self.state_dtype)
         self.visit_embedding = OptimizerVisitEmbedding(output_dim=int(visit_dim))
         self.cells = nn.ModuleDict(
             {
@@ -473,6 +512,7 @@ class ParentOptimizerGatedDeltaKV(nn.Module):
                     decay_min=decay_min,
                     query_rms_unit=bool(query_rms_unit),
                     key_rms_unit=bool(key_rms_unit),
+                    state_dtype=self.state_dtype,
                 )
                 for branch in ("bg", "distant", "rigid")
             }
@@ -518,7 +558,13 @@ class ParentOptimizerGatedDeltaKV(nn.Module):
         visit_meta: Optional[VisitMeta | Dict[str, object] | object],
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, float]]:
         cell = self.cells[str(branch)]
-        base = _ensure_delta_dense(cell, None if state is None else state.dense, rows=int(x.shape[0]), device=x.device, dtype=x.dtype)
+        base = _ensure_delta_dense(
+            cell,
+            None if state is None else state.dense,
+            rows=int(x.shape[0]),
+            device=x.device,
+            dtype=self.state_dtype,
+        )
         seen = base.seen[: int(x.shape[0])].to(device=x.device, dtype=torch.bool)
         visit = self._visit(visit_meta, ref=x, rows=int(x.shape[0]))
         cell_state = DeltaKVCellState(
@@ -543,11 +589,23 @@ class ParentOptimizerGatedDeltaKV(nn.Module):
                 x.new_zeros((0, self.ctx_dim)),
                 x.new_zeros((0,), dtype=torch.bool),
                 x.new_zeros((0, self.visit_dim)),
-                {"ctx_rms_mean": 0.0, "ctx_rms_max": 0.0, "query_rms_mean": 0.0, "query_rms_max": 0.0},
+                {
+                    "ctx_rms_mean": 0.0,
+                    "ctx_rms_max": 0.0,
+                    "query_rms_mean": 0.0,
+                    "query_rms_max": 0.0,
+                    "state_dtype_id": float(self.state_dtype_id),
+                },
             )
         cell = self.cells[str(branch)]
         keys_u, inverse, x_u = _weighted_aggregate(x, keys.to(device=x.device, dtype=torch.long), support=support)
-        cell_state, _ = _gather_delta_keyed(cell, None if state is None else state.keyed, keys_u, device=x.device, dtype=x.dtype)
+        cell_state, _ = _gather_delta_keyed(
+            cell,
+            None if state is None else state.keyed,
+            keys_u,
+            device=x.device,
+            dtype=self.state_dtype,
+        )
         seen_u = cell_state.seen.to(device=x.device, dtype=torch.bool)
         visit_u = self._visit(visit_meta, ref=x_u, rows=int(keys_u.numel()))
         out_u, aux = cell.read(x_u, cell_state)
@@ -698,6 +756,7 @@ class ParentOptimizerGatedDeltaKV(nn.Module):
             for key, value in branch_aux.items():
                 aux[f"iforward/parent_optimizer_gdkv/{branch}_{key}"] = float(value)
         aux["iforward/parent_optimizer_gdkv/read"] = 1.0
+        aux["iforward/parent_optimizer_gdkv/state_dtype_id"] = float(self.state_dtype_id)
         aux["iforward/parent_optimizer_mamba/read"] = 1.0
         aux["iforward/parent_optimizer_memory/type_id"] = 1.0
         aux["iforward/parent_optimizer_memory/is_gdkv"] = 1.0
@@ -760,7 +819,13 @@ class ParentOptimizerGatedDeltaKV(nn.Module):
         write = self._valid_write_mask(x, valid, support)
         assert write is not None
         cell = self.cells[str(branch)]
-        base = _ensure_delta_dense(cell, branch_state.dense, rows=int(x.shape[0]), device=x.device, dtype=x.dtype)
+        base = _ensure_delta_dense(
+            cell,
+            branch_state.dense,
+            rows=int(x.shape[0]),
+            device=x.device,
+            dtype=self.state_dtype,
+        )
         old_seen = base.seen[: int(x.shape[0])].to(device=x.device, dtype=torch.bool)
         cell_state = DeltaKVCellState(
             kv_state=base.kv_state[: int(x.shape[0])],
@@ -818,7 +883,13 @@ class ParentOptimizerGatedDeltaKV(nn.Module):
         write_counts.index_add_(0, inverse, write.to(dtype=x.dtype))
         write_u = write_counts > 0
         cell = self.cells[str(branch)]
-        cell_state, meta_state = _gather_delta_keyed(cell, branch_state.keyed, keys_u, device=x.device, dtype=x.dtype)
+        cell_state, meta_state = _gather_delta_keyed(
+            cell,
+            branch_state.keyed,
+            keys_u,
+            device=x.device,
+            dtype=self.state_dtype,
+        )
         updated, cell_aux = cell.write(x_u, cell_state, write_mask=write_u, visit_meta=visit_meta)
         meta_vals = self._meta_values(visit_meta, device=x.device)
         meta_state = {str(k): v.clone() for k, v in meta_state.items()}
@@ -846,7 +917,7 @@ class ParentOptimizerGatedDeltaKV(nn.Module):
             meta_state,
             write_mask=write_u,
             device=x.device,
-            dtype=x.dtype,
+            dtype=self.state_dtype,
         )
         return DeltaKVOptimizerBranchState(dense=branch_state.dense, keyed=keyed), self._written_aux(
             "gdkv",
@@ -947,6 +1018,7 @@ class ParentOptimizerGatedDeltaKV(nn.Module):
             **aux_rigid,
             "iforward/parent_optimizer_gdkv/write": 1.0,
             "iforward/parent_optimizer_gdkv/global_update_step": float(next_state.global_update_step),
+            "iforward/parent_optimizer_gdkv/state_dtype_id": float(self.state_dtype_id),
             "iforward/parent_optimizer_mamba/write": 1.0,
             "iforward/parent_optimizer_mamba/global_update_step": float(next_state.global_update_step),
             "iforward/parent_optimizer_memory/type_id": 1.0,

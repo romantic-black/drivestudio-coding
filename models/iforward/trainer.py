@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 
+from .amp_policy import amp_dtype_name, build_amp_policy, make_grad_scaler
 from .model import IForwardModel, IForwardRolloutOutput
 from .state import IForwardState
 from .utils import cfg_get
@@ -30,6 +31,9 @@ class IForwardTrainer(nn.Module):
         self._optimizer_group_names: List[str] = []
         self._optimizer_group_param_ids: Dict[str, List[int]] = {}
         self.optimizer = optimizer if optimizer is not None else self._build_optimizer(config)
+        self.amp_policy = build_amp_policy(config)
+        self.model.amp_policy = build_amp_policy(config, inference_only=True)
+        self.grad_scaler = make_grad_scaler(config, self.amp_policy)
         self._apply_trainability_schedule(0)
         self._state_cache: Dict[Tuple[int, int, int], IForwardState] = {}
         self._random_window_metric_cache: Dict[Tuple[int, int, int, int], Dict[str, float]] = {}
@@ -462,7 +466,7 @@ class IForwardTrainer(nn.Module):
                 continue
             grad = param.grad.detach()
             ref = grad
-            value = grad.pow(2).sum()
+            value = grad.float().pow(2).sum()
             total = value if total is None else total + value
         if total is None:
             if ref is not None:
@@ -724,7 +728,8 @@ class IForwardTrainer(nn.Module):
             )
         self._sync_cuda(profile_cuda)
         t0 = time.perf_counter()
-        out = self.model.forward_rollout(batch, carried_state=carried, ablation=ablation)
+        with self.amp_policy.autocast():
+            out = self.model.forward_rollout(batch, carried_state=carried, ablation=ablation)
         self._sync_cuda(profile_cuda)
         timings["forward_ms"] = (time.perf_counter() - t0) * 1000.0
         if profile_memory:
@@ -737,7 +742,11 @@ class IForwardTrainer(nn.Module):
         loss = out.loss
         self._sync_cuda(profile_cuda)
         t0 = time.perf_counter()
-        loss.backward()
+        scaler_enabled = bool(getattr(self.grad_scaler, "is_enabled", lambda: False)())
+        if scaler_enabled:
+            self.grad_scaler.scale(loss).backward()
+        else:
+            loss.backward()
         self._sync_cuda(profile_cuda)
         timings["backward_ms"] = (time.perf_counter() - t0) * 1000.0
         if profile_memory:
@@ -755,22 +764,32 @@ class IForwardTrainer(nn.Module):
         grad_clip_invoked = bool(grad_clip_enable and params_with_grad)
         grad_clip_was_active = False
         grad_clip_scale = 1.0
+        if scaler_enabled:
+            self.grad_scaler.unscale_(self.optimizer)
         if grad_clip_enable and params_with_grad:
             unclipped = torch.nn.utils.clip_grad_norm_(params_with_grad, max_norm=float(grad_clip_max_norm))
-            grad_norm_unclipped = torch.as_tensor(unclipped, device=loss.device, dtype=loss.dtype)
+            grad_norm_unclipped = torch.as_tensor(unclipped, device=loss.device, dtype=torch.float32)
         else:
-            grad_norm_unclipped = self._grad_norm(params_with_grad).to(device=loss.device)
-        if not torch.isfinite(grad_norm_unclipped).all():
+            grad_norm_unclipped = self._grad_norm(params_with_grad).to(device=loss.device, dtype=torch.float32)
+        grad_norm_unclipped_finite = bool(torch.isfinite(grad_norm_unclipped).all().detach().item())
+        nonfinite_grad_count = 0.0 if bool(grad_norm_unclipped_finite) else 1.0
+        if not bool(grad_norm_unclipped_finite) and not bool(scaler_enabled):
             raise RuntimeError("IForward gradient norm became NaN/Inf.")
         if grad_clip_enable and params_with_grad:
             grad_norm_value = float(grad_norm_unclipped.detach().item())
-            if grad_norm_value > float(grad_clip_max_norm):
+            if math.isfinite(grad_norm_value) and grad_norm_value > float(grad_clip_max_norm):
                 grad_clip_was_active = True
                 grad_clip_scale = float(grad_clip_max_norm) / max(float(grad_norm_value), 1.0e-12)
-            grad_norm_after_clip = grad_norm_unclipped.new_tensor(min(float(grad_norm_value), float(grad_clip_max_norm)))
+                grad_norm_after_clip = grad_norm_unclipped.new_tensor(min(float(grad_norm_value), float(grad_clip_max_norm)))
+            elif math.isfinite(grad_norm_value):
+                grad_norm_after_clip = grad_norm_unclipped
+            else:
+                grad_clip_was_active = True
+                grad_clip_scale = 0.0
+                grad_norm_after_clip = grad_norm_unclipped
         else:
             grad_norm_after_clip = grad_norm_unclipped
-        if not torch.isfinite(grad_norm_after_clip).all():
+        if not torch.isfinite(grad_norm_after_clip).all() and not bool(scaler_enabled):
             raise RuntimeError("IForward clipped gradient norm became NaN/Inf.")
         group_metrics = self._optimizer_group_metrics()
         adapter_metrics = self._adapter_metrics()
@@ -784,7 +803,15 @@ class IForwardTrainer(nn.Module):
             )
         self._sync_cuda(profile_cuda)
         t0 = time.perf_counter()
-        self.optimizer.step()
+        optimizer_step_skipped = False
+        if scaler_enabled:
+            scale_before = float(self.grad_scaler.get_scale())
+            self.grad_scaler.step(self.optimizer)
+            self.grad_scaler.update()
+            scale_after = float(self.grad_scaler.get_scale())
+            optimizer_step_skipped = bool(scale_after < scale_before)
+        else:
+            self.optimizer.step()
         self.optimizer.zero_grad(set_to_none=True)
         self._sync_cuda(profile_cuda)
         timings["optimizer_ms"] += (time.perf_counter() - t0) * 1000.0
@@ -798,11 +825,12 @@ class IForwardTrainer(nn.Module):
 
         t0 = time.perf_counter()
         runtime_reset_after: Dict[str, int] = {}
-        if bool(out.resolved.carry_scene_state_after_rollout) and not bool(out.resolved.episode_end_after_rollout):
-            self._state_cache[key] = out.next_state.detach_for_next_rollout()
-        else:
-            self._state_cache.pop(key, None)
-            runtime_reset_after = self._reset_bridge_runtime_node_state()
+        if not bool(optimizer_step_skipped):
+            if bool(out.resolved.carry_scene_state_after_rollout) and not bool(out.resolved.episode_end_after_rollout):
+                self._state_cache[key] = out.next_state.detach_for_next_rollout()
+            else:
+                self._state_cache.pop(key, None)
+                runtime_reset_after = self._reset_bridge_runtime_node_state()
         timings["state_cache_ms"] += (time.perf_counter() - t0) * 1000.0
         if profile_memory:
             self._record_cuda_memory_snapshot(
@@ -871,6 +899,10 @@ class IForwardTrainer(nn.Module):
             "iforward/grad_clip_applied": bool(grad_clip_was_active),
             "iforward/runtime_node_state_reset_before": bool(runtime_reset_before),
             "iforward/runtime_node_state_reset_after": bool(runtime_reset_after),
+            "amp/dtype": amp_dtype_name(self.amp_policy.dtype),
+            "amp/grad_scale": float(self.grad_scaler.get_scale()) if hasattr(self.grad_scaler, "get_scale") else 1.0,
+            "amp/optimizer_step_skipped": 1.0 if bool(optimizer_step_skipped) else 0.0,
+            "amp/nonfinite_grad_count": float(nonfinite_grad_count),
             "num_targets": int(out.stats.get("num_targets", 0)),
             "num_source_views": int(out.stats.get("num_source_views", 0)),
             "num_gaussians_bg": int(out.stats.get("num_gaussians_bg", 0)),
@@ -883,6 +915,7 @@ class IForwardTrainer(nn.Module):
             "image_roles": [str(role) for role in out.image_roles],
         }
         final["iforward/scheduler_version"] = str(out.resolved.scheduler_version)
+        final.update(self.amp_policy.metrics())
         final["iforward/window_block_ids"] = [int(x) for x in tuple(out.resolved.window_block_ids)]
         if str(out.resolved.scheduler_version) in {
             "iforward_2_3_scheduler_v3_optimizer_mamba",

@@ -11,6 +11,7 @@ import torch.nn as nn
 
 from models.streetforward.stage6_0 import DeltaPack, LocalGSState
 
+from .amp_policy import build_amp_policy, storage_dtype_from_name
 from .adc_lite import (
     ADC_STAT_PREFIX,
     GateSuppressedADCAccumulator,
@@ -472,6 +473,7 @@ class IForwardModel(nn.Module):
         super().__init__()
         self.config = config
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.amp_policy = build_amp_policy(config, inference_only=True)
         if resolver is not None:
             self.resolver = resolver
         else:
@@ -838,6 +840,14 @@ class IForwardModel(nn.Module):
                             include_parent_event=include_parent_event,
                             include_delta_summary=include_delta_summary,
                             include_visit_embedding=include_visit_embedding,
+                            state_dtype=storage_dtype_from_name(
+                                cfg_get(
+                                    cfg_get(cfg_get(cfg_get(self.config, "training", {}) or {}, "amp", {}) or {}, "memory", {}) or {},
+                                    "gdkv_state_dtype",
+                                    "fp32",
+                                ),
+                                amp_dtype=self.amp_policy.dtype,
+                            ),
                         )
                     else:
                         self.parent_temporal_mamba = ParentOptimizerMamba(
@@ -1025,6 +1035,11 @@ class IForwardModel(nn.Module):
     def _nvtx_range(self, name: str) -> Any:
         if bool(self.enable_nvtx_ranges) and torch.cuda.is_available():
             return torch.cuda.nvtx.range(name)
+        return nullcontext()
+
+    def _amp_fp32_context(self, *, enabled: bool = True) -> Any:
+        if bool(enabled):
+            return self.amp_policy.fp32()
         return nullcontext()
 
     def load_init_checkpoint_payload(
@@ -2088,13 +2103,14 @@ class IForwardModel(nn.Module):
             history_damage_indices = list(resolved.history_rollout_target_indices)
             if history_damage_indices:
                 with torch.no_grad():
-                    _before_loss, _before_stats, before_per_ref = self.bridge.render_loss(
-                        local_state=local_state,
-                        batch=batch,
-                        target_indices=history_damage_indices,
-                        mask_policy=str(getattr(self.bridge, "current_mask_policy", "non_sky_non_egocar")),
-                        return_per_ref_loss=True,
-                    )
+                    with self._amp_fp32_context(enabled=bool(self.amp_policy.render_force_fp32)):
+                        _before_loss, _before_stats, before_per_ref = self.bridge.render_loss(
+                            local_state=local_state,
+                            batch=batch,
+                            target_indices=history_damage_indices,
+                            mask_policy=str(getattr(self.bridge, "current_mask_policy", "non_sky_non_egocar")),
+                            return_per_ref_loss=True,
+                        )
                 history_damage_probe = HistoryDamageProbe(
                     target_indices=[int(x) for x in history_damage_indices],
                     before_per_ref=before_per_ref.detach(),
@@ -2769,22 +2785,23 @@ class IForwardModel(nn.Module):
         rollout_mem_prev = _record_stage_mem("after_rollout_loop", out=rollout_mem_aux, prev=rollout_mem_prev)
         t0 = time.perf_counter()
         with self._nvtx_range("iforward/final_render"):
-            (
-                final_losses,
-                final_stats,
-                pred_rgbs,
-                gt_images,
-                image_refs,
-                image_roles,
-                final_render_pack,
-            ) = self._render_final_losses(
-                local_state=local_state,
-                batch=batch,
-                resolved=resolved,
-                carried_state=prior_state_for_history,
-                ablation=module_ablation_name,
-                in_rollout_history_loss_weight=float(in_rollout_history_loss_weight),
-            )
+            with self._amp_fp32_context(enabled=bool(self.amp_policy.render_force_fp32)):
+                (
+                    final_losses,
+                    final_stats,
+                    pred_rgbs,
+                    gt_images,
+                    image_refs,
+                    image_roles,
+                    final_render_pack,
+                ) = self._render_final_losses(
+                    local_state=local_state,
+                    batch=batch,
+                    resolved=resolved,
+                    carried_state=prior_state_for_history,
+                    ablation=module_ablation_name,
+                    in_rollout_history_loss_weight=float(in_rollout_history_loss_weight),
+                )
         timings["final_render_ms"] += (time.perf_counter() - t0) * 1000.0
         rollout_mem_prev = _record_stage_mem("after_final_render", out=rollout_mem_aux, prev=rollout_mem_prev)
         is_sequence10_scheduler = str(getattr(resolved, "scheduler_version", "")) == IFORWARD_SEQUENCE10_SCHEDULER_VERSION
@@ -2860,13 +2877,14 @@ class IForwardModel(nn.Module):
         history_damage_loss = local_state.bg.means.new_tensor(0.0)
         history_damage_num_refs = 0
         if history_damage_probe is not None and history_damage_probe.valid:
-            _after_loss, _after_stats, after_per_ref = self.bridge.render_loss(
-                local_state=local_state,
-                batch=batch,
-                target_indices=list(history_damage_probe.target_indices),
-                mask_policy=str(getattr(self.bridge, "current_mask_policy", "non_sky_non_egocar")),
-                return_per_ref_loss=True,
-            )
+            with self._amp_fp32_context(enabled=bool(self.amp_policy.render_force_fp32)):
+                _after_loss, _after_stats, after_per_ref = self.bridge.render_loss(
+                    local_state=local_state,
+                    batch=batch,
+                    target_indices=list(history_damage_probe.target_indices),
+                    mask_policy=str(getattr(self.bridge, "current_mask_policy", "non_sky_non_egocar")),
+                    return_per_ref_loss=True,
+                )
             history_damage_loss = history_damage_hinge(
                 after_per_ref=after_per_ref,
                 before_per_ref=history_damage_probe.before_per_ref.to(device=after_per_ref.device, dtype=after_per_ref.dtype),
@@ -3041,17 +3059,19 @@ class IForwardModel(nn.Module):
                         aabb_max=adc_aabb_max,
                     )
 
-        total = (
-            self.loss_current_weight * final_losses["current"]
-            + self.loss_nearby_weight * final_losses["nearby"]
-            + float(in_rollout_history_loss_weight) * final_losses["in_rollout_history"]
-            + self.loss_short_window_history_weight * final_losses["short_window_history"]
-            + self.loss_delta_reg_weight * final_losses["delta_regularization"]
-            + final_losses["stage3_gather_regularization"]
-            + self.hsp_damage_loss_weight * final_losses["hsp_damage_loss"]
-            + float(getattr(self, "loss_hgv2_gate_weight", 0.0)) * final_losses["hgv2_gate"]
-            + float(history_damage_weight) * final_losses["history_damage"]
-        )
+        with self._amp_fp32_context(enabled=bool(self.amp_policy.loss_force_fp32)):
+            final_losses = {name: value.float() if torch.is_tensor(value) else value for name, value in final_losses.items()}
+            total = (
+                self.loss_current_weight * final_losses["current"]
+                + self.loss_nearby_weight * final_losses["nearby"]
+                + float(in_rollout_history_loss_weight) * final_losses["in_rollout_history"]
+                + self.loss_short_window_history_weight * final_losses["short_window_history"]
+                + self.loss_delta_reg_weight * final_losses["delta_regularization"]
+                + final_losses["stage3_gather_regularization"]
+                + self.hsp_damage_loss_weight * final_losses["hsp_damage_loss"]
+                + float(getattr(self, "loss_hgv2_gate_weight", 0.0)) * final_losses["hgv2_gate"]
+                + float(history_damage_weight) * final_losses["history_damage"]
+            )
         if not torch.isfinite(total).all():
             raise RuntimeError("IForward rollout loss became NaN/Inf.")
         rollout_mem_prev = _record_stage_mem("after_total_loss", out=rollout_mem_aux, prev=rollout_mem_prev)

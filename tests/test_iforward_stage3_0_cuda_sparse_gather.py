@@ -107,6 +107,31 @@ def test_cuda_sparse_gather_forward_matches_pytorch_reference() -> None:
 
 
 @pytest.mark.skipif(not _cuda_sparse_available(), reason="Stage3 CUDA sparse gather op unavailable")
+def test_cuda_sparse_gather_force_fp32_kernel_under_autocast() -> None:
+    device = torch.device("cuda")
+    feature = torch.arange(18, device=device, dtype=torch.float16).reshape(2, 3, 3, 1)
+    uv = torch.tensor(
+        [[[[1.0, 1.0]], [[2.0, 1.0]]], [[[0.0, 2.0]], [[1.0, 0.0]]]],
+        device=device,
+        dtype=torch.float16,
+    )
+    weights = torch.ones((2, 2, 1), device=device, dtype=torch.float16)
+    valid = torch.ones((2, 2, 1), device=device, dtype=torch.bool)
+    with torch.amp.autocast(device_type="cuda", dtype=torch.float16, enabled=True):
+        out, _inbound, backend = sparse_gather_2d(
+            feature,
+            uv,
+            weights,
+            valid,
+            image_height=3,
+            image_width=3,
+            backend="cuda",
+        )
+    assert backend == "cuda"
+    assert out.dtype is torch.float32
+
+
+@pytest.mark.skipif(not _cuda_sparse_available(), reason="Stage3 CUDA sparse gather op unavailable")
 def test_cuda_sparse_gather_backward_matches_pytorch_reference() -> None:
     device = torch.device("cuda")
     torch.manual_seed(7)

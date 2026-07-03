@@ -18,8 +18,8 @@ def stage3_gather_regularization(
             break
     if ref is None:
         return torch.tensor(0.0), {}
-    offset = terms.get("offset_l2", ref.new_tensor(0.0))
-    oob = terms.get("out_of_bounds", ref.new_tensor(0.0))
+    offset = terms.get("offset_l2", ref.new_tensor(0.0)).float()
+    oob = terms.get("out_of_bounds", ref.new_tensor(0.0)).float()
     loss = float(offset_l2_weight) * offset + float(out_of_bounds_weight) * oob
     return loss, {
         "iforward/stage3/loss_offset_l2_raw": float(offset.detach().item()),

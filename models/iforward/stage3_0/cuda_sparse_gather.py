@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Literal, Optional, Tuple
 
 import torch
@@ -7,6 +8,12 @@ import torch
 from .sparse_grid_sample import prepare_value_nchw, sparse_grid_sample_prepared
 
 SparseGatherBackend = Literal["auto", "cuda", "pytorch"]
+
+
+def _cuda_fp32_context():
+    if torch.cuda.is_available():
+        return torch.amp.autocast(device_type="cuda", enabled=False)
+    return nullcontext()
 
 
 def cuda_sparse_gather_available() -> bool:
@@ -181,19 +188,27 @@ def sparse_gather_2d(
         raise ValueError("weights/valid must match uv.shape[:3]")
     if valid.dtype != torch.bool:
         valid = valid.to(dtype=torch.bool)
-    if backend != "pytorch" and can_use_cuda_sparse_gather(feature_map, backend=backend):
-        if uv.dtype != torch.float32 or weights.dtype != torch.float32:
+    cuda_feature = feature_map
+    cuda_uv = uv
+    cuda_weights = weights
+    if backend != "pytorch" and feature_map.is_cuda:
+        cuda_feature = feature_map.to(dtype=torch.float32)
+        cuda_uv = uv.to(device=feature_map.device, dtype=torch.float32)
+        cuda_weights = weights.to(device=feature_map.device, dtype=torch.float32)
+    if backend != "pytorch" and can_use_cuda_sparse_gather(cuda_feature, backend=backend):
+        if cuda_uv.dtype != torch.float32 or cuda_weights.dtype != torch.float32:
             if backend == "cuda":
                 raise RuntimeError("Stage3 CUDA sparse gather v1 requires float32 uv and weights.")
         else:
-            out, inbound = _SparseGather2DFunction.apply(
-                feature_map,
-                uv,
-                weights,
-                valid,
-                int(image_height),
-                int(image_width),
-            )
+            with _cuda_fp32_context():
+                out, inbound = _SparseGather2DFunction.apply(
+                    cuda_feature,
+                    cuda_uv,
+                    cuda_weights,
+                    valid,
+                    int(image_height),
+                    int(image_width),
+                )
             return out, inbound, "cuda"
     out, inbound = sparse_gather_2d_pytorch_reference(
         feature_map,
