@@ -77,6 +77,7 @@ class FakeIForwardBridge(nn.Module):
         self.delta_scale = nn.Parameter(torch.tensor(0.05))
         self.observe_calls: List[Tuple[int, Tuple[int, ...]]] = []
         self.render_calls: List[Tuple[int, ...]] = []
+        self.runtime_reset_calls = 0
         self.bg = _node_state()
 
     def make_local_state(self, *, batch: Dict[str, Any]):
@@ -153,6 +154,10 @@ class FakeIForwardBridge(nn.Module):
     def delta_regularization(self, delta, *, local_state):
         _ = local_state
         return delta.bg.means.pow(2).mean() * 0.0, {"delta_l2": 0.0}
+
+    def reset_runtime_node_state(self) -> Dict[str, int]:
+        self.runtime_reset_calls += 1
+        return {"runtime_reset_calls": int(self.runtime_reset_calls)}
 
 
 def _batch(*, rollout_idx=0, episode_end=False, repeat_only=False, episode_id=3):
@@ -585,6 +590,7 @@ def test_iforward_trainer_amp_skip_keeps_cache_and_unscales_before_clip(monkeypa
     )
     logs0 = trainer.train_step(_batch(rollout_idx=0), step=0)
     assert logs0["iforward/state_cache_size"] == 1
+    reset_calls_before_skip = int(bridge.runtime_reset_calls)
 
     calls: List[str] = []
     original_clip = torch.nn.utils.clip_grad_norm_
@@ -597,7 +603,10 @@ def test_iforward_trainer_amp_skip_keeps_cache_and_unscales_before_clip(monkeypa
     trainer.grad_scaler = _SkippingScaler(calls)
     logs1 = trainer.train_step(_batch(rollout_idx=1, episode_end=True), step=1)
     assert logs1["amp/optimizer_step_skipped"] == 1.0
-    assert logs1["iforward/state_cache_size"] == 1
+    assert logs1["iforward/state_cache_size"] == 0
+    assert logs1["iforward/state_cache_dropped_on_optimizer_skip"] == 1.0
+    assert logs1["iforward/runtime_node_state_reset_after"] is True
+    assert bridge.runtime_reset_calls == reset_calls_before_skip + 1
     assert calls.index("unscale") < calls.index("clip") < calls.index("step")
 
 

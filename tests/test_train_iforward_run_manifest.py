@@ -74,3 +74,24 @@ def test_iforward_run_start_hook_writes_manifest_snapshot_and_first_row(tmp_path
     assert manifest["config_snapshot_sha256"] == rows[0]["config_snapshot_sha256"]
     assert "stage3_0_scalar_anchor_child_support_parent_legacy" in snapshot_path.read_text(encoding="utf-8")
 
+
+def test_iforward_run_manifest_prefers_enabled_validation_v4(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("output_name: manifest-test\n", encoding="utf-8")
+    cfg = _cfg(tmp_path)
+    cfg.scheduler_stage3_0_validation.enable = False
+    cfg.iforward_validation_v4 = {"enable": True, "run_at_train_start": False}
+    rows = []
+    monkeypatch.setattr(train_ifwd.base, "_write_metrics_history", lambda fh, row: fh.append(dict(row)))
+
+    train_ifwd._iforward_run_start_hook(
+        cfg=cfg,
+        args=SimpleNamespace(config_file=str(config_path)),
+        metrics_fh=rows,
+        resume_checkpoint="",
+        init_checkpoint="",
+        checkpoint_prefix="iforward_stage3",
+    )
+
+    assert rows[0]["validation_key"] == "iforward_validation_v4"
+    assert rows[0]["validation_enable"] is True

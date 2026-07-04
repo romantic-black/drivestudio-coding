@@ -825,12 +825,17 @@ class IForwardTrainer(nn.Module):
 
         t0 = time.perf_counter()
         runtime_reset_after: Dict[str, int] = {}
+        state_cache_dropped_on_optimizer_skip = False
         if not bool(optimizer_step_skipped):
             if bool(out.resolved.carry_scene_state_after_rollout) and not bool(out.resolved.episode_end_after_rollout):
                 self._state_cache[key] = out.next_state.detach_for_next_rollout()
             else:
                 self._state_cache.pop(key, None)
                 runtime_reset_after = self._reset_bridge_runtime_node_state()
+        else:
+            self._state_cache.pop(key, None)
+            runtime_reset_after = self._reset_bridge_runtime_node_state()
+            state_cache_dropped_on_optimizer_skip = True
         timings["state_cache_ms"] += (time.perf_counter() - t0) * 1000.0
         if profile_memory:
             self._record_cuda_memory_snapshot(
@@ -899,6 +904,7 @@ class IForwardTrainer(nn.Module):
             "iforward/grad_clip_applied": bool(grad_clip_was_active),
             "iforward/runtime_node_state_reset_before": bool(runtime_reset_before),
             "iforward/runtime_node_state_reset_after": bool(runtime_reset_after),
+            "iforward/state_cache_dropped_on_optimizer_skip": 1.0 if bool(state_cache_dropped_on_optimizer_skip) else 0.0,
             "amp/dtype": amp_dtype_name(self.amp_policy.dtype),
             "amp/grad_scale": float(self.grad_scaler.get_scale()) if hasattr(self.grad_scaler, "get_scale") else 1.0,
             "amp/optimizer_step_skipped": 1.0 if bool(optimizer_step_skipped) else 0.0,
@@ -944,10 +950,14 @@ class IForwardTrainer(nn.Module):
                 final["iforward/stage3_2/order_type_id"] = int(stage32_request_meta.get("order_type_id", 0) or 0)
                 final["iforward/stage3_2/train_2d_mode"] = str(stage32_request_meta.get("train_2d_mode", ""))
                 final["iforward/stage3_2/train_2d_mode_id"] = int(stage32_request_meta.get("train_2d_mode_id", 0) or 0)
+                final["iforward/stage3_2/raw_B"] = int(stage32_request_meta.get("raw_B", 0) or 0)
+                final["iforward/stage3_2/raw_R"] = int(stage32_request_meta.get("raw_R", 0) or 0)
                 final["iforward/stage3_2/B"] = int(stage32_request_meta.get("B", 0) or 0)
+                final["iforward/stage3_2/R"] = int(stage32_request_meta.get("R", 0) or 0)
                 final["iforward/stage3_2/R_mean"] = float(stage32_request_meta.get("R_mean", 0.0) or 0.0)
                 final["iforward/stage3_2/K"] = int(stage32_request_meta.get("K", 0) or 0)
                 final["iforward/stage3_2/maxK"] = int(stage32_request_meta.get("maxK", 0) or 0)
+                final["iforward/stage3_2/clamp_strategy"] = str(stage32_request_meta.get("clamp_strategy", ""))
                 final["iforward/stage3_2/visited_ratio_before"] = float(stage32_request_meta.get("visited_ratio_before", 0.0) or 0.0)
                 final["iforward/stage3_2/visited_ratio_after"] = float(stage32_request_meta.get("visited_ratio_after", 0.0) or 0.0)
                 final["iforward/stage3_2/repair_visited_ratio"] = float(stage32_request_meta.get("repair_visited_ratio", 0.0) or 0.0)
@@ -956,6 +966,18 @@ class IForwardTrainer(nn.Module):
                 final["iforward/stage3_2/prelude_repeat_count"] = int(stage32_request_meta.get("prelude_repeat_count", 0) or 0)
                 final["iforward/stage3_2/prelude_shuffle_count"] = int(stage32_request_meta.get("prelude_shuffle_count", 0) or 0)
                 final["iforward/stage3_2/repair_tail_count"] = int(stage32_request_meta.get("repair_tail_count", 0) or 0)
+                for key in (
+                    "episode_distribution_rollout_count_repeat_refine",
+                    "episode_distribution_rollout_count_shuffled_coverage",
+                    "episode_distribution_rollout_count_high_block_repair",
+                    "episode_distribution_k_count_repeat_refine",
+                    "episode_distribution_k_count_shuffled_coverage",
+                    "episode_distribution_k_count_high_block_repair",
+                    "episode_distribution_weight_repeat_refine",
+                    "episode_distribution_weight_shuffled_coverage",
+                    "episode_distribution_weight_high_block_repair",
+                ):
+                    final[f"iforward/stage3_2/{key}"] = float(stage32_request_meta.get(key, 0.0) or 0.0)
         if str(out.resolved.scheduler_version) == "iforward_sequence10_v1":
             meta = dict(getattr(out.resolved, "meta", {}) or {})
             sequence_positions = [int(x) for x in list(meta.get("sequence_positions", []) or [])]

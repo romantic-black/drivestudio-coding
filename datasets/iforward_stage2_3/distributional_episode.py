@@ -102,18 +102,24 @@ def _random_partition(rng: Any, total: int, parts: int) -> list[int]:
     return values
 
 
-def _clamp_b_r_for_max_k(b: int, r: int, max_k: int, n: int) -> tuple[int, int]:
+def _clamp_b_r_for_max_k(b: int, r: int, max_k: int, n: int, *, preserve_b: bool = False) -> tuple[int, int, str]:
     n = int(max(1, n))
     max_k = int(max(1, max_k))
     r = int(max(1, r))
     b = int(max(1, min(int(b), n)))
     if b * r <= max_k:
-        return b, r
+        return b, r, "none"
+    if bool(preserve_b):
+        b = int(max(1, min(b, max_k, n)))
+        if b * r <= max_k:
+            return b, r, "cap_b"
+        r = int(max(1, max_k // max(1, b)))
+        return b, r, "preserve_b_reduce_r"
     b = int(max(1, min(b, max_k // max(1, r))))
     if b * r <= max_k:
-        return b, r
+        return b, r, "reduce_b"
     r = int(max(1, max_k // max(1, b)))
-    return b, r
+    return b, r, "reduce_b_then_r"
 
 
 @dataclass(frozen=True)
@@ -167,6 +173,9 @@ class DistributionalRolloutSample:
     repeat_budgets: tuple[int, ...]
     requested_b: int
     requested_k: int
+    raw_b: int
+    raw_r: int
+    clamp_strategy: str
     max_k: int
     train_2d_mode: str
     candidate_pool: str
@@ -536,6 +545,9 @@ class DistributionalEpisodeCompiler:
         if dist.distribution_type == "repeat_refine":
             b = int(_weighted_choice(self.scheduler.rng, dist.b_choices, default=1))
             k = int(_weighted_choice(self.scheduler.rng, dist.k_budget, default=min(max_k, 4)))
+            raw_b = int(b)
+            raw_r = 0
+            clamp_strategy = "k_budget"
             k = int(max(1, min(k, max_k)))
             b = int(max(1, min(2, b, k, n)))
             positions = self._choose_positions(n=n, count=b, visited=visited_before, policy=dist.candidate_policy)
@@ -545,7 +557,9 @@ class DistributionalEpisodeCompiler:
         elif dist.distribution_type == "shuffled_coverage":
             b_raw = int(_weighted_choice(self.scheduler.rng, dist.b_choices, default=4))
             r_raw = int(_weighted_choice(self.scheduler.rng, dist.r_choices, default=1))
-            b, r = _clamp_b_r_for_max_k(b_raw, r_raw, max_k, n)
+            raw_b = int(b_raw)
+            raw_r = int(r_raw)
+            b, r, clamp_strategy = _clamp_b_r_for_max_k(b_raw, r_raw, max_k, n)
             order_type = str(_weighted_choice(self.scheduler.rng, dist.order_weights, default="stratified_shuffle"))
             positions = self._choose_positions(n=n, count=b, visited=visited_before, policy=dist.candidate_policy, order_type=order_type)
             positions = self._apply_order(positions, order_type=order_type, n=n)
@@ -553,7 +567,9 @@ class DistributionalEpisodeCompiler:
         else:
             b_raw = int(_weighted_choice(self.scheduler.rng, dist.b_choices, default=6))
             r_raw = int(_weighted_choice(self.scheduler.rng, dist.r_choices, default=1))
-            b, r = _clamp_b_r_for_max_k(b_raw, r_raw, max_k, n)
+            raw_b = int(b_raw)
+            raw_r = int(r_raw)
+            b, r, clamp_strategy = _clamp_b_r_for_max_k(b_raw, r_raw, max_k, n, preserve_b=True)
             order_type = "global_shuffle"
             positions = self._choose_positions(n=n, count=b, visited=visited_before, policy="visited_preferred")
             positions = self._apply_order(positions, order_type=order_type, n=n)
@@ -580,6 +596,9 @@ class DistributionalEpisodeCompiler:
             repeat_budgets=tuple(int(x) for x in repeat_budgets[: len(positions)]),
             requested_b=int(len(positions)),
             requested_k=int(requested_k),
+            raw_b=int(raw_b),
+            raw_r=int(raw_r),
+            clamp_strategy=str(clamp_strategy),
             max_k=int(max_k),
             train_2d_mode=str(dist.train_2d_mode),
             candidate_pool=str(dist.candidate_policy if episode_stage != "repair_tail" else "visited_preferred"),
@@ -657,6 +676,10 @@ class DistributionalEpisodeCompiler:
         repeat_count = sum(1 for x in samples if x.distribution_type == "repeat_refine")
         shuffle_count = sum(1 for x in samples if x.distribution_type == "shuffled_coverage")
         repair_count = sum(1 for x in samples if x.distribution_type == "high_block_repair")
+        repeat_k = sum(int(x.requested_k) for x in samples if x.distribution_type == "repeat_refine")
+        shuffle_k = sum(int(x.requested_k) for x in samples if x.distribution_type == "shuffled_coverage")
+        repair_k = sum(int(x.requested_k) for x in samples if x.distribution_type == "high_block_repair")
+        phase = self.curriculum[int(sample.curriculum_phase_id)]
         meta = {
             "enabled": True,
             "distribution_type": str(sample.distribution_type),
@@ -667,10 +690,14 @@ class DistributionalEpisodeCompiler:
             "order_type_id": int(ORDER_TYPE_IDS.get(str(sample.order_type), 0)),
             "train_2d_mode": str(sample.train_2d_mode),
             "train_2d_mode_id": int(TRAIN_2D_MODE_IDS.get(str(sample.train_2d_mode), 0)),
+            "raw_B": int(sample.raw_b),
+            "raw_R": int(sample.raw_r),
             "B": int(sample.requested_b),
+            "R": int(round(float(sample.requested_k) / float(max(1, sample.requested_b)))),
             "R_mean": float(sample.requested_k) / float(max(1, sample.requested_b)),
             "K": int(sample.requested_k),
             "maxK": int(sample.max_k),
+            "clamp_strategy": str(sample.clamp_strategy),
             "visited_ratio_before": float(sample.visited_ratio_before),
             "visited_ratio_after": float(sample.visited_ratio_after),
             "repair_visited_ratio": float(sample.repair_visited_ratio),
@@ -682,6 +709,15 @@ class DistributionalEpisodeCompiler:
             "prelude_repeat_count": int(repeat_count),
             "prelude_shuffle_count": int(shuffle_count),
             "repair_tail_count": int(repair_count),
+            "episode_distribution_rollout_count_repeat_refine": int(repeat_count),
+            "episode_distribution_rollout_count_shuffled_coverage": int(shuffle_count),
+            "episode_distribution_rollout_count_high_block_repair": int(repair_count),
+            "episode_distribution_k_count_repeat_refine": int(repeat_k),
+            "episode_distribution_k_count_shuffled_coverage": int(shuffle_k),
+            "episode_distribution_k_count_high_block_repair": int(repair_k),
+            "episode_distribution_weight_repeat_refine": float(phase.distribution_weights.get("repeat_refine", 0.0)),
+            "episode_distribution_weight_shuffled_coverage": float(phase.distribution_weights.get("shuffled_coverage", 0.0)),
+            "episode_distribution_weight_high_block_repair": float(phase.distribution_weights.get("high_block_repair", 0.0)),
         }
         request_meta = dict(getattr(plan, "request_meta", {}) or {})
         request_meta["iforward_stage3_2"] = meta

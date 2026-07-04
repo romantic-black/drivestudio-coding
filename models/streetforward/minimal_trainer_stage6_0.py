@@ -218,6 +218,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         cfg = self._repair_training_cfg()
         return bool(
             bool(self._cfg_get(cfg, "enable", False))
+            and bool(self._cfg_get(cfg, "stage3_2_train_2d_policy_override", True))
             and self._repair_training_train_2d_mode(visit_meta) == "frozen_no_grad"
         )
 
@@ -3929,6 +3930,11 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "iforward/repair_training/train_2d_mode_id": float(repair_train_2d_mode_id),
             "iforward/repair_training/stage3_2_policy_override": (
                 1.0 if bool(self._repair_training_stage3_2_frozen_no_grad(visit_meta)) else 0.0
+            ),
+            "iforward/repair_training/stage3_2_train_2d_policy_override": (
+                1.0
+                if bool(self._cfg_get(self._repair_training_cfg(), "stage3_2_train_2d_policy_override", True))
+                else 0.0
             ),
         }
         t0 = time.perf_counter()

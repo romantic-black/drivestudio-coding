@@ -82,7 +82,7 @@ def test_stage3_validation_status_success(monkeypatch):
         "manifest_built",
         "protocol_start",
         "protocol_done",
-        "done",
+        "completed",
     ]
     assert rows[-1]["split"] == "iforward_stage2_3_validation"
 
@@ -98,6 +98,105 @@ def test_stage3_validation_status_empty(monkeypatch):
     status_rows = [row for row in rows if row["split"] == "iforward_stage3_0_validation_status"]
     assert status_rows[-1]["status"] == "empty"
     assert status_rows[-1]["num_rows"] == 0
+
+
+def test_stage3_step_end_hook_runs_validation_v4_when_due(monkeypatch):
+    cfg = _cfg()
+    cfg["scheduler_stage3_0_validation"]["enable"] = False
+    cfg["iforward_validation_v4"] = {"enable": True, "interval_steps": 1, "run_at_train_start": False}
+    calls = []
+    monkeypatch.setattr(train_ifwd, "_run_validation_v4_with_status", lambda **kwargs: calls.append(dict(kwargs)) or [])
+
+    train_ifwd._iforward_step_end_hook(
+        cfg=cfg,
+        dataset=object(),
+        model=object(),
+        device="cpu",
+        trigger_step=0,
+        metrics_fh=[],
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["trigger"] == "interval"
+    assert calls[0]["trigger_step"] == 0
+
+
+def test_validation_v4_image_policy_first_plan_only(tmp_path):
+    cfg = _cfg()
+    cfg["log_dir"] = str(tmp_path)
+    cfg["iforward_validation_v4"] = {
+        "enable": True,
+        "report": {"images": True, "image_policy": "first_plan_only"},
+    }
+
+    assert train_ifwd._validation_v4_record_images(cfg, plan_idx=0) is True
+    assert train_ifwd._validation_v4_record_images(cfg, plan_idx=1) is False
+
+    cfg["iforward_validation_v4"]["report"]["image_policy"] = "none"
+    assert train_ifwd._validation_v4_record_images(cfg, plan_idx=0) is False
+
+
+def test_validation_v4_with_status_writes_compact_rows(tmp_path, monkeypatch):
+    cfg = _cfg()
+    cfg["log_dir"] = str(tmp_path)
+    cfg["iforward_validation_v4"] = {
+        "enable": True,
+        "interval_steps": 1,
+        "max_entries_debug": 1,
+        "repair_permutations": 3,
+        "memory_ablation": ["full"],
+        "report": {"images": True, "image_policy": "first_plan_only"},
+    }
+    rows = []
+    image_flags = []
+    monkeypatch.setattr(train_ifwd.base, "_write_metrics_history", lambda fh, row: fh.append(dict(row)))
+
+    class Episode:
+        protocol_name = "proto"
+
+    class Plan:
+        def __init__(self, plan_id):
+            self.plan_id = plan_id
+            self.episode = Episode()
+
+    class Trace:
+        events = [object(), object()]
+        summary = {"current_psnr/mean": 21.0, "history_rollout_psnr/mean": 20.0, "loss/mean": 0.1}
+
+    class Recorder:
+        def __init__(self, output_dir, *, record_images=True):
+            image_flags.append(bool(record_images))
+
+    class Runner:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self, *args, **kwargs):
+            return Trace()
+
+    monkeypatch.setattr(train_ifwd, "build_validation_v4_plans", lambda **kwargs: [Plan("p0"), Plan("p1")])
+    monkeypatch.setattr(train_ifwd, "_make_validation_v4_scheduler", lambda cfg, dataset: object())
+    monkeypatch.setattr(train_ifwd, "Stage3SchedulerAdapter", lambda scheduler: object())
+    monkeypatch.setattr(train_ifwd, "TraceRecorder", Recorder)
+    monkeypatch.setattr(train_ifwd, "IForwardRunner", Runner)
+    monkeypatch.setattr(train_ifwd, "export_html_report", lambda trace, output_dir, title: str(tmp_path / "index.html"))
+
+    out = train_ifwd._run_validation_v4_with_status(
+        cfg=cfg,
+        dataset=object(),
+        model=object(),
+        device="cpu",
+        trigger_step=0,
+        trigger="interval",
+        metrics_fh=rows,
+    )
+
+    assert len(out) == 2
+    assert image_flags == [True, False]
+    assert any(row["split"] == "iforward_validation_v4_global" and row["status"] == "completed" for row in rows)
+    status_rows = [row for row in rows if row["split"] == "iforward_validation_v4_status"]
+    assert status_rows[0]["status"] == "start"
+    assert status_rows[-1]["status"] == "completed"
 
 
 def test_stage3_validation_status_failed(monkeypatch):
@@ -116,4 +215,3 @@ def test_stage3_validation_status_failed(monkeypatch):
     assert status_rows[-1]["status"] == "failed"
     assert status_rows[-1]["exception_type"] == "RuntimeError"
     assert "validation exploded" in status_rows[-1]["exception_tail"]
-

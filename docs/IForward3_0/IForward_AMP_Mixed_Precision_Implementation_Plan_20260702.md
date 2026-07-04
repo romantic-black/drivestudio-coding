@@ -3,13 +3,13 @@
 日期：2026-07-02  
 适用代码：`drivestudio_stage6_refactor_context_20260702_v44`  
 适用主线：IForward 3_1 / 3_2，Low-rank Gated Delta KV，distributional episode scheduler  
-目标：使用 AMP 降低显存并提升速度，同时保留几何、渲染、loss、BigGS parent state 等数值敏感路径的 FP32 稳定性。
+目标：使用 AMP 降低显存，并在保留几何、渲染、loss、BigGS parent state 等数值敏感路径 FP32 稳定性的前提下评估速度收益。
 
 ---
 
 ## 0. 执行结论
 
-原始状态是 `training.amp.enable=false`；当前实现已在 Stage3.1 / Stage3.2 主配置默认开启 AMP 与 Phase 5 bf16 storage。当前 3_1 / 3_2 模型已经是：
+原始状态是 `training.amp.enable=false`；当前实现已在 Stage3.1 / Stage3.2 主配置默认开启 AMP，但 storage 默认保持 FP32。Phase 5 bf16 storage 能力保留为 ablation，不作为主线默认。当前 3_1 / 3_2 模型已经是：
 
 ```text
 stage3_1_lowrank_gated_delta_kv_lift
@@ -26,7 +26,7 @@ repair_training: repair 阶段 freeze_2d_frontend + no_grad_2d_forward
 2. FP32 islands：保留几何投影、gsplat raster、scalar anchor、BigGS sufficient stats、loss reduction、grad clipping 等关键路径。
 3. AMP-safe zones：2D frontend、parent 2D feature lifting、parent spatial/PTv3、GDKV MLP、child decoder MLP、posterior updater MLP。
 4. Parent 2D feature lifting：允许低精度，因为 parent 本来是粗略估计；child detail / render / geometry 不跟随放宽。
-5. 分阶段启用：先 bf16 autocast + FP32 state；稳定后再考虑 fp16 + scaler 或 GDKV state/cache bf16。
+5. 分阶段启用：主线使用 bf16 autocast + FP32 storage/state；仅在 ablation 中评估 fp16 + scaler 或 GDKV state/cache bf16。
 ```
 
 推荐默认版：
@@ -43,10 +43,10 @@ training:
     parent_lift_amp: true
     child_gather_amp: false
     storage:
-      features_2d_cache_dtype: bf16
-      parent_context_cache_dtype: bf16
-    gdkv_state_dtype: bf16
-    child_detail_output_dtype: bf16
+      features_2d_cache_dtype: fp32
+      parent_context_cache_dtype: fp32
+    gdkv_state_dtype: fp32
+    child_detail_output_dtype: fp32
 ```
 
 核心态度：**AMP 优先用于 activation-heavy 的神经网络路径和 parent coarse feature 路径；几何、render、loss、BigGS parent stats、sparse gather kernel 和 GRLD child decoder 继续保持 FP32。**
@@ -231,17 +231,17 @@ training:
       parent_lift_amp: true
       parent_lift_dtype: amp   # amp / bf16 / fp16 / fp32
       child_gather_amp: false
-      child_detail_output_dtype: bf16
+      child_detail_output_dtype: fp32
       scalar_anchor_force_fp32: true
       cuda_sparse_gather_force_fp32_kernel: true
 
     storage:
-      features_2d_cache_dtype: bf16
-      parent_context_cache_dtype: bf16
+      features_2d_cache_dtype: fp32
+      parent_context_cache_dtype: fp32
 
     memory:
-      gdkv_compute_amp: true
-      gdkv_state_dtype: bf16
+      gdkv_compute_amp: false  # reserved: GDKV core compute is still FP32
+      gdkv_state_dtype: fp32
       gdkv_aux_stats_fp32: true
 
     render:
@@ -555,11 +555,11 @@ B. CUDA kernel 输入仍 float32，但 parent gather output 立刻 cast 到 amp 
 
 ### 7.4 child gather
 
-gather 计算默认不 AMP，输出 storage 可 bf16：
+gather 计算默认不 AMP，主线输出 storage 也保持 FP32；bf16 output 只作为 storage ablation：
 
 ```yaml
 child_gather_amp: false
-child_detail_output_dtype: bf16
+child_detail_output_dtype: fp32
 ```
 
 原因：
@@ -636,8 +636,8 @@ state_rms_max=4
 
 ```yaml
 memory:
-  gdkv_compute_amp: true
-  gdkv_state_dtype: bf16
+  gdkv_compute_amp: false  # reserved: GDKV core compute is still FP32
+  gdkv_state_dtype: fp32
   gdkv_aux_stats_fp32: true
 ```
 
@@ -961,16 +961,17 @@ apply_delta FP32
 
 ### Phase 5：Optional storage AMP
 
-Stage3.1 / Stage3.2 主配置默认开启：
+Stage3.1 / Stage3.2 主配置默认保持 storage FP32：
 
 ```text
-features_2d cache bf16
-parent_context cache bf16
-GDKV state bf16
-child detail bf16 ablation
+features_2d cache fp32
+parent_context cache fp32
+GDKV state fp32
+child detail output fp32
 ```
 
 计算敏感路径继续保持 FP32：geometry/render/loss/scalar anchor/sparse gather kernel/BigGS parent stats/GRLD child decoder。
+bf16/fp16/amp storage policy 仍保留，用于单项 ablation 和显存压力实验；1000-step 对照显示 all-bf16 storage 未优于主线 AMP，因此不推荐默认启用。
 
 当前 runner 使用单 `--config_file` + trailing `opts`，所以 ablation 直接用 dotlist 覆盖：
 
@@ -1012,6 +1013,17 @@ training.amp.memory.gdkv_state_dtype=bf16 \
 training.amp.stage3.child_detail_output_dtype=bf16
 ```
 
+真实速度 benchmark 建议关闭重型 profiling / debug logging，只保留外部 wall-clock 或低频 train metrics：
+
+```bash
+logging.performance.enable=false \
+logging.performance.phase_timing=false \
+logging.performance.cuda_memory=false \
+training.amp.debug.log_amp_memory=false \
+training.amp.debug.log_dtype_summary=false \
+training.amp.debug.finite_check_interval=0
+```
+
 ---
 
 ## 15. 风险与处理
@@ -1021,10 +1033,10 @@ training.amp.stage3.child_detail_output_dtype=bf16
 处理：
 
 ```text
-默认 bf16；
+AMP dtype 默认 auto，支持时实际为 bf16；
 fp16 必须 GradScaler；
 loss/grad_norm/clip FP32；
-step skip 不更新 carried state。
+step skip 不更新 carried state，并清空当前 state cache / reset runtime node state。
 ```
 
 ### 风险 2：CUDA kernel dtype assert
@@ -1062,8 +1074,8 @@ validation fixed-plan 对照。
 处理：
 
 ```text
-默认 gdkv_state_dtype=bf16；
-如数值风险偏高，用 all_fp32 或 gdkv_state_only 反向 ablation 回退。
+默认 gdkv_state_dtype=fp32；
+bf16/fp16 state 只作为 ablation，若数值风险或性能开销偏高，使用 all_fp32 storage 回退。
 ```
 
 ---
@@ -1089,15 +1101,15 @@ training:
       parent_lift_amp: true
       parent_lift_dtype: amp
       child_gather_amp: false
-      child_detail_output_dtype: bf16
+      child_detail_output_dtype: fp32
       scalar_anchor_force_fp32: true
       cuda_sparse_gather_force_fp32_kernel: true
     storage:
-      features_2d_cache_dtype: bf16
-      parent_context_cache_dtype: bf16
+      features_2d_cache_dtype: fp32
+      parent_context_cache_dtype: fp32
     memory:
-      gdkv_compute_amp: true
-      gdkv_state_dtype: bf16
+      gdkv_compute_amp: false  # reserved: GDKV core compute is still FP32
+      gdkv_state_dtype: fp32
       gdkv_aux_stats_fp32: true
     render:
       force_fp32: true
@@ -1107,6 +1119,10 @@ training:
       log_scaler: true
       log_amp_memory: true
       finite_check_interval: 1000
+model:
+  iforward:
+    debug:
+      gdkv_aux_interval: 100
 ```
 
 默认不推荐：
@@ -1129,7 +1145,7 @@ Trainer 必须在 scaler.unscale_(optimizer) 后再 grad clip；如果 scaler sk
 FP32 islands：gsplat render/projection, Stage3 scalar_anchor, CUDA sparse gather kernel, BigGS parent stats, loss reductions, grad clip, optimizer step。
 AMP zones：2D frontend, parent 2D feature lifting, parent spatial/PTv3, GDKV projections, child decoder MLP, posterior updater MLP。
 用户明确认为 parent 2D feature lifting 不需要高精度，因为 parent 是粗估计，因此 parent_lift_amp=true 是第一优先优化点。
-child_gather 计算保持 FP32，因为 child detail 直接影响 fine update，且 CUDA sparse gather 当前要求 float32 feature_map/uv/weights；child detail 输出 storage 默认 bf16。
-GDKV compute 可 AMP，但 read/write/update/RMS/stats 仍 FP32；kv_state 写回 storage 默认 bf16，可用 all_fp32 dotlist 回退。
+child_gather 计算保持 FP32，因为 child detail 直接影响 fine update，且 CUDA sparse gather 当前要求 float32 feature_map/uv/weights；child detail 输出 storage 主线默认 FP32，bf16 仅作 ablation。
+GDKV core compute 当前仍 FP32；gdkv_compute_amp 标为 reserved/false，kv_state 写回 storage 主线默认 FP32，bf16/fp16 仅作 ablation。
 render/loss 强制 FP32，保证 validation/PSNR 可信。
 ```

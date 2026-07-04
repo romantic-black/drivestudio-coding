@@ -40,10 +40,16 @@ from datasets.iforward_stage2_3.validation_runner import (
     run_stage2_3_validation_manifest_only,
     stage2_3_validation_cfg,
 )
+from datasets.iforward_stage2_3.scheduler import Stage23Scheduler
 from datasets.train_scheduler_iforward import TrainSchedulerIForward
 from datasets.train_scheduler_iforward_sequence10 import TrainSchedulerIForwardSequence10
 from models.iforward import IForwardTrainer
+from models.iforward.protocols.validation_recipes import build_validation_v4_plans, iforward_validation_v4_cfg
 from models.iforward.resolver import IFORWARD_STAGE3_2_SCHEDULER_VERSION
+from models.iforward.runtime.adapter_stage3 import Stage3SchedulerAdapter
+from models.iforward.runtime.runner import IForwardRunner, RunnerOptions
+from models.iforward.runtime.trace import TraceRecorder
+from models.iforward.validation_v4.html_exporter import export_html_report
 from models.iforward.versions import is_stage3_optimizer_memory_iforward_version
 from tools.train_minimal_streetforward_stage4_3_iforward_common import (
     build_multi_scene_dataset_v4,
@@ -136,6 +142,7 @@ def _active_scheduler_manifest_fields(cfg: Any) -> Dict[str, Any]:
 def _active_validation_manifest_fields(cfg: Any) -> Dict[str, Any]:
     candidates = [
         ("scheduler_stage3_0_validation", _cfg_get(cfg, "scheduler_stage3_0_validation", None)),
+        ("iforward_validation_v4", _cfg_get(cfg, "iforward_validation_v4", None)),
         ("validation_v3", _cfg_get(cfg, "validation_v3", None)),
         ("iforward_stage2_2_validation", _cfg_get(cfg, "iforward_stage2_2_validation", None)),
         ("iforward_sequence10_validation", _cfg_get(cfg, "iforward_sequence10_validation", None)),
@@ -144,11 +151,20 @@ def _active_validation_manifest_fields(cfg: Any) -> Dict[str, Any]:
     ]
     validation_key = ""
     validation_cfg: Any = {}
+    fallback_key = ""
+    fallback_cfg: Any = {}
     for key, raw in candidates:
         if raw is not None:
-            validation_key = str(key)
-            validation_cfg = raw
-            break
+            if not fallback_key:
+                fallback_key = str(key)
+                fallback_cfg = raw
+            if bool(_cfg_get(raw, "enable", False)):
+                validation_key = str(key)
+                validation_cfg = raw
+                break
+    if not validation_key and fallback_key:
+        validation_key = fallback_key
+        validation_cfg = fallback_cfg
     return {
         "validation_key": validation_key,
         "validation_enable": bool(_cfg_get(validation_cfg, "enable", False)),
@@ -528,7 +544,7 @@ def _run_stage2_3_validation_with_status(
             )
             status_writer(
                 {
-                    "status": "empty" if not entries else "done",
+                    "status": "empty" if not entries else "completed",
                     "num_rows": 0,
                     "num_entries": int(len(entries)),
                     "protocols_completed": [],
@@ -550,7 +566,7 @@ def _run_stage2_3_validation_with_status(
         if rows:
             status_writer(
                 {
-                    "status": "done",
+                    "status": "completed",
                     "num_rows": int(len(rows)),
                     "protocols_completed": completed,
                 }
@@ -582,6 +598,228 @@ def _run_stage2_3_validation_with_status(
                 "exception_type": type(exc).__name__,
                 "exception_tail": _exception_tail(exc),
             }
+        )
+        raise
+
+
+def _validation_v4_enabled(cfg: Any) -> bool:
+    return bool(iforward_validation_v4_cfg(cfg).get("enable", False))
+
+
+def _validation_v4_due(cfg: Any, *, trigger: str, step: int) -> bool:
+    val = iforward_validation_v4_cfg(cfg)
+    if not bool(val.get("enable", False)):
+        return False
+    if str(trigger) == "train_start":
+        return bool(val.get("run_at_train_start", False))
+    interval = int(val.get("interval_steps", 0) or 0)
+    return bool(interval > 0 and int(step) >= 0 and (int(step) + 1) % int(interval) == 0)
+
+
+def _validation_v4_status_row(cfg: Any, *, trigger: str, trigger_step: int, row: Dict[str, Any]) -> Dict[str, Any]:
+    out = {
+        "step": int(trigger_step),
+        "trigger_step": int(trigger_step),
+        "split": "iforward_validation_v4_status",
+        "trigger": str(trigger),
+        "validation_key": "iforward_validation_v4",
+        **_active_scheduler_manifest_fields(cfg),
+    }
+    out.update(dict(row))
+    return out
+
+
+def _write_validation_v4_status(cfg: Any, metrics_fh: Any, *, trigger: str, trigger_step: int, row: Dict[str, Any]) -> None:
+    if metrics_fh is None:
+        return
+    base._write_metrics_history(
+        metrics_fh,
+        _validation_v4_status_row(cfg, trigger=trigger, trigger_step=int(trigger_step), row=row),
+    )
+
+
+def _safe_path_component(value: Any) -> str:
+    text = str(value or "item").strip()
+    out = []
+    for ch in text:
+        out.append(ch if ch.isalnum() or ch in {"_", "-", "."} else "_")
+    return "".join(out).strip("._") or "item"
+
+
+def _validation_v4_log_dir(cfg: Any, *, trigger_step: int) -> str:
+    log_dir = str(_cfg_get(cfg, "log_dir", "") or "")
+    if not log_dir:
+        logging_cfg = _cfg_get(cfg, "logging", {}) or {}
+        log_dir = str(_cfg_get(logging_cfg, "log_dir", "") or "")
+    return os.path.join(log_dir or ".", "iforward_validation_v4", f"step{int(trigger_step):06d}")
+
+
+def _validation_v4_record_images(cfg: Any, *, plan_idx: int) -> bool:
+    val = iforward_validation_v4_cfg(cfg)
+    report = dict(val.get("report", {}) or {})
+    if not bool(report.get("images", True)):
+        return False
+    policy = str(report.get("image_policy", "first_plan_only") or "first_plan_only")
+    if policy == "none":
+        return False
+    if policy == "all":
+        return True
+    return int(plan_idx) == 0
+
+
+def _make_validation_v4_scheduler(cfg: Any, dataset: Any) -> Stage23Scheduler:
+    sched_cfg = _cfg_get(cfg, "scheduler_stage3_2", None)
+    if sched_cfg is None or not bool(_cfg_get(sched_cfg, "enable", False)):
+        sched_cfg = _cfg_get(cfg, "scheduler_stage3_0", None)
+    if sched_cfg is None or not bool(_cfg_get(sched_cfg, "enable", False)):
+        sched_cfg = _cfg_get(cfg, "scheduler_v3", {}) or {}
+    producer_cfg = dict(_cfg_get(sched_cfg, "producer", {}) or {})
+    producer_cfg["enable"] = False
+    return Stage23Scheduler(dataset=dataset, cfg=cfg, producer_cfg=producer_cfg, fail_fast=False)
+
+
+def _run_validation_v4_with_status(
+    *,
+    cfg: Any,
+    dataset: Any,
+    model: Any,
+    device: Any,
+    trigger_step: int,
+    trigger: str,
+    metrics_fh: Any,
+) -> List[Dict[str, Any]]:
+    val = iforward_validation_v4_cfg(cfg)
+    output_dir = _validation_v4_log_dir(cfg, trigger_step=int(trigger_step))
+    _write_validation_v4_status(
+        cfg,
+        metrics_fh,
+        trigger=trigger,
+        trigger_step=int(trigger_step),
+        row={
+            "status": "start",
+            "validation_enable": bool(val.get("enable", False)),
+            "validation_run_at_train_start": bool(val.get("run_at_train_start", False)),
+            "interval_steps": int(val.get("interval_steps", 0) or 0),
+            "output_dir": str(output_dir),
+        },
+    )
+    try:
+        plans = build_validation_v4_plans(
+            cfg=cfg,
+            dataset=dataset,
+            max_entries=int(val.get("max_entries_debug", 1) or 1),
+            repair_permutations=int(val.get("repair_permutations", 3) or 3),
+            memory_ablation=list(val.get("memory_ablation", ["full"]) or ["full"]),
+        )
+        _write_validation_v4_status(
+            cfg,
+            metrics_fh,
+            trigger=trigger,
+            trigger_step=int(trigger_step),
+            row={
+                "status": "plans_built",
+                "num_plans": int(len(plans)),
+                "output_dir": str(output_dir),
+                "image_policy": str((dict(val.get("report", {}) or {})).get("image_policy", "first_plan_only")),
+            },
+        )
+        prev_training = bool(getattr(model, "training", False))
+        if hasattr(model, "eval"):
+            model.eval()
+        summaries: List[Dict[str, Any]] = []
+        html_paths: List[str] = []
+        try:
+            for idx, plan in enumerate(plans):
+                plan_id = str(getattr(plan, "plan_id", f"plan{idx}") or f"plan{idx}")
+                plan_dir = os.path.join(str(output_dir), f"{idx:04d}_{_safe_path_component(plan_id)}")
+                scheduler = _make_validation_v4_scheduler(cfg, dataset)
+                adapter = Stage3SchedulerAdapter(scheduler)
+                runner = IForwardRunner(model, adapter, _sequence10_minimal_from_scheduler_batch)
+                record_images = bool(_validation_v4_record_images(cfg, plan_idx=int(idx)))
+                recorder = TraceRecorder(plan_dir, record_images=record_images)
+                trace = runner.run(
+                    plan,
+                    recorder,
+                    RunnerOptions.for_mode("validate", device=str(device), trigger_step=int(trigger_step)),
+                )
+                html_path = export_html_report(trace, plan_dir, title=f"IForward Validation v4 {plan.episode.protocol_name}")
+                html_paths.append(str(html_path))
+                summary = dict(getattr(trace, "summary", {}) or {})
+                protocol = str(getattr(getattr(plan, "episode", None), "protocol_name", plan_id))
+                compact = {
+                    "plan_idx": int(idx),
+                    "plan_id": str(plan_id),
+                    "protocol": protocol,
+                    "num_events": int(len(list(getattr(trace, "events", []) or []))),
+                    "record_images": bool(record_images),
+                    "html_path": str(html_path),
+                    "current_psnr_mean": _safe_float(summary.get("current_psnr/mean")),
+                    "history_rollout_psnr_mean": _safe_float(summary.get("history_rollout_psnr/mean")),
+                    "loss_mean": _safe_float(summary.get("loss/mean")),
+                }
+                summaries.append(compact)
+                _write_validation_v4_status(
+                    cfg,
+                    metrics_fh,
+                    trigger=trigger,
+                    trigger_step=int(trigger_step),
+                    row={"status": "plan_completed", **compact},
+                )
+        finally:
+            if prev_training and hasattr(model, "train"):
+                model.train()
+
+        index_path = os.path.join(str(output_dir), "index.html")
+        os.makedirs(str(output_dir), exist_ok=True)
+        with open(index_path, "w", encoding="utf-8") as fh:
+            fh.write("<!doctype html><meta charset='utf-8'><h1>IForward Validation v4</h1><ul>")
+            for path in html_paths:
+                rel = os.path.relpath(path, str(output_dir))
+                fh.write(f"<li><a href='{rel}'>{rel}</a></li>")
+            fh.write("</ul>\n")
+
+        global_row = {
+            "step": int(trigger_step),
+            "trigger_step": int(trigger_step),
+            "split": "iforward_validation_v4_global",
+            "status": "completed" if summaries else "empty",
+            "num_plans": int(len(plans)),
+            "num_completed_plans": int(len(summaries)),
+            "num_events": int(sum(int(x.get("num_events", 0) or 0) for x in summaries)),
+            "output_dir": str(output_dir),
+            "html_index_path": str(index_path),
+            "current_psnr_mean": _mean([_safe_float(x.get("current_psnr_mean")) for x in summaries]),
+            "history_rollout_psnr_mean": _mean([_safe_float(x.get("history_rollout_psnr_mean")) for x in summaries]),
+            "loss_mean": _mean([_safe_float(x.get("loss_mean")) for x in summaries]),
+        }
+        if metrics_fh is not None:
+            base._write_metrics_history(metrics_fh, global_row)
+        _write_validation_v4_status(
+            cfg,
+            metrics_fh,
+            trigger=trigger,
+            trigger_step=int(trigger_step),
+            row={
+                "status": "completed" if summaries else "empty",
+                "num_plans": int(len(plans)),
+                "num_completed_plans": int(len(summaries)),
+                "output_dir": str(output_dir),
+                "html_index_path": str(index_path),
+            },
+        )
+        return summaries
+    except Exception as exc:
+        _write_validation_v4_status(
+            cfg,
+            metrics_fh,
+            trigger=trigger,
+            trigger_step=int(trigger_step),
+            row={
+                "status": "failed",
+                "exception_type": type(exc).__name__,
+                "exception_tail": _exception_tail(exc),
+                "output_dir": str(output_dir),
+            },
         )
         raise
 
@@ -1721,6 +1959,16 @@ def _iforward_train_start_hook(**kwargs: Any) -> None:
                         "status": "completed" if entries else "empty",
                     },
                 )
+        if _validation_v4_due(cfg, trigger="train_start", step=trigger_step):
+            _run_validation_v4_with_status(
+                cfg=cfg,
+                dataset=kwargs.get("dataset", None),
+                model=kwargs.get("model", None),
+                device=kwargs.get("device", torch.device("cpu")),
+                trigger_step=trigger_step,
+                trigger="train_start",
+                metrics_fh=metrics_fh,
+            )
         return
     if _is_sequence10_scheduler_cfg(cfg):
         val_cfg = _iforward_sequence10_validation_cfg(cfg)
@@ -1769,6 +2017,16 @@ def _iforward_step_end_hook(**kwargs: Any) -> None:
                         "status": "completed" if rows else "empty",
                     },
                 )
+        if _validation_v4_due(cfg, trigger="interval", step=step):
+            _run_validation_v4_with_status(
+                cfg=cfg,
+                dataset=kwargs.get("dataset", None),
+                model=kwargs.get("model", None),
+                device=kwargs.get("device", torch.device("cpu")),
+                trigger_step=int(step),
+                trigger="interval",
+                metrics_fh=kwargs.get("metrics_fh", None),
+            )
         return
     if _is_stage2_3_scheduler_cfg(cfg):
         val_cfg = stage2_3_validation_cfg(cfg)
@@ -1799,6 +2057,16 @@ def _iforward_step_end_hook(**kwargs: Any) -> None:
                         "status": "completed" if rows else "empty",
                     },
                 )
+        if _validation_v4_due(cfg, trigger="interval", step=step):
+            _run_validation_v4_with_status(
+                cfg=cfg,
+                dataset=kwargs.get("dataset", None),
+                model=kwargs.get("model", None),
+                device=kwargs.get("device", torch.device("cpu")),
+                trigger_step=int(step),
+                trigger="interval",
+                metrics_fh=kwargs.get("metrics_fh", None),
+            )
         return
     if _is_sequence10_scheduler_cfg(cfg):
         val_cfg = _iforward_sequence10_validation_cfg(cfg)

@@ -227,7 +227,14 @@ def _make_scheduler_for_frame_set(cfg: Any, dataset: Any, *, fs: FrameSetSpec, s
     producer["enable"] = False
     sched["producer"] = producer
     cfg_plain[sched_key] = sched
-    return Stage23Scheduler(dataset=dataset, cfg=cfg_plain, producer_cfg=producer, seed=int(seed), fail_fast=False)
+    return Stage23Scheduler(
+        dataset=dataset,
+        cfg=cfg_plain,
+        producer_cfg=producer,
+        index_dir=_cfg_get(sched, "index_dir", None),
+        seed=int(seed),
+        fail_fast=False,
+    )
 
 
 def _is_stage3_2_scheduler(scheduler: Stage23Scheduler) -> bool:

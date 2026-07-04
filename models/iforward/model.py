@@ -1307,6 +1307,14 @@ class IForwardModel(nn.Module):
         factor = start_factor + (1.0 - start_factor) * progress
         return float(base * factor)
 
+    @staticmethod
+    def _should_emit_gdkv_aux_stats(debug_cfg: Any, *, global_step: int) -> bool:
+        interval_raw = cfg_get(debug_cfg, "gdkv_aux_interval", None)
+        if interval_raw is None:
+            return True
+        interval = int(interval_raw)
+        return bool(interval > 0 and int(global_step) % interval == 0)
+
     def _history_damage_loss_weight_for_step(self, global_step: int) -> float:
         if not bool(getattr(self, "loss_history_damage_enable", False)):
             return 0.0
@@ -2013,6 +2021,7 @@ class IForwardModel(nn.Module):
         forward_mem_interval = int(
             cfg_get(debug_cfg_for_mem, "forward_memory_aux_interval", default_mem_interval)
         )
+        emit_gdkv_aux_stats = self._should_emit_gdkv_aux_stats(debug_cfg_for_mem, global_step=global_step)
         emit_forward_mem_aux = bool(
             torch.cuda.is_available()
             and int(forward_mem_interval) > 0
@@ -2243,6 +2252,11 @@ class IForwardModel(nn.Module):
                                 state=preview_state,
                                 keys=parent_keys,
                                 visit_meta=VisitMeta.from_step(step),
+                                **(
+                                    {"emit_aux_stats": bool(emit_gdkv_aux_stats)}
+                                    if bool(getattr(self, "is_stage3_1_lowrank_gdkv", False))
+                                    else {}
+                                ),
                             )
                         elif self.is_stage2_2_parent_temporal:
                             parent_preview = parent_temporal.preview(
@@ -2669,6 +2683,11 @@ class IForwardModel(nn.Module):
                             keys=optimizer_keys,
                             visit_meta=VisitMeta.from_step(step),
                             delta=delta_for_optimizer_write,
+                            **(
+                                {"emit_aux_stats": bool(emit_gdkv_aux_stats)}
+                                if bool(getattr(self, "is_stage3_1_lowrank_gdkv", False))
+                                else {}
+                            ),
                         )
                         state.parent_temporal = parent_temporal_state
                         update_aux.update(

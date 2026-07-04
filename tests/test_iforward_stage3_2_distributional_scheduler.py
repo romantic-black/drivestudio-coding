@@ -4,6 +4,7 @@ import pytest
 from omegaconf import OmegaConf
 
 from datasets.iforward_stage2_3.index_builder import build_stage2_3_index_from_dataset
+from datasets.iforward_stage2_3.distributional_episode import _clamp_b_r_for_max_k
 from datasets.iforward_stage2_3.scheduler import IFORWARD_STAGE3_2_SCHEDULER_VERSION, Stage23Scheduler
 from tests.test_iforward_stage2_3_scheduler import _Dataset
 
@@ -74,6 +75,13 @@ def test_stage3_2_parser_rejects_repeat_refine_b_above_two():
         Stage23Scheduler(dataset=ds, cfg=cfg, index=index, seed=11)
 
 
+def test_stage3_2_high_block_repair_clamp_preserves_b_first():
+    assert _clamp_b_r_for_max_k(8, 2, 15, 24, preserve_b=True) == (8, 1, "preserve_b_reduce_r")
+    assert _clamp_b_r_for_max_k(12, 2, 15, 24, preserve_b=True) == (12, 1, "preserve_b_reduce_r")
+    assert _clamp_b_r_for_max_k(20, 2, 15, 24, preserve_b=True) == (15, 1, "preserve_b_reduce_r")
+    assert _clamp_b_r_for_max_k(8, 2, 15, 24) == (7, 2, "reduce_b")
+
+
 def test_stage3_2_samples_repeat_shuffle_and_repair_with_constraints():
     sched = _scheduler(seed=19)
     episode = sched._build_episode()
@@ -97,6 +105,10 @@ def test_stage3_2_samples_repeat_shuffle_and_repair_with_constraints():
             assert rollout.scheduler_phase == "repair"
             assert meta["train_2d_mode"] == "frozen_no_grad"
             assert meta["repair_visited_ratio"] > 0.0
+            assert "raw_B" in meta
+            assert "raw_R" in meta
+            assert "R" in meta
+            assert meta["clamp_strategy"] in {"none", "cap_b", "preserve_b_reduce_r"}
             assert rollout.steps[-1].optimizer_memory_write is False
 
 

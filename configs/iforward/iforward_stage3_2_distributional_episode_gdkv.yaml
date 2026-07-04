@@ -137,7 +137,7 @@ scheduler_stage3_0:
       local_shuffle: 0.20
   assimilation:
     start_step: 0
-    max_inner_k: 8
+    max_inner_k: 10
     rollout_options:
       B1R8: 0.1
       B1R6: 0.1
@@ -168,8 +168,8 @@ scheduler_stage3_0:
     random_order: true
     mamba_read: true
     mamba_write: true
-    last_update_write: false
-    max_inner_k: 12
+    last_update_write: true
+    max_inner_k: 15
   producer:
     enable: true
     queue_depth: 1
@@ -229,7 +229,7 @@ scheduler_stage3_2:
       candidate_policy: visited_preferred
       phase: repair
       visit_kind: repair
-      last_update_write: false
+      last_update_write: true
   curriculum:
     - name: warmup
       start_step: 0
@@ -243,13 +243,13 @@ scheduler_stage3_2:
         high_block_repair: 0.10
       max_k:
         train_2d:
-          repeat_refine: 8
+          repeat_refine: 10
           shuffled_coverage: 6
           high_block_repair: 6
         frozen_2d:
           repeat_refine: 16
           shuffled_coverage: 14
-          high_block_repair: 12
+          high_block_repair: 15
     - name: main
       start_step: 5000
       end_step: 30000
@@ -257,18 +257,18 @@ scheduler_stage3_2:
       min_frames: 10
       allow_short: true
       weights:
-        repeat_refine: 0.20
-        shuffled_coverage: 0.55
-        high_block_repair: 0.25
+        repeat_refine: 0.30
+        shuffled_coverage: 0.50
+        high_block_repair: 0.20
       max_k:
         train_2d:
-          repeat_refine: 8
+          repeat_refine: 10
           shuffled_coverage: 6
           high_block_repair: 6
         frozen_2d:
           repeat_refine: 16
           shuffled_coverage: 14
-          high_block_repair: 12
+          high_block_repair: 15
     - name: hardening
       start_step: 30000
       end_step: 60010
@@ -276,18 +276,18 @@ scheduler_stage3_2:
       min_frames: 8
       allow_short: true
       weights:
-        repeat_refine: 0.10
+        repeat_refine: 0.20
         shuffled_coverage: 0.40
-        high_block_repair: 0.50
+        high_block_repair: 0.40
       max_k:
         train_2d:
-          repeat_refine: 8
+          repeat_refine: 10
           shuffled_coverage: 6
           high_block_repair: 6
         frozen_2d:
           repeat_refine: 16
           shuffled_coverage: 14
-          high_block_repair: 12
+          high_block_repair: 15
   episode_recipe:
     prelude:
       order_policy: mixed_random
@@ -367,7 +367,8 @@ model:
       enable_memory_aux_stats: false
       log_per_k_metrics: false
       log_per_k_aux_interval: 10000
-      forward_memory_aux_interval: 100
+      forward_memory_aux_interval: 1000
+      gdkv_aux_interval: 1000
       nvtx_ranges: false
     short_window_history:
       max_entries: 24
@@ -378,6 +379,7 @@ model:
       kinds: [repair]
       freeze_2d_frontend: true
       no_grad_2d_forward: true
+      stage3_2_train_2d_policy_override: true
     lifting:
       type: full_sparse_gather
       context_dim: 32
@@ -385,19 +387,19 @@ model:
       scalar_anchor_backend: cuda_scalar_anchor
       detach_geometry: true
       return_stage3_debug_tensors: false
-      memory_aux_interval: 100
+      memory_aux_interval: 0
       scalar_anchor:
         support_mode: projected_opacity
         anchor_mode: auto
         count_pairs: false
-        heavy_aux_interval: 100
+        heavy_aux_interval: 0
         cuda_event_timing: false
         support_threshold:
           bg: 1.0e-3
           distant: 1.0e-3
           rigid: 1.0e-3
         eps: 1.0e-6
-      gather_aux_interval: 100
+      gather_aux_interval: 0
       parent:
         type: legacy_direct_lift
         feature_source: features_2d
@@ -779,8 +781,8 @@ training:
   resume_checkpoint: ""
   iforward:
     allow_missing_carried_state_reset: false
-  log_interval: 100
-  save_checkpoint_freq: 5000
+  log_interval: 1
+  save_checkpoint_freq: 10000
   seed: 41
   amp:
     enable: true
@@ -804,41 +806,39 @@ training:
       parent_lift_amp: true
       parent_lift_dtype: amp
       child_gather_amp: false
-      child_detail_output_dtype: bf16
+      child_detail_output_dtype: fp32
       scalar_anchor_force_fp32: true
       cuda_sparse_gather_force_fp32_kernel: true
     storage:
-      features_2d_cache_dtype: bf16
-      parent_context_cache_dtype: bf16
+      features_2d_cache_dtype: fp32
+      parent_context_cache_dtype: fp32
     memory:
-      gdkv_compute_amp: true
-      gdkv_state_dtype: bf16
+      gdkv_compute_amp: false
+      gdkv_state_dtype: fp32
       gdkv_aux_stats_fp32: true
     render:
       force_fp32: true
       loss_force_fp32: true
     debug:
-      log_dtype_summary: true
-      log_scaler: true
-      log_amp_memory: true
-      finite_check_interval: 1000
+      log_dtype_summary: false
+      log_scaler: false
+      log_amp_memory: false
+      finite_check_interval: 0
   grad_clip:
     enable: true
     max_norm: 1.0
 
 scheduler_stage3_0_validation:
-  enable: true
+  enable: false
   run_at_train_start: false
-  interval_steps: 5000
+  interval_steps: 10000
   max_entries: 1
   modes: [full]
   protocols:
     assimilation: true
     repair_permutations: 1
-    repeat_stability: [8, 16]
-    mamba_ablation: [full, mamba_off, mamba_read_only, mamba_read_write, mamba_shuffle_state, mamba_freeze_write]
   tensorboard_images:
-    enable: true
+    enable: false
     max_images_per_role: 2
 
 iforward_runtime:
@@ -850,10 +850,10 @@ iforward_runtime:
   save_trace_jsonl: true
 
 iforward_validation_v4:
-  enable: false
+  enable: true
   run_at_train_start: false
-  interval_steps: 5000
-  max_entries_debug: 2
+  interval_steps: 10000
+  max_entries_debug: 1
   seed: 20260701
   frame_sets:
     - name: seq10
@@ -876,12 +876,13 @@ iforward_validation_v4:
     assimilation_timeline: true
     repair_before_after: true
     order_robustness: true
-    repeat_stability: true
+    repeat_stability: false
     memory_ablation: true
     state_health: true
   report:
     html: true
     images: true
+    image_policy: first_plan_only
     videos: false
 
 iforward_demo:
@@ -900,15 +901,15 @@ logging:
   output_root: /root/autodl-tmp/outputs
   project: iforward_stage3_2_distributional_episode_gdkv
   log_dir: /root/autodl-tmp/outputs/iforward_stage3_2_distributional_episode_gdkv
-  image_interval_blocks: 1000
-  image_interval: 1000
+  image_interval_blocks: 5000
+  image_interval: 5000
   image_trigger:
     mode: raw_step_interval
-    interval_blocks_equiv: 1000
+    interval_blocks_equiv: 5000
   enable_jsonl_metrics: true
   metrics_history_append: true
-  train_step_metrics_interval: 1009
-  scheduler_metrics_interval: 1009
+  train_step_metrics_interval: 50
+  scheduler_metrics_interval: 50
   random_window_diagnostics_interval: 5000
   sequence10_force_train_step_metrics: none
   sequence10_force_scheduler_metrics: none
@@ -919,12 +920,12 @@ logging:
     enable_low_psnr_image_dump: false
   performance:
     enable: false
-    phase_timing: true
-    cuda_memory: true
+    phase_timing: false
+    cuda_memory: false
     empty_cache_interval_steps: 0
     cleanup_metrics_interval_steps: 500
     live_tensor_summary_interval_steps: 0
-  use_tensorboard: true
+  use_tensorboard: false
 
 eval:
   enable_psnr: true

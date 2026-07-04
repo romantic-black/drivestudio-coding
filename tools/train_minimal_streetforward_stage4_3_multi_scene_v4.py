@@ -610,7 +610,16 @@ def _build_iforward_scheduler_row(
                     "iforward/stage3_2/train_2d_mode_id": _metric_int(
                         result.get("iforward/stage3_2/train_2d_mode_id", scheduler_info.get("train_2d_mode_id", 0))
                     ),
+                    "iforward/stage3_2/raw_B": _metric_int(
+                        result.get("iforward/stage3_2/raw_B", scheduler_info.get("stage3_2_raw_B", 0))
+                    ),
+                    "iforward/stage3_2/raw_R": _metric_int(
+                        result.get("iforward/stage3_2/raw_R", scheduler_info.get("stage3_2_raw_R", 0))
+                    ),
                     "iforward/stage3_2/B": _metric_int(result.get("iforward/stage3_2/B", scheduler_info.get("stage3_2_B", 0))),
+                    "iforward/stage3_2/R": _metric_int(
+                        result.get("iforward/stage3_2/R", scheduler_info.get("stage3_2_R", 0))
+                    ),
                     "iforward/stage3_2/R_mean": _metric_float(
                         result.get("iforward/stage3_2/R_mean", scheduler_info.get("stage3_2_R_mean", 0.0)),
                         0.0,
@@ -618,6 +627,9 @@ def _build_iforward_scheduler_row(
                     "iforward/stage3_2/K": _metric_int(result.get("iforward/stage3_2/K", scheduler_info.get("stage3_2_K", 0))),
                     "iforward/stage3_2/maxK": _metric_int(
                         result.get("iforward/stage3_2/maxK", scheduler_info.get("stage3_2_maxK", 0))
+                    ),
+                    "iforward/stage3_2/clamp_strategy": str(
+                        result.get("iforward/stage3_2/clamp_strategy", scheduler_info.get("clamp_strategy", ""))
                     ),
                     "iforward/stage3_2/visited_ratio_before": _metric_float(
                         result.get("iforward/stage3_2/visited_ratio_before", scheduler_info.get("visited_ratio_before", 0.0)),
@@ -645,6 +657,63 @@ def _build_iforward_scheduler_row(
                     ),
                     "iforward/stage3_2/repair_tail_count": _metric_int(
                         result.get("iforward/stage3_2/repair_tail_count", scheduler_info.get("repair_tail_count", 0))
+                    ),
+                    "iforward/stage3_2/episode_distribution_rollout_count_repeat_refine": _metric_int(
+                        result.get(
+                            "iforward/stage3_2/episode_distribution_rollout_count_repeat_refine",
+                            scheduler_info.get("episode_distribution_rollout_count_repeat_refine", 0),
+                        )
+                    ),
+                    "iforward/stage3_2/episode_distribution_rollout_count_shuffled_coverage": _metric_int(
+                        result.get(
+                            "iforward/stage3_2/episode_distribution_rollout_count_shuffled_coverage",
+                            scheduler_info.get("episode_distribution_rollout_count_shuffled_coverage", 0),
+                        )
+                    ),
+                    "iforward/stage3_2/episode_distribution_rollout_count_high_block_repair": _metric_int(
+                        result.get(
+                            "iforward/stage3_2/episode_distribution_rollout_count_high_block_repair",
+                            scheduler_info.get("episode_distribution_rollout_count_high_block_repair", 0),
+                        )
+                    ),
+                    "iforward/stage3_2/episode_distribution_k_count_repeat_refine": _metric_int(
+                        result.get(
+                            "iforward/stage3_2/episode_distribution_k_count_repeat_refine",
+                            scheduler_info.get("episode_distribution_k_count_repeat_refine", 0),
+                        )
+                    ),
+                    "iforward/stage3_2/episode_distribution_k_count_shuffled_coverage": _metric_int(
+                        result.get(
+                            "iforward/stage3_2/episode_distribution_k_count_shuffled_coverage",
+                            scheduler_info.get("episode_distribution_k_count_shuffled_coverage", 0),
+                        )
+                    ),
+                    "iforward/stage3_2/episode_distribution_k_count_high_block_repair": _metric_int(
+                        result.get(
+                            "iforward/stage3_2/episode_distribution_k_count_high_block_repair",
+                            scheduler_info.get("episode_distribution_k_count_high_block_repair", 0),
+                        )
+                    ),
+                    "iforward/stage3_2/episode_distribution_weight_repeat_refine": _metric_float(
+                        result.get(
+                            "iforward/stage3_2/episode_distribution_weight_repeat_refine",
+                            scheduler_info.get("episode_distribution_weight_repeat_refine", 0.0),
+                        ),
+                        0.0,
+                    ),
+                    "iforward/stage3_2/episode_distribution_weight_shuffled_coverage": _metric_float(
+                        result.get(
+                            "iforward/stage3_2/episode_distribution_weight_shuffled_coverage",
+                            scheduler_info.get("episode_distribution_weight_shuffled_coverage", 0.0),
+                        ),
+                        0.0,
+                    ),
+                    "iforward/stage3_2/episode_distribution_weight_high_block_repair": _metric_float(
+                        result.get(
+                            "iforward/stage3_2/episode_distribution_weight_high_block_repair",
+                            scheduler_info.get("episode_distribution_weight_high_block_repair", 0.0),
+                        ),
+                        0.0,
                     ),
                 }
             )
@@ -3742,6 +3811,21 @@ def main() -> None:
                                     "iforward/stage3_2/maxK": _metric_int(
                                         result.get("iforward/stage3_2/maxK", scheduler_info.get("stage3_2_maxK", 0))
                                     ),
+                                    "iforward/stage3_2/raw_B": _metric_int(
+                                        result.get("iforward/stage3_2/raw_B", scheduler_info.get("stage3_2_raw_B", 0))
+                                    ),
+                                    "iforward/stage3_2/raw_R": _metric_int(
+                                        result.get("iforward/stage3_2/raw_R", scheduler_info.get("stage3_2_raw_R", 0))
+                                    ),
+                                    "iforward/stage3_2/R": _metric_int(
+                                        result.get("iforward/stage3_2/R", scheduler_info.get("stage3_2_R", 0))
+                                    ),
+                                    "iforward/stage3_2/clamp_strategy": str(
+                                        result.get(
+                                            "iforward/stage3_2/clamp_strategy",
+                                            scheduler_info.get("clamp_strategy", ""),
+                                        )
+                                    ),
                                     "iforward/stage3_2/repair_visited_ratio": _metric_float(
                                         result.get(
                                             "iforward/stage3_2/repair_visited_ratio",
@@ -3773,6 +3857,7 @@ def main() -> None:
                             "iforward/stage3_2/episode_stage",
                             "iforward/stage3_2/order_type",
                             "iforward/stage3_2/train_2d_mode",
+                            "iforward/stage3_2/clamp_strategy",
                         }:
                             train_step_row[k] = str(v)
                         elif k in {

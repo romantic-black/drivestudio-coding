@@ -136,6 +136,21 @@ def test_gated_delta_kv_cell_stores_bf16_state_with_fp32_compute() -> None:
     assert write_aux["state_dtype_id"] == 2.0
 
 
+def test_gated_delta_kv_cell_can_skip_heavy_aux_stats() -> None:
+    torch.manual_seed(43)
+    cell = LowRankGatedDeltaKVCell(event_dim=8, token_dim=8, key_dim=4, value_dim=5, state_dtype="bf16")
+    state = cell.init_state(6, device=torch.device("cpu"), dtype=torch.bfloat16)
+    event = torch.randn(6, 8)
+    token = torch.randn(6, 8)
+    mask = torch.ones(6, dtype=torch.bool)
+    ctx, read_aux = cell.read(event, state, emit_aux_stats=False)
+    next_state, write_aux = cell.write(token, state, mask, visit_meta=_visit("assimilate"), emit_aux_stats=False)
+    assert ctx.dtype is torch.float32
+    assert next_state.kv_state.dtype is torch.bfloat16
+    assert read_aux == {"state_dtype_id": 2.0}
+    assert write_aux == {"state_dtype_id": 2.0}
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA autocast is required")
 def test_gated_delta_kv_cell_keeps_state_fp32_under_cuda_autocast() -> None:
     torch.manual_seed(41)
@@ -271,6 +286,43 @@ def test_gated_delta_kv_parent_optimizer_stores_bf16_state() -> None:
     assert preview.event.event_bg.dtype is torch.float32
 
 
+def test_gated_delta_kv_parent_optimizer_can_skip_heavy_aux_stats() -> None:
+    mem = ParentOptimizerGatedDeltaKV(
+        event_dim=4,
+        ctx_dim=3,
+        token_dim=4,
+        key_dim=2,
+        value_dim=3,
+        adapter_hidden_dim=8,
+        visit_dim=4,
+        state_dtype="bf16",
+    )
+    event = _event()
+    state, write_aux = mem.write(
+        spatial_event=event,
+        state=ParentOptimizerDeltaKVState.empty(),
+        keys=_keys(),
+        visit_meta=_visit("assimilate"),
+        emit_aux_stats=False,
+    )
+    assert write_aux["iforward/parent_optimizer_gdkv/write"] == 1.0
+    assert write_aux["iforward/parent_optimizer_gdkv/state_dtype_id"] == 2.0
+    assert "iforward/parent_optimizer_gdkv/bg_state_rms_max" not in write_aux
+    preview = mem.preview(event=event, state=state, keys=_keys(), visit_meta=_visit("repair"), emit_aux_stats=False)
+    assert preview.aux["iforward/parent_optimizer_gdkv/read"] == 1.0
+    assert preview.aux["iforward/parent_optimizer_gdkv/state_dtype_id"] == 2.0
+    assert "iforward/parent_optimizer_gdkv/bg_preview_seen_ratio" not in preview.aux
+    assert "iforward/parent_optimizer_gdkv/bg_ctx_rms_max" not in preview.aux
+
+
+def test_gdkv_aux_interval_sampling_rule() -> None:
+    assert IForwardModel._should_emit_gdkv_aux_stats({}, global_step=7) is True
+    assert IForwardModel._should_emit_gdkv_aux_stats({"gdkv_aux_interval": 0}, global_step=0) is False
+    assert IForwardModel._should_emit_gdkv_aux_stats({"gdkv_aux_interval": 100}, global_step=0) is True
+    assert IForwardModel._should_emit_gdkv_aux_stats({"gdkv_aux_interval": 100}, global_step=99) is False
+    assert IForwardModel._should_emit_gdkv_aux_stats({"gdkv_aux_interval": 100}, global_step=100) is True
+
+
 def test_gated_delta_kv_keyed_gather_scatter_repeated_keys() -> None:
     mem = _memory()
     event = _event()
@@ -317,10 +369,12 @@ def test_stage3_1_config_and_legacy_ablation_alias() -> None:
     assert cfg.model.iforward.parent_optimizer_memory.type == "lowrank_gated_delta_kv"
     assert cfg.model.iforward.parent_optimizer_memory.gated_delta_kv.K == 16
     assert cfg.model.iforward.parent_optimizer_memory.gated_delta_kv.V == 32
-    assert cfg.training.amp.storage.features_2d_cache_dtype == "bf16"
-    assert cfg.training.amp.storage.parent_context_cache_dtype == "bf16"
-    assert cfg.training.amp.memory.gdkv_state_dtype == "bf16"
-    assert cfg.training.amp.stage3.child_detail_output_dtype == "bf16"
+    assert cfg.model.iforward.debug.gdkv_aux_interval == 100
+    assert cfg.training.amp.storage.features_2d_cache_dtype == "fp32"
+    assert cfg.training.amp.storage.parent_context_cache_dtype == "fp32"
+    assert cfg.training.amp.memory.gdkv_compute_amp is False
+    assert cfg.training.amp.memory.gdkv_state_dtype == "fp32"
+    assert cfg.training.amp.stage3.child_detail_output_dtype == "fp32"
     ParentOptimizerGatedDeltaKV(
         event_dim=4,
         ctx_dim=3,
@@ -347,9 +401,28 @@ def test_stage3_2_distributional_config_keeps_gdkv_model_and_enables_scheduler()
     assert cfg.model.stage6_0.local_rollout.source == "scheduler_stage3_2"
     assert cfg.model.iforward.version == "stage3_1_lowrank_gated_delta_kv_lift"
     assert cfg.model.iforward.parent_optimizer_memory.type == "lowrank_gated_delta_kv"
-    assert cfg.training.amp.storage.features_2d_cache_dtype == "bf16"
-    assert cfg.training.amp.storage.parent_context_cache_dtype == "bf16"
-    assert cfg.training.amp.memory.gdkv_state_dtype == "bf16"
-    assert cfg.training.amp.stage3.child_detail_output_dtype == "bf16"
+    assert cfg.model.iforward.debug.gdkv_aux_interval == 1000
+    assert cfg.model.iforward.debug.forward_memory_aux_interval == 1000
+    assert cfg.model.iforward.repair_training.stage3_2_train_2d_policy_override is True
+    assert cfg.training.amp.storage.features_2d_cache_dtype == "fp32"
+    assert cfg.training.amp.storage.parent_context_cache_dtype == "fp32"
+    assert cfg.training.amp.memory.gdkv_compute_amp is False
+    assert cfg.training.amp.memory.gdkv_state_dtype == "fp32"
+    assert cfg.training.amp.stage3.child_detail_output_dtype == "fp32"
     assert list(cfg.model.iforward.repair_training.kinds) == ["repair"]
     assert cfg.scheduler_stage3_2.episode_recipe.train_2d_policy.high_block_repair == "frozen_no_grad"
+    assert cfg.scheduler_stage3_0.repair.last_update_write is True
+    assert cfg.scheduler_stage3_2.distributions.high_block_repair.last_update_write is True
+    assert cfg.scheduler_stage3_2.curriculum[1].weights.repeat_refine == 0.30
+    assert cfg.scheduler_stage3_2.curriculum[1].weights.shuffled_coverage == 0.50
+    assert cfg.scheduler_stage3_2.curriculum[1].weights.high_block_repair == 0.20
+    assert cfg.scheduler_stage3_2.curriculum[2].weights.repeat_refine == 0.20
+    assert cfg.scheduler_stage3_2.curriculum[2].weights.shuffled_coverage == 0.40
+    assert cfg.scheduler_stage3_2.curriculum[2].weights.high_block_repair == 0.40
+    assert cfg.scheduler_stage3_0_validation.enable is False
+    assert cfg.iforward_validation_v4.enable is True
+    assert cfg.iforward_validation_v4.interval_steps == 10000
+    assert cfg.iforward_validation_v4.max_entries_debug == 1
+    assert cfg.iforward_validation_v4.repair_permutations == 3
+    assert cfg.iforward_validation_v4.protocols.repeat_stability is False
+    assert cfg.iforward_validation_v4.report.image_policy == "first_plan_only"

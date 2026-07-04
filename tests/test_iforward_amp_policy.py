@@ -44,6 +44,21 @@ def test_amp_policy_disabled_without_cuda(monkeypatch) -> None:
     assert policy.use_grad_scaler is False
 
 
+def test_amp_policy_storage_dtype_defaults_are_fp32_metrics(monkeypatch) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: True)
+    policy = build_amp_policy({"training": {"amp": {"enable": True, "dtype": "auto"}}})
+    metrics = policy.metrics()
+    assert policy.features_2d_cache_dtype == "fp32"
+    assert policy.parent_context_cache_dtype == "fp32"
+    assert policy.child_detail_output_dtype == "fp32"
+    assert policy.gdkv_state_dtype == "fp32"
+    assert metrics["amp/dtype/features_2d_cache"] == 0.0
+    assert metrics["amp/dtype/parent_context_cache"] == 0.0
+    assert metrics["amp/dtype/child_detail"] == 0.0
+    assert metrics["amp/gdkv_state_dtype_id"] == 0.0
+
+
 def test_amp_policy_storage_dtype_parsing_and_metrics(monkeypatch) -> None:
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: True)
