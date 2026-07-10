@@ -1610,6 +1610,12 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         self.stage6_nearby_warmup_steps = int(self._cfg_get(nearby_render, "warmup_steps", 2000))
         self.stage6_nearby_final_step_only = bool(self._cfg_get(nearby_render, "final_step_only", True))
         self.stage6_nearby_mask_policy = str(self._cfg_get(nearby_render, "mask_policy", "non_sky_non_egocar"))
+        self.stage6_render_loss_target_chunk_size = int(self._cfg_get(stage6, "render_loss_target_chunk_size", 0) or 0)
+        if int(self.stage6_render_loss_target_chunk_size) < 0:
+            raise ValueError(
+                "model.stage6_0.render_loss_target_chunk_size must be >= 0, "
+                f"got {int(self.stage6_render_loss_target_chunk_size)}"
+            )
         self.stage6_delta_l2_weight = float(self._cfg_get(regularization, "delta_l2_weight", 1.0e-3))
         self.stage6_opacity_delta_l2_weight = float(
             self._cfg_get(regularization, "opacity_delta_l2_weight", 0.0)
@@ -5934,34 +5940,43 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         ssim_vals: List[float] = []
         valid_ratios: List[float] = []
         skip_count = 0.0
-        targets_with_indices = [(int(idx), batch["targets"][int(idx)]) for idx in target_indices]
-        pred_by_idx = self._render_targets_grouped_by_frame(
-            local_state=local_state,
-            targets_with_indices=targets_with_indices,
+        chunk_size = int(getattr(self, "stage6_render_loss_target_chunk_size", 0) or 0)
+        chunks = (
+            [target_indices]
+            if chunk_size <= 0 or len(target_indices) <= chunk_size
+            else [target_indices[start : start + chunk_size] for start in range(0, len(target_indices), chunk_size)]
         )
-        for idx in target_indices:
-            target = batch["targets"][int(idx)]
-            pred, _alpha = pred_by_idx[int(idx)]
-            gt = target["gt_image"].to(device=pred.device, dtype=pred.dtype)
-            mask = target_valid_mask(target, mask_policy=mask_policy, device=pred.device)
-            loss_i, stat_i = masked_rgb_loss(
-                pred,
-                gt,
-                mask=mask,
-                l1_weight=1.0 if l1_weight is None else float(l1_weight),
-                ssim_weight=float(getattr(self, "loss_w_ssim", 0.0)) if ssim_weight is None else float(ssim_weight),
+        stats["target_chunk_size"] = float(chunk_size)
+        stats["target_chunk_count"] = float(len(chunks))
+        for chunk_indices in chunks:
+            targets_with_indices = [(int(idx), batch["targets"][int(idx)]) for idx in chunk_indices]
+            pred_by_idx = self._render_targets_grouped_by_frame(
+                local_state=local_state,
+                targets_with_indices=targets_with_indices,
             )
-            if pred_rgbs_out is not None:
-                pred_rgbs_out.append(pred.detach().float().clamp(0.0, 1.0).cpu())
-            if gt_images_out is not None:
-                gt_images_out.append(gt.detach().float().clamp(0.0, 1.0).cpu())
-            losses.append(loss_i)
-            if float(stat_i.get("skipped_no_valid_pixels", 0.0)) < 0.5:
-                psnr_vals.append(float(stat_i["psnr"]))
-                l1_vals.append(float(stat_i["l1"]))
-                ssim_vals.append(float(stat_i.get("ssim", 0.0)))
-            valid_ratios.append(float(stat_i.get("valid_ratio", 0.0)))
-            skip_count += float(stat_i.get("skipped_no_valid_pixels", 0.0))
+            for idx in chunk_indices:
+                target = batch["targets"][int(idx)]
+                pred, _alpha = pred_by_idx[int(idx)]
+                gt = target["gt_image"].to(device=pred.device, dtype=pred.dtype)
+                mask = target_valid_mask(target, mask_policy=mask_policy, device=pred.device)
+                loss_i, stat_i = masked_rgb_loss(
+                    pred,
+                    gt,
+                    mask=mask,
+                    l1_weight=1.0 if l1_weight is None else float(l1_weight),
+                    ssim_weight=float(getattr(self, "loss_w_ssim", 0.0)) if ssim_weight is None else float(ssim_weight),
+                )
+                if pred_rgbs_out is not None:
+                    pred_rgbs_out.append(pred.detach().float().clamp(0.0, 1.0).cpu())
+                if gt_images_out is not None:
+                    gt_images_out.append(gt.detach().float().clamp(0.0, 1.0).cpu())
+                losses.append(loss_i)
+                if float(stat_i.get("skipped_no_valid_pixels", 0.0)) < 0.5:
+                    psnr_vals.append(float(stat_i["psnr"]))
+                    l1_vals.append(float(stat_i["l1"]))
+                    ssim_vals.append(float(stat_i.get("ssim", 0.0)))
+                valid_ratios.append(float(stat_i.get("valid_ratio", 0.0)))
+                skip_count += float(stat_i.get("skipped_no_valid_pixels", 0.0))
         if psnr_vals:
             stats["psnr"] = float(sum(psnr_vals) / len(psnr_vals))
             stats["l1"] = float(sum(l1_vals) / len(l1_vals))

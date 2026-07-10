@@ -100,6 +100,9 @@ def _memory_summary(protocols: list[dict[str, Any]]) -> dict[str, float]:
     full = by_mode.get("full")
     off = by_mode.get("memory_off") or by_mode.get("mamba_off")
     shuffle = by_mode.get("memory_shuffle_state") or by_mode.get("mamba_shuffle_state")
+    shuffle_rw = by_mode.get("memory_shuffle_read_write_state") or by_mode.get("mamba_shuffle_read_write_state")
+    wrong_key = by_mode.get("memory_wrong_parent_key_fixed") or by_mode.get("mamba_wrong_parent_key_fixed")
+    freeze_after_prefill = by_mode.get("memory_freeze_after_prefill") or by_mode.get("mamba_freeze_after_prefill")
     out: dict[str, float] = {}
     if full and off:
         out["memory_gain_retention"] = _finite_float(full.get("history_retention_auc")) - _finite_float(
@@ -111,6 +114,18 @@ def _memory_summary(protocols: list[dict[str, Any]]) -> dict[str, float]:
     if full and shuffle:
         out["memory_shuffle_gap"] = _finite_float(full.get("history_retention_auc")) - _finite_float(
             shuffle.get("history_retention_auc")
+        )
+    if full and shuffle_rw:
+        out["memory_shuffle_read_write_gap"] = _finite_float(full.get("history_retention_auc")) - _finite_float(
+            shuffle_rw.get("history_retention_auc")
+        )
+    if full and wrong_key:
+        out["memory_wrong_parent_key_gap"] = _finite_float(full.get("history_retention_auc")) - _finite_float(
+            wrong_key.get("history_retention_auc")
+        )
+    if full and freeze_after_prefill:
+        out["memory_freeze_after_prefill_gap"] = _finite_float(full.get("history_retention_auc")) - _finite_float(
+            freeze_after_prefill.get("history_retention_auc")
         )
     return out
 

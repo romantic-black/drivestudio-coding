@@ -188,10 +188,14 @@ class Stage3SchedulerAdapter:
                     "order_type_id": int(stage3_2_meta.get("order_type_id", 0) or 0),
                     "train_2d_mode": str(stage3_2_meta.get("train_2d_mode", "")),
                     "train_2d_mode_id": int(stage3_2_meta.get("train_2d_mode_id", 0) or 0),
+                    "raw_B": int(stage3_2_meta.get("raw_B", 0) or 0),
+                    "raw_R": int(stage3_2_meta.get("raw_R", 0) or 0),
                     "B": int(stage3_2_meta.get("B", 0) or 0),
+                    "R": int(stage3_2_meta.get("R", 0) or 0),
                     "R_mean": float(stage3_2_meta.get("R_mean", 0.0) or 0.0),
                     "K": int(stage3_2_meta.get("K", 0) or 0),
                     "maxK": int(stage3_2_meta.get("maxK", 0) or 0),
+                    "clamp_strategy": str(stage3_2_meta.get("clamp_strategy", "")),
                     "visited_ratio_before": float(stage3_2_meta.get("visited_ratio_before", 0.0) or 0.0),
                     "visited_ratio_after": float(stage3_2_meta.get("visited_ratio_after", 0.0) or 0.0),
                     "repair_visited_ratio": float(stage3_2_meta.get("repair_visited_ratio", 0.0) or 0.0),
@@ -200,6 +204,29 @@ class Stage3SchedulerAdapter:
                     "prelude_repeat_count": int(stage3_2_meta.get("prelude_repeat_count", 0) or 0),
                     "prelude_shuffle_count": int(stage3_2_meta.get("prelude_shuffle_count", 0) or 0),
                     "repair_tail_count": int(stage3_2_meta.get("repair_tail_count", 0) or 0),
+                    "episode_distribution_rollout_count_repeat_refine": int(
+                        stage3_2_meta.get("episode_distribution_rollout_count_repeat_refine", 0) or 0
+                    ),
+                    "episode_distribution_rollout_count_shuffled_coverage": int(
+                        stage3_2_meta.get("episode_distribution_rollout_count_shuffled_coverage", 0) or 0
+                    ),
+                    "episode_distribution_rollout_count_high_block_repair": int(
+                        stage3_2_meta.get("episode_distribution_rollout_count_high_block_repair", 0) or 0
+                    ),
+                    "episode_distribution_k_count_repeat_refine": int(stage3_2_meta.get("episode_distribution_k_count_repeat_refine", 0) or 0),
+                    "episode_distribution_k_count_shuffled_coverage": int(
+                        stage3_2_meta.get("episode_distribution_k_count_shuffled_coverage", 0) or 0
+                    ),
+                    "episode_distribution_k_count_high_block_repair": int(
+                        stage3_2_meta.get("episode_distribution_k_count_high_block_repair", 0) or 0
+                    ),
+                    "episode_distribution_weight_repeat_refine": float(stage3_2_meta.get("episode_distribution_weight_repeat_refine", 0.0) or 0.0),
+                    "episode_distribution_weight_shuffled_coverage": float(
+                        stage3_2_meta.get("episode_distribution_weight_shuffled_coverage", 0.0) or 0.0
+                    ),
+                    "episode_distribution_weight_high_block_repair": float(
+                        stage3_2_meta.get("episode_distribution_weight_high_block_repair", 0.0) or 0.0
+                    ),
                     "iforward_stage3_2": stage3_2_meta,
                 }
             )

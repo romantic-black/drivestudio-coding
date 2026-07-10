@@ -56,6 +56,21 @@ def test_repair_showcase_24_respects_fixed_scene_segment_and_events():
     assert any(isinstance(event, UpdateEvent) and event.kind == "repair_update" for event in plan.events)
 
 
+def test_repair_showcase_20_uses_twenty_frame_plan():
+    result = build_demo_v0_plans(
+        cfg=_cfg(),
+        dataset=_Dataset(scene_ids=(3,), segment_ids=(5,), frames=range(40)),
+        recipe="repair_showcase_20",
+        scene_id=3,
+        segment_id=5,
+        seed=31,
+    )
+
+    assert result.recipe == "repair_showcase_20"
+    assert len(result.plans) == 1
+    assert len(result.plans[0].episode.frame_ids) == 20
+
+
 def test_memory_ablation_showcase_emits_one_plan_per_mode():
     result = build_demo_v0_plans(
         cfg=_cfg(),
@@ -71,6 +86,25 @@ def test_memory_ablation_showcase_emits_one_plan_per_mode():
     modes = [str(plan.metadata.get("memory_mode", "")) for plan in result.plans]
     assert modes == ["full", "memory_off", "memory_read_write"]
     assert all(plan.source == "demo_recipe" for plan in result.plans)
+
+
+def test_memory_ablation_showcase_freeze_after_prefill_uses_full_prefill():
+    result = build_demo_v0_plans(
+        cfg=_cfg(),
+        dataset=_Dataset(scene_ids=(1,), segment_ids=(0,), frames=range(40)),
+        recipe="memory_ablation_showcase",
+        scene_id=1,
+        segment_id=0,
+        seed=32,
+        memory_ablation=["memory_freeze_after_prefill"],
+    )
+
+    assert len(result.plans) == 1
+    modes = [getattr(event, "memory_mode", "") for event in result.plans[0].events if hasattr(event, "memory_mode")]
+    assert modes[:-1]
+    assert set(modes[:-1]) == {"full"}
+    assert modes[-1] == "memory_freeze_after_prefill"
+    assert [step.visit_kind for step in result.plans[0].events[-1].rollout_plan.steps] == ["assimilation"]
 
 
 def test_demo_recipe_rejects_unknown_recipe():

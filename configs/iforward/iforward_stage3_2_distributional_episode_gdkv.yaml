@@ -131,7 +131,7 @@ scheduler_stage3_0:
     max_frame_span: 30
     frame_count_schedule:
       - {start_step: 0, target_frames: 10, min_frames: 10, allow_short: false}
-      - {start_step: 30000, target_frames: 24, min_frames: 8, allow_short: true}
+      - {start_step: 30000, target_frames: 20, min_frames: 8, allow_short: true}
     assimilation_order:
       chronological: 0.80
       local_shuffle: 0.20
@@ -272,22 +272,22 @@ scheduler_stage3_2:
     - name: hardening
       start_step: 30000
       end_step: 60010
-      sequence_target_frames: 24
+      sequence_target_frames: 20
       min_frames: 8
       allow_short: true
       weights:
-        repeat_refine: 0.20
-        shuffled_coverage: 0.40
-        high_block_repair: 0.40
+        repeat_refine: 0.22
+        shuffled_coverage: 0.56
+        high_block_repair: 0.22
       max_k:
         train_2d:
           repeat_refine: 10
-          shuffled_coverage: 6
+          shuffled_coverage: 8
           high_block_repair: 6
         frozen_2d:
           repeat_refine: 16
           shuffled_coverage: 14
-          high_block_repair: 15
+          high_block_repair: 12
   episode_recipe:
     prelude:
       order_policy: mixed_random
@@ -368,7 +368,7 @@ model:
       log_per_k_metrics: false
       log_per_k_aux_interval: 10000
       forward_memory_aux_interval: 1000
-      gdkv_aux_interval: 1000
+      gdkv_aux_interval: 100
       nvtx_ranges: false
     short_window_history:
       max_entries: 24
@@ -447,6 +447,7 @@ model:
           repair: 0.03
           repeat_stability: 0.03
       gated_delta_kv:
+        update_rule: balanced_residual_delta_v1
         K: 16
         V: 32
         query_rms_unit: true
@@ -454,14 +455,31 @@ model:
         value_rms_max: 2.0
         ctx_rms_max: 4.0
         state_rms_max: 4.0
+        alpha_mode: value_channel
+        alpha_max: 1.0
+        alpha_init: 0.10
+        surprise_gating: true
+        surprise_target_rms: 1.0
+        min_alpha_on_unseen: 0.5
+        cleanup_enable: true
+        cleanup_key: learned
+        cleanup_max: 0.2
+        cleanup_init: 0.02
+        cleanup_by_kind:
+          bootstrap: 0.0
+          assimilate: 0.05
+          assimilation: 0.05
+          repeat_stability: 0.05
+          repair: 0.10
+          stress: 0.10
         erase_gate_max: 1.0
         write_gate_max: 1.0
         decay_min:
           bootstrap: 1.0
           assimilate: 0.98
           assimilation: 0.98
-          repair: 1.0
-          repeat_stability: 1.0
+          repair: 0.995
+          repeat_stability: 0.995
     biggs:
       enable: true
       observe:
@@ -616,6 +634,7 @@ model:
   stage6_0:
     fail_fast: true
     phase_a_mode: from_scratch
+    render_loss_target_chunk_size: 12
     base_measurement:
       type: stage5_4_v4
       mode: from_scratch
@@ -765,10 +784,10 @@ optimizer:
     stage6_posterior_updater_base: 1.0e-4
     stage6_struct_decoder: 5.0e-5
     biggs_child_decoder: 1.0e-4
-    parent_token_builder: 1.0e-4
-    parent_ptv3: 1.0e-4
-    parent_temporal_mamba: 1.0e-4
-    parent_temporal_adapter: 1.0e-4
+    parent_token_builder: 1.5e-4
+    parent_ptv3: 1.5e-4
+    parent_temporal_mamba: 1.5e-4
+    parent_temporal_adapter: 2.0e-4
     measurement_frontend: 1.0e-5
     stage6_measurement_frontend_residual_unet: 5.0e-5
   betas: [0.9, 0.95]
@@ -826,7 +845,7 @@ training:
       finite_check_interval: 0
   grad_clip:
     enable: true
-    max_norm: 1.0
+    max_norm: 1.5
 
 scheduler_stage3_0_validation:
   enable: false
@@ -860,8 +879,8 @@ iforward_validation_v4:
       target_frames: 10
       min_frames: 10
       allow_short: false
-    - name: seq24
-      target_frames: 24
+    - name: seq20
+      target_frames: 20
       min_frames: 8
       allow_short: true
   repair_permutations: 3
@@ -872,6 +891,9 @@ iforward_validation_v4:
     - memory_read_write
     - memory_freeze_write
     - memory_shuffle_state
+    - memory_shuffle_read_write_state
+    - memory_freeze_after_prefill
+    - memory_wrong_parent_key_fixed
   protocols:
     assimilation_timeline: true
     repair_before_after: true
@@ -887,7 +909,7 @@ iforward_validation_v4:
 
 iforward_demo:
   enable: false
-  default_recipe: repair_showcase_24
+  default_recipe: repair_showcase_20
   output_dir: ""
   seed: 20260701
   memory_ablation:
@@ -896,6 +918,9 @@ iforward_demo:
     - memory_read_write
     - memory_freeze_write
     - memory_shuffle_state
+    - memory_shuffle_read_write_state
+    - memory_freeze_after_prefill
+    - memory_wrong_parent_key_fixed
 
 logging:
   output_root: /root/autodl-tmp/outputs

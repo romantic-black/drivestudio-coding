@@ -61,13 +61,21 @@ class IForwardRunner:
                 recorder.record_control(event, state, event_idx=idx, memory_mode=memory_mode)
             elif isinstance(event, UpdateEvent):
                 event_memory_mode = normalize_memory_mode(event.memory_mode or memory_mode)
+                previous_state = state
                 out = self._run_update(event, state, event_memory_mode, options)
                 state = self._next_state(out) if bool(options.update_state) else state
-                recorder.record_update(event, out, state, event_idx=idx, memory_mode=event_memory_mode)
+                recorder.record_update(
+                    event,
+                    out,
+                    state,
+                    event_idx=idx,
+                    memory_mode=event_memory_mode,
+                    previous_state=previous_state,
+                )
                 memory_mode = event_memory_mode
             elif isinstance(event, ProbeEvent):
                 out = self._run_probe(event, state, memory_mode, options)
-                recorder.record_probe(event, out, state, event_idx=idx, memory_mode=memory_mode)
+                recorder.record_probe(event, out, state, event_idx=idx, memory_mode=memory_mode, previous_state=state)
             else:
                 raise TypeError(type(event))
         return recorder.end_plan(trace)

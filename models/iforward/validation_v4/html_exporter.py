@@ -44,7 +44,7 @@ def export_html_report(trace: Any, output_dir: str | Path, *, title: str = "IFor
         title=title,
         summary=summary,
         rows=rows,
-        raw_links=["plan.json", "trace.jsonl", "summary.json", "html_summary.json"],
+        raw_links=_raw_links(output, ["plan.json", "trace.jsonl", "summary.json", "html_summary.json", "parent_diagnostics_summary.csv"]),
     )
     path = output / "index.html"
     path.write_text(html_text, encoding="utf-8")
@@ -96,9 +96,16 @@ def _render_html(*, title: str, summary: dict[str, Any], rows: list[dict[str, An
         "<section><h2>Raw Trace</h2>",
         _table(rows[:200]),
         "</section>",
+        "<section><h2>Parent Diagnostics</h2>",
+        _parent_artifact_table(rows),
+        "</section>",
         "</body></html>",
     ]
     return "\n".join(body)
+
+
+def _raw_links(output: Path, candidates: list[str]) -> list[str]:
+    return [name for name in candidates if (output / name).exists()]
 
 
 def _status_block(protocols: list[dict[str, Any]], summary: dict[str, Any]) -> str:
@@ -149,6 +156,52 @@ def _table(rows: list[dict[str, Any]]) -> str:
                 value = json.dumps(value, sort_keys=True)[:180]
             vals.append(f"<td>{html.escape(str(value))}</td>")
         lines.append("<tr>" + "".join(vals) + "</tr>")
+    lines.append("</tbody></table>")
+    return "\n".join(lines)
+
+
+def _parent_artifact_table(rows: list[dict[str, Any]]) -> str:
+    compact = []
+    for row in rows:
+        artifacts = dict(row.get("artifacts", {}) or {})
+        parent_csv = artifacts.get("parent_topk_csv", "")
+        if not parent_csv:
+            continue
+        metadata = dict(row.get("metadata", {}) or {})
+        parent_meta = dict(metadata.get("parent_diagnostics", {}) or {})
+        compact.append(
+            {
+                "event_id": row.get("event_id", ""),
+                "protocol": row.get("protocol", ""),
+                "memory_mode": row.get("memory_mode", ""),
+                "num_rows": parent_meta.get("num_rows", 0),
+                "max_impact_score": parent_meta.get("max_impact_score", 0.0),
+                "max_delta_norm_rms": parent_meta.get("max_delta_norm_rms", 0.0),
+                "parent_topk_csv": parent_csv,
+                "parent_summary_json": artifacts.get("parent_summary_json", ""),
+            }
+        )
+    if not compact:
+        return "<p>No parent diagnostics were recorded.</p>"
+    lines = [
+        "<table><thead><tr>"
+        "<th>event_id</th><th>protocol</th><th>memory_mode</th><th>rows</th>"
+        "<th>max impact</th><th>max delta rms</th><th>top-K</th><th>summary</th>"
+        "</tr></thead><tbody>"
+    ]
+    for row in compact[:200]:
+        lines.append(
+            "<tr>"
+            f"<td>{html.escape(str(row['event_id']))}</td>"
+            f"<td>{html.escape(str(row['protocol']))}</td>"
+            f"<td>{html.escape(str(row['memory_mode']))}</td>"
+            f"<td>{html.escape(str(row['num_rows']))}</td>"
+            f"<td>{float(row['max_impact_score']):.6f}</td>"
+            f"<td>{float(row['max_delta_norm_rms']):.6f}</td>"
+            f"<td><a href='{html.escape(str(row['parent_topk_csv']))}'>csv</a></td>"
+            f"<td><a href='{html.escape(str(row['parent_summary_json']))}'>json</a></td>"
+            "</tr>"
+        )
     lines.append("</tbody></table>")
     return "\n".join(lines)
 

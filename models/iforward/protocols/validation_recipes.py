@@ -22,6 +22,7 @@ class FrameSetSpec:
 
 DEFAULT_FRAME_SETS = {
     "seq10": FrameSetSpec(name="seq10", target_frames=10, min_frames=10, allow_short=False),
+    "seq20": FrameSetSpec(name="seq20", target_frames=20, min_frames=8, allow_short=True),
     "seq24": FrameSetSpec(name="seq24", target_frames=24, min_frames=8, allow_short=True),
 }
 
@@ -72,7 +73,23 @@ def iforward_validation_v4_cfg(cfg: Any) -> dict[str, Any]:
     frame_sets = _parse_frame_sets(frame_sets_raw)
     memory_modes = [
         normalize_memory_mode(x)
-        for x in list(_cfg_get(raw, "memory_ablation", ["full", "memory_off", "memory_read_write", "memory_freeze_write", "memory_shuffle_state"]) or [])
+        for x in list(
+            _cfg_get(
+                raw,
+                "memory_ablation",
+                [
+                    "full",
+                    "memory_off",
+                    "memory_read_write",
+                    "memory_freeze_write",
+                    "memory_shuffle_state",
+                    "memory_shuffle_read_write_state",
+                    "memory_freeze_after_prefill",
+                    "memory_wrong_parent_key_fixed",
+                ],
+            )
+            or []
+        )
     ]
     return {
         "enable": bool(_cfg_get(raw, "enable", False)),
@@ -127,14 +144,23 @@ def build_validation_v4_plans(
                 )
             if bool(protocols.get("memory_ablation", True)) or bool(protocols.get("memory_ablation_by_distribution", False)):
                 for mode in memory_modes:
-                    plans.append(
-                        adapter.plan_from_episode_v3(
-                            episode,
-                            f"{'memory_ablation_by_distribution' if bool(protocols.get('memory_ablation_by_distribution', False)) else 'memory_ablation'}/{fs.name}/{mode}/entry{entry_idx}",
-                            memory_mode=mode,
-                            metadata={"frame_set": fs.name, "entry_idx": int(entry_idx), "memory_mode": mode},
-                        )
+                    protocol_prefix = (
+                        "memory_ablation_by_distribution"
+                        if bool(protocols.get("memory_ablation_by_distribution", False))
+                        else "memory_ablation"
                     )
+                    protocol_name = f"{protocol_prefix}/{fs.name}/{mode}/entry{entry_idx}"
+                    if str(mode) == "memory_freeze_after_prefill":
+                        plans.append(_freeze_after_prefill_plan(adapter=adapter, scheduler=scheduler, episode=episode, protocol_name=protocol_name))
+                    else:
+                        plans.append(
+                            adapter.plan_from_episode_v3(
+                                episode,
+                                protocol_name,
+                                memory_mode=mode,
+                                metadata={"frame_set": fs.name, "entry_idx": int(entry_idx), "memory_mode": mode},
+                            )
+                        )
             if bool(protocols.get("repair_before_after", True)) or bool(protocols.get("repair_tail_before_after", False)):
                 plans.append(
                     _repair_plan(
@@ -220,6 +246,16 @@ def _make_scheduler_for_frame_set(cfg: Any, dataset: Any, *, fs: FrameSetSpec, s
         }
     )
     sched["sequence"] = sequence
+    if sched_key == "scheduler_stage3_2":
+        curriculum = []
+        for phase in list(_cfg_get(sched, "curriculum", []) or []):
+            item = dict(phase or {})
+            item["sequence_target_frames"] = int(fs.target_frames)
+            item["min_frames"] = int(fs.min_frames)
+            item["allow_short"] = bool(fs.allow_short)
+            curriculum.append(item)
+        if curriculum:
+            sched["curriculum"] = curriculum
     repair = dict(_cfg_get(sched, "repair", {}) or {})
     repair["enable"] = False
     sched["repair"] = repair
@@ -354,6 +390,43 @@ def _repeat_stability_plan(
             rollouts_per_episode=len(tuple(episode.rollouts)) + 1,
         )
         events.append(adapter._event_from_rollout_plan(plan, event_idx=len(events), protocol_name=protocol_name))
+    return _plan_from_events(adapter, episode, protocol_name, tuple(events))
+
+
+def _freeze_after_prefill_plan(
+    *,
+    adapter: Stage3SchedulerAdapter,
+    scheduler: Stage23Scheduler,
+    episode: Any,
+    protocol_name: str,
+) -> EpisodePlan:
+    rows = _rows_for_episode(scheduler, episode)
+    events: list[Any] = [
+        adapter._event_from_rollout_plan(rollout, event_idx=idx, protocol_name=protocol_name, memory_mode="full")
+        for idx, rollout in enumerate(tuple(episode.rollouts))
+    ]
+    final_positions = list(range(int(rows.shape[0])))
+    target_pos = int(final_positions[-1]) if final_positions else 0
+    freeze_plan = _manual_stage2_3_plan(
+        scheduler=scheduler,
+        episode=episode,
+        rows=rows,
+        positions=[target_pos],
+        repeat_budgets=[1],
+        phase="assimilation",
+        visit_kind="assimilation",
+        rollout_idx=len(tuple(episode.rollouts)),
+        rollouts_per_episode=len(tuple(episode.rollouts)) + 1,
+        target_positions=final_positions,
+    )
+    events.append(
+        adapter._event_from_rollout_plan(
+            freeze_plan,
+            event_idx=len(events),
+            protocol_name=protocol_name,
+            memory_mode="memory_freeze_after_prefill",
+        )
+    )
     return _plan_from_events(adapter, episode, protocol_name, tuple(events))
 
 

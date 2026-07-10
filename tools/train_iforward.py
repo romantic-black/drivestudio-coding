@@ -17,6 +17,25 @@ import sys
 import traceback
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+
+def _install_headless_dash_comm_stub() -> None:
+    """Make open3d's optional dash import safe in non-notebook CLI runs."""
+    try:
+        import comm  # type: ignore
+    except Exception:
+        return
+
+    def _raise_import_error(*args: Any, **kwargs: Any) -> Any:
+        raise ImportError("dash comm disabled for headless training")
+
+    try:
+        comm.create_comm = _raise_import_error  # type: ignore[attr-defined]
+    except Exception:
+        return
+
+
+_install_headless_dash_comm_stub()
+
 import torch
 from omegaconf import OmegaConf
 

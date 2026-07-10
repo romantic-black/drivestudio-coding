@@ -840,6 +840,18 @@ class IForwardModel(nn.Module):
                             include_parent_event=include_parent_event,
                             include_delta_summary=include_delta_summary,
                             include_visit_embedding=include_visit_embedding,
+                            update_rule=str(cfg_get(gdkv_cfg, "update_rule", "gdn2_legacy")),
+                            alpha_mode=str(cfg_get(gdkv_cfg, "alpha_mode", "value_channel")),
+                            alpha_max=float(cfg_get(gdkv_cfg, "alpha_max", 1.0)),
+                            alpha_init=float(cfg_get(gdkv_cfg, "alpha_init", 0.1)),
+                            surprise_gating=bool(cfg_get(gdkv_cfg, "surprise_gating", True)),
+                            surprise_target_rms=float(cfg_get(gdkv_cfg, "surprise_target_rms", 1.0)),
+                            min_alpha_on_unseen=float(cfg_get(gdkv_cfg, "min_alpha_on_unseen", 0.5)),
+                            cleanup_enable=bool(cfg_get(gdkv_cfg, "cleanup_enable", False)),
+                            cleanup_key=str(cfg_get(gdkv_cfg, "cleanup_key", "learned")),
+                            cleanup_max=float(cfg_get(gdkv_cfg, "cleanup_max", 0.2)),
+                            cleanup_init=float(cfg_get(gdkv_cfg, "cleanup_init", 0.02)),
+                            cleanup_by_kind=cfg_get(gdkv_cfg, "cleanup_by_kind", None),
                             state_dtype=storage_dtype_from_name(
                                 cfg_get(
                                     cfg_get(cfg_get(cfg_get(self.config, "training", {}) or {}, "amp", {}) or {}, "memory", {}) or {},
@@ -1017,6 +1029,8 @@ class IForwardModel(nn.Module):
                 "mamba_read_write",
                 "mamba_shuffle_state",
                 "mamba_freeze_write",
+                "mamba_shuffle_read_write_state",
+                "mamba_wrong_parent_key_fixed",
             }
         else:
             self.allowed_ablations = {
@@ -1055,20 +1069,38 @@ class IForwardModel(nn.Module):
             init_cfg = cfg_get(self.config, "initialization", {}) or {}
             skip_keys = [str(x) for x in list(cfg_get(init_cfg, "skip_keys", []) or []) if str(x)]
             sd = ckpt.get("model_state_dict")
-            if not skip_keys or not isinstance(sd, dict):
+            if not isinstance(sd, dict):
                 return False
+            raw_sd = {str(k): v for k, v in dict(sd).items() if str(k) != "_extra_state"}
+            current_keys = set(self.state_dict().keys())
+            direct_matches = sum(1 for key in raw_sd if key in current_keys)
+            stripped_sd = {
+                (key[len("model.") :] if key.startswith("model.") else key): value
+                for key, value in raw_sd.items()
+            }
+            stripped_matches = sum(1 for key in stripped_sd if key in current_keys)
+            normalized_sd = stripped_sd if stripped_matches > direct_matches else raw_sd
             filtered = {
-                str(k): v
-                for k, v in dict(sd).items()
-                if not any(str(k).startswith(prefix) or f".{prefix}" in str(k) for prefix in skip_keys)
+                key: value
+                for key, value in normalized_sd.items()
+                if not any(str(key).startswith(prefix) or f".{prefix}" in str(key) for prefix in skip_keys)
             }
             missing, unexpected = self.load_state_dict(filtered, strict=False)
 
-            def _allowed(name: str) -> bool:
+            def _skip_allowed(name: str) -> bool:
                 return any(str(name).startswith(prefix) or f".{prefix}" in str(name) for prefix in skip_keys)
 
-            bad_missing = [str(k) for k in missing if not _allowed(str(k))]
-            bad_unexpected = [str(k) for k in unexpected if not _allowed(str(k))]
+            def _new_gdkv_param(name: str) -> bool:
+                text = str(name)
+                return ".alpha_proj." in text or ".cleanup_key_proj." in text or ".cleanup_proj." in text
+
+            def _legacy_sparse_conv(name: str) -> bool:
+                return str(name).startswith("phase_a_runtime.sparse_conv.") or str(name).startswith(
+                    "model.phase_a_runtime.sparse_conv."
+                )
+
+            bad_missing = [str(k) for k in missing if not (_skip_allowed(str(k)) or _new_gdkv_param(str(k)))]
+            bad_unexpected = [str(k) for k in unexpected if not (_skip_allowed(str(k)) or _legacy_sparse_conv(str(k)))]
             if bad_missing or bad_unexpected:
                 raise ValueError(
                     "IForward init_checkpoint skip_keys load failed: "
@@ -1759,6 +1791,9 @@ class IForwardModel(nn.Module):
             "shuffle_memory": "mamba_shuffle_state",
             "bypass_memory": "mamba_off",
             "freeze_write": "mamba_freeze_write",
+            "shuffle_read_write_state": "mamba_shuffle_read_write_state",
+            "shuffle_rw_state": "mamba_shuffle_read_write_state",
+            "wrong_parent_key_fixed": "mamba_wrong_parent_key_fixed",
         }
         return str(aliases.get(name, name))
 
@@ -1861,10 +1896,15 @@ class IForwardModel(nn.Module):
             module_ablation_name = "full"
         stage2_3_mamba_off = bool(self.is_stage2_3_optimizer_mamba and ablation_name == "mamba_off")
         stage2_3_mamba_freeze_write = bool(
-            self.is_stage2_3_optimizer_mamba and ablation_name in {"mamba_read_only", "mamba_freeze_write"}
+            self.is_stage2_3_optimizer_mamba
+            and ablation_name in {"mamba_read_only", "mamba_freeze_write", "mamba_wrong_parent_key_fixed"}
         )
         stage2_3_mamba_shuffle_state = bool(
             self.is_stage2_3_optimizer_mamba and ablation_name == "mamba_shuffle_state"
+        )
+        stage2_3_mamba_shuffle_read_write_state = bool(
+            self.is_stage2_3_optimizer_mamba
+            and ablation_name in {"mamba_shuffle_read_write_state", "mamba_wrong_parent_key_fixed"}
         )
         adc_disabled_by_ablation = ablation_name == "no_adc"
         resolved = self.resolver.resolve(batch)
@@ -1884,6 +1924,10 @@ class IForwardModel(nn.Module):
         else:
             state = carried_state
             prior_state_for_history = carried_state
+        if bool(stage2_3_mamba_shuffle_read_write_state) and getattr(state, "parent_temporal", None) is not None:
+            state.parent_temporal = self._shuffle_stage2_3_optimizer_state(state.parent_temporal)
+            if prior_state_for_history is state:
+                prior_state_for_history = state
             if tuple(state.cache_key) != tuple(resolved.cache_key):
                 raise ValueError(f"IForward carried state key {state.cache_key} does not match batch {resolved.cache_key}.")
 

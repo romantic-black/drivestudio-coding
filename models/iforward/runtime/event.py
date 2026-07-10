@@ -11,6 +11,9 @@ MemoryMode = Literal[
     "memory_read_write",
     "memory_shuffle_state",
     "memory_freeze_write",
+    "memory_shuffle_read_write_state",
+    "memory_freeze_after_prefill",
+    "memory_wrong_parent_key_fixed",
 ]
 
 LEGACY_MEMORY_MODE_ALIASES = {
@@ -21,11 +24,18 @@ LEGACY_MEMORY_MODE_ALIASES = {
     "shuffle_memory": "memory_shuffle_state",
     "bypass_memory": "memory_off",
     "freeze_write": "memory_freeze_write",
+    "shuffle_read_write_state": "memory_shuffle_read_write_state",
+    "shuffle_rw_state": "memory_shuffle_read_write_state",
+    "freeze_after_prefill": "memory_freeze_after_prefill",
+    "wrong_parent_key_fixed": "memory_wrong_parent_key_fixed",
     "mamba_off": "memory_off",
     "mamba_read_only": "memory_read_only",
     "mamba_read_write": "memory_read_write",
     "mamba_shuffle_state": "memory_shuffle_state",
     "mamba_freeze_write": "memory_freeze_write",
+    "mamba_shuffle_read_write_state": "memory_shuffle_read_write_state",
+    "mamba_freeze_after_prefill": "memory_freeze_after_prefill",
+    "mamba_wrong_parent_key_fixed": "memory_wrong_parent_key_fixed",
 }
 
 VALID_MEMORY_MODES = {
@@ -35,6 +45,9 @@ VALID_MEMORY_MODES = {
     "memory_read_write",
     "memory_shuffle_state",
     "memory_freeze_write",
+    "memory_shuffle_read_write_state",
+    "memory_freeze_after_prefill",
+    "memory_wrong_parent_key_fixed",
 }
 
 MEMORY_MODE_TO_FORWARD_ABLATION = {
@@ -44,6 +57,9 @@ MEMORY_MODE_TO_FORWARD_ABLATION = {
     "memory_read_write": "mamba_read_write",
     "memory_shuffle_state": "mamba_shuffle_state",
     "memory_freeze_write": "mamba_freeze_write",
+    "memory_shuffle_read_write_state": "mamba_shuffle_read_write_state",
+    "memory_freeze_after_prefill": "mamba_freeze_write",
+    "memory_wrong_parent_key_fixed": "mamba_wrong_parent_key_fixed",
 }
 
 

@@ -86,6 +86,39 @@ def _visit(kind: str = "assimilate", repeat: int = 0) -> VisitMeta:
     )
 
 
+def _constant_key_residual_cell(*, cleanup_enable: bool = False) -> LowRankGatedDeltaKVCell:
+    cell = LowRankGatedDeltaKVCell(
+        event_dim=2,
+        token_dim=2,
+        key_dim=2,
+        value_dim=2,
+        value_rms_max=100.0,
+        state_rms_max=100.0,
+        update_rule="balanced_residual_delta_v1",
+        alpha_init=1.0,
+        surprise_gating=False,
+        min_alpha_on_unseen=1.0,
+        decay_min=1.0,
+        cleanup_enable=cleanup_enable,
+        cleanup_key="current_key",
+        cleanup_max=0.2,
+        cleanup_init=0.2,
+        cleanup_by_kind={"repair": 1.0, "default": 1.0},
+    )
+    with torch.no_grad():
+        cell.key_proj.weight.zero_()
+        cell.key_proj.bias.copy_(torch.tensor([1.0, -1.0]))
+        cell.value_proj.weight.copy_(torch.eye(2))
+        cell.value_proj.bias.zero_()
+    return cell
+
+
+def _read_write_address(cell: LowRankGatedDeltaKVCell, token: torch.Tensor, state) -> tuple[torch.Tensor, torch.Tensor]:
+    _, _, key, value, _ = cell._write_inputs(token, state, visit_meta=None)
+    old = torch.einsum("nkv,nk->nv", state.kv_state.float(), key)
+    return old, value
+
+
 def test_gated_delta_kv_cell_shape_mask_and_state_clamp() -> None:
     torch.manual_seed(4)
     cell = LowRankGatedDeltaKVCell(event_dim=64, token_dim=64, key_dim=16, value_dim=32, state_rms_max=0.75)
@@ -103,6 +136,109 @@ def test_gated_delta_kv_cell_shape_mask_and_state_clamp() -> None:
     assert torch.isfinite(next_state.kv_state).all()
     assert float(_rms_rows(next_state.kv_state, dims=(-2, -1)).max().item()) <= 0.7501
     assert aux["state_rms_max"] <= 0.7501
+
+
+def test_gated_delta_kv_residual_delta_fixed_point_stops_repeated_write() -> None:
+    cell = _constant_key_residual_cell()
+    state = cell.init_state(1, device=torch.device("cpu"), dtype=torch.float32)
+    token = torch.tensor([[0.75, -0.25]], dtype=torch.float32)
+    mask = torch.ones(1, dtype=torch.bool)
+    old0, value = _read_write_address(cell, token, state)
+    initial_residual = float(torch.norm(value - old0).item())
+    residuals = []
+    aux = {}
+    for _ in range(4):
+        state, aux = cell.write(token, state, mask, visit_meta=_visit("repair"))
+        old, value = _read_write_address(cell, token, state)
+        residuals.append(float(torch.norm(value - old).item()))
+    assert residuals[-1] < initial_residual * 1.0e-3
+    assert torch.allclose(old, value, atol=1.0e-4, rtol=1.0e-4)
+    assert aux["state_clamp_ratio"] == 0.0
+    assert aux["residual_rms_mean"] < initial_residual
+
+
+def test_gated_delta_kv_residual_delta_replaces_conflicting_value() -> None:
+    cell = _constant_key_residual_cell()
+    state = cell.init_state(1, device=torch.device("cpu"), dtype=torch.float32)
+    mask = torch.ones(1, dtype=torch.bool)
+    token_a = torch.tensor([[0.6, -0.2]], dtype=torch.float32)
+    token_b = torch.tensor([[-0.4, 0.9]], dtype=torch.float32)
+    state, _ = cell.write(token_a, state, mask, visit_meta=_visit("repair"))
+    old_a, value_a = _read_write_address(cell, token_a, state)
+    assert torch.allclose(old_a, value_a, atol=1.0e-4, rtol=1.0e-4)
+    state, aux = cell.write(token_b, state, mask, visit_meta=_visit("repair", 1))
+    old_b, value_b = _read_write_address(cell, token_b, state)
+    dist_to_b = torch.norm(old_b - value_b)
+    dist_to_a = torch.norm(old_b - value_a)
+    assert float(dist_to_b.item()) < 1.0e-4
+    assert float(dist_to_b.item()) < float(dist_to_a.item())
+    assert aux["state_clamp_ratio"] == 0.0
+
+
+def test_gated_delta_kv_v2b_cleanup_fixed_point_stays_bounded() -> None:
+    cell = _constant_key_residual_cell(cleanup_enable=True)
+    state = cell.init_state(1, device=torch.device("cpu"), dtype=torch.float32)
+    token = torch.tensor([[0.75, -0.25]], dtype=torch.float32)
+    mask = torch.ones(1, dtype=torch.bool)
+    old0, value = _read_write_address(cell, token, state)
+    initial_residual = float(torch.norm(value - old0).item())
+    residuals = []
+    aux = {}
+    for repeat in range(4):
+        state, aux = cell.write(token, state, mask, visit_meta=_visit("repair", repeat))
+        old, value = _read_write_address(cell, token, state)
+        residuals.append(float(torch.norm(value - old).item()))
+    assert residuals[-1] < initial_residual * 1.0e-3
+    assert torch.allclose(old, value, atol=1.0e-4, rtol=1.0e-4)
+    assert aux["state_clamp_ratio"] == 0.0
+    assert aux["cleanup_mean"] > 0.0
+    assert aux["cleanup_old_rms_mean"] > 0.0
+    assert aux["cleanup_key_rms_mean"] > 0.0
+
+
+def test_gated_delta_kv_v2b_cleanup_replaces_stale_value_without_saturation() -> None:
+    cell = _constant_key_residual_cell(cleanup_enable=True)
+    state = cell.init_state(1, device=torch.device("cpu"), dtype=torch.float32)
+    mask = torch.ones(1, dtype=torch.bool)
+    token_a = torch.tensor([[0.6, -0.2]], dtype=torch.float32)
+    token_b = torch.tensor([[-0.4, 0.9]], dtype=torch.float32)
+    state, _ = cell.write(token_a, state, mask, visit_meta=_visit("repair"))
+    old_a, value_a = _read_write_address(cell, token_a, state)
+    assert torch.allclose(old_a, value_a, atol=1.0e-4, rtol=1.0e-4)
+    state, aux = cell.write(token_b, state, mask, visit_meta=_visit("repair", 1))
+    old_b, value_b = _read_write_address(cell, token_b, state)
+    assert torch.norm(old_b - value_b).item() < 1.0e-4
+    assert torch.norm(old_b - value_b).item() < torch.norm(old_b - value_a).item()
+    assert aux["state_clamp_ratio"] == 0.0
+    assert aux["post_state_rms_max"] < 100.0
+    assert aux["cleanup_mean"] > 0.0
+
+
+def test_gated_delta_kv_v2b_old_state_dict_loads_with_new_cleanup_params_missing() -> None:
+    new_cell = LowRankGatedDeltaKVCell(
+        event_dim=4,
+        token_dim=4,
+        key_dim=2,
+        value_dim=3,
+        cleanup_enable=True,
+    )
+    old_style_state = {
+        key: value
+        for key, value in new_cell.state_dict().items()
+        if "alpha_proj" not in key and "cleanup_key_proj" not in key and "cleanup_proj" not in key
+    }
+    missing, unexpected = new_cell.load_state_dict(old_style_state, strict=False)
+    assert unexpected == []
+    assert sorted(missing) == [
+        "alpha_proj.bias",
+        "alpha_proj.weight",
+        "cleanup_key_proj.bias",
+        "cleanup_key_proj.weight",
+        "cleanup_proj.bias",
+        "cleanup_proj.weight",
+    ]
+    assert torch.isfinite(new_cell.cleanup_key_proj.weight).all()
+    assert torch.isfinite(new_cell.cleanup_proj.bias).all()
 
 
 def test_gated_delta_kv_cell_keeps_state_fp32_from_half_state() -> None:
@@ -369,6 +505,8 @@ def test_stage3_1_config_and_legacy_ablation_alias() -> None:
     assert cfg.model.iforward.parent_optimizer_memory.type == "lowrank_gated_delta_kv"
     assert cfg.model.iforward.parent_optimizer_memory.gated_delta_kv.K == 16
     assert cfg.model.iforward.parent_optimizer_memory.gated_delta_kv.V == 32
+    assert cfg.model.iforward.parent_optimizer_memory.gated_delta_kv.get("update_rule", "gdn2_legacy") == "gdn2_legacy"
+    assert cfg.model.iforward.parent_optimizer_memory.gated_delta_kv.get("cleanup_enable", False) is False
     assert cfg.model.iforward.debug.gdkv_aux_interval == 100
     assert cfg.training.amp.storage.features_2d_cache_dtype == "fp32"
     assert cfg.training.amp.storage.parent_context_cache_dtype == "fp32"
@@ -389,6 +527,8 @@ def test_stage3_1_config_and_legacy_ablation_alias() -> None:
     model.is_stage2_3_optimizer_mamba = True
     assert IForwardModel._normalize_ablation_name(model, "shuffle_memory") == "mamba_shuffle_state"
     assert IForwardModel._normalize_ablation_name(model, "read_only") == "mamba_read_only"
+    assert IForwardModel._normalize_ablation_name(model, "shuffle_rw_state") == "mamba_shuffle_read_write_state"
+    assert IForwardModel._normalize_ablation_name(model, "wrong_parent_key_fixed") == "mamba_wrong_parent_key_fixed"
 
 
 def test_stage3_2_distributional_config_keeps_gdkv_model_and_enables_scheduler() -> None:
@@ -401,9 +541,30 @@ def test_stage3_2_distributional_config_keeps_gdkv_model_and_enables_scheduler()
     assert cfg.model.stage6_0.local_rollout.source == "scheduler_stage3_2"
     assert cfg.model.iforward.version == "stage3_1_lowrank_gated_delta_kv_lift"
     assert cfg.model.iforward.parent_optimizer_memory.type == "lowrank_gated_delta_kv"
-    assert cfg.model.iforward.debug.gdkv_aux_interval == 1000
+    gdkv_cfg = cfg.model.iforward.parent_optimizer_memory.gated_delta_kv
+    assert gdkv_cfg.update_rule == "balanced_residual_delta_v1"
+    assert gdkv_cfg.alpha_mode == "value_channel"
+    assert gdkv_cfg.alpha_max == 1.0
+    assert gdkv_cfg.alpha_init == 0.10
+    assert gdkv_cfg.surprise_gating is True
+    assert gdkv_cfg.surprise_target_rms == 1.0
+    assert gdkv_cfg.min_alpha_on_unseen == 0.5
+    assert gdkv_cfg.cleanup_enable is True
+    assert gdkv_cfg.cleanup_key == "learned"
+    assert gdkv_cfg.cleanup_max == 0.2
+    assert gdkv_cfg.cleanup_init == 0.02
+    assert gdkv_cfg.cleanup_by_kind.bootstrap == 0.0
+    assert gdkv_cfg.cleanup_by_kind.assimilate == 0.05
+    assert gdkv_cfg.cleanup_by_kind.assimilation == 0.05
+    assert gdkv_cfg.cleanup_by_kind.repeat_stability == 0.05
+    assert gdkv_cfg.cleanup_by_kind.repair == 0.10
+    assert gdkv_cfg.cleanup_by_kind.stress == 0.10
+    assert gdkv_cfg.decay_min.repair == 0.995
+    assert gdkv_cfg.decay_min.repeat_stability == 0.995
+    assert cfg.model.iforward.debug.gdkv_aux_interval == 100
     assert cfg.model.iforward.debug.forward_memory_aux_interval == 1000
     assert cfg.model.iforward.repair_training.stage3_2_train_2d_policy_override is True
+    assert cfg.model.stage6_0.render_loss_target_chunk_size == 12
     assert cfg.training.amp.storage.features_2d_cache_dtype == "fp32"
     assert cfg.training.amp.storage.parent_context_cache_dtype == "fp32"
     assert cfg.training.amp.memory.gdkv_compute_amp is False
@@ -416,13 +577,27 @@ def test_stage3_2_distributional_config_keeps_gdkv_model_and_enables_scheduler()
     assert cfg.scheduler_stage3_2.curriculum[1].weights.repeat_refine == 0.30
     assert cfg.scheduler_stage3_2.curriculum[1].weights.shuffled_coverage == 0.50
     assert cfg.scheduler_stage3_2.curriculum[1].weights.high_block_repair == 0.20
-    assert cfg.scheduler_stage3_2.curriculum[2].weights.repeat_refine == 0.20
-    assert cfg.scheduler_stage3_2.curriculum[2].weights.shuffled_coverage == 0.40
-    assert cfg.scheduler_stage3_2.curriculum[2].weights.high_block_repair == 0.40
+    assert cfg.scheduler_stage3_2.curriculum[2].weights.repeat_refine == 0.22
+    assert cfg.scheduler_stage3_2.curriculum[2].weights.shuffled_coverage == 0.56
+    assert cfg.scheduler_stage3_2.curriculum[2].weights.high_block_repair == 0.22
+    assert cfg.scheduler_stage3_2.curriculum[2].sequence_target_frames == 20
+    assert cfg.scheduler_stage3_2.curriculum[2].max_k.train_2d.shuffled_coverage == 8
+    assert cfg.scheduler_stage3_2.curriculum[2].max_k.frozen_2d.high_block_repair == 12
+    assert cfg.optimizer.lr.parent_temporal_adapter == 2.0e-4
+    assert cfg.optimizer.lr.parent_temporal_mamba == 1.5e-4
+    assert cfg.optimizer.lr.parent_ptv3 == 1.5e-4
+    assert cfg.optimizer.lr.parent_token_builder == 1.5e-4
+    assert cfg.training.grad_clip.max_norm == 1.5
     assert cfg.scheduler_stage3_0_validation.enable is False
     assert cfg.iforward_validation_v4.enable is True
     assert cfg.iforward_validation_v4.interval_steps == 10000
     assert cfg.iforward_validation_v4.max_entries_debug == 1
+    assert cfg.iforward_validation_v4.frame_sets[1].name == "seq20"
+    assert cfg.iforward_validation_v4.frame_sets[1].target_frames == 20
     assert cfg.iforward_validation_v4.repair_permutations == 3
     assert cfg.iforward_validation_v4.protocols.repeat_stability is False
     assert cfg.iforward_validation_v4.report.image_policy == "first_plan_only"
+    assert "memory_shuffle_read_write_state" in list(cfg.iforward_validation_v4.memory_ablation)
+    assert "memory_freeze_after_prefill" in list(cfg.iforward_validation_v4.memory_ablation)
+    assert "memory_wrong_parent_key_fixed" in list(cfg.iforward_validation_v4.memory_ablation)
+    assert cfg.iforward_demo.default_recipe == "repair_showcase_20"
