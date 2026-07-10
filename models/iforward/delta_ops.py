@@ -32,6 +32,8 @@ def gate_branch_delta(delta: BranchDelta, gate: Any) -> BranchDelta:
         hidden=maybe_mul("hidden", delta.hidden, gate.hidden),
         confidence=delta.confidence,
         noop=delta.noop,
+        # Uncertainty state is calibrated independently from history/update gates.
+        appearance_logvar_delta=delta.appearance_logvar_delta,
         active_attrs=active_attrs,
     )
 

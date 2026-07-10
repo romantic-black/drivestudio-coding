@@ -69,7 +69,10 @@ from models.iforward.runtime.adapter_stage3 import Stage3SchedulerAdapter
 from models.iforward.runtime.runner import IForwardRunner, RunnerOptions
 from models.iforward.runtime.trace import TraceRecorder
 from models.iforward.validation_v4.html_exporter import export_html_report
-from models.iforward.versions import is_stage3_optimizer_memory_iforward_version
+from models.iforward.versions import (
+    is_stage3_optimizer_memory_iforward_version,
+    uncertainty_schema_versions,
+)
 from tools.train_minimal_streetforward_stage4_3_iforward_common import (
     build_multi_scene_dataset_v4,
     build_train_scheduler_iforward_from_cfg,
@@ -234,6 +237,9 @@ def _build_iforward_run_manifest(**kwargs: Any) -> Tuple[Dict[str, Any], str]:
     manifest.update(_active_scheduler_manifest_fields(cfg))
     manifest.update(_active_validation_manifest_fields(cfg))
     manifest.update(_iforward_lifting_manifest_fields(cfg))
+    iforward_cfg = _cfg_get(_cfg_get(cfg, "model", {}) or {}, "iforward", {}) or {}
+    manifest.update({"local_gs_state_schema_version": 2})
+    manifest.update(uncertainty_schema_versions(_cfg_get(iforward_cfg, "version", "")))
     return manifest, snapshot_yaml
 
 

@@ -461,6 +461,8 @@ def test_adc_lite_conflict_score_uses_max_grad_gate_not_sqrt_product() -> None:
 
 def test_adc_lite_apply_clone_extends_episode_local_state() -> None:
     local = _local_state(3)
+    with torch.no_grad():
+        local.bg.appearance_logvar.copy_(torch.tensor([[-5.0], [-4.0], [-3.0]]))
     memory = IForwardGRUMemoryState.from_local_state(local, hidden_dim=5)
     history_ema = IForwardHistoryEMAState.from_local_state(local)
     hgv2_bank = build_history_gradient_bank_from_loss(
@@ -520,6 +522,11 @@ def test_adc_lite_apply_clone_extends_episode_local_state() -> None:
     assert state.adc_meta.original_bg_count == 3
     assert state.adc_meta.num_bg_clones_created_episode == 2
     assert state.adc_meta.parent_index.tolist() == [-1, -1, -1, 1, 2]
+    assert state.local_gs.bg.appearance_logvar.dtype == torch.float32
+    assert torch.equal(
+        state.local_gs.bg.appearance_logvar[-2:],
+        torch.tensor([[-4.0], [-3.0]]),
+    )
 
     alpha_each = torch.sigmoid(state.local_gs.bg.opacity_logit[1])
     combined = 1.0 - (1.0 - alpha_each) * (1.0 - alpha_each)

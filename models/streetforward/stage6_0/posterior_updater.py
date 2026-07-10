@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any, Dict, Optional
 
 import torch
@@ -31,6 +32,15 @@ class AppearanceDetailPack:
 
 
 @dataclass
+class AppearanceLogvarStatePack:
+    """Current uncertainty state aligned to the rows of each EventPack branch."""
+
+    bg: torch.Tensor
+    distant: Optional[torch.Tensor] = None
+    rigid: Optional[torch.Tensor] = None
+
+
+@dataclass
 class BranchDelta:
     means: torch.Tensor
     scales_log: torch.Tensor
@@ -40,7 +50,20 @@ class BranchDelta:
     hidden: torch.Tensor
     confidence: torch.Tensor
     noop: torch.Tensor
+    appearance_logvar_delta: Optional[torch.Tensor] = None
     active_attrs: Optional[Dict[str, bool]] = None
+
+    def __post_init__(self) -> None:
+        # Keep legacy/test constructors source-compatible while maintaining the
+        # runtime invariant that this field is always a concrete [N,1] tensor.
+        if self.appearance_logvar_delta is None:
+            self.appearance_logvar_delta = self.means.new_zeros((int(self.means.shape[0]), 1))
+        expected = (int(self.means.shape[0]), 1)
+        if tuple(self.appearance_logvar_delta.shape) != expected:
+            raise ValueError(
+                "appearance_logvar_delta must be [N,1], got "
+                f"{tuple(self.appearance_logvar_delta.shape)} for N={expected[0]}"
+            )
 
     def is_active(self, attr: str) -> bool:
         if self.active_attrs is None:
@@ -105,6 +128,7 @@ class Stage6PosteriorUpdater(nn.Module):
         "opacity_logit": "update_opacity",
         "sh": "update_sh",
         "hidden": "update_hidden",
+        "appearance_logvar_delta": "update_appearance_logvar",
     }
 
     def __init__(
@@ -134,6 +158,15 @@ class Stage6PosteriorUpdater(nn.Module):
         appearance_detail_attribute_gates: Optional[Dict[str, Dict[str, float]]] = None,
         appearance_detail_attribute_gate_max: Optional[Dict[str, float]] = None,
         invalid_update_policy: str = "none",
+        output_appearance_logvar_delta: bool = False,
+        appearance_logvar_detach_input: bool = True,
+        appearance_logvar_gate_by_valid: bool = True,
+        appearance_logvar_gate_by_main_noop: bool = False,
+        appearance_logvar_max_step: Optional[Dict[str, float]] = None,
+        zero_init_appearance_logvar_head: bool = True,
+        appearance_logvar_update_mode: str = "delta_v1",
+        appearance_logvar_target_temperature: float = 1.0,
+        appearance_logvar_state_cfg: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__()
         self.event_dim = int(event_dim)
@@ -148,6 +181,36 @@ class Stage6PosteriorUpdater(nn.Module):
         self.detail_attr_names = ("means", "scales", "quat", "opacity", "sh")
         self.detail_attribute_gates_enabled = bool(appearance_detail_attribute_gates)
         self.invalid_update_policy = str(invalid_update_policy or "none").lower()
+        self.output_appearance_logvar_delta = bool(output_appearance_logvar_delta)
+        self.appearance_logvar_detach_input = bool(appearance_logvar_detach_input)
+        self.appearance_logvar_gate_by_valid = bool(appearance_logvar_gate_by_valid)
+        self.appearance_logvar_gate_by_main_noop = bool(appearance_logvar_gate_by_main_noop)
+        self.appearance_logvar_update_mode = str(appearance_logvar_update_mode or "delta_v1").lower()
+        if self.appearance_logvar_update_mode not in {"delta_v1", "state_conditioned_target_v2"}:
+            raise ValueError(
+                "appearance_logvar_update_mode must be delta_v1 or state_conditioned_target_v2, "
+                f"got {appearance_logvar_update_mode!r}"
+            )
+        self.appearance_logvar_target_temperature = float(appearance_logvar_target_temperature)
+        if self.appearance_logvar_target_temperature <= 0.0:
+            raise ValueError("appearance_logvar_target_temperature must be positive")
+        raw_uncertainty_steps = dict(appearance_logvar_max_step or {})
+        self.appearance_logvar_max_step = {
+            "bg": float(raw_uncertainty_steps.get("bg", 0.08)),
+            "distant": float(raw_uncertainty_steps.get("distant", 0.10)),
+            "rigid": float(raw_uncertainty_steps.get("rigid", 0.10)),
+        }
+        state_cfg = dict(appearance_logvar_state_cfg or {})
+        init_sigma_cfg = dict(state_cfg.get("init_sigma", {}) or {})
+        sigma_min = float(state_cfg.get("sigma_min", 0.01))
+        sigma_max = float(state_cfg.get("sigma_max", 0.50))
+        default_sigma = {"bg": 0.08, "distant": 0.12, "rigid": 0.10}
+        self.appearance_logvar_prior = {
+            branch: 2.0 * math.log(float(init_sigma_cfg.get(branch, default_sigma[branch])))
+            for branch in default_sigma
+        }
+        self.appearance_logvar_min = 2.0 * math.log(sigma_min)
+        self.appearance_logvar_max = 2.0 * math.log(sigma_max)
         if self.invalid_update_policy not in {"none", "hard_zero"}:
             raise ValueError(
                 "Stage6PosteriorUpdater invalid_update_policy must be one of "
@@ -192,6 +255,24 @@ class Stage6PosteriorUpdater(nn.Module):
         self.head_hidden = nn.Linear(int(hidden_dim), self.stage_hidden_dim) if self.output_hidden else None
         self.head_confidence = nn.Linear(int(hidden_dim), 1) if self.output_confidence else None
         self.head_noop = nn.Linear(int(hidden_dim), 1) if self.output_noop else None
+        target_mode = self.appearance_logvar_update_mode == "state_conditioned_target_v2"
+        self.head_appearance_logvar_delta = (
+            nn.Linear(int(hidden_dim), 1)
+            if self.output_appearance_logvar_delta and not target_mode
+            else None
+        )
+        self.head_appearance_logvar_target = (
+            nn.Linear(int(hidden_dim) + 1, 1)
+            if self.output_appearance_logvar_delta and target_mode
+            else None
+        )
+        for uncertainty_head in (
+            self.head_appearance_logvar_delta,
+            self.head_appearance_logvar_target,
+        ):
+            if uncertainty_head is not None and bool(zero_init_appearance_logvar_head):
+                nn.init.zeros_(uncertainty_head.weight)
+                nn.init.zeros_(uncertainty_head.bias)
         self.detail_adapter: Optional[nn.Module]
         self.detail_gate_raw: Optional[nn.Parameter]
         self.detail_gate_raw_attr: Optional[nn.Parameter]
@@ -282,6 +363,7 @@ class Stage6PosteriorUpdater(nn.Module):
         ctx_vsm: Optional[torch.Tensor],
         appearance_detail: Optional[torch.Tensor] = None,
         appearance_valid: Optional[torch.Tensor] = None,
+        appearance_logvar_state: Optional[torch.Tensor] = None,
         branch_scope: Optional[Dict[str, Any]] = None,
     ) -> Optional[BranchDelta]:
         if event is None:
@@ -291,6 +373,8 @@ class Stage6PosteriorUpdater(nn.Module):
         active_attrs = self._active_attrs_from_scope(branch_scope)
         if self.head_hidden is None:
             active_attrs["hidden"] = False
+        if self.head_appearance_logvar_delta is None and self.head_appearance_logvar_target is None:
+            active_attrs["appearance_logvar_delta"] = False
         if event.dim() != 2 or int(event.shape[-1]) != int(self.event_dim):
             raise ValueError(f"event must be [N,{self.event_dim}], got {tuple(event.shape)}")
         if ctx_current is not None:
@@ -315,6 +399,7 @@ class Stage6PosteriorUpdater(nn.Module):
                 hidden=event.new_zeros((n, self.stage_hidden_dim if self.output_hidden else 0)),
                 confidence=z1 if self.output_confidence else event.new_zeros((n, 0)),
                 noop=z1,
+                appearance_logvar_delta=z1,
                 active_attrs=active_attrs,
             )
         ctx_in = event if ctx_current is None else ctx_current
@@ -388,6 +473,44 @@ class Stage6PosteriorUpdater(nn.Module):
         raw_quat = _raw_attr("quat_axis_angle", self.head_quat, h_quat, 2, 3)
         raw_opacity = _raw_attr("opacity_logit", self.head_opacity, h_opacity, 3, 1)
         raw_sh = _raw_attr("sh", self.head_sh, h_sh, 4, self.sh_dim)
+        target_logvar: Optional[torch.Tensor] = None
+        if self.head_appearance_logvar_target is not None and bool(active_attrs["appearance_logvar_delta"]):
+            if appearance_logvar_state is None:
+                raise ValueError(f"appearance_logvar_state is required for {branch_name} target update")
+            current_logvar = appearance_logvar_state.to(device=h.device, dtype=torch.float32)
+            if tuple(current_logvar.shape) != (n_rows, 1):
+                raise ValueError(
+                    f"appearance_logvar_state row mismatch for {branch_name}: "
+                    f"got {tuple(current_logvar.shape)}, expected {(n_rows, 1)}"
+                )
+            current_for_head = current_logvar.detach()
+            normalized_current = (
+                2.0
+                * (current_for_head - float(self.appearance_logvar_min))
+                / max(float(self.appearance_logvar_max - self.appearance_logvar_min), 1.0e-6)
+                - 1.0
+            ).clamp(-1.0, 1.0)
+            uncertainty_input = h.detach() if self.appearance_logvar_detach_input else h
+            raw_appearance_logvar = self.head_appearance_logvar_target(
+                torch.cat([uncertainty_input, normalized_current.to(dtype=uncertainty_input.dtype)], dim=-1)
+            )
+            target_unit = torch.tanh(raw_appearance_logvar.float())
+            prior = float(self.appearance_logvar_prior[str(branch_name)])
+            target_logvar = torch.where(
+                target_unit >= 0.0,
+                target_unit * float(self.appearance_logvar_max - prior) + prior,
+                (-target_unit) * float(self.appearance_logvar_min - prior) + prior,
+            )
+            raw_appearance_delta = (
+                target_logvar - current_logvar
+            ) / float(self.appearance_logvar_target_temperature)
+        elif self.head_appearance_logvar_delta is not None and bool(active_attrs["appearance_logvar_delta"]):
+            uncertainty_input = h.detach() if self.appearance_logvar_detach_input else h
+            raw_appearance_logvar = self.head_appearance_logvar_delta(uncertainty_input)
+            raw_appearance_delta = raw_appearance_logvar
+        else:
+            raw_appearance_logvar = event.new_zeros((n_rows, 1))
+            raw_appearance_delta = raw_appearance_logvar
         def _scaled_delta(attr: str, raw: torch.Tensor, max_step: float) -> torch.Tensor:
             if not bool(active_attrs[attr]):
                 return torch.zeros_like(raw)
@@ -402,8 +525,26 @@ class Stage6PosteriorUpdater(nn.Module):
             hidden=hidden,
             confidence=confidence,
             noop=noop,
+            appearance_logvar_delta=(
+                (
+                    gate
+                    if self.appearance_logvar_gate_by_main_noop
+                    else torch.ones_like(gate)
+                )
+                * float(self.appearance_logvar_max_step.get(str(branch_name), 0.10))
+                * torch.tanh(raw_appearance_delta)
+                if bool(active_attrs["appearance_logvar_delta"])
+                else torch.zeros_like(raw_appearance_logvar)
+            ),
             active_attrs=active_attrs,
         )
+        if self.appearance_logvar_gate_by_valid and appearance_valid is not None:
+            uncertainty_valid = appearance_valid.to(device=event.device, dtype=torch.bool).reshape(-1, 1)
+            if int(uncertainty_valid.shape[0]) != int(n_rows):
+                raise ValueError(f"appearance_valid row mismatch for {branch_name}")
+            delta.appearance_logvar_delta = delta.appearance_logvar_delta * uncertainty_valid.to(
+                dtype=delta.appearance_logvar_delta.dtype
+            )
         for name, value in delta.__dict__.items():
             if torch.is_tensor(value) and not torch.isfinite(value).all():
                 raise RuntimeError(f"Stage6PosteriorUpdater delta {name} contains NaN/Inf")
@@ -453,6 +594,7 @@ class Stage6PosteriorUpdater(nn.Module):
             hidden=delta.hidden * valid_f if delta.hidden.numel() else delta.hidden,
             confidence=delta.confidence * valid_f if delta.confidence.numel() else delta.confidence,
             noop=torch.where(mask.unsqueeze(-1), delta.noop, torch.ones_like(delta.noop)),
+            appearance_logvar_delta=delta.appearance_logvar_delta * valid_f,
             active_attrs=delta.active_attrs,
         )
 
@@ -463,6 +605,7 @@ class Stage6PosteriorUpdater(nn.Module):
         ctx_current: Optional[ContextPack] = None,
         ctx_vsm: Optional[ContextPack] = None,
         appearance_detail: Optional[AppearanceDetailPack] = None,
+        appearance_logvar_state: Optional[AppearanceLogvarStatePack] = None,
         branch_scope: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> tuple[DeltaPack, Dict[str, Any]]:
         bg = self._branch_forward(
@@ -472,6 +615,7 @@ class Stage6PosteriorUpdater(nn.Module):
             ctx_vsm=None if ctx_vsm is None else ctx_vsm.ctx_bg,
             appearance_detail=None if appearance_detail is None else appearance_detail.detail_bg,
             appearance_valid=None if appearance_detail is None else appearance_detail.valid_bg,
+            appearance_logvar_state=None if appearance_logvar_state is None else appearance_logvar_state.bg,
             branch_scope=None if branch_scope is None else branch_scope.get("bg"),
         )
         if bg is None:
@@ -483,6 +627,7 @@ class Stage6PosteriorUpdater(nn.Module):
             ctx_vsm=None if ctx_vsm is None else ctx_vsm.ctx_distant,
             appearance_detail=None if appearance_detail is None else appearance_detail.detail_distant,
             appearance_valid=None if appearance_detail is None else appearance_detail.valid_distant,
+            appearance_logvar_state=None if appearance_logvar_state is None else appearance_logvar_state.distant,
             branch_scope=None if branch_scope is None else branch_scope.get("distant"),
         )
         rigid = self._branch_forward(
@@ -492,6 +637,7 @@ class Stage6PosteriorUpdater(nn.Module):
             ctx_vsm=None if ctx_vsm is None else ctx_vsm.ctx_rigid,
             appearance_detail=None if appearance_detail is None else appearance_detail.detail_rigid,
             appearance_valid=None if appearance_detail is None else appearance_detail.valid_rigid,
+            appearance_logvar_state=None if appearance_logvar_state is None else appearance_logvar_state.rigid,
             branch_scope=None if branch_scope is None else branch_scope.get("rigid"),
         )
         bg = self._apply_invalid_update_policy(bg, event.valid_bg, branch_name="bg")
@@ -506,6 +652,55 @@ class Stage6PosteriorUpdater(nn.Module):
             if self.invalid_update_policy == "hard_zero"
             else 0.0,
         }
+        detail_valid_by_branch = {
+            "bg": None if appearance_detail is None else appearance_detail.valid_bg,
+            "distant": None if appearance_detail is None else appearance_detail.valid_distant,
+            "rigid": None if appearance_detail is None else appearance_detail.valid_rigid,
+        }
+        event_valid_by_branch = {
+            "bg": event.valid_bg,
+            "distant": event.valid_distant,
+            "rigid": event.valid_rigid,
+        }
+        for branch_name, branch_delta in (("bg", bg), ("distant", distant), ("rigid", rigid)):
+            if branch_delta is None or int(branch_delta.appearance_logvar_delta.numel()) == 0:
+                continue
+            value = branch_delta.appearance_logvar_delta.detach().float()
+            valid = detail_valid_by_branch[branch_name]
+            if valid is None:
+                valid = event_valid_by_branch[branch_name]
+            if valid is not None:
+                valid_mask = valid.to(device=value.device, dtype=torch.bool).reshape(-1)
+                if int(valid_mask.numel()) == int(value.shape[0]):
+                    value = value[valid_mask]
+            if int(value.numel()) == 0:
+                for suffix in (
+                    "delta_logvar_mean",
+                    "delta_logvar_abs_mean",
+                    "delta_logvar_max",
+                    "delta_positive_ratio",
+                    "delta_negative_ratio",
+                    "delta_near_zero_ratio",
+                    "target_current_gap_mean",
+                    "target_above_current_ratio",
+                    "target_below_current_ratio",
+                ):
+                    aux[f"uncertainty/{branch_name}/{suffix}"] = 0.0
+                continue
+            aux[f"uncertainty/{branch_name}/delta_logvar_mean"] = float(value.mean().item())
+            aux[f"uncertainty/{branch_name}/delta_logvar_abs_mean"] = float(value.abs().mean().item())
+            aux[f"uncertainty/{branch_name}/delta_logvar_max"] = float(value.abs().max().item())
+            eps = 1.0e-6
+            aux[f"uncertainty/{branch_name}/delta_positive_ratio"] = float((value > eps).float().mean().item())
+            aux[f"uncertainty/{branch_name}/delta_negative_ratio"] = float((value < -eps).float().mean().item())
+            aux[f"uncertainty/{branch_name}/delta_near_zero_ratio"] = float((value.abs() <= eps).float().mean().item())
+            if self.appearance_logvar_update_mode == "state_conditioned_target_v2":
+                max_step = max(float(self.appearance_logvar_max_step.get(branch_name, 0.10)), 1.0e-8)
+                scaled = (value / max_step).clamp(-0.999999, 0.999999)
+                gap = torch.atanh(scaled) * float(self.appearance_logvar_target_temperature)
+                aux[f"uncertainty/{branch_name}/target_current_gap_mean"] = float(gap.mean().item())
+                aux[f"uncertainty/{branch_name}/target_above_current_ratio"] = float((gap > eps).float().mean().item())
+                aux[f"uncertainty/{branch_name}/target_below_current_ratio"] = float((gap < -eps).float().mean().item())
         for branch_name, valid in (
             ("bg", event.valid_bg),
             ("distant", event.valid_distant),

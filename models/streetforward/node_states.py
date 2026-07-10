@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 import torch
 
@@ -16,6 +16,7 @@ class NodeStateBackground:
     opacity_logit: torch.Tensor
     sh_dc: torch.Tensor
     sh_rest: torch.Tensor
+    appearance_logvar: Optional[torch.Tensor] = None
 
     def detach_clone(self) -> "NodeStateBackground":
         return NodeStateBackground(
@@ -25,6 +26,11 @@ class NodeStateBackground:
             opacity_logit=self.opacity_logit.detach().clone(),
             sh_dc=self.sh_dc.detach().clone(),
             sh_rest=self.sh_rest.detach().clone(),
+            appearance_logvar=(
+                None
+                if getattr(self, "appearance_logvar", None) is None
+                else self.appearance_logvar.detach().clone()
+            ),
         )
 
 
@@ -45,6 +51,7 @@ class NodeStateRigid:
     instance_ids: List[int]
     frame_ids: List[int]
     cur_frame: int
+    appearance_logvar: Optional[torch.Tensor] = None
 
     def detach_clone(self) -> "NodeStateRigid":
         return NodeStateRigid(
@@ -61,6 +68,11 @@ class NodeStateRigid:
             instance_ids=list(self.instance_ids),
             frame_ids=list(self.frame_ids),
             cur_frame=int(self.cur_frame),
+            appearance_logvar=(
+                None
+                if getattr(self, "appearance_logvar", None) is None
+                else self.appearance_logvar.detach().clone()
+            ),
         )
 
 
@@ -74,6 +86,7 @@ class NodeStateDistant:
     opacity_logit: torch.Tensor
     sh_dc: torch.Tensor
     sh_rest: torch.Tensor
+    appearance_logvar: Optional[torch.Tensor] = None
 
     def detach_clone(self) -> "NodeStateDistant":
         return NodeStateDistant(
@@ -83,6 +96,11 @@ class NodeStateDistant:
             opacity_logit=self.opacity_logit.detach().clone(),
             sh_dc=self.sh_dc.detach().clone(),
             sh_rest=self.sh_rest.detach().clone(),
+            appearance_logvar=(
+                None
+                if getattr(self, "appearance_logvar", None) is None
+                else self.appearance_logvar.detach().clone()
+            ),
         )
 
 

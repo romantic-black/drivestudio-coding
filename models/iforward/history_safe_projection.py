@@ -84,6 +84,7 @@ def _clone_probe_branch(
         sh_dc=leaf("sh_dc", branch.sh_dc, sh_enabled),
         sh_rest=leaf("sh_rest", branch.sh_rest, sh_enabled),
         hidden=_clone_leaf(branch.hidden, requires_grad=False),
+        appearance_logvar=_clone_leaf(branch.appearance_logvar, requires_grad=False).float(),
     )
 
 

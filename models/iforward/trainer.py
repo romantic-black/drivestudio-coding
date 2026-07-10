@@ -7,11 +7,13 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 
+from models.streetforward.stage6_0.local_gs_state import _uncertainty_state_values
+
 from .amp_policy import amp_dtype_name, build_amp_policy, make_grad_scaler
 from .model import IForwardModel, IForwardRolloutOutput
 from .state import IForwardState
 from .utils import cfg_get
-from .versions import is_stage3_optimizer_memory_iforward_version
+from .versions import is_stage3_optimizer_memory_iforward_version, uncertainty_schema_versions
 
 
 class IForwardTrainer(nn.Module):
@@ -192,10 +194,16 @@ class IForwardTrainer(nn.Module):
             "stage6_posterior_updater.vsm_ctx_adapter",
         )
         adapter_ids = {id(param) for _, param in adapter_named}
+        uncertainty_head = getattr(updater, "head_appearance_logvar_target", None) if updater is not None else None
+        uncertainty_head_named = self._named_params(
+            uncertainty_head if isinstance(uncertainty_head, nn.Module) else None,
+            "stage6_posterior_updater.head_appearance_logvar_target",
+        )
+        uncertainty_head_ids = {id(param) for _, param in uncertainty_head_named}
         updater_base = [
             (f"stage6_posterior_updater.{name}", param)
             for name, param in self._named_params(updater, "")
-            if id(param) not in adapter_ids
+            if id(param) not in adapter_ids and id(param) not in uncertainty_head_ids
         ]
         struct_decoder = self._stage6_struct_decoder()
         if self._is_v3_gru_history_gate():
@@ -286,6 +294,8 @@ class IForwardTrainer(nn.Module):
         for group_name, named_params in measurement_groups.items():
             if named_params:
                 groups[str(group_name)] = list(named_params)
+        if uncertainty_head_named:
+            groups["stage6_uncertainty_head"] = uncertainty_head_named
         seen: Dict[int, str] = {}
         for group_name, named_params in groups.items():
             for name, param in named_params:
@@ -317,6 +327,7 @@ class IForwardTrainer(nn.Module):
             "memory_fuse": float(cfg_get(lr_cfg, "memory_fuse", fallback)),
             "vsm_ctx_adapter": float(cfg_get(lr_cfg, "vsm_ctx_adapter", 2.0e-4)),
             "stage6_posterior_updater_base": float(cfg_get(lr_cfg, "stage6_posterior_updater_base", 1.0e-5)),
+            "stage6_uncertainty_head": float(cfg_get(lr_cfg, "stage6_uncertainty_head", 1.0e-4)),
             "stage6_struct_decoder": float(cfg_get(lr_cfg, "stage6_struct_decoder", 0.0)),
             "biggs_child_decoder": float(cfg_get(lr_cfg, "biggs_child_decoder", fallback)),
             "stage3_sparse_gather": float(cfg_get(lr_cfg, "stage3_sparse_gather", fallback)),
@@ -392,6 +403,7 @@ class IForwardTrainer(nn.Module):
         self._set_group_requires_grad("vsm_ctx_adapter", bool(cfg_get(trainability, "train_vsm_ctx_adapter", True)))
         updater_train = bool(int(global_step) >= int(unfreeze_updater_step))
         self._set_group_requires_grad("stage6_posterior_updater_base", updater_train)
+        self._set_group_requires_grad("stage6_uncertainty_head", True)
         struct_train = bool(train_struct and int(global_step) >= int(unfreeze_struct_step))
         self._set_group_requires_grad("stage6_struct_decoder", struct_train)
         self._set_group_requires_grad("biggs_child_decoder", train_biggs_child_decoder)
@@ -492,6 +504,16 @@ class IForwardTrainer(nn.Module):
             metrics[f"iforward/optimizer/{name}/param_count"] = float(self._param_count(params))
             metrics[f"iforward/optimizer/{name}/trainable_param_count"] = float(self._trainable_param_count(params))
             metrics[f"iforward/grad/{name}"] = float(grad_norm.detach().item())
+            if name == "stage6_uncertainty_head":
+                for param, param_name in zip(params, list(group.get("param_names", []) or [])):
+                    suffix = "bias" if str(param_name).endswith(".bias") else "weight"
+                    metrics[f"iforward/uncertainty_head/{suffix}_norm"] = float(param.detach().float().norm().item())
+                    if suffix == "bias" and int(param.numel()) == 1:
+                        metrics["iforward/uncertainty_head/bias_value"] = float(param.detach().float().item())
+                    if param.grad is not None:
+                        metrics[f"iforward/uncertainty_head/{suffix}_grad_norm"] = float(
+                            param.grad.detach().float().norm().item()
+                        )
             if bool(getattr(self.model, "is_stage3_1_lowrank_gdkv", False)):
                 alias = None
                 if name == "parent_temporal_mamba":
@@ -919,6 +941,7 @@ class IForwardTrainer(nn.Module):
             "gt_images": [x.detach().float().cpu() for x in out.gt_images],
             "image_refs": [tuple(int(v) for v in ref) for ref in out.image_refs],
             "image_roles": [str(role) for role in out.image_roles],
+            "_iforward_uncertainty_images": list(out.uncertainty_images),
         }
         final["iforward/scheduler_version"] = str(out.resolved.scheduler_version)
         final.update(self.amp_policy.metrics())
@@ -1158,13 +1181,62 @@ class IForwardTrainer(nn.Module):
         return False
 
     def get_extra_state(self) -> Dict[str, Any]:
+        iforward_cfg = cfg_get(cfg_get(self.config, "model", {}) or {}, "iforward", {}) or {}
+        schema_versions = uncertainty_schema_versions(cfg_get(iforward_cfg, "version", ""))
         return {
-            "format": "iforward_trainer_extra_state_v1",
+            "format": "iforward_trainer_extra_state_v2",
+            "local_gs_state_schema_version": 2,
+            **schema_versions,
             "state_cache": {
                 tuple(key): value.detach_for_next_rollout()
                 for key, value in self._state_cache.items()
             },
         }
+
+    def _migrate_uncertainty_state(self, value: IForwardState) -> IForwardState:
+        state_cfg = cfg_get(
+            cfg_get(
+                cfg_get(cfg_get(self.config, "model", {}) or {}, "iforward", {}) or {},
+                "uncertainty",
+                {},
+            )
+            or {},
+            "state",
+            {},
+        ) or {}
+        local = getattr(value, "local_gs", None)
+        if local is None:
+            return value
+        for branch_name in ("bg", "distant", "rigid"):
+            branch = getattr(local, branch_name, None)
+            if branch is None:
+                continue
+            appearance = getattr(branch, "appearance_logvar", None)
+            if not torch.is_tensor(appearance):
+                prior_logvar, _, _, _ = _uncertainty_state_values(state_cfg, branch_name)
+                appearance = torch.full(
+                    (int(branch.means.shape[0]), 1),
+                    float(prior_logvar),
+                    device=branch.means.device,
+                    dtype=torch.float32,
+                )
+            branch.appearance_logvar = appearance.detach().clone().float()
+        for branch_name, attr_name in (
+            ("bg", "node_state_bg"),
+            ("distant", "node_state_distant"),
+            ("rigid", "node_state_rigid"),
+        ):
+            node = getattr(value, attr_name, None)
+            if node is None or torch.is_tensor(getattr(node, "appearance_logvar", None)):
+                continue
+            prior_logvar, _, _, _ = _uncertainty_state_values(state_cfg, branch_name)
+            node.appearance_logvar = torch.full(
+                (int(node.means.shape[0]), 1),
+                float(prior_logvar),
+                device=node.means.device,
+                dtype=torch.float32,
+            )
+        return value
 
     def set_extra_state(self, state: Any) -> None:
         if not isinstance(state, dict):
@@ -1175,7 +1247,7 @@ class IForwardTrainer(nn.Module):
             self._state_cache = {}
             return
         self._state_cache = {
-            tuple(int(x) for x in key): value.detach_for_next_rollout()
+            tuple(int(x) for x in key): self._migrate_uncertainty_state(value).detach_for_next_rollout()
             for key, value in raw_cache.items()
         }
 

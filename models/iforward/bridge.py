@@ -7,6 +7,7 @@ import torch
 from models.streetforward.node_states import NodeStateBackground, NodeStateDistant, NodeStateRigid
 from models.streetforward.stage6_0 import ContextPack, DeltaPack, EventPack, LocalGSState
 from models.streetforward.stage6_0.phase_a_losses import delta_regularization
+from models.iforward.uncertainty_renderer import UncertaintyImagePack
 
 from .history_ema import IForwardResidualPack
 
@@ -56,6 +57,7 @@ class IForwardStage6Bridge:
             distant=node_state_distant,
             rigid=node_state_rigid,
             hidden_dim=int(self.hidden_dim),
+            uncertainty_state_cfg=getattr(self.runtime, "iforward_uncertainty_state_cfg", None),
         )
         return local_state, node_state_bg, node_state_distant, node_state_rigid
 
@@ -313,7 +315,10 @@ class IForwardStage6Bridge:
         )
 
     def apply_delta_only(self, *, local_state: LocalGSState, delta: DeltaPack) -> LocalGSState:
-        next_state = local_state.apply_delta(delta)
+        next_state = local_state.apply_delta(
+            delta,
+            uncertainty_state_cfg=getattr(self.runtime, "iforward_uncertainty_state_cfg", None),
+        )
         constrain = getattr(self.runtime, "_constrain_local_state_after_delta", None)
         if callable(constrain):
             next_state = constrain(next_state)
@@ -364,6 +369,7 @@ class IForwardStage6Bridge:
             "quats_r": torch.cat([p["quats_r"] for p in parts], dim=0),
             "opacities_r": torch.cat([p["opacities_r"] for p in parts], dim=0),
             "colors_r": torch.cat([p["colors_r"] for p in parts], dim=0),
+            "appearance_logvar_r": torch.cat([p["appearance_logvar_r"] for p in parts], dim=0).float(),
         }
 
     def _residual_render_params_for_frame(
@@ -537,6 +543,9 @@ class IForwardStage6Bridge:
         pred_rgbs_out: Optional[List[torch.Tensor]] = None,
         gt_images_out: Optional[List[torch.Tensor]] = None,
         return_per_ref_loss: bool = False,
+        uncertainty_role: Optional[str] = None,
+        uncertainty_images_out: Optional[List[UncertaintyImagePack]] = None,
+        collect_uncertainty_calibration: bool = False,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         return self.runtime._render_loss_for_indices(
             local_state=local_state,
@@ -546,6 +555,9 @@ class IForwardStage6Bridge:
             pred_rgbs_out=pred_rgbs_out,
             gt_images_out=gt_images_out,
             return_per_ref_loss=bool(return_per_ref_loss),
+            uncertainty_role=uncertainty_role,
+            uncertainty_images_out=uncertainty_images_out,
+            collect_uncertainty_calibration=bool(collect_uncertainty_calibration),
         )
 
     def history_probe_loss(
@@ -563,6 +575,7 @@ class IForwardStage6Bridge:
             mask_policy=str(mask_policy),
             pred_rgbs_out=None,
             gt_images_out=None,
+            uncertainty_role=None,
         )
 
     def render_loss_for_targets(
@@ -574,6 +587,9 @@ class IForwardStage6Bridge:
         mask_policy: str,
         pred_rgbs_out: Optional[List[torch.Tensor]] = None,
         gt_images_out: Optional[List[torch.Tensor]] = None,
+        uncertainty_role: Optional[str] = None,
+        uncertainty_images_out: Optional[List[UncertaintyImagePack]] = None,
+        collect_uncertainty_calibration: bool = False,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         if not targets:
             ref = local_state.bg.means
@@ -593,6 +609,9 @@ class IForwardStage6Bridge:
             mask_policy=mask_policy,
             pred_rgbs_out=pred_rgbs_out,
             gt_images_out=gt_images_out,
+            uncertainty_role=uncertainty_role,
+            uncertainty_images_out=uncertainty_images_out,
+            collect_uncertainty_calibration=bool(collect_uncertainty_calibration),
         )
 
     def delta_regularization(

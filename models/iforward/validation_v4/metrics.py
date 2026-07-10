@@ -32,8 +32,9 @@ def _std(values: Iterable[Any]) -> float:
 
 
 def summarize_event_traces(events: Iterable[Any]) -> dict[str, Any]:
+    events_l = list(events)
     rows = []
-    for event in events:
+    for event in events_l:
         metadata = dict(getattr(event, "metadata", {}) or {})
         stage32 = dict(metadata.get("iforward_stage3_2", {}) or {})
         row = {
@@ -50,7 +51,94 @@ def summarize_event_traces(events: Iterable[Any]) -> dict[str, Any]:
             "current_loss": _finite_float(getattr(event, "metrics", {}).get("current", getattr(event, "metrics", {}).get("current_loss", 0.0))),
         }
         rows.append(row)
-    return summarize_legacy_rows(rows)
+    summary = summarize_legacy_rows(rows)
+    summary["uncertainty_calibration"] = _uncertainty_calibration_summary(events_l)
+    summary["uncertainty_state"] = _uncertainty_state_summary(events_l)
+    return summary
+
+
+def _uncertainty_calibration_summary(events: list[Any]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str, str], list[dict[str, float]]] = {}
+    for event in events:
+        metadata = dict(getattr(event, "metadata", {}) or {})
+        stage32 = dict(metadata.get("iforward_stage3_2", {}) or {})
+        distribution = str(stage32.get("distribution_type", metadata.get("distribution_type", "")))
+        phase = str(getattr(event, "scheduler_phase", ""))
+        metrics = dict(getattr(event, "metrics", {}) or {})
+        for role in ("current", "in_rollout_history"):
+            prefix = f"{role}/"
+            values = {
+                key[len(prefix) :]: _finite_float(value)
+                for key, value in metrics.items()
+                if str(key).startswith(prefix)
+                and any(
+                    token in str(key)
+                    for token in (
+                        "error_uncertainty_pearson",
+                        "error_uncertainty_spearman",
+                        "ause",
+                        "risk_coverage_",
+                    )
+                )
+            }
+            if values:
+                report_role = "repair" if phase == "repair" else role
+                grouped.setdefault((distribution, phase, report_role), []).append(values)
+    out = []
+    for (distribution, phase, role), rows in sorted(grouped.items()):
+        keys = sorted({key for row in rows for key in row})
+        out.append(
+            {
+                "distribution_type": distribution,
+                "scheduler_phase": phase,
+                "role": role,
+                "num_rows": int(len(rows)),
+                **{key: _mean(row.get(key) for row in rows if key in row) for key in keys},
+            }
+        )
+    return out
+
+
+def _uncertainty_state_summary(events: list[Any]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str, str], list[dict[str, float]]] = {}
+    state_keys = (
+        "sigma_mean",
+        "sigma_p10",
+        "sigma_p50",
+        "sigma_p90",
+        "logvar_min",
+        "logvar_max",
+        "clamp_min_ratio",
+        "clamp_max_ratio",
+    )
+    for event in events:
+        metadata = dict(getattr(event, "metadata", {}) or {})
+        stage32 = dict(metadata.get("iforward_stage3_2", {}) or {})
+        distribution = str(stage32.get("distribution_type", metadata.get("distribution_type", "")))
+        phase = str(getattr(event, "scheduler_phase", ""))
+        metrics = dict(getattr(event, "metrics", {}) or {})
+        for branch in ("bg", "distant", "rigid"):
+            prefix = f"uncertainty/{branch}/"
+            values = {
+                key: _finite_float(metrics[f"{prefix}{key}"])
+                for key in state_keys
+                if f"{prefix}{key}" in metrics
+            }
+            if values:
+                grouped.setdefault((distribution, phase, branch), []).append(values)
+    out = []
+    for (distribution, phase, branch), rows in sorted(grouped.items()):
+        keys = sorted({key for row in rows for key in row})
+        out.append(
+            {
+                "distribution_type": distribution,
+                "scheduler_phase": phase,
+                "branch": branch,
+                "num_rows": int(len(rows)),
+                **{key: _mean(row.get(key) for row in rows if key in row) for key in keys},
+            }
+        )
+    return out
 
 
 def summarize_legacy_rows(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
