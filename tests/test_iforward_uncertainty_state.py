@@ -8,6 +8,7 @@ import torch.nn as nn
 from omegaconf import OmegaConf
 
 from models.iforward.trainer import IForwardTrainer
+from models.iforward.model import IForwardModel
 from models.iforward.state import IForwardShortWindowHistory, IForwardState
 from models.iforward.versions import (
     is_stage3_3_iforward_version,
@@ -15,6 +16,7 @@ from models.iforward.versions import (
     is_stage3_optimizer_memory_iforward_version,
 )
 from models.streetforward.checkpoint_mixin import CheckpointMixin
+from models.streetforward.minimal_trainer_stage6_0 import MinimalStreetForwardStage6_0
 from models.streetforward.node_states import NodeStateBackground, NodeStateRigid
 from models.streetforward.stage6_0.local_gs_state import LocalGSState
 from models.streetforward.stage6_0.posterior_updater import BranchDelta, DeltaPack
@@ -157,6 +159,50 @@ def test_stage3_3_config_reuses_stage3_2_scheduler_and_lowrank_memory_paths() ->
     assert cfg_v2.model.iforward.uncertainty.updater.mode == "state_conditioned_target_v2"
     assert cfg_v2.model.iforward.uncertainty.rasterizer.variance_mode == "aleatoric_only"
     assert float(cfg_v2.model.iforward.uncertainty.rasterizer.background_sigma_for_loss) == 0.0
+    assert list(cfg_v2.initialization.skip_keys) == []
+    loss_v2 = cfg_v2.model.iforward.uncertainty.loss
+    assert loss_v2.normalize_precision_per_reference is True
+    assert float(loss_v2.precision_weight_min) == 0.25
+    assert float(loss_v2.precision_weight_max) == 4.0
+    assert loss_v2.mean_weighting_by_role.current is False
+    assert loss_v2.mean_weighting_by_role.history is True
+    assert loss_v2.mean_weighting_by_role.repair is True
+    assert int(loss_v2.warmup.freeze_main_model_until_step) == 2000
+
+
+def test_uncertainty_mean_weighting_role_switches_are_explicit() -> None:
+    stage = MinimalStreetForwardStage6_0.__new__(MinimalStreetForwardStage6_0)
+    stage.iforward_uncertainty_loss_cfg = {
+        "mean_weighting_by_role": {
+            "current": False,
+            "history": True,
+            "repair": True,
+        }
+    }
+    assert stage._uncertainty_mean_weighting_enabled("current") is False
+    assert stage._uncertainty_mean_weighting_enabled("history") is True
+    assert stage._uncertainty_mean_weighting_enabled("repair") is True
+    assert stage._uncertainty_mean_weighting_enabled(None) is False
+
+
+def test_clean_v2_warm_start_loads_pretrained_parent_gdkv_weights() -> None:
+    model = IForwardModel.__new__(IForwardModel)
+    nn.Module.__init__(model)
+    model.config = {"initialization": {"skip_keys": []}}
+    model.is_stage3_3_uncertainty_v2 = True
+    model.parent_temporal_mamba = nn.Linear(2, 2, bias=False)
+    model.stage6_posterior_updater = nn.Module()
+    model.stage6_posterior_updater.head_appearance_logvar_target = nn.Linear(3, 1)
+    with torch.no_grad():
+        model.parent_temporal_mamba.weight.zero_()
+
+    pretrained = torch.full_like(model.parent_temporal_mamba.weight, 0.375)
+    loaded = model.load_init_checkpoint_payload(
+        {"model_state_dict": {"parent_temporal_mamba.weight": pretrained}},
+        weights_only=True,
+    )
+    assert loaded is True
+    assert torch.equal(model.parent_temporal_mamba.weight, pretrained)
 
 
 def test_stage3_3_extra_state_schema_supports_strict_resume() -> None:

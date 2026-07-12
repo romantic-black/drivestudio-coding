@@ -31,8 +31,67 @@ class DecoupledGaussianNLLComponents:
     mean_path: torch.Tensor
     calibration_path: torch.Tensor
     precision: torch.Tensor
+    mean_precision: torch.Tensor
+    precision_normalizer: torch.Tensor
+    precision_clipped_low: torch.Tensor
+    precision_clipped_high: torch.Tensor
+    uncertainty_strength: torch.Tensor
     mean_valid: torch.Tensor
     calibration_valid: torch.Tensor
+
+
+def _precision_weight_stats(
+    components: DecoupledGaussianNLLComponents,
+    *,
+    collect_quantiles: bool,
+) -> Dict[str, float]:
+    valid = components.mean_valid
+    if not bool(valid.any().item()):
+        out = {
+            "precision_mean": 0.0,
+            "precision_normalizer": 0.0,
+            "precision_weight_mean": 0.0,
+            "precision_clipped_low_ratio": 0.0,
+            "precision_clipped_high_ratio": 0.0,
+            "precision_alpha_fallback_ratio": 0.0,
+        }
+        if collect_quantiles:
+            out.update(
+                {
+                    "precision_weight_p10": 0.0,
+                    "precision_weight_p50": 0.0,
+                    "precision_weight_p90": 0.0,
+                    "precision_weight_p99": 0.0,
+                }
+            )
+        return out
+    raw = components.precision.detach()[valid].float()
+    weights = components.mean_precision.detach()[valid].float()
+    out = {
+        "precision_mean": float(raw.mean().item()),
+        "precision_normalizer": float(components.precision_normalizer.detach().item()),
+        "precision_weight_mean": float(weights.mean().item()),
+        "precision_clipped_low_ratio": float(
+            components.precision_clipped_low.detach()[valid].float().mean().item()
+        ),
+        "precision_clipped_high_ratio": float(
+            components.precision_clipped_high.detach()[valid].float().mean().item()
+        ),
+        "precision_alpha_fallback_ratio": float(
+            (components.uncertainty_strength.detach()[valid] < 1.0 - 1.0e-6).float().mean().item()
+        ),
+    }
+    if collect_quantiles:
+        quantiles = torch.quantile(weights, weights.new_tensor([0.10, 0.50, 0.90, 0.99]))
+        out.update(
+            {
+                "precision_weight_p10": float(quantiles[0].item()),
+                "precision_weight_p50": float(quantiles[1].item()),
+                "precision_weight_p90": float(quantiles[2].item()),
+                "precision_weight_p99": float(quantiles[3].item()),
+            }
+        )
+    return out
 
 
 def masked_gaussian_rgb_nll_components(
@@ -43,6 +102,12 @@ def masked_gaussian_rgb_nll_components(
     mask: Optional[torch.Tensor],
     calibration_mask: Optional[torch.Tensor] = None,
     precision_floor: float = 0.0,
+    normalize_precision_per_reference: bool = False,
+    precision_weight_min: float = 0.25,
+    precision_weight_max: float = 4.0,
+    alpha: Optional[torch.Tensor] = None,
+    alpha_uncertainty_min: float = 0.25,
+    alpha_uncertainty_full: float = 0.75,
 ) -> DecoupledGaussianNLLComponents:
     if pred_rgb.shape != gt_rgb.shape:
         raise ValueError(f"pred/gt shape mismatch: {tuple(pred_rgb.shape)} vs {tuple(gt_rgb.shape)}")
@@ -62,6 +127,44 @@ def masked_gaussian_rgb_nll_components(
     if float(precision_floor) > 0.0 and bool(mean_valid.any().item()):
         relative_floor = torch.median(mean_precision[mean_valid]) * float(precision_floor)
         mean_precision = mean_precision.clamp_min(relative_floor)
+    precision_normalizer = mean_precision.new_tensor(1.0)
+    clipped_low = torch.zeros_like(mean_valid)
+    clipped_high = torch.zeros_like(mean_valid)
+    uncertainty_strength = torch.ones_like(mean_precision)
+    if bool(normalize_precision_per_reference):
+        weight_min = float(precision_weight_min)
+        weight_max = float(precision_weight_max)
+        if not (0.0 < weight_min <= 1.0 <= weight_max):
+            raise ValueError(
+                "normalized precision bounds must satisfy 0 < min <= 1 <= max, "
+                f"got min={weight_min} max={weight_max}"
+            )
+        if bool(mean_valid.any().item()):
+            precision_normalizer = mean_precision[mean_valid].mean().clamp_min(1.0e-6)
+        relative_precision = mean_precision / precision_normalizer.detach()
+        if alpha is not None:
+            alpha2 = alpha.to(device=pred_rgb.device, dtype=relative_precision.dtype)
+            if alpha2.dim() == 3 and int(alpha2.shape[-1]) == 1:
+                alpha2 = alpha2.squeeze(-1)
+            if tuple(alpha2.shape) != tuple(mean_valid.shape):
+                raise ValueError(
+                    f"alpha must be [H,W] or [H,W,1], got {tuple(alpha.shape)}"
+                )
+            alpha_min = float(alpha_uncertainty_min)
+            alpha_full = float(alpha_uncertainty_full)
+            if not alpha_full > alpha_min:
+                raise ValueError(
+                    "alpha_uncertainty_full must be greater than alpha_uncertainty_min, "
+                    f"got min={alpha_min} full={alpha_full}"
+                )
+            t = ((alpha2.detach() - alpha_min) / (alpha_full - alpha_min)).clamp(0.0, 1.0)
+            uncertainty_strength = t.square() * (3.0 - 2.0 * t)
+            relative_precision = (
+                uncertainty_strength * relative_precision + (1.0 - uncertainty_strength)
+            )
+        clipped_low = relative_precision < weight_min
+        clipped_high = relative_precision > weight_max
+        mean_precision = relative_precision.clamp(weight_min, weight_max)
     mean_path = _masked_mean(0.5 * mean_precision * resid2, mean_valid)
     calibration_path = _masked_mean(
         0.5 * precision * resid2.detach() + 0.5 * pixel_logvar,
@@ -71,6 +174,11 @@ def masked_gaussian_rgb_nll_components(
         mean_path=mean_path,
         calibration_path=calibration_path,
         precision=precision,
+        mean_precision=mean_precision,
+        precision_normalizer=precision_normalizer,
+        precision_clipped_low=clipped_low,
+        precision_clipped_high=clipped_high,
+        uncertainty_strength=uncertainty_strength,
         mean_valid=mean_valid,
         calibration_valid=calibration_valid,
     )
@@ -85,6 +193,13 @@ def masked_gaussian_rgb_nll(
     calibration_weight: float = 0.10,
     precision_floor: float = 0.0,
     calibration_mask: Optional[torch.Tensor] = None,
+    normalize_precision_per_reference: bool = False,
+    precision_weight_min: float = 0.25,
+    precision_weight_max: float = 4.0,
+    alpha: Optional[torch.Tensor] = None,
+    alpha_uncertainty_min: float = 0.25,
+    alpha_uncertainty_full: float = 0.75,
+    collect_precision_quantiles: bool = False,
 ) -> tuple[torch.Tensor, Dict[str, float]]:
     components = masked_gaussian_rgb_nll_components(
         pred_rgb,
@@ -93,22 +208,26 @@ def masked_gaussian_rgb_nll(
         mask=mask,
         calibration_mask=calibration_mask,
         precision_floor=precision_floor,
+        normalize_precision_per_reference=normalize_precision_per_reference,
+        precision_weight_min=precision_weight_min,
+        precision_weight_max=precision_weight_max,
+        alpha=alpha,
+        alpha_uncertainty_min=alpha_uncertainty_min,
+        alpha_uncertainty_full=alpha_uncertainty_full,
     )
     mean_path = components.mean_path
     calibration_path = components.calibration_path
     loss = mean_path + float(calibration_weight) * calibration_path
     mean_valid = components.mean_valid
     calibration_valid = components.calibration_valid
-    precision_mean = (
-        float(components.precision.detach()[mean_valid].mean().item())
-        if bool(mean_valid.any().item())
-        else 0.0
-    )
     return loss, {
         "loss_uncertainty_nll": float(loss.detach().item()),
         "loss_uncertainty_mean_path": float(mean_path.detach().item()),
         "loss_uncertainty_calibration": float(calibration_path.detach().item()),
-        "precision_mean": precision_mean,
+        **_precision_weight_stats(
+            components,
+            collect_quantiles=bool(collect_precision_quantiles),
+        ),
         "calibration_valid_ratio": float(calibration_valid.float().mean().item()),
         "skipped_no_valid_pixels": 0.0 if bool(mean_valid.any().item()) else 1.0,
     }
@@ -128,6 +247,13 @@ def masked_uncertainty_photometric_loss(
     mean_nll_weight: Optional[float] = None,
     calibration_path_weight: Optional[float] = None,
     calibration_mask: Optional[torch.Tensor] = None,
+    normalize_precision_per_reference: bool = False,
+    precision_weight_min: float = 0.25,
+    precision_weight_max: float = 4.0,
+    alpha: Optional[torch.Tensor] = None,
+    alpha_uncertainty_min: float = 0.25,
+    alpha_uncertainty_full: float = 0.75,
+    collect_precision_quantiles: bool = False,
 ) -> tuple[torch.Tensor, Dict[str, float]]:
     components = masked_gaussian_rgb_nll_components(
         pred_rgb,
@@ -136,6 +262,12 @@ def masked_uncertainty_photometric_loss(
         mask=mask,
         calibration_mask=calibration_mask,
         precision_floor=float(precision_floor),
+        normalize_precision_per_reference=normalize_precision_per_reference,
+        precision_weight_min=precision_weight_min,
+        precision_weight_max=precision_weight_max,
+        alpha=alpha,
+        alpha_uncertainty_min=alpha_uncertainty_min,
+        alpha_uncertainty_full=alpha_uncertainty_full,
     )
     legacy_nll = components.mean_path + float(calibration_weight) * components.calibration_path
     effective_mean_weight = float(nll_weight) if mean_nll_weight is None else float(mean_nll_weight)
@@ -169,10 +301,9 @@ def masked_uncertainty_photometric_loss(
         "loss_uncertainty_calibration_weighted": float(
             (effective_calibration_weight * components.calibration_path).detach().item()
         ),
-        "precision_mean": (
-            float(components.precision.detach()[mean_valid].mean().item())
-            if bool(mean_valid.any().item())
-            else 0.0
+        **_precision_weight_stats(
+            components,
+            collect_quantiles=bool(collect_precision_quantiles),
         ),
         "calibration_valid_ratio": float(calibration_valid.float().mean().item()),
         "skipped_no_valid_pixels": 0.0 if bool(mean_valid.any().item()) else 1.0,

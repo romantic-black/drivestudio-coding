@@ -1,11 +1,10 @@
-output_name: iforward_stage3_3_uncertainty_v2
-# IForward Stage 3_3: Stage 3.2 scheduler + low-rank GDKV + uncertainty semantic V2.
+output_name: iforward_stage3_3_uncertainty_v2_precision_clean_v1
+# IForward Stage 3_3 V2 clean experiment: pretrained GDKV + bounded relative precision.
 
 initialization:
-  skip_keys:
-    - parent_temporal_mamba
-    - parent_optimizer_mamba
-    - parent_optimizer_memory
+  # Clean Stage3.2 warm-start: GDKV lives under parent_temporal_mamba and must load.
+  # The checkpoint loader already permits the new uncertainty target head to be missing.
+  skip_keys: []
   phase_b_from_phase_a:
     enable: false
     checkpoint: ""
@@ -409,9 +408,25 @@ model:
         history_damage_enable: false
         history_precision_floor: 0.0
         repair_precision_floor: 0.0
+        # Keep the mean-path gradient scale comparable to raw reconstruction while
+        # preserving true (unnormalized) precision for uncertainty calibration.
+        normalize_precision_per_reference: true
+        precision_weight_min: 0.25
+        precision_weight_max: 4.0
+        # Low-coverage pixels smoothly fall back to ordinary RGB weight 1.
+        alpha_uncertainty_min: 0.25
+        alpha_uncertainty_full: 0.75
+        # First clean ablation: current remains the raw quality anchor; learned
+        # precision only reweights history and repair supervision.
+        mean_weighting_by_role:
+          current: false
+          history: true
+          repair: true
+        raw_l1_when_mean_weighting_disabled: 1.0
         warmup:
           start_step: 2000
           end_step: 10000
+          freeze_main_model_until_step: 2000
           mean_nll_final: 0.50
           calibration_path_weight: 0.05
           raw_l1_initial: 1.0
@@ -983,7 +998,7 @@ iforward_demo:
 logging:
   output_root: /root/autodl-tmp/outputs
   project: iforward_stage3_3_uncertainty_v2
-  log_dir: /root/autodl-tmp/outputs/iforward_stage3_3_uncertainty_v2
+  log_dir: /root/autodl-tmp/outputs/iforward_stage3_3_uncertainty_v2_precision_clean_v1
   image_interval_blocks: 5000
   image_interval: 5000
   image_trigger:

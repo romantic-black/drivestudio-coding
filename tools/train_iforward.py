@@ -238,8 +238,39 @@ def _build_iforward_run_manifest(**kwargs: Any) -> Tuple[Dict[str, Any], str]:
     manifest.update(_active_validation_manifest_fields(cfg))
     manifest.update(_iforward_lifting_manifest_fields(cfg))
     iforward_cfg = _cfg_get(_cfg_get(cfg, "model", {}) or {}, "iforward", {}) or {}
+    uncertainty_cfg = _cfg_get(iforward_cfg, "uncertainty", {}) or {}
+    uncertainty_loss_cfg = _cfg_get(uncertainty_cfg, "loss", {}) or {}
+    uncertainty_warmup_cfg = _cfg_get(uncertainty_loss_cfg, "warmup", {}) or {}
+    mean_weighting_cfg = _cfg_get(uncertainty_loss_cfg, "mean_weighting_by_role", {}) or {}
     manifest.update({"local_gs_state_schema_version": 2})
     manifest.update(uncertainty_schema_versions(_cfg_get(iforward_cfg, "version", "")))
+    manifest.update(
+        {
+            "uncertainty_precision_version": (
+                "per_reference_relative_clamped_v1"
+                if bool(
+                    _cfg_get(
+                        uncertainty_loss_cfg,
+                        "normalize_precision_per_reference",
+                        False,
+                    )
+                )
+                else "absolute_precision_legacy"
+            ),
+            "uncertainty_mean_weighting_current": bool(
+                _cfg_get(mean_weighting_cfg, "current", True)
+            ),
+            "uncertainty_mean_weighting_history": bool(
+                _cfg_get(mean_weighting_cfg, "history", True)
+            ),
+            "uncertainty_mean_weighting_repair": bool(
+                _cfg_get(mean_weighting_cfg, "repair", True)
+            ),
+            "uncertainty_calibration_only_until_step": int(
+                _cfg_get(uncertainty_warmup_cfg, "freeze_main_model_until_step", 0)
+            ),
+        }
+    )
     return manifest, snapshot_yaml
 
 

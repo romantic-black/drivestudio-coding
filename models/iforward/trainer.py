@@ -368,6 +368,17 @@ class IForwardTrainer(nn.Module):
         train_measurement = bool(cfg_get(trainability, "train_measurement_frontend", False))
         train_biggs_child_decoder = bool(cfg_get(trainability, "train_biggs_child_decoder", True))
         train_stage3_sparse_gather = bool(cfg_get(trainability, "train_stage3_sparse_gather", True))
+        uncertainty_cfg = cfg_get(iforward_cfg, "uncertainty", {}) or {}
+        uncertainty_loss_cfg = cfg_get(uncertainty_cfg, "loss", {}) or {}
+        uncertainty_warmup_cfg = cfg_get(uncertainty_loss_cfg, "warmup", {}) or {}
+        freeze_main_until_step = int(
+            cfg_get(uncertainty_warmup_cfg, "freeze_main_model_until_step", 0)
+        )
+        calibration_only_active = bool(
+            cfg_get(uncertainty_cfg, "enable", False)
+            and int(global_step) < int(freeze_main_until_step)
+        )
+        self._uncertainty_calibration_only_active = bool(calibration_only_active)
 
         self._set_all_model_requires_grad(False)
         if self._is_v3_gru_history_gate():
@@ -415,6 +426,10 @@ class IForwardTrainer(nn.Module):
         ):
             self._set_group_requires_grad(group_name, train_measurement)
 
+        if calibration_only_active:
+            self._set_all_model_requires_grad(False)
+            self._set_group_requires_grad("stage6_uncertainty_head", True)
+
         base_lrs = {name: self._lr_for_group(self.config, name, 1.0e-4) for name in self._optimizer_group_names}
         for group in getattr(self, "optimizer", None).param_groups if getattr(self, "optimizer", None) is not None else []:
             name = str(group.get("name", group.get("logical_name", "")))
@@ -428,6 +443,8 @@ class IForwardTrainer(nn.Module):
             if name == "stage3_sparse_gather" and not train_stage3_sparse_gather:
                 lr = 0.0
             if name.startswith("stage6_measurement_frontend") and not train_measurement:
+                lr = 0.0
+            if calibration_only_active and name != "stage6_uncertainty_head":
                 lr = 0.0
             group["lr"] = float(lr)
 
@@ -495,7 +512,11 @@ class IForwardTrainer(nn.Module):
         return int(sum(int(param.numel()) for param in parameters if bool(param.requires_grad)))
 
     def _optimizer_group_metrics(self) -> Dict[str, float]:
-        metrics: Dict[str, float] = {}
+        metrics: Dict[str, float] = {
+            "iforward/uncertainty/calibration_only_main_frozen": float(
+                bool(getattr(self, "_uncertainty_calibration_only_active", False))
+            )
+        }
         for group in getattr(self.optimizer, "param_groups", []):
             name = str(group.get("name", group.get("logical_name", "group")))
             params = [param for param in list(group.get("params", []) or []) if isinstance(param, nn.Parameter)]

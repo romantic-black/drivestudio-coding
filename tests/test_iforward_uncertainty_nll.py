@@ -7,11 +7,74 @@ import torch
 from models.iforward.uncertainty_losses import (
     grouped_uncertainty_calibration_metrics,
     masked_gaussian_rgb_nll,
+    masked_gaussian_rgb_nll_components,
     masked_uncertainty_variance_stats,
     masked_uncertainty_photometric_loss,
     uncertainty_calibration_metrics,
     uncertainty_v2_loss_weights,
 )
+
+
+def test_normalized_precision_uses_relative_bounded_mean_weights_only() -> None:
+    pred = torch.full((1, 2, 3), 0.2, requires_grad=True)
+    gt = torch.zeros_like(pred)
+    # True precisions are [1, 2], so normalized mean weights are [2/3, 4/3].
+    logvar = (-torch.log(torch.tensor([[1.0, 2.0]]))).requires_grad_()
+    components = masked_gaussian_rgb_nll_components(
+        pred,
+        gt,
+        logvar,
+        mask=None,
+        normalize_precision_per_reference=True,
+        precision_weight_min=0.25,
+        precision_weight_max=4.0,
+    )
+    assert torch.allclose(
+        components.mean_precision,
+        torch.tensor([[2.0 / 3.0, 4.0 / 3.0]]),
+    )
+    assert torch.allclose(components.precision_normalizer, torch.tensor(1.5))
+    assert torch.allclose(components.precision, torch.tensor([[1.0, 2.0]]))
+
+    components.mean_path.backward()
+    per_pixel_grad = pred.grad.detach().abs().mean(dim=-1)
+    assert torch.allclose(per_pixel_grad[0, 1] / per_pixel_grad[0, 0], torch.tensor(2.0))
+    assert logvar.grad is None
+
+
+def test_normalized_precision_clamps_and_low_alpha_falls_back_to_one() -> None:
+    pred = torch.zeros(1, 2, 3)
+    gt = torch.zeros_like(pred)
+    logvar = -torch.log(torch.tensor([[1000.0, 1.0]]))
+    components = masked_gaussian_rgb_nll_components(
+        pred,
+        gt,
+        logvar,
+        mask=None,
+        normalize_precision_per_reference=True,
+        precision_weight_min=0.25,
+        precision_weight_max=4.0,
+        alpha=torch.tensor([[0.0, 1.0]]),
+        alpha_uncertainty_min=0.25,
+        alpha_uncertainty_full=0.75,
+    )
+    assert torch.allclose(components.mean_precision, torch.tensor([[1.0, 0.25]]))
+    assert components.precision_clipped_low.tolist() == [[False, True]]
+    stats_loss, stats = masked_gaussian_rgb_nll(
+        pred,
+        gt,
+        logvar,
+        mask=None,
+        normalize_precision_per_reference=True,
+        precision_weight_min=0.25,
+        precision_weight_max=4.0,
+        alpha=torch.tensor([[0.0, 1.0]]),
+        collect_precision_quantiles=True,
+    )
+    assert torch.isfinite(stats_loss)
+    assert stats["precision_alpha_fallback_ratio"] == 0.5
+    assert stats["precision_clipped_low_ratio"] == 0.5
+    assert stats["precision_weight_p50"] >= 0.25
 
 
 def test_decoupled_nll_routes_mean_and_uncertainty_gradients() -> None:

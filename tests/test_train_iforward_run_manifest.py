@@ -105,6 +105,18 @@ def test_iforward_v2_manifest_records_semantic_schema_versions(tmp_path, monkeyp
     config_path.write_text("output_name: manifest-v2\n", encoding="utf-8")
     cfg = _cfg(tmp_path)
     cfg.model.iforward.version = "stage3_3_uncertainty_v2"
+    cfg.model.iforward.uncertainty = {
+        "enable": True,
+        "loss": {
+            "normalize_precision_per_reference": True,
+            "mean_weighting_by_role": {
+                "current": False,
+                "history": True,
+                "repair": True,
+            },
+            "warmup": {"freeze_main_model_until_step": 2000},
+        },
+    }
     rows = []
     monkeypatch.setattr(train_ifwd.base, "_write_metrics_history", lambda fh, row: fh.append(dict(row)))
     train_ifwd._iforward_run_start_hook(
@@ -119,3 +131,8 @@ def test_iforward_v2_manifest_records_semantic_schema_versions(tmp_path, monkeyp
     assert rows[0]["uncertainty_updater_version"] == "state_conditioned_target_v2"
     assert rows[0]["uncertainty_raster_version"] == "detached_moments_aleatoric_loss_v2"
     assert rows[0]["uncertainty_loss_version"] == "decoupled_warmup_v2"
+    assert rows[0]["uncertainty_precision_version"] == "per_reference_relative_clamped_v1"
+    assert rows[0]["uncertainty_mean_weighting_current"] is False
+    assert rows[0]["uncertainty_mean_weighting_history"] is True
+    assert rows[0]["uncertainty_mean_weighting_repair"] is True
+    assert rows[0]["uncertainty_calibration_only_until_step"] == 2000

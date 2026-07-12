@@ -251,3 +251,31 @@ def test_uncertainty_v2_head_has_independent_optimizer_group_from_step_zero() ->
     assert all(param.requires_grad for param in head_group["params"])
     assert all("head_appearance_logvar_target" in name for name in head_group["param_names"])
     assert all("head_appearance_logvar_target" not in name for name in updater_group["param_names"])
+
+
+def test_uncertainty_calibration_only_warmup_freezes_every_group_except_head() -> None:
+    cfg = _cfg()
+    cfg["model"]["iforward"]["uncertainty"] = {
+        "enable": True,
+        "loss": {"warmup": {"freeze_main_model_until_step": 2000}},
+    }
+    cfg["optimizer"]["lr"]["stage6_uncertainty_head"] = 1.0e-4
+    trainer = IForwardTrainer(config=cfg, device=torch.device("cpu"), model=_V2Model())
+
+    for group in trainer.optimizer.param_groups:
+        if group["name"] == "stage6_uncertainty_head":
+            assert group["lr"] == 1.0e-4
+            assert all(param.requires_grad for param in group["params"])
+        else:
+            assert group["lr"] == 0.0
+            assert all(not param.requires_grad for param in group["params"])
+    assert trainer._optimizer_group_metrics()[
+        "iforward/uncertainty/calibration_only_main_frozen"
+    ] == 1.0
+
+    trainer._apply_trainability_schedule(2000)
+    assert _group(trainer, "memory")["lr"] == 1.0e-4
+    assert any(param.requires_grad for param in _group(trainer, "memory")["params"])
+    assert trainer._optimizer_group_metrics()[
+        "iforward/uncertainty/calibration_only_main_frozen"
+    ] == 0.0

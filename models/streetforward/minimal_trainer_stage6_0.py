@@ -1171,6 +1171,35 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         self.iforward_uncertainty_raster_cfg = self._cfg_get(uncertainty_cfg, "rasterizer", {}) or {}
         self.iforward_uncertainty_loss_cfg = self._cfg_get(uncertainty_cfg, "loss", {}) or {}
         self.iforward_uncertainty_logging_cfg = self._cfg_get(uncertainty_cfg, "logging", {}) or {}
+        if bool(
+            self._cfg_get(
+                self.iforward_uncertainty_loss_cfg,
+                "normalize_precision_per_reference",
+                False,
+            )
+        ):
+            precision_weight_min = float(
+                self._cfg_get(self.iforward_uncertainty_loss_cfg, "precision_weight_min", 0.25)
+            )
+            precision_weight_max = float(
+                self._cfg_get(self.iforward_uncertainty_loss_cfg, "precision_weight_max", 4.0)
+            )
+            if not (0.0 < precision_weight_min <= 1.0 <= precision_weight_max):
+                raise ValueError(
+                    "IForward uncertainty normalized precision requires "
+                    "0 < precision_weight_min <= 1 <= precision_weight_max."
+                )
+            alpha_uncertainty_min = float(
+                self._cfg_get(self.iforward_uncertainty_loss_cfg, "alpha_uncertainty_min", 0.25)
+            )
+            alpha_uncertainty_full = float(
+                self._cfg_get(self.iforward_uncertainty_loss_cfg, "alpha_uncertainty_full", 0.75)
+            )
+            if not alpha_uncertainty_full > alpha_uncertainty_min:
+                raise ValueError(
+                    "IForward uncertainty alpha fallback requires "
+                    "alpha_uncertainty_full > alpha_uncertainty_min."
+                )
         clamp_cfg = self._cfg_get(updater_cfg, "clamps", {}) or {}
         render_cfg = self._cfg_get(stage6, "render", {}) or {}
         self.stage6_render_grouped_multiview_train = bool(
@@ -6127,6 +6156,16 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         }.get(str(role))
         return bool(key and self._cfg_get(self.iforward_uncertainty_loss_cfg, key, True))
 
+    def _uncertainty_mean_weighting_enabled(self, role: Optional[str]) -> bool:
+        if not role:
+            return False
+        role_cfg = self._cfg_get(
+            self.iforward_uncertainty_loss_cfg,
+            "mean_weighting_by_role",
+            {},
+        ) or {}
+        return bool(self._cfg_get(role_cfg, str(role), True))
+
     def _render_loss_for_indices(
         self,
         *,
@@ -6230,6 +6269,18 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                             raw_l1_final=float(self._cfg_get(warmup_cfg, "raw_l1_final", 0.25)),
                         )
                         raw_l1_weight = float(weight_schedule["raw_l1_anchor_weight"])
+                        mean_weighting_enabled = self._uncertainty_mean_weighting_enabled(
+                            uncertainty_role
+                        )
+                        if not bool(mean_weighting_enabled):
+                            weight_schedule["mean_nll_weight"] = 0.0
+                            raw_l1_weight = float(
+                                self._cfg_get(
+                                    self.iforward_uncertainty_loss_cfg,
+                                    "raw_l1_when_mean_weighting_disabled",
+                                    1.0,
+                                )
+                            )
                         loss_kwargs.update(
                             {
                                 "mean_nll_weight": float(weight_schedule["mean_nll_weight"]),
@@ -6237,6 +6288,61 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                                     weight_schedule["calibration_path_weight"]
                                 ),
                                 "calibration_mask": calibration_mask,
+                                "normalize_precision_per_reference": bool(
+                                    self._cfg_get(
+                                        self.iforward_uncertainty_loss_cfg,
+                                        "normalize_precision_per_reference",
+                                        False,
+                                    )
+                                ),
+                                "precision_weight_min": float(
+                                    self._cfg_get(
+                                        self.iforward_uncertainty_loss_cfg,
+                                        "precision_weight_min",
+                                        0.25,
+                                    )
+                                ),
+                                "precision_weight_max": float(
+                                    self._cfg_get(
+                                        self.iforward_uncertainty_loss_cfg,
+                                        "precision_weight_max",
+                                        4.0,
+                                    )
+                                ),
+                                "alpha": bundle.alpha.detach(),
+                                "alpha_uncertainty_min": float(
+                                    self._cfg_get(
+                                        self.iforward_uncertainty_loss_cfg,
+                                        "alpha_uncertainty_min",
+                                        0.25,
+                                    )
+                                ),
+                                "alpha_uncertainty_full": float(
+                                    self._cfg_get(
+                                        self.iforward_uncertainty_loss_cfg,
+                                        "alpha_uncertainty_full",
+                                        0.75,
+                                    )
+                                ),
+                                "collect_precision_quantiles": bool(
+                                    int(
+                                        self._cfg_get(
+                                            self.iforward_uncertainty_logging_cfg,
+                                            "interval",
+                                            200,
+                                        )
+                                    )
+                                    > 0
+                                    and int(getattr(self, "stage3_0_global_step", 0))
+                                    % int(
+                                        self._cfg_get(
+                                            self.iforward_uncertainty_logging_cfg,
+                                            "interval",
+                                            200,
+                                        )
+                                    )
+                                    == 0
+                                ),
                             }
                         )
                     loss_i, stat_i = masked_uncertainty_photometric_loss(
@@ -6255,6 +6361,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                     )
                     if bool(getattr(self, "iforward_uncertainty_v2", False)):
                         stat_i["loss_warmup_progress"] = float(weight_schedule["warmup_progress"])
+                        stat_i["mean_weighting_role_enabled"] = float(mean_weighting_enabled)
                     variance_floor = float(
                         self._cfg_get(self.iforward_uncertainty_raster_cfg, "variance_floor", 1.0e-4)
                     )
@@ -8672,6 +8779,14 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         optimizer_cfg = self._cfg_get(self.config, "optimizer", {}) or {}
         lr_scheduler_cfg = self._cfg_get(self.config, "lr_scheduler", {}) or {}
         iforward_cfg = self._cfg_get(self._cfg_get(self.config, "model", {}) or {}, "iforward", {}) or {}
+        uncertainty_cfg = self._cfg_get(iforward_cfg, "uncertainty", {}) or {}
+        uncertainty_loss_cfg = self._cfg_get(uncertainty_cfg, "loss", {}) or {}
+        uncertainty_warmup_cfg = self._cfg_get(uncertainty_loss_cfg, "warmup", {}) or {}
+        mean_weighting_cfg = self._cfg_get(
+            uncertainty_loss_cfg,
+            "mean_weighting_by_role",
+            {},
+        ) or {}
         schema_versions = uncertainty_schema_versions(self._cfg_get(iforward_cfg, "version", ""))
         return {
             "format": "streetforward_stage6_0_ckpt_v2",
@@ -8684,6 +8799,24 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "global_step": int(step),
             "local_gs_state_schema_version": 2,
             **schema_versions,
+            "uncertainty_precision_version": (
+                "per_reference_relative_clamped_v1"
+                if bool(
+                    self._cfg_get(
+                        uncertainty_loss_cfg,
+                        "normalize_precision_per_reference",
+                        False,
+                    )
+                )
+                else "absolute_precision_legacy"
+            ),
+            "uncertainty_mean_weighting_roles": {
+                role: bool(self._cfg_get(mean_weighting_cfg, role, True))
+                for role in ("current", "history", "repair")
+            },
+            "uncertainty_calibration_only_until_step": int(
+                self._cfg_get(uncertainty_warmup_cfg, "freeze_main_model_until_step", 0)
+            ),
             "optimizer_signature": self._stage6_optimizer_signature(),
             "optimizer_cfg": _to_plain_dict(optimizer_cfg),
             "lr_scheduler_cfg": _to_plain_dict(lr_scheduler_cfg),
