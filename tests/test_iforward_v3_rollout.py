@@ -105,16 +105,30 @@ class FakeV3Bridge(nn.Module):
             support_bg=local_state.bg.means.new_ones((n, 1)),
         )
 
-    def render_loss(self, *, local_state, batch, target_indices, mask_policy, pred_rgbs_out=None, gt_images_out=None):
+    def render_loss(
+        self,
+        *,
+        local_state,
+        batch,
+        target_indices,
+        mask_policy,
+        pred_rgbs_out=None,
+        gt_images_out=None,
+        return_per_ref_loss=False,
+        **kwargs,
+    ):
+        _ = kwargs
         _ = batch, mask_policy
         if not target_indices:
-            return local_state.bg.means.new_tensor(0.0), {"num_refs": 0.0, "valid_ratio": 0.0}
+            zero = local_state.bg.means.new_tensor(0.0)
+            stats0 = {"num_refs": 0.0, "valid_ratio": 0.0}
+            return (zero, stats0, zero.new_zeros((0,))) if return_per_ref_loss else (zero, stats0)
         loss = local_state.bg.means.pow(2).mean()
         if pred_rgbs_out is not None:
             pred_rgbs_out.append(local_state.bg.means.new_zeros(1, 1, 3))
         if gt_images_out is not None:
             gt_images_out.append(local_state.bg.means.new_zeros(1, 1, 3))
-        return loss, {
+        stats = {
             "num_refs": float(len(target_indices)),
             "num_metric_refs": float(len(target_indices)),
             "metric_valid": 1.0,
@@ -123,6 +137,9 @@ class FakeV3Bridge(nn.Module):
             "l1": float(loss.detach().item()),
             "ssim": 0.0,
         }
+        if return_per_ref_loss:
+            return loss, stats, loss.expand(len(target_indices)).clone()
+        return loss, stats
 
     def render_loss_for_targets(self, *, local_state, ref_batch, targets, mask_policy, pred_rgbs_out=None, gt_images_out=None):
         _ = ref_batch, mask_policy
