@@ -35,19 +35,6 @@ from models.iforward.dino_feature_cache import DINOFeatureCache
 from models.iforward.fwhr_lift import aggregate_fwhr_child_lift
 from models.iforward.amp_policy import amp_dtype_id, build_amp_policy, storage_dtype_from_name
 from models.iforward.parent_spatial_backbone import ParentStructInput, empty_parent_struct_input
-from models.iforward.uncertainty_losses import (
-    grouped_uncertainty_calibration_metrics,
-    masked_uncertainty_variance_stats,
-    masked_uncertainty_photometric_loss,
-    uncertainty_calibration_metrics,
-    uncertainty_v2_loss_weights,
-)
-from models.iforward.uncertainty_renderer import (
-    UncertaintyImagePack,
-    UncertaintyRenderBundle,
-    camera_matrices_for_targets,
-    render_detached_uncertainty_moments,
-)
 from models.iforward.stage3_0 import (
     GatherConfig,
     ParentContextFusion,
@@ -62,10 +49,7 @@ from models.iforward.stage3_0.losses import merge_stage3_reg_terms
 from models.iforward.stage3_0.sparse_grid_sample import prepare_value_nchw
 from models.iforward.versions import (
     STAGE3_0_SCALAR_ANCHOR_CHILD_SUPPORT_PARENT_LEGACY_VERSION,
-    is_stage3_3_iforward_version,
-    is_stage3_3_uncertainty_v2_version,
     is_stage3_optimizer_memory_iforward_version,
-    uncertainty_schema_versions,
 )
 from models.streetforward.minimal_trainer_stage4_0 import spatial_hw_from_image_tensor
 from models.streetforward.minimal_trainer_stage5_4 import MinimalStreetForwardStage5_4
@@ -73,7 +57,6 @@ from models.streetforward.node_states import NodeStateBackground, NodeStateDista
 from models.streetforward.struct_decoders.common import cat_param_dict
 from models.streetforward.stage6_0 import (
     AppearanceDetailPack,
-    AppearanceLogvarStatePack,
     ContextPack,
     LocalGSState,
     PHASE_B_NAME,
@@ -1155,51 +1138,6 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         near_cfg = self._cfg_get(struct_cfg, "near", {}) or {}
         far_cfg = self._cfg_get(struct_cfg, "far", {}) or {}
         updater_cfg = self._cfg_get(stage6, "posterior_updater", {}) or {}
-        ifwd_version = str(self._cfg_get(iforward_cfg, "version", ""))
-        uncertainty_cfg = self._cfg_get(iforward_cfg, "uncertainty", {}) or {}
-        uncertainty_state_cfg = self._cfg_get(uncertainty_cfg, "state", {}) or {}
-        uncertainty_updater_cfg = self._cfg_get(uncertainty_cfg, "updater", {}) or {}
-        self.iforward_uncertainty_cfg = uncertainty_cfg
-        self.iforward_uncertainty_state_cfg = uncertainty_state_cfg
-        self.iforward_uncertainty_enabled = bool(self._cfg_get(uncertainty_cfg, "enable", False))
-        self.iforward_uncertainty_update_enabled = bool(
-            self.iforward_uncertainty_enabled
-            and self._cfg_get(uncertainty_updater_cfg, "enable", True)
-        )
-        self.iforward_uncertainty_stage3_3 = bool(is_stage3_3_iforward_version(ifwd_version))
-        self.iforward_uncertainty_v2 = bool(is_stage3_3_uncertainty_v2_version(ifwd_version))
-        self.iforward_uncertainty_raster_cfg = self._cfg_get(uncertainty_cfg, "rasterizer", {}) or {}
-        self.iforward_uncertainty_loss_cfg = self._cfg_get(uncertainty_cfg, "loss", {}) or {}
-        self.iforward_uncertainty_logging_cfg = self._cfg_get(uncertainty_cfg, "logging", {}) or {}
-        if bool(
-            self._cfg_get(
-                self.iforward_uncertainty_loss_cfg,
-                "normalize_precision_per_reference",
-                False,
-            )
-        ):
-            precision_weight_min = float(
-                self._cfg_get(self.iforward_uncertainty_loss_cfg, "precision_weight_min", 0.25)
-            )
-            precision_weight_max = float(
-                self._cfg_get(self.iforward_uncertainty_loss_cfg, "precision_weight_max", 4.0)
-            )
-            if not (0.0 < precision_weight_min <= 1.0 <= precision_weight_max):
-                raise ValueError(
-                    "IForward uncertainty normalized precision requires "
-                    "0 < precision_weight_min <= 1 <= precision_weight_max."
-                )
-            alpha_uncertainty_min = float(
-                self._cfg_get(self.iforward_uncertainty_loss_cfg, "alpha_uncertainty_min", 0.25)
-            )
-            alpha_uncertainty_full = float(
-                self._cfg_get(self.iforward_uncertainty_loss_cfg, "alpha_uncertainty_full", 0.75)
-            )
-            if not alpha_uncertainty_full > alpha_uncertainty_min:
-                raise ValueError(
-                    "IForward uncertainty alpha fallback requires "
-                    "alpha_uncertainty_full > alpha_uncertainty_min."
-                )
         clamp_cfg = self._cfg_get(updater_cfg, "clamps", {}) or {}
         render_cfg = self._cfg_get(stage6, "render", {}) or {}
         self.stage6_render_grouped_multiview_train = bool(
@@ -1306,34 +1244,8 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             appearance_detail_attribute_gates=dict(appearance_detail_attribute_gates),
             appearance_detail_attribute_gate_max=dict(appearance_detail_attribute_gate_max),
             invalid_update_policy=str(self._cfg_get(updater_cfg, "invalid_update_policy", "none")),
-            output_appearance_logvar_delta=bool(self.iforward_uncertainty_stage3_3),
-            appearance_logvar_detach_input=bool(
-                self._cfg_get(uncertainty_updater_cfg, "detach_input", True)
-            ),
-            appearance_logvar_gate_by_valid=bool(
-                self._cfg_get(uncertainty_updater_cfg, "gate_by_appearance_valid", True)
-            ),
-            appearance_logvar_gate_by_main_noop=bool(
-                self._cfg_get(uncertainty_updater_cfg, "gate_by_main_noop", False)
-            ),
-            appearance_logvar_max_step=dict(
-                self._cfg_get(uncertainty_updater_cfg, "max_logvar_step", {}) or {}
-            ),
-            zero_init_appearance_logvar_head=bool(
-                self._cfg_get(uncertainty_updater_cfg, "zero_init_head", True)
-            ),
-            appearance_logvar_update_mode=str(
-                self._cfg_get(
-                    uncertainty_updater_cfg,
-                    "mode",
-                    "state_conditioned_target_v2" if self.iforward_uncertainty_v2 else "delta_v1",
-                )
-            ),
-            appearance_logvar_target_temperature=float(
-                self._cfg_get(uncertainty_updater_cfg, "target_temperature", 1.0)
-            ),
-            appearance_logvar_state_cfg=dict(uncertainty_state_cfg),
         ).to(self.device)
+        ifwd_version = str(self._cfg_get(iforward_cfg, "version", ""))
         self.stage2_0_biggs_enabled = ifwd_version in {
             "stage2_0_biggs_parent_lifting",
             "stage2_0_biggs_cuda_exact_diagonal_projector",
@@ -1836,7 +1748,6 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 "update_quat": True,
                 "update_opacity": True,
                 "update_sh": True,
-                "update_appearance_logvar": bool(getattr(self, "iforward_uncertainty_update_enabled", False)),
             },
             "distant": {
                 "enable": True,
@@ -1845,7 +1756,6 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 "update_quat": False,
                 "update_opacity": True,
                 "update_sh": True,
-                "update_appearance_logvar": bool(getattr(self, "iforward_uncertainty_update_enabled", False)),
             },
             "rigid": {
                 "enable": True,
@@ -1854,7 +1764,6 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 "update_quat": True,
                 "update_opacity": True,
                 "update_sh": True,
-                "update_appearance_logvar": bool(getattr(self, "iforward_uncertainty_update_enabled", False)),
             },
         }
         out: Dict[str, Dict[str, bool]] = {}
@@ -1866,10 +1775,6 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 for key, default in branch_defaults.items()
             }
             out[branch]["enable"] = enabled
-            out[branch]["update_appearance_logvar"] = bool(
-                out[branch].get("update_appearance_logvar", False)
-                and getattr(self, "iforward_uncertainty_update_enabled", False)
-            )
             if not enabled:
                 for key in list(out[branch].keys()):
                     if key.startswith("update_"):
@@ -5014,8 +4919,6 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "opacity_logit": bool(scope["update_opacity"]) and delta.is_active("opacity_logit"),
             "sh": bool(scope["update_sh"]) and delta.is_active("sh"),
             "hidden": bool(scope.get("update_hidden", True)) and delta.is_active("hidden"),
-            "appearance_logvar_delta": bool(scope.get("update_appearance_logvar", False))
-            and delta.is_active("appearance_logvar_delta"),
         }
         return BranchDelta(
             means=delta.means if bool(active_attrs["means"]) else torch.zeros_like(delta.means),
@@ -5034,11 +4937,6 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             hidden=delta.hidden if bool(active_attrs["hidden"]) else torch.zeros_like(delta.hidden),
             confidence=delta.confidence,
             noop=delta.noop,
-            appearance_logvar_delta=(
-                delta.appearance_logvar_delta
-                if bool(active_attrs["appearance_logvar_delta"])
-                else torch.zeros_like(delta.appearance_logvar_delta)
-            ),
             active_attrs=active_attrs,
         )
 
@@ -5075,7 +4973,6 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             hidden=cast(delta.hidden),
             confidence=cast(delta.confidence),
             noop=cast(delta.noop),
-            appearance_logvar_delta=cast(delta.appearance_logvar_delta),
             active_attrs=delta.active_attrs,
         )
 
@@ -5114,7 +5011,6 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             hidden=fill(delta.hidden),
             confidence=fill(delta.confidence),
             noop=fill(delta.noop),
-            appearance_logvar_delta=fill(delta.appearance_logvar_delta),
             active_attrs=delta.active_attrs,
         )
 
@@ -5839,34 +5735,18 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         event: Any,
         ctx_vsm: Optional[ContextPack] = None,
     ) -> tuple[LocalGSState, DeltaPack, Dict[str, Any]]:
-        route = event.route
-        appearance_logvar_state = None
-        if bool(getattr(self, "iforward_uncertainty_v2", False)):
-            rigid_logvar = None
-            if local_state.rigid is not None and getattr(event, "event_rigid", None) is not None:
-                rigid_indices = route.S.to(device=local_state.rigid.appearance_logvar.device, dtype=torch.long)
-                rigid_logvar = local_state.rigid.appearance_logvar[rigid_indices]
-            appearance_logvar_state = AppearanceLogvarStatePack(
-                bg=local_state.bg.appearance_logvar,
-                distant=(
-                    None if local_state.distant is None else local_state.distant.appearance_logvar
-                ),
-                rigid=rigid_logvar,
-            )
         with self._iforward_amp_autocast():
-            updater_kwargs = {
-                "event": event,
-                "ctx_current": None,
-                "ctx_vsm": ctx_vsm,
-                "appearance_detail": getattr(event, "appearance_detail", None),
-                "branch_scope": getattr(self, "stage6_branch_scope", None),
-            }
-            if appearance_logvar_state is not None:
-                updater_kwargs["appearance_logvar_state"] = appearance_logvar_state
-            delta, aux = self.stage6_posterior_updater(**updater_kwargs)
+            delta, aux = self.stage6_posterior_updater(
+                event=event,
+                ctx_current=None,
+                ctx_vsm=ctx_vsm,
+                appearance_detail=getattr(event, "appearance_detail", None),
+                branch_scope=getattr(self, "stage6_branch_scope", None),
+            )
         delta = self._delta_pack_to_float32(delta)
         local_state = local_state.to(device=local_state.bg.means.device, dtype=torch.float32)
         self._mem_debug("encode/after_posterior")
+        route = event.route
         if delta.rigid is not None and local_state.rigid is not None:
             delta = DeltaPack(
                 bg=delta.bg,
@@ -5879,14 +5759,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 aux=delta.aux,
             )
         delta = self._apply_branch_scope(delta)
-        next_state = local_state.apply_delta(
-            delta,
-            **(
-                {"uncertainty_state_cfg": self.iforward_uncertainty_state_cfg}
-                if hasattr(self, "iforward_uncertainty_state_cfg")
-                else {}
-            ),
-        )
+        next_state = local_state.apply_delta(delta)
         next_state = self._constrain_local_state_after_delta(next_state)
         return next_state, delta, {**event.aux, **aux}
 
@@ -5907,14 +5780,12 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         opacity_logit = branch.opacity_logit.detach() if bool(detach) else branch.opacity_logit
         sh_dc = branch.sh_dc.detach() if bool(detach) else branch.sh_dc
         sh_rest = branch.sh_rest.detach() if bool(detach) else branch.sh_rest
-        appearance_logvar = branch.appearance_logvar.detach() if bool(detach) else branch.appearance_logvar
         return {
             "means_r": means,
             "scales_r": torch.exp(scales_log),
             "quats_r": quats,
             "opacities_r": torch.sigmoid(opacity_logit).squeeze(-1),
             "colors_r": torch.cat([sh_dc[:, None, :], sh_rest], dim=1),
-            "appearance_logvar_r": appearance_logvar.float(),
         }
 
     def _phase_b_freeze_distant_branch(self, local_state: LocalGSState) -> LocalGSState:
@@ -5935,7 +5806,6 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 sh_dc=local_state.distant.sh_dc.detach(),
                 sh_rest=local_state.distant.sh_rest.detach(),
                 hidden=local_state.distant.hidden.detach(),
-                appearance_logvar=local_state.distant.appearance_logvar.detach().float(),
             ),
         )
 
@@ -5953,7 +5823,6 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "quats_r": torch.cat([p["quats_r"] for p in parts], dim=0),
             "opacities_r": torch.cat([p["opacities_r"] for p in parts], dim=0),
             "colors_r": torch.cat([p["colors_r"] for p in parts], dim=0),
-            "appearance_logvar_r": torch.cat([p["appearance_logvar_r"] for p in parts], dim=0).float(),
         }
 
     def _local_rigid_node_state(self, local_state: LocalGSState) -> Optional[NodeStateRigid]:
@@ -5968,7 +5837,6 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         rigid.opacity_logit = local_state.rigid.opacity_logit
         rigid.sh_dc = local_state.rigid.sh_dc
         rigid.sh_rest = local_state.rigid.sh_rest
-        rigid.appearance_logvar = local_state.rigid.appearance_logvar
         return rigid
 
     def _render_target(self, *, local_state: LocalGSState, target: Dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
@@ -6008,13 +5876,12 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         *,
         local_state: LocalGSState,
         targets_with_indices: List[Tuple[int, Dict[str, Any]]],
-        with_uncertainty: bool = False,
-    ) -> Dict[int, Tuple[torch.Tensor, torch.Tensor] | UncertaintyRenderBundle]:
+    ) -> Dict[int, Tuple[torch.Tensor, torch.Tensor]]:
         by_frame: Dict[int, List[Tuple[int, Dict[str, Any]]]] = defaultdict(list)
         for idx, target in targets_with_indices:
             by_frame[int(target.get("frame_idx", 0))].append((int(idx), target))
 
-        pred_by_idx: Dict[int, Tuple[torch.Tensor, torch.Tensor] | UncertaintyRenderBundle] = {}
+        pred_by_idx: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
         for frame_idx in sorted(by_frame.keys()):
             group = by_frame[int(frame_idx)]
             targets_f = [target for _, target in group]
@@ -6031,140 +5898,15 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             if use_grouped_multiview and all(int(h) == h0 and int(w) == w0 for h, w in zip(heights, widths)):
                 multi_result = self._render_multi_view(render_params, targets_f)
                 if multi_result is not None:
-                    if bool(with_uncertainty):
-                        rgbs = torch.stack([rgb for rgb, _acc in multi_result], dim=0)
-                        alphas = torch.stack(
-                            [acc.squeeze(-1) if acc.dim() == 3 else acc for _rgb, acc in multi_result],
-                            dim=0,
-                        )
-                        viewmats, Ks = camera_matrices_for_targets(
-                            targets_f,
-                            device=render_params["means_r"].device,
-                            dtype=torch.float32,
-                        )
-                        bundle = render_detached_uncertainty_moments(
-                            rasterizer=self.renderer,
-                            render_params=render_params,
-                            viewmats=viewmats,
-                            Ks=Ks,
-                            width=int(w0),
-                            height=int(h0),
-                            rgb=rgbs,
-                            alpha=alphas,
-                            sh_degree=int(self.sh_degree),
-                            background_sigma=float(
-                                self._cfg_get(self.iforward_uncertainty_raster_cfg, "background_sigma", 0.10)
-                            ),
-                            background_sigma_for_loss=float(
-                                self._cfg_get(
-                                    self.iforward_uncertainty_raster_cfg,
-                                    "background_sigma_for_loss",
-                                    0.0 if self.iforward_uncertainty_v2 else 0.10,
-                                )
-                            ),
-                            variance_floor=float(
-                                self._cfg_get(self.iforward_uncertainty_raster_cfg, "variance_floor", 1.0e-4)
-                            ),
-                            variance_max=float(
-                                self._cfg_get(self.iforward_uncertainty_raster_cfg, "variance_max", 0.25)
-                            ),
-                            variance_mode=str(
-                                self._cfg_get(
-                                    self.iforward_uncertainty_raster_cfg,
-                                    "variance_mode",
-                                    "aleatoric_only" if self.iforward_uncertainty_v2 else "total_variance_scalar",
-                                )
-                            ),
-                            detach_first_pass_alpha=bool(
-                                self._cfg_get(
-                                    self.iforward_uncertainty_raster_cfg,
-                                    "detach_first_pass_alpha",
-                                    self.iforward_uncertainty_v2,
-                                )
-                            ),
-                        )
-                        for view_idx, (orig_idx, _target) in enumerate(group):
-                            pred_by_idx[int(orig_idx)] = bundle.select_view(view_idx)
-                    else:
-                        for (orig_idx, _target), (rgb, acc) in zip(group, multi_result):
-                            pred_by_idx[int(orig_idx)] = (rgb, acc.squeeze(-1) if acc.dim() == 3 else acc)
+                    for (orig_idx, _target), (rgb, acc) in zip(group, multi_result):
+                        pred_by_idx[int(orig_idx)] = (rgb, acc.squeeze(-1) if acc.dim() == 3 else acc)
                     continue
 
             for orig_idx, target in group:
                 height, width = spatial_hw_from_image_tensor(target["gt_image"])
                 pred_rgb, acc = self._render_single_view(render_params, target["view"], int(height), int(width))
-                acc2 = acc.squeeze(-1) if acc.dim() == 3 else acc
-                if bool(with_uncertainty):
-                    viewmats, Ks = camera_matrices_for_targets(
-                        [target],
-                        device=render_params["means_r"].device,
-                        dtype=torch.float32,
-                    )
-                    bundle = render_detached_uncertainty_moments(
-                        rasterizer=self.renderer,
-                        render_params=render_params,
-                        viewmats=viewmats,
-                        Ks=Ks,
-                        width=int(width),
-                        height=int(height),
-                        rgb=pred_rgb,
-                        alpha=acc2,
-                        sh_degree=int(self.sh_degree),
-                        background_sigma=float(
-                            self._cfg_get(self.iforward_uncertainty_raster_cfg, "background_sigma", 0.10)
-                        ),
-                        background_sigma_for_loss=float(
-                            self._cfg_get(
-                                self.iforward_uncertainty_raster_cfg,
-                                "background_sigma_for_loss",
-                                0.0 if self.iforward_uncertainty_v2 else 0.10,
-                            )
-                        ),
-                        variance_floor=float(
-                            self._cfg_get(self.iforward_uncertainty_raster_cfg, "variance_floor", 1.0e-4)
-                        ),
-                        variance_max=float(
-                            self._cfg_get(self.iforward_uncertainty_raster_cfg, "variance_max", 0.25)
-                        ),
-                        variance_mode=str(
-                            self._cfg_get(
-                                self.iforward_uncertainty_raster_cfg,
-                                "variance_mode",
-                                "aleatoric_only" if self.iforward_uncertainty_v2 else "total_variance_scalar",
-                            )
-                        ),
-                        detach_first_pass_alpha=bool(
-                            self._cfg_get(
-                                self.iforward_uncertainty_raster_cfg,
-                                "detach_first_pass_alpha",
-                                self.iforward_uncertainty_v2,
-                            )
-                        ),
-                    )
-                    pred_by_idx[int(orig_idx)] = bundle.select_view(0)
-                else:
-                    pred_by_idx[int(orig_idx)] = (pred_rgb, acc2)
+                pred_by_idx[int(orig_idx)] = (pred_rgb, acc.squeeze(-1) if acc.dim() == 3 else acc)
         return pred_by_idx
-
-    def _uncertainty_role_enabled(self, role: Optional[str]) -> bool:
-        if not bool(getattr(self, "iforward_uncertainty_enabled", False)) or not role:
-            return False
-        key = {
-            "current": "current_enable",
-            "history": "history_enable",
-            "repair": "repair_enable",
-        }.get(str(role))
-        return bool(key and self._cfg_get(self.iforward_uncertainty_loss_cfg, key, True))
-
-    def _uncertainty_mean_weighting_enabled(self, role: Optional[str]) -> bool:
-        if not role:
-            return False
-        role_cfg = self._cfg_get(
-            self.iforward_uncertainty_loss_cfg,
-            "mean_weighting_by_role",
-            {},
-        ) or {}
-        return bool(self._cfg_get(role_cfg, str(role), True))
 
     def _render_loss_for_indices(
         self,
@@ -6178,9 +5920,6 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         pred_rgbs_out: Optional[List[torch.Tensor]] = None,
         gt_images_out: Optional[List[torch.Tensor]] = None,
         return_per_ref_loss: bool = False,
-        uncertainty_role: Optional[str] = None,
-        uncertainty_images_out: Optional[List[UncertaintyImagePack]] = None,
-        collect_uncertainty_calibration: bool = False,
     ) -> tuple:
         if len(target_indices) == 0:
             zero = local_state.bg.means.new_tensor(0.0)
@@ -6201,8 +5940,6 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         ssim_vals: List[float] = []
         valid_ratios: List[float] = []
         skip_count = 0.0
-        uncertainty_stats_values: Dict[str, List[float]] = defaultdict(list)
-        use_uncertainty = self._uncertainty_role_enabled(uncertainty_role)
         chunk_size = int(getattr(self, "stage6_render_loss_target_chunk_size", 0) or 0)
         chunks = (
             [target_indices]
@@ -6213,268 +5950,22 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         stats["target_chunk_count"] = float(len(chunks))
         for chunk_indices in chunks:
             targets_with_indices = [(int(idx), batch["targets"][int(idx)]) for idx in chunk_indices]
-            render_group_kwargs = {
-                "local_state": local_state,
-                "targets_with_indices": targets_with_indices,
-            }
-            if bool(use_uncertainty):
-                render_group_kwargs["with_uncertainty"] = True
-            pred_by_idx = self._render_targets_grouped_by_frame(**render_group_kwargs)
+            pred_by_idx = self._render_targets_grouped_by_frame(
+                local_state=local_state,
+                targets_with_indices=targets_with_indices,
+            )
             for idx in chunk_indices:
                 target = batch["targets"][int(idx)]
-                rendered_item = pred_by_idx[int(idx)]
-                if isinstance(rendered_item, UncertaintyRenderBundle):
-                    bundle = rendered_item
-                    pred, _alpha = bundle.rgb, bundle.alpha
-                else:
-                    bundle = None
-                    pred, _alpha = rendered_item
+                pred, _alpha = pred_by_idx[int(idx)]
                 gt = target["gt_image"].to(device=pred.device, dtype=pred.dtype)
                 mask = target_valid_mask(target, mask_policy=mask_policy, device=pred.device)
-                if bundle is not None:
-                    role_floor_key = "repair_precision_floor" if str(uncertainty_role) == "repair" else "history_precision_floor"
-                    precision_floor = (
-                        float(self._cfg_get(self.iforward_uncertainty_loss_cfg, role_floor_key, 0.0))
-                        if str(uncertainty_role) in {"history", "repair"}
-                        else 0.0
-                    )
-                    existing_ssim = (
-                        float(getattr(self, "loss_w_ssim", 0.0))
-                        if ssim_weight is None
-                        else float(ssim_weight)
-                    )
-                    if not bool(
-                        self._cfg_get(self.iforward_uncertainty_loss_cfg, "use_existing_ssim_anchor", True)
-                    ):
-                        existing_ssim = 0.0
-                    alpha_valid_min = float(
-                        self._cfg_get(self.iforward_uncertainty_raster_cfg, "alpha_valid_min", 0.01)
-                    )
-                    calibration_mask = bundle.alpha.detach() >= float(alpha_valid_min)
-                    loss_kwargs: Dict[str, Any] = {}
-                    raw_l1_weight = float(
-                        self._cfg_get(self.iforward_uncertainty_loss_cfg, "raw_l1_anchor_weight", 0.25)
-                    )
-                    if bool(getattr(self, "iforward_uncertainty_v2", False)):
-                        warmup_cfg = self._cfg_get(self.iforward_uncertainty_loss_cfg, "warmup", {}) or {}
-                        weight_schedule = uncertainty_v2_loss_weights(
-                            int(getattr(self, "stage3_0_global_step", 0)),
-                            warmup_start=int(self._cfg_get(warmup_cfg, "start_step", 2000)),
-                            warmup_end=int(self._cfg_get(warmup_cfg, "end_step", 10000)),
-                            mean_nll_final=float(self._cfg_get(warmup_cfg, "mean_nll_final", 0.50)),
-                            calibration=float(
-                                self._cfg_get(warmup_cfg, "calibration_path_weight", 0.05)
-                            ),
-                            raw_l1_initial=float(self._cfg_get(warmup_cfg, "raw_l1_initial", 1.0)),
-                            raw_l1_final=float(self._cfg_get(warmup_cfg, "raw_l1_final", 0.25)),
-                        )
-                        raw_l1_weight = float(weight_schedule["raw_l1_anchor_weight"])
-                        mean_weighting_enabled = self._uncertainty_mean_weighting_enabled(
-                            uncertainty_role
-                        )
-                        if not bool(mean_weighting_enabled):
-                            weight_schedule["mean_nll_weight"] = 0.0
-                            raw_l1_weight = float(
-                                self._cfg_get(
-                                    self.iforward_uncertainty_loss_cfg,
-                                    "raw_l1_when_mean_weighting_disabled",
-                                    1.0,
-                                )
-                            )
-                        loss_kwargs.update(
-                            {
-                                "mean_nll_weight": float(weight_schedule["mean_nll_weight"]),
-                                "calibration_path_weight": float(
-                                    weight_schedule["calibration_path_weight"]
-                                ),
-                                "calibration_mask": calibration_mask,
-                                "normalize_precision_per_reference": bool(
-                                    self._cfg_get(
-                                        self.iforward_uncertainty_loss_cfg,
-                                        "normalize_precision_per_reference",
-                                        False,
-                                    )
-                                ),
-                                "precision_weight_min": float(
-                                    self._cfg_get(
-                                        self.iforward_uncertainty_loss_cfg,
-                                        "precision_weight_min",
-                                        0.25,
-                                    )
-                                ),
-                                "precision_weight_max": float(
-                                    self._cfg_get(
-                                        self.iforward_uncertainty_loss_cfg,
-                                        "precision_weight_max",
-                                        4.0,
-                                    )
-                                ),
-                                "alpha": bundle.alpha.detach(),
-                                "alpha_uncertainty_min": float(
-                                    self._cfg_get(
-                                        self.iforward_uncertainty_loss_cfg,
-                                        "alpha_uncertainty_min",
-                                        0.25,
-                                    )
-                                ),
-                                "alpha_uncertainty_full": float(
-                                    self._cfg_get(
-                                        self.iforward_uncertainty_loss_cfg,
-                                        "alpha_uncertainty_full",
-                                        0.75,
-                                    )
-                                ),
-                                "collect_precision_quantiles": bool(
-                                    int(
-                                        self._cfg_get(
-                                            self.iforward_uncertainty_logging_cfg,
-                                            "interval",
-                                            200,
-                                        )
-                                    )
-                                    > 0
-                                    and int(getattr(self, "stage3_0_global_step", 0))
-                                    % int(
-                                        self._cfg_get(
-                                            self.iforward_uncertainty_logging_cfg,
-                                            "interval",
-                                            200,
-                                        )
-                                    )
-                                    == 0
-                                ),
-                            }
-                        )
-                    loss_i, stat_i = masked_uncertainty_photometric_loss(
-                        pred,
-                        gt,
-                        bundle.loss_logvar,
-                        mask=mask,
-                        nll_weight=float(self._cfg_get(self.iforward_uncertainty_loss_cfg, "nll_weight", 0.50)),
-                        calibration_weight=float(
-                            self._cfg_get(self.iforward_uncertainty_loss_cfg, "calibration_weight", 0.10)
-                        ),
-                        raw_l1_anchor_weight=raw_l1_weight,
-                        raw_ssim_anchor_weight=existing_ssim,
-                        precision_floor=float(precision_floor),
-                        **loss_kwargs,
-                    )
-                    if bool(getattr(self, "iforward_uncertainty_v2", False)):
-                        stat_i["loss_warmup_progress"] = float(weight_schedule["warmup_progress"])
-                        stat_i["mean_weighting_role_enabled"] = float(mean_weighting_enabled)
-                    variance_floor = float(
-                        self._cfg_get(self.iforward_uncertainty_raster_cfg, "variance_floor", 1.0e-4)
-                    )
-                    variance_max = float(
-                        self._cfg_get(self.iforward_uncertainty_raster_cfg, "variance_max", 0.25)
-                    )
-                    stat_i.update(
-                        masked_uncertainty_variance_stats(
-                            within_variance=bundle.within_variance,
-                            background_variance=bundle.background_variance,
-                            disagreement_variance=bundle.disagreement_variance,
-                            total_variance=bundle.total_variance,
-                            loss_variance=bundle.loss_variance,
-                            mask=mask,
-                            variance_floor=variance_floor,
-                            variance_max=variance_max,
-                        )
-                    )
-                    stat_i["pixel_variance_mean"] = stat_i["pixel_total_variance_mean"]
-                    stat_i["pixel_aleatoric_mean"] = (
-                        stat_i["pixel_within_mean"] + stat_i["pixel_background_mean"]
-                    )
-                    logvar_valid = torch.ones_like(bundle.loss_logvar, dtype=torch.bool)
-                    if mask is not None:
-                        mask2 = mask.squeeze(-1) if mask.dim() == 3 and int(mask.shape[-1]) == 1 else mask
-                        logvar_valid = mask2.to(device=bundle.loss_logvar.device) > 0.5
-                    logvar_values = bundle.loss_logvar.detach().float()[logvar_valid].reshape(-1)
-                    if int(logvar_values.numel()) == 0:
-                        logvar_values = bundle.loss_logvar.detach().float().new_zeros((1,))
-                    if int(logvar_values.numel()) > 65536:
-                        stride = max(1, int(logvar_values.numel()) // 65536)
-                        logvar_values = logvar_values[::stride][:65536]
-                    logvar_quantiles = torch.quantile(
-                        logvar_values,
-                        logvar_values.new_tensor([0.10, 0.50, 0.90]),
-                    )
-                    stat_i.update(
-                        {
-                            "pixel_logvar_p10": float(logvar_quantiles[0].item()),
-                            "pixel_logvar_p50": float(logvar_quantiles[1].item()),
-                            "pixel_logvar_p90": float(logvar_quantiles[2].item()),
-                        }
-                    )
-                    if bool(collect_uncertainty_calibration):
-                        if bool(getattr(self, "iforward_uncertainty_v2", False)):
-                            grouped_metrics = grouped_uncertainty_calibration_metrics(
-                                pred,
-                                gt,
-                                {
-                                    "within": bundle.within_variance,
-                                    "disagreement": bundle.disagreement_variance,
-                                    "total": bundle.total_variance,
-                                },
-                                mask=mask,
-                                alpha=bundle.alpha,
-                                dynamic_mask=target.get("dynamic_mask"),
-                                alpha_valid_min=alpha_valid_min,
-                                edge_threshold=float(
-                                    self._cfg_get(
-                                        self.iforward_uncertainty_logging_cfg,
-                                        "edge_sobel_threshold",
-                                        0.05,
-                                    )
-                                ),
-                            )
-                            stat_i.update(grouped_metrics)
-                            for metric_name in (
-                                "error_uncertainty_pearson",
-                                "error_uncertainty_spearman",
-                                "ause",
-                                "risk_coverage_100",
-                                "risk_coverage_80",
-                                "risk_coverage_60",
-                                "risk_coverage_40",
-                                "risk_coverage_20",
-                            ):
-                                source_key = f"calibration/within/{metric_name}"
-                                if source_key in grouped_metrics:
-                                    stat_i[metric_name] = float(grouped_metrics[source_key])
-                        else:
-                            stat_i.update(
-                                uncertainty_calibration_metrics(
-                                    pred,
-                                    gt,
-                                    bundle.variance,
-                                    mask=mask,
-                                    alpha=bundle.alpha,
-                                    alpha_valid_min=alpha_valid_min,
-                                )
-                            )
-                    if uncertainty_images_out is not None:
-                        uncertainty_images_out.append(
-                            UncertaintyImagePack(
-                                image_ref=(int(target.get("frame_idx", -1)), int(target.get("cam_idx", -1))),
-                                role=str(uncertainty_role or ""),
-                                sigma=bundle.loss_variance.sqrt(),
-                                variance=bundle.loss_variance,
-                                aleatoric_variance=bundle.aleatoric_variance,
-                                disagreement_variance=bundle.disagreement_variance,
-                                alpha=bundle.alpha,
-                                within_variance=bundle.within_variance,
-                                background_variance=bundle.background_variance,
-                                total_variance=bundle.total_variance,
-                            ).detached_cpu()
-                        )
-                else:
-                    loss_i, stat_i = masked_rgb_loss(
-                        pred,
-                        gt,
-                        mask=mask,
-                        l1_weight=1.0 if l1_weight is None else float(l1_weight),
-                        ssim_weight=float(getattr(self, "loss_w_ssim", 0.0)) if ssim_weight is None else float(ssim_weight),
-                    )
+                loss_i, stat_i = masked_rgb_loss(
+                    pred,
+                    gt,
+                    mask=mask,
+                    l1_weight=1.0 if l1_weight is None else float(l1_weight),
+                    ssim_weight=float(getattr(self, "loss_w_ssim", 0.0)) if ssim_weight is None else float(ssim_weight),
+                )
                 if pred_rgbs_out is not None:
                     pred_rgbs_out.append(pred.detach().float().clamp(0.0, 1.0).cpu())
                 if gt_images_out is not None:
@@ -6486,26 +5977,14 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                     ssim_vals.append(float(stat_i.get("ssim", 0.0)))
                 valid_ratios.append(float(stat_i.get("valid_ratio", 0.0)))
                 skip_count += float(stat_i.get("skipped_no_valid_pixels", 0.0))
-                for key, value in stat_i.items():
-                    if key in {"psnr", "l1", "ssim", "valid_ratio", "skipped_no_valid_pixels"}:
-                        continue
-                    if isinstance(value, (int, float)) and math.isfinite(float(value)):
-                        uncertainty_stats_values[str(key)].append(float(value))
         if psnr_vals:
             stats["psnr"] = float(sum(psnr_vals) / len(psnr_vals))
             stats["l1"] = float(sum(l1_vals) / len(l1_vals))
             stats["ssim"] = float(sum(ssim_vals) / len(ssim_vals))
-            stats["raw_psnr"] = stats["psnr"]
-            stats["raw_l1"] = stats["l1"]
-            # masked_rgb_loss reports DSSIM under its legacy `ssim` key.
-            stats["raw_ssim"] = 1.0 - stats["ssim"]
         stats["num_metric_refs"] = float(len(psnr_vals))
         stats["metric_valid"] = float(1.0 if psnr_vals else 0.0)
         stats["valid_ratio"] = float(sum(valid_ratios) / max(len(valid_ratios), 1))
         stats["skipped_no_valid_pixels"] = float(skip_count)
-        for key, values in uncertainty_stats_values.items():
-            if values:
-                stats[str(key)] = float(sum(values) / len(values))
         per_ref = torch.stack(losses)
         if bool(return_per_ref_loss):
             return per_ref.mean(), stats, per_ref
@@ -6543,7 +6022,6 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             sh_dc=branch.sh_dc.detach().clone(),
             sh_rest=branch.sh_rest.detach().clone(),
             hidden=branch.hidden.detach().clone(),
-            appearance_logvar=branch.appearance_logvar.detach().clone().float(),
         )
 
     def _detach_local_state(self, local_state: LocalGSState) -> LocalGSState:
@@ -6593,11 +6071,6 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             distant=node_state_distant,
             rigid=node_state_rigid,
             hidden_dim=self.stage6_hidden_dim,
-            **(
-                {"uncertainty_state_cfg": self.iforward_uncertainty_state_cfg}
-                if hasattr(self, "iforward_uncertainty_state_cfg")
-                else {}
-            ),
         )
         local_state = self._phase_b_freeze_distant_branch(local_state)
         vsm_state = self.stage6_vsm.init_state(
@@ -6986,11 +6459,6 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             distant=node_state_distant,
             rigid=node_state_rigid,
             hidden_dim=self.stage6_hidden_dim,
-            **(
-                {"uncertainty_state_cfg": self.iforward_uncertainty_state_cfg}
-                if hasattr(self, "iforward_uncertainty_state_cfg")
-                else {}
-            ),
         )
         self._mem_debug("forward/after_local_state_clone")
         total_loss = local_state.bg.means.new_tensor(0.0)
@@ -7110,11 +6578,6 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             distant=node_state_distant,
             rigid=node_state_rigid,
             hidden_dim=self.stage6_hidden_dim,
-            **(
-                {"uncertainty_state_cfg": self.iforward_uncertainty_state_cfg}
-                if hasattr(self, "iforward_uncertainty_state_cfg")
-                else {}
-            ),
         )
         base_state = self._detach_local_state(local_base)
         cached = self.stage6_phase_b_tbptt_cache.get(tuple(key)) if self.stage6_phase_b_tbptt_enable else None
@@ -7699,11 +7162,6 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             distant=node_state_distant,
             rigid=node_state_rigid,
             hidden_dim=self.stage6_hidden_dim,
-            **(
-                {"uncertainty_state_cfg": self.iforward_uncertainty_state_cfg}
-                if hasattr(self, "iforward_uncertainty_state_cfg")
-                else {}
-            ),
         )
         base_state = self._detach_local_state(local_base)
         offset_dtype = self._phase_b_long_state_dtype(
@@ -8703,11 +8161,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         if not updater_sd:
             raise ValueError("Stage6_0 Phase B export payload missing posterior_updater_base.")
         missing, unexpected = self.stage6_posterior_updater.load_state_dict(updater_sd, strict=False)
-        bad_missing = [
-            k
-            for k in missing
-            if not str(k).startswith(("vsm_ctx_adapter.", "head_appearance_logvar_delta."))
-        ]
+        bad_missing = [k for k in missing if not str(k).startswith("vsm_ctx_adapter.")]
         bad_unexpected = [k for k in unexpected if not str(k).startswith("vsm_ctx_adapter.")]
         if bad_missing or bad_unexpected:
             raise ValueError(
@@ -8754,16 +8208,10 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "stage6_long_vsm.",
             "stage6_long_offset_decoder.",
             "stage6_posterior_updater.vsm_ctx_adapter.",
-            "stage6_posterior_updater.head_appearance_logvar_delta.",
-            "stage6_posterior_updater.head_appearance_logvar_target.",
         )
         allowed_unexpected_prefixes = (
             "stage6_posterior_updater.vsm_ctx_adapter.",
         )
-        if bool(getattr(self, "iforward_uncertainty_v2", False)):
-            allowed_unexpected_prefixes = allowed_unexpected_prefixes + (
-                "stage6_posterior_updater.head_appearance_logvar_delta.",
-            )
         if bool(self._cfg_get(self._cfg_get(self.config, "model", {}) or {}, "allow_missing_legacy_sparse_conv", False)):
             allowed_unexpected_prefixes = allowed_unexpected_prefixes + ("sparse_conv.",)
         bad_missing = [k for k in missing if not str(k).startswith(allowed_missing_prefixes)]
@@ -8778,16 +8226,6 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
     def build_light_checkpoint_extra(self, *, step: int) -> Dict[str, Any]:
         optimizer_cfg = self._cfg_get(self.config, "optimizer", {}) or {}
         lr_scheduler_cfg = self._cfg_get(self.config, "lr_scheduler", {}) or {}
-        iforward_cfg = self._cfg_get(self._cfg_get(self.config, "model", {}) or {}, "iforward", {}) or {}
-        uncertainty_cfg = self._cfg_get(iforward_cfg, "uncertainty", {}) or {}
-        uncertainty_loss_cfg = self._cfg_get(uncertainty_cfg, "loss", {}) or {}
-        uncertainty_warmup_cfg = self._cfg_get(uncertainty_loss_cfg, "warmup", {}) or {}
-        mean_weighting_cfg = self._cfg_get(
-            uncertainty_loss_cfg,
-            "mean_weighting_by_role",
-            {},
-        ) or {}
-        schema_versions = uncertainty_schema_versions(self._cfg_get(iforward_cfg, "version", ""))
         return {
             "format": "streetforward_stage6_0_ckpt_v2",
             "resume_semantics": "resume_model_optimizer_runtime_when_available",
@@ -8797,26 +8235,6 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "model_stage": "6_0",
             "phase": str(getattr(self, "stage6_phase", "phase_A_block_local_unroll")),
             "global_step": int(step),
-            "local_gs_state_schema_version": 2,
-            **schema_versions,
-            "uncertainty_precision_version": (
-                "per_reference_relative_clamped_v1"
-                if bool(
-                    self._cfg_get(
-                        uncertainty_loss_cfg,
-                        "normalize_precision_per_reference",
-                        False,
-                    )
-                )
-                else "absolute_precision_legacy"
-            ),
-            "uncertainty_mean_weighting_roles": {
-                role: bool(self._cfg_get(mean_weighting_cfg, role, True))
-                for role in ("current", "history", "repair")
-            },
-            "uncertainty_calibration_only_until_step": int(
-                self._cfg_get(uncertainty_warmup_cfg, "freeze_main_model_until_step", 0)
-            ),
             "optimizer_signature": self._stage6_optimizer_signature(),
             "optimizer_cfg": _to_plain_dict(optimizer_cfg),
             "lr_scheduler_cfg": _to_plain_dict(lr_scheduler_cfg),

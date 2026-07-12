@@ -14,39 +14,11 @@ from models.streetforward.node_states import (
     NodeStateRigid,
     NodeStateDistant,
 )
-from models.streetforward.stage6_0.local_gs_state import _uncertainty_state_values
 
 logger = logging.getLogger(__name__)
 
 
 class CheckpointMixin:
-    def _appearance_logvar_from_state_dict(
-        self,
-        state_dict: Dict,
-        *,
-        branch_name: str,
-        ref: torch.Tensor,
-    ) -> torch.Tensor:
-        value = state_dict.get("appearance_logvar")
-        if torch.is_tensor(value):
-            out = value.to(device=self.device, dtype=torch.float32)
-            if tuple(out.shape) != (int(ref.shape[0]), 1):
-                raise ValueError(
-                    f"Checkpoint {branch_name}.appearance_logvar shape mismatch: "
-                    f"got {tuple(out.shape)}, expected {(int(ref.shape[0]), 1)}"
-                )
-            return out
-        prior_logvar, _, _, _ = _uncertainty_state_values(
-            getattr(self, "iforward_uncertainty_state_cfg", None),
-            str(branch_name),
-        )
-        return torch.full(
-            (int(ref.shape[0]), 1),
-            float(prior_logvar),
-            device=self.device,
-            dtype=torch.float32,
-        )
-
     def _node_state_to_dict(self, node_state: NodeState) -> Dict[str, torch.Tensor]:
         """
         将 NodeState 转换为字典（用于保存检查点）。
@@ -57,7 +29,7 @@ class CheckpointMixin:
         Returns:
             状态字典，所有张量都已分离并移到 CPU
         """
-        out = {
+        return {
             "means": node_state.means.detach().cpu(),
             "scales_log": node_state.scales_log.detach().cpu(),
             "quats": node_state.quats.detach().cpu(),
@@ -65,10 +37,6 @@ class CheckpointMixin:
             "sh_dc": node_state.sh_dc.detach().cpu(),
             "sh_rest": node_state.sh_rest.detach().cpu(),
         }
-        appearance = getattr(node_state, "appearance_logvar", None)
-        if torch.is_tensor(appearance):
-            out["appearance_logvar"] = appearance.detach().float().cpu()
-        return out
 
     def _node_state_from_dict(self, state_dict: Dict[str, torch.Tensor]) -> NodeState:
         """
@@ -80,38 +48,26 @@ class CheckpointMixin:
         Returns:
             恢复的 NodeState，所有张量都已移到设备并分离
         """
-        means = state_dict["means"].to(self.device)
         return NodeState(
-            means=means,
+            means=state_dict["means"].to(self.device),
             scales_log=state_dict["scales_log"].to(self.device),
             quats=state_dict["quats"].to(self.device),
             opacity_logit=state_dict["opacity_logit"].to(self.device),
             sh_dc=state_dict["sh_dc"].to(self.device),
             sh_rest=state_dict["sh_rest"].to(self.device),
-            appearance_logvar=self._appearance_logvar_from_state_dict(
-                state_dict,
-                branch_name="bg",
-                ref=means,
-            ),
         ).detach_clone()
 
     def _node_state_distant_from_dict(self, state_dict: Dict[str, torch.Tensor]) -> NodeStateDistant:
         """
         从字典恢复 NodeStateDistant（用于加载检查点）。
         """
-        means = state_dict["means"].to(self.device)
         return NodeStateDistant(
-            means=means,
+            means=state_dict["means"].to(self.device),
             scales_log=state_dict["scales_log"].to(self.device),
             quats=state_dict["quats"].to(self.device),
             opacity_logit=state_dict["opacity_logit"].to(self.device),
             sh_dc=state_dict["sh_dc"].to(self.device),
             sh_rest=state_dict["sh_rest"].to(self.device),
-            appearance_logvar=self._appearance_logvar_from_state_dict(
-                state_dict,
-                branch_name="distant",
-                ref=means,
-            ),
         ).detach_clone()
 
     def _node_state_rigid_to_dict(self, node_state: NodeStateRigid) -> Dict:
@@ -124,7 +80,7 @@ class CheckpointMixin:
         Returns:
             状态字典，所有张量都已分离并移到 CPU
         """
-        out = {
+        return {
             "means": node_state.means.detach().cpu(),
             "scales_log": node_state.scales_log.detach().cpu(),
             "quats": node_state.quats.detach().cpu(),
@@ -139,10 +95,6 @@ class CheckpointMixin:
             "frame_ids": list(node_state.frame_ids),
             "cur_frame": int(node_state.cur_frame),
         }
-        appearance = getattr(node_state, "appearance_logvar", None)
-        if torch.is_tensor(appearance):
-            out["appearance_logvar"] = appearance.detach().float().cpu()
-        return out
 
     def _node_state_rigid_from_dict(self, state_dict: Dict) -> NodeStateRigid:
         """
@@ -160,9 +112,8 @@ class CheckpointMixin:
             instance_ids = list(range(num_instances))
         elif isinstance(instance_ids, torch.Tensor):
             instance_ids = instance_ids.tolist()
-        means = state_dict["means"].to(self.device)
         return NodeStateRigid(
-            means=means,
+            means=state_dict["means"].to(self.device),
             scales_log=state_dict["scales_log"].to(self.device),
             quats=state_dict["quats"].to(self.device),
             opacity_logit=state_dict["opacity_logit"].to(self.device),
@@ -175,11 +126,6 @@ class CheckpointMixin:
             instance_ids=list(instance_ids),
             frame_ids=list(state_dict.get("frame_ids", [])),
             cur_frame=int(state_dict.get("cur_frame", 0)),
-            appearance_logvar=self._appearance_logvar_from_state_dict(
-                state_dict,
-                branch_name="rigid",
-                ref=means,
-            ),
         ).detach_clone()
 
     def save_checkpoint(

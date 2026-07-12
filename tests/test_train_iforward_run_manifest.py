@@ -65,9 +65,6 @@ def test_iforward_run_start_hook_writes_manifest_snapshot_and_first_row(tmp_path
     assert rows[0]["child_gather_type"] == "support_center"
     assert rows[0]["resume_checkpoint"] == "/tmp/resume.pt"
     assert rows[0]["init_checkpoint"] == "/tmp/init.pt"
-    assert rows[0]["local_gs_state_schema_version"] == 2
-    assert rows[0]["uncertainty_state_version"] == "appearance_logvar_v1"
-    assert rows[0]["uncertainty_raster_version"] == "detached_moments_v1"
 
     manifest_path = tmp_path / "run_manifest.json"
     snapshot_path = tmp_path / "config_snapshot.yaml"
@@ -98,41 +95,3 @@ def test_iforward_run_manifest_prefers_enabled_validation_v4(tmp_path, monkeypat
 
     assert rows[0]["validation_key"] == "iforward_validation_v4"
     assert rows[0]["validation_enable"] is True
-
-
-def test_iforward_v2_manifest_records_semantic_schema_versions(tmp_path, monkeypatch):
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text("output_name: manifest-v2\n", encoding="utf-8")
-    cfg = _cfg(tmp_path)
-    cfg.model.iforward.version = "stage3_3_uncertainty_v2"
-    cfg.model.iforward.uncertainty = {
-        "enable": True,
-        "loss": {
-            "normalize_precision_per_reference": True,
-            "mean_weighting_by_role": {
-                "current": False,
-                "history": True,
-                "repair": True,
-            },
-            "warmup": {"freeze_main_model_until_step": 2000},
-        },
-    }
-    rows = []
-    monkeypatch.setattr(train_ifwd.base, "_write_metrics_history", lambda fh, row: fh.append(dict(row)))
-    train_ifwd._iforward_run_start_hook(
-        cfg=cfg,
-        args=SimpleNamespace(config_file=str(config_path)),
-        metrics_fh=rows,
-        resume_checkpoint="",
-        init_checkpoint="",
-        checkpoint_prefix="iforward_stage3_3",
-    )
-    assert rows[0]["uncertainty_state_version"] == "appearance_logvar_v1"
-    assert rows[0]["uncertainty_updater_version"] == "state_conditioned_target_v2"
-    assert rows[0]["uncertainty_raster_version"] == "detached_moments_aleatoric_loss_v2"
-    assert rows[0]["uncertainty_loss_version"] == "decoupled_warmup_v2"
-    assert rows[0]["uncertainty_precision_version"] == "per_reference_relative_clamped_v1"
-    assert rows[0]["uncertainty_mean_weighting_current"] is False
-    assert rows[0]["uncertainty_mean_weighting_history"] is True
-    assert rows[0]["uncertainty_mean_weighting_repair"] is True
-    assert rows[0]["uncertainty_calibration_only_until_step"] == 2000

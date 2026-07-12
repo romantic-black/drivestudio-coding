@@ -327,7 +327,6 @@ def detach_local_branch(branch: Optional[LocalBranchState]) -> Optional[LocalBra
         sh_dc=branch.sh_dc.detach().clone(),
         sh_rest=branch.sh_rest.detach().clone(),
         hidden=branch.hidden.detach().clone(),
-        appearance_logvar=branch.appearance_logvar.detach().clone().float(),
     )
 
 

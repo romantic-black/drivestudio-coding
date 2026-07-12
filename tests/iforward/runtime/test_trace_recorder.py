@@ -9,7 +9,6 @@ from models.iforward.biggs_state import BigGSBranchAssignment
 from models.iforward.runtime.event import ControlEvent, EpisodeSpec
 from models.iforward.runtime.plan import EpisodePlan
 from models.iforward.runtime.trace import TraceRecorder
-from models.iforward.uncertainty_renderer import UncertaintyImagePack
 
 
 def test_trace_recorder_writes_plan_trace_and_summary(tmp_path):
@@ -104,58 +103,3 @@ def test_trace_recorder_writes_parent_diagnostics_artifacts(tmp_path):
     assert row["artifacts"]["parent_topk_csv"].startswith("parent_diagnostics/")
     assert row["metadata"]["parent_diagnostics"]["num_rows"] == 2
     assert (tmp_path / "parent_diagnostics_summary.csv").is_file()
-
-
-def test_trace_recorder_writes_uncertainty_artifacts_and_paired_deltas(tmp_path):
-    plan = EpisodePlan(
-        plan_id="",
-        version="iforward_episode_plan_v1",
-        episode=EpisodeSpec(
-            scene_id=1,
-            segment_id=2,
-            sequence_id=3,
-            frame_ids=(10,),
-            frame_positions=(0,),
-            cam_ids=(0,),
-            protocol_name="unit",
-        ),
-        events=(ControlEvent(event_id="update", kind="reset_state"),),
-    ).with_stable_plan_id()
-    image_ref = (10, 0)
-
-    def output(pred_value: float):
-        pred = torch.full((4, 4, 3), float(pred_value))
-        variance = torch.full((4, 4), 0.04)
-        return SimpleNamespace(
-            resolved=SimpleNamespace(meta={"scheduler_phase": "repair"}),
-            stats={},
-            losses={},
-            loss=torch.tensor(0.0),
-            pred_rgbs=[pred],
-            gt_images=[torch.zeros_like(pred)],
-            image_refs=[image_ref],
-            image_roles=["current_latest"],
-            uncertainty_images=[
-                UncertaintyImagePack(
-                    image_ref=image_ref,
-                    role="repair",
-                    sigma=variance.sqrt(),
-                    variance=variance,
-                    aleatoric_variance=variance,
-                    disagreement_variance=torch.zeros_like(variance),
-                    alpha=torch.ones_like(variance),
-                )
-            ],
-            next_state=None,
-        )
-
-    recorder = TraceRecorder(tmp_path, record_images=True, record_parent_diagnostics=False)
-    trace = recorder.begin_plan(plan)
-    first = recorder.record_update(plan.events[0], output(0.20), None, event_idx=0, memory_mode="full")
-    second = recorder.record_update(plan.events[0], output(0.10), None, event_idx=1, memory_mode="full")
-    recorder.end_plan(trace)
-
-    assert (tmp_path / first.artifacts["uncertainty_grid_0"]).is_file()
-    assert (tmp_path / first.artifacts["confidence_bins_0"]).is_file()
-    assert (tmp_path / second.artifacts["before_after_grid_0"]).is_file()
-    assert second.metrics["uncertainty/paired_0/error_after"] < second.metrics["uncertainty/paired_0/error_before"]

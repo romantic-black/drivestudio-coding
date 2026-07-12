@@ -69,10 +69,7 @@ from models.iforward.runtime.adapter_stage3 import Stage3SchedulerAdapter
 from models.iforward.runtime.runner import IForwardRunner, RunnerOptions
 from models.iforward.runtime.trace import TraceRecorder
 from models.iforward.validation_v4.html_exporter import export_html_report
-from models.iforward.versions import (
-    is_stage3_optimizer_memory_iforward_version,
-    uncertainty_schema_versions,
-)
+from models.iforward.versions import is_stage3_optimizer_memory_iforward_version
 from tools.train_minimal_streetforward_stage4_3_iforward_common import (
     build_multi_scene_dataset_v4,
     build_train_scheduler_iforward_from_cfg,
@@ -237,40 +234,6 @@ def _build_iforward_run_manifest(**kwargs: Any) -> Tuple[Dict[str, Any], str]:
     manifest.update(_active_scheduler_manifest_fields(cfg))
     manifest.update(_active_validation_manifest_fields(cfg))
     manifest.update(_iforward_lifting_manifest_fields(cfg))
-    iforward_cfg = _cfg_get(_cfg_get(cfg, "model", {}) or {}, "iforward", {}) or {}
-    uncertainty_cfg = _cfg_get(iforward_cfg, "uncertainty", {}) or {}
-    uncertainty_loss_cfg = _cfg_get(uncertainty_cfg, "loss", {}) or {}
-    uncertainty_warmup_cfg = _cfg_get(uncertainty_loss_cfg, "warmup", {}) or {}
-    mean_weighting_cfg = _cfg_get(uncertainty_loss_cfg, "mean_weighting_by_role", {}) or {}
-    manifest.update({"local_gs_state_schema_version": 2})
-    manifest.update(uncertainty_schema_versions(_cfg_get(iforward_cfg, "version", "")))
-    manifest.update(
-        {
-            "uncertainty_precision_version": (
-                "per_reference_relative_clamped_v1"
-                if bool(
-                    _cfg_get(
-                        uncertainty_loss_cfg,
-                        "normalize_precision_per_reference",
-                        False,
-                    )
-                )
-                else "absolute_precision_legacy"
-            ),
-            "uncertainty_mean_weighting_current": bool(
-                _cfg_get(mean_weighting_cfg, "current", True)
-            ),
-            "uncertainty_mean_weighting_history": bool(
-                _cfg_get(mean_weighting_cfg, "history", True)
-            ),
-            "uncertainty_mean_weighting_repair": bool(
-                _cfg_get(mean_weighting_cfg, "repair", True)
-            ),
-            "uncertainty_calibration_only_until_step": int(
-                _cfg_get(uncertainty_warmup_cfg, "freeze_main_model_until_step", 0)
-            ),
-        }
-    )
     return manifest, snapshot_yaml
 
 

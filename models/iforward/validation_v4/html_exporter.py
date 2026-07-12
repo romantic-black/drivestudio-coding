@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any, Iterable
 
-from .metrics import summarize_event_traces, summarize_legacy_rows
+from .metrics import summarize_legacy_rows
 
 
 def export_html_report(trace: Any, output_dir: str | Path, *, title: str = "IForward Validation v4") -> str:
@@ -38,7 +38,7 @@ def export_html_report(trace: Any, output_dir: str | Path, *, title: str = "IFor
                 }
             )
         rows.append(row)
-    summary = summarize_event_traces(list(getattr(trace, "events", []) or []))
+    summary = summarize_legacy_rows(rows)
     _write_json(output / "html_summary.json", summary)
     html_text = _render_html(
         title=title,
@@ -93,20 +93,11 @@ def _render_html(*, title: str, summary: dict[str, Any], rows: list[dict[str, An
         "<section><h2>Metrics Table</h2>",
         _table(protocols),
         "</section>",
-        "<section><h2>Uncertainty Calibration</h2>",
-        _table(list(summary.get("uncertainty_calibration", []) or [])),
-        "</section>",
-        "<section><h2>Uncertainty State by Branch</h2>",
-        _table(list(summary.get("uncertainty_state", []) or [])),
-        "</section>",
         "<section><h2>Raw Trace</h2>",
         _table(rows[:200]),
         "</section>",
         "<section><h2>Parent Diagnostics</h2>",
         _parent_artifact_table(rows),
-        "</section>",
-        "<section><h2>Uncertainty Diagnostics</h2>",
-        _uncertainty_artifact_table(rows),
         "</section>",
         "</body></html>",
     ]
@@ -209,55 +200,6 @@ def _parent_artifact_table(rows: list[dict[str, Any]]) -> str:
             f"<td>{float(row['max_delta_norm_rms']):.6f}</td>"
             f"<td><a href='{html.escape(str(row['parent_topk_csv']))}'>csv</a></td>"
             f"<td><a href='{html.escape(str(row['parent_summary_json']))}'>json</a></td>"
-            "</tr>"
-        )
-    lines.append("</tbody></table>")
-    return "\n".join(lines)
-
-
-def _uncertainty_artifact_table(rows: list[dict[str, Any]]) -> str:
-    compact = []
-    for row in rows:
-        artifacts = dict(row.get("artifacts", {}) or {})
-        for idx in range(2):
-            grid = artifacts.get(f"uncertainty_grid_{idx}", "")
-            if not grid:
-                continue
-            compact.append(
-                {
-                    "event_id": row.get("event_id", ""),
-                    "protocol": row.get("protocol", ""),
-                    "view": idx,
-                    "grid": grid,
-                    "before_after": artifacts.get(f"before_after_grid_{idx}", ""),
-                    "confidence_bins": artifacts.get(f"confidence_bins_{idx}", ""),
-                }
-            )
-    if not compact:
-        return "<p>No uncertainty diagnostics were recorded.</p>"
-    lines = [
-        "<table><thead><tr><th>event</th><th>protocol</th><th>view</th>"
-        "<th>GT / RGB / error / sigma / aleatoric / disagreement / alpha</th>"
-        "<th>before/after deltas</th><th>confidence bins</th></tr></thead><tbody>"
-    ]
-    for row in compact[:200]:
-        before_after = (
-            f"<a href='{html.escape(str(row['before_after']))}'>image</a>"
-            if row["before_after"]
-            else ""
-        )
-        bins = (
-            f"<a href='{html.escape(str(row['confidence_bins']))}'>csv</a>"
-            if row["confidence_bins"]
-            else ""
-        )
-        lines.append(
-            "<tr>"
-            f"<td>{html.escape(str(row['event_id']))}</td>"
-            f"<td>{html.escape(str(row['protocol']))}</td>"
-            f"<td>{int(row['view'])}</td>"
-            f"<td><a href='{html.escape(str(row['grid']))}'><img src='{html.escape(str(row['grid']))}'></a></td>"
-            f"<td>{before_after}</td><td>{bins}</td>"
             "</tr>"
         )
     lines.append("</tbody></table>")

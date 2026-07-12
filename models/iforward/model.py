@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import time
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -84,12 +84,7 @@ from .sequence10_history_bank import Sequence10HistoryBank, sequence10_damage_hi
 from .sequence10_resolver import IForwardSequence10Resolver
 from .state import IForwardMemoryState, IForwardShortWindowHistory, IForwardState
 from .utils import cfg_ensure_child, cfg_get, cfg_set, clone_config
-from .versions import (
-    is_stage3_3_uncertainty_v2_version,
-    is_stage3_lowrank_gdkv_iforward_version,
-    is_stage3_optimizer_memory_iforward_version,
-)
-from .uncertainty_renderer import UncertaintyImagePack
+from .versions import is_stage3_1_iforward_version, is_stage3_optimizer_memory_iforward_version
 
 
 def _cfg_set_missing(node: Any, key: str, value: Any) -> None:
@@ -118,7 +113,6 @@ class IForwardRolloutOutput:
     gt_images: List[torch.Tensor]
     image_refs: List[Tuple[int, int]]
     image_roles: List[str]
-    uncertainty_images: List[UncertaintyImagePack] = field(default_factory=list)
 
     def to_legacy_dict(self) -> Dict[str, Any]:
         return {
@@ -135,7 +129,6 @@ class IForwardRolloutOutput:
             "image_roles": list(self.image_roles),
             "num_targets": len(self.resolved.target_refs),
             "num_source_views": len(self.resolved.source_refs),
-            "_iforward_uncertainty_images": list(self.uncertainty_images),
         }
 
 
@@ -554,8 +547,7 @@ class IForwardModel(nn.Module):
         event_dim = int(getattr(self.bridge, "event_dim", 48))
         iforward_cfg = cfg_get(cfg_get(config, "model", {}) or {}, "iforward", {}) or {}
         self.iforward_version = str(cfg_get(iforward_cfg, "version", "v1"))
-        self.is_stage3_3_uncertainty_v2 = is_stage3_3_uncertainty_v2_version(self.iforward_version)
-        self.is_stage3_1_lowrank_gdkv = is_stage3_lowrank_gdkv_iforward_version(self.iforward_version)
+        self.is_stage3_1_lowrank_gdkv = is_stage3_1_iforward_version(self.iforward_version)
         self.is_stage3_0_full_sparse_gather_lift = is_stage3_optimizer_memory_iforward_version(self.iforward_version)
         self.is_v3_gru_history_gate = self.iforward_version == "v3_gru_history_gate"
         self.is_v6_point_mamba_xcpe = self.iforward_version == "v6_point_mamba_xcpe"
@@ -982,8 +974,6 @@ class IForwardModel(nn.Module):
         self.loss_history_damage_warmup_start_step = int(cfg_get(history_damage_warmup_cfg, "start_step", 10000))
         self.loss_history_damage_warmup_steps = int(cfg_get(history_damage_warmup_cfg, "steps", 15000))
         self.loss_delta_reg_weight = float(cfg_get(cfg_get(loss_cfg, "delta_regularization", {}) or {}, "weight", 1.0))
-        self.uncertainty_cfg = cfg_get(iforward_cfg, "uncertainty", {}) or {}
-        self.uncertainty_logging_cfg = cfg_get(self.uncertainty_cfg, "logging", {}) or {}
         stage3_lifting_cfg = cfg_get(iforward_cfg, "lifting", {}) or {}
         stage3_reg_cfg = cfg_get(stage3_lifting_cfg, "regularization", {}) or {}
         self.stage3_offset_l2_weight = float(cfg_get(stage3_reg_cfg, "offset_l2", 0.0))
@@ -1104,35 +1094,13 @@ class IForwardModel(nn.Module):
                 text = str(name)
                 return ".alpha_proj." in text or ".cleanup_key_proj." in text or ".cleanup_proj." in text
 
-            def _new_uncertainty_param(name: str) -> bool:
-                text = str(name)
-                return (
-                    "head_appearance_logvar_delta." in text
-                    or "head_appearance_logvar_target." in text
-                )
-
             def _legacy_sparse_conv(name: str) -> bool:
                 return str(name).startswith("phase_a_runtime.sparse_conv.") or str(name).startswith(
                     "model.phase_a_runtime.sparse_conv."
                 )
 
-            bad_missing = [
-                str(k)
-                for k in missing
-                if not (_skip_allowed(str(k)) or _new_gdkv_param(str(k)) or _new_uncertainty_param(str(k)))
-            ]
-            def _legacy_uncertainty_param(name: str) -> bool:
-                return bool(self.is_stage3_3_uncertainty_v2) and "head_appearance_logvar_delta." in str(name)
-
-            bad_unexpected = [
-                str(k)
-                for k in unexpected
-                if not (
-                    _skip_allowed(str(k))
-                    or _legacy_sparse_conv(str(k))
-                    or _legacy_uncertainty_param(str(k))
-                )
-            ]
+            bad_missing = [str(k) for k in missing if not (_skip_allowed(str(k)) or _new_gdkv_param(str(k)))]
+            bad_unexpected = [str(k) for k in unexpected if not (_skip_allowed(str(k)) or _legacy_sparse_conv(str(k)))]
             if bad_missing or bad_unexpected:
                 raise ValueError(
                     "IForward init_checkpoint skip_keys load failed: "
@@ -1522,32 +1490,11 @@ class IForwardModel(nn.Module):
         List[Tuple[int, int]],
         List[str],
         IForwardFinalRenderPack,
-        List[UncertaintyImagePack],
     ]:
         pred_rgbs: List[torch.Tensor] = []
         gt_images: List[torch.Tensor] = []
         image_refs: List[Tuple[int, int]] = []
         image_roles: List[str] = []
-        uncertainty_images: List[UncertaintyImagePack] = []
-        global_step = int(batch.get("global_step", 0) or 0)
-        resolved_meta = dict(getattr(resolved, "meta", {}) or {})
-        validation_render = bool(resolved_meta.get("validation_force_history_render", False))
-        calibration_interval = int(cfg_get(self.uncertainty_logging_cfg, "calibration_interval", 1000))
-        image_interval = int(cfg_get(self.uncertainty_logging_cfg, "image_interval", 5000))
-        collect_calibration = bool(
-            validation_render
-            or calibration_interval > 0
-            and int(global_step) % int(calibration_interval) == 0
-        )
-        collect_images = bool(
-            validation_render
-            or image_interval > 0
-            and int(global_step) % int(image_interval) == 0
-        )
-        repair_phase = str(resolved_meta.get("scheduler_phase", "")) == "repair"
-        current_uncertainty_role = "repair" if repair_phase else "current"
-        history_uncertainty_role = "repair" if repair_phase else "history"
-        uncertainty_enabled = bool(cfg_get(self.uncertainty_cfg, "enable", False))
         zero_ref = local_state.bg.means
         current_indices = list(resolved.current_latest_target_indices)
         before = len(pred_rgbs)
@@ -1559,15 +1506,6 @@ class IForwardModel(nn.Module):
             pred_rgbs_out=pred_rgbs,
             gt_images_out=gt_images,
             return_per_ref_loss=True,
-            **(
-                {
-                    "uncertainty_role": current_uncertainty_role,
-                    "uncertainty_images_out": uncertainty_images if collect_images else None,
-                    "collect_uncertainty_calibration": collect_calibration,
-                }
-                if uncertainty_enabled
-                else {}
-            ),
         )
         current_role = IForwardFinalRenderRole(
             target_indices=tuple(int(x) for x in current_indices),
@@ -1590,15 +1528,6 @@ class IForwardModel(nn.Module):
                 pred_rgbs_out=pred_rgbs,
                 gt_images_out=gt_images,
                 return_per_ref_loss=True,
-                **(
-                    {
-                        "uncertainty_role": history_uncertainty_role,
-                        "uncertainty_images_out": uncertainty_images if collect_images else None,
-                        "collect_uncertainty_calibration": collect_calibration,
-                    }
-                    if uncertainty_enabled
-                    else {}
-                ),
             )
             appended = len(pred_rgbs) - before
             image_refs.extend([tuple(int(x) for x in resolved.target_refs[int(i)]) for i in history_indices[:appended]])
@@ -1672,18 +1601,7 @@ class IForwardModel(nn.Module):
             image_refs.extend([tuple(int(x) for x in resolved.target_refs[int(i)]) for i in eval_indices[:appended]])
             image_roles.extend([eval_role] * int(appended))
             safe_prefix = str(eval_role).replace("/", "_")
-            for metric in (
-                "psnr",
-                "ssim",
-                "l1",
-                "raw_psnr",
-                "raw_ssim",
-                "raw_l1",
-                "valid_ratio",
-                "num_refs",
-                "num_metric_refs",
-                "metric_valid",
-            ):
+            for metric in ("psnr", "ssim", "l1", "valid_ratio", "num_refs", "num_metric_refs", "metric_valid"):
                 value = eval_stats.get(metric)
                 if value is not None and math.isfinite(float(value)):
                     eval_role_stats[f"{safe_prefix}_{metric}"] = float(value)
@@ -1722,7 +1640,7 @@ class IForwardModel(nn.Module):
             ("history_rollout", in_rollout_stats),
             ("short_window_history", short_history_stats),
         ):
-            for metric in ("psnr", "ssim", "l1", "raw_psnr", "raw_ssim", "raw_l1"):
+            for metric in ("psnr", "ssim", "l1"):
                 value = item.get(metric)
                 if value is not None and math.isfinite(float(value)):
                     stats[f"{prefix}_{metric}"] = float(value)
@@ -1736,13 +1654,7 @@ class IForwardModel(nn.Module):
             history=history_role,
             nearby=nearby_role,
         )
-        for prefix, item in (("current", current_stats), ("in_rollout_history", in_rollout_stats)):
-            for key, value in item.items():
-                if key in {"psnr", "ssim", "l1", "valid_ratio", "num_refs", "num_metric_refs", "metric_valid"}:
-                    continue
-                if isinstance(value, (int, float)) and math.isfinite(float(value)):
-                    stats[f"{prefix}/{key}"] = float(value)
-        return losses, stats, pred_rgbs, gt_images, image_refs, image_roles, render_pack, uncertainty_images
+        return losses, stats, pred_rgbs, gt_images, image_refs, image_roles, render_pack
 
     def _build_v6_context(
         self,
@@ -2945,7 +2857,6 @@ class IForwardModel(nn.Module):
                     image_refs,
                     image_roles,
                     final_render_pack,
-                    uncertainty_images,
                 ) = self._render_final_losses(
                     local_state=local_state,
                     batch=batch,
@@ -3535,32 +3446,6 @@ class IForwardModel(nn.Module):
         }
         if self.is_v3_gru_history_gate and history_ema is not None:
             stats.update(history_ema.stats())
-        uncertainty_state_cfg = cfg_get(self.uncertainty_cfg, "state", {}) or {}
-        sigma_min = float(cfg_get(uncertainty_state_cfg, "sigma_min", 0.01))
-        sigma_max = float(cfg_get(uncertainty_state_cfg, "sigma_max", 0.50))
-        logvar_min = 2.0 * math.log(sigma_min)
-        logvar_max = 2.0 * math.log(sigma_max)
-        for branch_name in ("bg", "distant", "rigid"):
-            branch = getattr(local_state, branch_name, None)
-            if branch is None or int(branch.appearance_logvar.numel()) == 0:
-                continue
-            values = branch.appearance_logvar.detach().float().reshape(-1)
-            if int(values.numel()) > 65536:
-                stride = max(1, int(values.numel()) // 65536)
-                sample = values[::stride][:65536]
-            else:
-                sample = values
-            sigma = torch.exp(0.5 * sample)
-            quantiles = torch.quantile(sigma, sigma.new_tensor([0.10, 0.50, 0.90]))
-            prefix = f"uncertainty/{branch_name}"
-            stats[f"{prefix}/sigma_mean"] = float(sigma.mean().item())
-            stats[f"{prefix}/sigma_p10"] = float(quantiles[0].item())
-            stats[f"{prefix}/sigma_p50"] = float(quantiles[1].item())
-            stats[f"{prefix}/sigma_p90"] = float(quantiles[2].item())
-            stats[f"{prefix}/logvar_min"] = float(values.min().item())
-            stats[f"{prefix}/logvar_max"] = float(values.max().item())
-            stats[f"{prefix}/clamp_min_ratio"] = float((values <= logvar_min + 1.0e-6).float().mean().item())
-            stats[f"{prefix}/clamp_max_ratio"] = float((values >= logvar_max - 1.0e-6).float().mean().item())
         current_psnr = stats.get("current_psnr")
         history_psnr = stats.get("history_rollout_psnr")
         short_psnr = stats.get("short_window_history_psnr")
@@ -3578,7 +3463,6 @@ class IForwardModel(nn.Module):
                 if isinstance(value, (int, float))
                 and (
                     str(key).startswith("iforward/")
-                    or str(key).startswith("uncertainty/")
                     or str(key).startswith("num_parent_")
                     or str(key) == "src_backproject_pass_count"
                 )
@@ -3681,7 +3565,6 @@ class IForwardModel(nn.Module):
             gt_images=gt_images,
             image_refs=image_refs,
             image_roles=image_roles,
-            uncertainty_images=uncertainty_images,
         )
 
     def forward(self, batch: Dict[str, Any]) -> Dict[str, Any]:

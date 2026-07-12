@@ -1037,7 +1037,6 @@ def _clone_local_bg_branch(
     child_hidden = torch.zeros((k, int(branch.hidden.shape[1])), device=branch.hidden.device, dtype=branch.hidden.dtype)
     if hidden_mode == "parent":
         child_hidden = branch.hidden[parent_idx]
-    child_appearance_logvar = branch.appearance_logvar[parent_idx].to(dtype=torch.float32)
 
     opacity = branch.opacity_logit
     parent_alpha_old = torch.sigmoid(opacity[parent_idx])
@@ -1087,10 +1086,6 @@ def _clone_local_bg_branch(
             sh_dc=torch.cat([branch.sh_dc, child_sh_dc], dim=0),
             sh_rest=torch.cat([branch.sh_rest, child_sh_rest], dim=0),
             hidden=torch.cat([branch.hidden, child_hidden], dim=0),
-            appearance_logvar=torch.cat(
-                [branch.appearance_logvar.float(), child_appearance_logvar],
-                dim=0,
-            ),
         ),
         aux,
     )

@@ -62,10 +62,8 @@ class TraceRecorder:
         self._fh: Optional[Any] = None
         self._trace: Optional[EpisodeTrace] = None
         self._parent_rows: list[dict[str, Any]] = []
-        self._previous_uncertainty_by_ref: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
 
     def begin_plan(self, plan: Any) -> EpisodeTrace:
-        self._previous_uncertainty_by_ref.clear()
         self.artifacts.save_json("plan.json", plan.to_json_dict())
         self._fh = open(self.trace_path, "w", encoding="utf-8")
         episode = plan.episode
@@ -146,10 +144,7 @@ class TraceRecorder:
         resolved = getattr(out, "resolved", None)
         meta = dict(getattr(resolved, "meta", {}) or {}) if resolved is not None else {}
         event_meta = dict(getattr(event, "metadata", {}) or {})
-        if self.record_images:
-            artifacts, uncertainty_metrics = self._artifacts_from_output(event, out)
-        else:
-            artifacts, uncertainty_metrics = {}, {}
+        artifacts = self._artifacts_from_output(event, out) if self.record_images else {}
         parent_meta, parent_artifacts = self._parent_diagnostics_from_state(
             event=event,
             event_idx=event_idx,
@@ -169,7 +164,7 @@ class TraceRecorder:
             input_positions=[int(x) for x in list(meta.get("rollout_positions", getattr(event, "input_positions", [])) or [])],
             history_positions=[int(x) for x in list(meta.get("history_positions", []) or [])],
             repair_positions=[int(x) for x in list(meta.get("repair_positions", getattr(event, "repair_positions", [])) or [])],
-            metrics={**_metrics_from_output(out), **uncertainty_metrics},
+            metrics=_metrics_from_output(out),
             state_health=_state_health_from_output(out),
             artifacts=artifacts,
             metadata={
@@ -188,20 +183,12 @@ class TraceRecorder:
             self._fh.write(json.dumps(dataclasses.asdict(row), sort_keys=True) + "\n")
             self._fh.flush()
 
-    def _artifacts_from_output(self, event: Any, out: Any) -> tuple[dict[str, str], dict[str, float]]:
+    def _artifacts_from_output(self, event: Any, out: Any) -> dict[str, str]:
         pred_rgbs = list(getattr(out, "pred_rgbs", []) or [])
         gt_images = list(getattr(out, "gt_images", []) or [])
         if not pred_rgbs or not gt_images:
-            return {}, {}
+            return {}
         artifacts: dict[str, str] = {}
-        metrics: dict[str, float] = {}
-        image_refs = [tuple(int(v) for v in ref) for ref in list(getattr(out, "image_refs", []) or [])]
-        uncertainty_packs = list(getattr(out, "uncertainty_images", []) or [])
-        packs_by_ref: dict[tuple[int, int], list[Any]] = {}
-        for pack in uncertainty_packs:
-            ref = tuple(int(v) for v in getattr(pack, "image_ref", (-1, -1)))
-            packs_by_ref.setdefault(ref, []).append(pack)
-        pending_cache: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
         max_pairs = min(2, len(pred_rgbs), len(gt_images))
         for idx in range(max_pairs):
             pred = pred_rgbs[idx]
@@ -209,116 +196,7 @@ class TraceRecorder:
             error = (torch.as_tensor(pred).detach().float().cpu() - torch.as_tensor(gt).detach().float().cpu()).abs()
             name = f"{str(event.event_id)}_{idx:02d}.png"
             artifacts[f"grid_{idx}"] = self.artifacts.save_grid(name, [gt, pred, error.clamp(0.0, 1.0)])
-            image_ref = image_refs[idx] if idx < len(image_refs) else (-1, idx)
-            matching_packs = packs_by_ref.get(tuple(image_ref), [])
-            if not matching_packs:
-                continue
-            # Output packs are emitted in the same current/history order as RGB
-            # images. Consume duplicate refs in order instead of silently using
-            # the last role for both images.
-            pack = matching_packs.pop(0)
-            sigma = torch.as_tensor(pack.sigma).detach().float().cpu()
-            within_raw = getattr(pack, "within_variance", None)
-            within = torch.as_tensor(
-                pack.aleatoric_variance if within_raw is None else within_raw
-            ).detach().float().cpu()
-            background_raw = getattr(pack, "background_variance", None)
-            background = (
-                torch.zeros_like(within)
-                if background_raw is None
-                else torch.as_tensor(background_raw).detach().float().cpu()
-            )
-            disagreement = torch.as_tensor(pack.disagreement_variance).detach().float().cpu()
-            total_raw = getattr(pack, "total_variance", None)
-            total = torch.as_tensor(
-                pack.variance if total_raw is None else total_raw
-            ).detach().float().cpu()
-            alpha = torch.as_tensor(pack.alpha).detach().float().cpu()
-            uncertainty_grid = f"{str(event.event_id)}_{idx:02d}_uncertainty.png"
-            artifacts[f"uncertainty_grid_{idx}"] = self.artifacts.save_grid(
-                uncertainty_grid,
-                [
-                    gt,
-                    pred,
-                    error.clamp(0.0, 1.0),
-                    (sigma / 0.50).clamp(0.0, 1.0),
-                    (within / 0.25).clamp(0.0, 1.0),
-                    (background / 0.25).clamp(0.0, 1.0),
-                    (disagreement / 0.25).clamp(0.0, 1.0),
-                    (total / 0.25).clamp(0.0, 1.0),
-                    alpha.clamp(0.0, 1.0),
-                ],
-            )
-            error_scalar = error.mean(dim=-1) if error.dim() == 3 else error
-            previous = self._previous_uncertainty_by_ref.get(tuple(image_ref))
-            if previous is not None and tuple(previous["error"].shape) == tuple(error_scalar.shape):
-                error_delta = error_scalar - previous["error"]
-                sigma_delta = sigma - previous["sigma"]
-                signed_error = (0.5 + error_delta / 0.20).clamp(0.0, 1.0)
-                signed_sigma = (0.5 + sigma_delta / 0.20).clamp(0.0, 1.0)
-                artifacts[f"before_after_grid_{idx}"] = self.artifacts.save_grid(
-                    f"{str(event.event_id)}_{idx:02d}_before_after.png",
-                    [signed_error, signed_sigma],
-                )
-                metrics[f"uncertainty/paired_{idx}/error_before"] = float(previous["error"].mean().item())
-                metrics[f"uncertainty/paired_{idx}/error_after"] = float(error_scalar.mean().item())
-                metrics[f"uncertainty/paired_{idx}/sigma_before"] = float(previous["sigma"].mean().item())
-                metrics[f"uncertainty/paired_{idx}/sigma_after"] = float(sigma.mean().item())
-            bins_path = self._write_confidence_bins(
-                event_id=str(event.event_id),
-                image_index=int(idx),
-                sigma=sigma,
-                error=error_scalar,
-                previous_error=None if previous is None else previous.get("error"),
-            )
-            artifacts[f"confidence_bins_{idx}"] = bins_path
-            pending_cache[tuple(image_ref)] = {"sigma": sigma, "error": error_scalar}
-        self._previous_uncertainty_by_ref.update(pending_cache)
-        return artifacts, metrics
-
-    def _write_confidence_bins(
-        self,
-        *,
-        event_id: str,
-        image_index: int,
-        sigma: torch.Tensor,
-        error: torch.Tensor,
-        previous_error: Optional[torch.Tensor],
-    ) -> str:
-        sigma_f = sigma.reshape(-1).float()
-        error_f = error.reshape(-1).float()
-        quantiles = torch.quantile(sigma_f, sigma_f.new_tensor([0.0, 0.2, 0.4, 0.6, 0.8, 1.0]))
-        rows = []
-        for bin_idx in range(5):
-            lo = quantiles[bin_idx]
-            hi = quantiles[bin_idx + 1]
-            selected = (sigma_f >= lo) & ((sigma_f <= hi) if bin_idx == 4 else (sigma_f < hi))
-            count = int(selected.sum().item())
-            if count > 0:
-                l1 = error_f[selected].mean()
-                mse = error_f[selected].square().mean().clamp_min(1.0e-12)
-                psnr = -10.0 * torch.log10(mse)
-            else:
-                l1 = sigma_f.new_tensor(0.0)
-                psnr = sigma_f.new_tensor(0.0)
-            destructive_ratio = 0.0
-            if previous_error is not None and tuple(previous_error.shape) == tuple(error.shape) and count > 0:
-                previous_f = previous_error.reshape(-1).float()
-                destructive_ratio = float((error_f[selected] > previous_f[selected] + 0.002).float().mean().item())
-            rows.append(
-                {
-                    "sigma_bin": int(bin_idx),
-                    "sigma_min": float(lo.item()),
-                    "sigma_max": float(hi.item()),
-                    "pixel_count": count,
-                    "raw_l1": float(l1.item()),
-                    "raw_psnr": float(psnr.item()),
-                    "destructive_update_ratio": float(destructive_ratio),
-                }
-            )
-        path = self.output_dir / "uncertainty" / f"{event_id}_{int(image_index):02d}_confidence_bins.csv"
-        _write_csv(path, rows)
-        return self.artifacts.relpath(path)
+        return artifacts
 
     def _parent_diagnostics_from_state(
         self,
