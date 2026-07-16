@@ -11,10 +11,24 @@ from .schema import EpisodePlanV3, RolloutPlanV3
 
 
 DistributionName = Literal["repeat_refine", "shuffled_coverage", "high_block_repair"]
+Train2DMode = Literal[
+    "trainable",
+    "frozen_no_grad",
+    "auto",
+    "trainable_checkpointed",
+    "frozen_input_grad_checkpointed",
+]
 
 DISTRIBUTION_TYPE_IDS = {"repeat_refine": 1, "shuffled_coverage": 2, "high_block_repair": 3}
 EPISODE_STAGE_IDS = {"prelude": 1, "repair_tail": 2}
-TRAIN_2D_MODE_IDS = {"trainable": 1, "frozen_no_grad": 2, "auto": 3}
+TRAIN_2D_MODE_IDS = {
+    "trainable": 1,
+    "frozen_no_grad": 2,
+    "auto": 3,
+    "trainable_checkpointed": 4,
+    "frozen_input_grad_checkpointed": 5,
+}
+FROZEN_2D_MODES = frozenset({"frozen_no_grad", "frozen_input_grad_checkpointed"})
 ORDER_TYPE_IDS = {
     "chronological": 1,
     "local": 2,
@@ -133,7 +147,7 @@ class RolloutDistributionSpec:
     k_budget: dict[int, float] = field(default_factory=dict)
     order_weights: dict[str, float] = field(default_factory=dict)
     candidate_policy: str = "unvisited_preferred"
-    train_2d_mode: Literal["trainable", "frozen_no_grad", "auto"] = "trainable"
+    train_2d_mode: Train2DMode = "trainable"
     last_update_write: bool = True
 
 
@@ -332,6 +346,16 @@ class DistributionalEpisodeCompiler:
         self.distributions = _default_distribution_specs(cfg)
         self.curriculum = _default_curriculum(cfg)
         self.recipe = _default_recipe(cfg)
+        self.max_inner_k_hard_cap = int(_cfg_get(cfg, "max_inner_k_hard_cap", 0) or 0)
+        if self.max_inner_k_hard_cap < 0:
+            raise ValueError("scheduler_stage3_2.max_inner_k_hard_cap must be >= 0")
+        for name, distribution in self.distributions.items():
+            if str(distribution.train_2d_mode) not in TRAIN_2D_MODE_IDS:
+                supported = ", ".join(TRAIN_2D_MODE_IDS)
+                raise ValueError(
+                    f"scheduler_stage3_2 distribution {name!r} has unsupported "
+                    f"train_2d_mode={distribution.train_2d_mode!r}; expected one of: {supported}"
+                )
         if "repeat_refine" in self.distributions and max(self.distributions["repeat_refine"].b_choices) > 2:
             raise ValueError("scheduler_stage3_2.repeat_refine requires B <= 2")
         prelude_names = [name for name in ("repeat_refine", "shuffled_coverage") if name in self.distributions]
@@ -470,9 +494,15 @@ class DistributionalEpisodeCompiler:
 
     def _max_k_for(self, phase: CurriculumPhaseSpec, dist: RolloutDistributionSpec) -> int:
         mode = str(dist.train_2d_mode)
-        table = phase.max_k_frozen_2d if mode == "frozen_no_grad" else phase.max_k_train_2d
-        fallback = 16 if mode == "frozen_no_grad" else 8
-        return int(table.get(str(dist.distribution_type), fallback))
+        if mode not in TRAIN_2D_MODE_IDS:
+            raise ValueError(f"unsupported train_2d_mode={mode!r}")
+        use_frozen_table = mode in FROZEN_2D_MODES
+        table = phase.max_k_frozen_2d if use_frozen_table else phase.max_k_train_2d
+        fallback = 16 if use_frozen_table else 8
+        max_k = int(table.get(str(dist.distribution_type), fallback))
+        if self.max_inner_k_hard_cap > 0:
+            max_k = min(max_k, self.max_inner_k_hard_cap)
+        return int(max_k)
 
     def _sample_episode_samples(self, *, rows: np.ndarray, phase: CurriculumPhaseSpec) -> list[DistributionalRolloutSample]:
         prelude_names = [name for name in ("repeat_refine", "shuffled_coverage") if name in self.distributions]
@@ -689,7 +719,7 @@ class DistributionalEpisodeCompiler:
             "order_type": str(sample.order_type),
             "order_type_id": int(ORDER_TYPE_IDS.get(str(sample.order_type), 0)),
             "train_2d_mode": str(sample.train_2d_mode),
-            "train_2d_mode_id": int(TRAIN_2D_MODE_IDS.get(str(sample.train_2d_mode), 0)),
+            "train_2d_mode_id": int(TRAIN_2D_MODE_IDS[str(sample.train_2d_mode)]),
             "raw_B": int(sample.raw_b),
             "raw_R": int(sample.raw_r),
             "B": int(sample.requested_b),
@@ -735,8 +765,10 @@ class DistributionalEpisodeCompiler:
 __all__ = [
     "DISTRIBUTION_TYPE_IDS",
     "EPISODE_STAGE_IDS",
+    "FROZEN_2D_MODES",
     "ORDER_TYPE_IDS",
     "TRAIN_2D_MODE_IDS",
+    "Train2DMode",
     "CurriculumPhaseSpec",
     "DistributionalEpisodeCompiler",
     "DistributionalRolloutSample",

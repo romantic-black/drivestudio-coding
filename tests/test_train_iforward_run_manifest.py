@@ -95,3 +95,14 @@ def test_iforward_run_manifest_prefers_enabled_validation_v4(tmp_path, monkeypat
 
     assert rows[0]["validation_key"] == "iforward_validation_v4"
     assert rows[0]["validation_enable"] is True
+
+
+def test_stage33_training_variant_controls_checkpoint_prefix_and_manifest(tmp_path):
+    cfg = _cfg(tmp_path)
+    cfg.model.iforward.training_variant = "stage3_3_observation_feedback"
+    assert train_ifwd.checkpoint_prefix_iforward_from_cfg(cfg) == (
+        "iforward_stage3_3_observation_feedback"
+    )
+    fields = train_ifwd._iforward_lifting_manifest_fields(cfg)
+    assert fields["iforward_version"] == "stage3_0_scalar_anchor_child_support_parent_legacy"
+    assert fields["training_variant"] == "stage3_3_observation_feedback"

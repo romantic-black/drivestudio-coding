@@ -71,3 +71,28 @@ def test_runner_executes_validation_plan_with_fake_model(tmp_path):
     assert model.calls[0]["ablation"] == "full"
     assert (tmp_path / "plan.json").is_file()
     assert (tmp_path / "trace.jsonl").is_file()
+
+
+def test_runner_marks_all_non_training_batches_as_read_only_feedback():
+    runner = IForwardRunner(
+        model=None,
+        convert_batch_to_minimal_format=lambda raw, _device, _step: raw,
+    )
+    raw = {
+        "request_meta": {
+            "iforward_stage3_2": {
+                "distribution_type": "shuffled_coverage",
+                "train_2d_mode": "trainable_checkpointed",
+            }
+        },
+        "_iforward": {"request_meta": {}},
+    }
+
+    batch = runner._convert(
+        raw,
+        RunnerOptions.for_mode("validate", device="cpu", trigger_step=9999),
+    )
+
+    assert batch["request_meta"]["observation_feedback_eval_mode"] == "frozen_no_grad"
+    assert batch["_iforward"]["request_meta"]["observation_feedback_eval_mode"] == "frozen_no_grad"
+    assert batch["request_meta"]["iforward_stage3_2"]["distribution_type"] == "shuffled_coverage"

@@ -830,6 +830,15 @@ def _checkpoint_step(payload: Dict[str, Any], default: int = 0) -> int:
     return int(default)
 
 
+def _periodic_checkpoint_due(step: int, save_every: Any) -> bool:
+    if save_every is None:
+        return False
+    interval = int(save_every)
+    if interval <= 0 or int(step) < 0:
+        return False
+    return (int(step) + 1) % interval == 0
+
+
 def _capture_rng_state() -> Dict[str, Any]:
     state: Dict[str, Any] = {
         "python_random": random.getstate(),
@@ -932,6 +941,13 @@ def _load_resume_checkpoint(path: str, model: Any) -> Dict[str, Any]:
     runtime_loader = getattr(model, "load_runtime_state_from_checkpoint", None)
     if callable(runtime_loader):
         runtime_loader(ckpt)
+    feedback_schedule_loader = getattr(model, "load_feedback_schedule_state_from_checkpoint", None)
+    if callable(feedback_schedule_loader):
+        restored_feedback_clock = bool(feedback_schedule_loader(ckpt))
+        if not restored_feedback_clock:
+            logger.info(
+                "Resume checkpoint has no observation_feedback_schedule; use the configured activation origin."
+            )
     logger.info(
         "Loaded resume_checkpoint from %s (saved_step=%s, global_step=%s)",
         path,
@@ -4400,6 +4416,36 @@ def main() -> None:
                     writer.add_scalar("train/perf/step_time_ms", float(step_time_ms), step)
                 block_end_monitor_ms += float((time.perf_counter() - block_end_t0) * 1000.0)
 
+            # Persist the just-completed optimization step before any periodic
+            # validation hook.  Validation is intentionally fail-fast, but its
+            # failure must not discard a full checkpoint interval of training.
+            # `(step + 1) % save_every` expresses completed-step count: after
+            # steps 0..9999, save step9999 and resume at step10000.
+            checkpoint_ms = 0.0
+            if _periodic_checkpoint_due(step, save_every):
+                ckpt_t0 = time.perf_counter()
+                ckpt_prefix = _checkpoint_prefix_for_cfg(cfg)
+                ckpt_path = os.path.join(cfg.log_dir, "checkpoints", f"{ckpt_prefix}_step{step}.pt")
+                ckpt_payload = {
+                    "step": step,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": model.optimizer.state_dict(),
+                }
+                if hasattr(model, "build_light_checkpoint_extra"):
+                    ckpt_payload.update(model.build_light_checkpoint_extra(step=int(step)))
+                ckpt_payload.update(
+                    _checkpoint_runtime_extra(
+                        model=model,
+                        scheduler=scheduler,
+                        train_episode_counter=int(train_episode_counter),
+                        step=int(step),
+                        start_step=int(start_step),
+                    )
+                )
+                torch.save(ckpt_payload, ckpt_path)
+                logger.info("Saved checkpoint to %s before periodic validation", ckpt_path)
+                checkpoint_ms = float((time.perf_counter() - ckpt_t0) * 1000.0)
+
             validation_ms = 0.0
             if callable(episode_end_hook) and len(hook_due_episode_counters) > 0:
                 val_t0 = time.perf_counter()
@@ -4566,6 +4612,7 @@ def main() -> None:
                     - float(batch_fetch_ms)
                     - float(batch_convert_ms)
                     - float(block_end_monitor_ms)
+                    - float(checkpoint_ms)
                     - float(validation_ms),
                 )
                 cleanup_row = {
@@ -4601,34 +4648,6 @@ def main() -> None:
                         )
                     )
                 _write_metrics_history(metrics_fh, cleanup_row)
-
-            checkpoint_ms = 0.0
-            if save_every and step > 0 and step % save_every == 0:
-                ckpt_t0 = time.perf_counter()
-                ckpt_prefix = _checkpoint_prefix_for_cfg(cfg)
-                ckpt_path = os.path.join(cfg.log_dir, "checkpoints", f"{ckpt_prefix}_step{step}.pt")
-                ckpt_payload = {
-                    "step": step,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": model.optimizer.state_dict(),
-                }
-                if hasattr(model, "build_light_checkpoint_extra"):
-                    ckpt_payload.update(model.build_light_checkpoint_extra(step=int(step)))
-                ckpt_payload.update(
-                    _checkpoint_runtime_extra(
-                        model=model,
-                        scheduler=scheduler,
-                        train_episode_counter=int(train_episode_counter),
-                        step=int(step),
-                        start_step=int(start_step),
-                    )
-                )
-                torch.save(
-                    ckpt_payload,
-                    ckpt_path,
-                )
-                logger.info("Saved checkpoint to %s", ckpt_path)
-                checkpoint_ms = float((time.perf_counter() - ckpt_t0) * 1000.0)
 
             iter_wall_ms = float((time.perf_counter() - iter_t0) * 1000.0)
             residual_non_train_ms = float(

@@ -201,6 +201,7 @@ def _iforward_lifting_manifest_fields(cfg: Any) -> Dict[str, Any]:
     child_cfg = _cfg_get(lifting_cfg, "child_gather", {}) or {}
     return {
         "iforward_version": str(_cfg_get(iforward_cfg, "version", "")),
+        "training_variant": str(_cfg_get(iforward_cfg, "training_variant", "") or ""),
         "lifting_type": str(_cfg_get(lifting_cfg, "type", "") or ""),
         "parent_lifting_type": str(_cfg_get(parent_cfg, "type", "") or ""),
         "child_gather_type": str(_cfg_get(child_cfg, "type", "") or ""),
@@ -264,6 +265,9 @@ def build_iforward_trainer_from_cfg(config: Any, device: torch.device) -> IForwa
 def checkpoint_prefix_iforward_from_cfg(cfg: Any) -> str:
     model_cfg = _cfg_get(cfg, "model", {}) or {}
     iforward_cfg = _cfg_get(model_cfg, "iforward", {}) or {}
+    training_variant = str(_cfg_get(iforward_cfg, "training_variant", "") or "").strip()
+    if training_variant:
+        return f"iforward_{training_variant}"
     version = str(_cfg_get(iforward_cfg, "version", "v1"))
     return f"iforward_{version}"
 

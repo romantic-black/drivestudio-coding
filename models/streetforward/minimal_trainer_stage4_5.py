@@ -12,12 +12,15 @@ import copy
 import logging
 import time
 from collections import defaultdict
+from contextlib import nullcontext
 from typing import Any, Dict, Hashable, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from models.feature_extractors import AlphaTWeightExtractorV3
+from models.iforward.observation_feedback import scale_feedback
 from models.streetforward.math_utils import _num_sh_bases, _sh_to_rgb
 from models.streetforward.metrics import compute_ssim_loss_masked
 from models.streetforward.minimal_trainer_stage3_2d import _create_proxy_params
@@ -151,7 +154,25 @@ class MinimalStreetForwardStage4_5(MinimalStreetForwardStage4_2):
         height: int,
         width: int,
         dino_cache_key: Optional[Hashable] = None,
+        feedback_enabled: bool = False,
+        feedback_alpha: float = 0.0,
+        checkpoint_dynamic: bool = False,
+        capture_source_rgb: bool = False,
     ) -> Dict[str, Any]:
+        if bool(feedback_enabled):
+            return self._render_source_scene_feedback_for_cnn(
+                gaussians_scene=gaussians_scene,
+                source_views=source_views,
+                source_images=source_images,
+                source_sky_masks=source_sky_masks,
+                source_egocar_masks=source_egocar_masks,
+                height=int(height),
+                width=int(width),
+                dino_cache_key=dino_cache_key,
+                feedback_alpha=float(feedback_alpha),
+                checkpoint_dynamic=bool(checkpoint_dynamic),
+                capture_source_rgb=bool(capture_source_rgb),
+            )
         if len(source_views) != len(source_images):
             raise ValueError(
                 f"Stage4.5 len(source_views)={len(source_views)} != len(source_images)={len(source_images)}."
@@ -466,7 +487,7 @@ class MinimalStreetForwardStage4_5(MinimalStreetForwardStage4_2):
         _mark_cuda("end")
         cnn_perf_stats["iforward/cnn/source_pair_valid_mask_mb"] = _tensor_mb(source_pair_valid_mask)
         cnn_perf_stats["iforward/cnn/total_ms"] = float((time.perf_counter() - total_t0) * 1000.0)
-        return {
+        result = {
             "features_2d": features_2d,
             "fwhr_detail_2d": fwhr_detail_2d,
             "stage3_dino_native_2d": stage3_dino_native_2d,
@@ -474,6 +495,323 @@ class MinimalStreetForwardStage4_5(MinimalStreetForwardStage4_2):
             "dino_cache_stats": dino_cache_stats,
             "cnn_perf_stats": {**cnn_perf_stats, **fwhr_aux_stats},
         }
+        if bool(capture_source_rgb):
+            result["source_rgb"] = scene_rgb_batch
+        return result
+
+    def _render_source_scene_feedback_for_cnn(
+        self,
+        *,
+        gaussians_scene: Dict[str, torch.Tensor],
+        source_views: List[Any],
+        source_images: List[torch.Tensor],
+        source_sky_masks: Optional[List[torch.Tensor]],
+        source_egocar_masks: Optional[List[torch.Tensor]],
+        height: int,
+        width: int,
+        dino_cache_key: Optional[Hashable],
+        feedback_alpha: float,
+        checkpoint_dynamic: bool,
+        capture_source_rgb: bool = False,
+    ) -> Dict[str, Any]:
+        """Pure checkpointed LocalGS -> render -> residual frontend feedback path."""
+        if len(source_views) != len(source_images) or len(source_views) < 1:
+            raise ValueError(
+                "Observation feedback requires matching, non-empty source_views/source_images; "
+                f"got {len(source_views)} and {len(source_images)}."
+            )
+        if not (0.0 <= float(feedback_alpha) <= 1.0):
+            raise ValueError(f"feedback_alpha must be in [0, 1], got {feedback_alpha}")
+        extractor = self.image_feature_extractor
+        required_apis = (
+            "get_feature_resolution",
+            "extract_residual_feature",
+            "extract_dino_feature",
+            "fuse_features",
+        )
+        missing = [name for name in required_apis if not hasattr(extractor, name)]
+        if missing:
+            raise RuntimeError(
+                "Checkpointed observation feedback requires the split residual/DINO frontend APIs; "
+                f"missing={missing}."
+            )
+        if hasattr(extractor, "dino_adapter_has_trainable_params") and bool(
+            extractor.dino_adapter_has_trainable_params()  # type: ignore[attr-defined]
+        ):
+            raise RuntimeError("Observation feedback requires the DINO adapter to remain frozen/no-grad.")
+
+        total_t0 = time.perf_counter()
+        feedback_debug = getattr(
+            getattr(self, "observation_feedback_policy", None), "debug", None
+        )
+        log_feedback_memory = bool(
+            getattr(feedback_debug, "log_feedback_memory", False)
+            and torch.cuda.is_available()
+        )
+        memory_start_allocated = (
+            int(torch.cuda.memory_allocated()) if log_feedback_memory else 0
+        )
+        memory_start_reserved = (
+            int(torch.cuda.memory_reserved()) if log_feedback_memory else 0
+        )
+        image_batch = torch.stack([img.to(self.device) for img in source_images], dim=0)
+        if image_batch.dim() == 4 and int(image_batch.shape[1]) == 3:
+            image_batch = image_batch.permute(0, 2, 3, 1).contiguous()
+        if image_batch.dim() != 4 or int(image_batch.shape[-1]) != 3:
+            raise ValueError(f"source image batch must be [V,H,W,3], got {tuple(image_batch.shape)}")
+        ref_hw = (int(image_batch.shape[1]), int(image_batch.shape[2]))
+        if ref_hw != (int(height), int(width)):
+            raise ValueError(f"source image/render size mismatch: images={ref_hw}, render={(height, width)}")
+        for index, image in enumerate(source_images):
+            if spatial_hw_from_image_tensor(image) != ref_hw:
+                raise ValueError(f"source image {index} does not match reference H/W={ref_hw}")
+
+        source_pair_valid_mask = self._build_source_pair_valid_mask(
+            source_images=source_images,
+            source_sky_masks=source_sky_masks,
+            source_egocar_masks=source_egocar_masks,
+        )
+        target_hw = tuple(int(x) for x in extractor.get_feature_resolution(int(height), int(width)))
+        if len(target_hw) != 2 or min(target_hw) <= 0:
+            raise RuntimeError(f"invalid frontend feature resolution {target_hw}")
+        cache = getattr(self, "dino_feature_cache", None)
+        cache_level = str(getattr(self, "dino_feature_cache_level", "adapter_output")).lower()
+        stage3_lifting_cfg = getattr(self, "stage3_0_lifting_cfg", {}) or {}
+        detach_detail_input = bool(
+            getattr(self, "stage3_0_enabled", False)
+            and (
+                stage3_lifting_cfg.get("detail_head_detach_residual", False)
+                if hasattr(stage3_lifting_cfg, "get")
+                else False
+            )
+        )
+        view_chunk_size = int(getattr(self, "stage6_cnn_view_chunk_size", 0) or 0)
+        if view_chunk_size <= 0:
+            view_chunk_size = int(image_batch.shape[0])
+
+        dino_cache_stats: Dict[str, float] = {}
+        feature_chunks: List[torch.Tensor] = []
+        detail_chunks: List[torch.Tensor] = []
+        dino_native_chunks: List[torch.Tensor] = []
+        source_rgb_chunks: List[torch.Tensor] = []
+        chunk_count = 0
+
+        def merge_cache_stats(stats: Any) -> None:
+            values = stats.as_dict() if hasattr(stats, "as_dict") else dict(stats or {})
+            for key, value in values.items():
+                try:
+                    number = float(value)
+                except Exception:
+                    continue
+                if str(key).endswith(("cache_cpu_mb", "cache_gpu_mb", "feature_dtype_id")):
+                    dino_cache_stats[str(key)] = number
+                else:
+                    dino_cache_stats[str(key)] = float(dino_cache_stats.get(str(key), 0.0)) + number
+
+        for start in range(0, int(image_batch.shape[0]), int(view_chunk_size)):
+            end = min(start + int(view_chunk_size), int(image_batch.shape[0]))
+            image_chunk = image_batch[start:end]
+            rgb_chunk = image_chunk.permute(0, 3, 1, 2).contiguous().detach()
+            # The feedback and detached-reference paths consume the same source
+            # RGB and therefore must share the same static DINO cache entry.
+            # Keeping a feedback-only namespace made the low-frequency parity
+            # probe execute the frozen DINO backbone twice and compared two AMP
+            # realizations instead of isolating the dynamic render/frontend.
+            chunk_key = (
+                (dino_cache_key, "view_chunk", int(start), int(end), int(image_batch.shape[0]))
+                if dino_cache_key is not None
+                else None
+            )
+            native_chunk = None
+            with torch.no_grad():
+                if cache_level == "backbone_intermediate":
+                    if not hasattr(extractor, "extract_dino_backbone_intermediates") or not hasattr(
+                        extractor, "adapt_dino_backbone_intermediates"
+                    ):
+                        raise RuntimeError(
+                            "DINO backbone_intermediate feedback cache requires split backbone adapter APIs"
+                        )
+                    if cache is not None and chunk_key is not None:
+                        cached_dino, cache_stats = cache.get_or_compute(
+                            key=chunk_key,
+                            device=rgb_chunk.device,
+                            trainable=False,
+                            compute=lambda rgb_in=rgb_chunk: extractor.extract_dino_backbone_intermediates(rgb_in),
+                        )
+                        merge_cache_stats(cache_stats)
+                    else:
+                        cached_dino = extractor.extract_dino_backbone_intermediates(rgb_chunk)
+                    if not isinstance(cached_dino, tuple):
+                        raise RuntimeError("DINO backbone_intermediate cache must return a tuple")
+                    dino_chunk = extractor.adapt_dino_backbone_intermediates(cached_dino, target_hw=target_hw)
+                    if bool(getattr(self, "stage3_dino_native_enabled", False)):
+                        native_hw = (int(cached_dino[-1].shape[-2]), int(cached_dino[-1].shape[-1]))
+                        native_chunk = extractor.adapt_dino_backbone_intermediates(cached_dino, target_hw=native_hw)
+                else:
+                    if cache is not None and chunk_key is not None:
+                        dino_chunk, cache_stats = cache.get_or_compute(
+                            key=chunk_key,
+                            device=rgb_chunk.device,
+                            trainable=False,
+                            compute=lambda rgb_in=rgb_chunk: extractor.extract_dino_feature(
+                                rgb_in, target_hw=target_hw, detach=True
+                            ),
+                        )
+                        merge_cache_stats(cache_stats)
+                    else:
+                        dino_chunk = extractor.extract_dino_feature(rgb_chunk, target_hw=target_hw, detach=True)
+                if not torch.is_tensor(dino_chunk):
+                    raise RuntimeError("DINO feedback preparation must return a tensor")
+                dino_chunk = dino_chunk.detach()
+                if native_chunk is not None:
+                    dino_native_chunks.append(native_chunk.detach())
+
+            chunk_views = source_views[start:end]
+
+            def dynamic_observation(
+                means: torch.Tensor,
+                scales: torch.Tensor,
+                quats: torch.Tensor,
+                opacities: torch.Tensor,
+                colors: torch.Tensor,
+                static_images: torch.Tensor,
+                static_dino: torch.Tensor,
+                _chunk_views: Tuple[Any, ...] = tuple(chunk_views),
+            ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                scene = {
+                    "means": means,
+                    "scales": scales,
+                    "quats": quats,
+                    "opacities": opacities,
+                    "colors": colors,
+                }
+                render_ctx = (
+                    torch.cuda.amp.autocast(enabled=False)
+                    if means.is_cuda
+                    else nullcontext()
+                )
+                with torch.autograd.profiler.record_function(
+                    "iforward/feedback/source_render"
+                ):
+                    with render_ctx:
+                        rgb_list = self.alpha_t_extractor.render_rgb_feedback(
+                            scene,
+                            list(_chunk_views),
+                            int(height),
+                            int(width),
+                            return_acc=False,
+                            absgrad=False,
+                        )
+                        if not isinstance(rgb_list, list) or len(rgb_list) != len(_chunk_views):
+                            raise RuntimeError("feedback renderer returned an invalid RGB view list")
+                        rendered = torch.stack(rgb_list, dim=0)
+                        rendered = scale_feedback(rendered, float(feedback_alpha))
+                        if tuple(rendered.shape[1:3]) != tuple(static_images.shape[1:3]):
+                            rendered = F.interpolate(
+                                rendered.permute(0, 3, 1, 2),
+                                size=(int(static_images.shape[1]), int(static_images.shape[2])),
+                                mode="bilinear",
+                                align_corners=True,
+                            ).permute(0, 2, 3, 1)
+                        multi = torch.cat([static_images, rendered], dim=-1)
+                with torch.autograd.profiler.record_function(
+                    "iforward/feedback/dynamic_frontend"
+                ):
+                    cnn_ctx = self._iforward_amp_autocast() if hasattr(self, "_iforward_amp_autocast") else nullcontext()
+                    with cnn_ctx:
+                        residual = extractor.extract_residual_feature(multi)
+                        context = extractor.fuse_features(
+                            static_dino.to(device=residual.device, dtype=residual.dtype), residual
+                        )
+                        if hasattr(extractor, "detail_head"):
+                            detail_input = residual.detach() if bool(detach_detail_input) else residual
+                            detail = extractor.detail_head(detail_input)  # type: ignore[attr-defined]
+                        else:
+                            detail = residual.new_empty((0,))
+                return context, detail, rendered
+
+            inputs = (
+                gaussians_scene["means"],
+                gaussians_scene["scales"],
+                gaussians_scene["quats"],
+                gaussians_scene["opacities"],
+                gaussians_scene["colors"],
+                image_chunk.detach(),
+                dino_chunk,
+            )
+            if bool(checkpoint_dynamic) and (
+                any(bool(t.requires_grad) for t in inputs)
+                or any(bool(p.requires_grad) for p in extractor.parameters())
+            ):
+                context_chunk, detail_chunk, rendered_chunk = checkpoint(
+                    dynamic_observation,
+                    *inputs,
+                    use_reentrant=False,
+                    preserve_rng_state=False,
+                )
+            else:
+                context_chunk, detail_chunk, rendered_chunk = dynamic_observation(*inputs)
+            feature_chunks.append(context_chunk)
+            if int(detail_chunk.numel()) > 0:
+                detail_chunks.append(detail_chunk)
+            if bool(capture_source_rgb):
+                source_rgb_chunks.append(rendered_chunk)
+            chunk_count += 1
+
+        features_2d = torch.cat(feature_chunks, dim=0).contiguous()
+        fwhr_detail_2d = torch.cat(detail_chunks, dim=0).contiguous() if detail_chunks else None
+        stage3_dino_native_2d = (
+            torch.cat(dino_native_chunks, dim=0).contiguous() if dino_native_chunks else None
+        )
+        cnn_perf_stats = {
+            "iforward/cnn/feedback_enabled": 1.0,
+            "iforward/cnn/feedback_alpha": float(feedback_alpha),
+            "iforward/cnn/checkpoint_dynamic": float(bool(checkpoint_dynamic)),
+            "iforward/cnn/view_chunk_count": float(chunk_count),
+            "iforward/cnn/view_chunk_size": float(view_chunk_size),
+            "iforward/cnn/features_2d_mb": float(
+                features_2d.numel() * features_2d.element_size() / (1024.0 * 1024.0)
+            ),
+            "iforward/cnn/total_ms": float((time.perf_counter() - total_t0) * 1000.0),
+            "iforward/cnn/detail_head_detach_residual": float(detach_detail_input),
+        }
+        if log_feedback_memory:
+            scale = 1024.0 * 1024.0
+            memory_end_allocated = int(torch.cuda.memory_allocated())
+            memory_end_reserved = int(torch.cuda.memory_reserved())
+            cnn_perf_stats.update(
+                {
+                    "iforward/feedback/memory_start_allocated_mb": float(
+                        memory_start_allocated / scale
+                    ),
+                    "iforward/feedback/memory_end_allocated_mb": float(
+                        memory_end_allocated / scale
+                    ),
+                    "iforward/feedback/memory_allocated_delta_mb": float(
+                        (memory_end_allocated - memory_start_allocated) / scale
+                    ),
+                    "iforward/feedback/memory_start_reserved_mb": float(
+                        memory_start_reserved / scale
+                    ),
+                    "iforward/feedback/memory_end_reserved_mb": float(
+                        memory_end_reserved / scale
+                    ),
+                    "iforward/feedback/memory_reserved_delta_mb": float(
+                        (memory_end_reserved - memory_start_reserved) / scale
+                    ),
+                }
+            )
+        result = {
+            "features_2d": features_2d,
+            "fwhr_detail_2d": fwhr_detail_2d,
+            "stage3_dino_native_2d": stage3_dino_native_2d,
+            "source_pair_valid_mask": source_pair_valid_mask,
+            "dino_cache_stats": dino_cache_stats,
+            "cnn_perf_stats": cnn_perf_stats,
+        }
+        if bool(capture_source_rgb):
+            result["source_rgb"] = torch.cat(source_rgb_chunks, dim=0).contiguous()
+        return result
 
     def _backproject_scene_features_multi_camera(
         self,

@@ -8,6 +8,7 @@ import pytest
 import torch
 import torch.nn as nn
 from omegaconf import OmegaConf
+from torch.utils.checkpoint import checkpoint
 
 from models.iforward.biggs_assignment import build_biggs_branch_assignment, build_biggs_assignments
 from models.iforward.biggs_event_decoder import BigGSToFineEventDecoder
@@ -797,6 +798,228 @@ def test_biggs_grld_relation_inputs_detached() -> None:
     assert local_state.bg.opacity_logit.grad is None
 
 
+def _relation_feedback_fixture(*, event_dim: int = 64):
+    local_state, measurement, parent_event = _decoder_fixture(event_dim=event_dim)
+    n = int(local_state.bg.means.shape[0])
+    scales = torch.tensor(
+        [[-1.8, -1.2, -0.7], [-1.5, -0.9, -0.4], [-1.7, -1.1, -0.5]],
+        dtype=local_state.bg.scales_log.dtype,
+    )[:n].clone().requires_grad_(True)
+    quats = torch.tensor(
+        [[0.90, 0.20, 0.30, 0.10], [0.82, -0.24, 0.31, 0.18], [0.87, 0.12, -0.35, 0.22]],
+        dtype=local_state.bg.quats.dtype,
+    )[:n].clone().requires_grad_(True)
+    bg = replace(
+        local_state.bg,
+        means=local_state.bg.means.detach().clone().requires_grad_(True),
+        scales_log=scales,
+        quats=quats,
+        opacity_logit=local_state.bg.opacity_logit.detach().clone().requires_grad_(True),
+        sh_dc=local_state.bg.sh_dc.detach().clone().requires_grad_(True),
+        sh_rest=local_state.bg.sh_rest.detach().clone().requires_grad_(True),
+    )
+    local_state = replace(local_state, bg=bg)
+    measurement = dict(measurement)
+    measurement["parent_params_bg"] = {
+        key: value.detach().clone().requires_grad_(True)
+        for key, value in measurement["parent_params_bg"].items()
+    }
+    parent_event = replace(
+        parent_event,
+        event_bg=parent_event.event_bg.detach().clone().requires_grad_(True),
+    )
+    _attach_grld_runtime(local_state, measurement)
+    return local_state, measurement, parent_event
+
+
+def _relation_feedback_decoder(*, checkpoint_enabled: bool, alpha: float) -> BigGSToFineEventDecoder:
+    decoder = BigGSToFineEventDecoder(
+        event_dim=64,
+        parent_event_dim=64,
+        fine_event_dim=16,
+        mode="gaussian_relational",
+        rank=4,
+        fused_cuda=False,
+        residual_scale_init=1.0,
+        residual_scale_learnable=False,
+        detach_relation_inputs=True,
+    )
+    assert decoder.grld_decoder is not None
+    nn.init.normal_(decoder.grld_decoder.detail_head[-1].weight, std=0.05)
+    decoder.set_relation_feedback(
+        enabled=True,
+        alpha=float(alpha),
+        branches=("bg",),
+        grad_to_child_geometry=True,
+        grad_to_parent_geometry=True,
+        grad_to_child_code=False,
+        grad_to_parent_event=True,
+        grad_to_support=False,
+        checkpoint=bool(checkpoint_enabled),
+    )
+    return decoder
+
+
+def test_biggs_grld_relation_feedback_cache_forward_live_backward_and_checkpoint() -> None:
+    torch.manual_seed(71)
+    local_state, measurement, parent_event = _relation_feedback_fixture()
+    bg_runtime = measurement["biggs_parent_runtime"].bg
+    bg_runtime.child_cache.mass.requires_grad_(True)
+    bg_runtime.child_cache.diag_cov.requires_grad_(True)
+    bg_runtime.stats.weight_sum.requires_grad_(True)
+    decoder = _relation_feedback_decoder(checkpoint_enabled=False, alpha=0.3)
+
+    decoder.set_relation_feedback(
+        enabled=False,
+        alpha=0.0,
+        branches=("bg",),
+        grad_to_child_geometry=True,
+        grad_to_parent_geometry=True,
+        grad_to_child_code=False,
+        grad_to_parent_event=True,
+        grad_to_support=False,
+        checkpoint=False,
+    )
+    baseline = decoder(parent_event_pack=parent_event, local_state=local_state, measurement=measurement)
+    decoder.set_relation_feedback(
+        enabled=True,
+        alpha=0.3,
+        branches=("bg",),
+        grad_to_child_geometry=True,
+        grad_to_parent_geometry=True,
+        grad_to_child_code=False,
+        grad_to_parent_event=True,
+        grad_to_support=False,
+        checkpoint=True,
+    )
+    feedback = decoder(parent_event_pack=parent_event, local_state=local_state, measurement=measurement)
+    assert torch.equal(feedback.event_bg, baseline.event_bg)
+    assert feedback.aux["iforward/grld/feedback_enabled"] == 1.0
+    assert feedback.aux["iforward/grld/feedback_alpha"] == pytest.approx(0.3)
+    assert feedback.aux["iforward/grld/checkpoint_enabled"] == 1.0
+
+    loss = feedback.event_bg[0].square().sum() + 0.37 * feedback.event_bg[1].square().sum()
+    loss.backward()
+    assert local_state.bg.means.grad is not None
+    assert float(local_state.bg.means.grad.abs().sum().item()) > 0.0
+    assert local_state.bg.scales_log.grad is not None
+    assert float(local_state.bg.scales_log.grad.abs().sum().item()) > 0.0
+    assert local_state.bg.quats.grad is not None
+    assert float(local_state.bg.quats.grad.abs().sum().item()) > 0.0
+    assert local_state.bg.opacity_logit.grad is None
+    assert local_state.bg.sh_dc.grad is None
+    assert local_state.bg.sh_rest.grad is None
+    assert parent_event.event_bg.grad is not None
+    assert float(parent_event.event_bg.grad.abs().sum().item()) > 0.0
+    parent_scales = measurement["parent_params_bg"]["scales_log"]
+    assert parent_scales.grad is not None
+    assert float(parent_scales.grad.abs().sum().item()) > 0.0
+    assert bg_runtime.child_cache.mass.grad is None
+    assert bg_runtime.child_cache.diag_cov.grad is None
+    assert bg_runtime.stats.weight_sum.grad is None
+
+
+def test_biggs_grld_relation_feedback_alpha_scales_only_child_jacobian() -> None:
+    torch.manual_seed(72)
+    local_state, measurement, parent_event = _relation_feedback_fixture()
+    decoder = _relation_feedback_decoder(checkpoint_enabled=False, alpha=1.0)
+
+    def means_grad(alpha: float):
+        decoder.set_relation_feedback(
+            enabled=True,
+            alpha=float(alpha),
+            branches=("bg",),
+            grad_to_child_geometry=True,
+            grad_to_parent_geometry=False,
+            grad_to_child_code=False,
+            grad_to_parent_event=False,
+            grad_to_support=False,
+            checkpoint=False,
+        )
+        out = decoder(parent_event_pack=parent_event, local_state=local_state, measurement=measurement)
+        loss = out.event_bg[0].square().sum() + 0.37 * out.event_bg[1].square().sum()
+        return torch.autograd.grad(
+            loss,
+            local_state.bg.means,
+            allow_unused=True,
+        )[0]
+
+    grad_one = means_grad(1.0)
+    grad_partial = means_grad(0.3)
+    grad_zero = means_grad(0.0)
+    assert grad_one is not None and float(grad_one.abs().sum().item()) > 0.0
+    assert grad_partial is not None
+    assert torch.allclose(grad_partial, 0.3 * grad_one, atol=1.0e-6, rtol=1.0e-5)
+    assert grad_zero is not None
+    assert torch.count_nonzero(grad_zero) == 0
+
+
+def test_biggs_grld_relation_feedback_checkpoint_matches_eager_gradients() -> None:
+    torch.manual_seed(73)
+    local_state, measurement, parent_event = _relation_feedback_fixture()
+    decoder = _relation_feedback_decoder(checkpoint_enabled=False, alpha=0.3)
+    assert decoder.grld_decoder is not None
+    grad_inputs = (
+        local_state.bg.means,
+        local_state.bg.scales_log,
+        local_state.bg.quats,
+        measurement["parent_params_bg"]["scales_log"],
+        parent_event.event_bg,
+        decoder.grld_decoder.relation_proj.weight,
+    )
+
+    def run(checkpoint_enabled: bool):
+        decoder.set_relation_feedback(
+            enabled=True,
+            alpha=0.3,
+            branches=("bg",),
+            grad_to_child_geometry=True,
+            grad_to_parent_geometry=True,
+            grad_to_child_code=False,
+            grad_to_parent_event=True,
+            grad_to_support=False,
+            checkpoint=bool(checkpoint_enabled),
+        )
+        out = decoder(parent_event_pack=parent_event, local_state=local_state, measurement=measurement)
+        loss = out.event_bg[0].square().sum() + 0.37 * out.event_bg[1].square().sum()
+        grads = torch.autograd.grad(loss, grad_inputs)
+        return out.event_bg.detach(), grads
+
+    eager_value, eager_grads = run(False)
+    checkpoint_value, checkpoint_grads = run(True)
+    assert torch.equal(checkpoint_value, eager_value)
+    for got, expected in zip(checkpoint_grads, eager_grads):
+        assert torch.allclose(got, expected, atol=1.0e-6, rtol=1.0e-5)
+
+
+def test_biggs_grld_relation_feedback_rejects_support_and_rigid_gradients() -> None:
+    decoder = _relation_feedback_decoder(checkpoint_enabled=False, alpha=1.0)
+    with pytest.raises(ValueError, match="grad_to_support=true"):
+        decoder.set_relation_feedback(
+            enabled=True,
+            alpha=1.0,
+            branches=("bg",),
+            grad_to_child_geometry=True,
+            grad_to_parent_geometry=True,
+            grad_to_child_code=False,
+            grad_to_parent_event=True,
+            grad_to_support=True,
+            checkpoint=False,
+        )
+    with pytest.raises(ValueError, match="only bg/distant"):
+        decoder.set_relation_feedback(
+            enabled=True,
+            alpha=1.0,
+            branches=("rigid",),
+            grad_to_child_geometry=True,
+            grad_to_parent_geometry=True,
+            grad_to_child_code=False,
+            grad_to_parent_event=True,
+            grad_to_support=False,
+            checkpoint=False,
+        )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available() or not grld_decode_available(), reason="GRLD CUDA extension unavailable")
 def test_grld_cuda_decode_matches_reference_forward_backward() -> None:
     device = torch.device("cuda")
@@ -824,6 +1047,35 @@ def test_grld_cuda_decode_matches_reference_forward_backward() -> None:
     cuda_grads = torch.autograd.grad(out_cuda, (base, detail, gate, coeff, scale), grad, retain_graph=True)
     ref_grads = torch.autograd.grad(out_ref, (base, detail, gate, coeff, scale), grad)
     for got, exp in zip(cuda_grads, ref_grads):
+        assert torch.allclose(got, exp, atol=2.0e-5, rtol=2.0e-4)
+
+    out_checkpoint = checkpoint(
+        lambda base_t, detail_t, gate_t, coeff_t, scale_t: grld_decode(
+            base_t,
+            detail_t,
+            gate_t,
+            coeff_t,
+            child_to_parent,
+            child_order,
+            parent_start,
+            parent_count,
+            scale_t,
+        ),
+        base,
+        detail,
+        gate,
+        coeff,
+        scale,
+        use_reentrant=False,
+        preserve_rng_state=False,
+    )
+    assert torch.allclose(out_checkpoint, out_cuda, atol=1.0e-6, rtol=1.0e-5)
+    checkpoint_grads = torch.autograd.grad(
+        out_checkpoint,
+        (base, detail, gate, coeff, scale),
+        grad,
+    )
+    for got, exp in zip(checkpoint_grads, ref_grads):
         assert torch.allclose(got, exp, atol=2.0e-5, rtol=2.0e-4)
 
 

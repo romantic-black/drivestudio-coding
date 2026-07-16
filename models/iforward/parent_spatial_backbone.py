@@ -232,6 +232,8 @@ class ParentSpatialBackbone(nn.Module):
         event_dim: int = 64,
         token_dim: int = 64,
         param_support_dim: int = 24,
+        param_codec_detach_params: bool = True,
+        param_codec_detach_support: bool = True,
         support_embed_dim: int = 4,
         branch_embed_dim: int = 4,
         frame_gap_embed_dim: int = 4,
@@ -261,7 +263,11 @@ class ParentSpatialBackbone(nn.Module):
         self.support_threshold_distant = float(support_threshold_distant)
         self.support_threshold_rigid = float(support_threshold_rigid)
         self.support_threshold_rigid_out = float(support_threshold_rigid_out)
-        self.param_support_codec = Stage6ParentParamSupportCodec(output_dim=int(param_support_dim))
+        self.param_support_codec = Stage6ParentParamSupportCodec(
+            output_dim=int(param_support_dim),
+            detach_params=bool(param_codec_detach_params),
+            detach_support=bool(param_codec_detach_support),
+        )
         self.token_builder = ParentTokenBuilder(
             context_dim=int(context_dim),
             param_support_dim=int(param_support_dim),

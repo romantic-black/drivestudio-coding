@@ -4,7 +4,7 @@ import pytest
 from omegaconf import OmegaConf
 
 from datasets.iforward_stage2_3.index_builder import build_stage2_3_index_from_dataset
-from datasets.iforward_stage2_3.distributional_episode import _clamp_b_r_for_max_k
+from datasets.iforward_stage2_3.distributional_episode import TRAIN_2D_MODE_IDS, _clamp_b_r_for_max_k
 from datasets.iforward_stage2_3.scheduler import IFORWARD_STAGE3_2_SCHEDULER_VERSION, Stage23Scheduler
 from tests.test_iforward_stage2_3_scheduler import _Dataset
 
@@ -72,6 +72,54 @@ def test_stage3_2_parser_rejects_repeat_refine_b_above_two():
     index = build_stage2_3_index_from_dataset(dataset=ds, cfg=cfg)
 
     with pytest.raises(ValueError, match="repeat_refine"):
+        Stage23Scheduler(dataset=ds, cfg=cfg, index=index, seed=11)
+
+
+def test_stage3_2_train_2d_mode_ids_remain_compatible_and_add_feedback_modes():
+    assert TRAIN_2D_MODE_IDS == {
+        "trainable": 1,
+        "frozen_no_grad": 2,
+        "auto": 3,
+        "trainable_checkpointed": 4,
+        "frozen_input_grad_checkpointed": 5,
+    }
+
+
+def test_stage3_2_feedback_modes_select_expected_k_tables_and_hard_cap():
+    ds = _Dataset(frames=range(48))
+    cfg = _cfg()
+    cfg.scheduler_stage3_2.max_inner_k_hard_cap = 15
+    cfg.scheduler_stage3_2.episode_recipe.train_2d_policy = {
+        "repeat_refine": "trainable_checkpointed",
+        "shuffled_coverage": "trainable_checkpointed",
+        "high_block_repair": "frozen_input_grad_checkpointed",
+    }
+    index = build_stage2_3_index_from_dataset(dataset=ds, cfg=cfg)
+    sched = Stage23Scheduler(dataset=ds, cfg=cfg, index=index, seed=13)
+    compiler = sched._distributional_compiler
+    assert compiler is not None
+    phase = compiler.phase_for_step(0)
+
+    assert compiler._max_k_for(phase, compiler.distributions["repeat_refine"]) == 8
+    assert compiler._max_k_for(phase, compiler.distributions["shuffled_coverage"]) == 10
+    assert compiler._max_k_for(phase, compiler.distributions["high_block_repair"]) == 15
+
+    episode = sched._build_episode()
+    modes_and_ids = {
+        (_stage32(rollout)["train_2d_mode"], _stage32(rollout)["train_2d_mode_id"])
+        for rollout in episode.rollouts
+    }
+    assert ("trainable_checkpointed", 4) in modes_and_ids
+    assert ("frozen_input_grad_checkpointed", 5) in modes_and_ids
+
+
+def test_stage3_2_rejects_unknown_train_2d_mode_instead_of_emitting_id_zero():
+    ds = _Dataset(frames=range(48))
+    cfg = _cfg()
+    cfg.scheduler_stage3_2.episode_recipe.train_2d_policy.repeat_refine = "typo_mode"
+    index = build_stage2_3_index_from_dataset(dataset=ds, cfg=cfg)
+
+    with pytest.raises(ValueError, match="unsupported train_2d_mode='typo_mode'"):
         Stage23Scheduler(dataset=ds, cfg=cfg, index=index, seed=11)
 
 

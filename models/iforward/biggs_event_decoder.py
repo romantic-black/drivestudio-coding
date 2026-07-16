@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+import math
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -10,6 +11,7 @@ from models.streetforward.stage6_0.event_encoder import EventPack
 
 from .biggs_relational_decoder import GaussianRelationalLiftingDecoder
 from .biggs_state import BigGSBranchAssignment, BigGSRigidActiveAssignment
+from .observation_feedback import scale_feedback
 from .utils import cfg_get
 
 
@@ -119,6 +121,14 @@ class BigGSToFineEventDecoder(nn.Module):
         self.whdd_chunk_size = max(int(whdd_chunk_size), 1)
         self.decode_chunk_size = max(int(decode_chunk_size) if decode_chunk_size is not None else int(whdd_chunk_size), 1)
         self.rigid_relation_space = str(rigid_relation_space).lower()
+        self._relation_feedback_enabled = False
+        self._relation_feedback_alpha = 0.0
+        self._relation_feedback_branches = frozenset({"bg", "distant"})
+        self._relation_grad_to_child_geometry = True
+        self._relation_grad_to_parent_geometry = True
+        self._relation_grad_to_child_code = False
+        self._relation_grad_to_parent_event = True
+        self._relation_checkpoint = False
         mode_l = str(self.mode).lower()
         if mode_l not in {"whdd_compact_fixed_basis", "gaussian_relational"} and int(self.parent_event_dim) != int(self.fine_event_dim):
             raise ValueError(
@@ -187,6 +197,54 @@ class BigGSToFineEventDecoder(nn.Module):
                 detail_head_init_std=float(detail_head_init_std),
             )
 
+    def set_relation_feedback(
+        self,
+        *,
+        enabled: bool,
+        alpha: float,
+        branches: Sequence[str],
+        grad_to_child_geometry: bool,
+        grad_to_parent_geometry: bool,
+        grad_to_child_code: bool,
+        grad_to_parent_event: bool,
+        grad_to_support: bool,
+        checkpoint: bool,
+    ) -> None:
+        """Set the per-visit GRLD continuous feedback policy.
+
+        The values are copied into immutable Python scalars/sets.  Each
+        ``decode_branch`` call snapshots them into its checkpoint closure, so a
+        later rollout visit cannot change the policy used during recomputation.
+        """
+
+        alpha_f = float(alpha)
+        if not math.isfinite(alpha_f) or not 0.0 <= alpha_f <= 1.0:
+            raise ValueError("relation feedback alpha must be finite and in [0, 1]")
+        normalized = tuple(str(branch).lower() for branch in branches)
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("relation feedback branches must not contain duplicates")
+        unsupported = sorted(set(normalized) - {"bg", "distant"})
+        if unsupported:
+            raise ValueError(
+                "relation feedback supports only bg/distant; unsupported branches="
+                + ",".join(unsupported)
+            )
+        if bool(enabled) and not normalized:
+            raise ValueError("enabled relation feedback requires at least one bg/distant branch")
+        if bool(enabled) and str(self.mode).lower() != "gaussian_relational":
+            raise ValueError("relation feedback requires child_decoder.mode=gaussian_relational")
+        if bool(grad_to_support):
+            raise ValueError("relation feedback grad_to_support=true is unsupported; support must remain detached")
+
+        self._relation_feedback_enabled = bool(enabled)
+        self._relation_feedback_alpha = alpha_f
+        self._relation_feedback_branches = frozenset(normalized)
+        self._relation_grad_to_child_geometry = bool(grad_to_child_geometry)
+        self._relation_grad_to_parent_geometry = bool(grad_to_parent_geometry)
+        self._relation_grad_to_child_code = bool(grad_to_child_code)
+        self._relation_grad_to_parent_event = bool(grad_to_parent_event)
+        self._relation_checkpoint = bool(checkpoint)
+
     @classmethod
     def from_config(cls, cfg: Any, *, event_dim: int) -> "BigGSToFineEventDecoder":
         parent_event_dim = cfg_get(cfg, "parent_event_dim", event_dim)
@@ -228,6 +286,87 @@ class BigGSToFineEventDecoder(nn.Module):
             return scale
         idx = max(0, min(int(branch_id), int(scale.numel()) - 1))
         return scale[idx]
+
+    @staticmethod
+    def _relation_branch_name(branch_id: int) -> str:
+        names = {0: "bg", 1: "distant", 2: "rigid"}
+        if int(branch_id) not in names:
+            raise ValueError(f"unsupported BigGS relation branch_id={branch_id}")
+        return names[int(branch_id)]
+
+    def _relation_feedback_active(self, *, branch_id: int) -> bool:
+        return bool(self._relation_feedback_enabled) and self._relation_branch_name(
+            int(branch_id)
+        ) in self._relation_feedback_branches
+
+    def _prepare_relation_feedback_inputs(
+        self,
+        *,
+        parent_event: torch.Tensor,
+        child_params: Dict[str, torch.Tensor],
+        parent_params: Dict[str, torch.Tensor],
+        child_cache: Any,
+        branch_id: int,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor], bool, float]:
+        active = self._relation_feedback_active(branch_id=int(branch_id))
+        if not active:
+            return parent_event, child_params, parent_params, False, 0.0
+        if int(branch_id) == 2:
+            raise RuntimeError("rigid relation feedback is unsupported and must remain detached")
+        if child_cache is None:
+            raise RuntimeError("relation feedback requires a graph-free BigGS child runtime cache")
+
+        # Snapshot the scalar policy before building the checkpoint closure.
+        alpha = float(self._relation_feedback_alpha)
+
+        def routed(value: torch.Tensor, *, enabled: bool) -> torch.Tensor:
+            return scale_feedback(value, alpha) if bool(enabled) else value.detach()
+
+        child = {key: value.detach() for key, value in child_params.items()}
+        parent = {key: value.detach() for key, value in parent_params.items()}
+
+        child["means"] = routed(
+            child_params["means"],
+            enabled=bool(self._relation_grad_to_child_geometry),
+        )
+        live_diag_cov = self._diag_cov_from_scales_quats(
+            child_params["scales_log"],
+            child_params["quats"],
+        )
+        cached_diag_cov = child_cache.diag_cov.detach().to(
+            device=live_diag_cov.device,
+            dtype=live_diag_cov.dtype,
+        )
+        if tuple(cached_diag_cov.shape) != tuple(live_diag_cov.shape):
+            raise ValueError(
+                "relation feedback child_cache.diag_cov shape mismatch: "
+                f"cache={tuple(cached_diag_cov.shape)} live={tuple(live_diag_cov.shape)}"
+            )
+        if bool(self._relation_grad_to_child_geometry):
+            live_scaled = scale_feedback(live_diag_cov, alpha)
+            # Preserve the incremental runtime cache value exactly in forward,
+            # while sourcing the backward Jacobian from live scales/quats.
+            child["diag_cov"] = cached_diag_cov + (live_scaled - live_scaled.detach())
+        else:
+            child["diag_cov"] = cached_diag_cov
+
+        for key in ("opacity_logit", "sh_dc", "sh_rest"):
+            child[key] = routed(
+                child_params[key],
+                enabled=bool(self._relation_grad_to_child_code),
+            )
+            parent[key] = routed(
+                parent_params[key],
+                enabled=bool(self._relation_grad_to_child_code),
+            )
+        for key in ("means", "scales_log"):
+            parent[key] = routed(
+                parent_params[key],
+                enabled=bool(self._relation_grad_to_parent_geometry),
+            )
+
+        event = parent_event if bool(self._relation_grad_to_parent_event) else parent_event.detach()
+        return event, child, parent, bool(self._relation_checkpoint), alpha
 
     def _decode_whdd_residual(
         self,
@@ -389,10 +528,24 @@ class BigGSToFineEventDecoder(nn.Module):
                 raise RuntimeError("BigGS gaussian_relational decoder was not initialized")
             if child_cache is None or parent_stats is None or parent_start is None or child_order is None:
                 raise RuntimeError("BigGS gaussian_relational decoder requires runtime child_cache/stats and parent assignment order")
-            fine, parent_e, residual, extra_aux = self.grld_decoder.decode_branch(
+            (
+                relation_parent_event,
+                relation_child_params,
+                relation_parent_params,
+                relation_checkpoint,
+                relation_alpha,
+            ) = self._prepare_relation_feedback_inputs(
                 parent_event=parent_event,
                 child_params=child_params,
                 parent_params=parent_params,
+                child_cache=child_cache,
+                branch_id=int(branch_id),
+            )
+            relation_feedback_active = self._relation_feedback_active(branch_id=int(branch_id))
+            fine, parent_e, residual, extra_aux = self.grld_decoder.decode_branch(
+                parent_event=relation_parent_event,
+                child_params=relation_child_params,
+                parent_params=relation_parent_params,
                 child_cache=child_cache,
                 parent_stats=parent_stats,
                 child_to_parent=pid,
@@ -401,7 +554,12 @@ class BigGSToFineEventDecoder(nn.Module):
                 child_order=child_order,
                 branch_id=int(branch_id),
                 branch_scale=residual_scale,
+                checkpoint_branch=bool(relation_checkpoint),
+                detach_relation_params=False if bool(relation_feedback_active) else None,
+                detach_support=True if bool(relation_feedback_active) else None,
             )
+            extra_aux["feedback_enabled"] = 1.0 if bool(relation_feedback_active) else 0.0
+            extra_aux["feedback_alpha"] = float(relation_alpha)
             scaled_residual = residual
         else:
             parent_e = parent_event.index_select(0, pid)
@@ -456,7 +614,11 @@ class BigGSToFineEventDecoder(nn.Module):
         if not torch.isfinite(fine).all():
             raise RuntimeError("BigGS fine event contains NaN/Inf")
         mean_preserve_error = 0.0
-        if n > 0 and bool(self.mean_preserve):
+        compact_checkpoint_aux = bool(
+            mode == "gaussian_relational"
+            and float(extra_aux.get("checkpoint_compact_aux", 0.0)) > 0.0
+        )
+        if n > 0 and bool(self.mean_preserve) and not compact_checkpoint_aux:
             mean_residual = _scatter_weighted_mean(
                 residual,
                 pid,
@@ -708,6 +870,9 @@ class BigGSToFineEventDecoder(nn.Module):
             "iforward/grld/decode_ms": grld_sum("decode_ms"),
             "iforward/grld/rigid_relation_world_mode": grld_max("rigid_relation_world_mode"),
             "iforward/grld/rigid_relation_canonical_mode": grld_max("rigid_relation_canonical_mode"),
+            "iforward/grld/feedback_enabled": grld_max("feedback_enabled"),
+            "iforward/grld/feedback_alpha": grld_max("feedback_alpha"),
+            "iforward/grld/checkpoint_enabled": grld_max("checkpoint_enabled"),
             "iforward/grld/lambda_bg": float(self._residual_scale_for_branch(branch_id=0, ref=parent_event_pack.event_bg).detach().item())
             if parent_event_pack.event_bg is not None
             else 0.0,

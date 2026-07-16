@@ -473,6 +473,56 @@ def init_parent_branch_runtime(
 
 
 @torch.no_grad()
+def refresh_parent_branch_runtime_exact(
+    *,
+    runtime: BigGSParentBranchRuntime,
+    params: Dict[str, torch.Tensor],
+    child_to_parent: torch.Tensor,
+    parent_count: torch.Tensor,
+    child_mass: torch.Tensor,
+    cfg: Any,
+    child_order: Optional[torch.Tensor] = None,
+    parent_start: Optional[torch.Tensor] = None,
+    max_scale: Optional[float] = None,
+) -> BigGSParentBranchRuntime:
+    """Rebuild one graph-free runtime branch from exact diagonal statistics."""
+
+    covariance_mode = str(cfg_get(cfg, "covariance_mode", "diagonal")).lower()
+    if covariance_mode not in {"diag", "diagonal", "exact_diag", "exact_diagonal"}:
+        raise ValueError(
+            "exact parent runtime refresh requires diagonal covariance, "
+            f"got covariance_mode={covariance_mode!r}"
+        )
+    refreshed = init_parent_branch_runtime(
+        params=params,
+        child_to_parent=child_to_parent,
+        parent_count=parent_count,
+        child_mass=child_mass,
+        cfg=cfg,
+        child_order=child_order,
+        parent_start=parent_start,
+        max_scale=max_scale,
+        assignment_signature=str(runtime.assignment_signature),
+    )
+    runtime_tensors = (
+        *refreshed.params.values(),
+        refreshed.stats.weight_sum,
+        refreshed.stats.weighted_mean_sum,
+        refreshed.stats.weighted_second_sum,
+        refreshed.stats.tau_area_sum,
+        refreshed.stats.weighted_sh_dc_sum,
+        refreshed.stats.weighted_sh_rest_sum,
+        refreshed.child_cache.mass,
+        refreshed.child_cache.tau_area,
+        refreshed.child_cache.diag_cov,
+        refreshed.child_mass_mean,
+    )
+    if any(value.requires_grad or value.grad_fn is not None for value in runtime_tensors):
+        raise RuntimeError("exact parent runtime refresh must return graph-free persistent state")
+    return refreshed
+
+
+@torch.no_grad()
 def update_parent_branch_runtime(
     *,
     runtime: BigGSParentBranchRuntime,
@@ -595,5 +645,6 @@ def update_parent_branch_runtime(
 __all__ = [
     "init_parent_branch_runtime",
     "projection_from_runtime",
+    "refresh_parent_branch_runtime_exact",
     "update_parent_branch_runtime",
 ]

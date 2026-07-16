@@ -125,9 +125,27 @@ class IForwardRunner:
         if isinstance(raw.get("_iforward"), dict):
             raw["_iforward"]["validation_force_history_render"] = True
         if callable(self.convert_batch_to_minimal_format):
-            return self.convert_batch_to_minimal_format(raw, torch.device(options.device), int(options.trigger_step))
-        raw["global_step"] = int(options.trigger_step)
-        return raw
+            batch = self.convert_batch_to_minimal_format(
+                raw, torch.device(options.device), int(options.trigger_step)
+            )
+        else:
+            raw["global_step"] = int(options.trigger_step)
+            batch = raw
+        if str(options.mode) in {"validate", "demo", "replay"}:
+            # Runtime evaluation is read-only even when the training policy uses
+            # differentiable/checkpointed observation modes.  Keep distribution
+            # metadata intact for reporting and carry a separate explicit mode so
+            # synthetic events (for example freeze-after-prefill) cannot inherit
+            # or omit a training-only 2D mode.
+            request_meta = dict(batch.get("request_meta", {}) or {})
+            request_meta["observation_feedback_eval_mode"] = "frozen_no_grad"
+            batch["request_meta"] = request_meta
+            iforward_meta = batch.get("_iforward", None)
+            if isinstance(iforward_meta, dict):
+                nested_request_meta = dict(iforward_meta.get("request_meta", {}) or {})
+                nested_request_meta["observation_feedback_eval_mode"] = "frozen_no_grad"
+                iforward_meta["request_meta"] = nested_request_meta
+        return batch
 
     @staticmethod
     def _next_state(out: Any) -> Any:

@@ -274,6 +274,28 @@ class MultiSceneDatasetV4:
         self._load_sky_mask = bool(self._cfg_get(pixel_source_cfg, "load_sky_mask", False))
         self._load_dynamic_mask = bool(self._cfg_get(pixel_source_cfg, "load_dynamic_mask", False))
         self._load_egocar_mask = bool(self._cfg_get(pixel_source_cfg, "load_egocar_mask", True))
+        self._require_egocar_mask_template = bool(
+            self._cfg_get(pixel_source_cfg, "require_egocar_mask_template", False)
+        )
+        absent_cameras_raw = list(
+            self._cfg_get(pixel_source_cfg, "egocar_mask_absent_cameras", []) or []
+        )
+        self._egocar_mask_absent_cameras = {int(cam_id) for cam_id in absent_cameras_raw}
+        if any(cam_id < 0 for cam_id in self._egocar_mask_absent_cameras):
+            raise ValueError("pixel_source.egocar_mask_absent_cameras must contain non-negative camera ids")
+        configured_camera_ids = {
+            int(cam_id) for cam_id in list(self._cfg_get(pixel_source_cfg, "cameras", []) or [])
+        }
+        unknown_absent_cameras = self._egocar_mask_absent_cameras.difference(configured_camera_ids)
+        if configured_camera_ids and unknown_absent_cameras:
+            raise ValueError(
+                "pixel_source.egocar_mask_absent_cameras must be a subset of pixel_source.cameras; "
+                f"unknown={sorted(unknown_absent_cameras)}"
+            )
+        if self._require_egocar_mask_template and not self._load_egocar_mask:
+            raise ValueError(
+                "pixel_source.require_egocar_mask_template=true requires load_egocar_mask=true"
+            )
         self._sky_mask_loader_semantics = self._parse_sky_mask_semantics()
         self._pixel_source_cameras: List[int] = [int(x) for x in list(self._cfg_get(pixel_source_cfg, "cameras", []) or [])]
         self._egocar_mask_cache: "OrderedDict[Tuple[str, int, int, int], Any]" = OrderedDict()
@@ -1706,7 +1728,9 @@ class MultiSceneDatasetV4:
             arr = np.asarray(Image.open(str(path)))
         if arr.ndim == 3:
             arr = arr[..., 0]
-        t = torch.as_tensor(arr, dtype=torch.float32)
+        # PIL/mmap-backed arrays can be read-only.  Never expose that storage to
+        # PyTorch because later in-place masking/resizing would be undefined.
+        t = torch.from_numpy(np.array(arr, copy=True)).to(dtype=torch.float32)
         if t.shape[0] != int(height) or t.shape[1] != int(width):
             t = self._resize_2d_tensor_to_hw(t, int(height), int(width), mode="bilinear")
         return t
@@ -1715,7 +1739,7 @@ class MultiSceneDatasetV4:
         arr = np.asarray(Image.open(path_str))
         if arr.ndim == 3:
             arr = arr[..., 0]
-        mask = torch.as_tensor(arr, dtype=torch.float32)
+        mask = torch.from_numpy(np.array(arr, copy=True)).to(dtype=torch.float32)
         if mask.shape[0] != int(height) or mask.shape[1] != int(width):
             mask = self._resize_2d_tensor_to_hw(mask, int(height), int(width), mode="nearest")
         if mask.max().item() > 1.0:
@@ -1750,18 +1774,27 @@ class MultiSceneDatasetV4:
         path = self._resolve_egocar_mask_path(int(cam_id))
         if path is None:
             ds_name = self._asset_dataset_name()
+            declared_no_occlusion = int(cam_id) in self._egocar_mask_absent_cameras
+            if self._require_egocar_mask_template and not declared_no_occlusion:
+                raise FileNotFoundError(
+                    "Required egocar mask template is missing for "
+                    f"dataset={ds_name} cam_id={int(cam_id)}; expected "
+                    f"data/ego_masks/{ds_name}/{int(cam_id)}.png or explicitly declare this "
+                    "camera in pixel_source.egocar_mask_absent_cameras when it has no ego occlusion"
+                )
             warn_key = (ds_name, int(cam_id))
-            with self._lock:
-                if warn_key not in self._egocar_missing_warned:
-                    self._egocar_missing_warned.add(warn_key)
-                    logger.warning(
-                        "No egocar mask template for dataset=%s cam_id=%d. "
-                        "Expected file under data/ego_masks/%s/{cam_id}.png; "
-                        "ego suppression for this camera will be disabled.",
-                        ds_name,
-                        int(cam_id),
-                        ds_name,
-                    )
+            if not declared_no_occlusion:
+                with self._lock:
+                    if warn_key not in self._egocar_missing_warned:
+                        self._egocar_missing_warned.add(warn_key)
+                        logger.warning(
+                            "No egocar mask template for dataset=%s cam_id=%d. "
+                            "Expected file under data/ego_masks/%s/{cam_id}.png; "
+                            "ego suppression for this camera will be disabled.",
+                            ds_name,
+                            int(cam_id),
+                            ds_name,
+                        )
             with self._lock:
                 self._cache_set(
                     self._egocar_mask_cache,

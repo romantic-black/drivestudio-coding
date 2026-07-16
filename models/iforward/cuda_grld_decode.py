@@ -74,15 +74,23 @@ class _GRLDDecodeFn(torch.autograd.Function):
             scale,
         )
         ctx.save_for_backward(
-            base,
-            detail,
-            gate,
-            coeff,
-            child_to_parent.to(device=base.device, dtype=torch.long),
-            child_order.to(device=base.device, dtype=torch.long),
-            parent_start.to(device=base.device, dtype=torch.long),
-            parent_count.to(device=base.device, dtype=torch.long),
-            scale,
+            # Non-reentrant activation checkpointing replays this custom
+            # Function while its original inputs are saved leaves.  Saving
+            # those leaves directly makes PyTorch 2.0 try to recover a grad
+            # accumulator for the replayed SavedVariable and fails with
+            # ``No grad accumulator for a saved leaf``.  Backward only needs
+            # the forward values, so graph-free views are the correct state to
+            # retain here; gradients are still returned for the original
+            # Function inputs below.
+            base.detach(),
+            detail.detach(),
+            gate.detach(),
+            coeff.detach(),
+            child_to_parent.to(device=base.device, dtype=torch.long).detach(),
+            child_order.to(device=base.device, dtype=torch.long).detach(),
+            parent_start.to(device=base.device, dtype=torch.long).detach(),
+            parent_count.to(device=base.device, dtype=torch.long).detach(),
+            scale.detach(),
         )
         return out
 

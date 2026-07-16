@@ -39,6 +39,7 @@ from .iforward_v6_state import IForwardV6MemoryState
 from .local_conflict_xcpe import IForwardLocalConflictXcpe
 from .memory import IForwardMemoryStepContext, IForwardSceneMemory
 from .parent_spatial_backbone import ParentSpatialBackbone
+from .observation_feedback import ObservationFeedbackPolicy
 from .parent_temporal_keys import ParentTemporalKeys, build_parent_temporal_keys
 from .parent_temporal_mamba import ParentTemporalMemory
 from .parent_temporal_state import ParentTemporalState
@@ -546,6 +547,7 @@ class IForwardModel(nn.Module):
 
         event_dim = int(getattr(self.bridge, "event_dim", 48))
         iforward_cfg = cfg_get(cfg_get(config, "model", {}) or {}, "iforward", {}) or {}
+        self.observation_feedback_policy = ObservationFeedbackPolicy.from_config(config or {})
         self.iforward_version = str(cfg_get(iforward_cfg, "version", "v1"))
         self.is_stage3_1_lowrank_gdkv = is_stage3_1_iforward_version(self.iforward_version)
         self.is_stage3_0_full_sparse_gather_lift = is_stage3_optimizer_memory_iforward_version(self.iforward_version)
@@ -766,6 +768,11 @@ class IForwardModel(nn.Module):
                     event_dim=int(cfg_get(parent_spatial_cfg, "event_dim", 64)),
                     token_dim=int(cfg_get(parent_spatial_cfg, "token_dim", cfg_get(parent_spatial_cfg, "event_dim", 64))),
                     param_support_dim=int(cfg_get(parent_spatial_cfg, "param_support_dim", 24)),
+                    param_codec_detach_params=not bool(
+                        self.observation_feedback_policy.enable
+                        and self.observation_feedback_policy.parent_projection.enable
+                    ),
+                    param_codec_detach_support=True,
                     support_embed_dim=int(cfg_get(parent_spatial_cfg, "support_embed_dim", 4)),
                     branch_embed_dim=int(cfg_get(parent_spatial_cfg, "branch_embed_dim", 4)),
                     near_depth=int(cfg_get(parent_ptv3_cfg, "depth", 4)),
@@ -2150,6 +2157,10 @@ class IForwardModel(nn.Module):
             observe_batch["_iforward"] = ifwd_meta
 
         global_step = int(batch.get("global_step", 0))
+        feedback_schedule_step = int(batch.get("feedback_schedule_step", global_step) or 0)
+        feedback_activation_global_step = int(
+            batch.get("feedback_activation_global_step", 0) or 0
+        )
         history_damage_weight = self._history_damage_loss_weight_for_step(global_step)
         history_damage_probe: Optional[HistoryDamageProbe] = None
         if self.is_stage2_1_parent_temporal and float(history_damage_weight) > 0.0:
@@ -2202,11 +2213,18 @@ class IForwardModel(nn.Module):
                     )
                     visit_meta = {
                         "global_step": int(global_step),
+                        "feedback_schedule_step": int(feedback_schedule_step),
+                        "feedback_activation_global_step": int(feedback_activation_global_step),
                         "step_idx": int(getattr(step, "step_idx", 0)),
                         "repeat_idx": int(getattr(step, "repeat_idx", 0)),
                         "repeat_budget": int(getattr(step, "repeat_budget", 0)),
                         "visit_kind": str(getattr(step, "visit_kind", "")),
                     }
+                    feedback_eval_mode = dict(observe_batch.get("request_meta") or {}).get(
+                        "observation_feedback_eval_mode", None
+                    )
+                    if feedback_eval_mode is not None:
+                        visit_meta["observation_feedback_eval_mode"] = str(feedback_eval_mode)
                     if stage3_2_visit_meta:
                         for meta_key in (
                             "distribution_type",

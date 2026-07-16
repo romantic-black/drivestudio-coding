@@ -28,12 +28,20 @@ from models.iforward.biggs_parent_projector import (
 from models.iforward.biggs_parent_stats import (
     init_parent_branch_runtime,
     projection_from_runtime,
+    refresh_parent_branch_runtime_exact,
     update_parent_branch_runtime,
 )
 from models.iforward.biggs_state import BigGSBlockRuntime, IForwardBigGSState
 from models.iforward.dino_feature_cache import DINOFeatureCache
 from models.iforward.fwhr_lift import aggregate_fwhr_child_lift
 from models.iforward.amp_policy import amp_dtype_id, build_amp_policy, storage_dtype_from_name
+from models.iforward.observation_feedback import FeedbackMode, ObservationFeedbackPolicy
+from models.iforward.runtime_parent_projection_vjp import (
+    ParentVJPDriftPolicy,
+    RuntimeParentVJPDriftCollector,
+    parent_projection_feedback,
+    runtime_exact_drift,
+)
 from models.iforward.parent_spatial_backbone import ParentStructInput, empty_parent_struct_input
 from models.iforward.stage3_0 import (
     GatherConfig,
@@ -137,8 +145,18 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         finally:
             self._stage6_bootstrapping_parent = False
         self.config = config
+        self.observation_feedback_policy = ObservationFeedbackPolicy.from_config(config)
+        self._parent_vjp_drift_collector = RuntimeParentVJPDriftCollector()
+        self._parent_vjp_force_refresh_branches: set[str] = set()
+        self._parent_vjp_sampled_branches: set[str] = set()
+        self._observation_feedback_grad_records: Dict[str, List[torch.Tensor]] = defaultdict(list)
+        self._observation_feedback_probe_modes_seen: set[str] = set()
+        self._observation_feedback_probe_modes_current: set[str] = set()
+        self._observation_feedback_force_probe_current = False
+        self._observation_feedback_parity_steps_seen: set[int] = set()
         self._validate_stage6_0_config(config)
         self._configure_measurement_frontend_trainability(config)
+        self._validate_observation_feedback_runtime(config)
         self._init_stage6_modules(config)
         self._configure_stage6_trainability_after_module_init(config)
         self._rebuild_stage6_optimizer(config)
@@ -1126,6 +1144,392 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             bool(is_stage2_biggs) and self.stage6_source_evidence_grad_mode == "no_grad_v4"
         ):
             raise ValueError("Stage6_0 Phase A from_scratch did not enable any 2D frontend parameters.")
+
+    def _validate_observation_feedback_runtime(self, config: Any) -> None:
+        policy = getattr(self, "observation_feedback_policy", None)
+        if not isinstance(policy, ObservationFeedbackPolicy) or not bool(policy.enable):
+            return
+        scheduler_cfg = self._cfg_get(config, "scheduler_stage3_2", {}) or {}
+        episode_recipe = self._cfg_get(scheduler_cfg, "episode_recipe", {}) or {}
+        scheduler_modes = self._cfg_get(episode_recipe, "train_2d_policy", {}) or {}
+        policy.validate_scheduler_modes(dict(scheduler_modes))
+
+        model_cfg = self._require_key(config, "model", "config")
+        iforward_cfg = self._cfg_get(model_cfg, "iforward", {}) or {}
+        biggs_cfg = self._cfg_get(iforward_cfg, "biggs", {}) or {}
+        observe_cfg = self._cfg_get(biggs_cfg, "observe", {}) or {}
+        stage6_cfg = self._require_key(model_cfg, "stage6_0", "model")
+        measurement_cfg = self._require_key(stage6_cfg, "base_measurement", "model.stage6_0")
+        local_rollout_cfg = self._require_key(stage6_cfg, "local_rollout", "model.stage6_0")
+        repair_cfg = self._cfg_get(iforward_cfg, "repair_training", {}) or {}
+
+        if not bool(self._cfg_get(local_rollout_cfg, "local_G_no_detach_between_steps", False)):
+            raise ValueError(
+                "observation feedback requires local_G_no_detach_between_steps=true within a rollout"
+            )
+        if bool(self._cfg_get(local_rollout_cfg, "detach_persistent_state_at_block_start", False)):
+            raise ValueError(
+                "observation feedback forbids detach_persistent_state_at_block_start inside a rollout"
+            )
+
+        if bool(policy.source_render.enable):
+            if bool(self._cfg_get(observe_cfg, "parent_scene_for_cnn", True)):
+                raise ValueError("observation feedback source render requires biggs.observe.parent_scene_for_cnn=false")
+            if bool(self._cfg_get(measurement_cfg, "detach_source_render_for_cnn", True)):
+                raise ValueError(
+                    "observation feedback requires stage6_0.base_measurement.detach_source_render_for_cnn=false"
+                )
+            if str(self._cfg_get(measurement_cfg, "source_evidence_grad_mode", "no_grad_v4")) == "no_grad_v4":
+                raise ValueError("observation feedback source render requires a grad-enabled source_evidence_grad_mode")
+            conflicting = {
+                "freeze_2d_frontend": bool(self._cfg_get(repair_cfg, "freeze_2d_frontend", False)),
+                "no_grad_2d_forward": bool(self._cfg_get(repair_cfg, "no_grad_2d_forward", False)),
+                "stage3_2_train_2d_policy_override": bool(
+                    self._cfg_get(repair_cfg, "stage3_2_train_2d_policy_override", False)
+                ),
+            }
+            enabled_conflicts = sorted(key for key, value in conflicting.items() if value)
+            if enabled_conflicts:
+                raise ValueError(
+                    "observation feedback mode is the sole 2D policy; disable legacy repair flags: "
+                    + ", ".join(enabled_conflicts)
+                )
+            extractor = getattr(self, "image_feature_extractor", None)
+            if not isinstance(extractor, nn.Module):
+                raise RuntimeError("observation feedback requires image_feature_extractor")
+            dynamic_modules = [
+                module
+                for module in (
+                    getattr(extractor, "residual_unet", None),
+                    getattr(extractor, "fusion_neck", None),
+                    getattr(extractor, "detail_head", None),
+                )
+                if isinstance(module, nn.Module)
+            ]
+            for root in dynamic_modules:
+                for module in root.modules():
+                    if isinstance(module, nn.modules.batchnorm._BatchNorm):
+                        raise ValueError(
+                            "checkpointed observation feedback forbids BatchNorm state mutation; use GroupNorm"
+                        )
+                    if isinstance(module, nn.modules.dropout._DropoutNd) and float(module.p) > 0.0:
+                        raise ValueError(
+                            "checkpointed observation feedback uses preserve_rng_state=false and forbids dropout"
+                        )
+
+        if bool(policy.parent_projection.enable or policy.relation.enable):
+            parent_state_cfg = self._cfg_get(biggs_cfg, "parent_state", {}) or {}
+            projector_cfg = self._cfg_get(biggs_cfg, "parent_projector", {}) or {}
+            if str(self._cfg_get(parent_state_cfg, "mode", "none")).lower() != "incremental_sufficient_stats":
+                raise ValueError(
+                    "parent/relation feedback requires parent_state.mode=incremental_sufficient_stats"
+                )
+            if str(self._cfg_get(parent_state_cfg, "stats_dtype", "")).lower() != "float32" or str(
+                self._cfg_get(parent_state_cfg, "child_cache_dtype", "")
+            ).lower() != "float32":
+                raise ValueError("parent/relation feedback requires FP32 parent stats and child cache")
+            backend = str(self._cfg_get(projector_cfg, "backend", "")).lower()
+            if backend not in {"cuda_exact_diag_forward_only", "cuda_exact_diagonal_forward_only"}:
+                raise ValueError(
+                    "parent/relation feedback requires the CUDA exact-diagonal forward-only projector"
+                )
+
+        if bool(policy.relation.enable):
+            child_decoder_cfg = self._cfg_get(biggs_cfg, "child_decoder", {}) or {}
+            if str(self._cfg_get(child_decoder_cfg, "mode", "")).lower() != "gaussian_relational":
+                raise ValueError("relation feedback requires biggs.child_decoder.mode=gaussian_relational")
+            if not bool(policy.relation.checkpoint):
+                raise ValueError("relation feedback requires relation.checkpoint=true")
+            if not bool(self._cfg_get(child_decoder_cfg, "fused_cuda", False)):
+                raise ValueError("relation feedback requires the fused CUDA GRLD decoder")
+
+    def _observation_feedback_for_visit(
+        self,
+        visit_meta: Optional[Dict[str, Any]],
+    ) -> Tuple[FeedbackMode, float, float, float]:
+        policy = getattr(self, "observation_feedback_policy", ObservationFeedbackPolicy())
+        if not bool(policy.enable):
+            raw_mode = self._repair_training_train_2d_mode(visit_meta)
+            mode = FeedbackMode.parse(raw_mode) if raw_mode else FeedbackMode.AUTO
+            return mode, 0.0, 0.0, 0.0
+        if not isinstance(visit_meta, dict):
+            raise ValueError("enabled observation feedback requires per-visit scheduler metadata")
+        mode = policy.mode_for_visit(visit_meta)
+        step = int(
+            visit_meta.get(
+                "feedback_schedule_step",
+                policy.schedule_step(int(visit_meta.get("global_step", 0) or 0)),
+            )
+            or 0
+        )
+        self.stage3_0_feedback_schedule_step = int(step)
+        mode_name = str(mode.value)
+        self._observation_feedback_probe_modes_current.add(mode_name)
+        if mode_name not in self._observation_feedback_probe_modes_seen:
+            self._observation_feedback_force_probe_current = True
+        if not bool(mode.input_grad_enabled):
+            return mode, 0.0, 0.0, 0.0
+        return (
+            mode,
+            float(policy.source_alpha(step)),
+            float(policy.parent_alpha(step)),
+            float(policy.relation_alpha(step)),
+        )
+
+    @staticmethod
+    def _feedback_child_params(branch: Any) -> Dict[str, torch.Tensor]:
+        return {
+            "means": branch.means,
+            "scales_log": branch.scales_log,
+            "quats": branch.quats,
+            "opacity_logit": branch.opacity_logit,
+            "sh_dc": branch.sh_dc,
+            "sh_rest": branch.sh_rest,
+        }
+
+    def reset_observation_feedback_runtime_stats(self) -> None:
+        self._parent_vjp_drift_collector.clear()
+        self._parent_vjp_sampled_branches.clear()
+        self._observation_feedback_grad_records.clear()
+        self._observation_feedback_probe_modes_current.clear()
+        self._observation_feedback_force_probe_current = False
+
+    def consume_observation_feedback_runtime_stats(self, *, grad_scale: float = 1.0) -> Dict[str, float]:
+        metrics: Dict[str, float] = {}
+        collector = self._parent_vjp_drift_collector
+        for branch in ("bg", "distant"):
+            records = collector.records(branch)
+            if not records:
+                continue
+            prefix = f"feedback/parent_vjp/runtime_exact_rel_error/{branch}"
+            per_record = [record.metric_tensors(prefix=prefix) for record in records]
+            for key in per_record[0]:
+                values = torch.stack(
+                    [item[key].detach().float().reshape(()).cpu() for item in per_record]
+                )
+                # Backward visits are reported in reverse-forward order.  Reduce
+                # explicitly instead of treating list[-1] as the latest visit.
+                reduced = values.min() if str(key).endswith("/effective_alpha") else values.max()
+                metrics[str(key)] = float(reduced.item())
+            metrics[f"feedback/parent_vjp/{branch}/backward_reports"] = float(len(records))
+            if any(report.requires_exact_refresh() for report in records):
+                self._parent_vjp_force_refresh_branches.add(branch)
+        collector.clear()
+        scale = max(float(grad_scale), 1.0e-12)
+        source_norms: List[torch.Tensor] = []
+        for name, records in self._observation_feedback_grad_records.items():
+            if not records:
+                continue
+            stacked = torch.stack([value.detach().float().cpu() for value in records]) / scale
+            metrics[f"feedback/grad/{name}"] = float(stacked.norm().item())
+            if str(name).startswith("source_render_input/"):
+                source_norms.extend(records)
+        if source_norms:
+            source_stacked = torch.stack([value.detach().float().cpu() for value in source_norms]) / scale
+            metrics["feedback/source_render_input_grad_norm"] = float(source_stacked.norm().item())
+        if self._observation_feedback_force_probe_current:
+            metrics["feedback/grad_probe/forced_first_mode"] = 1.0
+            mode_ids = {
+                FeedbackMode.TRAINABLE_CHECKPOINTED.value: 4,
+                FeedbackMode.FROZEN_INPUT_GRAD_CHECKPOINTED.value: 5,
+                FeedbackMode.FROZEN_NO_GRAD.value: 2,
+            }
+            for mode_name in sorted(self._observation_feedback_probe_modes_current):
+                metrics[f"feedback/grad_probe/first_mode/{mode_name}"] = 1.0
+                metrics["feedback/grad_probe/forced_mode_id"] = float(mode_ids.get(mode_name, 0))
+        self._observation_feedback_probe_modes_seen.update(
+            self._observation_feedback_probe_modes_current
+        )
+        self._observation_feedback_grad_records.clear()
+        return metrics
+
+    def _register_observation_feedback_grad_probe(self, tensor: torch.Tensor, *, name: str) -> None:
+        policy = getattr(self, "observation_feedback_policy", ObservationFeedbackPolicy())
+        interval = int(policy.debug.grad_probe_interval)
+        schedule_step = int(
+            getattr(self, "stage3_0_feedback_schedule_step", self.stage3_0_global_step)
+        )
+        interval_due = bool(interval > 0 and schedule_step % interval == 0)
+        if (
+            not bool(self._observation_feedback_force_probe_current or interval_due)
+            or not bool(tensor.requires_grad)
+        ):
+            return
+
+        def record(grad: torch.Tensor, *, key: str = str(name)) -> torch.Tensor:
+            self._observation_feedback_grad_records[key].append(grad.detach().float().norm())
+            return grad
+
+        tensor.register_hook(record)
+
+    @staticmethod
+    def _observation_feedback_forward_parity_stats(
+        actual: Dict[str, Any],
+        reference: Dict[str, Any],
+    ) -> Dict[str, float]:
+        pairs = (
+            ("source_rgb", "source_rgb"),
+            ("features_2d", "features_2d"),
+            ("detail_2d", "fwhr_detail_2d"),
+            ("dino_native_2d", "stage3_dino_native_2d"),
+            ("source_pair_valid_mask", "source_pair_valid_mask"),
+        )
+        stats: Dict[str, float] = {
+            "iforward/feedback/parity/executed": 1.0,
+            "iforward/feedback/parity/pass": 1.0,
+            "iforward/feedback/parity/downstream_input_pass": 1.0,
+        }
+        compared = 0
+        failures: List[str] = []
+        for label, key in pairs:
+            lhs = actual.get(key)
+            rhs = reference.get(key)
+            if lhs is None and rhs is None:
+                continue
+            if not torch.is_tensor(lhs) or not torch.is_tensor(rhs):
+                raise RuntimeError(f"feedback parity {label} presence/type mismatch")
+            if tuple(lhs.shape) != tuple(rhs.shape):
+                raise RuntimeError(
+                    f"feedback parity {label} shape mismatch: {tuple(lhs.shape)} vs {tuple(rhs.shape)}"
+                )
+            lhs_f = lhs.detach().float()
+            rhs_f = rhs.detach().float().to(device=lhs_f.device)
+            diff = lhs_f - rhs_f
+            max_abs = float(diff.abs().max().item()) if int(diff.numel()) > 0 else 0.0
+            value_peak = float(
+                torch.maximum(lhs_f.abs().max(), rhs_f.abs().max()).item()
+            ) if int(diff.numel()) > 0 else 0.0
+            max_rel_to_peak = float(max_abs / max(value_peak, 1.0e-8))
+            rel_rms = float(
+                diff.square().mean().sqrt().div(rhs_f.square().mean().sqrt().clamp_min(1.0e-8)).item()
+            ) if int(diff.numel()) > 0 else 0.0
+            low_precision = lhs.dtype in {torch.float16, torch.bfloat16} or rhs.dtype in {
+                torch.float16,
+                torch.bfloat16,
+            }
+            amp_active = bool(torch.is_autocast_enabled())
+            atol = 1.0e-3 if low_precision else 1.0e-5
+            rtol = 1.0e-3 if low_precision else 1.0e-5
+            try:
+                torch.testing.assert_close(lhs_f, rhs_f, atol=atol, rtol=rtol)
+            except AssertionError:
+                # The frozen DINO adapter/fusion uses CUDA interpolation and
+                # convolution kernels whose repeated AMP executions are not
+                # bitwise identical.  A fixed absolute peak bound is invalid
+                # here because freshly initialized feature amplitudes vary by
+                # scene and seed.  Accept only when both the global relative RMS
+                # and the worst error relative to the feature peak are bounded;
+                # renderer, residual detail, masks and FP32 execution remain on
+                # strict assert_close above.
+                amp_relative_ok = bool(
+                    amp_active
+                    and label == "features_2d"
+                    and rel_rms <= 1.0e-2
+                    and max_rel_to_peak <= 2.0e-2
+                )
+                if amp_relative_ok:
+                    stats["iforward/feedback/parity/amp_relative_tolerance_used"] = 1.0
+                else:
+                    failures.append(
+                        f"{label}(max_abs={max_abs:.6g},value_peak={value_peak:.6g},"
+                        f"max_rel_to_peak={max_rel_to_peak:.6g},rel_rms={rel_rms:.6g},"
+                        f"atol={atol},rtol={rtol})"
+                    )
+            stats[f"iforward/feedback/parity/{label}_max_abs"] = max_abs
+            stats[f"iforward/feedback/parity/{label}_value_peak"] = value_peak
+            stats[f"iforward/feedback/parity/{label}_max_rel_to_peak"] = max_rel_to_peak
+            stats[f"iforward/feedback/parity/{label}_rel_rms"] = rel_rms
+            compared += 1
+        if compared < 3:
+            raise RuntimeError(
+                f"observation feedback forward parity compared too few tensors: {compared}"
+            )
+        if failures:
+            raise RuntimeError(
+                "observation feedback forward parity failed: " + "; ".join(failures)
+            )
+        stats["iforward/feedback/parity/tensor_count"] = float(compared)
+        return stats
+
+    def _stage2_0_attach_parent_feedback(
+        self,
+        *,
+        branch_name: str,
+        runtime_projection: BigGSParentProjection,
+        runtime_branch: Any,
+        child_branch: Any,
+        assignment: Any,
+        alpha: float,
+        global_step: int,
+    ) -> Tuple[BigGSParentProjection, Any, Dict[str, float]]:
+        policy = self.observation_feedback_policy.parent_projection
+        branch_name = str(branch_name)
+        if branch_name not in set(policy.branches):
+            return runtime_projection, runtime_branch, {}
+        if runtime_branch is None:
+            raise RuntimeError(f"parent feedback requires persistent runtime branch {branch_name}")
+        params = self._feedback_child_params(child_branch)
+        branch_cfg = self._stage2_0_parent_runtime_cfg_for_branch(branch_name)
+        max_scale = self._stage2_0_biggs_max_scale(branch_name)
+        drift_policy = ParentVJPDriftPolicy.from_config(policy.drift)
+        sampled_stats: Dict[str, float] = {}
+        force_refresh = branch_name in self._parent_vjp_force_refresh_branches
+        scheduled_sample = bool(
+            drift_policy.should_sample(int(global_step))
+            and branch_name not in self._parent_vjp_sampled_branches
+        )
+        should_sample = bool(force_refresh or scheduled_sample)
+        if should_sample:
+            # A training step may contain K visits.  Drift interval is expressed
+            # in optimizer steps, so sample each branch at most once per step.
+            self._parent_vjp_sampled_branches.add(branch_name)
+            report = runtime_exact_drift(
+                runtime_projection,
+                child_params=params,
+                child_mass=assignment.child_mass,
+                child_to_parent=assignment.child_to_parent,
+                parent_count=assignment.parent_count,
+                projector_cfg=branch_cfg,
+                max_scale=max_scale,
+                alpha=float(alpha),
+                drift_policy=drift_policy,
+                branch=branch_name,
+            )
+            for key, value in report.metric_tensors(
+                prefix=f"feedback/parent_vjp/runtime_exact_rel_error/{branch_name}/sampled"
+            ).items():
+                sampled_stats[str(key)] = float(value.detach().float().cpu().item())
+            if bool(force_refresh or report.requires_exact_refresh()):
+                runtime_branch = refresh_parent_branch_runtime_exact(
+                    runtime=runtime_branch,
+                    params=params,
+                    child_to_parent=assignment.child_to_parent,
+                    parent_count=assignment.parent_count,
+                    child_mass=assignment.child_mass,
+                    cfg=branch_cfg,
+                    child_order=assignment.child_order,
+                    parent_start=assignment.parent_start,
+                    max_scale=max_scale,
+                )
+                runtime_projection = projection_from_runtime(runtime_branch)
+                sampled_stats[f"feedback/parent_vjp/{branch_name}/exact_refresh"] = 1.0
+                self._parent_vjp_force_refresh_branches.discard(branch_name)
+            else:
+                sampled_stats[f"feedback/parent_vjp/{branch_name}/exact_refresh"] = 0.0
+        runtime_projection = parent_projection_feedback(
+            runtime_projection,
+            child_params=params,
+            child_mass=assignment.child_mass,
+            child_to_parent=assignment.child_to_parent,
+            parent_count=assignment.parent_count,
+            projector_cfg=branch_cfg,
+            max_scale=max_scale,
+            alpha=float(alpha),
+            drift_policy=drift_policy,
+            drift_collector=self._parent_vjp_drift_collector,
+            branch=branch_name,
+        )
+        return runtime_projection, runtime_branch, sampled_stats
 
     def _init_stage6_modules(self, config: Any) -> None:
         model_cfg = self._require_key(config, "model", "config")
@@ -3646,6 +4050,26 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         biggs_observe_perf: Dict[str, float] = {}
         if isinstance(visit_meta, dict) and "global_step" in visit_meta:
             self.stage3_0_global_step = int(visit_meta.get("global_step", 0) or 0)
+        feedback_policy = getattr(self, "observation_feedback_policy", ObservationFeedbackPolicy())
+        feedback_mode, render_feedback_alpha, parent_feedback_alpha, relation_feedback_alpha = (
+            self._observation_feedback_for_visit(visit_meta)
+        )
+        source_feedback_enabled = bool(
+            feedback_policy.enable
+            and feedback_policy.source_render.enable
+            and feedback_mode.checkpointed
+            and feedback_mode.input_grad_enabled
+        )
+        parent_feedback_enabled = bool(
+            feedback_policy.enable
+            and feedback_policy.parent_projection.enable
+            and feedback_mode.input_grad_enabled
+        )
+        relation_feedback_enabled = bool(
+            feedback_policy.enable
+            and feedback_policy.relation.enable
+            and feedback_mode.input_grad_enabled
+        )
 
         def _record_observe_time(name: str, start: float) -> None:
             biggs_observe_perf[f"iforward/biggs/time_observe_{name}_ms"] = float((time.perf_counter() - start) * 1000.0)
@@ -3683,6 +4107,49 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 int(source_frame_idx),
                 torch.zeros((0,), dtype=torch.long, device=self.device),
             )
+        bg_feedback = None
+        distant_feedback = None
+        rigid_feedback = None
+        route_feedback = None
+        if bool(source_feedback_enabled or parent_feedback_enabled or relation_feedback_enabled):
+            bg_feedback, distant_feedback, rigid_feedback = self._local_to_node_states(local_state, detach=False)
+            for branch_name, branch_value in (
+                ("bg", bg_feedback),
+                ("distant", distant_feedback),
+                ("rigid", rigid_feedback),
+            ):
+                if branch_value is None:
+                    continue
+                for param_name in ("means", "scales_log", "quats", "opacity_logit", "sh_dc", "sh_rest"):
+                    self._register_observation_feedback_grad_probe(
+                        getattr(branch_value, param_name),
+                        name=f"local_before_observe/{branch_name}/{param_name}",
+                    )
+            route_feedback = route
+            if rigid_feedback is not None and int(route.S.numel()) > 0:
+                s_feedback = route.S.long()
+                point_ids_feedback = rigid_feedback.point_ids.index_select(0, s_feedback)[:, 0]
+                means_world_feedback = self._transform_rigid_to_world(
+                    rigid_feedback,
+                    rigid_feedback.means.index_select(0, s_feedback),
+                    int(source_frame_idx),
+                    point_ids_subset=point_ids_feedback,
+                )
+                quats_world_feedback = self._transform_rigid_quats_to_world(
+                    rigid_feedback,
+                    rigid_feedback.quats.index_select(0, s_feedback),
+                    int(source_frame_idx),
+                    point_ids_subset=point_ids_feedback,
+                )
+                route_feedback = type(route)(
+                    S=route.S.detach(),
+                    S_in=route.S_in.detach(),
+                    S_out=route.S_out.detach(),
+                    inside_mask_S=route.inside_mask_S.detach(),
+                    route_inside_global=route.route_inside_global.detach(),
+                    means_world_S=means_world_feedback,
+                    quats_world_S=quats_world_feedback,
+                )
         _record_observe_time("rigid_route", t0)
         t0 = time.perf_counter()
         state_cpu, state, assignment_cache_stats = self._stage2_0_get_or_build_biggs_state_for_observe(
@@ -3889,7 +4356,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             )
             next_parent_runtime.block_id = int(self._stage2_0_biggs_parent_runtime_block_counter)
         drift_stats: Dict[str, float] = {}
-        if bool(parent_runtime_enabled) and bool(runtime_reuse):
+        if bool(parent_runtime_enabled) and bool(runtime_reuse) and not bool(parent_feedback_enabled):
             drift_stats = self._stage2_0_maybe_check_parent_runtime_drift(
                 runtime=next_parent_runtime,
                 bg=bg_m,
@@ -3897,6 +4364,47 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 rigid=rigid_m,
                 source_frame_idx=int(source_frame_idx),
             )
+
+        parent_feedback_stats: Dict[str, float] = {}
+        if bool(parent_feedback_enabled):
+            if not bool(parent_runtime_enabled) or next_parent_runtime is None:
+                raise RuntimeError("parent projection feedback requires incremental parent runtime state")
+            if bg_feedback is None:
+                raise RuntimeError("parent projection feedback requires attached bg LocalGS tensors")
+            bg_proj, next_parent_runtime.bg, bg_feedback_stats = self._stage2_0_attach_parent_feedback(
+                branch_name="bg",
+                runtime_projection=bg_proj,
+                runtime_branch=next_parent_runtime.bg,
+                child_branch=bg_feedback,
+                assignment=state.bg,
+                alpha=float(parent_feedback_alpha),
+                global_step=int(self.stage3_0_global_step),
+            )
+            parent_feedback_stats.update(bg_feedback_stats)
+            if (
+                distant_proj is not None
+                and distant_feedback is not None
+                and state.distant is not None
+                and next_parent_runtime.distant is not None
+            ):
+                distant_proj, next_parent_runtime.distant, distant_feedback_stats = (
+                    self._stage2_0_attach_parent_feedback(
+                        branch_name="distant",
+                        runtime_projection=distant_proj,
+                        runtime_branch=next_parent_runtime.distant,
+                        child_branch=distant_feedback,
+                        assignment=state.distant,
+                        alpha=float(parent_feedback_alpha),
+                        global_step=int(self.stage3_0_global_step),
+                    )
+                )
+                parent_feedback_stats.update(distant_feedback_stats)
+            refreshes = sum(
+                int(value > 0.0)
+                for key, value in parent_feedback_stats.items()
+                if str(key).endswith("/exact_refresh")
+            )
+            next_parent_runtime.exact_refresh_count += int(refreshes)
 
         t_scene_source = time.perf_counter()
         parts = [self._stage2_0_scene_parts_from_params(bg_proj.params)]
@@ -3923,12 +4431,34 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             cnn_scene = fine_scene
         elif not bool(parent_scene_for_cnn):
             cnn_scene = fine_scene
+        if bool(source_feedback_enabled):
+            if bool(parent_scene_for_cnn):
+                raise RuntimeError("source observation feedback cannot render the detached parent scene")
+            if bg_feedback is None or route_feedback is None:
+                raise RuntimeError("source observation feedback failed to construct attached LocalGS view")
+            cnn_scene = self._stage2_0_fine_scene_from_state(
+                bg=bg_feedback,
+                distant=distant_feedback,
+                rigid=rigid_feedback,
+                route=route_feedback,
+            )
+            for param_name, value in cnn_scene.items():
+                self._register_observation_feedback_grad_probe(
+                    value,
+                    name=f"source_render_input/{param_name}",
+                )
         _record_observe_time("parent_scene_source", t_scene_source)
         repair_training_active = bool(self._repair_training_enabled_for_visit(visit_meta))
         repair_freeze_2d = bool(self._repair_training_freeze_2d_for_visit(visit_meta))
         repair_no_grad_2d = bool(self._repair_training_no_grad_2d_for_visit(visit_meta))
         repair_train_2d_mode = self._repair_training_train_2d_mode(visit_meta)
-        repair_train_2d_mode_id = {"trainable": 1, "frozen_no_grad": 2, "auto": 3}.get(str(repair_train_2d_mode), 0)
+        repair_train_2d_mode_id = {
+            "trainable": 1,
+            "frozen_no_grad": 2,
+            "auto": 3,
+            "trainable_checkpointed": 4,
+            "frozen_input_grad_checkpointed": 5,
+        }.get(str(repair_train_2d_mode), 0)
         repair_training_aux: Dict[str, float] = {
             "iforward/repair_training/enabled": 1.0 if bool(repair_training_active) else 0.0,
             "iforward/repair_training/freeze_2d_frontend": 1.0 if bool(repair_freeze_2d) else 0.0,
@@ -3953,6 +4483,22 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             height=height,
             width=width,
         )
+        feedback_schedule_step = int(
+            (visit_meta or {}).get(
+                "feedback_schedule_step",
+                (visit_meta or {}).get("global_step", 0),
+            )
+            or 0
+        )
+        parity_interval = int(feedback_policy.debug.forward_parity_interval)
+        parity_due = bool(
+            source_feedback_enabled
+            and parity_interval > 0
+            and feedback_schedule_step % parity_interval == 0
+            and feedback_schedule_step not in self._observation_feedback_parity_steps_seen
+        )
+        if parity_due:
+            self._observation_feedback_parity_steps_seen.add(feedback_schedule_step)
         cnn_ctx = torch.no_grad() if bool(repair_no_grad_2d) else nullcontext()
         with cnn_ctx:
             cnn_inputs = self._render_source_scene_only_for_cnn(
@@ -3964,7 +4510,34 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 height=height,
                 width=width,
                 dino_cache_key=dino_cache_key,
+                feedback_enabled=bool(source_feedback_enabled),
+                feedback_alpha=float(render_feedback_alpha),
+                checkpoint_dynamic=bool(source_feedback_enabled),
+                capture_source_rgb=bool(parity_due),
             )
+        if parity_due:
+            detached_scene = {str(key): value.detach() for key, value in cnn_scene.items()}
+            with torch.no_grad():
+                parity_reference = self._render_source_scene_only_for_cnn(
+                    gaussians_scene=detached_scene,
+                    source_views=source_views,
+                    source_images=source_images,
+                    source_sky_masks=source_sky_masks,
+                    source_egocar_masks=source_egocar_masks,
+                    height=height,
+                    width=width,
+                    dino_cache_key=dino_cache_key,
+                    feedback_enabled=False,
+                    feedback_alpha=0.0,
+                    checkpoint_dynamic=False,
+                    capture_source_rgb=True,
+                )
+            parity_stats = self._observation_feedback_forward_parity_stats(
+                cnn_inputs,
+                parity_reference,
+            )
+            cnn_inputs.setdefault("cnn_perf_stats", {}).update(parity_stats)
+            cnn_inputs.pop("source_rgb", None)
         if bool(repair_freeze_2d):
             cnn_inputs = self._detach_cnn_inputs_for_repair_training(cnn_inputs)
         if bool(stage3_enabled):
@@ -4341,6 +4914,13 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "iforward/biggs/time_parent_render_cnn_ms": float(time_parent_render_cnn_ms),
             "iforward/biggs/time_parent_lifting_ms": float(time_parent_lifting_ms),
             "iforward/biggs/parent_runtime_reuse": 1.0 if bool(runtime_reuse) else 0.0,
+            "iforward/feedback/mode_id": float(repair_train_2d_mode_id),
+            "iforward/feedback/render_enabled": float(source_feedback_enabled),
+            "iforward/feedback/render_alpha": float(render_feedback_alpha),
+            "iforward/feedback/parent_vjp_enabled": float(parent_feedback_enabled),
+            "iforward/feedback/parent_vjp_alpha": float(parent_feedback_alpha),
+            "iforward/feedback/relation_enabled": float(relation_feedback_enabled),
+            "iforward/feedback/relation_alpha": float(relation_feedback_alpha),
             "iforward/biggs/exact_refresh_count": float(getattr(next_parent_runtime, "exact_refresh_count", 0) if next_parent_runtime is not None else 0),
             "iforward/biggs/incremental_update_count": float(getattr(next_parent_runtime, "incremental_update_count", 0) if next_parent_runtime is not None else 0),
             **assignment_cache_stats,
@@ -4348,6 +4928,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             **bp_delta_stats,
             **biggs_observe_perf,
             **drift_stats,
+            **parent_feedback_stats,
             **dict(cnn_inputs.get("dino_cache_stats", {}) or {}),
             **dict(cnn_inputs.get("cnn_perf_stats", {}) or {}),
             **repair_training_aux,
@@ -4385,6 +4966,10 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         visit_meta: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         grad_enabled = str(getattr(self, "stage6_source_evidence_grad_mode", "no_grad_v4")) != "no_grad_v4"
+        feedback_policy = getattr(self, "observation_feedback_policy", ObservationFeedbackPolicy())
+        if bool(feedback_policy.any_continuous_feedback_enabled):
+            feedback_mode, _, _, _ = self._observation_feedback_for_visit(visit_meta)
+            grad_enabled = bool(grad_enabled or feedback_mode.input_grad_enabled)
         ctx_mgr = torch.enable_grad() if grad_enabled else torch.no_grad()
         if bool(getattr(self, "stage2_0_biggs_enabled", False)):
             with ctx_mgr:
@@ -5547,6 +6132,39 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "far_batch_offsets": self._build_struct_batch_offsets(far_in, device=self.device),
         }
 
+    def _configure_relation_feedback_for_measurement(
+        self,
+        *,
+        decoder: BigGSToFineEventDecoder,
+        measurement: Dict[str, Any],
+    ) -> None:
+        setter = getattr(decoder, "set_relation_feedback", None)
+        if not callable(setter):
+            if bool(self.observation_feedback_policy.relation.enable):
+                raise RuntimeError("configured relation feedback requires decoder.set_relation_feedback")
+            return
+        visit_meta = measurement.get("stage3_visit_meta", {}) or {}
+        policy = getattr(self, "observation_feedback_policy", ObservationFeedbackPolicy())
+        enabled = False
+        alpha = 0.0
+        if bool(policy.enable):
+            mode = policy.mode_for_visit(visit_meta)
+            step = int(visit_meta.get("global_step", 0) or 0)
+            enabled = bool(policy.relation.enable and mode.input_grad_enabled)
+            alpha = float(policy.relation_alpha(step)) if enabled else 0.0
+        relation = policy.relation
+        setter(
+            enabled=bool(enabled),
+            alpha=float(alpha),
+            branches=tuple(relation.branches),
+            grad_to_child_geometry=bool(relation.grad_to_child_geometry),
+            grad_to_parent_geometry=bool(relation.grad_to_parent_geometry),
+            grad_to_child_code=bool(relation.grad_to_child_code),
+            grad_to_parent_event=bool(relation.grad_to_parent_event),
+            grad_to_support=bool(relation.grad_to_support),
+            checkpoint=bool(relation.checkpoint and enabled),
+        )
+
     def _decode_stage2_1_biggs_child_event(
         self,
         *,
@@ -5557,6 +6175,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         decoder = getattr(self, "biggs_child_decoder", None)
         if decoder is None:
             raise RuntimeError("Stage2_1 requires runtime.biggs_child_decoder")
+        self._configure_relation_feedback_for_measurement(decoder=decoder, measurement=measurement)
         # GRLD fused decode currently supports FP32 only.
         with self._iforward_amp_fp32():
             fine_event = decoder(
@@ -5602,6 +6221,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         decoder = getattr(self, "biggs_child_decoder", None)
         if decoder is None:
             raise RuntimeError("BigGS Stage 2.0 requires runtime.biggs_child_decoder")
+        self._configure_relation_feedback_for_measurement(decoder=decoder, measurement=measurement)
         source_frame_idx = int(measurement.get("source_frame_idx", 0))
         parent_route = self._stage2_0_parent_route_from_measurement(measurement)
         self._mem_debug("encode/biggs_parent_begin", source_frame_idx=source_frame_idx)

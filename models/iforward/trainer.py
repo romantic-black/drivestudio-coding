@@ -9,6 +9,11 @@ import torch.nn as nn
 
 from .amp_policy import amp_dtype_name, build_amp_policy, make_grad_scaler
 from .model import IForwardModel, IForwardRolloutOutput
+from .observation_feedback import (
+    FeedbackMode,
+    FrontendParameterModeScope,
+    ObservationFeedbackPolicy,
+)
 from .state import IForwardState
 from .utils import cfg_get
 from .versions import is_stage3_optimizer_memory_iforward_version
@@ -34,6 +39,13 @@ class IForwardTrainer(nn.Module):
         self.amp_policy = build_amp_policy(config)
         self.model.amp_policy = build_amp_policy(config, inference_only=True)
         self.grad_scaler = make_grad_scaler(config, self.amp_policy)
+        self.observation_feedback_policy = ObservationFeedbackPolicy.from_config(config)
+        self._feedback_activation_global_step = int(
+            self.observation_feedback_policy.schedule.activation_step
+        )
+        self._feedback_schedule_step = 0
+        self._feedback_schedule_state_restored = False
+        self._validate_observation_feedback_distributed_mode()
         self._apply_trainability_schedule(0)
         self._state_cache: Dict[Tuple[int, int, int], IForwardState] = {}
         self._random_window_metric_cache: Dict[Tuple[int, int, int, int], Dict[str, float]] = {}
@@ -668,6 +680,123 @@ class IForwardTrainer(nn.Module):
         runtime_policy: Optional[Any] = None,
         ablation: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """Run one optimizer transaction under the rollout's frontend grad mode."""
+        step_i = int(step or 0)
+        self._apply_trainability_schedule(step_i)
+        policy = self.observation_feedback_policy
+        batch_for_forward = batch
+        if bool(policy.enable):
+            request_meta = self._observation_feedback_request_meta(batch)
+            mode = policy.mode_for_visit(request_meta)
+            self._feedback_schedule_step = int(
+                policy.schedule_step(
+                    step_i,
+                    activation_step=int(self._feedback_activation_global_step),
+                )
+            )
+            batch_for_forward = dict(batch)
+            batch_for_forward["feedback_schedule_step"] = int(self._feedback_schedule_step)
+            batch_for_forward["feedback_activation_global_step"] = int(
+                self._feedback_activation_global_step
+            )
+        else:
+            mode = FeedbackMode.AUTO
+        if bool(mode.freezes_frontend_parameters) and self._distributed_training_active():
+            raise RuntimeError(
+                "dynamic frontend parameter freezing is unsupported under distributed/DDP execution; "
+                "in particular it is incompatible with DDP static_graph"
+            )
+        runtime = self._phase_a_runtime()
+        if runtime is None:
+            if bool(policy.enable):
+                raise RuntimeError("observation feedback requires a Stage6 phase-A runtime")
+            return self._train_step_impl(
+                batch_for_forward,
+                step=step,
+                profile_phase_timing=profile_phase_timing,
+                sync_cuda_timing=sync_cuda_timing,
+                profile_cuda_memory=profile_cuda_memory,
+                scheduler_node_sync=scheduler_node_sync,
+                runtime_policy=runtime_policy,
+                ablation=ablation,
+            )
+        if bool(mode.freezes_frontend_parameters) and isinstance(
+            self.model, torch.nn.parallel.DistributedDataParallel
+        ):
+            raise RuntimeError(
+                "dynamic frontend parameter freezing is not supported under DDP static-graph execution"
+            )
+        frontend_names = tuple(
+            str(name) for name in getattr(runtime, "stage6_measurement_trainable_param_names", set())
+        )
+        with FrontendParameterModeScope(runtime, frontend_names, mode):
+            return self._train_step_impl(
+                batch_for_forward,
+                step=step,
+                profile_phase_timing=profile_phase_timing,
+                sync_cuda_timing=sync_cuda_timing,
+                profile_cuda_memory=profile_cuda_memory,
+                scheduler_node_sync=scheduler_node_sync,
+                runtime_policy=runtime_policy,
+                ablation=ablation,
+            )
+
+    @staticmethod
+    def _distributed_training_active() -> bool:
+        return bool(
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            and int(torch.distributed.get_world_size()) > 1
+        )
+
+    @staticmethod
+    def _observation_feedback_request_meta(batch: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(batch, dict):
+            raise TypeError("observation feedback batch must be a mapping")
+        iforward_meta = batch.get("_iforward", {}) or {}
+        candidates = [
+            batch.get("request_meta", {}) or {},
+            iforward_meta.get("request_meta", {}) if isinstance(iforward_meta, dict) else {},
+        ]
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            nested = candidate.get("iforward_stage3_2", {}) or {}
+            if (
+                "train_2d_mode" in candidate
+                or "distribution_type" in candidate
+                or (isinstance(nested, dict) and bool(nested))
+            ):
+                return dict(candidate)
+        raise ValueError(
+            "enabled observation feedback requires Stage3.2 train_2d_mode/distribution metadata "
+            "in batch.request_meta or batch._iforward.request_meta"
+        )
+
+    def _validate_observation_feedback_distributed_mode(self) -> None:
+        policy = self.observation_feedback_policy
+        if not bool(policy.enable) or not self._distributed_training_active():
+            return
+        dynamic_modes = sorted(
+            name for name, mode in policy.modes.items() if bool(mode.freezes_frontend_parameters)
+        )
+        if dynamic_modes:
+            raise RuntimeError(
+                "observation feedback uses dynamic frontend parameter freezing for "
+                f"{dynamic_modes}, which is unsupported under distributed/DDP execution and DDP static_graph"
+            )
+
+    def _train_step_impl(
+        self,
+        batch: Dict[str, Any],
+        step: Optional[int] = None,
+        profile_phase_timing: bool = False,
+        sync_cuda_timing: bool = False,
+        profile_cuda_memory: bool = False,
+        scheduler_node_sync: Optional[Dict[str, Any]] = None,
+        runtime_policy: Optional[Any] = None,
+        ablation: Optional[str] = None,
+    ) -> Dict[str, Any]:
         _ = (scheduler_node_sync, runtime_policy)
         profile_cuda = bool(profile_phase_timing or sync_cuda_timing)
         profile_memory = bool(profile_cuda_memory and torch.cuda.is_available())
@@ -687,7 +816,6 @@ class IForwardTrainer(nn.Module):
                 )
         batch = dict(batch)
         batch["global_step"] = int(step or 0)
-        self._apply_trainability_schedule(int(step or 0))
         t0 = time.perf_counter()
         resolved = self.model.resolver.resolve(batch)
         timings["resolve_ms"] = (time.perf_counter() - t0) * 1000.0
@@ -718,6 +846,10 @@ class IForwardTrainer(nn.Module):
         self.train(True)
         t0 = time.perf_counter()
         self.optimizer.zero_grad(set_to_none=True)
+        feedback_runtime = self._phase_a_runtime()
+        reset_feedback_stats = getattr(feedback_runtime, "reset_observation_feedback_runtime_stats", None)
+        if callable(reset_feedback_stats):
+            reset_feedback_stats()
         timings["optimizer_ms"] = (time.perf_counter() - t0) * 1000.0
         if profile_memory:
             self._record_cuda_memory_snapshot(
@@ -749,6 +881,17 @@ class IForwardTrainer(nn.Module):
             loss.backward()
         self._sync_cuda(profile_cuda)
         timings["backward_ms"] = (time.perf_counter() - t0) * 1000.0
+        feedback_runtime_metrics: Dict[str, float] = {}
+        consume_feedback_stats = getattr(feedback_runtime, "consume_observation_feedback_runtime_stats", None)
+        if callable(consume_feedback_stats):
+            backward_grad_scale = (
+                float(self.grad_scaler.get_scale())
+                if bool(getattr(self.grad_scaler, "is_enabled", lambda: False)())
+                else 1.0
+            )
+            feedback_runtime_metrics.update(
+                dict(consume_feedback_stats(grad_scale=float(backward_grad_scale)))
+            )
         if profile_memory:
             self._record_cuda_memory_snapshot(
                 cuda_memory_metrics,
@@ -793,6 +936,46 @@ class IForwardTrainer(nn.Module):
             raise RuntimeError("IForward clipped gradient norm became NaN/Inf.")
         group_metrics = self._optimizer_group_metrics()
         adapter_metrics = self._adapter_metrics()
+        frontend_params = self._measurement_frontend_params()
+        frontend_unique = self._dedupe_params(
+            frontend_params["stage6_measurement_frontend_residual_unet"]
+            + frontend_params["stage6_measurement_frontend_fusion_neck"]
+            + frontend_params["stage6_measurement_frontend"]
+        )
+        frontend_grads = [param.grad for param in frontend_unique if param.grad is not None]
+        feedback_runtime_metrics["feedback/2d_param_grad_count"] = float(len(frontend_grads))
+        feedback_runtime_metrics["feedback/2d_param_grad_norm"] = float(
+            self._grad_norm([param for param in frontend_unique if param.grad is not None]).detach().cpu().item()
+        )
+        if bool(self.observation_feedback_policy.enable):
+            feedback_mode = self.observation_feedback_policy.mode_for_visit(
+                self._observation_feedback_request_meta(batch)
+            )
+            feedback_runtime_metrics["iforward/feedback/activation_global_step"] = float(
+                self._feedback_activation_global_step
+            )
+            feedback_runtime_metrics["iforward/feedback/schedule_step"] = float(
+                self._feedback_schedule_step
+            )
+            if feedback_mode is FeedbackMode.FROZEN_INPUT_GRAD_CHECKPOINTED:
+                if len(frontend_grads) != 0:
+                    raise RuntimeError(
+                        "frozen_input_grad_checkpointed produced measurement frontend parameter gradients"
+                    )
+                source_probe = feedback_runtime_metrics.get(
+                    "feedback/source_render_input_grad_norm"
+                )
+                source_alpha = self.observation_feedback_policy.source_alpha(
+                    int(self._feedback_schedule_step)
+                )
+                if (
+                    source_probe is not None
+                    and float(source_alpha) > 0.0
+                    and not float(source_probe) > 0.0
+                ):
+                    raise RuntimeError(
+                        "frozen_input_grad_checkpointed lost source LocalGS gradients while feedback alpha > 0"
+                    )
         timings["grad_norm_ms"] = (time.perf_counter() - t0) * 1000.0
         if profile_memory:
             self._record_cuda_memory_snapshot(
@@ -849,8 +1032,57 @@ class IForwardTrainer(nn.Module):
         losses = {name: float(value.detach().item()) for name, value in out.losses.items()}
         resolved_meta = dict(getattr(out.resolved, "meta", {}) or {})
         request_meta = dict(resolved_meta.get("request_meta", {}) or {})
+        if bool(self.observation_feedback_policy.enable):
+            request_meta = self._observation_feedback_request_meta(dict(out.resolved.raw))
         stage23_request_meta = dict(request_meta.get("iforward_stage2_3", {}) or {})
         stage32_request_meta = dict(request_meta.get("iforward_stage3_2", {}) or {})
+        if bool(self.observation_feedback_policy.enable):
+            feedback_mode = self.observation_feedback_policy.mode_for_visit(request_meta)
+            feedback_step = int(self._feedback_schedule_step)
+            feedback_runtime_metrics.update(
+                {
+                    "iforward/feedback/mode_id": float(
+                        {
+                            FeedbackMode.TRAINABLE: 1,
+                            FeedbackMode.FROZEN_NO_GRAD: 2,
+                            FeedbackMode.AUTO: 3,
+                            FeedbackMode.TRAINABLE_CHECKPOINTED: 4,
+                            FeedbackMode.FROZEN_INPUT_GRAD_CHECKPOINTED: 5,
+                        }[feedback_mode]
+                    ),
+                    "iforward/feedback/activation_global_step": float(
+                        self._feedback_activation_global_step
+                    ),
+                    "iforward/feedback/schedule_step": float(feedback_step),
+                    "iforward/feedback/render_enabled": float(
+                        self.observation_feedback_policy.source_render.enable
+                        and feedback_mode.input_grad_enabled
+                    ),
+                    "iforward/feedback/render_alpha": float(
+                        self.observation_feedback_policy.source_alpha(feedback_step)
+                        if feedback_mode.input_grad_enabled
+                        else 0.0
+                    ),
+                    "iforward/feedback/parent_vjp_enabled": float(
+                        self.observation_feedback_policy.parent_projection.enable
+                        and feedback_mode.input_grad_enabled
+                    ),
+                    "iforward/feedback/parent_vjp_alpha": float(
+                        self.observation_feedback_policy.parent_alpha(feedback_step)
+                        if feedback_mode.input_grad_enabled
+                        else 0.0
+                    ),
+                    "iforward/feedback/relation_enabled": float(
+                        self.observation_feedback_policy.relation.enable
+                        and feedback_mode.input_grad_enabled
+                    ),
+                    "iforward/feedback/relation_alpha": float(
+                        self.observation_feedback_policy.relation_alpha(feedback_step)
+                        if feedback_mode.input_grad_enabled
+                        else 0.0
+                    ),
+                }
+            )
         requested_inner_k = int(
             resolved_meta.get(
                 "requested_inner_K",
@@ -1061,6 +1293,7 @@ class IForwardTrainer(nn.Module):
             final[f"iforward/loss_{name}"] = float(value)
         final.update(group_metrics)
         final.update(adapter_metrics)
+        final.update(feedback_runtime_metrics)
         final.update(cuda_memory_metrics)
         if profile_memory:
             self._record_cuda_phase_delta(
@@ -1159,11 +1392,12 @@ class IForwardTrainer(nn.Module):
 
     def get_extra_state(self) -> Dict[str, Any]:
         return {
-            "format": "iforward_trainer_extra_state_v1",
+            "format": "iforward_trainer_extra_state_v2",
             "state_cache": {
                 tuple(key): value.detach_for_next_rollout()
                 for key, value in self._state_cache.items()
             },
+            "observation_feedback_schedule": self.feedback_schedule_state(),
         }
 
     def set_extra_state(self, state: Any) -> None:
@@ -1178,6 +1412,62 @@ class IForwardTrainer(nn.Module):
             tuple(int(x) for x in key): value.detach_for_next_rollout()
             for key, value in raw_cache.items()
         }
+        feedback_state = state.get("observation_feedback_schedule")
+        if isinstance(feedback_state, dict):
+            self._restore_feedback_schedule_state(feedback_state)
+
+    def feedback_schedule_state(self, *, global_step: Optional[int] = None) -> Dict[str, Any]:
+        schedule_step = int(self._feedback_schedule_step)
+        if global_step is not None:
+            schedule_step = int(
+                self.observation_feedback_policy.schedule_step(
+                    int(global_step),
+                    activation_step=int(self._feedback_activation_global_step),
+                )
+            )
+        return {
+            "format": "iforward_observation_feedback_schedule_v1",
+            "origin": str(self.observation_feedback_policy.schedule.origin),
+            "feedback_activation_global_step": int(self._feedback_activation_global_step),
+            "feedback_schedule_step": int(schedule_step),
+        }
+
+    def _restore_feedback_schedule_state(self, state: Dict[str, Any]) -> None:
+        if not bool(self.observation_feedback_policy.enable):
+            return
+        if str(state.get("format", "")) != "iforward_observation_feedback_schedule_v1":
+            raise ValueError("unsupported observation feedback schedule checkpoint format")
+        saved_origin = str(state.get("origin", ""))
+        current_origin = str(self.observation_feedback_policy.schedule.origin)
+        if saved_origin != current_origin:
+            raise ValueError(
+                "feedback schedule origin changed across resume: "
+                f"checkpoint={saved_origin!r} config={current_origin!r}"
+            )
+        activation_step = int(state.get("feedback_activation_global_step", -1))
+        schedule_step = int(state.get("feedback_schedule_step", -1))
+        if activation_step < 0 or schedule_step < 0:
+            raise ValueError("feedback schedule checkpoint steps must be >= 0")
+        self._feedback_activation_global_step = activation_step
+        self._feedback_schedule_step = schedule_step
+        self._feedback_schedule_state_restored = True
+
+    def build_light_checkpoint_extra(self, *, step: int) -> Dict[str, Any]:
+        iforward_cfg = cfg_get(cfg_get(self.config, "model", {}) or {}, "iforward", {}) or {}
+        return {
+            "training_variant": str(cfg_get(iforward_cfg, "training_variant", "") or ""),
+            "observation_feedback_schedule": self.feedback_schedule_state(global_step=int(step)),
+        }
+
+    def load_feedback_schedule_state_from_checkpoint(self, payload: Dict[str, Any]) -> bool:
+        state = payload.get("observation_feedback_schedule")
+        if not isinstance(state, dict):
+            # Stage3.2 and pre-clock Stage3.3 checkpoints intentionally start
+            # from the configured activation origin.
+            self._feedback_schedule_state_restored = False
+            return False
+        self._restore_feedback_schedule_state(state)
+        return True
 
     def load_optimizer_state_from_checkpoint(self, payload: Dict[str, Any]) -> bool:
         opt_state = payload.get("optimizer_state_dict")

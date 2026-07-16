@@ -209,7 +209,7 @@ class AlphaTWeightExtractor:
             )
         return weight_info
 
-    def _extract_rgb(self, render_colors: torch.Tensor) -> torch.Tensor:
+    def _extract_rgb(self, render_colors: torch.Tensor, *, detach: bool = True) -> torch.Tensor:
         """
         From packed renderer output, extract an RGB image tensor with shape [H, W, 3].
         """
@@ -219,7 +219,81 @@ class AlphaTWeightExtractor:
             rgb = render_colors.squeeze(0)
         else:
             rgb = render_colors
-        return torch.clamp(rgb, 0.0, 1.0).detach()
+        rgb = torch.clamp(rgb, 0.0, 1.0)
+        return rgb.detach() if bool(detach) else rgb
+
+    def _render_rgb_batched(
+        self,
+        gaussians: Dict[str, torch.Tensor],
+        cameras: List,
+        height: int,
+        width: int,
+        *,
+        return_acc: bool,
+        viewmats_override: Optional[torch.Tensor],
+        absgrad: bool,
+        detach_outputs: bool,
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        """Shared batched RGB render core.
+
+        The caller owns the surrounding grad/autocast context. Camera tensors are
+        always treated as constants; only Gaussian continuous parameters may carry
+        gradients through the feedback renderer.
+        """
+        if viewmats_override is not None:
+            if viewmats_override.dim() == 2:
+                viewmats_override = viewmats_override.unsqueeze(0)
+            if int(viewmats_override.shape[0]) != int(len(cameras)):
+                raise ValueError(
+                    "viewmats_override first dim must match len(cameras), "
+                    f"got {viewmats_override.shape[0]} vs {len(cameras)}."
+                )
+            viewmats_list = [viewmats_override.detach()]
+        else:
+            cam0 = cameras[0]
+            cam0_ctw = cam0.camtoworlds if hasattr(cam0, "camtoworlds") else cam0["camtoworlds"]
+            viewmats_list = [_get_viewmat(cam0_ctw.detach())]
+        Ks_list = [self._resolve_intrinsics(cameras[0]).detach()]
+        for cam in cameras[1:]:
+            if viewmats_override is None:
+                cam_ctw = cam.camtoworlds if hasattr(cam, "camtoworlds") else cam["camtoworlds"]
+                viewmats_list.append(_get_viewmat(cam_ctw.detach()))
+            Ks_list.append(self._resolve_intrinsics(cam).detach())
+
+        viewmats = torch.cat(viewmats_list, dim=0)
+        Ks = torch.cat(Ks_list, dim=0)
+        render_colors, render_alphas, _ = self.renderer(
+            means=gaussians["means"],
+            quats=gaussians["quats"],
+            scales=gaussians["scales"],
+            opacities=gaussians["opacities"],
+            colors=gaussians["colors"],
+            viewmats=viewmats,
+            Ks=Ks,
+            width=width,
+            height=height,
+            tile_size=self.tile_size,
+            packed=False,
+            near_plane=0.01,
+            far_plane=1e10,
+            render_mode="RGB",
+            sh_degree=self.sh_degree,
+            sparse_grad=False,
+            absgrad=bool(absgrad),
+            rasterize_mode="classic",
+        )
+        if render_colors.dim() == 5:
+            render_colors = render_colors.squeeze(0)
+        if render_alphas.dim() == 5:
+            render_alphas = render_alphas.squeeze(0)
+        rendered_rgbs: List[torch.Tensor] = []
+        rendered_accs: List[torch.Tensor] = []
+        for c in range(int(render_colors.shape[0])):
+            rendered_rgbs.append(self._extract_rgb(render_colors[c], detach=detach_outputs))
+            if bool(return_acc):
+                acc = render_alphas[c]
+                rendered_accs.append(acc.detach() if bool(detach_outputs) else acc)
+        return rendered_rgbs, rendered_accs
 
     def render_rgb_only(
         self,
@@ -244,68 +318,17 @@ class AlphaTWeightExtractor:
 
         # Batched multi-view render when possible (one gsplat call, packed=False).
         t_start = time.perf_counter()
-        rendered_rgbs: List[torch.Tensor] = []
-        rendered_accs: List[torch.Tensor] = []
         with torch.no_grad():
-            if viewmats_override is not None:
-                if viewmats_override.dim() == 2:
-                    viewmats_override = viewmats_override.unsqueeze(0)
-                if int(viewmats_override.shape[0]) != int(len(cameras)):
-                    raise ValueError(
-                        "viewmats_override first dim must match len(cameras), "
-                        f"got {viewmats_override.shape[0]} vs {len(cameras)}."
-                    )
-                viewmats_list = [viewmats_override]
-            else:
-                cam0 = cameras[0]
-                cam0_ctw = cam0.camtoworlds if hasattr(cam0, "camtoworlds") else cam0["camtoworlds"]
-                viewmat0 = _get_viewmat(cam0_ctw)
-                viewmats_list = [viewmat0]
-            k_mat0 = self._resolve_intrinsics(cameras[0])
-
-            Ks_list = [k_mat0]
-            for cam in cameras[1:]:
-                k_mat = self._resolve_intrinsics(cam)
-                if viewmats_override is None:
-                    cam_ctw = cam.camtoworlds if hasattr(cam, "camtoworlds") else cam["camtoworlds"]
-                    viewmat = _get_viewmat(cam_ctw)
-                    viewmats_list.append(viewmat)
-                Ks_list.append(k_mat)
-
-            viewmats = torch.cat(viewmats_list, dim=0)
-            Ks = torch.cat(Ks_list, dim=0)
-
-            render_colors, render_alphas, _ = self.renderer(
-                means=gaussians["means"],
-                quats=gaussians["quats"],
-                scales=gaussians["scales"],
-                opacities=gaussians["opacities"],
-                colors=gaussians["colors"],
-                viewmats=viewmats,
-                Ks=Ks,
-                width=width,
-                height=height,
-                tile_size=self.tile_size,
-                packed=False,
-                near_plane=0.01,
-                far_plane=1e10,
-                render_mode="RGB",
-                sh_degree=self.sh_degree,
-                sparse_grad=False,
+            rendered_rgbs, rendered_accs = self._render_rgb_batched(
+                gaussians,
+                cameras,
+                height,
+                width,
+                return_acc=bool(return_acc),
+                viewmats_override=viewmats_override,
                 absgrad=True,
-                rasterize_mode="classic",
+                detach_outputs=True,
             )
-
-            # render_colors shape: [C, H, W, 3] or [1, C, H, W, 3]
-            if render_colors.dim() == 5:
-                render_colors = render_colors.squeeze(0)
-            for c in range(render_colors.shape[0]):
-                rgb = render_colors[c]
-                rgb = torch.clamp(rgb, 0.0, 1.0).detach()
-                rendered_rgbs.append(rgb)
-                if return_acc:
-                    acc = render_alphas[c]
-                    rendered_accs.append(acc.detach())
 
         if return_debug_stats:
             stats = {
@@ -317,6 +340,39 @@ class AlphaTWeightExtractor:
                 return rendered_rgbs, rendered_accs, stats
             return rendered_rgbs, stats
         if return_acc:
+            return rendered_rgbs, rendered_accs
+        return rendered_rgbs
+
+    def render_rgb_feedback(
+        self,
+        gaussians: Dict[str, torch.Tensor],
+        cameras: List,
+        height: int,
+        width: int,
+        *,
+        return_acc: bool = False,
+        viewmats_override: Optional[torch.Tensor] = None,
+        absgrad: bool = False,
+    ) -> Union[List[torch.Tensor], Tuple[List[torch.Tensor], List[torch.Tensor]]]:
+        """Differentiable RGB render for within-rollout observation feedback.
+
+        This API deliberately has no debug/statistics side effects so it can be
+        called safely from a non-reentrant activation-checkpoint closure.
+        """
+        if not cameras:
+            return ([], []) if bool(return_acc) else []
+        with torch.enable_grad():
+            rendered_rgbs, rendered_accs = self._render_rgb_batched(
+                gaussians,
+                cameras,
+                height,
+                width,
+                return_acc=bool(return_acc),
+                viewmats_override=viewmats_override,
+                absgrad=bool(absgrad),
+                detach_outputs=False,
+            )
+        if bool(return_acc):
             return rendered_rgbs, rendered_accs
         return rendered_rgbs
 

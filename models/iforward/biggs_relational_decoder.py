@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from .biggs_state import BigGSChildContributionCache, BigGSParentStats
 from .cuda_grld_decode import grld_decode
@@ -105,14 +106,27 @@ class GaussianRelationCodec(nn.Module):
         self.detach_inputs = bool(detach_inputs)
         self.rigid_relation_space = space_l
 
-    def _param(self, params: Dict[str, torch.Tensor], name: str, *, ref: torch.Tensor) -> torch.Tensor:
+    def _param(
+        self,
+        params: Dict[str, torch.Tensor],
+        name: str,
+        *,
+        ref: torch.Tensor,
+        detach: Optional[bool] = None,
+    ) -> torch.Tensor:
         value = params[name]
-        if bool(self.detach_inputs):
+        if bool(self.detach_inputs if detach is None else detach):
             value = value.detach()
         return value.to(device=ref.device, dtype=ref.dtype)
 
-    def _cache_tensor(self, value: torch.Tensor, *, ref: torch.Tensor) -> torch.Tensor:
-        if bool(self.detach_inputs):
+    def _cache_tensor(
+        self,
+        value: torch.Tensor,
+        *,
+        ref: torch.Tensor,
+        detach: Optional[bool] = None,
+    ) -> torch.Tensor:
+        if bool(self.detach_inputs if detach is None else detach):
             value = value.detach()
         return value.to(device=ref.device, dtype=ref.dtype)
 
@@ -126,6 +140,9 @@ class GaussianRelationCodec(nn.Module):
         child_to_parent: torch.Tensor,
         parent_count: torch.Tensor,
         branch_id: int,
+        detach_params: Optional[bool] = None,
+        detach_support: Optional[bool] = None,
+        collect_aux: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
         ref = child_params["means"]
         n = int(ref.shape[0])
@@ -135,16 +152,16 @@ class GaussianRelationCodec(nn.Module):
         if child_cache is None or parent_stats is None:
             raise RuntimeError("GRLD requires BigGS parent runtime child_cache and parent_stats")
 
-        child_means = self._param(child_params, "means", ref=ref)
-        child_opacity = self._param(child_params, "opacity_logit", ref=ref)
-        child_sh_dc = self._param(child_params, "sh_dc", ref=ref)
-        child_sh_rest = self._param(child_params, "sh_rest", ref=ref)
+        child_means = self._param(child_params, "means", ref=ref, detach=detach_params)
+        child_opacity = self._param(child_params, "opacity_logit", ref=ref, detach=detach_params)
+        child_sh_dc = self._param(child_params, "sh_dc", ref=ref, detach=detach_params)
+        child_sh_rest = self._param(child_params, "sh_rest", ref=ref, detach=detach_params)
 
-        parent_means_all = self._param(parent_params, "means", ref=ref)
-        parent_scales_log_all = self._param(parent_params, "scales_log", ref=ref)
-        parent_opacity_all = self._param(parent_params, "opacity_logit", ref=ref)
-        parent_sh_dc_all = self._param(parent_params, "sh_dc", ref=ref)
-        parent_sh_rest_all = self._param(parent_params, "sh_rest", ref=ref)
+        parent_means_all = self._param(parent_params, "means", ref=ref, detach=detach_params)
+        parent_scales_log_all = self._param(parent_params, "scales_log", ref=ref, detach=detach_params)
+        parent_opacity_all = self._param(parent_params, "opacity_logit", ref=ref, detach=detach_params)
+        parent_sh_dc_all = self._param(parent_params, "sh_dc", ref=ref, detach=detach_params)
+        parent_sh_rest_all = self._param(parent_params, "sh_rest", ref=ref, detach=detach_params)
 
         parent_means = parent_means_all.index_select(0, parent_id)
         parent_scales_log = parent_scales_log_all.index_select(0, parent_id)
@@ -153,15 +170,28 @@ class GaussianRelationCodec(nn.Module):
         parent_sh_dc = parent_sh_dc_all.index_select(0, parent_id)
         parent_sh_rest = parent_sh_rest_all.index_select(0, parent_id)
 
-        mass = self._cache_tensor(child_cache.mass, ref=ref).reshape(-1).clamp_min(float(self.eps))
+        mass = self._cache_tensor(child_cache.mass, ref=ref, detach=detach_support).reshape(-1).clamp_min(float(self.eps))
         if "diag_cov" in child_params:
-            child_diag_cov = self._param(child_params, "diag_cov", ref=ref).reshape(n, 3).clamp_min(float(self.eps))
+            child_diag_cov = self._param(
+                child_params,
+                "diag_cov",
+                ref=ref,
+                detach=detach_params,
+            ).reshape(n, 3).clamp_min(float(self.eps))
         else:
-            child_diag_cov = self._cache_tensor(child_cache.diag_cov, ref=ref).reshape(n, 3).clamp_min(float(self.eps))
+            child_diag_cov = self._cache_tensor(
+                child_cache.diag_cov,
+                ref=ref,
+                detach=detach_support,
+            ).reshape(n, 3).clamp_min(float(self.eps))
         parent_diag_cov = torch.exp(2.0 * parent_scales_log).clamp_min(float(self.eps))
 
         parent_counts_all = parent_count.to(device=ref.device, dtype=ref.dtype).reshape(-1).clamp_min(1.0)
-        parent_weight_sum = self._cache_tensor(parent_stats.weight_sum, ref=ref).reshape(-1).clamp_min(float(self.eps))
+        parent_weight_sum = self._cache_tensor(
+            parent_stats.weight_sum,
+            ref=ref,
+            detach=detach_support,
+        ).reshape(-1).clamp_min(float(self.eps))
         mean_mass_all = parent_weight_sum / parent_counts_all
         mean_mass = mean_mass_all.index_select(0, parent_id).clamp_min(float(self.eps))
 
@@ -176,6 +206,8 @@ class GaussianRelationCodec(nn.Module):
             torch.log(child_sh_energy + float(self.eps)) - torch.log(parent_sh_energy + float(self.eps))
         ).reshape(-1, 1)
         relation = torch.cat([r_xyz, r_cov, r_mass, r_opacity, r_sh_dc, r_sh_rest_energy], dim=-1)
+        if not bool(collect_aux):
+            return relation, mass, {}
         if not torch.isfinite(relation).all():
             raise RuntimeError("GRLD relation contains NaN/Inf")
         aux = {
@@ -261,6 +293,7 @@ class GaussianRelationalLiftingDecoder(nn.Module):
         weights: torch.Tensor,
         parent_count: torch.Tensor,
         num_parents: int,
+        collect_aux: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
         if int(relation.numel()) == 0:
             return relation, relation.new_zeros((int(num_parents), self.summary_dim)), {}
@@ -291,6 +324,8 @@ class GaussianRelationalLiftingDecoder(nn.Module):
             parent_count.to(device=relation.device, dtype=relation.dtype).reshape(-1, 1).clamp_min(1.0)
         )
         summary = torch.cat([rms, entropy, log_child_count], dim=-1)
+        if not bool(collect_aux):
+            return coeff_input, summary, {}
         active = parent_count.to(device=relation.device).reshape(-1) > 0
         centered_mean = _scatter_weighted_mean(centered, pid, mass, num_parents=int(num_parents), eps=float(self.eps))
         coeff_mean = _scatter_weighted_mean(coeff_input, pid, mass, num_parents=int(num_parents), eps=float(self.eps))
@@ -356,7 +391,30 @@ class GaussianRelationalLiftingDecoder(nn.Module):
         child_order: torch.Tensor,
         branch_id: int,
         branch_scale: torch.Tensor,
+        checkpoint_branch: bool = False,
+        detach_relation_params: Optional[bool] = None,
+        detach_support: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, float]]:
+        if bool(checkpoint_branch):
+            if int(branch_id) not in {0, 1}:
+                raise ValueError("GRLD relation checkpoint feedback supports only bg/distant branches")
+            if detach_support is not True:
+                raise ValueError("GRLD relation checkpoint requires detached support/runtime statistics")
+            return self._decode_branch_checkpointed(
+                parent_event=parent_event,
+                child_params=child_params,
+                parent_params=parent_params,
+                child_cache=child_cache,
+                parent_stats=parent_stats,
+                child_to_parent=child_to_parent,
+                parent_start=parent_start,
+                parent_count=parent_count,
+                child_order=child_order,
+                branch_id=int(branch_id),
+                branch_scale=branch_scale,
+                detach_relation_params=detach_relation_params,
+                detach_support=detach_support,
+            )
         t0 = time.perf_counter()
         pid = child_to_parent.long().to(device=parent_event.device)
         relation, mass, rel_aux = self.codec.build_relation(
@@ -367,6 +425,8 @@ class GaussianRelationalLiftingDecoder(nn.Module):
             child_to_parent=pid,
             parent_count=parent_count,
             branch_id=int(branch_id),
+            detach_params=detach_relation_params,
+            detach_support=detach_support,
         )
         relation = relation.to(device=parent_event.device, dtype=parent_event.dtype)
         mass = mass.to(device=parent_event.device, dtype=parent_event.dtype)
@@ -420,6 +480,250 @@ class GaussianRelationalLiftingDecoder(nn.Module):
             ),
         }
         return fine, base_child, residual, aux
+
+    def _decode_branch_checkpointed(
+        self,
+        *,
+        parent_event: torch.Tensor,
+        child_params: Dict[str, torch.Tensor],
+        parent_params: Dict[str, torch.Tensor],
+        child_cache: BigGSChildContributionCache,
+        parent_stats: BigGSParentStats,
+        child_to_parent: torch.Tensor,
+        parent_start: torch.Tensor,
+        parent_count: torch.Tensor,
+        child_order: torch.Tensor,
+        branch_id: int,
+        branch_scale: torch.Tensor,
+        detach_relation_params: Optional[bool],
+        detach_support: Optional[bool],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, float]]:
+        """Checkpoint the side-effect-free relation, summary and decode path.
+
+        Runtime support tensors and all discrete assignment tensors remain
+        graph-free.  Tensor diagnostics are computed outside the checkpoint
+        closure so recomputation cannot duplicate Python metrics/timers.
+        """
+
+        pid = child_to_parent.long().to(device=parent_event.device).detach()
+        parent_start_d = parent_start.to(device=parent_event.device, dtype=torch.long).detach()
+        parent_count_d = parent_count.to(device=parent_event.device, dtype=torch.long).detach()
+        child_order_d = child_order.to(device=parent_event.device, dtype=torch.long).detach()
+        scale = branch_scale.to(device=parent_event.device, dtype=parent_event.dtype)
+
+        def tensor_path_impl(
+            parent_event_t: torch.Tensor,
+            child_params_t: Dict[str, torch.Tensor],
+            parent_params_t: Dict[str, torch.Tensor],
+            branch_scale_t: torch.Tensor,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+            relation_t, mass_t, _ = self.codec.build_relation(
+                child_params=child_params_t,
+                parent_params=parent_params_t,
+                child_cache=child_cache,
+                parent_stats=parent_stats,
+                child_to_parent=pid,
+                parent_count=parent_count_d,
+                branch_id=int(branch_id),
+                detach_params=detach_relation_params,
+                detach_support=detach_support,
+                collect_aux=False,
+            )
+            relation_t = relation_t.to(device=parent_event_t.device, dtype=parent_event_t.dtype)
+            mass_t = mass_t.to(device=parent_event_t.device, dtype=parent_event_t.dtype)
+            centered_t, summary_t, _ = self._center_and_summarize(
+                relation=relation_t,
+                parent_id=pid,
+                weights=mass_t,
+                parent_count=parent_count_d,
+                num_parents=int(parent_event_t.shape[0]),
+                collect_aux=False,
+            )
+            coeff_t = self.relation_proj(centered_t)
+            h_parent_t = parent_event_t + self.summary_proj(
+                summary_t.to(device=parent_event_t.device, dtype=parent_event_t.dtype)
+            )
+            base_t = self.base_head(h_parent_t)
+            detail_t = self.detail_head(h_parent_t).reshape(
+                int(parent_event_t.shape[0]),
+                int(self.rank),
+                int(self.fine_event_dim),
+            )
+            gate_t = 1.0 + torch.tanh(self.gate_head(h_parent_t))
+            fine_t = self._decode(
+                base=base_t,
+                detail=detail_t,
+                gate=gate_t,
+                coeff=coeff_t,
+                child_to_parent=pid,
+                child_order=child_order_d,
+                parent_start=parent_start_d,
+                parent_count=parent_count_d,
+                branch_scale=branch_scale_t,
+            )
+            base_child_t = base_t.index_select(0, pid)
+            # Only ``fine_t`` is consumed downstream.  Returning child-sized
+            # relation/base/residual tensors from the checkpoint would retain
+            # them for every rollout visit and defeat the K=15 memory target.
+            # Compute a compact detached statistics vector in the pure tensor
+            # closure and build the Python aux dictionary outside.
+            with torch.no_grad():
+                relation_value_t = relation_t.detach()
+                mass_value_t = mass_t.detach()
+                residual_value_t = (fine_t - base_child_t).detach()
+                mean_residual_t = _scatter_weighted_mean(
+                    residual_value_t,
+                    pid,
+                    mass_value_t,
+                    num_parents=int(parent_event_t.shape[0]),
+                    eps=float(self.eps),
+                )
+                active_t = parent_count_d.reshape(-1) > 0
+
+                def mean_norm(value: torch.Tensor) -> torch.Tensor:
+                    return (
+                        value.norm(dim=-1).mean()
+                        if int(value.numel()) > 0
+                        else relation_value_t.new_zeros(())
+                    )
+
+                def mean_abs(value: torch.Tensor) -> torch.Tensor:
+                    return (
+                        value.abs().mean()
+                        if int(value.numel()) > 0
+                        else relation_value_t.new_zeros(())
+                    )
+
+                mean_error_t = mean_residual_t[active_t].norm(dim=-1).max()
+                raw_mean_t = _scatter_weighted_mean(
+                    relation_value_t,
+                    pid,
+                    mass_value_t,
+                    num_parents=int(parent_event_t.shape[0]),
+                    eps=float(self.eps),
+                )
+                raw_centered_t = relation_value_t - raw_mean_t.index_select(0, pid)
+                raw_centered_mean_t = _scatter_weighted_mean(
+                    raw_centered_t,
+                    pid,
+                    mass_value_t,
+                    num_parents=int(parent_event_t.shape[0]),
+                    eps=float(self.eps),
+                )
+                coeff_mean_t = _scatter_weighted_mean(
+                    centered_t.detach(),
+                    pid,
+                    mass_value_t,
+                    num_parents=int(parent_event_t.shape[0]),
+                    eps=float(self.eps),
+                )
+                rms_t = summary_t.detach()[:, : int(self.relation_dim)]
+                relation_centering_error_t = coeff_mean_t[active_t].norm(dim=-1).max()
+                raw_centering_error_t = raw_centered_mean_t[active_t].norm(dim=-1).max()
+                rms_min_t = rms_t[active_t].min()
+                rms_max_t = rms_t[active_t].max()
+                base_norm_t = mean_norm(base_child_t.detach())
+                residual_norm_t = mean_norm(residual_value_t)
+                detail_ratio_t = residual_norm_t / base_norm_t.clamp_min(1.0e-8)
+                stats_t = torch.stack(
+                    (
+                        mean_norm(relation_value_t[:, 0:3]),
+                        mean_norm(relation_value_t[:, 3:6]),
+                        mean_abs(relation_value_t[:, 6:7]),
+                        mean_abs(relation_value_t[:, 7:8]),
+                        mean_norm(relation_value_t[:, 8:12]),
+                        (
+                            (~torch.isfinite(mass_value_t)).to(dtype=relation_value_t.dtype).mean()
+                            if int(mass_value_t.numel()) > 0
+                            else relation_value_t.new_zeros(())
+                        ),
+                        mean_error_t,
+                        detail_ratio_t,
+                        residual_norm_t,
+                        base_norm_t,
+                        relation_centering_error_t,
+                        raw_centering_error_t,
+                        rms_min_t,
+                        rms_max_t,
+                        mean_norm(centered_t.detach()[:, 3:6]),
+                    )
+                )
+            return fine_t, stats_t
+
+        def tensor_path(
+            parent_event_t: torch.Tensor,
+            child_params_t: Dict[str, torch.Tensor],
+            parent_params_t: Dict[str, torch.Tensor],
+            branch_scale_t: torch.Tensor,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+            with torch.autograd.profiler.record_function(
+                "iforward/feedback/relation_grld_checkpoint"
+            ):
+                return tensor_path_impl(
+                    parent_event_t,
+                    child_params_t,
+                    parent_params_t,
+                    branch_scale_t,
+                )
+
+        t0 = time.perf_counter()
+        fine, compact_stats = checkpoint(
+            tensor_path,
+            parent_event,
+            child_params,
+            parent_params,
+            scale,
+            use_reentrant=False,
+            preserve_rng_state=False,
+        )
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        if not torch.isfinite(fine).all() or not torch.isfinite(compact_stats).all():
+            raise RuntimeError("checkpointed GRLD output or compact statistics contain NaN/Inf")
+        stats = compact_stats.detach().float().cpu()
+        relation_xyz_norm = float(stats[0].item())
+        relation_cov_norm = float(stats[1].item())
+        relation_mass_norm = float(stats[2].item())
+        relation_opacity_norm = float(stats[3].item())
+        relation_sh_norm = float(stats[4].item())
+        dynamic_mass_nan_ratio = float(stats[5].item())
+        mean_error = float(stats[6].item())
+        detail_ratio = float(stats[7].item())
+        residual_norm = float(stats[8].item())
+        base_norm = float(stats[9].item())
+        relation_centering_error = float(stats[10].item())
+        relation_raw_centering_error = float(stats[11].item())
+        relation_channel_rms_min = float(stats[12].item())
+        relation_channel_rms_max = float(stats[13].item())
+        relation_cov_norm_after_norm = float(stats[14].item())
+        rel_aux = {
+            "relation_xyz_norm": relation_xyz_norm,
+            "relation_cov_norm": relation_cov_norm,
+            "relation_cov_norm_before_norm": relation_cov_norm,
+            "relation_mass_norm": relation_mass_norm,
+            "relation_opacity_norm": relation_opacity_norm,
+            "relation_sh_norm": relation_sh_norm,
+            "dynamic_mass_nan_ratio": dynamic_mass_nan_ratio,
+            "rigid_relation_world_mode": 0.0,
+            "rigid_relation_canonical_mode": 0.0,
+        }
+        aux = {
+            **rel_aux,
+            "relation_centering_error": relation_centering_error,
+            "relation_raw_centering_error": relation_raw_centering_error,
+            "relation_channel_rms_min": relation_channel_rms_min,
+            "relation_channel_rms_max": relation_channel_rms_max,
+            "relation_cov_norm_after_norm": relation_cov_norm_after_norm,
+            "weighted_mean_error": mean_error,
+            "relation_ms": float(elapsed_ms),
+            "decode_ms": 0.0,
+            "detail_to_base_ratio": detail_ratio,
+            "checkpoint_residual_norm": residual_norm,
+            "checkpoint_base_norm": base_norm,
+            "checkpoint_compact_aux": 1.0,
+            "checkpoint_enabled": 1.0,
+        }
+        empty = fine.new_empty((0, int(fine.shape[-1])))
+        return fine, empty, empty, aux
 
 
 __all__ = [
