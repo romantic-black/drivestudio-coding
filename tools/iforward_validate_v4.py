@@ -32,8 +32,14 @@ _install_headless_dash_comm_stub()
 from datasets.iforward_stage2_3.scheduler import Stage23Scheduler
 from models.iforward.protocols.validation_recipes import build_validation_v4_plans
 from models.iforward.runtime.adapter_stage3 import Stage3SchedulerAdapter
+from models.iforward.runtime.eval_guard import parameter_version_snapshot
 from models.iforward.runtime.runner import IForwardRunner, RunnerOptions
 from models.iforward.runtime.trace import TraceRecorder
+from models.iforward.validation_v4.contract import (
+    assert_validation_contract,
+    build_validation_contract,
+    write_validation_contract,
+)
 from models.iforward.validation_v4.html_exporter import export_html_report, export_legacy_rows_html_report
 from tools.train_iforward import build_iforward_trainer_from_cfg
 from tools.train_iforward import _sequence10_minimal_from_scheduler_batch as _convert_batch
@@ -48,6 +54,7 @@ class RuntimeBundle:
     dataset: Any
     model: Any
     device: torch.device
+    checkpoint_payload: dict[str, Any]
 
 
 def _parse_csv(value: str | None) -> list[str]:
@@ -95,6 +102,12 @@ def _skip_full_dataset_asset_validation_for_validate(dataset: Any) -> None:
 
 def _load_model_weights(model: Any, checkpoint: str) -> dict[str, Any]:
     if not checkpoint:
+        resume_guard = getattr(model, "validate_resume_checkpoint_payload", None)
+        if callable(resume_guard):
+            # Legacy versions deliberately accept an empty payload.  Native
+            # Stage 3.4 rejects it, preventing an expensive validation run on
+            # randomly initialized weights with no codec identity to verify.
+            resume_guard({})
         return {}
     payload = torch.load(checkpoint, map_location="cpu")
     if not isinstance(payload, dict):
@@ -102,6 +115,12 @@ def _load_model_weights(model: Any, checkpoint: str) -> dict[str, Any]:
     state = payload.get("model_state_dict")
     if state is None:
         raise ValueError(f"checkpoint missing model_state_dict: {checkpoint}")
+    resume_guard = getattr(model, "validate_resume_checkpoint_payload", None)
+    if callable(resume_guard):
+        # Validate-only runs use native checkpoint semantics.  In particular,
+        # a Stage 3.3 payload or the superseded Stage 3.4 13D codec must not be
+        # silently treated as a native Stage 3.4 validation checkpoint.
+        resume_guard(payload)
     incompatible = model.load_state_dict(state, strict=False)
     missing = list(getattr(incompatible, "missing_keys", []) or [])
     unexpected = list(getattr(incompatible, "unexpected_keys", []) or [])
@@ -134,10 +153,16 @@ def build_iforward_runtime_from_cfg(cfg: Any, *, checkpoint: str = "", device: s
     dataset = build_multi_scene_dataset_v4(cfg, device_obj)
     _skip_full_dataset_asset_validation_for_validate(dataset)
     model = build_iforward_trainer_from_cfg(cfg, device_obj)
-    _load_model_weights(model, checkpoint)
+    checkpoint_payload = _load_model_weights(model, checkpoint)
     if hasattr(model, "eval"):
         model.eval()
-    return RuntimeBundle(cfg=cfg, dataset=dataset, model=model, device=device_obj)
+    return RuntimeBundle(
+        cfg=cfg,
+        dataset=dataset,
+        model=model,
+        device=device_obj,
+        checkpoint_payload=checkpoint_payload,
+    )
 
 
 def _make_scheduler(cfg: Any, dataset: Any) -> Stage23Scheduler:
@@ -185,28 +210,61 @@ def run_validate(args: argparse.Namespace) -> list[str]:
         memory_ablation=_parse_csv(args.memory_ablation),
     )
     html_paths: list[str] = []
-    for idx, plan in enumerate(plans):
-        plan_dir = output_dir / f"{idx:04d}_{plan.plan_id}"
-        scheduler = _make_scheduler(cfg, bundle.dataset)
-        adapter = Stage3SchedulerAdapter(scheduler)
-        runner = IForwardRunner(bundle.model, adapter, _convert_batch)
-        recorder = TraceRecorder(plan_dir, record_images=_record_images_for_plan(image_policy, idx))
-        trace = runner.run(
-            plan,
-            recorder,
-            RunnerOptions.for_mode("validate", device=str(bundle.device), trigger_step=int(args.trigger_step)),
+    traces: list[Any] = []
+    plan_dirs = [output_dir / f"{idx:04d}_{plan.plan_id}" for idx, plan in enumerate(plans)]
+    parameter_versions_before = parameter_version_snapshot(bundle.model)
+    runtime_error = ""
+    caught: Exception | None = None
+    try:
+        for idx, (plan, plan_dir) in enumerate(zip(plans, plan_dirs)):
+            scheduler = _make_scheduler(cfg, bundle.dataset)
+            adapter = Stage3SchedulerAdapter(scheduler)
+            runner = IForwardRunner(bundle.model, adapter, _convert_batch)
+            recorder = TraceRecorder(plan_dir, record_images=_record_images_for_plan(image_policy, idx))
+            trace = runner.run(
+                plan,
+                recorder,
+                RunnerOptions.for_mode("validate", device=str(bundle.device), trigger_step=int(args.trigger_step)),
+            )
+            traces.append(trace)
+            html_paths.append(
+                export_html_report(
+                    trace,
+                    plan_dir,
+                    title=f"IForward Validation v4 {plan.episode.protocol_name}",
+                )
+            )
+        index = output_dir / "index.html"
+        index.write_text(
+            "<!doctype html><meta charset='utf-8'><h1>IForward Validation v4</h1>"
+            "<p><a href='validation_contract.json'>validation contract</a></p><ul>"
+            + "".join(
+                f"<li><a href='{Path(path).parent.name}/index.html'>{Path(path).parent.name}</a></li>"
+                for path in html_paths
+            )
+            + "</ul>",
+            encoding="utf-8",
         )
-        html_paths.append(export_html_report(trace, plan_dir, title=f"IForward Validation v4 {plan.episode.protocol_name}"))
-    index = output_dir / "index.html"
-    index.write_text(
-        "<!doctype html><meta charset='utf-8'><h1>IForward Validation v4</h1><ul>"
-        + "".join(
-            f"<li><a href='{Path(path).parent.name}/index.html'>{Path(path).parent.name}</a></li>" for path in html_paths
-        )
-        + "</ul>",
-        encoding="utf-8",
+    except Exception as exc:  # write a machine-readable failed contract before propagating
+        caught = exc
+        runtime_error = f"{type(exc).__name__}: {exc}"
+
+    contract = build_validation_contract(
+        output_dir=output_dir,
+        cfg=cfg,
+        plans=plans,
+        traces=traces,
+        plan_dirs=plan_dirs,
+        parameter_versions_before=parameter_versions_before,
+        parameter_versions_after=parameter_version_snapshot(bundle.model),
+        checkpoint_payload=bundle.checkpoint_payload,
+        runtime_error=runtime_error,
     )
-    return [str(index), *html_paths]
+    contract_path = write_validation_contract(contract, output_dir)
+    if caught is not None:
+        raise caught
+    assert_validation_contract(contract)
+    return [str(output_dir / "index.html"), contract_path, *html_paths]
 
 
 def main() -> None:

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from omegaconf import OmegaConf
 
 import tools.train_iforward as train_ifwd
+from pathlib import Path
 
 
 def _cfg(tmp_path):
@@ -106,3 +107,32 @@ def test_stage33_training_variant_controls_checkpoint_prefix_and_manifest(tmp_pa
     fields = train_ifwd._iforward_lifting_manifest_fields(cfg)
     assert fields["iforward_version"] == "stage3_0_scalar_anchor_child_support_parent_legacy"
     assert fields["training_variant"] == "stage3_3_observation_feedback"
+
+
+def test_stage34_manifest_binds_functional_parent_and_gdkv_contract() -> None:
+    root = Path(__file__).resolve().parents[1]
+    cfg = OmegaConf.load(
+        root / "configs" / "iforward" / "iforward_stage3_4_functional_parentgs_lift.yaml"
+    )
+    fields = train_ifwd._iforward_lifting_manifest_fields(cfg)
+    assert fields == {
+        **fields,
+        "iforward_version": "stage3_4_functional_parentgs_lift",
+        "training_variant": "stage3_4_functional_parentgs_lift",
+        "parent_lifting_type": "functional_parent_direct_lift",
+        "parent_projector_backend": "cuda_exact_diag",
+        "parent_projector_covariance_mode": "diagonal",
+        "parent_projector_mass_mode": "dynamic_tau_area",
+        "parent_projector_grad_mode": "functional_autograd",
+        "parent_state_mode": "functional_per_visit",
+        "parent_param_codec_mode": "legacy17d_plus_geometry8d_residual",
+        "parent_codec_schema": "legacy17d_plus_geometry8d_residual_v1",
+        "parent_param_codec_grad_to_parent_params": True,
+        "parent_optimizer_memory_enable": True,
+        "parent_optimizer_memory_type": "lowrank_gated_delta_kv",
+        "parent_optimizer_memory_reset_scope": "episode",
+        "parent_optimizer_memory_detach_scope": "rollout_boundary",
+    }
+    assert train_ifwd.checkpoint_prefix_iforward_from_cfg(cfg) == (
+        "iforward_stage3_4_functional_parentgs_lift"
+    )

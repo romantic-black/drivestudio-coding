@@ -209,8 +209,13 @@ def test_full_dynamic_observation_checkpoint_recomputes_without_repeating_dino()
     assert stage.image_feature_extractor.residual_unet.weight.grad is not None
 
 
-def test_feedback_and_legacy_parity_share_static_dino_cache_entries() -> None:
+@pytest.mark.parametrize(("chunk_size", "expected_calls"), [(1, 2), (12, 1)])
+def test_feedback_and_legacy_parity_share_static_dino_cache_entries(
+    chunk_size: int,
+    expected_calls: int,
+) -> None:
     stage = _feedback_stage()
+    stage.stage6_cnn_view_chunk_size = int(chunk_size)
     stage.dino_feature_cache = DINOFeatureCache(
         dtype="float32",
         cpu_pinned=False,
@@ -236,14 +241,14 @@ def test_feedback_and_legacy_parity_share_static_dino_cache_entries() -> None:
         feedback_alpha=1.0,
         checkpoint_dynamic=False,
     )
-    assert stage.image_feature_extractor.dino_calls == 2
+    assert stage.image_feature_extractor.dino_calls == expected_calls
     legacy = stage._render_source_scene_only_for_cnn(
         **common,
         feedback_enabled=False,
         feedback_alpha=0.0,
         checkpoint_dynamic=False,
     )
-    assert stage.image_feature_extractor.dino_calls == 2
+    assert stage.image_feature_extractor.dino_calls == expected_calls
     torch.testing.assert_close(feedback["features_2d"], legacy["features_2d"])
 
 

@@ -16,7 +16,12 @@ from .observation_feedback import (
 )
 from .state import IForwardState
 from .utils import cfg_get
-from .versions import is_stage3_optimizer_memory_iforward_version
+from .versions import (
+    IFORWARD_STAGE3_4_FUNCTIONAL_PARENTGS_LIFT_VERSION,
+    IFORWARD_STAGE3_4_PARENT_CODEC_SCHEMA,
+    is_stage3_4_iforward_version,
+    is_stage3_optimizer_memory_iforward_version,
+)
 
 
 class IForwardTrainer(nn.Module):
@@ -134,6 +139,10 @@ class IForwardTrainer(nn.Module):
             "iforward_2_3_optimizer_mamba",
         } or is_stage3_optimizer_memory_iforward_version(cfg_get(iforward_cfg, "version", ""))
 
+    def _is_stage3_4_functional_parent(self) -> bool:
+        iforward_cfg = cfg_get(cfg_get(self.config, "model", {}) or {}, "iforward", {}) or {}
+        return is_stage3_4_iforward_version(cfg_get(iforward_cfg, "version", ""))
+
     def _is_stage2_1_parent_temporal(self) -> bool:
         if (
             bool(getattr(self.model, "is_stage2_1_parent_temporal", False))
@@ -234,6 +243,12 @@ class IForwardTrainer(nn.Module):
             parent_ptv3_named: List[Tuple[str, nn.Parameter]] = []
             if isinstance(parent_spatial, nn.Module):
                 parent_token_named.extend(self._named_params(getattr(parent_spatial, "param_support_codec", None), "parent_spatial_backbone.param_support_codec"))
+                parent_token_named.extend(
+                    self._named_params(
+                        getattr(parent_spatial, "geometry_residual_adapter", None),
+                        "parent_spatial_backbone.geometry_residual_adapter",
+                    )
+                )
                 parent_token_named.extend(self._named_params(getattr(parent_spatial, "token_builder", None), "parent_spatial_backbone.token_builder"))
                 parent_token_named.extend(self._named_params(getattr(parent_spatial, "far_mlp", None), "parent_spatial_backbone.far_mlp"))
                 parent_token_named.extend(self._named_params(getattr(parent_spatial, "far_norm", None), "parent_spatial_backbone.far_norm"))
@@ -1063,15 +1078,6 @@ class IForwardTrainer(nn.Module):
                         if feedback_mode.input_grad_enabled
                         else 0.0
                     ),
-                    "iforward/feedback/parent_vjp_enabled": float(
-                        self.observation_feedback_policy.parent_projection.enable
-                        and feedback_mode.input_grad_enabled
-                    ),
-                    "iforward/feedback/parent_vjp_alpha": float(
-                        self.observation_feedback_policy.parent_alpha(feedback_step)
-                        if feedback_mode.input_grad_enabled
-                        else 0.0
-                    ),
                     "iforward/feedback/relation_enabled": float(
                         self.observation_feedback_policy.relation.enable
                         and feedback_mode.input_grad_enabled
@@ -1083,6 +1089,23 @@ class IForwardTrainer(nn.Module):
                     ),
                 }
             )
+            if not self._is_stage3_4_functional_parent():
+                # These names describe the legacy runtime/surrogate VJP path.
+                # Stage 3.4 has its own Functional Parent metrics and must not
+                # emit zero-valued legacy sentinels that look like execution.
+                feedback_runtime_metrics.update(
+                    {
+                        "iforward/feedback/parent_vjp_enabled": float(
+                            self.observation_feedback_policy.parent_projection.enable
+                            and feedback_mode.input_grad_enabled
+                        ),
+                        "iforward/feedback/parent_vjp_alpha": float(
+                            self.observation_feedback_policy.parent_alpha(feedback_step)
+                            if feedback_mode.input_grad_enabled
+                            else 0.0
+                        ),
+                    }
+                )
         requested_inner_k = int(
             resolved_meta.get(
                 "requested_inner_K",
@@ -1454,10 +1477,63 @@ class IForwardTrainer(nn.Module):
 
     def build_light_checkpoint_extra(self, *, step: int) -> Dict[str, Any]:
         iforward_cfg = cfg_get(cfg_get(self.config, "model", {}) or {}, "iforward", {}) or {}
+        parent_spatial_cfg = cfg_get(iforward_cfg, "parent_spatial", {}) or {}
+        parent_codec_cfg = cfg_get(parent_spatial_cfg, "param_codec", {}) or {}
         return {
+            "iforward_version": str(cfg_get(iforward_cfg, "version", "") or ""),
             "training_variant": str(cfg_get(iforward_cfg, "training_variant", "") or ""),
+            "parent_codec_schema": str(cfg_get(parent_codec_cfg, "schema", "") or ""),
             "observation_feedback_schedule": self.feedback_schedule_state(global_step=int(step)),
         }
+
+    def validate_resume_checkpoint_payload(self, payload: Dict[str, Any]) -> None:
+        """Forbid treating Stage 3.3 weights as a native Stage 3.4 resume."""
+
+        iforward_cfg = cfg_get(cfg_get(self.config, "model", {}) or {}, "iforward", {}) or {}
+        current_version = str(cfg_get(iforward_cfg, "version", "") or "")
+        saved_version = str(payload.get("iforward_version", "") or "")
+        stage3_4 = IFORWARD_STAGE3_4_FUNCTIONAL_PARENTGS_LIFT_VERSION
+        if is_stage3_4_iforward_version(current_version) or is_stage3_4_iforward_version(
+            saved_version
+        ):
+            if not saved_version:
+                raise ValueError(
+                    "Native Stage 3.4 strict resume requires checkpoint iforward_version metadata; "
+                    "use initialization.weights_only for a Stage 3.3 checkpoint."
+                )
+            if saved_version != current_version or current_version != stage3_4:
+                raise ValueError(
+                    "Cross-version strict resume is forbidden for Stage 3.4: "
+                    f"checkpoint={saved_version!r} config={current_version!r}. "
+                    "Use weights-only initialization for migration."
+                )
+            saved_variant = str(payload.get("training_variant", "") or "")
+            current_variant = str(cfg_get(iforward_cfg, "training_variant", "") or "")
+            if saved_variant != current_variant:
+                raise ValueError(
+                    "Native Stage 3.4 strict resume training_variant mismatch: "
+                    f"checkpoint={saved_variant!r} config={current_variant!r}"
+                )
+            parent_spatial_cfg = cfg_get(iforward_cfg, "parent_spatial", {}) or {}
+            parent_codec_cfg = cfg_get(parent_spatial_cfg, "param_codec", {}) or {}
+            current_schema = str(cfg_get(parent_codec_cfg, "schema", "") or "")
+            saved_schema = str(payload.get("parent_codec_schema", "") or "")
+            if current_schema != IFORWARD_STAGE3_4_PARENT_CODEC_SCHEMA:
+                raise ValueError(
+                    "Stage 3.4 config parent codec schema mismatch: "
+                    f"expected={IFORWARD_STAGE3_4_PARENT_CODEC_SCHEMA!r} "
+                    f"config={current_schema!r}"
+                )
+            if not saved_schema:
+                raise ValueError(
+                    "Native Stage 3.4 strict resume requires checkpoint parent_codec_schema metadata; "
+                    "pre-v57 13D Stage 3.4 checkpoints are not resume-compatible."
+                )
+            if saved_schema != current_schema:
+                raise ValueError(
+                    "Native Stage 3.4 strict resume parent_codec_schema mismatch: "
+                    f"checkpoint={saved_schema!r} config={current_schema!r}"
+                )
 
     def load_feedback_schedule_state_from_checkpoint(self, payload: Dict[str, Any]) -> bool:
         state = payload.get("observation_feedback_schedule")

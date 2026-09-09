@@ -8,7 +8,13 @@ from models.iforward.biggs_state import BigGSBranchAssignment
 from models.streetforward.stage6_0.event_encoder import EventPack
 from models.streetforward.stage6_0.posterior_updater import BranchDelta, DeltaPack
 from models.iforward.stage2_2.parent_temporal_keys_v2 import ParentTemporalKeysV2
-from models.iforward.stage2_3 import ParentOptimizerMamba, ParentOptimizerMambaState, VisitMeta, build_parent_delta_summary
+from models.iforward.stage2_3 import (
+    ParentAssignmentPack,
+    ParentOptimizerMamba,
+    ParentOptimizerMambaState,
+    VisitMeta,
+    build_parent_delta_summary,
+)
 
 
 def _memory():
@@ -156,3 +162,48 @@ def test_stage2_3_parent_delta_summary_missing_mapping_fail_fast():
             spatial_event=event,
             fail_fast=True,
         )
+
+
+def test_stage3_4_assignment_only_delta_summary_matches_legacy_runtime() -> None:
+    event = EventPack(
+        event_bg=torch.zeros(2, 4),
+        support_bg=torch.ones(2, 1),
+        valid_bg=torch.ones(2, dtype=torch.bool),
+    )
+    assignment = BigGSBranchAssignment(
+        branch="bg",
+        child_to_parent=torch.tensor([0, 0, 1, 1], dtype=torch.long),
+        child_order=torch.arange(4),
+        parent_start=torch.tensor([0, 2], dtype=torch.long),
+        parent_count=torch.tensor([2, 2], dtype=torch.long),
+        # This is deliberately nonuniform: the Stage 3.4 write-token contract
+        # uses persistent assignment mass rather than live projector mass.
+        child_mass=torch.tensor([1.0, 5.0, 2.0, 7.0]),
+        num_children=4,
+        num_parents=2,
+    )
+    delta = DeltaPack(bg=_branch_delta(4))
+    runtime = SimpleNamespace(
+        bg_assignment=assignment,
+        distant_assignment=None,
+        rigid_active_assignment=None,
+    )
+
+    legacy, legacy_aux = build_parent_delta_summary(delta, event, runtime=runtime)
+    functional, functional_aux = build_parent_delta_summary(
+        delta,
+        event,
+        assignments=ParentAssignmentPack(bg=assignment),
+    )
+
+    assert legacy.bg is not None and functional.bg is not None
+    torch.testing.assert_close(functional.bg.summary7, legacy.bg.summary7, rtol=0.0, atol=0.0)
+    assert functional_aux == legacy_aux
+
+
+def test_stage3_4_delta_summary_rejects_ambiguous_topology_source() -> None:
+    event = EventPack(event_bg=torch.zeros(1, 4))
+    assignments = ParentAssignmentPack()
+    runtime = SimpleNamespace()
+    with pytest.raises(ValueError, match="either assignments or runtime"):
+        build_parent_delta_summary(None, event, assignments=assignments, runtime=runtime)

@@ -878,7 +878,15 @@ class StreetForwardBatchEvalRunner:
             elif bool(self.runtime_cfg.history_record_on_input_exit) and bool(is_block_exit):
                 self._record_model_history(update_batch)
 
-            should_render = bool(self.protocol.save_each_iter_views) or (int(global_iter) == int(total_visits))
+            report_iterations = self.protocol.report_iterations
+            should_render = (
+                bool(self.protocol.save_each_iter_views)
+                or (
+                    report_iterations is not None
+                    and int(global_iter) in set(int(x) for x in report_iterations)
+                )
+                or (int(global_iter) == int(total_visits))
+            )
             if should_render:
                 rows = self._render_current_state(spec=spec)
                 self._record_iteration(

@@ -25,6 +25,11 @@ class TestProtocolSpec:
     metric_primary_mask: str
     report_full_image: bool
 
+    # Global optimization iterations at which the current state is rendered and
+    # evaluated.  None preserves the legacy behavior (every iteration when
+    # save_each_iter_views=true, otherwise only the final iteration).
+    report_iterations: Optional[List[int]] = None
+
     input_count_label: Optional[str] = None
     train_block_size_label: Optional[str] = None
 
@@ -101,6 +106,20 @@ def validate_protocol(
                 f"eval offset out of range: {o}, sequence_length={protocol.sequence_length}"
             )
 
+    if protocol.report_iterations is not None:
+        report_iterations = [int(x) for x in protocol.report_iterations]
+        if len(report_iterations) == 0:
+            raise ValueError("report_iterations must not be empty when provided")
+        if report_iterations != sorted(set(report_iterations)):
+            raise ValueError("report_iterations must be strictly increasing and unique")
+        total_iterations = int(len(protocol.input_offsets) * protocol.steps_per_input)
+        for iteration in report_iterations:
+            if iteration < 1 or iteration > total_iterations:
+                raise ValueError(
+                    "report_iterations values must be within the experiment optimization budget: "
+                    f"iteration={iteration}, total_iterations={total_iterations}"
+                )
+
 
 def protocol_from_dict(
     *,
@@ -143,6 +162,19 @@ def protocol_from_dict(
         raise ValueError(f"experiment {name}: steps_per_input is required")
     steps_per_input = int(steps_any)
 
+    report_iterations_any = exp_cfg.get("report_iterations")
+    report_iterations = (
+        None
+        if report_iterations_any is None
+        else [
+            int(x)
+            for x in _as_list(
+                report_iterations_any,
+                f"experiment {name}: report_iterations",
+            )
+        ]
+    )
+
     cameras_cfg = global_cfg.get("cameras")
     cameras_cfg = _as_mapping(cameras_cfg, "batch_eval.cameras")
     camera_ids_any = cameras_cfg.get("ids")
@@ -171,6 +203,7 @@ def protocol_from_dict(
         save_each_iter_views=bool(render_cfg.get("save_each_iter_views", True)),
         metric_primary_mask=str(metrics_cfg.get("primary_mask", "non_sky_non_ego")),
         report_full_image=bool(metrics_cfg.get("report_full_image", True)),
+        report_iterations=report_iterations,
         input_count_label=(
             None
             if exp_cfg.get("input_count_label") is None

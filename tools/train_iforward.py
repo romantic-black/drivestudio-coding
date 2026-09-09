@@ -199,12 +199,40 @@ def _iforward_lifting_manifest_fields(cfg: Any) -> Dict[str, Any]:
     lifting_cfg = _cfg_get(iforward_cfg, "lifting", {}) or {}
     parent_cfg = _cfg_get(lifting_cfg, "parent", {}) or {}
     child_cfg = _cfg_get(lifting_cfg, "child_gather", {}) or {}
+    biggs_cfg = _cfg_get(iforward_cfg, "biggs", {}) or {}
+    projector_cfg = _cfg_get(biggs_cfg, "parent_projector", {}) or {}
+    parent_state_cfg = _cfg_get(biggs_cfg, "parent_state", {}) or {}
+    parent_spatial_cfg = _cfg_get(iforward_cfg, "parent_spatial", {}) or {}
+    parent_codec_cfg = _cfg_get(parent_spatial_cfg, "param_codec", {}) or {}
+    parent_memory_cfg = _cfg_get(iforward_cfg, "parent_optimizer_memory", {}) or {}
     return {
         "iforward_version": str(_cfg_get(iforward_cfg, "version", "")),
         "training_variant": str(_cfg_get(iforward_cfg, "training_variant", "") or ""),
         "lifting_type": str(_cfg_get(lifting_cfg, "type", "") or ""),
         "parent_lifting_type": str(_cfg_get(parent_cfg, "type", "") or ""),
         "child_gather_type": str(_cfg_get(child_cfg, "type", "") or ""),
+        "parent_projector_backend": str(_cfg_get(projector_cfg, "backend", "") or ""),
+        "parent_projector_covariance_mode": str(
+            _cfg_get(projector_cfg, "covariance_mode", "") or ""
+        ),
+        "parent_projector_mass_mode": str(_cfg_get(projector_cfg, "mass_mode", "") or ""),
+        "parent_projector_grad_mode": str(_cfg_get(projector_cfg, "grad_mode", "") or ""),
+        "parent_state_mode": str(_cfg_get(parent_state_cfg, "mode", "") or ""),
+        "parent_param_codec_mode": str(_cfg_get(parent_codec_cfg, "mode", "") or ""),
+        "parent_codec_schema": str(_cfg_get(parent_codec_cfg, "schema", "") or ""),
+        "parent_param_codec_grad_to_parent_params": _cfg_get(
+            parent_codec_cfg,
+            "grad_to_parent_params",
+            None,
+        ),
+        "parent_optimizer_memory_enable": _cfg_get(parent_memory_cfg, "enable", None),
+        "parent_optimizer_memory_type": str(_cfg_get(parent_memory_cfg, "type", "") or ""),
+        "parent_optimizer_memory_reset_scope": str(
+            _cfg_get(parent_memory_cfg, "reset_scope", "") or ""
+        ),
+        "parent_optimizer_memory_detach_scope": str(
+            _cfg_get(parent_memory_cfg, "detach_scope", "") or ""
+        ),
     }
 
 

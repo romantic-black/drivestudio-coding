@@ -586,6 +586,9 @@ class MinimalStreetForwardStage4_5(MinimalStreetForwardStage4_2):
             )
         )
         view_chunk_size = int(getattr(self, "stage6_cnn_view_chunk_size", 0) or 0)
+        use_view_chunks = bool(
+            view_chunk_size > 0 and int(image_batch.shape[0]) > view_chunk_size
+        )
         if view_chunk_size <= 0:
             view_chunk_size = int(image_batch.shape[0])
 
@@ -617,11 +620,15 @@ class MinimalStreetForwardStage4_5(MinimalStreetForwardStage4_2):
             # Keeping a feedback-only namespace made the low-frequency parity
             # probe execute the frozen DINO backbone twice and compared two AMP
             # realizations instead of isolating the dynamic render/frontend.
-            chunk_key = (
-                (dino_cache_key, "view_chunk", int(start), int(end), int(image_batch.shape[0]))
-                if dino_cache_key is not None
-                else None
-            )
+            chunk_key = dino_cache_key
+            if dino_cache_key is not None and use_view_chunks:
+                chunk_key = (
+                    dino_cache_key,
+                    "view_chunk",
+                    int(start),
+                    int(end),
+                    int(image_batch.shape[0]),
+                )
             native_chunk = None
             with torch.no_grad():
                 if cache_level == "backbone_intermediate":

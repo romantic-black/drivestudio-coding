@@ -1,0 +1,108 @@
+# Stage 5_3 single-frame cumulative optimization curve.
+#
+# The model starts from one reset state, observes one frame through cameras
+# 0/1/2, and is updated 256 times. PSNR is rendered only after powers of two,
+# so every row in psnr_by_optimization_steps.csv belongs to the same trajectory.
+#
+# Run (checkpoint is intentionally supplied explicitly):
+#   conda run -n drivestudio-new env PYTHONPATH=/root/drivestudio-coding \
+#     python tools/eval_streetforward_benchmark.py \
+#       --config_file configs/eval/streetforward_batcheval_stage5_3_single_frame_curve.yaml \
+#       --checkpoint /absolute/path/to/stage5_3_checkpoint.pt
+
+base_config_file: configs/minimal_streetforward_stage5_3_multi_scene_v8.yaml
+base_config_git_revision: "59266ef"
+
+# The matching local asset pack. Override this when the checkpoint was trained
+# with a different exported asset root.
+data:
+  assets:
+    root: /root/autodl-tmp/streetforward_assets_pt40w_40w
+  pixel_source:
+    cameras: [0, 1, 2]
+
+dataset:
+  segment_aabb:
+    - [-20.0, -10.0, 0.0]
+    - [20.0, 4.8, 60.0]
+  pointcloud:
+    monocular_chosen_cam_ids: [0, 1, 2]
+    monocular_downscale: 1
+    monocular_dynamic_recovery_max_points_per_instance: 5000
+    near_max_points: 400000
+    distant_max_points: 400000
+
+batch_eval:
+  enable: true
+  output_dir: /root/autodl-tmp/outputs/batch_eval_stage5_3_single_frame_curve
+  data_mode: segment_finetune_train
+
+  # step80000 was trained before the current Stage 5_3 attribute-gate upgrade.
+  # Load its exact tracked implementation so strict checkpoint loading remains
+  # meaningful; do not silently reshape or drop learned parameters.
+  model_implementation:
+    git_revision: "59266ef"
+    source_file: models/streetforward/minimal_trainer_stage5_3.py
+    class_name: MinimalStreetForwardStage5_3
+
+  checkpoint:
+    path: null
+    strict: true
+
+  dataset:
+    scene_ids: [0]
+    segment_policy: first
+    require_full_window: true
+    stride: 1
+    max_episodes_per_scene: 1
+    max_total_episodes: 1
+    window_policy: middle
+
+  cameras:
+    ids: [0, 1, 2]
+    names: [front, front_left, front_right]
+
+  runtime:
+    mode: inference_only
+    no_grad: true
+    amp: false
+    reset_state_per_episode: true
+    align_with_scheduler_v8: false
+    update_node_state: true
+    update_hidden_state: true
+    update_view_transient: true
+    target_frame_policy: all_observed
+    max_target_frames_including_source: 1
+    reset_policy: episode_end
+
+  history:
+    update_step_norm_ema: true
+    record_support_residual_on_input_exit: true
+    record_each_step: false
+
+  render:
+    save_pre_update: false
+    save_each_iter_views: false
+    save_png: true
+    save_video: false
+    save_numpy: false
+    save_depth_or_acc: false
+
+  metrics:
+    # Stage 5_3 is trained with sky excluded. mean_psnr therefore reports the
+    # non-sky region; mean_psnr_full is emitted alongside it for reference.
+    primary_mask: non_sky
+    report_full_image: true
+    compute_psnr: true
+    compute_ssim: false
+    compute_lpips: false
+    compute_l1: false
+    min_valid_pixels: 32
+
+  experiments:
+    - name: stage5_3_single_frame_1_to_256
+      sequence_length: 1
+      input_offsets: [0]
+      eval_offsets: [0]
+      steps_per_input: 256
+      report_iterations: [1, 2, 4, 8, 16, 32, 64, 128, 256]

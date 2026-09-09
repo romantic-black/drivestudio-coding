@@ -219,6 +219,30 @@ def _branches(values: Mapping[str, Any], *, path: str) -> tuple[str, ...]:
     return branches
 
 
+def _functional_parent_branches(values: Mapping[str, Any], *, path: str) -> tuple[str, ...]:
+    raw = values.get("branches", ("bg", "distant", "rigid_active"))
+    if isinstance(raw, (str, bytes, Mapping)):
+        raise TypeError(f"{path}.branches must be a sequence")
+    try:
+        raw_branches = tuple(raw)
+    except TypeError as exc:
+        raise TypeError(f"{path}.branches must be a sequence") from exc
+    if not raw_branches:
+        raise ValueError(f"{path}.branches must be non-empty")
+    if any(not isinstance(value, str) for value in raw_branches):
+        raise TypeError(f"{path}.branches entries must be strings")
+    branches = tuple(str(value) for value in raw_branches)
+    if len(set(branches)) != len(branches):
+        raise ValueError(f"{path}.branches must contain no duplicates")
+    unsupported = sorted(set(branches) - {"bg", "distant", "rigid_active"})
+    if unsupported:
+        raise ValueError(
+            f"{path}.branches only supports bg/distant/rigid_active, got: "
+            + ", ".join(unsupported)
+        )
+    return branches
+
+
 @dataclass(frozen=True)
 class SourceRenderFeedbackPolicy:
     enable: bool = False
@@ -244,6 +268,16 @@ class ParentProjectionFeedbackPolicy:
     backward_mode: str = "exact_diag_recompute_surrogate_vjp"
     alpha_schedule: FeedbackAlphaSchedule = field(default_factory=FeedbackAlphaSchedule)
     drift: ParentProjectionDriftPolicy = field(default_factory=ParentProjectionDriftPolicy)
+
+
+@dataclass(frozen=True)
+class FunctionalParentFeedbackPolicy:
+    """Stage 3.4 per-visit Functional Parent geometry feedback policy."""
+
+    enable: bool = False
+    branches: tuple[str, ...] = ("bg", "distant", "rigid_active")
+    start_after_model_updates: int = 1
+    alpha_schedule: FeedbackAlphaSchedule = field(default_factory=FeedbackAlphaSchedule)
 
 
 @dataclass(frozen=True)
@@ -305,6 +339,9 @@ class ObservationFeedbackPolicy:
     schedule: ObservationFeedbackSchedulePolicy = field(default_factory=ObservationFeedbackSchedulePolicy)
     modes: Mapping[str, FeedbackMode] = field(default_factory=dict)
     source_render: SourceRenderFeedbackPolicy = field(default_factory=SourceRenderFeedbackPolicy)
+    functional_parent: FunctionalParentFeedbackPolicy = field(
+        default_factory=FunctionalParentFeedbackPolicy
+    )
     parent_projection: ParentProjectionFeedbackPolicy = field(default_factory=ParentProjectionFeedbackPolicy)
     relation: RelationFeedbackPolicy = field(default_factory=RelationFeedbackPolicy)
     scalar_anchor_geometry_grad: bool = False
@@ -328,6 +365,7 @@ class ObservationFeedbackPolicy:
                 "schedule",
                 "modes",
                 "source_render",
+                "functional_parent",
                 "parent_projection",
                 "relation",
                 "scalar_anchor",
@@ -345,6 +383,7 @@ class ObservationFeedbackPolicy:
                 "schedule",
                 "modes",
                 "source_render",
+                "functional_parent",
                 "parent_projection",
                 "relation",
                 "scalar_anchor",
@@ -432,6 +471,39 @@ class ObservationFeedbackPolicy:
                 raise ValueError("source_render.checkpoint_scope must be 'full_dynamic_observation' when enabled")
             if source.absgrad:
                 raise ValueError("source_render.absgrad must remain false for observation feedback")
+
+        functional_parent_raw = _section(
+            root.get("functional_parent", {}),
+            path="observation_feedback.functional_parent",
+            allowed={"enable", "branches", "start_after_model_updates", "alpha_schedule"},
+        )
+        functional_parent = FunctionalParentFeedbackPolicy(
+            enable=_bool(
+                functional_parent_raw,
+                "enable",
+                False,
+                path="observation_feedback.functional_parent",
+            ),
+            branches=_functional_parent_branches(
+                functional_parent_raw,
+                path="observation_feedback.functional_parent",
+            ),
+            start_after_model_updates=_int(
+                functional_parent_raw,
+                "start_after_model_updates",
+                1,
+                path="observation_feedback.functional_parent",
+                minimum=1,
+            ),
+            alpha_schedule=FeedbackAlphaSchedule.from_config(
+                functional_parent_raw.get("alpha_schedule", [[0, 0.0]]),
+                path="observation_feedback.functional_parent.alpha_schedule",
+            ),
+        )
+        if functional_parent.enable and not enabled:
+            raise ValueError(
+                "functional_parent.enable=true requires observation_feedback.enable=true"
+            )
 
         parent_raw = _section(
             root.get("parent_projection", {}),
@@ -590,6 +662,7 @@ class ObservationFeedbackPolicy:
             schedule=schedule,
             modes=dict(modes),
             source_render=source,
+            functional_parent=functional_parent,
             parent_projection=parent,
             relation=relation,
             scalar_anchor_geometry_grad=scalar_geometry_grad,
@@ -652,6 +725,12 @@ class ObservationFeedbackPolicy:
             return 0.0
         if component == "source_render":
             return self.source_render.alpha_schedule(step) if self.source_render.enable else 0.0
+        if component == "functional_parent":
+            return (
+                self.functional_parent.alpha_schedule(step)
+                if self.functional_parent.enable
+                else 0.0
+            )
         if component == "parent_projection":
             return self.parent_projection.alpha_schedule(step) if self.parent_projection.enable else 0.0
         if component == "relation":
@@ -667,6 +746,9 @@ class ObservationFeedbackPolicy:
     def parent_alpha(self, step: int) -> float:
         return self.alpha_for("parent_projection", step)
 
+    def functional_parent_alpha(self, step: int) -> float:
+        return self.alpha_for("functional_parent", step)
+
     def relation_alpha(self, step: int) -> float:
         return self.alpha_for("relation", step)
 
@@ -674,11 +756,16 @@ class ObservationFeedbackPolicy:
     def any_continuous_feedback_enabled(self) -> bool:
         return bool(
             self.enable
-            and (self.source_render.enable or self.parent_projection.enable or self.relation.enable)
+            and (
+                self.source_render.enable
+                or self.functional_parent.enable
+                or self.parent_projection.enable
+                or self.relation.enable
+            )
         )
 
 
-class FrontendParameterModeScope(AbstractContextManager["FrontendParameterModeScope"]):
+class FrontendParameterModeScope(AbstractContextManager):
     """Temporarily freeze the exact frontend parameter set across forward/backward/step."""
 
     def __init__(
@@ -740,6 +827,7 @@ class FrontendParameterModeScope(AbstractContextManager["FrontendParameterModeSc
 __all__ = [
     "FeedbackAlphaSchedule",
     "FeedbackMode",
+    "FunctionalParentFeedbackPolicy",
     "FrontendParameterModeScope",
     "ObservationFeedbackDebugPolicy",
     "ObservationFeedbackPolicy",

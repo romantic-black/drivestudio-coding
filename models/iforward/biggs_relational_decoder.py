@@ -135,11 +135,14 @@ class GaussianRelationCodec(nn.Module):
         *,
         child_params: Dict[str, torch.Tensor],
         parent_params: Dict[str, torch.Tensor],
-        child_cache: BigGSChildContributionCache,
-        parent_stats: BigGSParentStats,
         child_to_parent: torch.Tensor,
         parent_count: torch.Tensor,
         branch_id: int,
+        child_cache: Optional[BigGSChildContributionCache] = None,
+        parent_stats: Optional[BigGSParentStats] = None,
+        child_mass: Optional[torch.Tensor] = None,
+        child_diag_cov: Optional[torch.Tensor] = None,
+        parent_mass_sum: Optional[torch.Tensor] = None,
         detach_params: Optional[bool] = None,
         detach_support: Optional[bool] = None,
         collect_aux: bool = True,
@@ -149,8 +152,15 @@ class GaussianRelationCodec(nn.Module):
         parent_id = child_to_parent.long().to(device=ref.device)
         if n == 0:
             return ref.new_zeros((0, self.relation_dim)), ref.new_zeros((0,)), {}
-        if child_cache is None or parent_stats is None:
-            raise RuntimeError("GRLD requires BigGS parent runtime child_cache and parent_stats")
+        functional_stats = any(value is not None for value in (child_mass, child_diag_cov, parent_mass_sum))
+        if functional_stats and not all(value is not None for value in (child_mass, child_diag_cov, parent_mass_sum)):
+            raise RuntimeError(
+                "GRLD functional relation stats require child_mass, child_diag_cov, and parent_mass_sum together"
+            )
+        if not functional_stats and (child_cache is None or parent_stats is None):
+            raise RuntimeError(
+                "GRLD requires either functional detached stats or legacy BigGS runtime child_cache/parent_stats"
+            )
 
         child_means = self._param(child_params, "means", ref=ref, detach=detach_params)
         child_opacity = self._param(child_params, "opacity_logit", ref=ref, detach=detach_params)
@@ -170,13 +180,22 @@ class GaussianRelationCodec(nn.Module):
         parent_sh_dc = parent_sh_dc_all.index_select(0, parent_id)
         parent_sh_rest = parent_sh_rest_all.index_select(0, parent_id)
 
-        mass = self._cache_tensor(child_cache.mass, ref=ref, detach=detach_support).reshape(-1).clamp_min(float(self.eps))
+        mass_source = child_mass if functional_stats else child_cache.mass
+        mass = self._cache_tensor(mass_source, ref=ref, detach=detach_support).reshape(-1).clamp_min(float(self.eps))
+        if int(mass.numel()) != n:
+            raise ValueError(f"GRLD child mass rows {int(mass.numel())} != {n}")
         if "diag_cov" in child_params:
             child_diag_cov = self._param(
                 child_params,
                 "diag_cov",
                 ref=ref,
                 detach=detach_params,
+            ).reshape(n, 3).clamp_min(float(self.eps))
+        elif functional_stats:
+            child_diag_cov = self._cache_tensor(
+                child_diag_cov,
+                ref=ref,
+                detach=detach_support,
             ).reshape(n, 3).clamp_min(float(self.eps))
         else:
             child_diag_cov = self._cache_tensor(
@@ -187,11 +206,17 @@ class GaussianRelationCodec(nn.Module):
         parent_diag_cov = torch.exp(2.0 * parent_scales_log).clamp_min(float(self.eps))
 
         parent_counts_all = parent_count.to(device=ref.device, dtype=ref.dtype).reshape(-1).clamp_min(1.0)
+        parent_weight_sum_source = parent_mass_sum if functional_stats else parent_stats.weight_sum
         parent_weight_sum = self._cache_tensor(
-            parent_stats.weight_sum,
+            parent_weight_sum_source,
             ref=ref,
             detach=detach_support,
         ).reshape(-1).clamp_min(float(self.eps))
+        if int(parent_weight_sum.numel()) != int(parent_counts_all.numel()):
+            raise ValueError(
+                "GRLD parent mass sum rows "
+                f"{int(parent_weight_sum.numel())} != parent count rows {int(parent_counts_all.numel())}"
+            )
         mean_mass_all = parent_weight_sum / parent_counts_all
         mean_mass = mean_mass_all.index_select(0, parent_id).clamp_min(float(self.eps))
 
@@ -383,14 +408,17 @@ class GaussianRelationalLiftingDecoder(nn.Module):
         parent_event: torch.Tensor,
         child_params: Dict[str, torch.Tensor],
         parent_params: Dict[str, torch.Tensor],
-        child_cache: BigGSChildContributionCache,
-        parent_stats: BigGSParentStats,
         child_to_parent: torch.Tensor,
         parent_start: torch.Tensor,
         parent_count: torch.Tensor,
         child_order: torch.Tensor,
         branch_id: int,
         branch_scale: torch.Tensor,
+        child_cache: Optional[BigGSChildContributionCache] = None,
+        parent_stats: Optional[BigGSParentStats] = None,
+        child_mass: Optional[torch.Tensor] = None,
+        child_diag_cov: Optional[torch.Tensor] = None,
+        parent_mass_sum: Optional[torch.Tensor] = None,
         checkpoint_branch: bool = False,
         detach_relation_params: Optional[bool] = None,
         detach_support: Optional[bool] = None,
@@ -406,6 +434,9 @@ class GaussianRelationalLiftingDecoder(nn.Module):
                 parent_params=parent_params,
                 child_cache=child_cache,
                 parent_stats=parent_stats,
+                child_mass=child_mass,
+                child_diag_cov=child_diag_cov,
+                parent_mass_sum=parent_mass_sum,
                 child_to_parent=child_to_parent,
                 parent_start=parent_start,
                 parent_count=parent_count,
@@ -422,6 +453,9 @@ class GaussianRelationalLiftingDecoder(nn.Module):
             parent_params=parent_params,
             child_cache=child_cache,
             parent_stats=parent_stats,
+            child_mass=child_mass,
+            child_diag_cov=child_diag_cov,
+            parent_mass_sum=parent_mass_sum,
             child_to_parent=pid,
             parent_count=parent_count,
             branch_id=int(branch_id),
@@ -487,8 +521,11 @@ class GaussianRelationalLiftingDecoder(nn.Module):
         parent_event: torch.Tensor,
         child_params: Dict[str, torch.Tensor],
         parent_params: Dict[str, torch.Tensor],
-        child_cache: BigGSChildContributionCache,
-        parent_stats: BigGSParentStats,
+        child_cache: Optional[BigGSChildContributionCache],
+        parent_stats: Optional[BigGSParentStats],
+        child_mass: Optional[torch.Tensor],
+        child_diag_cov: Optional[torch.Tensor],
+        parent_mass_sum: Optional[torch.Tensor],
         child_to_parent: torch.Tensor,
         parent_start: torch.Tensor,
         parent_count: torch.Tensor,
@@ -522,6 +559,9 @@ class GaussianRelationalLiftingDecoder(nn.Module):
                 parent_params=parent_params_t,
                 child_cache=child_cache,
                 parent_stats=parent_stats,
+                child_mass=child_mass,
+                child_diag_cov=child_diag_cov,
+                parent_mass_sum=parent_mass_sum,
                 child_to_parent=pid,
                 parent_count=parent_count_d,
                 branch_id=int(branch_id),

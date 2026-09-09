@@ -33,16 +33,18 @@ from models.iforward.biggs_parent_stats import (
 )
 from models.iforward.biggs_state import BigGSBlockRuntime, IForwardBigGSState
 from models.iforward.dino_feature_cache import DINOFeatureCache
+from models.iforward.functional_parentgs import (
+    FunctionalParentPack,
+    FunctionalParentProjectorConfig,
+    build_functional_parent_pack,
+    build_parent_lift_scene,
+    validate_stage3_4_functional_parentgs_config,
+)
 from models.iforward.fwhr_lift import aggregate_fwhr_child_lift
 from models.iforward.amp_policy import amp_dtype_id, build_amp_policy, storage_dtype_from_name
 from models.iforward.observation_feedback import FeedbackMode, ObservationFeedbackPolicy
-from models.iforward.runtime_parent_projection_vjp import (
-    ParentVJPDriftPolicy,
-    RuntimeParentVJPDriftCollector,
-    parent_projection_feedback,
-    runtime_exact_drift,
-)
 from models.iforward.parent_spatial_backbone import ParentStructInput, empty_parent_struct_input
+from models.iforward.stage2_3 import ParentAssignmentPack
 from models.iforward.stage3_0 import (
     GatherConfig,
     ParentContextFusion,
@@ -57,6 +59,7 @@ from models.iforward.stage3_0.losses import merge_stage3_reg_terms
 from models.iforward.stage3_0.sparse_grid_sample import prepare_value_nchw
 from models.iforward.versions import (
     STAGE3_0_SCALAR_ANCHOR_CHILD_SUPPORT_PARENT_LEGACY_VERSION,
+    is_stage3_4_iforward_version,
     is_stage3_optimizer_memory_iforward_version,
 )
 from models.streetforward.minimal_trainer_stage4_0 import spatial_hw_from_image_tensor
@@ -137,6 +140,11 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
     """
 
     def __init__(self, config, device: torch.device, **kwargs):
+        model_cfg_raw = self._cfg_get(config, "model", {}) or {}
+        iforward_cfg_raw = self._cfg_get(model_cfg_raw, "iforward", {}) or {}
+        self.stage3_4_functional_parentgs_enabled = is_stage3_4_iforward_version(
+            self._cfg_get(iforward_cfg_raw, "version", "")
+        )
         self._stage6_orig_config = config
         self._stage6_bootstrapping_parent = True
         parent_cfg = self._compat_stage5_4_config(config)
@@ -146,7 +154,14 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             self._stage6_bootstrapping_parent = False
         self.config = config
         self.observation_feedback_policy = ObservationFeedbackPolicy.from_config(config)
-        self._parent_vjp_drift_collector = RuntimeParentVJPDriftCollector()
+        if bool(self.stage3_4_functional_parentgs_enabled):
+            self._parent_vjp_drift_collector = None
+        else:
+            # This module is intentionally legacy/lazy: Stage 3.4 must not even
+            # import the surrogate runtime-VJP implementation on its path.
+            from models.iforward.runtime_parent_projection_vjp import RuntimeParentVJPDriftCollector
+
+            self._parent_vjp_drift_collector = RuntimeParentVJPDriftCollector()
         self._parent_vjp_force_refresh_branches: set[str] = set()
         self._parent_vjp_sampled_branches: set[str] = set()
         self._observation_feedback_grad_records: Dict[str, List[torch.Tensor]] = defaultdict(list)
@@ -464,6 +479,113 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
 
         self._validate_stage6_0_config(config)
 
+    def _validate_stage3_4_functional_parentgs_runtime_config(
+        self,
+        iforward_cfg: Any,
+        full_config: Any,
+    ) -> None:
+        """Keep the Stage6 runtime from silently falling back to Stage 3.3."""
+
+        validate_stage3_4_functional_parentgs_config(iforward_cfg)
+
+        biggs_cfg = self._cfg_get(iforward_cfg, "biggs", {}) or {}
+        projector_cfg = self._cfg_get(biggs_cfg, "parent_projector", {}) or {}
+        FunctionalParentProjectorConfig.from_config(projector_cfg)
+        state_cfg = self._cfg_get(biggs_cfg, "parent_state", {}) or {}
+        gradient_cfg = self._cfg_get(biggs_cfg, "gradient_contract", {}) or {}
+        decoder_cfg = self._cfg_get(biggs_cfg, "child_decoder", {}) or {}
+        lifting_cfg = self._cfg_get(iforward_cfg, "lifting", {}) or {}
+        parent_lift_cfg = self._cfg_get(lifting_cfg, "parent", {}) or {}
+        spatial_cfg = self._cfg_get(iforward_cfg, "parent_spatial", {}) or {}
+        codec_cfg = self._cfg_get(spatial_cfg, "param_codec", {}) or {}
+        ptv3_cfg = self._cfg_get(spatial_cfg, "ptv3", {}) or {}
+        feedback = ObservationFeedbackPolicy.from_config(full_config)
+
+        checks = {
+            "lifting.parent.type=functional_parent_direct_lift": (
+                str(self._cfg_get(parent_lift_cfg, "type", "")).lower()
+                == "functional_parent_direct_lift"
+            ),
+            "lifting.detach_geometry=true": bool(self._cfg_get(lifting_cfg, "detach_geometry", False)),
+            "lifting.parent.geometry_grad=false": not bool(
+                self._cfg_get(parent_lift_cfg, "geometry_grad", True)
+            ),
+            "lifting.parent.color_mode=constant_zero": (
+                str(self._cfg_get(parent_lift_cfg, "color_mode", "")).lower() == "constant_zero"
+            ),
+            "parent_state.mode=functional_per_visit": (
+                str(self._cfg_get(state_cfg, "mode", "")).lower() == "functional_per_visit"
+            ),
+            "parent_state.persistent_geometry=false": not bool(
+                self._cfg_get(state_cfg, "persistent_geometry", True)
+            ),
+            "parent_state.incremental_update=false": not bool(
+                self._cfg_get(state_cfg, "incremental_update", True)
+            ),
+            "param_codec.mode=legacy17d_plus_geometry8d_residual": (
+                str(self._cfg_get(codec_cfg, "mode", "")).lower()
+                == "legacy17d_plus_geometry8d_residual"
+            ),
+            "param_codec.schema=legacy17d_plus_geometry8d_residual_v1": (
+                str(self._cfg_get(codec_cfg, "schema", ""))
+                == "legacy17d_plus_geometry8d_residual_v1"
+            ),
+            "param_codec.grad_to_parent_params=true": bool(
+                self._cfg_get(codec_cfg, "grad_to_parent_params", False)
+            ),
+            "param_codec.detach_legacy_params=true": bool(
+                self._cfg_get(codec_cfg, "detach_legacy_params", False)
+            ),
+            "param_codec.detach_support=true": bool(self._cfg_get(codec_cfg, "detach_support", False)),
+            "ptv3.detach_coords=true": bool(self._cfg_get(ptv3_cfg, "detach_coords", False)),
+            "observation_feedback.source_render.enable=true": bool(
+                feedback.enable and feedback.source_render.enable
+            ),
+            "observation_feedback.functional_parent.enable=true": bool(
+                feedback.enable and feedback.functional_parent.enable
+            ),
+            "observation_feedback.functional_parent.branches=bg,distant,rigid_active": (
+                tuple(feedback.functional_parent.branches)
+                == ("bg", "distant", "rigid_active")
+            ),
+            "observation_feedback.functional_parent.start_after_model_updates=1": (
+                int(feedback.functional_parent.start_after_model_updates) == 1
+            ),
+            "observation_feedback.parent_projection.enable=false": not bool(
+                feedback.parent_projection.enable
+            ),
+            "observation_feedback.relation.enable=false": not bool(feedback.relation.enable),
+            "child_decoder.relation_source=functional_detached_stats": (
+                str(self._cfg_get(decoder_cfg, "relation_source", "")).lower()
+                == "functional_detached_stats"
+            ),
+        }
+        for key in (
+            "detach_relation_inputs",
+            "detach_child_code_inputs",
+            "detach_child_params",
+            "detach_parent_params",
+        ):
+            checks[f"child_decoder.{key}=true"] = bool(self._cfg_get(decoder_cfg, key, False))
+        expected_gradient_contract = {
+            "param_codec_geometry": True,
+            "lifting_geometry": False,
+            "ptv3_coords": False,
+            "assignment": False,
+            "relation_child_geometry": False,
+            "relation_parent_geometry": False,
+        }
+        for key, expected in expected_gradient_contract.items():
+            value = self._cfg_get(gradient_cfg, key, None)
+            checks[f"gradient_contract.{key}={str(expected).lower()}"] = (
+                isinstance(value, bool) and value is expected
+            )
+        failed = [name for name, ok in checks.items() if not bool(ok)]
+        if failed:
+            raise ValueError(
+                "Stage 3.4 functional ParentGS runtime contract violation: " + ", ".join(failed)
+            )
+
     def _stage6_config_phase(self, config: Any) -> str:
         model_cfg = self._require_key(config, "model", "config")
         return str(self._cfg_get(model_cfg, "phase", "phase_A_block_local_unroll"))
@@ -490,6 +612,8 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
 
         iforward_cfg = self._cfg_get(model_cfg, "iforward", {}) or {}
         ifwd_version = str(self._cfg_get(iforward_cfg, "version", ""))
+        if is_stage3_4_iforward_version(ifwd_version):
+            self._validate_stage3_4_functional_parentgs_runtime_config(iforward_cfg, config)
         biggs_cfg = self._cfg_get(iforward_cfg, "biggs", {}) or {}
         biggs_enabled = ifwd_version in {
             "stage2_0_biggs_parent_lifting",
@@ -527,11 +651,21 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                     raise ValueError(f"unsupported Stage3_0 scalar_anchor_backend={backend!r}")
                 parent_lift_cfg = self._cfg_get(stage3_lifting, "parent", {}) or {}
                 parent_lift_type = str(self._cfg_get(parent_lift_cfg, "type", "legacy_direct_lift")).lower()
-                if parent_lift_type not in {"legacy_direct_lift", "sparse_gather"}:
+                supported_parent_lifts = {"legacy_direct_lift", "sparse_gather"}
+                if is_stage3_4_iforward_version(ifwd_version):
+                    supported_parent_lifts.add("functional_parent_direct_lift")
+                if parent_lift_type not in supported_parent_lifts:
                     raise ValueError(f"unsupported Stage3_0 parent.type={parent_lift_type!r}")
+                if (
+                    is_stage3_4_iforward_version(ifwd_version)
+                    and parent_lift_type != "functional_parent_direct_lift"
+                ):
+                    raise ValueError("Stage 3.4 requires parent.type=functional_parent_direct_lift")
                 dino_native_cfg = self._cfg_get(stage3_lifting, "dino_native", {}) or {}
-                if parent_lift_type == "legacy_direct_lift" and bool(self._cfg_get(dino_native_cfg, "enable", False)):
-                    raise ValueError("Stage3_0 parent.type=legacy_direct_lift forbids dino_native.enable=true.")
+                if parent_lift_type in {"legacy_direct_lift", "functional_parent_direct_lift"} and bool(
+                    self._cfg_get(dino_native_cfg, "enable", False)
+                ):
+                    raise ValueError(f"Stage3_0 parent.type={parent_lift_type} forbids dino_native.enable=true.")
                 if bool(self._cfg_get(dino_native_cfg, "enable", False)):
                     dino_cache_cfg = (
                         self._cfg_get(
@@ -1288,45 +1422,85 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         }
 
     def reset_observation_feedback_runtime_stats(self) -> None:
-        self._parent_vjp_drift_collector.clear()
+        collector = self._parent_vjp_drift_collector
+        if collector is not None:
+            collector.clear()
         self._parent_vjp_sampled_branches.clear()
         self._observation_feedback_grad_records.clear()
         self._observation_feedback_probe_modes_current.clear()
         self._observation_feedback_force_probe_current = False
+        self._stage3_4_isolation_boundaries_seen = set()
+
+    def register_stage3_4_isolation_boundary(self, name: str) -> None:
+        boundary = str(name)
+        allowed = {"parent_lift", "ptv3_coords", "relation"}
+        if boundary not in allowed:
+            raise ValueError(f"unsupported Stage 3.4 isolation boundary {boundary!r}")
+        seen = getattr(self, "_stage3_4_isolation_boundaries_seen", None)
+        if not isinstance(seen, set):
+            seen = set()
+            self._stage3_4_isolation_boundaries_seen = seen
+        seen.add(boundary)
 
     def consume_observation_feedback_runtime_stats(self, *, grad_scale: float = 1.0) -> Dict[str, float]:
         metrics: Dict[str, float] = {}
         collector = self._parent_vjp_drift_collector
-        for branch in ("bg", "distant"):
-            records = collector.records(branch)
-            if not records:
-                continue
-            prefix = f"feedback/parent_vjp/runtime_exact_rel_error/{branch}"
-            per_record = [record.metric_tensors(prefix=prefix) for record in records]
-            for key in per_record[0]:
-                values = torch.stack(
-                    [item[key].detach().float().reshape(()).cpu() for item in per_record]
-                )
-                # Backward visits are reported in reverse-forward order.  Reduce
-                # explicitly instead of treating list[-1] as the latest visit.
-                reduced = values.min() if str(key).endswith("/effective_alpha") else values.max()
-                metrics[str(key)] = float(reduced.item())
-            metrics[f"feedback/parent_vjp/{branch}/backward_reports"] = float(len(records))
-            if any(report.requires_exact_refresh() for report in records):
-                self._parent_vjp_force_refresh_branches.add(branch)
-        collector.clear()
+        if collector is not None:
+            for branch in ("bg", "distant"):
+                records = collector.records(branch)
+                if not records:
+                    continue
+                prefix = f"feedback/parent_vjp/runtime_exact_rel_error/{branch}"
+                per_record = [record.metric_tensors(prefix=prefix) for record in records]
+                for key in per_record[0]:
+                    values = torch.stack(
+                        [item[key].detach().float().reshape(()).cpu() for item in per_record]
+                    )
+                    # Backward visits are reported in reverse-forward order.  Reduce
+                    # explicitly instead of treating list[-1] as the latest visit.
+                    reduced = values.min() if str(key).endswith("/effective_alpha") else values.max()
+                    metrics[str(key)] = float(reduced.item())
+                metrics[f"feedback/parent_vjp/{branch}/backward_reports"] = float(len(records))
+                if any(report.requires_exact_refresh() for report in records):
+                    self._parent_vjp_force_refresh_branches.add(branch)
+            collector.clear()
         scale = max(float(grad_scale), 1.0e-12)
         source_norms: List[torch.Tensor] = []
         for name, records in self._observation_feedback_grad_records.items():
             if not records:
                 continue
             stacked = torch.stack([value.detach().float().cpu() for value in records]) / scale
-            metrics[f"feedback/grad/{name}"] = float(stacked.norm().item())
+            if str(name).startswith(("functional_parent/", "parent_lift/", "ptv3_coords/", "relation/")):
+                metrics[f"feedback/{name}"] = float(stacked.norm().item())
+            else:
+                metrics[f"feedback/grad/{name}"] = float(stacked.norm().item())
             if str(name).startswith("source_render_input/"):
                 source_norms.extend(records)
         if source_norms:
             source_stacked = torch.stack([value.detach().float().cpu() for value in source_norms]) / scale
             metrics["feedback/source_render_input_grad_norm"] = float(source_stacked.norm().item())
+        if bool(getattr(self, "stage3_4_functional_parentgs_enabled", False)):
+            for branch in ("bg", "distant", "rigid_active"):
+                for attr in ("means", "scales", "opacity"):
+                    metrics.setdefault(
+                        f"feedback/functional_parent/{branch}/parent_{attr}_grad_norm",
+                        0.0,
+                    )
+            metrics.setdefault("feedback/functional_parent/earlier_delta_grad_norm/distance_1", 0.0)
+            metrics.setdefault("feedback/functional_parent/earlier_delta_grad_norm/distance_2", 0.0)
+            metrics.setdefault("feedback/parent_lift/features_2d_grad_norm", 0.0)
+            metrics["feedback/parent_lift/geometry_grad_configured_off"] = 1.0
+            metrics["feedback/ptv3_coords/geometry_grad_configured_off"] = 1.0
+            metrics["feedback/relation/geometry_grad_configured_off"] = 1.0
+            boundaries_seen = getattr(
+                self,
+                "_stage3_4_isolation_boundaries_seen",
+                set(),
+            )
+            for boundary in ("parent_lift", "ptv3_coords", "relation"):
+                metrics[f"feedback/{boundary}/boundary_assertion_passed"] = (
+                    1.0 if boundary in boundaries_seen else 0.0
+                )
         if self._observation_feedback_force_probe_current:
             metrics["feedback/grad_probe/forced_first_mode"] = 1.0
             mode_ids = {
@@ -1341,6 +1515,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             self._observation_feedback_probe_modes_current
         )
         self._observation_feedback_grad_records.clear()
+        self._stage3_4_isolation_boundaries_seen = set()
         return metrics
 
     def _register_observation_feedback_grad_probe(self, tensor: torch.Tensor, *, name: str) -> None:
@@ -1361,6 +1536,29 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             return grad
 
         tensor.register_hook(record)
+
+    def register_stage3_4_earlier_delta_grad_probe(
+        self,
+        *,
+        delta: DeltaPack,
+        distance: int,
+    ) -> None:
+        if not bool(getattr(self, "stage3_4_functional_parentgs_enabled", False)):
+            return
+        distance_i = int(distance)
+        if distance_i not in {1, 2}:
+            return
+        for branch_name in ("bg", "distant", "rigid"):
+            branch = getattr(delta, branch_name, None)
+            if branch is None:
+                continue
+            for attr in ("means", "scales_log", "quat_axis_angle", "opacity_logit"):
+                value = getattr(branch, attr, None)
+                if torch.is_tensor(value):
+                    self._register_observation_feedback_grad_probe(
+                        value,
+                        name=f"functional_parent/earlier_delta_grad_norm/distance_{distance_i}",
+                    )
 
     @staticmethod
     def _observation_feedback_forward_parity_stats(
@@ -1462,6 +1660,14 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         alpha: float,
         global_step: int,
     ) -> Tuple[BigGSParentProjection, Any, Dict[str, float]]:
+        if bool(getattr(self, "stage3_4_functional_parentgs_enabled", False)):
+            raise RuntimeError("Stage 3.4 forbids the legacy Parent runtime/VJP bridge")
+        from models.iforward.runtime_parent_projection_vjp import (
+            ParentVJPDriftPolicy,
+            parent_projection_feedback,
+            runtime_exact_drift,
+        )
+
         policy = self.observation_feedback_policy.parent_projection
         branch_name = str(branch_name)
         if branch_name not in set(policy.branches):
@@ -1695,8 +1901,9 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 "stage2_0 BigGS parent_state.exact_refresh_policy currently supports "
                 f"'block_enter' or 'none', got {parent_state_policy!r}."
             )
-        self._stage2_0_biggs_parent_runtime_block_counter = 0
-        self._stage2_0_biggs_parent_last_drift_block = -1
+        if not bool(getattr(self, "stage3_4_functional_parentgs_enabled", False)):
+            self._stage2_0_biggs_parent_runtime_block_counter = 0
+            self._stage2_0_biggs_parent_last_drift_block = -1
         projector_backend = str(self._cfg_get(self.stage2_0_biggs_projector_cfg, "backend", "")).lower()
         if projector_backend in {"cuda_exact_diag_forward_only", "cuda_exact_diagonal_forward_only"}:
             if bool(self._cfg_get(self.stage2_0_biggs_projector_cfg, "grad_to_local_state", False)):
@@ -1794,16 +2001,21 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             self.stage3_parent_lifting_type = str(
                 self._cfg_get(parent_lift_cfg, "type", "legacy_direct_lift")
             ).lower()
-            if self.stage3_parent_lifting_type not in {"legacy_direct_lift", "sparse_gather"}:
+            supported_parent_lifts = {"legacy_direct_lift", "sparse_gather"}
+            if bool(getattr(self, "stage3_4_functional_parentgs_enabled", False)):
+                supported_parent_lifts.add("functional_parent_direct_lift")
+            if self.stage3_parent_lifting_type not in supported_parent_lifts:
                 raise ValueError(f"unsupported Stage3_0 parent.type={self.stage3_parent_lifting_type!r}")
             parent_query_dim = int(self._cfg_get(parent_cfg, "query_dim", 96))
             parent_query_cfg = self._cfg_get(self.stage3_0_lifting_cfg, "parent_query", {}) or {}
             parent_context_cfg = self._cfg_get(self.stage3_0_lifting_cfg, "parent_context", {}) or {}
             dino_native_cfg = self._cfg_get(self.stage3_0_lifting_cfg, "dino_native", {}) or {}
-            if self.stage3_parent_lifting_type == "legacy_direct_lift" and bool(
+            if self.stage3_parent_lifting_type in {"legacy_direct_lift", "functional_parent_direct_lift"} and bool(
                 self._cfg_get(dino_native_cfg, "enable", False)
             ):
-                raise ValueError("Stage3_0 parent.type=legacy_direct_lift forbids dino_native.enable=true")
+                raise ValueError(
+                    f"Stage3_0 parent.type={self.stage3_parent_lifting_type} forbids dino_native.enable=true"
+                )
             obs2d_dim = int(self._cfg_get(parent_query_cfg, "obs2d_lift_dim", 0) or 0)
             self.stage3_parent_query_use_obs2d_lift = bool(
                 self._cfg_get(parent_query_cfg, "use_obs2d_lift", False)
@@ -3151,7 +3363,10 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             if requested_anchor_mode not in {"auto", "full", "fast_uv_support"}:
                 raise ValueError(f"unsupported Stage3_0 scalar_anchor.anchor_mode={requested_anchor_mode!r}")
             parent_lifting_type = str(getattr(self, "stage3_parent_lifting_type", "legacy_direct_lift")).lower()
-            parent_legacy_direct = parent_lifting_type == "legacy_direct_lift"
+            parent_legacy_direct = parent_lifting_type in {
+                "legacy_direct_lift",
+                "functional_parent_direct_lift",
+            }
             parent_gather = getattr(self, "stage3_parent_gather", None)
             fast_anchor_allowed = (
                 bool(parent_legacy_direct)
@@ -4054,28 +4269,111 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         feedback_mode, render_feedback_alpha, parent_feedback_alpha, relation_feedback_alpha = (
             self._observation_feedback_for_visit(visit_meta)
         )
-        source_feedback_enabled = bool(
+        functional_parent_enabled = bool(
+            getattr(self, "stage3_4_functional_parentgs_enabled", False)
+        )
+        visit_meta_map = dict(visit_meta or {})
+        model_update_count = int(visit_meta_map.get("model_update_count", 0) or 0)
+        has_update_ancestor = bool(
+            visit_meta_map.get(
+                "has_update_ancestor",
+                model_update_count > 0,
+            )
+        )
+        validation_render_only = bool(visit_meta_map.get("validation_render_only", False))
+        functional_feedback_policy = feedback_policy.functional_parent
+        feedback_schedule_step = int(
+            visit_meta_map.get(
+                "feedback_schedule_step",
+                feedback_policy.schedule_step(int(visit_meta_map.get("global_step", 0) or 0)),
+            )
+            or 0
+        )
+        functional_parent_alpha = float(
+            feedback_policy.functional_parent_alpha(feedback_schedule_step)
+            if functional_parent_enabled
+            else 0.0
+        )
+        functional_parent_grad_active = bool(
+            functional_parent_enabled
+            and functional_feedback_policy.enable
+            and has_update_ancestor
+            and model_update_count >= int(functional_feedback_policy.start_after_model_updates)
+            and feedback_mode.input_grad_enabled
+            and torch.is_grad_enabled()
+            and not validation_render_only
+            and functional_parent_alpha > 0.0
+        )
+        configured_functional_branches = (
+            set(functional_feedback_policy.branches)
+            if functional_feedback_policy.enable
+            else set()
+        )
+        functional_parent_attachment_requested_by_branch = {
+            branch_name: bool(
+                functional_parent_grad_active
+                and branch_name in configured_functional_branches
+            )
+            for branch_name in ("bg", "distant", "rigid_active")
+        }
+        # The policy gate is rollout-global, while an updater ancestor can be
+        # branch-sparse.  Resolve the actual attachment after constructing each
+        # branch's current live tensors; a present but unchanged carried branch
+        # must still be recomputed exactly, only in forward-only mode.
+        functional_parent_attached_by_branch = {
+            branch_name: False
+            for branch_name in ("bg", "distant", "rigid_active")
+        }
+        base_source_feedback_enabled = bool(
             feedback_policy.enable
             and feedback_policy.source_render.enable
             and feedback_mode.checkpointed
             and feedback_mode.input_grad_enabled
+            and torch.is_grad_enabled()
+            and not validation_render_only
+        )
+        # Preserve the Stage 3.3 checkpointed alpha=0 path.  Stage 3.4 has the
+        # stronger contract that source geometry is attached only after a real
+        # updater delta and only while its scheduled scale is nonzero.
+        source_feedback_enabled = bool(
+            base_source_feedback_enabled
+            and (
+                not functional_parent_enabled
+                or (
+                    float(render_feedback_alpha) > 0.0
+                    and bool(has_update_ancestor)
+                )
+            )
         )
         parent_feedback_enabled = bool(
             feedback_policy.enable
             and feedback_policy.parent_projection.enable
             and feedback_mode.input_grad_enabled
+            and torch.is_grad_enabled()
+            and not validation_render_only
         )
         relation_feedback_enabled = bool(
             feedback_policy.enable
             and feedback_policy.relation.enable
             and feedback_mode.input_grad_enabled
+            and torch.is_grad_enabled()
+            and not validation_render_only
         )
+        if functional_parent_enabled:
+            if biggs_parent_runtime is not None:
+                raise RuntimeError("Stage 3.4 observe forbids a legacy biggs_parent_runtime input")
+            if parent_feedback_enabled or relation_feedback_enabled:
+                raise RuntimeError("Stage 3.4 forbids legacy Parent VJP and Relation Feedback")
 
         def _record_observe_time(name: str, start: float) -> None:
             biggs_observe_perf[f"iforward/biggs/time_observe_{name}_ms"] = float((time.perf_counter() - start) * 1000.0)
 
         projector_cfg = getattr(self, "stage2_0_biggs_projector_cfg", {}) or {}
-        detach_local = not bool(self._cfg_get(projector_cfg, "grad_to_local_state", False))
+        detach_local = bool(
+            not functional_parent_grad_active
+            if functional_parent_enabled
+            else not bool(self._cfg_get(projector_cfg, "grad_to_local_state", False))
+        )
         t0 = time.perf_counter()
         if bool(detach_local):
             bg_m, distant_m, rigid_m = local_state.to(device=self.device).to_node_states_detached_view()
@@ -4112,7 +4410,19 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         rigid_feedback = None
         route_feedback = None
         if bool(source_feedback_enabled or parent_feedback_enabled or relation_feedback_enabled):
-            bg_feedback, distant_feedback, rigid_feedback = self._local_to_node_states(local_state, detach=False)
+            if functional_parent_enabled:
+                # Source rendering and Functional Parent geometry are separate
+                # backward paths.  Never reuse the Functional Parent view here:
+                # either component may be enabled while the other is gated off.
+                bg_feedback, distant_feedback, rigid_feedback = self._local_to_node_states(
+                    local_state,
+                    detach=False,
+                )
+            else:
+                bg_feedback, distant_feedback, rigid_feedback = self._local_to_node_states(
+                    local_state,
+                    detach=False,
+                )
             for branch_name, branch_value in (
                 ("bg", bg_feedback),
                 ("distant", distant_feedback),
@@ -4126,7 +4436,10 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                         name=f"local_before_observe/{branch_name}/{param_name}",
                     )
             route_feedback = route
-            if rigid_feedback is not None and int(route.S.numel()) > 0:
+            if (
+                rigid_feedback is not None
+                and int(route.S.numel()) > 0
+            ):
                 s_feedback = route.S.long()
                 point_ids_feedback = rigid_feedback.point_ids.index_select(0, s_feedback)[:, 0]
                 means_world_feedback = self._transform_rigid_to_world(
@@ -4151,13 +4464,19 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                     quats_world_S=quats_world_feedback,
                 )
         _record_observe_time("rigid_route", t0)
+        if functional_parent_enabled:
+            assignment_bg_m, assignment_distant_m, assignment_rigid_m = (
+                local_state.to(device=self.device).to_node_states_detached_view()
+            )
+        else:
+            assignment_bg_m, assignment_distant_m, assignment_rigid_m = bg_m, distant_m, rigid_m
         t0 = time.perf_counter()
         state_cpu, state, assignment_cache_stats = self._stage2_0_get_or_build_biggs_state_for_observe(
             existing=biggs_state,
             batch=batch,
-            bg=bg_m,
-            distant=distant_m,
-            rigid=rigid_m,
+            bg=assignment_bg_m,
+            distant=assignment_distant_m,
+            rigid=assignment_rigid_m,
             ids_override=(
                 int(biggs_scene_id) if biggs_scene_id is not None else -1,
                 int(biggs_segment_id) if biggs_segment_id is not None else -1,
@@ -4191,8 +4510,140 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         active_rigid = None
         rigid_proj_active = None
         next_parent_runtime = biggs_parent_runtime if bool(runtime_reuse) else None
+        functional_parent_pack: Optional[FunctionalParentPack] = None
+        functional_parent_assignments: Optional[ParentAssignmentPack] = None
 
-        if bool(runtime_reuse) and biggs_parent_runtime is not None:
+        if functional_parent_enabled:
+            if parent_state_mode != "functional_per_visit":
+                raise RuntimeError("Stage 3.4 requires parent_state.mode=functional_per_visit")
+            if parent_runtime_enabled or runtime_reuse or next_parent_runtime is not None:
+                raise RuntimeError("Stage 3.4 must not create or reuse a legacy Parent runtime")
+
+            active_rigid = build_rigid_active_assignment(
+                rigid_assignment=state.rigid,
+                fine_S=route.S.detach(),
+                inside_mask_S=route.inside_mask_S.detach(),
+            )
+
+            def live_params(branch: Any) -> Dict[str, torch.Tensor]:
+                return {
+                    "means": branch.means,
+                    "scales_log": branch.scales_log,
+                    "quats": branch.quats,
+                    "opacity_logit": branch.opacity_logit,
+                    "sh_dc": branch.sh_dc,
+                    "sh_rest": branch.sh_rest,
+                }
+
+            def has_live_geometry_graph(params: Optional[Dict[str, torch.Tensor]]) -> bool:
+                if params is None:
+                    return False
+                # SH is intentionally excluded from the v57 geometry path.
+                # Quaternion can affect the exact projected diagonal covariance
+                # even though it is not read directly by the 8D residual codec.
+                return any(
+                    bool(params[key].requires_grad or params[key].grad_fn is not None)
+                    for key in ("means", "scales_log", "quats", "opacity_logit")
+                )
+
+            bg_params = live_params(bg_m)
+            distant_params = (
+                live_params(distant_m)
+                if distant_m is not None and state.distant is not None
+                else None
+            )
+            rigid_active_params = None
+            rigid_active_assignment = None
+            if (
+                rigid_m is not None
+                and active_rigid is not None
+                and int(active_rigid.active_parent_global.numel()) > 0
+            ):
+                s = active_rigid.fine_S.long().to(device=rigid_m.means.device)
+                rigid_active_params = {
+                    "means": route.means_world_S,
+                    "quats": route.quats_world_S,
+                    "scales_log": rigid_m.scales_log.index_select(0, s),
+                    "opacity_logit": rigid_m.opacity_logit.index_select(0, s),
+                    "sh_dc": rigid_m.sh_dc.index_select(0, s),
+                    "sh_rest": rigid_m.sh_rest.index_select(0, s),
+                }
+                rigid_active_assignment = active_rigid
+            live_params_by_branch = {
+                "bg": bg_params,
+                "distant": distant_params,
+                "rigid_active": rigid_active_params,
+            }
+            for branch_name, params in live_params_by_branch.items():
+                functional_parent_attached_by_branch[branch_name] = bool(
+                    functional_parent_attachment_requested_by_branch[branch_name]
+                    and has_live_geometry_graph(params)
+                )
+            with self._iforward_amp_fp32():
+                functional_parent_pack = build_functional_parent_pack(
+                    bg_params=bg_params,
+                    bg_assignment=state.bg,
+                    distant_params=distant_params,
+                    distant_assignment=state.distant if distant_params is not None else None,
+                    rigid_active_params=rigid_active_params,
+                    rigid_active_assignment=rigid_active_assignment,
+                    projector_cfg=projector_cfg,
+                    attached_by_branch=functional_parent_attached_by_branch,
+                )
+            bg_proj = functional_parent_pack.bg.projection
+            distant_proj = (
+                functional_parent_pack.distant.projection
+                if functional_parent_pack.distant is not None
+                else None
+            )
+            rigid_proj_active = (
+                functional_parent_pack.rigid_active.projection
+                if functional_parent_pack.rigid_active is not None
+                else None
+            )
+            functional_parent_assignments = ParentAssignmentPack(
+                bg=functional_parent_pack.bg.assignment,
+                distant=(
+                    functional_parent_pack.distant.assignment
+                    if functional_parent_pack.distant is not None
+                    else None
+                ),
+                rigid_active=(
+                    functional_parent_pack.rigid_active.assignment
+                    if functional_parent_pack.rigid_active is not None
+                    else None
+                ),
+            )
+            for functional_branch in functional_parent_pack.iter_branches():
+                branch_name = str(functional_branch.branch_name)
+                parent_params = functional_branch.projection.params
+                for tensor_key in ("means", "scales_log", "opacity_logit"):
+                    value = parent_params[tensor_key]
+                    branch_attached = bool(
+                        functional_parent_attached_by_branch.get(branch_name, False)
+                    )
+                    if branch_attached and not bool(value.requires_grad):
+                        raise RuntimeError(
+                            "Stage 3.4 attached visit failed to construct a live "
+                            f"{branch_name}.{tensor_key} Parent geometry graph"
+                        )
+                    if not branch_attached and (
+                        value.requires_grad or value.grad_fn is not None
+                    ):
+                        raise RuntimeError(
+                            "Stage 3.4 forward-only visit must keep "
+                            f"{branch_name}.{tensor_key} Parent geometry forward-only"
+                        )
+                for metric_attr, tensor_key in (
+                    ("means", "means"),
+                    ("scales", "scales_log"),
+                    ("opacity", "opacity_logit"),
+                ):
+                    self._register_observation_feedback_grad_probe(
+                        parent_params[tensor_key],
+                        name=f"functional_parent/{branch_name}/parent_{metric_attr}_grad_norm",
+                    )
+        elif bool(runtime_reuse) and biggs_parent_runtime is not None:
             t_reuse = time.perf_counter()
             bg_proj = projection_from_runtime(biggs_parent_runtime.bg)  # type: ignore[arg-type]
             distant_proj = (
@@ -4274,7 +4725,12 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             self._mem_debug("biggs/after_project_distant", m_distant=int(distant_proj.num_parents))
 
         t_rigid_project = time.perf_counter()
-        if not bool(runtime_reuse) and rigid_m is not None and state.rigid is not None:
+        if (
+            not functional_parent_enabled
+            and not bool(runtime_reuse)
+            and rigid_m is not None
+            and state.rigid is not None
+        ):
             active_rigid = build_rigid_active_assignment(
                 rigid_assignment=state.rigid,
                 fine_S=route.S,
@@ -4340,7 +4796,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 "biggs/after_project_rigid_active",
                 m_rigid=int(rigid_proj_active.num_parents) if rigid_proj_active is not None else 0,
             )
-        elif not bool(runtime_reuse) and rigid_m is None:
+        elif not functional_parent_enabled and not bool(runtime_reuse) and rigid_m is None:
             active_rigid = build_rigid_active_assignment(
                 rigid_assignment=None,
                 fine_S=route.S,
@@ -4406,13 +4862,40 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             )
             next_parent_runtime.exact_refresh_count += int(refreshes)
 
+        route_for_measurement = route
+        if functional_parent_enabled:
+            route_for_measurement = type(route)(
+                S=route.S.detach(),
+                S_in=route.S_in.detach(),
+                S_out=route.S_out.detach(),
+                inside_mask_S=route.inside_mask_S.detach(),
+                route_inside_global=route.route_inside_global.detach(),
+                means_world_S=route.means_world_S.detach(),
+                quats_world_S=route.quats_world_S.detach(),
+            )
+
         t_scene_source = time.perf_counter()
-        parts = [self._stage2_0_scene_parts_from_params(bg_proj.params)]
-        if distant_proj is not None and int(distant_proj.num_parents) > 0:
-            parts.append(self._stage2_0_scene_parts_from_params(distant_proj.params))
-        if rigid_proj_active is not None and int(rigid_proj_active.num_parents) > 0:
-            parts.append(self._stage2_0_scene_parts_from_params(rigid_proj_active.params))
-        parent_scene = self._stage2_0_cat_scene(parts)
+        if functional_parent_enabled:
+            if functional_parent_pack is None:
+                raise RuntimeError("Stage 3.4 functional Parent pack was not built")
+            parent_scene = build_parent_lift_scene(
+                functional_parent_pack,
+                color_mode="constant_zero",
+            )
+            for geometry_key in ("means", "scales", "quats", "opacities", "colors"):
+                value = parent_scene[geometry_key]
+                if value.requires_grad or value.grad_fn is not None:
+                    raise RuntimeError(
+                        f"Stage 3.4 lifting boundary requires detached {geometry_key}"
+                    )
+            self.register_stage3_4_isolation_boundary("parent_lift")
+        else:
+            parts = [self._stage2_0_scene_parts_from_params(bg_proj.params)]
+            if distant_proj is not None and int(distant_proj.num_parents) > 0:
+                parts.append(self._stage2_0_scene_parts_from_params(distant_proj.params))
+            if rigid_proj_active is not None and int(rigid_proj_active.num_parents) > 0:
+                parts.append(self._stage2_0_scene_parts_from_params(rigid_proj_active.params))
+            parent_scene = self._stage2_0_cat_scene(parts)
         self._mem_debug("biggs/after_parent_scene", num_parent=int(parent_scene["means"].shape[0]))
         source_views, source_images, source_sky_masks, source_egocar_masks = self._source_subset(batch, source_indices)
         height, width = spatial_hw_from_image_tensor(source_images[0])
@@ -4426,7 +4909,23 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             fwhr_enabled = False
             parent_scene_for_cnn = False
         if bool(fwhr_enabled) or bool(stage3_enabled) or not bool(parent_scene_for_cnn):
-            fine_scene = self._stage2_0_fine_scene_from_state(bg=bg_m, distant=distant_m, rigid=rigid_m, route=route)
+            # Stage 3.4 only uses this fine scene for scalar-anchor metadata.
+            # Build it without a geometry graph; the separately constructed
+            # cnn_scene below is the sole attached source-render view.
+            fine_scene_ctx = torch.no_grad() if functional_parent_enabled else nullcontext()
+            with fine_scene_ctx:
+                fine_scene = self._stage2_0_fine_scene_from_state(
+                    bg=bg_m,
+                    distant=distant_m,
+                    rigid=rigid_m,
+                    route=route,
+                )
+            if functional_parent_enabled:
+                for param_name, value in fine_scene.items():
+                    if value.requires_grad or value.grad_fn is not None:
+                        raise RuntimeError(
+                            f"Stage 3.4 scalar-anchor scene {param_name} must be detached"
+                        )
         if bool(fwhr_enabled) or bool(stage3_enabled):
             cnn_scene = fine_scene
         elif not bool(parent_scene_for_cnn):
@@ -4447,6 +4946,19 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                     value,
                     name=f"source_render_input/{param_name}",
                 )
+        elif functional_parent_enabled:
+            # The first visit and every alpha=0 visit are forward-only at the
+            # source-render boundary.  The frontend remains trainable, but no
+            # LocalGS geometry graph may enter its renderer input.
+            cnn_scene = {
+                str(key): value.detach() if torch.is_tensor(value) else value
+                for key, value in cnn_scene.items()
+            }
+            for param_name, value in cnn_scene.items():
+                if torch.is_tensor(value) and (value.requires_grad or value.grad_fn is not None):
+                    raise RuntimeError(
+                        f"Stage 3.4 forward-only source scene {param_name} must be detached"
+                    )
         _record_observe_time("parent_scene_source", t_scene_source)
         repair_training_active = bool(self._repair_training_enabled_for_visit(visit_meta))
         repair_freeze_2d = bool(self._repair_training_freeze_2d_for_visit(visit_meta))
@@ -4649,6 +5161,11 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             parent_context_cache_dtype = self._stage3_parent_context_cache_dtype(context_2d)
             child_detail_output_dtype = self._stage3_child_detail_output_dtype(detail_2d)
             parent_context_2d = context_2d.to(dtype=parent_lift_dtype)
+            if functional_parent_enabled:
+                self._register_observation_feedback_grad_probe(
+                    parent_context_2d,
+                    name="parent_lift/features_2d_grad_norm",
+                )
             child_detail_2d = detail_2d.to(dtype=child_detail_dtype)
             if self._stage3_0_memory_aux_enabled() and torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats()
@@ -4679,7 +5196,11 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             stage3_child_to_parent_global = child_to_parent_global
             parent_lifting_type = str(getattr(self, "stage3_parent_lifting_type", "legacy_direct_lift")).lower()
             parent_reg: Dict[str, torch.Tensor] = {}
-            if parent_lifting_type == "legacy_direct_lift":
+            if parent_lifting_type in {"legacy_direct_lift", "functional_parent_direct_lift"}:
+                if parent_lifting_type == "functional_parent_direct_lift" and not functional_parent_enabled:
+                    raise RuntimeError(
+                        "functional_parent_direct_lift is reserved for Stage 3.4 functional ParentGS"
+                    )
                 amp_ctx = self._iforward_amp_autocast() if self._stage3_parent_lift_amp_enabled() else self._iforward_amp_fp32()
                 with amp_ctx:
                     feat_all, acc_all = self._backproject_scene_features_multi_camera(
@@ -4692,11 +5213,18 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                         return_debug_stats=bool(getattr(self, "stage2_0_biggs_return_debug_stats", True)),
                     )
                 feat_all = feat_all.to(dtype=parent_context_cache_dtype)
-                acc_all = acc_all.to(device=feat_all.device, dtype=torch.float32)
+                acc_all = acc_all.detach().to(device=feat_all.device, dtype=torch.float32)
+                is_functional_direct = parent_lifting_type == "functional_parent_direct_lift"
                 parent_aux = {
-                    "iforward/stage3/parent_legacy_direct_lift_enabled": 1.0,
+                    "iforward/stage3/parent_legacy_direct_lift_enabled": (
+                        0.0 if is_functional_direct else 1.0
+                    ),
                     "iforward/stage3/parent_sparse_gather_enabled": 0.0,
                     "iforward/stage3/parent_dino_native_stage3_enabled": 0.0,
+                    "iforward/stage3_4/functional_parent_direct_lift_enabled": (
+                        1.0 if is_functional_direct else 0.0
+                    ),
+                    "iforward/stage3_4/lift_geometry_grad_enabled": 0.0,
                 }
             elif parent_lifting_type == "sparse_gather":
                 stage3_dino_native_2d = cnn_inputs.get("stage3_dino_native_2d")
@@ -4759,7 +5287,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 "assign_bg": state.bg,
                 "assign_distant": state.distant,
                 "assign_rigid_active": active_rigid,
-                "route": route,
+                "route": route_for_measurement,
             }
             self._stage3_0_gather_child_detail(local_state=local_state, measurement=child_measurement)
             child_measurement.update(self._stage3_0_memory_aux("after_child_gather"))
@@ -4861,8 +5389,7 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
                 else "parent_lifting_event_decode"
             ),
             "biggs_state": state_cpu.detach(),
-            "biggs_parent_runtime": next_parent_runtime,
-            "route": route,
+            "route": route_for_measurement,
             "source_frame_idx": int(source_frame_idx),
             "assign_bg": state.bg,
             "assign_distant": state.distant,
@@ -4872,20 +5399,52 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             "parent_acc_w_bg": acc_bg,
             "parent_obs_bg": obs_bg,
             "parent_params_bg": bg_proj.params,
-            "parent_coords_bg": bg_proj.params["means"],
-            "parent_mass_mean_bg": bg_proj.child_mass_mean,
+            "parent_coords_bg": (
+                bg_proj.params["means"].detach()
+                if functional_parent_enabled
+                else bg_proj.params["means"]
+            ),
+            "parent_mass_mean_bg": (
+                functional_parent_pack.bg.parent_mass_mean
+                if functional_parent_pack is not None
+                else bg_proj.child_mass_mean
+            ),
             "parent_feat_2d_distant": feat_d,
             "parent_acc_w_distant": acc_d,
             "parent_obs_distant": obs_d,
             "parent_params_distant": None if distant_proj is None else distant_proj.params,
-            "parent_coords_distant": None if distant_proj is None else distant_proj.params["means"],
-            "parent_mass_mean_distant": None if distant_proj is None else distant_proj.child_mass_mean,
+            "parent_coords_distant": (
+                None
+                if distant_proj is None
+                else distant_proj.params["means"].detach()
+                if functional_parent_enabled
+                else distant_proj.params["means"]
+            ),
+            "parent_mass_mean_distant": (
+                None
+                if distant_proj is None
+                else functional_parent_pack.distant.parent_mass_mean
+                if functional_parent_pack is not None and functional_parent_pack.distant is not None
+                else distant_proj.child_mass_mean
+            ),
             "parent_feat_2d_rigid_S": feat_r,
             "parent_acc_w_rigid_S": acc_r,
             "parent_obs_rigid_S": obs_r,
             "parent_params_rigid_active": None if rigid_proj_active is None else rigid_proj_active.params,
-            "parent_coords_rigid_S": None if rigid_proj_active is None else rigid_proj_active.params["means"],
-            "parent_mass_mean_rigid_active": None if rigid_proj_active is None else rigid_proj_active.child_mass_mean,
+            "parent_coords_rigid_S": (
+                None
+                if rigid_proj_active is None
+                else rigid_proj_active.params["means"].detach()
+                if functional_parent_enabled
+                else rigid_proj_active.params["means"]
+            ),
+            "parent_mass_mean_rigid_active": (
+                None
+                if rigid_proj_active is None
+                else functional_parent_pack.rigid_active.parent_mass_mean
+                if functional_parent_pack is not None and functional_parent_pack.rigid_active is not None
+                else rigid_proj_active.child_mass_mean
+            ),
             "child_detail_bg": child_detail_bg,
             "child_detail_distant": child_detail_d,
             "child_detail_rigid_S": child_detail_r,
@@ -4934,6 +5493,134 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             **repair_training_aux,
             "src_backproject_pass_count": 1,
         }
+        if functional_parent_enabled:
+            if functional_parent_pack is None or functional_parent_assignments is None:
+                raise RuntimeError("Stage 3.4 measurement is missing its functional Parent ABI")
+            result["functional_parent_pack"] = functional_parent_pack
+            result["functional_parent_assignments"] = functional_parent_assignments
+            result["functional_parent_alpha"] = float(functional_parent_alpha)
+            result["functional_parent_grad_active"] = bool(functional_parent_grad_active)
+            result["functional_parent_attached_by_branch"] = dict(
+                functional_parent_attached_by_branch
+            )
+            result["functional_parent_configured_branches"] = tuple(
+                functional_feedback_policy.branches
+            )
+            present_functional_branches = {
+                str(branch.branch_name) for branch in functional_parent_pack.iter_branches()
+            }
+            result.update(
+                {
+                    "iforward/stage3_4/enabled": 1.0,
+                    "iforward/stage3_4/functional_parent_enabled": 1.0,
+                    "iforward/stage3_4/parent_runtime_enabled": 0.0,
+                    "iforward/stage3_4/surrogate_vjp_enabled": 0.0,
+                    "iforward/stage3_4/relation_feedback_enabled": 0.0,
+                    "iforward/stage3_4/parent_lift_geometry_grad": 0.0,
+                    "feedback/parent_lift/boundary_assertion_passed": 1.0,
+                    "iforward/stage3_4/first_visit_forward_only": (
+                        0.0 if has_update_ancestor else 1.0
+                    ),
+                    "iforward/stage3_4/has_update_ancestor": (
+                        1.0 if has_update_ancestor else 0.0
+                    ),
+                    "feedback/functional_parent/geometry_alpha": float(
+                        functional_parent_alpha
+                    ),
+                    "feedback/functional_parent/grad_active": (
+                        1.0 if functional_parent_grad_active else 0.0
+                    ),
+                    "feedback/functional_parent/forward_only": (
+                        0.0 if functional_parent_grad_active else 1.0
+                    ),
+                    "feedback/functional_parent/validation_render_only": (
+                        1.0 if validation_render_only else 0.0
+                    ),
+                }
+            )
+            for branch_name in ("bg", "distant", "rigid_active"):
+                branch_prefix = f"feedback/functional_parent/branch/{branch_name}"
+                result[f"{branch_prefix}/configured"] = (
+                    1.0 if branch_name in configured_functional_branches else 0.0
+                )
+                result[f"{branch_prefix}/attached"] = (
+                    1.0
+                    if branch_name in present_functional_branches
+                    and functional_parent_attached_by_branch[branch_name]
+                    else 0.0
+                )
+            support_by_branch = {
+                "bg": acc_bg,
+                "distant": acc_d,
+                "rigid_active": acc_r,
+            }
+            total_parent_rows = max(sum(branch.num_parents for branch in functional_parent_pack.iter_branches()), 1)
+            functional_projector_cfg = FunctionalParentProjectorConfig.from_config(projector_cfg)
+            for branch in functional_parent_pack.iter_branches():
+                branch_name = str(branch.branch_name)
+                prefix = f"iforward/stage3_4/{branch_name}"
+                support = support_by_branch.get(branch_name)
+                result[f"{prefix}/num_children"] = float(branch.num_children)
+                result[f"{prefix}/num_parents"] = float(branch.num_parents)
+                result[f"{prefix}/project_ms"] = float(
+                    (branch.projection.aux_stats or {}).get("functional_project_ms", 0.0)
+                )
+                result[f"{prefix}/lift_ms"] = float(time_parent_lifting_ms) * float(
+                    branch.num_parents
+                ) / float(total_parent_rows)
+                # Functional diagnostics are sampled every visit and directly
+                # from this ephemeral projection.  They must not inherit the
+                # sparse/global legacy runtime stats counter.
+                with torch.no_grad():
+                    parent_scales = torch.exp(branch.projection.params["scales_log"].detach())
+                    min_scale = float(functional_projector_cfg.min_scale)
+                    max_scale = float(
+                        functional_projector_cfg.max_scale_for(branch_name)
+                    )
+                    scale_at_bound = (
+                        (parent_scales <= min_scale * 1.0001)
+                        | (parent_scales >= max_scale * 0.9999)
+                    ).any(dim=-1)
+                    parent_opacity = torch.sigmoid(
+                        branch.projection.params["opacity_logit"].detach()
+                    ).reshape(-1)
+                    opacity_at_cap = parent_opacity >= (
+                        float(functional_projector_cfg.opacity_cap) * 0.99
+                    )
+                result[f"{prefix}/parent_scale_clamp_ratio"] = (
+                    float(scale_at_bound.float().mean().item())
+                    if int(scale_at_bound.numel()) > 0
+                    else 0.0
+                )
+                result[f"{prefix}/parent_opacity_cap_ratio"] = (
+                    float(opacity_at_cap.float().mean().item())
+                    if int(opacity_at_cap.numel()) > 0
+                    else 0.0
+                )
+                result[f"{prefix}/parent_support_mean"] = (
+                    float(support.detach().float().mean().item())
+                    if torch.is_tensor(support) and int(support.numel()) > 0
+                    else 0.0
+                )
+            # Old runtime/drift/refresh diagnostics must be absent, not merely zero.
+            for key in list(result):
+                key_text = str(key)
+                if (
+                    (
+                        "parent_runtime" in key_text
+                        and key_text != "iforward/stage3_4/parent_runtime_enabled"
+                    )
+                    or "runtime_update" in key_text
+                    or "incremental_update" in key_text
+                    or "exact_refresh" in key_text
+                    or "/drift" in key_text
+                    or key_text.startswith("iforward/feedback/parent_vjp")
+                    or "runtime_parent_projection_vjp" in key_text
+                    or "time_parent_runtime" in key_text
+                ):
+                    result.pop(key, None)
+        else:
+            result["biggs_parent_runtime"] = next_parent_runtime
         if bool(stage3_enabled) and bool(
             self._cfg_get(getattr(self, "stage3_0_lifting_cfg", {}) or {}, "return_stage3_debug_tensors", False)
         ):
@@ -4965,9 +5652,25 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         parent_optimizer_state: Optional[Any] = None,
         visit_meta: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        grad_enabled = str(getattr(self, "stage6_source_evidence_grad_mode", "no_grad_v4")) != "no_grad_v4"
+        caller_grad_enabled = bool(torch.is_grad_enabled())
+        visit_meta_map = dict(visit_meta or {})
+        evaluation_no_grad = bool(
+            visit_meta_map.get("validation_render_only", False)
+            or visit_meta_map.get("observation_feedback_eval_mode", None)
+            == FeedbackMode.FROZEN_NO_GRAD.value
+        )
+        grad_enabled = bool(
+            caller_grad_enabled
+            and not evaluation_no_grad
+            and str(getattr(self, "stage6_source_evidence_grad_mode", "no_grad_v4"))
+            != "no_grad_v4"
+        )
         feedback_policy = getattr(self, "observation_feedback_policy", ObservationFeedbackPolicy())
-        if bool(feedback_policy.any_continuous_feedback_enabled):
+        if bool(
+            caller_grad_enabled
+            and not evaluation_no_grad
+            and feedback_policy.any_continuous_feedback_enabled
+        ):
             feedback_mode, _, _, _ = self._observation_feedback_for_visit(visit_meta)
             grad_enabled = bool(grad_enabled or feedback_mode.input_grad_enabled)
         ctx_mgr = torch.enable_grad() if grad_enabled else torch.no_grad()
@@ -5810,13 +6513,18 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         params = measurement.get("parent_params_rigid_active")
         if coords is None or params is None:
             raise RuntimeError("BigGS parent route requires active rigid parent coords/params")
+        functional_parent = measurement.get("functional_parent_pack") is not None
         return SimpleNamespace(
             S=parent_S,
             S_in=parent_S[inside],
             S_out=parent_S[~inside],
             inside_mask_S=inside,
-            means_world_S=coords.to(device=ref.device, dtype=ref.dtype),
-            quats_world_S=params["quats"].to(device=ref.device, dtype=ref.dtype),
+            means_world_S=(
+                coords.detach() if functional_parent else coords
+            ).to(device=ref.device, dtype=ref.dtype),
+            quats_world_S=(
+                params["quats"].detach() if functional_parent else params["quats"]
+            ).to(device=ref.device, dtype=ref.dtype),
         )
 
     def _build_stage2_0_parent_struct_input_near(
@@ -6001,6 +6709,12 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         support_parts = [support_bg.reshape(-1)]
         coords_parts = [clamp_near(measurement["parent_coords_bg"])]
         branch_ids = [torch.zeros((num_bg,), dtype=torch.long, device=feat_bg.device)]
+        functional_parent = measurement.get("functional_parent_pack") is not None
+        geometry_branch_ids = (
+            [torch.zeros((num_bg,), dtype=torch.long, device=feat_bg.device)]
+            if functional_parent
+            else []
+        )
         params_bg = measurement["parent_params_bg"]
         rows_in = parent_route.S_in.long()
         params_rigid_in = None
@@ -6015,6 +6729,15 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             support_parts.append(support_rigid.reshape(-1).index_select(0, rows.to(device=support_rigid.device)))
             coords_parts.append(clamp_near(parent_route.means_world_S.index_select(0, rows_in)))
             branch_ids.append(torch.ones((num_rigid_in,), dtype=torch.long, device=feat_bg.device))
+            if functional_parent:
+                geometry_branch_ids.append(
+                    torch.full(
+                        (num_rigid_in,),
+                        2,
+                        dtype=torch.long,
+                        device=feat_bg.device,
+                    )
+                )
             params_rigid_in = self._stage2_0_select_param_rows(measurement.get("parent_params_rigid_active"), rows_in)
 
         return ParentStructInput(
@@ -6024,6 +6747,16 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             coords=torch.cat(coords_parts, dim=0),
             branch_id=torch.cat(branch_ids, dim=0),
             params_for_embed=cat_param_dict(params_bg, params_rigid_in),
+            geometry_branch_id=(
+                torch.cat(geometry_branch_ids, dim=0).detach()
+                if functional_parent
+                else None
+            ),
+            geometry_alpha=(
+                float(measurement["functional_parent_alpha"])
+                if functional_parent
+                else None
+            ),
             split_0=num_bg,
             split_1=num_rigid_in,
             meta={"path": "near"},
@@ -6060,6 +6793,8 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
         support_parts: List[torch.Tensor] = []
         coords_parts: List[torch.Tensor] = []
         branch_ids: List[torch.Tensor] = []
+        functional_parent = measurement.get("functional_parent_pack") is not None
+        geometry_branch_ids: List[torch.Tensor] = []
         params_for_embed = None
         if bool(include_distant):
             feat_distant = self._maybe_detach_feature(feat_distant_ref, detach=detach_features)
@@ -6070,6 +6805,10 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             support_parts.append(support_distant.reshape(-1))
             coords_parts.append(measurement["parent_coords_distant"])
             branch_ids.append(torch.zeros((num_distant,), dtype=torch.long, device=ref.device))
+            if functional_parent:
+                geometry_branch_ids.append(
+                    torch.ones((num_distant,), dtype=torch.long, device=ref.device)
+                )
             params_for_embed = measurement["parent_params_distant"]
 
         params_rigid_out = None
@@ -6083,6 +6822,15 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             support_parts.append(support_rigid.reshape(-1).index_select(0, rows.to(device=support_rigid.device)))
             coords_parts.append(parent_route.means_world_S.index_select(0, rows_out))
             branch_ids.append(torch.ones((num_rigid_out,), dtype=torch.long, device=ref.device))
+            if functional_parent:
+                geometry_branch_ids.append(
+                    torch.full(
+                        (num_rigid_out,),
+                        2,
+                        dtype=torch.long,
+                        device=ref.device,
+                    )
+                )
             params_rigid_out = self._stage2_0_select_param_rows(measurement.get("parent_params_rigid_active"), rows_out)
 
         if params_for_embed is None:
@@ -6099,6 +6847,16 @@ class MinimalStreetForwardStage6_0(MinimalStreetForwardStage5_4):
             coords=torch.cat(coords_parts, dim=0),
             branch_id=torch.cat(branch_ids, dim=0),
             params_for_embed=params_for_embed,
+            geometry_branch_id=(
+                torch.cat(geometry_branch_ids, dim=0).detach()
+                if functional_parent
+                else None
+            ),
+            geometry_alpha=(
+                float(measurement["functional_parent_alpha"])
+                if functional_parent
+                else None
+            ),
             split_0=num_distant,
             split_1=num_rigid_out,
             meta={"path": "far"},

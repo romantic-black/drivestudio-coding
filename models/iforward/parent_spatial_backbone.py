@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
+from models.streetforward.math_utils import _normalize_quat, _quat_to_rotmat
 from models.streetforward.stage6_0.event_encoder import EventPack
 from models.streetforward.struct_decoders.common import normalize_params_for_embed
 
+from .observation_feedback import scale_feedback
 from .parent_ptv3 import ParentPTv3Encoder
 from .parent_serialization import ParentSerializedLayout
 
@@ -24,6 +28,8 @@ class ParentStructInput:
     split_0: int
     split_1: int
     meta: Dict[str, Any] = field(default_factory=dict)
+    geometry_branch_id: Optional[torch.Tensor] = None
+    geometry_alpha: float | torch.Tensor | None = None
 
 
 @dataclass
@@ -63,6 +69,8 @@ def empty_parent_struct_input(
         split_0=0,
         split_1=0,
         meta={"path": str(path)},
+        geometry_branch_id=torch.zeros((0,), dtype=torch.long, device=ref.device),
+        geometry_alpha=0.0,
     )
 
 
@@ -142,6 +150,284 @@ class Stage6ParentParamSupportCodec(nn.Module):
         out = self.net(x)
         if not torch.isfinite(out).all():
             raise RuntimeError("Stage6ParentParamSupportCodec output contains NaN/Inf")
+        return out
+
+
+class Stage34ParentGeometrySupportCodec(nn.Module):
+    """Stage 3.4 geometry-only ParentGS parameter/support codec.
+
+    The raw parameter vector is intentionally independent from the legacy 17D
+    codec: normalized means (3), rot6d (6), normalized log-scales (3), and
+    opacity (1).  SH tensors are neither required nor read, which keeps the
+    Stage 3.4 ParentGS gradient contract geometry-only.
+    """
+
+    def __init__(
+        self,
+        *,
+        support_dim: int = 2,
+        branch_embed_dim: int = 4,
+        output_dim: int = 24,
+        detach_support: bool = True,
+        norm: str = "layernorm",
+        activation: str = "gelu",
+    ) -> None:
+        super().__init__()
+        self.raw_param_dim = 13
+        self.support_dim = int(support_dim)
+        self.branch_embed_dim = int(branch_embed_dim)
+        self.output_dim = int(output_dim)
+        self.detach_params = False
+        self.detach_support = bool(detach_support)
+        self.branch_embed = nn.Embedding(2, int(branch_embed_dim))
+        in_dim = self.raw_param_dim + int(support_dim) + int(branch_embed_dim)
+        layers: list[nn.Module] = [nn.Linear(in_dim, int(output_dim))]
+        if str(norm).lower() == "layernorm":
+            layers.append(nn.LayerNorm(int(output_dim)))
+        elif str(norm).lower() not in {"none", "identity"}:
+            raise ValueError(f"unsupported Stage34ParentGeometrySupportCodec norm={norm!r}")
+        if str(activation).lower() == "gelu":
+            layers.append(nn.GELU())
+        elif str(activation).lower() == "relu":
+            layers.append(nn.ReLU())
+        elif str(activation).lower() not in {"none", "identity"}:
+            raise ValueError(f"unsupported Stage34ParentGeometrySupportCodec activation={activation!r}")
+        self.net = nn.Sequential(*layers)
+
+    @staticmethod
+    def _geometry_vector(
+        params: Dict[str, torch.Tensor],
+        *,
+        aabb_min: torch.Tensor,
+        aabb_max: torch.Tensor,
+    ) -> torch.Tensor:
+        # Deliberately index only the four geometry fields.  In particular,
+        # callers may omit SH tensors entirely and still use this codec.
+        means = params["means"]
+        quats = params["quats"]
+        scales_log = params["scales_log"]
+        opacity_logit = params["opacity_logit"]
+        bbx_min = aabb_min.to(device=means.device, dtype=means.dtype)
+        bbx_max = aabb_max.to(device=means.device, dtype=means.dtype)
+        means_norm = (means - bbx_min) / (bbx_max - bbx_min).clamp_min(1.0e-6) * 2.0 - 1.0
+        rot = _quat_to_rotmat(_normalize_quat(quats))
+        rot6d = rot[..., :3, :2].reshape(quats.shape[:-1] + (6,))
+        scales_clamped = scales_log.clamp(-10.0, 10.0)
+        scales_norm = F.layer_norm(scales_clamped, scales_clamped.shape[1:])
+        opacity_norm = torch.tanh(opacity_logit)
+        return torch.cat([means_norm, rot6d, scales_norm, opacity_norm], dim=-1)
+
+    def forward(
+        self,
+        *,
+        params_for_embed: Dict[str, torch.Tensor],
+        support: torch.Tensor,
+        valid_mask: torch.Tensor,
+        branch_id: torch.Tensor,
+        aabb_min: torch.Tensor,
+        aabb_max: torch.Tensor,
+    ) -> torch.Tensor:
+        n = int(branch_id.numel())
+        if n == 0:
+            return support.new_zeros((0, self.output_dim))
+        branch = branch_id.reshape(-1).long()
+        if bool(((branch < 0) | (branch > 1)).any().item()):
+            raise ValueError("Stage34ParentGeometrySupportCodec branch_id must be in {0,1}")
+        param_vec = self._geometry_vector(
+            params_for_embed,
+            aabb_min=aabb_min,
+            aabb_max=aabb_max,
+        )
+        if int(param_vec.shape[0]) != n or int(param_vec.shape[-1]) != self.raw_param_dim:
+            raise ValueError(
+                "Stage34ParentGeometrySupportCodec geometry shape mismatch: "
+                f"got {tuple(param_vec.shape)}, expected ({n}, {self.raw_param_dim})"
+            )
+        supp = support.reshape(-1).to(device=param_vec.device, dtype=param_vec.dtype)
+        valid = valid_mask.reshape(-1).to(device=param_vec.device, dtype=torch.bool)
+        if int(supp.shape[0]) != n or int(valid.shape[0]) != n:
+            raise ValueError("Stage34ParentGeometrySupportCodec support/valid row mismatch")
+        supp = supp.detach() if self.detach_support else supp
+        support_vec = torch.stack([torch.log1p(supp.clamp_min(0.0)), valid.to(dtype=param_vec.dtype)], dim=-1)
+        if self.support_dim == 1:
+            support_vec = support_vec[:, :1]
+        elif self.support_dim != 2:
+            raise ValueError(
+                "Stage34ParentGeometrySupportCodec supports support_dim 1 or 2, "
+                f"got {self.support_dim}"
+            )
+        branch_vec = self.branch_embed(branch).to(dtype=param_vec.dtype)
+        out = self.net(torch.cat([param_vec, support_vec, branch_vec], dim=-1))
+        if not torch.isfinite(out).all():
+            raise RuntimeError("Stage34ParentGeometrySupportCodec output contains NaN/Inf")
+        return out
+
+
+class Stage34ParentGeometryResidualAdapter(nn.Module):
+    """Forward-compatible Stage 3.4 geometry residual for Parent tokens.
+
+    The adapter deliberately reads only means, log-scales, and opacity.  Its
+    final projection is zero initialized so adding the residual preserves the
+    exact Stage 3.3 Parent token distribution at weights-only initialization.
+    ``geometry_branch_id`` uses the stable three-way schema bg=0,
+    distant=1, rigid=2 and selects the same fixed scale bounds as the exact
+    Parent projector.
+    """
+
+    GEOMETRY_BRANCH_BG = 0
+    GEOMETRY_BRANCH_DISTANT = 1
+    GEOMETRY_BRANCH_RIGID = 2
+
+    def __init__(
+        self,
+        *,
+        output_dim: int = 24,
+        hidden_dim: int = 24,
+        min_scale: float = 1.0e-3,
+        max_scale_bg: float = 0.60,
+        max_scale_distant: float = 3.0,
+        max_scale_rigid: float = 0.45,
+    ) -> None:
+        super().__init__()
+        self.raw_geometry_dim = 8
+        self.raw_param_dim = self.raw_geometry_dim
+        self.output_dim = int(output_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.min_scale = float(min_scale)
+        self.max_scale_bg = float(max_scale_bg)
+        self.max_scale_distant = float(max_scale_distant)
+        self.max_scale_rigid = float(max_scale_rigid)
+        if self.output_dim <= 0 or self.hidden_dim <= 0:
+            raise ValueError("Stage34ParentGeometryResidualAdapter dimensions must be positive")
+        if self.min_scale <= 0.0:
+            raise ValueError("Stage34ParentGeometryResidualAdapter min_scale must be > 0")
+        for name, value in (
+            ("bg", self.max_scale_bg),
+            ("distant", self.max_scale_distant),
+            ("rigid", self.max_scale_rigid),
+        ):
+            if value < self.min_scale:
+                raise ValueError(
+                    "Stage34ParentGeometryResidualAdapter "
+                    f"max_scale_{name} must be >= min_scale"
+                )
+
+        self.input_proj = nn.Linear(self.raw_geometry_dim, self.hidden_dim)
+        self.activation = nn.GELU()
+        self.output_proj = nn.Linear(self.hidden_dim, self.output_dim)
+        nn.init.zeros_(self.output_proj.weight)
+        nn.init.zeros_(self.output_proj.bias)
+
+    def is_zero_initialized(self) -> bool:
+        """Return whether the residual output projection is still exactly zero."""
+
+        return bool(
+            int(torch.count_nonzero(self.output_proj.weight.detach()).item()) == 0
+            and int(torch.count_nonzero(self.output_proj.bias.detach()).item()) == 0
+        )
+
+    def _branch_log_scale_bounds(
+        self,
+        geometry_branch_id: torch.Tensor,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        branch = geometry_branch_id.to(device=device, dtype=torch.long).reshape(-1)
+        if bool(((branch < 0) | (branch > 2)).any().item()):
+            raise ValueError(
+                "Stage34ParentGeometryResidualAdapter geometry_branch_id must be in {0,1,2}"
+            )
+        min_log = math.log(self.min_scale)
+        max_logs = torch.tensor(
+            [
+                math.log(self.max_scale_bg),
+                math.log(self.max_scale_distant),
+                math.log(self.max_scale_rigid),
+            ],
+            dtype=dtype,
+            device=device,
+        )
+        lo = torch.full((int(branch.numel()), 1), min_log, dtype=dtype, device=device)
+        hi = max_logs.index_select(0, branch).reshape(-1, 1)
+        return lo, hi
+
+    def geometry_vector(
+        self,
+        params_for_embed: Dict[str, torch.Tensor],
+        *,
+        geometry_branch_id: torch.Tensor,
+        aabb_min: torch.Tensor,
+        aabb_max: torch.Tensor,
+    ) -> torch.Tensor:
+        # Do not index quats or SH: those fields must have no path through the
+        # Stage 3.4 residual even when present in the legacy parameter dict.
+        means = params_for_embed["means"]
+        scales_log = params_for_embed["scales_log"]
+        opacity_logit = params_for_embed["opacity_logit"]
+        if means.ndim != 2 or tuple(means.shape[1:]) != (3,):
+            raise ValueError("Stage34ParentGeometryResidualAdapter means must have shape [N,3]")
+        n = int(means.shape[0])
+        if tuple(scales_log.shape) != (n, 3):
+            raise ValueError("Stage34ParentGeometryResidualAdapter scales_log must have shape [N,3]")
+        if tuple(opacity_logit.shape) != (n, 1):
+            raise ValueError("Stage34ParentGeometryResidualAdapter opacity_logit must have shape [N,1]")
+        branch = geometry_branch_id.reshape(-1)
+        if int(branch.numel()) != n:
+            raise ValueError(
+                "Stage34ParentGeometryResidualAdapter geometry_branch_id row mismatch"
+            )
+
+        bbx_min = aabb_min.to(device=means.device, dtype=means.dtype)
+        bbx_max = aabb_max.to(device=means.device, dtype=means.dtype)
+        means_norm = (means - bbx_min) / (bbx_max - bbx_min).clamp_min(1.0e-6) * 2.0 - 1.0
+
+        lo, hi = self._branch_log_scale_bounds(
+            branch,
+            dtype=scales_log.dtype,
+            device=scales_log.device,
+        )
+        clamped_log_scales = torch.maximum(torch.minimum(scales_log, hi), lo)
+        log_size = clamped_log_scales.mean(dim=-1, keepdim=True)
+        center = (lo + hi) * 0.5
+        half_range = ((hi - lo) * 0.5).clamp_min(1.0e-6)
+        log_size_norm = (log_size - center) / half_range
+        log_shape_norm = (clamped_log_scales - log_size) / half_range
+        opacity_norm = torch.tanh(opacity_logit)
+        out = torch.cat(
+            [means_norm, log_size_norm, log_shape_norm, opacity_norm],
+            dim=-1,
+        )
+        if tuple(out.shape) != (n, self.raw_geometry_dim):
+            raise RuntimeError(
+                "Stage34ParentGeometryResidualAdapter internal geometry shape mismatch: "
+                f"got {tuple(out.shape)}"
+            )
+        if not torch.isfinite(out).all():
+            raise RuntimeError("Stage34ParentGeometryResidualAdapter geometry contains NaN/Inf")
+        return out
+
+    def forward(
+        self,
+        *,
+        params_for_embed: Dict[str, torch.Tensor],
+        geometry_branch_id: torch.Tensor,
+        aabb_min: torch.Tensor,
+        aabb_max: torch.Tensor,
+        alpha: float | torch.Tensor,
+    ) -> torch.Tensor:
+        geometry = self.geometry_vector(
+            params_for_embed,
+            geometry_branch_id=geometry_branch_id,
+            aabb_min=aabb_min,
+            aabb_max=aabb_max,
+        )
+        if int(geometry.shape[0]) == 0:
+            return geometry.new_zeros((0, self.output_dim))
+        geometry_used = scale_feedback(geometry, alpha)
+        out = self.output_proj(self.activation(self.input_proj(geometry_used)))
+        if not torch.isfinite(out).all():
+            raise RuntimeError("Stage34ParentGeometryResidualAdapter output contains NaN/Inf")
         return out
 
 
@@ -232,8 +518,14 @@ class ParentSpatialBackbone(nn.Module):
         event_dim: int = 64,
         token_dim: int = 64,
         param_support_dim: int = 24,
+        param_codec_mode: str = "legacy_17d",
         param_codec_detach_params: bool = True,
         param_codec_detach_support: bool = True,
+        geometry_min_scale: float = 1.0e-3,
+        geometry_max_scale_bg: float = 0.60,
+        geometry_max_scale_distant: float = 3.0,
+        geometry_max_scale_rigid: float = 0.45,
+        ptv3_detach_coords: bool = False,
         support_embed_dim: int = 4,
         branch_embed_dim: int = 4,
         frame_gap_embed_dim: int = 4,
@@ -258,16 +550,68 @@ class ParentSpatialBackbone(nn.Module):
             raise ValueError("ParentSpatialBackbone P0 requires event_dim == token_dim")
         self.context_dim = int(context_dim)
         self.event_dim = int(event_dim)
+        self.param_codec_mode = str(param_codec_mode).lower()
+        self.param_codec_schema = "legacy_17d_v1"
+        self.ptv3_detach_coords = bool(ptv3_detach_coords)
+        self.detach_support_inputs = bool(param_codec_detach_support)
         self.zero_invalid_context = bool(zero_invalid_context)
         self.support_threshold_bg = float(support_threshold_bg)
         self.support_threshold_distant = float(support_threshold_distant)
         self.support_threshold_rigid = float(support_threshold_rigid)
         self.support_threshold_rigid_out = float(support_threshold_rigid_out)
-        self.param_support_codec = Stage6ParentParamSupportCodec(
-            output_dim=int(param_support_dim),
-            detach_params=bool(param_codec_detach_params),
-            detach_support=bool(param_codec_detach_support),
-        )
+        self.geometry_residual_adapter: Optional[Stage34ParentGeometryResidualAdapter] = None
+        if self.param_codec_mode in {"legacy", "legacy_17d", "legacy_geometry_sh", "stage6_17d", "17d"}:
+            self.param_support_codec = Stage6ParentParamSupportCodec(
+                output_dim=int(param_support_dim),
+                detach_params=bool(param_codec_detach_params),
+                detach_support=bool(param_codec_detach_support),
+            )
+        elif self.param_codec_mode in {
+            "geometry_only",
+            "geometry_only_13d",
+            "geometry_only_stage3_4",
+            "stage3_4_geometry_13d",
+            "13d",
+        }:
+            if bool(param_codec_detach_params):
+                raise ValueError(
+                    "Stage 3.4 geometry-only ParentGS codec requires param_codec_detach_params=false"
+                )
+            self.param_support_codec = Stage34ParentGeometrySupportCodec(
+                output_dim=int(param_support_dim),
+                detach_support=bool(param_codec_detach_support),
+            )
+            self.param_codec_schema = "geometry_only_13d_v1"
+        elif self.param_codec_mode in {
+            "legacy17d_plus_geometry8d_residual",
+            "legacy_17d_plus_geometry_8d_residual",
+        }:
+            if bool(param_codec_detach_params):
+                raise ValueError(
+                    "Stage 3.4 residual ParentGS codec requires param_codec_detach_params=false"
+                )
+            if int(param_support_dim) != 24:
+                raise ValueError(
+                    "Stage 3.4 residual ParentGS codec requires param_support_dim=24"
+                )
+            # Preserve these legacy module names and shapes so a Stage 3.3
+            # weights-only initialization loads the exact old token path.
+            self.param_support_codec = Stage6ParentParamSupportCodec(
+                output_dim=int(param_support_dim),
+                detach_params=True,
+                detach_support=bool(param_codec_detach_support),
+            )
+            self.geometry_residual_adapter = Stage34ParentGeometryResidualAdapter(
+                output_dim=int(param_support_dim),
+                hidden_dim=24,
+                min_scale=float(geometry_min_scale),
+                max_scale_bg=float(geometry_max_scale_bg),
+                max_scale_distant=float(geometry_max_scale_distant),
+                max_scale_rigid=float(geometry_max_scale_rigid),
+            )
+            self.param_codec_schema = "legacy17d_plus_geometry8d_residual_v1"
+        else:
+            raise ValueError(f"unsupported ParentSpatialBackbone param_codec_mode={param_codec_mode!r}")
         self.token_builder = ParentTokenBuilder(
             context_dim=int(context_dim),
             param_support_dim=int(param_support_dim),
@@ -320,18 +664,37 @@ class ParentSpatialBackbone(nn.Module):
         context = x.parent_context
         if self.zero_invalid_context:
             context = torch.where(valid[:, None], context, torch.zeros_like(context))
+        support = x.support.detach() if self.detach_support_inputs else x.support
         param_support = self.param_support_codec(
             params_for_embed=x.params_for_embed,
-            support=x.support,
+            support=support,
             valid_mask=valid,
             branch_id=x.branch_id,
             aabb_min=aabb_min,
             aabb_max=aabb_max,
         )
+        if self.geometry_residual_adapter is not None:
+            if x.geometry_branch_id is None:
+                raise ValueError(
+                    "Stage 3.4 residual ParentGS codec requires ParentStructInput.geometry_branch_id"
+                )
+            if x.geometry_alpha is None:
+                raise ValueError(
+                    "Stage 3.4 residual ParentGS codec requires ParentStructInput.geometry_alpha"
+                )
+            geometry_branch_id = x.geometry_branch_id.detach()
+            residual = self.geometry_residual_adapter(
+                params_for_embed=x.params_for_embed,
+                geometry_branch_id=geometry_branch_id,
+                aabb_min=aabb_min,
+                aabb_max=aabb_max,
+                alpha=x.geometry_alpha,
+            )
+            param_support = param_support + residual.to(dtype=param_support.dtype)
         return self.token_builder(
             parent_context=context,
             param_support=param_support,
-            support=x.support,
+            support=support,
             valid_mask=valid,
             branch_id=x.branch_id,
             frame_gap=frame_gap,
@@ -347,6 +710,40 @@ class ParentSpatialBackbone(nn.Module):
         mapping = {"bootstrap": 0, "causal_first": 1, "repair": 2}
         return int(mapping.get(str(visit_kind), 1))
 
+    @staticmethod
+    def _validate_input_rows(x: ParentStructInput, *, path: str) -> int:
+        if not torch.is_tensor(x.coords) or x.coords.ndim != 2 or int(x.coords.shape[-1]) != 3:
+            raise ValueError(f"ParentSpatial {path} coords must have shape [N,3]")
+        n = int(x.coords.shape[0])
+        row_tensors = {
+            "parent_context": x.parent_context,
+            "support": x.support,
+            "branch_id": x.branch_id,
+        }
+        if x.geometry_branch_id is not None:
+            row_tensors["geometry_branch_id"] = x.geometry_branch_id
+        if x.valid is not None:
+            row_tensors["valid"] = x.valid
+        for name, value in row_tensors.items():
+            if not torch.is_tensor(value) or value.ndim == 0 or int(value.shape[0]) != n:
+                shape = tuple(value.shape) if torch.is_tensor(value) else type(value).__name__
+                raise ValueError(
+                    f"ParentSpatial {path} {name} row mismatch: got {shape}, expected N={n}"
+                )
+        for name, value in x.params_for_embed.items():
+            if not torch.is_tensor(value) or value.ndim == 0 or int(value.shape[0]) != n:
+                shape = tuple(value.shape) if torch.is_tensor(value) else type(value).__name__
+                raise ValueError(
+                    f"ParentSpatial {path} params_for_embed.{name} row mismatch: "
+                    f"got {shape}, expected N={n}"
+                )
+        if int(x.split_0 + x.split_1) != n:
+            raise ValueError(
+                f"ParentSpatial {path} split mismatch: "
+                f"split_0+split_1={int(x.split_0 + x.split_1)} N={n}"
+            )
+        return n
+
     def encode_near(
         self,
         x: ParentStructInput,
@@ -358,9 +755,7 @@ class ParentSpatialBackbone(nn.Module):
         frame_gap: int | torch.Tensor = 0,
         visit_kind: str | int | torch.Tensor = 1,
     ) -> ParentStructOutput:
-        n = int(x.coords.shape[0])
-        if int(x.split_0 + x.split_1) != n:
-            raise ValueError("ParentSpatial near split mismatch")
+        n = self._validate_input_rows(x, path="near")
         if n == 0:
             return ParentStructOutput(
                 event=x.coords.new_zeros((0, self.event_dim)),
@@ -376,15 +771,22 @@ class ParentSpatialBackbone(nn.Module):
             frame_gap=frame_gap,
             visit_kind_id=self._visit_kind_id(visit_kind),
         )
+        coords = x.coords.detach() if self.ptv3_detach_coords else x.coords
+        if self.ptv3_detach_coords and (coords.requires_grad or coords.grad_fn is not None):
+            raise RuntimeError("Stage 3.4 ParentPTv3 coords must be detached at the call boundary")
         event, layouts, aux = self.near_ptv3(
             token,
-            coords=x.coords,
+            coords=coords,
             aabb_min=aabb_min,
             aabb_max=aabb_max,
             batch_offsets=batch_offsets,
             layout_cache=layout_cache,
         )
-        return ParentStructOutput(event=event, valid_mask=valid, support=x.support, aux=aux, layout_cache=layouts)
+        if self.ptv3_detach_coords:
+            aux = dict(aux or {})
+            aux["feedback/ptv3_coords/boundary_assertion_passed"] = 1.0
+        support = x.support.detach() if self.detach_support_inputs else x.support
+        return ParentStructOutput(event=event, valid_mask=valid, support=support, aux=aux, layout_cache=layouts)
 
     def encode_far(
         self,
@@ -397,9 +799,7 @@ class ParentSpatialBackbone(nn.Module):
         visit_kind: str | int | torch.Tensor = 1,
     ) -> ParentStructOutput:
         _ = batch_offsets
-        n = int(x.coords.shape[0])
-        if int(x.split_0 + x.split_1) != n:
-            raise ValueError("ParentSpatial far split mismatch")
+        n = self._validate_input_rows(x, path="far")
         if n == 0:
             return ParentStructOutput(
                 event=x.coords.new_zeros((0, self.event_dim)),
@@ -422,10 +822,11 @@ class ParentSpatialBackbone(nn.Module):
         event = self.far_norm(self.far_mlp(token))
         if not torch.isfinite(event).all():
             raise RuntimeError("ParentSpatial far event contains NaN/Inf")
+        support = x.support.detach() if self.detach_support_inputs else x.support
         return ParentStructOutput(
             event=event,
             valid_mask=valid,
-            support=x.support,
+            support=support,
             aux={"iforward/parent_spatial/far_mlp": 1.0},
         )
 
@@ -518,6 +919,8 @@ __all__ = [
     "ParentStructOutput",
     "ParentSpatialBackbone",
     "ParentTokenBuilder",
+    "Stage34ParentGeometryResidualAdapter",
+    "Stage34ParentGeometrySupportCodec",
     "Stage6ParentParamSupportCodec",
     "empty_parent_struct_input",
 ]

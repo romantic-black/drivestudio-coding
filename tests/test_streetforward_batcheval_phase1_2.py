@@ -11,10 +11,10 @@ from omegaconf import OmegaConf
 from streetforward_eval.batch_builder import validate_update_target_refs
 from streetforward_eval.episode_builder import TestEpisodeSpec, build_test_episode_specs
 from streetforward_eval.metrics import MetricAccumulator
-from streetforward_eval.protocols import TestProtocolSpec, protocol_from_dict
+from streetforward_eval.protocols import TestProtocolSpec, protocol_from_dict, validate_protocol
 from streetforward_eval.runner import RunnerRuntimeConfig, StreetForwardBatchEvalRunner
 from streetforward_eval.snapshot_writer import SnapshotWriter
-from streetforward_eval.summary import build_summary_rows
+from streetforward_eval.summary import build_optimization_curve_rows, build_summary_rows
 
 
 @dataclass
@@ -445,6 +445,78 @@ def test_runner_iter_count(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> N
     assert out["final_iter"] == 3
 
 
+def test_runner_renders_only_requested_optimization_iterations(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from streetforward_eval import runner as runner_mod
+
+    monkeypatch.setattr(
+        runner_mod,
+        "build_update_batch_from_refs",
+        lambda **kwargs: {"dummy": True, "kwargs": kwargs},
+    )
+    protocol = TestProtocolSpec(
+        name="single_frame_curve",
+        data_mode="segment_finetune_train",
+        sequence_length=1,
+        input_offsets=[0],
+        eval_offsets=[0],
+        camera_ids=[0, 1, 2],
+        camera_names=["front", "front_left", "front_right"],
+        steps_per_input=8,
+        save_pre_update=False,
+        save_each_iter_views=False,
+        metric_primary_mask="full_image",
+        report_full_image=True,
+        report_iterations=[1, 2, 4, 8],
+    )
+    spec = TestEpisodeSpec(
+        exp_name=protocol.name,
+        scene_id=1,
+        segment_id=2,
+        episode_idx=0,
+        sequence_start_pos=0,
+        frame_offsets=[0],
+        frame_ids=[100],
+        input_offsets=[0],
+        eval_offsets=[0],
+        input_frame_ids=[100],
+        eval_frame_ids=[100],
+        camera_ids=[0, 1, 2],
+        camera_names=["front", "front_left", "front_right"],
+        input_image_refs=[(100, 0), (100, 1), (100, 2)],
+        eval_image_refs=[(100, 0), (100, 1), (100, 2)],
+        episode_uid="scene001_seg002_start000000",
+    )
+    model = _FakeModel()
+    metric_acc = MetricAccumulator(
+        output_dir=tmp_path / "metrics",
+        protocol=protocol,
+        min_valid_pixels=1,
+        compute_ssim=False,
+        compute_lpips=False,
+    )
+    runner = StreetForwardBatchEvalRunner(
+        model=model,
+        dataset=object(),
+        protocol=protocol,
+        writer=SnapshotWriter(output_dir=tmp_path / "snapshots"),
+        metric_acc=metric_acc,
+        device=torch.device("cpu"),
+        runtime_cfg=RunnerRuntimeConfig(history_record_on_input_exit=True),
+    )
+
+    runner.run_episode(spec)
+
+    assert model.update_calls == 8
+    assert model.render_calls == 4
+    assert sorted({int(row["global_iter"]) for row in metric_acc.iter_rows}) == [1, 2, 4, 8]
+    curve = build_optimization_curve_rows(metric_acc.iter_rows)
+    assert [row["optimization_steps"] for row in curve] == [1, 2, 4, 8]
+    assert all(row["num_views"] == 3 for row in curve)
+
+
 def test_protocol_from_dict_accepts_omegaconf_nodes() -> None:
     cfg = OmegaConf.create(
         {
@@ -453,6 +525,7 @@ def test_protocol_from_dict_accepts_omegaconf_nodes() -> None:
             "input_offsets": [0, 5, 10, 15],
             "eval_offsets": "all",
             "steps_per_input": 8,
+            "report_iterations": [1, 2, 4, 8],
         }
     )
     global_cfg = OmegaConf.create(
@@ -467,6 +540,52 @@ def test_protocol_from_dict_accepts_omegaconf_nodes() -> None:
     assert protocol.sequence_length == 20
     assert protocol.input_offsets == [0, 5, 10, 15]
     assert protocol.eval_offsets == "all"
+    assert protocol.report_iterations == [1, 2, 4, 8]
+
+
+def test_load_cfg_supports_historical_git_base(tmp_path: Path) -> None:
+    from tools.eval_streetforward_benchmark import load_cfg
+
+    config_path = tmp_path / "historical_overlay.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "base_config_file: configs/minimal_streetforward_stage5_3_multi_scene_v8.yaml",
+                'base_config_git_revision: "59266ef"',
+                "batch_eval:",
+                "  enable: true",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    cfg = load_cfg(str(config_path))
+
+    assert str(cfg.model.stage) == "5_3"
+    assert int(cfg.model.struct_decoder.feat_2d_channels) == 32
+    assert float(cfg.model.update_gate.min_gate) == pytest.approx(0.05)
+    assert bool(cfg.batch_eval.enable) is True
+
+
+def test_protocol_rejects_report_iteration_outside_budget() -> None:
+    protocol = TestProtocolSpec(
+        name="single_frame_curve",
+        data_mode="segment_finetune_train",
+        sequence_length=1,
+        input_offsets=[0],
+        eval_offsets=[0],
+        camera_ids=[0],
+        camera_names=["front"],
+        steps_per_input=8,
+        save_pre_update=False,
+        save_each_iter_views=False,
+        metric_primary_mask="full_image",
+        report_full_image=True,
+        report_iterations=[1, 2, 16],
+    )
+
+    with pytest.raises(ValueError, match="optimization budget"):
+        validate_protocol(protocol)
 
 
 def test_runner_update_targets_source_frame_first(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

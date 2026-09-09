@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from contextlib import nullcontext
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 import torch
@@ -478,6 +479,9 @@ class BigGSToFineEventDecoder(nn.Module):
         child_basis: Optional[torch.Tensor] = None,
         child_cache: Optional[Any] = None,
         parent_stats: Optional[Any] = None,
+        relation_child_mass: Optional[torch.Tensor] = None,
+        relation_child_diag_cov: Optional[torch.Tensor] = None,
+        relation_parent_mass_sum: Optional[torch.Tensor] = None,
         parent_start: Optional[torch.Tensor] = None,
         child_order: Optional[torch.Tensor] = None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Dict[str, float]]:
@@ -526,28 +530,69 @@ class BigGSToFineEventDecoder(nn.Module):
         elif mode == "gaussian_relational":
             if self.grld_decoder is None:
                 raise RuntimeError("BigGS gaussian_relational decoder was not initialized")
-            if child_cache is None or parent_stats is None or parent_start is None or child_order is None:
-                raise RuntimeError("BigGS gaussian_relational decoder requires runtime child_cache/stats and parent assignment order")
-            (
-                relation_parent_event,
-                relation_child_params,
-                relation_parent_params,
-                relation_checkpoint,
-                relation_alpha,
-            ) = self._prepare_relation_feedback_inputs(
-                parent_event=parent_event,
-                child_params=child_params,
-                parent_params=parent_params,
-                child_cache=child_cache,
-                branch_id=int(branch_id),
+            functional_relation = any(
+                value is not None
+                for value in (relation_child_mass, relation_child_diag_cov, relation_parent_mass_sum)
             )
-            relation_feedback_active = self._relation_feedback_active(branch_id=int(branch_id))
+            if functional_relation and not all(
+                value is not None
+                for value in (relation_child_mass, relation_child_diag_cov, relation_parent_mass_sum)
+            ):
+                raise RuntimeError("functional GRLD requires complete child mass/diag-cov/parent mass-sum stats")
+            if parent_start is None or child_order is None:
+                raise RuntimeError("BigGS gaussian_relational decoder requires parent assignment order")
+            if not functional_relation and (child_cache is None or parent_stats is None):
+                raise RuntimeError(
+                    "BigGS gaussian_relational decoder requires functional detached stats or legacy runtime stats"
+                )
+            if functional_relation:
+                # Stage 3.4 relation geometry/support are graph-free.  Parent
+                # events remain attached so decoder/memory gradients are
+                # preserved, but the legacy relation feedback bridge is never
+                # entered.
+                relation_parent_event = parent_event
+                relation_child_params = {
+                    str(key): value.detach() for key, value in child_params.items()
+                }
+                relation_parent_params = {
+                    str(key): value.detach() for key, value in parent_params.items()
+                }
+                for param_role, params in (
+                    ("child", relation_child_params),
+                    ("parent", relation_parent_params),
+                ):
+                    for key, value in params.items():
+                        if value.requires_grad or value.grad_fn is not None:
+                            raise RuntimeError(
+                                f"functional GRLD {param_role} relation param {key} must be detached"
+                            )
+                relation_checkpoint = False
+                relation_alpha = 0.0
+                relation_feedback_active = False
+            else:
+                (
+                    relation_parent_event,
+                    relation_child_params,
+                    relation_parent_params,
+                    relation_checkpoint,
+                    relation_alpha,
+                ) = self._prepare_relation_feedback_inputs(
+                    parent_event=parent_event,
+                    child_params=child_params,
+                    parent_params=parent_params,
+                    child_cache=child_cache,
+                    branch_id=int(branch_id),
+                )
+                relation_feedback_active = self._relation_feedback_active(branch_id=int(branch_id))
             fine, parent_e, residual, extra_aux = self.grld_decoder.decode_branch(
                 parent_event=relation_parent_event,
                 child_params=relation_child_params,
                 parent_params=relation_parent_params,
                 child_cache=child_cache,
                 parent_stats=parent_stats,
+                child_mass=relation_child_mass,
+                child_diag_cov=relation_child_diag_cov,
+                parent_mass_sum=relation_parent_mass_sum,
                 child_to_parent=pid,
                 parent_start=parent_start,
                 parent_count=parent_count,
@@ -555,8 +600,10 @@ class BigGSToFineEventDecoder(nn.Module):
                 branch_id=int(branch_id),
                 branch_scale=residual_scale,
                 checkpoint_branch=bool(relation_checkpoint),
-                detach_relation_params=False if bool(relation_feedback_active) else None,
-                detach_support=True if bool(relation_feedback_active) else None,
+                detach_relation_params=(
+                    True if functional_relation else (False if bool(relation_feedback_active) else None)
+                ),
+                detach_support=True if functional_relation or bool(relation_feedback_active) else None,
             )
             extra_aux["feedback_enabled"] = 1.0 if bool(relation_feedback_active) else 0.0
             extra_aux["feedback_alpha"] = float(relation_alpha)
@@ -661,6 +708,34 @@ class BigGSToFineEventDecoder(nn.Module):
         }
 
     @staticmethod
+    def _functional_relation_stats(branch: Optional[Any]) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if branch is None:
+            return None, None, None
+        stats = getattr(branch, "child_stats_detached", None)
+        if stats is None:
+            raise RuntimeError("functional ParentGS branch is missing child_stats_detached")
+        mass = getattr(stats, "mass", None)
+        diag_cov = getattr(stats, "diag_cov", None)
+        parent_mass_sum = getattr(branch, "parent_mass_sum", None)
+        if parent_mass_sum is None:
+            projection = getattr(branch, "projection", None)
+            parent_mass_sum = None if projection is None else getattr(projection, "child_mass_sum", None)
+            if torch.is_tensor(parent_mass_sum):
+                # Compatibility with early functional-pack implementations;
+                # the formal property itself returns an already detached view.
+                parent_mass_sum = parent_mass_sum.detach()
+        if not all(torch.is_tensor(value) for value in (mass, diag_cov, parent_mass_sum)):
+            raise RuntimeError("functional ParentGS relation stats are incomplete")
+        for name, value in (
+            ("child_mass", mass),
+            ("child_diag_cov", diag_cov),
+            ("parent_mass_sum", parent_mass_sum),
+        ):
+            if value.requires_grad or value.grad_fn is not None:
+                raise RuntimeError(f"functional ParentGS relation {name} must be detached")
+        return mass, diag_cov, parent_mass_sum
+
+    @staticmethod
     def _diag_cov_from_scales_quats(scales_log: torch.Tensor, quats: torch.Tensor) -> torch.Tensor:
         scales = torch.exp(scales_log).clamp_min(1.0e-6)
         rot = _quat_to_rotmat(_normalize_quat(quats))
@@ -709,7 +784,12 @@ class BigGSToFineEventDecoder(nn.Module):
     ) -> EventPack:
         route = measurement["route"]
         runtime = measurement.get("biggs_parent_runtime")
+        functional_pack = measurement.get("functional_parent_pack")
+        if functional_pack is not None and runtime is not None:
+            raise RuntimeError("functional ParentGS decoder path must not receive biggs_parent_runtime")
         bg_runtime = getattr(runtime, "bg", None) if runtime is not None else None
+        functional_bg = getattr(functional_pack, "bg", None) if functional_pack is not None else None
+        bg_relation_mass, bg_relation_diag, bg_parent_mass_sum = self._functional_relation_stats(functional_bg)
         assign_bg: BigGSBranchAssignment = measurement["assign_bg"]
         event_bg, support_bg, valid_bg, obs_bg, aux_bg = self._decode_branch(
             parent_event=parent_event_pack.event_bg,
@@ -726,6 +806,9 @@ class BigGSToFineEventDecoder(nn.Module):
             child_basis=assign_bg.child_basis,
             child_cache=None if bg_runtime is None else bg_runtime.child_cache,
             parent_stats=None if bg_runtime is None else bg_runtime.stats,
+            relation_child_mass=bg_relation_mass,
+            relation_child_diag_cov=bg_relation_diag,
+            relation_parent_mass_sum=bg_parent_mass_sum,
             parent_start=assign_bg.parent_start,
             child_order=assign_bg.child_order,
         )
@@ -738,6 +821,12 @@ class BigGSToFineEventDecoder(nn.Module):
             and parent_event_pack.event_distant is not None
         ):
             distant_runtime = getattr(runtime, "distant", None) if runtime is not None else None
+            functional_distant = (
+                getattr(functional_pack, "distant", None) if functional_pack is not None else None
+            )
+            distant_relation_mass, distant_relation_diag, distant_parent_mass_sum = self._functional_relation_stats(
+                functional_distant
+            )
             event_distant, support_distant, valid_distant, obs_distant, aux_distant = self._decode_branch(
                 parent_event=parent_event_pack.event_distant,
                 parent_support=parent_event_pack.support_distant,
@@ -753,6 +842,9 @@ class BigGSToFineEventDecoder(nn.Module):
                 child_basis=assign_distant.child_basis,
                 child_cache=None if distant_runtime is None else distant_runtime.child_cache,
                 parent_stats=None if distant_runtime is None else distant_runtime.stats,
+                relation_child_mass=distant_relation_mass,
+                relation_child_diag_cov=distant_relation_diag,
+                relation_parent_mass_sum=distant_parent_mass_sum,
                 parent_start=assign_distant.parent_start,
                 child_order=assign_distant.child_order,
             )
@@ -761,36 +853,66 @@ class BigGSToFineEventDecoder(nn.Module):
         active: Optional[BigGSRigidActiveAssignment] = measurement.get("assign_rigid_active")
         if local_state.rigid is not None and active is not None and int(active.fine_S.numel()) > 0:
             rigid_runtime = getattr(runtime, "rigid_active", None) if runtime is not None else None
+            functional_rigid = (
+                getattr(functional_pack, "rigid_active", None) if functional_pack is not None else None
+            )
+            rigid_relation_mass, rigid_relation_diag, rigid_parent_mass_sum = self._functional_relation_stats(
+                functional_rigid
+            )
             s = active.fine_S.long().to(device=local_state.rigid.means.device)
+            relation_tensor = (
+                (lambda value: value.detach())
+                if functional_rigid is not None
+                else (lambda value: value)
+            )
             world_child_params = {
-                "means": measurement["route"].means_world_S,
-                "scales_log": local_state.rigid.scales_log.index_select(0, s),
-                "quats": measurement["route"].quats_world_S,
-                "opacity_logit": local_state.rigid.opacity_logit.index_select(0, s),
-                "sh_dc": local_state.rigid.sh_dc.index_select(0, s),
-                "sh_rest": local_state.rigid.sh_rest.index_select(0, s),
+                "means": relation_tensor(measurement["route"].means_world_S),
+                "scales_log": relation_tensor(local_state.rigid.scales_log).index_select(0, s),
+                "quats": relation_tensor(measurement["route"].quats_world_S),
+                "opacity_logit": relation_tensor(local_state.rigid.opacity_logit).index_select(0, s),
+                "sh_dc": relation_tensor(local_state.rigid.sh_dc).index_select(0, s),
+                "sh_rest": relation_tensor(local_state.rigid.sh_rest).index_select(0, s),
             }
             parent_params_rigid = measurement["parent_params_rigid_active"]
+            if functional_rigid is not None:
+                parent_params_rigid = {
+                    str(key): value.detach()
+                    for key, value in parent_params_rigid.items()
+                }
             child_params = world_child_params
             if str(self.mode).lower() == "gaussian_relational" and self.rigid_relation_space == "canonical":
                 child_params = {
-                    "means": local_state.rigid.means.index_select(0, s),
-                    "scales_log": local_state.rigid.scales_log.index_select(0, s),
-                    "quats": local_state.rigid.quats.index_select(0, s),
-                    "opacity_logit": local_state.rigid.opacity_logit.index_select(0, s),
-                    "sh_dc": local_state.rigid.sh_dc.index_select(0, s),
-                    "sh_rest": local_state.rigid.sh_rest.index_select(0, s),
+                    "means": relation_tensor(local_state.rigid.means).index_select(0, s),
+                    "scales_log": relation_tensor(local_state.rigid.scales_log).index_select(0, s),
+                    "quats": relation_tensor(local_state.rigid.quats).index_select(0, s),
+                    "opacity_logit": relation_tensor(local_state.rigid.opacity_logit).index_select(0, s),
+                    "sh_dc": relation_tensor(local_state.rigid.sh_dc).index_select(0, s),
+                    "sh_rest": relation_tensor(local_state.rigid.sh_rest).index_select(0, s),
                 }
                 child_mass_for_relation = (
-                    active.child_mass_S if rigid_runtime is None else rigid_runtime.child_cache.mass
+                    rigid_relation_mass
+                    if rigid_relation_mass is not None
+                    else (active.child_mass_S if rigid_runtime is None else rigid_runtime.child_cache.mass)
                 )
-                parent_params_rigid = self._canonical_rigid_relation_parent_params(
-                    child_params=child_params,
-                    base_parent_params=parent_params_rigid,
-                    child_to_parent=active.child_to_active_parent_S,
-                    child_mass=child_mass_for_relation,
-                    num_parents=int(active.active_parent_count.numel()),
-                )
+                canonical_ctx = torch.no_grad() if functional_rigid is not None else nullcontext()
+                with canonical_ctx:
+                    parent_params_rigid = self._canonical_rigid_relation_parent_params(
+                        child_params=child_params,
+                        base_parent_params=parent_params_rigid,
+                        child_to_parent=active.child_to_active_parent_S,
+                        child_mass=child_mass_for_relation,
+                        num_parents=int(active.active_parent_count.numel()),
+                    )
+            if functional_rigid is not None:
+                for param_role, params in (
+                    ("child", child_params),
+                    ("parent", parent_params_rigid),
+                ):
+                    for key, value in params.items():
+                        if value.requires_grad or value.grad_fn is not None:
+                            raise RuntimeError(
+                                f"functional rigid GRLD {param_role} param {key} must be detached"
+                            )
             route_flag = active.parent_inside_mask.to(device=active.child_to_active_parent_S.device)[active.child_to_active_parent_S.long()].float()
             event_rigid, support_rigid, valid_rigid, obs_rigid, aux_rigid = self._decode_branch(
                 parent_event=parent_event_pack.event_rigid,
@@ -808,6 +930,9 @@ class BigGSToFineEventDecoder(nn.Module):
                 child_basis=active.child_basis_S,
                 child_cache=None if rigid_runtime is None else rigid_runtime.child_cache,
                 parent_stats=None if rigid_runtime is None else rigid_runtime.stats,
+                relation_child_mass=rigid_relation_mass,
+                relation_child_diag_cov=rigid_relation_diag,
+                relation_parent_mass_sum=rigid_parent_mass_sum,
                 parent_start=active.active_parent_start,
                 child_order=active.active_child_order_S,
             )
@@ -883,6 +1008,10 @@ class BigGSToFineEventDecoder(nn.Module):
             if parent_event_pack.event_bg is not None
             else 0.0,
         }
+        if functional_pack is not None:
+            # Reaching this point means every present functional branch passed
+            # the detached relation-stat and child/parent parameter assertions.
+            aux["feedback/relation/boundary_assertion_passed"] = 1.0
         return EventPack(
             event_bg=event_bg,
             event_distant=event_distant,

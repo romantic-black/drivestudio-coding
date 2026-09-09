@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import logging
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -35,6 +36,7 @@ from .history_gate_v2_features import (
 from .history_gradient_bank import HGV2_ATTRS, build_history_gradient_bank_from_loss
 from .history_damage_loss import HistoryDamageProbe, history_damage_hinge
 from .history_safe_projection import IForwardHistorySafeProjection
+from .functional_parentgs import validate_stage3_4_functional_parentgs_config
 from .iforward_v6_state import IForwardV6MemoryState
 from .local_conflict_xcpe import IForwardLocalConflictXcpe
 from .memory import IForwardMemoryStepContext, IForwardSceneMemory
@@ -85,8 +87,15 @@ from .sequence10_history_bank import Sequence10HistoryBank, sequence10_damage_hi
 from .sequence10_resolver import IForwardSequence10Resolver
 from .state import IForwardMemoryState, IForwardShortWindowHistory, IForwardState
 from .utils import cfg_ensure_child, cfg_get, cfg_set, clone_config
-from .versions import is_stage3_1_iforward_version, is_stage3_optimizer_memory_iforward_version
+from .versions import (
+    IFORWARD_STAGE3_4_PARENT_CODEC_SCHEMA,
+    is_stage3_1_iforward_version,
+    is_stage3_4_iforward_version,
+    is_stage3_optimizer_memory_iforward_version,
+)
 
+
+logger = logging.getLogger(__name__)
 
 def _cfg_set_missing(node: Any, key: str, value: Any) -> None:
     if cfg_get(node, key, None) is None:
@@ -549,7 +558,15 @@ class IForwardModel(nn.Module):
         iforward_cfg = cfg_get(cfg_get(config, "model", {}) or {}, "iforward", {}) or {}
         self.observation_feedback_policy = ObservationFeedbackPolicy.from_config(config or {})
         self.iforward_version = str(cfg_get(iforward_cfg, "version", "v1"))
-        self.is_stage3_1_lowrank_gdkv = is_stage3_1_iforward_version(self.iforward_version)
+        self.is_stage3_4_functional_parentgs = is_stage3_4_iforward_version(
+            self.iforward_version
+        )
+        if bool(self.is_stage3_4_functional_parentgs):
+            self._validate_stage3_4_functional_parentgs_contract(iforward_cfg)
+        self.is_stage3_1_lowrank_gdkv = bool(
+            is_stage3_1_iforward_version(self.iforward_version)
+            or self.is_stage3_4_functional_parentgs
+        )
         self.is_stage3_0_full_sparse_gather_lift = is_stage3_optimizer_memory_iforward_version(self.iforward_version)
         self.is_v3_gru_history_gate = self.iforward_version == "v3_gru_history_gate"
         self.is_v6_point_mamba_xcpe = self.iforward_version == "v6_point_mamba_xcpe"
@@ -604,8 +621,16 @@ class IForwardModel(nn.Module):
                     raise ValueError(f"Stage3_0 unsupported scalar_anchor_backend={scalar_anchor_backend!r}.")
                 parent_lift_cfg = cfg_get(stage3_lifting_cfg, "parent", {}) or {}
                 parent_lift_type = str(cfg_get(parent_lift_cfg, "type", "legacy_direct_lift")).lower()
-                if parent_lift_type not in {"legacy_direct_lift", "sparse_gather"}:
+                supported_parent_lifts = {"legacy_direct_lift", "sparse_gather"}
+                if bool(self.is_stage3_4_functional_parentgs):
+                    supported_parent_lifts.add("functional_parent_direct_lift")
+                if parent_lift_type not in supported_parent_lifts:
                     raise ValueError(f"Stage3_0 unsupported parent.type={parent_lift_type!r}.")
+                if bool(self.is_stage3_4_functional_parentgs) and parent_lift_type != "functional_parent_direct_lift":
+                    raise ValueError(
+                        "Stage 3.4 requires model.iforward.lifting.parent.type="
+                        "functional_parent_direct_lift."
+                    )
                 if parent_lift_type == "legacy_direct_lift" and bool(
                     cfg_get(cfg_get(stage3_lifting_cfg, "dino_native", {}) or {}, "enable", False)
                 ):
@@ -762,17 +787,36 @@ class IForwardModel(nn.Module):
             if self.is_stage2_1_parent_temporal or self.is_stage2_2_parent_temporal or self.is_stage2_3_optimizer_mamba:
                 parent_spatial_cfg = cfg_get(iforward_cfg, "parent_spatial", {}) or {}
                 parent_ptv3_cfg = cfg_get(parent_spatial_cfg, "ptv3", {}) or {}
+                parent_param_codec_cfg = cfg_get(parent_spatial_cfg, "param_codec", {}) or {}
                 parent_support_cfg = cfg_get(parent_spatial_cfg, "support_threshold", {}) or {}
+                parent_projector_cfg = cfg_get(biggs_cfg, "parent_projector", {}) or {}
+                codec_grad_to_parent = bool(
+                    cfg_get(
+                        parent_param_codec_cfg,
+                        "grad_to_parent_params",
+                        bool(
+                            self.observation_feedback_policy.enable
+                            and self.observation_feedback_policy.parent_projection.enable
+                        ),
+                    )
+                )
                 self.parent_spatial_backbone = ParentSpatialBackbone(
                     context_dim=int(cfg_get(parent_spatial_cfg, "context_dim", 48)),
                     event_dim=int(cfg_get(parent_spatial_cfg, "event_dim", 64)),
                     token_dim=int(cfg_get(parent_spatial_cfg, "token_dim", cfg_get(parent_spatial_cfg, "event_dim", 64))),
                     param_support_dim=int(cfg_get(parent_spatial_cfg, "param_support_dim", 24)),
-                    param_codec_detach_params=not bool(
-                        self.observation_feedback_policy.enable
-                        and self.observation_feedback_policy.parent_projection.enable
+                    param_codec_mode=str(cfg_get(parent_param_codec_cfg, "mode", "legacy_17d")),
+                    param_codec_detach_params=not codec_grad_to_parent,
+                    param_codec_detach_support=bool(cfg_get(parent_param_codec_cfg, "detach_support", True)),
+                    geometry_min_scale=float(cfg_get(parent_projector_cfg, "min_scale", 1.0e-3)),
+                    geometry_max_scale_bg=float(cfg_get(parent_projector_cfg, "max_scale_bg", 0.60)),
+                    geometry_max_scale_distant=float(
+                        cfg_get(parent_projector_cfg, "max_scale_distant", 3.0)
                     ),
-                    param_codec_detach_support=True,
+                    geometry_max_scale_rigid=float(
+                        cfg_get(parent_projector_cfg, "max_scale_rigid", 0.45)
+                    ),
+                    ptv3_detach_coords=bool(cfg_get(parent_ptv3_cfg, "detach_coords", False)),
                     support_embed_dim=int(cfg_get(parent_spatial_cfg, "support_embed_dim", 4)),
                     branch_embed_dim=int(cfg_get(parent_spatial_cfg, "branch_embed_dim", 4)),
                     near_depth=int(cfg_get(parent_ptv3_cfg, "depth", 4)),
@@ -1053,6 +1097,194 @@ class IForwardModel(nn.Module):
             }
         self.to(self.device)
 
+    def _validate_stage3_4_functional_parentgs_contract(self, iforward_cfg: Any) -> None:
+        """Fail before module construction if Stage 3.4 could enter a legacy path."""
+
+        validate_stage3_4_functional_parentgs_config(iforward_cfg)
+
+        biggs_cfg = cfg_get(iforward_cfg, "biggs", {}) or {}
+        projector_cfg = cfg_get(biggs_cfg, "parent_projector", {}) or {}
+        parent_state_cfg = cfg_get(biggs_cfg, "parent_state", {}) or {}
+        gradient_cfg = cfg_get(biggs_cfg, "gradient_contract", {}) or {}
+        child_decoder_cfg = cfg_get(biggs_cfg, "child_decoder", {}) or {}
+        lifting_cfg = cfg_get(iforward_cfg, "lifting", {}) or {}
+        parent_lift_cfg = cfg_get(lifting_cfg, "parent", {}) or {}
+        parent_spatial_cfg = cfg_get(iforward_cfg, "parent_spatial", {}) or {}
+        codec_cfg = cfg_get(parent_spatial_cfg, "param_codec", {}) or {}
+        ptv3_cfg = cfg_get(parent_spatial_cfg, "ptv3", {}) or {}
+        feedback = self.observation_feedback_policy
+
+        failures: List[str] = []
+
+        def require(condition: bool, path: str, expected: str, actual: Any) -> None:
+            if not bool(condition):
+                failures.append(f"{path} must be {expected}, got {actual!r}")
+
+        parent_lift_type = str(cfg_get(parent_lift_cfg, "type", "")).lower()
+        require(
+            parent_lift_type == "functional_parent_direct_lift",
+            "model.iforward.lifting.parent.type",
+            "'functional_parent_direct_lift'",
+            parent_lift_type,
+        )
+        require(
+            bool(cfg_get(lifting_cfg, "detach_geometry", False)),
+            "model.iforward.lifting.detach_geometry",
+            "true",
+            cfg_get(lifting_cfg, "detach_geometry", None),
+        )
+        require(
+            not bool(cfg_get(parent_lift_cfg, "geometry_grad", True)),
+            "model.iforward.lifting.parent.geometry_grad",
+            "false",
+            cfg_get(parent_lift_cfg, "geometry_grad", None),
+        )
+        require(
+            str(cfg_get(parent_lift_cfg, "color_mode", "")).lower() == "constant_zero",
+            "model.iforward.lifting.parent.color_mode",
+            "'constant_zero'",
+            cfg_get(parent_lift_cfg, "color_mode", None),
+        )
+
+        backend = str(cfg_get(projector_cfg, "backend", "")).lower()
+        require(
+            backend in {"cuda_exact_diag", "cuda_exact_diagonal"},
+            "model.iforward.biggs.parent_projector.backend",
+            "'cuda_exact_diag'",
+            backend,
+        )
+        require(
+            bool(cfg_get(projector_cfg, "grad_to_local_state", False)),
+            "model.iforward.biggs.parent_projector.grad_to_local_state",
+            "true",
+            cfg_get(projector_cfg, "grad_to_local_state", None),
+        )
+        require(
+            bool(cfg_get(projector_cfg, "recompute_every_visit", False)),
+            "model.iforward.biggs.parent_projector.recompute_every_visit",
+            "true",
+            cfg_get(projector_cfg, "recompute_every_visit", None),
+        )
+        for fallback_key in ("allow_cpu_fallback", "allow_torch_fallback", "allow_forward_only", "allow_surrogate_runtime_vjp"):
+            require(
+                not bool(cfg_get(projector_cfg, fallback_key, False)),
+                f"model.iforward.biggs.parent_projector.{fallback_key}",
+                "false",
+                cfg_get(projector_cfg, fallback_key, None),
+            )
+
+        require(
+            str(cfg_get(parent_state_cfg, "mode", "")).lower() == "functional_per_visit",
+            "model.iforward.biggs.parent_state.mode",
+            "'functional_per_visit'",
+            cfg_get(parent_state_cfg, "mode", None),
+        )
+        require(
+            not bool(cfg_get(parent_state_cfg, "persistent_geometry", True)),
+            "model.iforward.biggs.parent_state.persistent_geometry",
+            "false",
+            cfg_get(parent_state_cfg, "persistent_geometry", None),
+        )
+        require(
+            not bool(cfg_get(parent_state_cfg, "incremental_update", True)),
+            "model.iforward.biggs.parent_state.incremental_update",
+            "false",
+            cfg_get(parent_state_cfg, "incremental_update", None),
+        )
+
+        require(
+            str(cfg_get(codec_cfg, "mode", "")).lower()
+            == "legacy17d_plus_geometry8d_residual",
+            "model.iforward.parent_spatial.param_codec.mode",
+            "'legacy17d_plus_geometry8d_residual'",
+            cfg_get(codec_cfg, "mode", None),
+        )
+        require(
+            str(cfg_get(codec_cfg, "schema", "")) == IFORWARD_STAGE3_4_PARENT_CODEC_SCHEMA,
+            "model.iforward.parent_spatial.param_codec.schema",
+            repr(IFORWARD_STAGE3_4_PARENT_CODEC_SCHEMA),
+            cfg_get(codec_cfg, "schema", None),
+        )
+        require(
+            bool(cfg_get(codec_cfg, "grad_to_parent_params", False)),
+            "model.iforward.parent_spatial.param_codec.grad_to_parent_params",
+            "true",
+            cfg_get(codec_cfg, "grad_to_parent_params", None),
+        )
+        require(
+            bool(cfg_get(codec_cfg, "detach_support", False)),
+            "model.iforward.parent_spatial.param_codec.detach_support",
+            "true",
+            cfg_get(codec_cfg, "detach_support", None),
+        )
+        require(
+            bool(cfg_get(codec_cfg, "detach_legacy_params", False)),
+            "model.iforward.parent_spatial.param_codec.detach_legacy_params",
+            "true",
+            cfg_get(codec_cfg, "detach_legacy_params", None),
+        )
+        require(
+            bool(cfg_get(ptv3_cfg, "detach_coords", False)),
+            "model.iforward.parent_spatial.ptv3.detach_coords",
+            "true",
+            cfg_get(ptv3_cfg, "detach_coords", None),
+        )
+
+        expected_gradient_contract = {
+            "param_codec_geometry": True,
+            "lifting_geometry": False,
+            "ptv3_coords": False,
+            "assignment": False,
+            "relation_child_geometry": False,
+            "relation_parent_geometry": False,
+        }
+        for key, expected in expected_gradient_contract.items():
+            actual = cfg_get(gradient_cfg, key, None)
+            require(
+                isinstance(actual, bool) and actual is expected,
+                f"model.iforward.biggs.gradient_contract.{key}",
+                str(expected).lower(),
+                actual,
+            )
+        for key in (
+            "detach_relation_inputs",
+            "detach_child_code_inputs",
+            "detach_child_params",
+            "detach_parent_params",
+        ):
+            require(
+                bool(cfg_get(child_decoder_cfg, key, False)),
+                f"model.iforward.biggs.child_decoder.{key}",
+                "true",
+                cfg_get(child_decoder_cfg, key, None),
+            )
+        require(
+            str(cfg_get(child_decoder_cfg, "relation_source", "")).lower() == "functional_detached_stats",
+            "model.iforward.biggs.child_decoder.relation_source",
+            "'functional_detached_stats'",
+            cfg_get(child_decoder_cfg, "relation_source", None),
+        )
+        require(
+            bool(feedback.enable and feedback.source_render.enable),
+            "model.iforward.observation_feedback.source_render.enable",
+            "true",
+            bool(feedback.source_render.enable),
+        )
+        require(
+            not bool(feedback.parent_projection.enable),
+            "model.iforward.observation_feedback.parent_projection.enable",
+            "false",
+            bool(feedback.parent_projection.enable),
+        )
+        require(
+            not bool(feedback.relation.enable),
+            "model.iforward.observation_feedback.relation.enable",
+            "false",
+            bool(feedback.relation.enable),
+        )
+        if failures:
+            raise ValueError("Stage 3.4 functional ParentGS contract violation: " + "; ".join(failures))
+
     def _nvtx_range(self, name: str) -> Any:
         if bool(self.enable_nvtx_ranges) and torch.cuda.is_available():
             return torch.cuda.nvtx.range(name)
@@ -1071,15 +1303,52 @@ class IForwardModel(nn.Module):
         weights_only: bool = True,
         path: Optional[str] = None,
     ) -> bool:
-        _ = (weights_only, path)
+        _ = path
+        if bool(getattr(self, "is_stage3_4_functional_parentgs", False)) and not bool(weights_only):
+            raise ValueError(
+                "Stage 3.3 -> Stage 3.4 initialization is weights-only; "
+                "use strict resume only with a native Stage 3.4 checkpoint."
+            )
         if str(ckpt.get("export_type", "")) != "stage6_0_phase_a_for_phase_b":
             init_cfg = cfg_get(self.config, "initialization", {}) or {}
             skip_keys = [str(x) for x in list(cfg_get(init_cfg, "skip_keys", []) or []) if str(x)]
+            is_stage3_4 = bool(getattr(self, "is_stage3_4_functional_parentgs", False))
+            saved_version = str(ckpt.get("iforward_version", "") or "")
+            saved_codec_schema = str(ckpt.get("parent_codec_schema", "") or "")
+            if is_stage3_4:
+                if is_stage3_4_iforward_version(saved_version) and (
+                    saved_codec_schema != IFORWARD_STAGE3_4_PARENT_CODEC_SCHEMA
+                ):
+                    raise ValueError(
+                        "Pre-v57 Stage 3.4 checkpoints are not weights-only compatible: "
+                        f"checkpoint parent_codec_schema={saved_codec_schema!r}, "
+                        f"expected={IFORWARD_STAGE3_4_PARENT_CODEC_SCHEMA!r}. "
+                        "Initialize v57 from a native Stage 3.3 checkpoint instead."
+                    )
+                mandatory_prefixes = (
+                    "parent_spatial_backbone.param_support_codec.",
+                    "parent_spatial_backbone.token_builder.param_support_proj.",
+                )
+                blocked_skips = [
+                    prefix
+                    for prefix in mandatory_prefixes
+                    if any(prefix.startswith(skip) or skip.startswith(prefix) for skip in skip_keys)
+                ]
+                if blocked_skips:
+                    raise ValueError(
+                        "Stage 3.4 v57 migration must load the detached legacy Parent codec and "
+                        f"token projection; remove initialization.skip_keys entries for {blocked_skips}"
+                    )
             sd = ckpt.get("model_state_dict")
             if not isinstance(sd, dict):
                 return False
-            raw_sd = {str(k): v for k, v in dict(sd).items() if str(k) != "_extra_state"}
-            current_keys = set(self.state_dict().keys())
+            raw_sd = {
+                str(k): v
+                for k, v in dict(sd).items()
+                if str(k) != "_extra_state" and not str(k).endswith("._extra_state")
+            }
+            current_state = self.state_dict()
+            current_keys = set(current_state.keys())
             direct_matches = sum(1 for key in raw_sd if key in current_keys)
             stripped_sd = {
                 (key[len("model.") :] if key.startswith("model.") else key): value
@@ -1087,6 +1356,66 @@ class IForwardModel(nn.Module):
             }
             stripped_matches = sum(1 for key in stripped_sd if key in current_keys)
             normalized_sd = stripped_sd if stripped_matches > direct_matches else raw_sd
+            stage3_4_unexpected_runtime_vjp = sum(
+                1
+                for key in normalized_sd
+                if "runtime_parent_projection_vjp" in str(key)
+                or "parent_vjp" in str(key)
+                or "biggs_parent_runtime" in str(key)
+            )
+            legacy_codec_keys: List[str] = []
+            token_projection_keys: List[str] = []
+            residual_adapter_keys: List[str] = []
+            native_stage3_4_source = bool(
+                is_stage3_4
+                and is_stage3_4_iforward_version(saved_version)
+                and saved_codec_schema == IFORWARD_STAGE3_4_PARENT_CODEC_SCHEMA
+            )
+            if is_stage3_4:
+                legacy_codec_keys = sorted(
+                    key
+                    for key in current_keys
+                    if key.startswith("parent_spatial_backbone.param_support_codec.")
+                )
+                token_projection_keys = sorted(
+                    key
+                    for key in current_keys
+                    if key.startswith("parent_spatial_backbone.token_builder.param_support_proj.")
+                )
+                residual_adapter_keys = sorted(
+                    key
+                    for key in current_keys
+                    if key.startswith("parent_spatial_backbone.geometry_residual_adapter.")
+                )
+                if not legacy_codec_keys or not token_projection_keys or not residual_adapter_keys:
+                    raise ValueError(
+                        "Stage 3.4 v57 model is missing the legacy codec, token projection, "
+                        "or geometry residual adapter state"
+                    )
+                required_source_keys = legacy_codec_keys + token_projection_keys
+                missing_required = [key for key in required_source_keys if key not in normalized_sd]
+                shape_mismatches = [
+                    (
+                        key,
+                        tuple(normalized_sd[key].shape),
+                        tuple(current_state[key].shape),
+                    )
+                    for key in required_source_keys
+                    if key in normalized_sd
+                    and torch.is_tensor(normalized_sd[key])
+                    and tuple(normalized_sd[key].shape) != tuple(current_state[key].shape)
+                ]
+                if missing_required or shape_mismatches:
+                    raise ValueError(
+                        "Stage 3.4 v57 weights-only migration requires the complete Stage 3.3 "
+                        "legacy Parent codec and downstream token projection: "
+                        f"missing={missing_required[:20]} shape_mismatches={shape_mismatches[:10]}"
+                    )
+                if stage3_4_unexpected_runtime_vjp:
+                    raise ValueError(
+                        "Stage 3.4 v57 init checkpoint unexpectedly contains legacy Parent "
+                        f"runtime/VJP state keys: count={stage3_4_unexpected_runtime_vjp}"
+                    )
             filtered = {
                 key: value
                 for key, value in normalized_sd.items()
@@ -1106,12 +1435,70 @@ class IForwardModel(nn.Module):
                     "model.phase_a_runtime.sparse_conv."
                 )
 
-            bad_missing = [str(k) for k in missing if not (_skip_allowed(str(k)) or _new_gdkv_param(str(k)))]
+            def _new_stage3_4_residual(name: str) -> bool:
+                return bool(
+                    is_stage3_4
+                    and not native_stage3_4_source
+                    and str(name).startswith("parent_spatial_backbone.geometry_residual_adapter.")
+                )
+
+            bad_missing = [
+                str(k)
+                for k in missing
+                if not (
+                    _skip_allowed(str(k))
+                    or _new_gdkv_param(str(k))
+                    or _new_stage3_4_residual(str(k))
+                )
+            ]
             bad_unexpected = [str(k) for k in unexpected if not (_skip_allowed(str(k)) or _legacy_sparse_conv(str(k)))]
             if bad_missing or bad_unexpected:
                 raise ValueError(
                     "IForward init_checkpoint skip_keys load failed: "
                     f"missing={bad_missing[:20]} unexpected={bad_unexpected[:20]}"
+                )
+            if is_stage3_4:
+                adapter = getattr(
+                    getattr(self, "parent_spatial_backbone", None),
+                    "geometry_residual_adapter",
+                    None,
+                )
+                zero_init_checker = getattr(adapter, "is_zero_initialized", None)
+                adapter_zero_initialized = bool(
+                    isinstance(adapter, nn.Module)
+                    and callable(zero_init_checker)
+                    and zero_init_checker()
+                )
+                if not native_stage3_4_source and not adapter_zero_initialized:
+                    raise ValueError(
+                        "Stage 3.4 v57 geometry residual adapter must remain exactly zero-initialized "
+                        "after Stage 3.3 weights-only migration"
+                    )
+                self.stage3_4_checkpoint_migration_stats = {
+                    "stage3_4/checkpoint/legacy_parent_codec_loaded": 1.0,
+                    "stage3_4/checkpoint/legacy_parent_codec_keys": float(len(legacy_codec_keys)),
+                    "stage3_4/checkpoint/parent_token_proj_loaded": 1.0,
+                    "stage3_4/checkpoint/parent_token_proj_keys": float(len(token_projection_keys)),
+                    "stage3_4/checkpoint/geometry_residual_zero_initialized": float(
+                        1.0 if adapter_zero_initialized else 0.0
+                    ),
+                    "stage3_4/checkpoint/unexpected_runtime_vjp_keys": float(
+                        stage3_4_unexpected_runtime_vjp
+                    ),
+                }
+                logger.info(
+                    "Stage 3.4 weights-only checkpoint migration: path=%s "
+                    "stage3_4/checkpoint/legacy_parent_codec_loaded=1 "
+                    "stage3_4/checkpoint/legacy_parent_codec_keys=%d "
+                    "stage3_4/checkpoint/parent_token_proj_loaded=1 "
+                    "stage3_4/checkpoint/parent_token_proj_keys=%d "
+                    "stage3_4/checkpoint/geometry_residual_zero_initialized=%d "
+                    "stage3_4/checkpoint/unexpected_runtime_vjp_keys=%d",
+                    path,
+                    len(legacy_codec_keys),
+                    len(token_projection_keys),
+                    1 if adapter_zero_initialized else 0,
+                    stage3_4_unexpected_runtime_vjp,
                 )
             return True
         runtime = getattr(self, "phase_a_runtime", None)
@@ -2060,10 +2447,11 @@ class IForwardModel(nn.Module):
             "event_ms": 0.0,
             "memory_ms": 0.0,
             "update_ms": 0.0,
-            "parent_runtime_update_ms": 0.0,
             "delta_reg_ms": 0.0,
             "final_render_ms": 0.0,
         }
+        if not bool(getattr(self, "is_stage3_4_functional_parentgs", False)):
+            timings["parent_runtime_update_ms"] = 0.0
         model_cfg = cfg_get(self.config, "model", {}) or {}
         iforward_cfg_for_mem = cfg_get(model_cfg, "iforward", {}) or {}
         debug_cfg_for_mem = cfg_get(iforward_cfg_for_mem, "debug", {}) or {}
@@ -2181,7 +2569,10 @@ class IForwardModel(nn.Module):
                 )
             else:
                 history_damage_probe = HistoryDamageProbe.empty(ref=local_state.bg.means)
+        # A Functional Parent graph is measurement-local.  Only legacy versions
+        # own a persistent incremental Parent runtime inside a rollout.
         biggs_parent_runtime = None
+        model_update_count = 0
         stage2_1_parent_block_cache: Dict[str, Any] = {}
         for step_pos, step in enumerate(resolved.steps):
             step_mem_aux: Dict[str, float] = {}
@@ -2191,7 +2582,10 @@ class IForwardModel(nn.Module):
             if bool(is_block_enter):
                 block_hsp_cache = {}
                 stage2_1_parent_block_cache = {}
-                if self.is_stage2_0_biggs_parent_lifting:
+                if (
+                    self.is_stage2_0_biggs_parent_lifting
+                    and not bool(getattr(self, "is_stage3_4_functional_parentgs", False))
+                ):
                     if str(getattr(self, "stage2_0_biggs_parent_exact_refresh_policy", "block_enter")) == "block_enter":
                         biggs_parent_runtime = None
             t0 = time.perf_counter()
@@ -2204,7 +2598,8 @@ class IForwardModel(nn.Module):
                 }
                 if self.is_stage2_0_biggs_parent_lifting:
                     observe_kwargs["biggs_state"] = getattr(state, "biggs_state", None)
-                    observe_kwargs["biggs_parent_runtime"] = biggs_parent_runtime
+                    if not bool(getattr(self, "is_stage3_4_functional_parentgs", False)):
+                        observe_kwargs["biggs_parent_runtime"] = biggs_parent_runtime
                     observe_kwargs["biggs_scene_id"] = int(resolved.scene_id)
                     observe_kwargs["biggs_segment_id"] = int(resolved.segment_id)
                     observe_kwargs["biggs_episode_id"] = int(resolved.episode_id)
@@ -2219,6 +2614,11 @@ class IForwardModel(nn.Module):
                         "repeat_idx": int(getattr(step, "repeat_idx", 0)),
                         "repeat_budget": int(getattr(step, "repeat_budget", 0)),
                         "visit_kind": str(getattr(step, "visit_kind", "")),
+                        "model_update_count": int(model_update_count),
+                        "has_update_ancestor": bool(model_update_count > 0),
+                        "validation_render_only": bool(
+                            getattr(step, "validation_render_only", False)
+                        ),
                     }
                     feedback_eval_mode = dict(observe_batch.get("request_meta") or {}).get(
                         "observation_feedback_eval_mode", None
@@ -2249,7 +2649,8 @@ class IForwardModel(nn.Module):
                     next_biggs_state = measurement["biggs_state"]
                     detach_biggs = getattr(next_biggs_state, "detach", None)
                     state.biggs_state = detach_biggs() if callable(detach_biggs) else next_biggs_state
-                    biggs_parent_runtime = measurement.get("biggs_parent_runtime", biggs_parent_runtime)
+                    if not bool(getattr(self, "is_stage3_4_functional_parentgs", False)):
+                        biggs_parent_runtime = measurement.get("biggs_parent_runtime", biggs_parent_runtime)
             step_mem_prev = _record_stage_mem("after_observe", out=step_mem_aux, prev=step_mem_prev)
             observe_step_ms = (time.perf_counter() - t0) * 1000.0
             timings["observe_ms"] += observe_step_ms
@@ -2266,6 +2667,17 @@ class IForwardModel(nn.Module):
                         local_state=local_state,
                         measurement=measurement,
                     )
+                    # Functional ParentGS geometry and rigid routing are rebuilt
+                    # for every measurement.  A layout serialized for an earlier
+                    # visit can therefore have a different row count (or a stale
+                    # Morton order) after the updater changes live geometry.  Keep
+                    # the legacy block cache for the stable runtime path, but force
+                    # Stage 3.4 to serialize the current detached coordinates.
+                    cached_near_layout = (
+                        None
+                        if bool(getattr(self, "is_stage3_4_functional_parentgs", False))
+                        else stage2_1_parent_block_cache.get("near_layout_cache")
+                    )
                     parent_event_spatial, near_layout_cache = parent_spatial(
                         near_in=parent_inputs["near_in"],
                         far_in=parent_inputs["far_in"],
@@ -2274,11 +2686,37 @@ class IForwardModel(nn.Module):
                         aabb_max=parent_inputs["aabb_max"],
                         near_batch_offsets=parent_inputs.get("near_batch_offsets"),
                         far_batch_offsets=parent_inputs.get("far_batch_offsets"),
-                        near_layout_cache=stage2_1_parent_block_cache.get("near_layout_cache"),
+                        near_layout_cache=cached_near_layout,
                         frame_gap=int(getattr(step, "frame_gap", 0)),
                         visit_kind=str(getattr(step, "visit_kind", "causal_first") or "causal_first"),
                     )
-                    stage2_1_parent_block_cache["near_layout_cache"] = near_layout_cache
+                    if bool(getattr(self, "is_stage3_4_functional_parentgs", False)):
+                        if float(
+                            dict(parent_event_spatial.aux or {}).get(
+                                "feedback/ptv3_coords/boundary_assertion_passed",
+                                0.0,
+                            )
+                        ) != 1.0:
+                            raise RuntimeError(
+                                "Stage 3.4 ParentPTv3 boundary assertion was not executed"
+                            )
+                        self.bridge.register_stage3_4_isolation_boundary("ptv3_coords")
+                        # Layout tensors are graph-free products of detached
+                        # routing coordinates and must not survive this visit.
+                        for layout in dict(near_layout_cache or {}).values():
+                            for tensor in (
+                                layout.order,
+                                layout.inverse,
+                                layout.pad_mask,
+                                layout.patch_batch_ids,
+                            ):
+                                if bool(tensor.requires_grad):
+                                    raise RuntimeError(
+                                        "Stage 3.4 ParentPTv3 layout cache must be detached"
+                                    )
+                        stage2_1_parent_block_cache.pop("near_layout_cache", None)
+                    else:
+                        stage2_1_parent_block_cache["near_layout_cache"] = near_layout_cache
                     if self.is_stage2_2_parent_temporal or self.is_stage2_3_optimizer_mamba:
                         parent_keys = build_parent_temporal_keys_v2(
                             parent_event=parent_event_spatial,
@@ -2405,6 +2843,17 @@ class IForwardModel(nn.Module):
                         local_state=local_state,
                         measurement=measurement,
                     )
+                    if bool(getattr(self, "is_stage3_4_functional_parentgs", False)):
+                        if float(
+                            dict(event.aux or {}).get(
+                                "feedback/relation/boundary_assertion_passed",
+                                0.0,
+                            )
+                        ) != 1.0:
+                            raise RuntimeError(
+                                "Stage 3.4 relation boundary assertion was not executed"
+                            )
+                        self.bridge.register_stage3_4_isolation_boundary("relation")
                 else:
                     event = self.bridge.build_event(local_state=local_state, measurement=measurement)
                 if self.is_stage3_0_full_sparse_gather_lift and isinstance(measurement, dict):
@@ -2682,7 +3131,28 @@ class IForwardModel(nn.Module):
                         event=event,
                         ctx_memory=ctx_memory,
                     )
-                if self.is_stage2_0_biggs_parent_lifting and isinstance(measurement, dict):
+                if (
+                    bool(getattr(self, "is_stage3_4_functional_parentgs", False))
+                    and delta is not None
+                    and not bool(validation_render_only)
+                ):
+                    register_delta_probe = getattr(
+                        self.bridge,
+                        "register_stage3_4_earlier_delta_grad_probe",
+                        None,
+                    )
+                    if callable(register_delta_probe):
+                        register_delta_probe(
+                            delta=delta,
+                            distance=int(len(resolved.steps) - 1 - step_pos),
+                        )
+                    model_update_count += 1
+                    update_aux["iforward/stage3_4/model_update_count"] = float(model_update_count)
+                if (
+                    self.is_stage2_0_biggs_parent_lifting
+                    and isinstance(measurement, dict)
+                    and not bool(getattr(self, "is_stage3_4_functional_parentgs", False))
+                ):
                     parent_runtime_update_step_ms = 0.0
                     current_runtime = measurement.get("biggs_parent_runtime", biggs_parent_runtime)
                     skip_exit = bool(getattr(self, "stage2_0_biggs_skip_update_on_block_exit", True))
@@ -2726,15 +3196,31 @@ class IForwardModel(nn.Module):
                     ):
                         delta_for_optimizer_write = None
                         if bool(getattr(self, "stage2_3_include_delta_summary", True)):
-                            runtime_for_delta = biggs_parent_runtime
-                            if isinstance(measurement, dict):
-                                runtime_for_delta = runtime_for_delta or measurement.get("biggs_parent_runtime", None)
-                            delta_for_optimizer_write, delta_summary_aux = build_parent_delta_summary(
-                                delta=delta,
-                                runtime=runtime_for_delta,
-                                spatial_event=spatial_event,
-                                fail_fast=bool(getattr(self, "stage2_3_delta_summary_fail_fast", True)),
-                            )
+                            if bool(getattr(self, "is_stage3_4_functional_parentgs", False)):
+                                if not isinstance(measurement, dict):
+                                    raise RuntimeError("Stage 3.4 delta summary requires a measurement mapping")
+                                functional_assignments = measurement.get("functional_parent_assignments")
+                                if functional_assignments is None:
+                                    raise RuntimeError(
+                                        "Stage 3.4 delta summary requires functional_parent_assignments; "
+                                        "legacy Parent runtime fallback is forbidden"
+                                    )
+                                delta_for_optimizer_write, delta_summary_aux = build_parent_delta_summary(
+                                    delta=delta,
+                                    spatial_event=spatial_event,
+                                    assignments=functional_assignments,
+                                    fail_fast=bool(getattr(self, "stage2_3_delta_summary_fail_fast", True)),
+                                )
+                            else:
+                                runtime_for_delta = biggs_parent_runtime
+                                if isinstance(measurement, dict):
+                                    runtime_for_delta = runtime_for_delta or measurement.get("biggs_parent_runtime", None)
+                                delta_for_optimizer_write, delta_summary_aux = build_parent_delta_summary(
+                                    delta=delta,
+                                    spatial_event=spatial_event,
+                                    runtime=runtime_for_delta,
+                                    fail_fast=bool(getattr(self, "stage2_3_delta_summary_fail_fast", True)),
+                                )
                             update_aux.update(
                                 {str(k): float(v) for k, v in delta_summary_aux.items() if isinstance(v, (int, float))}
                             )
@@ -3481,6 +3967,7 @@ class IForwardModel(nn.Module):
                 if isinstance(value, (int, float))
                 and (
                     str(key).startswith("iforward/")
+                    or str(key).startswith("feedback/functional_parent/")
                     or str(key).startswith("num_parent_")
                     or str(key) == "src_backproject_pass_count"
                 )
@@ -3499,6 +3986,13 @@ class IForwardModel(nn.Module):
             stats[f"{key}_mean"] = float(sum(values) / float(len(values)))
             if str(key).startswith("iforward/forward_mem/"):
                 stats[f"{key}_max"] = float(max(values))
+        if bool(getattr(self, "is_stage3_4_functional_parentgs", False)):
+            stats["iforward/stage3_4/enabled"] = 1.0
+            for key, value in dict(
+                getattr(self, "stage3_4_checkpoint_migration_stats", {}) or {}
+            ).items():
+                out_key = str(key) if str(key).startswith("iforward/") else f"iforward/{key}"
+                stats[out_key] = float(value)
         if bool(emit_forward_mem_aux):
             for item in per_step:
                 raw_k = item.get("k", None)

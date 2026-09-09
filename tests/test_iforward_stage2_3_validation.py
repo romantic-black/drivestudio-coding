@@ -71,12 +71,19 @@ class _FakeModel:
 
     def forward_rollout(self, batch, carried_state=None, ablation="full"):
         resolved = self.resolver.resolve(batch)
+        request_meta = dict(batch.get("request_meta", {}) or {})
+        nested_request_meta = dict((batch.get("_iforward", {}) or {}).get("request_meta", {}) or {})
         self.calls.append(
             {
                 "phase": str(resolved.meta.get("scheduler_phase", "")),
                 "positions": list(resolved.meta.get("rollout_positions", [])),
                 "ablation": str(ablation),
                 "carried": carried_state is not None,
+                "feedback_eval_mode": str(request_meta.get("observation_feedback_eval_mode", "")),
+                "nested_feedback_eval_mode": str(
+                    nested_request_meta.get("observation_feedback_eval_mode", "")
+                ),
+                "grad_enabled": bool(torch.is_grad_enabled()),
             }
         )
         idx = len(self.calls)
@@ -186,6 +193,9 @@ def test_stage2_3_validation_runner_calls_fake_model_and_protocols():
     assert "protocol_start" in statuses
     assert "protocol_done" in statuses
     assert model.calls
+    assert all(call["feedback_eval_mode"] == "frozen_no_grad" for call in model.calls)
+    assert all(call["nested_feedback_eval_mode"] == "frozen_no_grad" for call in model.calls)
+    assert all(not call["grad_enabled"] for call in model.calls)
     protocols = {str(row.get("protocol", "")) for row in rows}
     assert {
         "Assimilation-Causal-FinalAll",

@@ -6,6 +6,12 @@ from typing import Any, Callable, Literal, Optional
 import torch
 
 from .event import ControlEvent, ProbeEvent, UpdateEvent, memory_mode_to_forward_ablation, normalize_memory_mode
+from .eval_guard import (
+    FROZEN_FEEDBACK_RUNNER_MODES,
+    apply_frozen_feedback_eval_metadata,
+    assert_parameter_versions_unchanged,
+    parameter_version_snapshot,
+)
 from .plan import EpisodePlan
 from .state_snapshot import RuntimeSnapshot, clone_runtime_state
 
@@ -51,6 +57,11 @@ class IForwardRunner:
         self.convert_batch_to_minimal_format = convert_batch_to_minimal_format
 
     def run(self, plan: EpisodePlan, recorder: Any, options: RunnerOptions) -> Any:
+        eval_versions = (
+            parameter_version_snapshot(self.model)
+            if str(options.mode) in FROZEN_FEEDBACK_RUNNER_MODES
+            else None
+        )
         state = None
         memory_mode = "full"
         snapshots: dict[str, RuntimeSnapshot] = {}
@@ -78,7 +89,10 @@ class IForwardRunner:
                 recorder.record_probe(event, out, state, event_idx=idx, memory_mode=memory_mode, previous_state=state)
             else:
                 raise TypeError(type(event))
-        return recorder.end_plan(trace)
+        result = recorder.end_plan(trace)
+        if eval_versions is not None:
+            assert_parameter_versions_unchanged(self.model, eval_versions)
+        return result
 
     def _run_control(
         self,
@@ -108,7 +122,8 @@ class IForwardRunner:
         raw = self.scheduler_adapter.batch_from_rollout_plan(event.rollout_plan)
         batch = self._convert(raw, options)
         ablation = memory_mode_to_forward_ablation(memory_mode)
-        with torch.set_grad_enabled(bool(options.allow_grad)):
+        allow_grad = bool(options.allow_grad) and str(options.mode) not in FROZEN_FEEDBACK_RUNNER_MODES
+        with torch.set_grad_enabled(allow_grad):
             return self.model.forward_rollout(batch, carried_state=carried_state, ablation=ablation)
 
     def _run_probe(self, event: ProbeEvent, carried_state: Any, memory_mode: str, options: RunnerOptions) -> Any:
@@ -131,20 +146,10 @@ class IForwardRunner:
         else:
             raw["global_step"] = int(options.trigger_step)
             batch = raw
-        if str(options.mode) in {"validate", "demo", "replay"}:
-            # Runtime evaluation is read-only even when the training policy uses
-            # differentiable/checkpointed observation modes.  Keep distribution
-            # metadata intact for reporting and carry a separate explicit mode so
-            # synthetic events (for example freeze-after-prefill) cannot inherit
-            # or omit a training-only 2D mode.
-            request_meta = dict(batch.get("request_meta", {}) or {})
-            request_meta["observation_feedback_eval_mode"] = "frozen_no_grad"
-            batch["request_meta"] = request_meta
-            iforward_meta = batch.get("_iforward", None)
-            if isinstance(iforward_meta, dict):
-                nested_request_meta = dict(iforward_meta.get("request_meta", {}) or {})
-                nested_request_meta["observation_feedback_eval_mode"] = "frozen_no_grad"
-                iforward_meta["request_meta"] = nested_request_meta
+        if str(options.mode) in FROZEN_FEEDBACK_RUNNER_MODES:
+            # Keep distribution metadata intact while making evaluation's
+            # graph-free feedback policy explicit in both scheduler ABI slots.
+            apply_frozen_feedback_eval_metadata(batch)
         return batch
 
     @staticmethod

@@ -184,7 +184,34 @@ class ParentPTv3Encoder(nn.Module):
     ) -> tuple[torch.Tensor, Dict[str, ParentSerializedLayout], Dict[str, Any]]:
         if x.dim() != 2 or int(x.shape[-1]) != int(self.dim):
             raise ValueError(f"ParentPTv3 expected x [N,{self.dim}], got {tuple(x.shape)}")
+        if coords.dim() != 2 or tuple(coords.shape) != (int(x.shape[0]), 3):
+            raise ValueError(
+                "ParentPTv3 token/coordinate row mismatch: "
+                f"x={tuple(x.shape)}, coords={tuple(coords.shape)}"
+            )
         layouts = dict(layout_cache or {})
+        n = int(x.shape[0])
+        for order_name in tuple(self.orders):
+            layout = layouts.get(order_name)
+            if layout is None:
+                continue
+            order = layout.order
+            inverse = layout.inverse
+            expected_flat = int(layout.num_patches) * int(layout.patch_size)
+            compatible = (
+                int(layout.patch_size) == int(self.patch_size)
+                and int(order.numel()) == expected_flat
+                and int(inverse.numel()) == n
+                and tuple(layout.pad_mask.shape)
+                == (int(layout.num_patches), int(layout.patch_size))
+                and (n == 0 or bool(((order >= 0) & (order < n)).all().item()))
+                and (
+                    n == 0
+                    or bool(((inverse >= 0) & (inverse < max(expected_flat, 1))).all().item())
+                )
+            )
+            if not bool(compatible):
+                layouts.pop(order_name, None)
         missing = [order for order in self.orders if order not in layouts]
         if missing:
             layouts.update(

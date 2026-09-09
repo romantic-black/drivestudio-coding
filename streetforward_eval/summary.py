@@ -118,6 +118,43 @@ def build_summary_rows(final_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     return out
 
 
+def build_optimization_curve_rows(iter_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Aggregate PSNR by completed optimization count.
+
+    Each output row represents the same cumulative optimizer trajectory at one
+    reporting point. Camera columns are included when those camera names are
+    present; ``mean_psnr`` is the mean over all evaluated views/episodes.
+    """
+    post_update_rows = [r for r in iter_rows if not bool(r.get("is_pre_update", False))]
+    by_iteration: Dict[int, List[Dict[str, Any]]] = {}
+    for row in post_update_rows:
+        by_iteration.setdefault(int(row["global_iter"]), []).append(row)
+
+    out: List[Dict[str, Any]] = []
+    for iteration in sorted(by_iteration):
+        rows = by_iteration[iteration]
+        out.append(
+            {
+                "optimization_steps": int(iteration),
+                "num_episodes": int(len(set(str(r["episode_uid"]) for r in rows))),
+                "num_views": int(len(rows)),
+                "mean_psnr": _mean_key(rows, "psnr"),
+                "mean_psnr_non_sky": _mean_key(rows, "psnr_non_sky"),
+                "mean_psnr_full": _mean_key(rows, "psnr_full"),
+                "psnr_front": _mean(
+                    [_row_float(r, "psnr") for r in rows if str(r.get("cam_name")) == "front"]
+                ),
+                "psnr_front_left": _mean(
+                    [_row_float(r, "psnr") for r in rows if str(r.get("cam_name")) == "front_left"]
+                ),
+                "psnr_front_right": _mean(
+                    [_row_float(r, "psnr") for r in rows if str(r.get("cam_name")) == "front_right"]
+                ),
+            }
+        )
+    return out
+
+
 def write_summary_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if len(rows) == 0:

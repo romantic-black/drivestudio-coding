@@ -7,6 +7,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
+from models.iforward.runtime.eval_guard import apply_frozen_feedback_eval_metadata
+
 from .scheduler import Stage23Scheduler
 from .schema import STAGE23_CURRENT_ROLE, make_final_supervision_v3
 
@@ -224,6 +226,7 @@ def _run_plan(
         if callable(convert_batch_to_minimal_format)
         else raw
     )
+    apply_frozen_feedback_eval_metadata(batch)
     return model.forward_rollout(batch, carried_state=carried_state, ablation=str(mode))
 
 

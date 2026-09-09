@@ -160,6 +160,27 @@ class FakeIForwardBridge(nn.Module):
         return {"runtime_reset_calls": int(self.runtime_reset_calls)}
 
 
+class FakeStage34GateBridge(FakeIForwardBridge):
+    def __init__(self) -> None:
+        super().__init__()
+        self.stage3_4_visit_meta: List[Dict[str, Any]] = []
+
+    def observe(self, **kwargs: Any) -> Dict[str, Any]:
+        assert "biggs_parent_runtime" not in kwargs
+        visit_meta = dict(kwargs.get("visit_meta") or {})
+        self.stage3_4_visit_meta.append(visit_meta)
+        source_frame_idx = int(kwargs["source_frame_idx"])
+        self.observe_calls.append(
+            (source_frame_idx, tuple(int(x) for x in kwargs["source_indices"]))
+        )
+        return {
+            "source_frame_idx": source_frame_idx,
+            "feedback/functional_parent/grad_active": (
+                1.0 if bool(visit_meta.get("has_update_ancestor", False)) else 0.0
+            ),
+        }
+
+
 def _batch(*, rollout_idx=0, episode_end=False, repeat_only=False, episode_id=3):
     source_refs = [(10, 0), (10, 1), (10, 2), (11, 0), (11, 1), (11, 2)]
     target_refs = [(10, 0), (10, 1), (10, 2), (11, 0), (11, 1), (11, 2), (12, 0), (12, 1), (12, 2)]
@@ -350,6 +371,38 @@ def test_iforward_forward_rollout_carries_memory_and_renders_only_final():
     assert len(out.next_state.history.entries) == 6
     assert out.image_refs == [(11, 0), (10, 0), (12, 0)]
     assert out.image_roles == ["current_latest", "history_rollout", "nearby"]
+
+
+def test_stage3_4_model_update_ancestor_gate_resets_at_each_rollout_boundary() -> None:
+    bridge = FakeStage34GateBridge()
+    model = IForwardModel(
+        config=None,
+        device=torch.device("cpu"),
+        bridge=bridge,
+        resolver=IForwardBatchResolver(),
+    )
+    # Isolate the rollout protocol from heavyweight Stage 3.4 spatial modules;
+    # the real functional observe path is covered in test_iforward_stage3_4_observe.py.
+    model.is_stage3_4_functional_parentgs = True
+    model.is_stage2_0_biggs_parent_lifting = True
+
+    first = model.forward_rollout(_batch(rollout_idx=0))
+    first_meta = bridge.stage3_4_visit_meta[-2:]
+    assert [(x["model_update_count"], x["has_update_ancestor"]) for x in first_meta] == [
+        (0, False),
+        (1, True),
+    ]
+    assert [x["validation_render_only"] for x in first_meta] == [False, False]
+    assert first.stats["feedback/functional_parent/grad_active"] == 1.0
+    assert first.stats["feedback/functional_parent/grad_active_mean"] == 0.5
+
+    model.forward_rollout(_batch(rollout_idx=1), carried_state=first.next_state)
+    second_meta = bridge.stage3_4_visit_meta[-2:]
+    assert [(x["model_update_count"], x["has_update_ancestor"]) for x in second_meta] == [
+        (0, False),
+        (1, True),
+    ]
+    assert [x["validation_render_only"] for x in second_meta] == [False, False]
 
 
 def test_iforward_skips_history_render_when_effective_history_weight_zero():

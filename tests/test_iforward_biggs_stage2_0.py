@@ -798,6 +798,81 @@ def test_biggs_grld_relation_inputs_detached() -> None:
     assert local_state.bg.opacity_logit.grad is None
 
 
+def test_biggs_grld_functional_stats_match_runtime_and_bypass_relation_feedback() -> None:
+    torch.manual_seed(70)
+    local_state, measurement, parent_event = _relation_feedback_fixture()
+    runtime = measurement["biggs_parent_runtime"]
+    decoder = _relation_feedback_decoder(checkpoint_enabled=False, alpha=0.4)
+    decoder.set_relation_feedback(
+        enabled=False,
+        alpha=0.0,
+        branches=("bg",),
+        grad_to_child_geometry=True,
+        grad_to_parent_geometry=True,
+        grad_to_child_code=False,
+        grad_to_parent_event=True,
+        grad_to_support=False,
+        checkpoint=False,
+    )
+    runtime_out = decoder(parent_event_pack=parent_event, local_state=local_state, measurement=measurement)
+
+    def functional_branch(branch_runtime):
+        return SimpleNamespace(
+            child_stats_detached=SimpleNamespace(
+                mass=branch_runtime.child_cache.mass.detach(),
+                diag_cov=branch_runtime.child_cache.diag_cov.detach(),
+            ),
+            parent_mass_sum=branch_runtime.stats.weight_sum.detach(),
+        )
+
+    functional_measurement = dict(measurement)
+    del functional_measurement["biggs_parent_runtime"]
+    functional_measurement["functional_parent_pack"] = SimpleNamespace(
+        bg=functional_branch(runtime.bg),
+        distant=functional_branch(runtime.distant),
+        rigid_active=functional_branch(runtime.rigid_active),
+    )
+    # Even if legacy feedback state was configured on the decoder, the
+    # functional path must not enter that bridge.
+    decoder.set_relation_feedback(
+        enabled=True,
+        alpha=0.4,
+        branches=("bg",),
+        grad_to_child_geometry=True,
+        grad_to_parent_geometry=True,
+        grad_to_child_code=False,
+        grad_to_parent_event=True,
+        grad_to_support=False,
+        checkpoint=False,
+    )
+    functional_out = decoder(
+        parent_event_pack=parent_event,
+        local_state=local_state,
+        measurement=functional_measurement,
+    )
+    assert torch.equal(functional_out.event_bg, runtime_out.event_bg)
+    assert torch.equal(functional_out.event_distant, runtime_out.event_distant)
+    assert torch.equal(functional_out.event_rigid, runtime_out.event_rigid)
+    assert functional_out.aux["iforward/grld/feedback_enabled"] == 0.0
+    assert functional_out.aux["iforward/grld/checkpoint_enabled"] == 0.0
+    assert functional_out.aux["feedback/relation/boundary_assertion_passed"] == 1.0
+
+    loss = functional_out.event_bg[0].square().sum() + 0.37 * functional_out.event_bg[1].square().sum()
+    child_grad, parent_grad, event_grad = torch.autograd.grad(
+        loss,
+        (
+            local_state.bg.means,
+            functional_measurement["parent_params_bg"]["means"],
+            parent_event.event_bg,
+        ),
+        allow_unused=True,
+    )
+    assert child_grad is None
+    assert parent_grad is None
+    assert event_grad is not None
+    assert float(event_grad.abs().sum().item()) > 0.0
+
+
 def _relation_feedback_fixture(*, event_dim: int = 64):
     local_state, measurement, parent_event = _decoder_fixture(event_dim=event_dim)
     n = int(local_state.bg.means.shape[0])

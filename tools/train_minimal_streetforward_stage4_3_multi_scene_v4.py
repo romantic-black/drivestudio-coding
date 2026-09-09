@@ -928,6 +928,9 @@ def _load_resume_checkpoint(path: str, model: Any) -> Dict[str, Any]:
     sd = ckpt.get("model_state_dict")
     if sd is None:
         raise ValueError(f"Resume checkpoint missing model_state_dict: {path}")
+    resume_validator = getattr(model, "validate_resume_checkpoint_payload", None)
+    if callable(resume_validator):
+        resume_validator(ckpt)
     model.load_state_dict(sd, strict=True)
     od = ckpt.get("optimizer_state_dict")
     if od is None:

@@ -3,6 +3,9 @@ from __future__ import annotations
 import argparse
 import io
 import logging
+import subprocess
+import sys
+import types
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -32,7 +35,11 @@ from streetforward_eval.protocols import protocol_from_dict, resolve_eval_offset
 from streetforward_eval.runner import RunnerRuntimeConfig, StreetForwardBatchEvalRunner
 from streetforward_eval.stage5_6_runtime import configure_segment_finetune_optimizer
 from streetforward_eval.snapshot_writer import RenderSaveConfig, SnapshotWriter
-from streetforward_eval.summary import build_summary_rows, write_summary_csv
+from streetforward_eval.summary import (
+    build_optimization_curve_rows,
+    build_summary_rows,
+    write_summary_csv,
+)
 
 logger = logging.getLogger("streetforward_batcheval")
 
@@ -97,7 +104,25 @@ def load_cfg(config_file: str) -> Any:
     cfg = OmegaConf.load(config_file)
     base_cfg_file = cfg.get("base_config_file")
     if base_cfg_file:
-        base = OmegaConf.load(str(base_cfg_file))
+        base_git_revision = cfg.get("base_config_git_revision")
+        if base_git_revision:
+            repo_root = Path(__file__).resolve().parents[1]
+            spec = f"{str(base_git_revision)}:{str(base_cfg_file)}"
+            try:
+                base_yaml = subprocess.run(
+                    ["git", "-C", str(repo_root), "show", spec],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout
+            except subprocess.CalledProcessError as e:
+                raise ValueError(
+                    f"failed to load historical base config from git object {spec!r}: {e.stderr.strip()}"
+                ) from e
+            base = OmegaConf.create(base_yaml)
+            logger.info("loaded historical base config from git object %s", spec)
+        else:
+            base = OmegaConf.load(str(base_cfg_file))
         cfg = OmegaConf.merge(base, cfg)
     return cfg
 
@@ -123,6 +148,44 @@ def _as_mapping(value: Any, name: str) -> Dict[str, Any]:
 
 
 def _build_model(cfg: Any, device: torch.device) -> Any:
+    batch_eval_cfg = cfg.get("batch_eval")
+    implementation_cfg = (
+        batch_eval_cfg.get("model_implementation")
+        if batch_eval_cfg is not None and hasattr(batch_eval_cfg, "get")
+        else None
+    )
+    if implementation_cfg is not None:
+        git_revision = str(implementation_cfg.get("git_revision") or "").strip()
+        source_file = str(implementation_cfg.get("source_file") or "").strip()
+        class_name = str(implementation_cfg.get("class_name") or "").strip()
+        if not git_revision or not source_file or not class_name:
+            raise ValueError(
+                "batch_eval.model_implementation requires git_revision, source_file, and class_name"
+            )
+        repo_root = Path(__file__).resolve().parents[1]
+        spec = f"{git_revision}:{source_file}"
+        try:
+            source = subprocess.run(
+                ["git", "-C", str(repo_root), "show", spec],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+        except subprocess.CalledProcessError as e:
+            raise ValueError(
+                f"failed to load historical model source from git object {spec!r}: {e.stderr.strip()}"
+            ) from e
+        module_name = f"streetforward_eval_legacy_{git_revision.replace('-', '_')}"
+        module = types.ModuleType(module_name)
+        module.__file__ = f"git:{spec}"
+        sys.modules[module_name] = module
+        exec(compile(source, module.__file__, "exec"), module.__dict__)
+        model_cls = getattr(module, class_name, None)
+        if model_cls is None:
+            raise ValueError(f"historical model source {spec!r} has no class {class_name!r}")
+        logger.info("using historical model implementation %s class=%s", spec, class_name)
+        return model_cls(cfg, device=device).to(device)
+
     stage = str(cfg.model.stage).strip().lower()
     production_training = bool(cfg.model.get("production_training", False))
     if stage == "4_6":
@@ -778,6 +841,8 @@ def _run_one_experiment(
         )
 
     metric_acc.write_csvs()
+    optimization_curve_rows = build_optimization_curve_rows(metric_acc.iter_rows)
+    write_summary_csv(exp_dir / "psnr_by_optimization_steps.csv", optimization_curve_rows)
     final_rows: List[Dict[str, Any]] = []
     for rows in metric_acc.episode_rows.values():
         if len(rows) == 0:
@@ -786,11 +851,12 @@ def _run_one_experiment(
         final_rows.extend([r for r in rows if int(r["global_iter"]) == int(final_iter)])
     write_summary_csv(exp_dir / "summary.csv", build_summary_rows(final_rows))
     logger.info(
-        "experiment=%s wrote outputs to %s (png=%s metrics_iter=%s summary=%s final_views=%d)",
+        "experiment=%s wrote outputs to %s (png=%s metrics_iter=%s psnr_curve=%s summary=%s final_views=%d)",
         protocol.name,
         exp_dir,
         exp_dir / "image",
         exp_dir / "metrics_iter.csv",
+        exp_dir / "psnr_by_optimization_steps.csv",
         exp_dir / "summary.csv",
         int(len(final_rows)),
     )

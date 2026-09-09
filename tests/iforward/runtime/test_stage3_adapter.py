@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import pytest
+import torch
+
 from models.iforward.protocols.validation_recipes import build_validation_v4_plans
 from models.iforward.runtime.adapter_stage3 import Stage3SchedulerAdapter
 from models.iforward.runtime.runner import IForwardRunner, RunnerOptions
@@ -69,6 +72,7 @@ def test_runner_executes_validation_plan_with_fake_model(tmp_path):
     assert trace.events
     assert model.calls
     assert model.calls[0]["ablation"] == "full"
+    assert all(not call["grad_enabled"] for call in model.calls)
     assert (tmp_path / "plan.json").is_file()
     assert (tmp_path / "trace.jsonl").is_file()
 
@@ -96,3 +100,61 @@ def test_runner_marks_all_non_training_batches_as_read_only_feedback():
     assert batch["request_meta"]["observation_feedback_eval_mode"] == "frozen_no_grad"
     assert batch["_iforward"]["request_meta"]["observation_feedback_eval_mode"] == "frozen_no_grad"
     assert batch["request_meta"]["iforward_stage3_2"]["distribution_type"] == "shuffled_coverage"
+
+
+@pytest.mark.parametrize("mode", ["validate", "demo", "replay"])
+def test_runner_marks_every_runtime_eval_mode_as_frozen_no_grad(mode):
+    runner = IForwardRunner(
+        model=None,
+        convert_batch_to_minimal_format=lambda raw, _device, _step: raw,
+    )
+    batch = runner._convert(
+        {"request_meta": {}, "_iforward": {"request_meta": {}}},
+        RunnerOptions.for_mode(mode, device="cpu"),
+    )
+
+    assert batch["request_meta"]["observation_feedback_eval_mode"] == "frozen_no_grad"
+    assert batch["_iforward"]["request_meta"]["observation_feedback_eval_mode"] == "frozen_no_grad"
+
+
+class _ParameterMutatingModel(_FakeModel, torch.nn.Module):
+    def __init__(self):
+        torch.nn.Module.__init__(self)
+        _FakeModel.__init__(self)
+        self.bad_parameter = torch.nn.Parameter(torch.zeros(()))
+
+    def forward_rollout(self, batch, carried_state=None, ablation="full"):
+        with torch.no_grad():
+            self.bad_parameter.add_(1.0)
+        return super().forward_rollout(batch, carried_state=carried_state, ablation=ablation)
+
+
+def test_runner_rejects_parameter_mutation_during_validation(tmp_path):
+    scheduler = _scheduler(seed=15)
+    episode = scheduler._build_episode()
+    adapter = Stage3SchedulerAdapter(scheduler)
+    plan = adapter.plan_from_episode_v3(episode, "assimilation_timeline/seq10/entry0")
+
+    with pytest.raises(RuntimeError, match="evaluation mutated model parameters"):
+        IForwardRunner(_ParameterMutatingModel(), adapter).run(
+            plan,
+            TraceRecorder(tmp_path, record_images=False),
+            RunnerOptions.for_mode("validate", device="cpu"),
+        )
+
+
+def test_runner_forces_no_grad_even_if_eval_options_request_grad(tmp_path):
+    scheduler = _scheduler(seed=16)
+    episode = scheduler._build_episode()
+    adapter = Stage3SchedulerAdapter(scheduler)
+    plan = adapter.plan_from_episode_v3(episode, "assimilation_timeline/seq10/entry0")
+    model = _FakeModel()
+
+    IForwardRunner(model, adapter).run(
+        plan,
+        TraceRecorder(tmp_path, record_images=False),
+        RunnerOptions(mode="validate", allow_grad=True, device="cpu"),
+    )
+
+    assert model.calls
+    assert all(not call["grad_enabled"] for call in model.calls)

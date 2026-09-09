@@ -129,6 +129,28 @@ class IForwardStage6Bridge:
             new_local_state=new_local_state,
         )
 
+    def register_stage3_4_earlier_delta_grad_probe(
+        self,
+        *,
+        delta: DeltaPack,
+        distance: int,
+    ) -> None:
+        register = getattr(self.runtime, "register_stage3_4_earlier_delta_grad_probe", None)
+        if callable(register):
+            register(delta=delta, distance=int(distance))
+
+    def register_stage3_4_isolation_boundary(self, name: str) -> None:
+        register = getattr(
+            self.runtime,
+            "register_stage3_4_isolation_boundary",
+            None,
+        )
+        if not callable(register):
+            raise RuntimeError(
+                "Stage 3.4 runtime is missing isolation-boundary diagnostics"
+            )
+        register(str(name))
+
     def build_stage2_1_parent_inputs(
         self,
         *,

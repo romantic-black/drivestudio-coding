@@ -49,6 +49,48 @@ def _top2_area(scales: torch.Tensor) -> torch.Tensor:
     return torch.topk(scales, k=2, dim=-1).values.prod(dim=-1)
 
 
+def compute_child_projection_stats(
+    *,
+    scales_log: torch.Tensor,
+    quats: torch.Tensor,
+    opacity_logit: torch.Tensor,
+    child_mass: torch.Tensor,
+    min_mass: float,
+    mass_mode: str | int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute the child terms shared by exact diagonal ParentGS paths.
+
+    The returned tensors remain attached to ``scales_log``, ``quats`` and
+    ``opacity_logit``.  Callers that use the terms only as relation/runtime
+    metadata must detach them explicitly at that boundary.
+    """
+
+    n = int(scales_log.shape[0])
+    if int(quats.shape[0]) != n or int(opacity_logit.shape[0]) != n:
+        raise ValueError("BigGS child projection stats input length mismatch")
+    if int(child_mass.numel()) != n:
+        raise ValueError(
+            "BigGS child projection stats child_mass length mismatch: "
+            f"child_mass={int(child_mass.numel())} children={n}"
+        )
+
+    mass_mode_id = int(mass_mode) if isinstance(mass_mode, int) else mass_mode_to_id(str(mass_mode))
+    scales = torch.exp(scales_log)
+    tau_child = F.softplus(opacity_logit.reshape(-1))
+    child_area = _top2_area(scales)
+    tau_area = tau_child * child_area
+    if mass_mode_id == 0:
+        mass = tau_area.clamp_min(float(min_mass))
+    elif mass_mode_id == 1:
+        mass = child_mass.to(device=scales_log.device, dtype=scales_log.dtype).reshape(-1).clamp_min(float(min_mass))
+    else:
+        raise ValueError(f"unsupported BigGS diagonal projector mass_mode_id={mass_mode_id}")
+
+    rot = _quat_to_rotmat(_normalize_quat(quats))
+    diag_cov = (rot.square() * scales.square()[:, None, :]).sum(dim=-1)
+    return mass, tau_area, diag_cov
+
+
 def project_biggs_parent_diag_reference_tensors(
     *,
     means: torch.Tensor,
@@ -115,15 +157,15 @@ def project_biggs_parent_diag_reference_tensors(
     min_mass_f = float(min_mass)
     mass_mode_id = int(mass_mode) if isinstance(mass_mode, int) else mass_mode_to_id(str(mass_mode))
 
+    mass, tau_area_child, child_diag_cov = compute_child_projection_stats(
+        scales_log=scales_log,
+        quats=quats,
+        opacity_logit=opacity_logit,
+        child_mass=child_mass,
+        min_mass=min_mass_f,
+        mass_mode=mass_mode_id,
+    )
     scales = torch.exp(scales_log)
-    tau_child = F.softplus(opacity_logit.reshape(-1))
-    child_area = _top2_area(scales)
-    if mass_mode_id == 0:
-        mass = (tau_child * child_area).clamp_min(min_mass_f)
-    elif mass_mode_id == 1:
-        mass = child_mass.to(device=means.device, dtype=dtype).reshape(-1).clamp_min(min_mass_f)
-    else:
-        raise ValueError(f"unsupported BigGS diagonal projector mass_mode_id={mass_mode_id}")
 
     mass_sum = means.new_zeros((m,))
     mass_sum.index_add_(0, pid, mass)
@@ -134,8 +176,6 @@ def project_biggs_parent_diag_reference_tensors(
     weighted_means.index_add_(0, pid, means * mass[:, None])
     parent_means = weighted_means / mass_safe[:, None]
 
-    rot = _quat_to_rotmat(_normalize_quat(quats))
-    child_diag_cov = (rot.square() * scales.square()[:, None, :]).sum(dim=-1)
     child_anchor = parent_means.index_select(0, pid)
     second = child_diag_cov + (means - child_anchor).square()
     weighted_second = means.new_zeros((m, 3))
@@ -150,7 +190,7 @@ def project_biggs_parent_diag_reference_tensors(
     parent_scales_log = torch.log(parent_scales.clamp_min(min_scale_f))
 
     tau_area = means.new_zeros((m,))
-    tau_area.index_add_(0, pid, tau_child * child_area)
+    tau_area.index_add_(0, pid, tau_area_child)
     parent_area = _top2_area(parent_scales).clamp_min(eps_f)
     tau_parent = float(tau_parent_scale) * tau_area / (parent_area + eps_f)
     opacity_parent = float(opacity_cap) * (1.0 - torch.exp(-tau_parent))
@@ -184,6 +224,7 @@ def project_biggs_parent_diag_reference_tensors(
 
 __all__ = [
     "child_to_parent_from_grouped",
+    "compute_child_projection_stats",
     "mass_mode_from_id",
     "mass_mode_to_id",
     "project_biggs_parent_diag_reference_tensors",

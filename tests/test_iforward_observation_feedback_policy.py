@@ -126,6 +126,44 @@ def test_observation_feedback_policy_strict_parse_and_scheduler_match():
         policy.validate_scheduler_modes({**cfg["modes"], "high_block_repair": "frozen_no_grad"})
 
 
+def test_functional_parent_feedback_policy_is_strict_and_independently_scheduled():
+    cfg = _feedback_cfg()
+    cfg["functional_parent"] = {
+        "enable": True,
+        "branches": ["bg", "distant", "rigid_active"],
+        "start_after_model_updates": 1,
+        "alpha_schedule": [[0, 0.0], [1000, 0.1], [3000, 0.25]],
+    }
+    policy = ObservationFeedbackPolicy.from_config(cfg)
+
+    assert policy.functional_parent.enable is True
+    assert policy.functional_parent.branches == ("bg", "distant", "rigid_active")
+    assert policy.functional_parent.start_after_model_updates == 1
+    assert policy.functional_parent_alpha(500) == pytest.approx(0.05)
+    assert policy.any_continuous_feedback_enabled is True
+
+    invalid = _feedback_cfg()
+    invalid["functional_parent"] = {**cfg["functional_parent"], "extra": True}
+    with pytest.raises(ValueError, match="unsupported keys"):
+        ObservationFeedbackPolicy.from_config(invalid)
+
+    invalid = _feedback_cfg()
+    invalid["functional_parent"] = {
+        **cfg["functional_parent"],
+        "branches": ["bg", "rigid"],
+    }
+    with pytest.raises(ValueError, match="only supports"):
+        ObservationFeedbackPolicy.from_config(invalid)
+
+    invalid = _feedback_cfg()
+    invalid["functional_parent"] = {
+        **cfg["functional_parent"],
+        "start_after_model_updates": 0,
+    }
+    with pytest.raises(ValueError, match="must be >= 1"):
+        ObservationFeedbackPolicy.from_config(invalid)
+
+
 def test_observation_feedback_policy_uses_explicit_read_only_evaluation_mode():
     policy = ObservationFeedbackPolicy.from_config(_feedback_cfg())
     mode = policy.mode_for_visit(

@@ -10,7 +10,7 @@ from .optimizer_memory_schema import (
     ParentOptimizerMambaState,
 )
 from .optimizer_visit_embedding import OptimizerVisitEmbedding, VisitMeta
-from .optimizer_write_token import ParentDeltaSummaryPack, build_parent_delta_summary
+from .optimizer_write_token import ParentAssignmentPack, ParentDeltaSummaryPack, build_parent_delta_summary
 from .parent_optimizer_gated_delta_kv import LowRankGatedDeltaKVCell, ParentOptimizerGatedDeltaKV
 from .parent_optimizer_mamba import ParentOptimizerMamba, ParentOptimizerPreview
 from .sequence_loss_v3 import role_normalized_loss_v3
@@ -31,6 +31,7 @@ __all__ = [
     "ParentOptimizerMamba",
     "ParentOptimizerMambaState",
     "ParentOptimizerPreview",
+    "ParentAssignmentPack",
     "ParentDeltaSummaryPack",
     "VisitMeta",
     "build_parent_delta_summary",

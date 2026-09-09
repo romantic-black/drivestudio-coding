@@ -4,12 +4,9 @@ from dataclasses import replace
 from typing import Any, Dict, Optional
 
 import torch
-import torch.nn.functional as F
-
-from models.streetforward.math_utils import _normalize_quat, _quat_to_rotmat
 
 from .biggs_parent_projector import BigGSParentProjection
-from .biggs_parent_projector_diag import mass_mode_to_id
+from .biggs_parent_projector_diag import compute_child_projection_stats
 from .biggs_state import BigGSChildContributionCache, BigGSParentBranchRuntime, BigGSParentStats
 from .utils import cfg_get
 
@@ -59,23 +56,16 @@ def _compute_child_terms(
     child_mass: torch.Tensor,
     cfg: Any,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    means = params["means"]
-    dtype = means.dtype
     min_mass = float(cfg_get(cfg, "min_child_mass", 1.0e-8))
     mass_mode = str(cfg_get(cfg, "mass_mode", "dynamic_tau_area"))
-    mass_mode_id = mass_mode_to_id(mass_mode)
-    scales = torch.exp(params["scales_log"])
-    tau_child = F.softplus(params["opacity_logit"].reshape(-1))
-    child_area = _top2_area(scales)
-    tau_area = tau_child * child_area
-    if mass_mode_id == 0:
-        mass = tau_area.clamp_min(float(min_mass))
-    elif mass_mode_id == 1:
-        mass = child_mass.to(device=means.device, dtype=dtype).reshape(-1).clamp_min(float(min_mass))
-    else:  # pragma: no cover - mass_mode_to_id rejects unsupported modes.
-        raise ValueError(f"unsupported BigGS mass_mode_id={mass_mode_id}")
-    rot = _quat_to_rotmat(_normalize_quat(params["quats"]))
-    diag_cov = (rot.square() * scales.square()[:, None, :]).sum(dim=-1)
+    mass, tau_area, diag_cov = compute_child_projection_stats(
+        scales_log=params["scales_log"],
+        quats=params["quats"],
+        opacity_logit=params["opacity_logit"],
+        child_mass=child_mass,
+        min_mass=min_mass,
+        mass_mode=mass_mode,
+    )
     return mass.detach(), tau_area.detach(), diag_cov.detach()
 
 

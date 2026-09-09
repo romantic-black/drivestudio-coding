@@ -160,7 +160,9 @@ def _resolve_init_checkpoint_cfg(cfg: Any, args: argparse.Namespace) -> Tuple[st
     if phase_b_enabled:
         weights_only = bool(getattr(args, "init_weights_only", False)) or bool(_cfg_get(phase_b_cfg, "weights_only", True))
     elif cli_path:
-        weights_only = bool(getattr(args, "init_weights_only", False))
+        weights_only = bool(getattr(args, "init_weights_only", False)) or bool(
+            _cfg_get(init_cfg, "init_weights_only", False)
+        )
     else:
         weights_only = bool(_cfg_get(init_cfg, "init_weights_only", False))
 

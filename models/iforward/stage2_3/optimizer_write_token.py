@@ -21,6 +21,21 @@ class ParentDeltaSummaryPack:
     rigid: Optional[ParentDeltaSummaryBranch] = None
 
 
+@dataclass
+class ParentAssignmentPack:
+    """Graph-free ParentGS assignments used by optimizer write-token aggregation.
+
+    The assignments are topology state, not Parent geometry state.  In
+    particular, ``child_mass`` is the static mass stored by assignment
+    construction; live dynamic projector mass must not enter the GDKV delta
+    summary.
+    """
+
+    bg: Optional[object] = None
+    distant: Optional[object] = None
+    rigid_active: Optional[object] = None
+
+
 def _branch_delta_summary(delta_branch: Optional[object], rows: int, *, ref: torch.Tensor) -> torch.Tensor:
     if delta_branch is None or int(rows) == 0:
         return ref.new_zeros((int(rows), 7))
@@ -305,20 +320,38 @@ def _build_branch_parent_delta_summary(
 
 
 def build_parent_delta_summary(
-    *,
     delta: Optional[object],
-    runtime: Optional[object],
     spatial_event: EventPack,
+    *,
+    assignments: Optional[ParentAssignmentPack] = None,
+    runtime: Optional[object] = None,
     fail_fast: bool = True,
 ) -> Tuple[ParentDeltaSummaryPack, Dict[str, float]]:
-    """Aggregate child-level updater deltas into parent-row 7D write-token summaries."""
+    """Aggregate child deltas using assignments without requiring Parent runtime.
+
+    ``assignments=`` is the Stage 3.4 path. ``runtime=`` is retained solely for
+    legacy Stage 3.0/3.1/3.3 callers. Supplying both would make the topology
+    source ambiguous and is therefore rejected.
+    """
+
+    if assignments is not None and runtime is not None:
+        raise ValueError("build_parent_delta_summary accepts either assignments or runtime, not both")
+
+    if assignments is not None:
+        bg_assignment = getattr(assignments, "bg", None)
+        distant_assignment = getattr(assignments, "distant", None)
+        rigid_assignment = getattr(assignments, "rigid_active", None)
+    else:
+        bg_assignment = None if runtime is None else getattr(runtime, "bg_assignment", None)
+        distant_assignment = None if runtime is None else getattr(runtime, "distant_assignment", None)
+        rigid_assignment = None if runtime is None else getattr(runtime, "rigid_active_assignment", None)
 
     aux: Dict[str, float] = {}
     bg, bg_aux = _build_branch_parent_delta_summary(
         branch="bg",
         delta_branch=None if delta is None else getattr(delta, "bg", None),
         spatial=spatial_event.event_bg,
-        assignment=None if runtime is None else getattr(runtime, "bg_assignment", None),
+        assignment=bg_assignment,
         fail_fast=bool(fail_fast),
         rigid_active=False,
     )
@@ -327,7 +360,7 @@ def build_parent_delta_summary(
         branch="distant",
         delta_branch=None if delta is None else getattr(delta, "distant", None),
         spatial=spatial_event.event_distant,
-        assignment=None if runtime is None else getattr(runtime, "distant_assignment", None),
+        assignment=distant_assignment,
         fail_fast=bool(fail_fast),
         rigid_active=False,
     )
@@ -336,7 +369,7 @@ def build_parent_delta_summary(
         branch="rigid",
         delta_branch=None if delta is None else getattr(delta, "rigid", None),
         spatial=spatial_event.event_rigid,
-        assignment=None if runtime is None else getattr(runtime, "rigid_active_assignment", None),
+        assignment=rigid_assignment,
         fail_fast=bool(fail_fast),
         rigid_active=True,
     )
@@ -471,6 +504,7 @@ class OptimizerWriteTokenBuilder(nn.Module):
 
 __all__ = [
     "OptimizerWriteTokenBuilder",
+    "ParentAssignmentPack",
     "ParentDeltaSummaryBranch",
     "ParentDeltaSummaryPack",
     "build_parent_delta_summary",
